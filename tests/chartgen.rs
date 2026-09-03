@@ -17,11 +17,13 @@ mod chartgen;
 use chartgen::{ChartError, Document, Family, Mode};
 use plotters::style::RGBColor;
 
-/// The x band that can only hold y-axis tick labels: the frame gutter plus
-/// the y-label area (chartgen's `GUTTER` + `y_label_area_size`, private
-/// constants). Kept in one place so a layout change breaks one line, not a
-/// probe per test.
-const Y_TICK_BAND_X: f64 = 110.0;
+/// The x band that can only hold y-axis tick labels: the frame's 16px left
+/// margin plus the 74px `y_label_area_size` — the real plot-left in the
+/// line charts. Chartgen does not export those, so this is a hand-synced
+/// copy; it sits exactly at plot-left (no slack) so no plot-interior text
+/// (a category label on a dense sweep) can leak into the probes filtering
+/// on it.
+const Y_TICK_BAND_X: f64 = 90.0;
 
 /// A minimal document that satisfies every rule, used as the base for the
 /// mutations below. Written as JSON rather than built through the structs so
@@ -538,11 +540,6 @@ fn a_non_representative_run_does_not_stretch_the_axis() {
     let axis_of = |doc: &Document| -> Vec<String> {
         let svg = chartgen::render_to_string(doc, Family::ThroughputVsConsumers, Mode::Light)
             .expect("chart should render");
-        let tick_shaped = |c: &str| {
-            !c.is_empty()
-                && c.chars()
-                    .all(|ch| ch.is_ascii_digit() || ch == '.' || ch == 'k' || ch == 'M')
-        };
         let ticks: Vec<String> = texts(&svg)
             .into_iter()
             .filter(|(x, _, _, c)| *x < Y_TICK_BAND_X && tick_shaped(c))
@@ -883,6 +880,34 @@ fn the_two_variants_differ_in_ink_and_agree_on_content() {
 
 // ── Layout: nothing may run off the canvas ──────────────────────────────────
 
+/// One attribute's raw value out of an SVG element chunk. Every element
+/// parser below shares this, so a quoting or format quirk in the emitted
+/// SVG gets fixed in one place — each caller keeps its own policy for a
+/// missing value.
+fn svg_attr(chunk: &str, name: &str) -> Option<String> {
+    let key = format!("{name}=\"");
+    let start = chunk.find(&key)? + key.len();
+    let rest = chunk.get(start..)?;
+    let stop = rest.find('"')?;
+    rest.get(..stop).map(str::to_string)
+}
+
+/// The suite's wide-fallback-font extent model: 0.55em per character,
+/// over-estimating a proportional face — the conservative direction for
+/// every fits-on-canvas assertion built on it.
+fn est_width(size: f64, content: &str) -> f64 {
+    content.chars().count() as f64 * size * 0.55
+}
+
+/// What a y-axis tick label may look like: `fmt_count`'s output alphabet,
+/// including the exponent spellings ("1e-7") that deep sub-unit floors
+/// produce. Shared by every axis probe so the alphabet cannot drift.
+fn tick_shaped(c: &str) -> bool {
+    !c.is_empty()
+        && c.chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | 'k' | 'M' | 'e' | '-'))
+}
+
 /// Every `<text>` in the file, as (x, y, font-size, content).
 fn texts(svg: &str) -> Vec<(f64, f64, f64, String)> {
     let mut out = Vec::new();
@@ -891,13 +916,7 @@ fn texts(svg: &str) -> Vec<(f64, f64, f64, String)> {
             continue;
         };
         let (head, body) = chunk.split_at(chunk.find('>').unwrap_or(0));
-        let attr = |name: &str| -> Option<String> {
-            let key = format!("{name}=\"");
-            let start = head.find(&key)? + key.len();
-            let rest = head.get(start..)?;
-            let stop = rest.find('"')?;
-            rest.get(..stop).map(str::to_string)
-        };
+        let attr = |name: &str| svg_attr(head, name);
         // f64 with a loud failure: an unparseable coordinate silently
         // becoming 0 would vacuously pass every overflow assertion built on
         // this helper.
@@ -926,13 +945,7 @@ fn texts(svg: &str) -> Vec<(f64, f64, f64, String)> {
 fn circles(svg: &str) -> Vec<(f64, f64, f64, String)> {
     let mut out = Vec::new();
     for chunk in svg.split("<circle ").skip(1) {
-        let attr = |name: &str| -> Option<String> {
-            let key = format!("{name}=\"");
-            let start = chunk.find(&key)? + key.len();
-            let rest = chunk.get(start..)?;
-            let stop = rest.find('"')?;
-            rest.get(..stop).map(str::to_string)
-        };
+        let attr = |name: &str| svg_attr(chunk, name);
         let coord = |v: Option<String>| -> f64 {
             v.and_then(|v| v.parse().ok())
                 .unwrap_or_else(|| panic!("circle with an unparseable coordinate"))
@@ -955,11 +968,11 @@ fn full_size_rects(svg: &str) -> (usize, usize) {
     let mut full = 0;
     let mut total = 0;
     for rect in svg.split("<rect ").skip(1) {
+        // Missing-value policy here: an unparseable dimension counts as 0
+        // (not canvas-sized), which errs toward failing the "exactly two
+        // canvas-sized rects" assertion loudly.
         let attr = |name: &str| -> f64 {
-            let key = format!("{name}=\"");
-            rect.split(&key)
-                .nth(1)
-                .and_then(|r| r.split('"').next())
+            svg_attr(rect, name)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0)
         };
@@ -997,10 +1010,8 @@ fn no_text_runs_off_the_canvas() {
                 (0.0..=f64::from(chartgen::HEIGHT)).contains(&y),
                 "{family:?}: text baseline y={y} is outside the canvas: {content:?}"
             );
-            // A start-anchored run of text must end inside the canvas. 0.55em
-            // per character over-estimates a proportional face, so this is the
-            // conservative direction.
-            let width = content.chars().count() as f64 * size * 0.55;
+            // A start-anchored run of text must end inside the canvas.
+            let width = est_width(size, &content);
             if x == 24.0 {
                 assert!(
                     x + width <= f64::from(chartgen::WIDTH),
@@ -3408,9 +3419,7 @@ fn a_long_backend_name_widens_the_end_label_gutter() {
         "expected the legend entry plus the end label"
     );
     for (x, _, size, content) in names {
-        // The same wide-fallback-font extent model the canvas-overflow test
-        // uses: 0.55em per character.
-        let right = x + content.chars().count() as f64 * size * 0.55;
+        let right = x + est_width(size, &content);
         assert!(
             right <= f64::from(chartgen::WIDTH),
             "the label runs off the canvas (x={x}, est. right edge {right:.0})"
@@ -3459,7 +3468,9 @@ fn a_refusal_panel_that_cannot_fit_its_band_is_refused() {
     // footer, where the caption-block guard counted them; drawn as a free
     // panel block they need the same loud refusal when they outgrow the band
     // the frame guard proves free — never a silent overprint of the footer.
-    let runs: Vec<String> = (0..6)
+    // 20 long-named backends wrap to ~28 accounting lines (~470px), taller
+    // than the whole footer-to-chrome gap this fixture leaves free.
+    let runs: Vec<String> = (0..20)
         .map(|i| {
             format!(
                 r#"{{
@@ -3509,10 +3520,12 @@ fn sub_unit_decade_ticks_carry_distinct_labels() {
     // A log floor below 1 is legal (any positive throughput validates), and
     // every sub-0.05 decade used to render as the same "0.0" tick — several
     // distinct decades wearing one wrong label. The floor decade itself is
-    // not emitted by the tick generator, so the fixture reaches 1e-5 to put
-    // four sub-unit decades in the interior.
+    // not emitted by the tick generator, so the fixture reaches 1e-8 to put
+    // seven sub-unit decades in the interior — deep enough that the decades
+    // past six decimals must switch to exponent form ("1e-7") rather than
+    // outgrow the ~90px y-label area and clip at the viewBox.
     let rows = [
-        scenario("consume_parallel", "parallel", 64, 1, 0.00002),
+        scenario("consume_parallel", "parallel", 64, 1, 0.00000002),
         scenario("consume_parallel", "parallel", 64, 2, 0.5),
         scenario("consume_parallel", "parallel", 64, 4, 0.9),
     ];
@@ -3526,11 +3539,6 @@ fn sub_unit_decade_ticks_carry_distinct_labels() {
     let doc = parse(&document(&run));
     let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
         .expect("sub-unit throughput must render");
-    let tick_shaped = |c: &str| {
-        !c.is_empty()
-            && c.chars()
-                .all(|ch| ch.is_ascii_digit() || ch == '.' || ch == 'k' || ch == 'M')
-    };
     let ticks: Vec<String> = texts(&svg)
         .into_iter()
         .filter(|(x, _, _, c)| *x < Y_TICK_BAND_X && tick_shaped(c))
@@ -3539,6 +3547,10 @@ fn sub_unit_decade_ticks_carry_distinct_labels() {
     assert!(
         ticks.iter().any(|t| t == "0.01"),
         "the 0.01 decade must be labelled as itself, got {ticks:?}"
+    );
+    assert!(
+        ticks.iter().any(|t| t == "1e-7"),
+        "a decade past six decimals must wear exponent form, got {ticks:?}"
     );
     let mut deduped = ticks.clone();
     deduped.sort();
@@ -3552,10 +3564,11 @@ fn sub_unit_decade_ticks_carry_distinct_labels() {
 
 #[test]
 fn a_mid_chart_end_label_is_not_displaced_by_a_far_away_gutter_label() {
-    // Label deconfliction is per column: a gutter label and a mid-chart
-    // label ~700px apart never actually overlap, and displacing the
-    // mid-chart one detaches it from its leaderless dot — the reader then
-    // hangs the name on whichever other line passes through that y.
+    // Label deconfliction is geometric: a gutter label and a mid-chart
+    // label whose x-extents sit ~700px apart never actually overlap, and
+    // displacing the mid-chart one detaches it from its leaderless dot —
+    // the reader then hangs the name on whichever other line passes
+    // through that y.
     //
     // Byte-determinism makes the probe exact: the label-to-dot anchor offset
     // in a control render (kafka alone near the top, nothing within spacing
@@ -3594,10 +3607,14 @@ fn a_mid_chart_end_label_is_not_displaced_by_a_far_away_gutter_label() {
         )));
         let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
             .expect("chart should render");
-        // kafka's endpoint dot: the rightmost r=4 circle in kafka's hue.
+        // kafka's endpoint dot: the rightmost r=4 circle in kafka's hue —
+        // derived from the palette (fixed slot 1), never a literal that a
+        // retune would orphan.
+        let k = Mode::Light.series()[1];
+        let kafka_hex = format!("#{:02X}{:02X}{:02X}", k.0, k.1, k.2);
         let (cx, cy) = circles(&svg)
             .into_iter()
-            .filter(|(_, _, r, fill)| *r == 4.0 && fill == "#EB6834")
+            .filter(|(_, _, r, fill)| *r == 4.0 && *fill == kafka_hex)
             .map(|(cx, cy, _, _)| (cx, cy))
             .fold((f64::MIN, f64::MIN), |acc, (cx, cy)| {
                 if cx > acc.0 { (cx, cy) } else { acc }
@@ -3647,11 +3664,11 @@ fn every_ink_role_and_series_hue_clears_its_surface() {
         (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
     }
     for mode in Mode::ALL {
-        let (surface, roles) = mode.inks();
+        let (surface, [primary, secondary, muted]) = mode.inks();
         for (role, ink, floor) in [
-            ("primary", roles[0].1, 7.0),
-            ("secondary", roles[1].1, 4.5),
-            ("muted", roles[2].1, 3.0),
+            ("primary", primary, 7.0),
+            ("secondary", secondary, 4.5),
+            ("muted", muted, 3.0),
         ] {
             let ratio = contrast(&ink, &surface);
             assert!(
@@ -3666,5 +3683,179 @@ fn every_ink_role_and_series_hue_clears_its_surface() {
                 "{mode:?} series slot {i} contrast {ratio:.2} is under the 1.9:1 mark floor"
             );
         }
+        // The pre-blended muted fills are, by construction, the lowest-
+        // contrast marks in the system (shape-only and lower-bound bars).
+        // Muted is the point — the floor is set to catch invisibility (a
+        // typo'd blend lands near 1.0), not to promise full a11y contrast.
+        for (i, fill) in mode.muted_fills().iter().enumerate() {
+            let ratio = contrast(fill, &surface);
+            assert!(
+                ratio >= 1.4,
+                "{mode:?} muted fill for slot {i} contrast {ratio:.2} is under the 1.4:1 \
+                 visibility floor"
+            );
+        }
     }
+}
+
+// ── Redesign diff-review round-2 guards ─────────────────────────────────────
+
+#[test]
+fn labels_in_adjacent_columns_are_still_deconflicted() {
+    // Round 1's per-column allocator assumed only same-column labels can
+    // collide; at 12 categories the column pitch (~66px) is narrower than
+    // an 8-char label (72px), so labels anchored in adjacent columns at the
+    // same y overprint. Collision is geometry, not column identity: any two
+    // labels whose estimated x-extents overlap must keep the 14px vertical
+    // spacing.
+    let counts: Vec<u32> = (0..12).map(|i| 1u32 << i).collect();
+    let series = |backend: &str, upto: usize, v: f64| -> String {
+        let rows: Vec<String> = counts[..upto]
+            .iter()
+            .map(|c| scenario("consume_parallel", "parallel", 64, *c, v))
+            .collect();
+        format!(
+            r#"{{
+              "backend": "{backend}", "representative": true,
+              "results": [{}], "failures": [], "unsupported": []
+            }}"#,
+            rows.join(",")
+        )
+    };
+    // rabbitmq ends at category 9, redis at category 10, same throughput —
+    // same desired y, overlapping x-extents, different columns.
+    let doc = parse(&document(&format!(
+        "{},{},{}",
+        series("inmemory", 12, 50_000.0),
+        series("rabbitmq", 10, 500.0),
+        series("redis", 11, 500.0)
+    )));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+    let label_y = |name: &str| -> f64 {
+        texts(&svg)
+            .into_iter()
+            .filter(|(x, _, _, c)| c == name && *x > 300.0)
+            .map(|(_, y, _, _)| y)
+            .next()
+            .unwrap_or_else(|| panic!("{name}'s end label not found"))
+    };
+    let dy = (label_y("rabbitmq") - label_y("redis")).abs();
+    assert!(
+        dy >= 13.0,
+        "overlapping-extent labels in adjacent columns must be separated \
+         vertically (got {dy:.0}px)"
+    );
+}
+
+#[test]
+fn a_long_name_that_never_enters_the_gutter_does_not_refuse_the_chart() {
+    // The gutter is sized (and its cap enforced) only for names it will
+    // actually hold. A 26-char backend whose line stops at the first
+    // category labels at its endpoint, not in the gutter — refusing the
+    // whole chart for it was round 1 overshooting.
+    let long_name = "a-backend-name-of-26-chars";
+    let short = format!(
+        r#"{{
+          "backend": "{long_name}", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 5_000.0)
+    );
+    // inmemory spans consumers 1/2/4 in the headline slice, so the sweep has
+    // three categories and the long name's single point sits at the first —
+    // never the final, never the gutter.
+    let sweep: Vec<String> = [1u32, 2, 4]
+        .iter()
+        .map(|c| {
+            scenario(
+                "consume_parallel",
+                "parallel",
+                64,
+                *c,
+                10_000.0 * f64::from(*c),
+            )
+        })
+        .collect();
+    let inmemory = format!(
+        r#"{{
+          "backend": "inmemory", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        sweep.join(",")
+    );
+    let doc = parse(&document(&format!("{inmemory},{short}")));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("a long mid-chart name must not refuse the chart");
+    for (x, _, size, content) in texts(&svg)
+        .into_iter()
+        .filter(|(_, _, _, c)| c == long_name)
+    {
+        let right = x + est_width(size, &content);
+        assert!(
+            right <= f64::from(chartgen::WIDTH),
+            "the mid-chart label must fit the canvas (x={x}, est. right {right:.0})"
+        );
+    }
+}
+
+#[test]
+fn a_mid_chart_label_that_cannot_fit_rightward_flips_left() {
+    // A long name whose line ends deep into a dense sweep cannot extend
+    // rightward without crossing the canvas edge; it flips to the left of
+    // its endpoint (end-anchored) instead of clipping or refusing.
+    let long_name = "a-backend-name-of-26-chars";
+    let counts: Vec<u32> = (0..12).map(|i| 1u32 << i).collect();
+    let rows = |upto: usize| -> String {
+        counts[..upto]
+            .iter()
+            .map(|c| scenario("consume_parallel", "parallel", 64, *c, 9_000.0))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let ending_mid = format!(
+        r#"{{
+          "backend": "{long_name}", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        rows(11)
+    );
+    let reaching_end = format!(
+        r#"{{
+          "backend": "inmemory", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        rows(12)
+    );
+    let doc = parse(&document(&format!("{},{}", reaching_end, ending_mid)));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("a fit-by-flip label must not refuse the chart");
+    // Read the label's own element so the anchor is visible: a flipped
+    // label is end-anchored and its extent runs leftward from x.
+    let chunk = svg
+        .split("<text ")
+        .skip(1)
+        .find(|c| {
+            c.contains(long_name)
+                && svg_attr(c, "x")
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .is_some_and(|x| x > 200.0)
+        })
+        .expect("the end label must exist");
+    let x: f64 = svg_attr(chunk, "x")
+        .and_then(|v| v.parse().ok())
+        .expect("label x");
+    let size: f64 = svg_attr(chunk, "font-size")
+        .and_then(|v| v.parse().ok())
+        .expect("label size");
+    assert_eq!(
+        svg_attr(chunk, "text-anchor").as_deref(),
+        Some("end"),
+        "a label with no rightward room must flip to end-anchored"
+    );
+    let left = x - est_width(size, long_name);
+    assert!(
+        left >= 0.0 && x <= f64::from(chartgen::WIDTH),
+        "the flipped label must sit fully on canvas (est. left {left:.0}, x={x})"
+    );
 }

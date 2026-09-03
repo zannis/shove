@@ -28,13 +28,13 @@ aarch64 — 8 cores — 15 GB RAM — Ubuntu 24.04.4 LTS — rustc 1.91.1 (ed61e
 <text x="24" y="614" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
 10 recorded failure(s) in the dataset — see failures[]
 </text>
-<text x="480" y="137" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+<text x="480" y="251" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
 no publishable dispatch-latency measurement in this document
 </text>
-<text x="480" y="162" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+<text x="480" y="276" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
 percentiles recorded and withheld for: inmemory, kafka, nats, rabbitmq, redis
 </text>
-<text x="480" y="178" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+<text x="480" y="292" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
 no measured rows in this document (nothing to withhold): sqs
 </text>
 </svg>

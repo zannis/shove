@@ -931,41 +931,40 @@ impl Mode {
         self.theme().series
     }
 
-    /// The surface plus the ordered ink roles (primary, secondary, muted),
-    /// public so the suite can hold a WCAG floor for every ink against the
-    /// surface it prints on — the whitelist proves a render uses only the
-    /// constants; it cannot catch a typo'd constant itself.
-    pub fn inks(self) -> (RGBColor, [(&'static str, RGBColor); 3]) {
+    /// The surface plus the ink roles in fixed order — primary, secondary,
+    /// muted — public so the suite can hold a WCAG floor for every ink
+    /// against the surface it prints on: the whitelist proves a render uses
+    /// only the constants; it cannot catch a typo'd constant itself.
+    pub fn inks(self) -> (RGBColor, [RGBColor; 3]) {
         let t = self.theme();
-        (
-            t.surface,
-            [
-                ("primary", t.primary),
-                ("secondary", t.secondary),
-                ("muted", t.muted),
-            ],
-        )
+        (t.surface, [t.primary, t.secondary, t.muted])
+    }
+
+    /// The pre-blended muted fills, one per series slot (what shape-only and
+    /// lower-bound bars actually wear) — public for the same reason as
+    /// [`Mode::inks`]: they are the lowest-contrast marks in the system and
+    /// need their own visibility floor.
+    pub fn muted_fills(self) -> [RGBColor; 8] {
+        let t = self.theme();
+        t.series.map(|c| t.blend_muted(c))
     }
 
     /// Every hex this mode is allowed to emit: the chrome roles, the series
     /// slots, and the pre-blended muted fills. The whitelist test renders a
-    /// variant and refuses any color outside this set.
+    /// variant and refuses any color outside this set. Seeded from
+    /// [`Mode::inks`], [`Mode::series`] and [`Mode::muted_fills`] so the
+    /// role inventory is enumerated once — a colour this set knows about is
+    /// a colour the contrast floors also see.
     pub fn allowed_hexes(self) -> BTreeSet<String> {
         let t = self.theme();
-        let mut set: BTreeSet<String> = [
-            t.surface,
-            t.primary,
-            t.secondary,
-            t.muted,
-            t.grid,
-            t.baseline,
-        ]
-        .iter()
-        .map(hex)
-        .collect();
-        for colour in t.series {
-            set.insert(hex(&colour));
-            set.insert(hex(&t.blend_muted(colour)));
+        let (surface, inks) = self.inks();
+        let mut set: BTreeSet<String> = [surface, t.grid, t.baseline]
+            .iter()
+            .chain(inks.iter())
+            .map(hex)
+            .collect();
+        for colour in self.series().iter().chain(self.muted_fills().iter()) {
+            set.insert(hex(colour));
         }
         set
     }
@@ -1385,13 +1384,14 @@ fn fmt_count(v: f64) -> String {
     } else {
         // Sub-unit values: one decimal renders every decade below 0.05 as
         // the same "0.0" label, so print just enough decimals to name the
-        // value ("0.01", "0.001"). Deep floors fall back to exponent form
-        // rather than a wall of zeros.
+        // value ("0.01", "0.001"). Past six decimals the decimal spelling
+        // (9+ chars) outgrows the ~90px left of the axis and would clip at
+        // the viewBox — exponent form stays short and exact.
         let decades = -v.log10().floor();
-        if decades > 9.0 {
+        if decades > 6.0 {
             format!("{v:e}")
         } else {
-            // 1..=9 by the branch above, so the cast is exact.
+            // 1..=6 by the branch above, so the cast is exact.
             format!("{:.*}", decades as usize, v)
         }
     }
@@ -1484,6 +1484,17 @@ const SUBTITLE_WRAP: usize = 100;
 /// Baseline-to-baseline spacing for wrapped subtitle lines.
 const SUBTITLE_LINE: i32 = 19;
 
+/// What `frame` proved about the canvas it framed: the extra top margin its
+/// wrapped subtitle consumed, and the vertical band `[band_top, band_bottom]`
+/// its guard proved free between the chrome and the footer. Consumers center
+/// or guard against THIS, never against a re-derivation of frame's
+/// internals — the re-derived copy is the one that drifts.
+struct FrameLayout {
+    subtitle_extra: i32,
+    band_top: i32,
+    band_bottom: i32,
+}
+
 fn frame<'b>(
     root: &DrawingArea<SVGBackend<'b>, Shift>,
     doc: &Document,
@@ -1492,7 +1503,7 @@ fn frame<'b>(
     subtitle: &str,
     notes: &[String],
     legend_rows: i32,
-) -> Result<(DrawingArea<SVGBackend<'b>, Shift>, i32), ChartError> {
+) -> Result<(DrawingArea<SVGBackend<'b>, Shift>, FrameLayout), ChartError> {
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
     let theme = mode.theme();
 
@@ -1565,9 +1576,9 @@ fn frame<'b>(
     // less the reserved gap and bottom margin; below MIN_PLOT_PX of that, the
     // bars are slivers — and past zero plotters draws the plot over the
     // legend rather than erroring. A document that gets here gets a loud
-    // refusal instead of a garbage chart. The refusal panel's block stays
-    // inside [PLOT_TOP, PLOT_TOP + MIN_PLOT_PX], above any footer top this
-    // permits.
+    // refusal instead of a garbage chart. The band this guard proves free is
+    // returned in `FrameLayout`; the refusal panel guards and centers
+    // against that, never against a copy of this arithmetic.
     if top_of_footer
         < PLOT_TOP
             .saturating_add(legend_extra)
@@ -1606,7 +1617,13 @@ fn frame<'b>(
             16,
             16,
         ),
-        subtitle_extra,
+        FrameLayout {
+            subtitle_extra,
+            band_top: PLOT_TOP
+                .saturating_add(legend_extra)
+                .saturating_add(subtitle_extra),
+            band_bottom: top_of_footer.saturating_sub(PLOT_BOTTOM_GAP),
+        },
     ))
 }
 
@@ -1949,15 +1966,22 @@ where
 /// Where the legend starts.
 const LEGEND_ORIGIN: (i32, i32) = (94, 74);
 
-/// The estimated width of one legend entry. An estimate rather than a
-/// measurement: text extents are approximated (no ttf feature), and the
-/// estimate is what stays equal across hosts. Saturating: a document-supplied
-/// label has no length bound.
-fn legend_entry_width(label: &str) -> i32 {
+/// The estimated pixel width of a run of label-sized text: 9px per char. An
+/// estimate rather than a measurement — text extents are approximated (no
+/// ttf feature), and the estimate is what stays equal across hosts. One
+/// definition, shared by every fits-or-refuses gate (legend, end-label
+/// gutter, mid-chart labels), so the gates cannot disagree about the same
+/// string. Saturating: a document-supplied label has no length bound.
+fn text_px(label: &str) -> i32 {
     i32::try_from(label.chars().count())
         .unwrap_or(i32::MAX)
         .saturating_mul(9)
-        .saturating_add(44)
+}
+
+/// The estimated width of one legend entry: its text plus the swatch and
+/// inter-entry padding.
+fn legend_entry_width(label: &str) -> i32 {
+    text_px(label).saturating_add(44)
 }
 
 /// Lay the legend out into rows: `(row index, x)` per entry, and the row
@@ -1985,15 +2009,18 @@ fn legend_layout(entries: &[(String, RGBColor)]) -> Result<(Vec<(i32, i32)>, i32
     Ok((slots, row.saturating_add(1)))
 }
 
+/// Draw the legend into the slots its caller already laid out — the caller
+/// needed `legend_layout` for the row count before framing, so the same
+/// slots are passed through rather than recomputed here.
 fn draw_legend(
     root: &DrawingArea<SVGBackend<'_>, Shift>,
     mode: Mode,
     entries: &[(String, RGBColor)],
+    slots: &[(i32, i32)],
     y_offset: i32,
 ) -> Result<(), ChartError> {
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
-    let (slots, _) = legend_layout(entries)?;
-    for ((label, colour), (row, x)) in entries.iter().zip(slots) {
+    for ((label, colour), (row, x)) in entries.iter().zip(slots.iter().copied()) {
         let y = LEGEND_ORIGIN
             .1
             .saturating_add(y_offset)
@@ -2291,10 +2318,7 @@ where
 {
     let mut gutter = END_LABEL_GUTTER;
     for name in plotted {
-        let need = i32::try_from(name.chars().count())
-            .unwrap_or(i32::MAX)
-            .saturating_mul(9)
-            .saturating_add(END_LABEL_PAD);
+        let need = text_px(name).saturating_add(END_LABEL_PAD);
         if need > END_LABEL_GUTTER_MAX {
             return Err(ChartError::Render(format!(
                 "backend `{name}` needs a {need}px end-label gutter (cap \
@@ -2366,13 +2390,25 @@ fn line_chart(
         };
         legend.push((label, colour_of(backend)?));
     }
-    let (_, legend_rows) = legend_layout(&legend)?;
-    let (area, subtitle_extra) = frame(root, doc, mode, title, subtitle, &notes, legend_rows)?;
+    let (legend_slots, legend_rows) = legend_layout(&legend)?;
+    let (area, layout) = frame(root, doc, mode, title, subtitle, &notes, legend_rows)?;
     // The end-label gutter: carved out of the plot body, not the canvas, so
     // the labels land between the plot and the frame's right margin — and
-    // sized to the names it will hold, or refused.
-    let gutter = end_label_gutter(presences.iter().filter_map(|(b, p)| {
-        matches!(p, Presence::Absolute { .. } | Presence::ShapeOnly { .. }).then_some(b.as_str())
+    // sized to the names it will actually hold: only a series reaching the
+    // final category labels in the gutter. A series ending mid-chart labels
+    // at its endpoint (with its own fits-or-flips check in the body), so
+    // its name neither widens the gutter nor trips the gutter's cap.
+    let final_cat = x_labels.len().saturating_sub(1) as f64;
+    let ends_at_final = |points: &[(f64, f64)]| {
+        points
+            .last()
+            .is_some_and(|(x, _)| (*x - final_cat).abs() < f64::EPSILON)
+    };
+    let gutter = end_label_gutter(presences.iter().filter_map(|(b, p)| match p {
+        Presence::Absolute { points, .. } | Presence::ShapeOnly { points, .. } => {
+            ends_at_final(points).then_some(b.as_str())
+        }
+        _ => None,
     }))?;
     let area = area.margin(0, 0, 0, gutter);
 
@@ -2453,7 +2489,7 @@ fn line_chart(
             line_chart_body(root, &mut chart, mode, &specs, x_labels, x_desc)?;
         }
     }
-    draw_legend(root, mode, &legend, subtitle_extra)?;
+    draw_legend(root, mode, &legend, &legend_slots, layout.subtitle_extra)?;
     Ok(())
 }
 
@@ -2550,77 +2586,136 @@ where
     // legend presupposes color-matching, which is exactly what sub-3:1
     // contrast and CVD take away). Every plotted series gets its name once,
     // at its line's end — in the gutter when the line reaches the final
-    // category, at the endpoint when it stops early (a leader from a
-    // mid-chart endpoint into the gutter would read as the bridged line
-    // rule 2 forbids).
+    // category; otherwise at its endpoint, extending right when the canvas
+    // has room, flipped to end just left of the dot when it does not, and
+    // refused loudly when neither side fits (a leader from a mid-chart
+    // endpoint into the gutter would read as the bridged line rule 2
+    // forbids).
     let plot = chart.plotting_area().get_pixel_range();
     let (plot_top, plot_bottom) = (plot.1.start, plot.1.end);
     let plot_right = plot.0.end;
     let final_cat = x_labels.len().saturating_sub(1) as f64;
-    // (backend, endpoint px/py, in-gutter, endpoint category index)
-    let mut entries: Vec<(String, (i32, i32), bool, i64)> = Vec::new();
+    let half = END_LABEL_SPACING / 2;
+    /// One placed end label: where its text anchors, which way it runs, and
+    /// the x-extent it occupies for collision grouping.
+    struct EndLabel {
+        backend: String,
+        endpoint: (i32, i32),
+        anchor_x: i32,
+        /// End-anchored — the text extends leftward from `anchor_x`.
+        flip: bool,
+        /// A gutter label, tied to its line by a leader stub.
+        leader: bool,
+        x0: i32,
+        x1: i32,
+        y: i32,
+    }
+    let mut labels: Vec<EndLabel> = Vec::new();
     for spec in specs {
         let Some((x, y)) = spec.points.last() else {
             continue;
         };
         let (px, py) = chart.plotting_area().map_coordinate(&(*x, *y));
+        let w = text_px(&spec.backend);
         let in_gutter = (*x - final_cat).abs() < f64::EPSILON;
-        // x is a category index (exact small integer in f64); the round is
-        // for the cast, not for information.
-        entries.push((spec.backend.clone(), (px, py), in_gutter, x.round() as i64));
+        let (anchor_x, flip, leader) = if in_gutter {
+            // Always fits: the gutter was sized for every name it holds.
+            (plot_right.saturating_add(10), false, true)
+        } else if px.saturating_add(8).saturating_add(w) <= WIDTH as i32 - 16 {
+            (px.saturating_add(8), false, false)
+        } else if px.saturating_sub(8).saturating_sub(w) >= 16 {
+            (px.saturating_sub(8), true, false)
+        } else {
+            return Err(ChartError::Render(format!(
+                "backend `{}`'s end label fits on neither side of its endpoint — \
+                 it cannot be labelled legibly on this canvas",
+                spec.backend
+            )));
+        };
+        let (x0, x1) = if flip {
+            (anchor_x.saturating_sub(w), anchor_x)
+        } else {
+            (anchor_x, anchor_x.saturating_add(w))
+        };
+        labels.push(EndLabel {
+            backend: spec.backend.clone(),
+            endpoint: (px, py),
+            anchor_x,
+            flip,
+            leader,
+            x0,
+            x1,
+            y: py.clamp(plot_top + half, plot_bottom - half),
+        });
     }
-    // Deterministic slot allocation, per column: only labels anchored at the
-    // same category can actually collide, and letting a gutter label push a
-    // mid-chart label ~700px away off its leaderless dot mis-attributes the
-    // name to whichever other line passes through that y. Within a column:
-    // sort by desired y (name-tied for equal ys), clamp into the plot band,
-    // then a forward pass pushing collisions down and a backward pass
-    // pulling the tail back above the bottom edge.
-    entries.sort_by(|a, b| (a.3, a.1.1, a.0.as_str()).cmp(&(b.3, b.1.1, b.0.as_str())));
-    let half = END_LABEL_SPACING / 2;
-    let mut ys: Vec<i32> = entries
-        .iter()
-        .map(|(_, (_, py), _, _)| (*py).clamp(plot_top + half, plot_bottom - half))
-        .collect();
-    let mut start = 0usize;
-    while start < entries.len() {
-        let mut end = start + 1;
-        while end < entries.len() && entries[end].3 == entries[start].3 {
-            end += 1;
+    // Deterministic slot allocation, per collision component: two labels
+    // can only overprint when their x-extents (nearly) overlap, and
+    // displacing a label vertically away from an extent 700px distant
+    // detaches it from its leaderless dot — collision is geometry, never
+    // column identity (at a dense sweep the column pitch is narrower than
+    // a label). Components come from a sweep over the sorted extents; a
+    // ≤8px horizontal gap still counts as touching, because two labels
+    // that close at one y are unreadable anyway. Within a component: order
+    // by desired y (name-tied), a forward pass pushing collisions down,
+    // then a backward pass pulling the tail back above the bottom edge.
+    labels.sort_by(|a, b| (a.x0, a.y, a.backend.as_str()).cmp(&(b.x0, b.y, b.backend.as_str())));
+    let mut components: Vec<Vec<usize>> = Vec::new();
+    let mut max_x1 = i32::MIN;
+    for (i, label) in labels.iter().enumerate() {
+        if components.is_empty() || label.x0 > max_x1.saturating_add(8) {
+            components.push(Vec::new());
         }
-        for i in start + 1..end {
-            if ys[i] < ys[i - 1].saturating_add(END_LABEL_SPACING) {
-                ys[i] = ys[i - 1].saturating_add(END_LABEL_SPACING);
+        if let Some(component) = components.last_mut() {
+            component.push(i);
+        }
+        max_x1 = max_x1.max(label.x1);
+    }
+    for component in &components {
+        let mut idx = component.clone();
+        idx.sort_by(|&a, &b| {
+            (labels[a].y, labels[a].backend.as_str())
+                .cmp(&(labels[b].y, labels[b].backend.as_str()))
+        });
+        for k in 1..idx.len() {
+            let floor = labels[idx[k - 1]].y.saturating_add(END_LABEL_SPACING);
+            if labels[idx[k]].y < floor {
+                labels[idx[k]].y = floor;
             }
         }
-        ys[end - 1] = ys[end - 1].min(plot_bottom - half);
-        for i in (start..end - 1).rev() {
-            if ys[i] > ys[i + 1].saturating_sub(END_LABEL_SPACING) {
-                ys[i] = ys[i + 1].saturating_sub(END_LABEL_SPACING);
+        if let Some(&last) = idx.last() {
+            labels[last].y = labels[last].y.min(plot_bottom - half);
+        }
+        for k in (0..idx.len().saturating_sub(1)).rev() {
+            let ceiling = labels[idx[k + 1]].y.saturating_sub(END_LABEL_SPACING);
+            if labels[idx[k]].y > ceiling {
+                labels[idx[k]].y = ceiling;
             }
         }
-        start = end;
     }
-    let label_style = (FONT, VALUE_PX)
+    let rightward = (FONT, VALUE_PX)
         .into_font()
         .color(&theme.secondary)
         .pos(Pos::new(HPos::Left, VPos::Center));
-    for ((backend, (px, py), in_gutter, _), label_y) in entries.iter().zip(ys) {
-        if *in_gutter {
-            let label_x = plot_right + 10;
+    let leftward = (FONT, VALUE_PX)
+        .into_font()
+        .color(&theme.secondary)
+        .pos(Pos::new(HPos::Right, VPos::Center));
+    for label in &labels {
+        if label.leader {
             // The leader ties the label to its line across the gutter; it
             // never spans a category.
             root.draw(&PathElement::new(
-                vec![(*px + 6, *py), (label_x - 3, label_y)],
+                vec![
+                    (label.endpoint.0 + 6, label.endpoint.1),
+                    (label.anchor_x - 3, label.y),
+                ],
                 stroke(theme.muted, 1),
             ))
             .map_err(render)?;
-            root.draw_text(backend, &label_style, (label_x, label_y))
-                .map_err(render)?;
-        } else {
-            root.draw_text(backend, &label_style, (px.saturating_add(8), label_y))
-                .map_err(render)?;
         }
+        let style = if label.flip { &leftward } else { &rightward };
+        root.draw_text(&label.backend, style, (label.anchor_x, label.y))
+            .map_err(render)?;
     }
 
     draw_categories(root, chart, mode, x_labels)?;
@@ -2686,8 +2781,8 @@ fn bar_chart(
             slice: title.to_string(),
         });
     }
-    let (_, legend_rows) = legend_layout(series)?;
-    let (area, subtitle_extra) = frame(root, doc, mode, title, subtitle, notes, legend_rows)?;
+    let (legend_slots, legend_rows) = legend_layout(series)?;
+    let (area, layout) = frame(root, doc, mode, title, subtitle, notes, legend_rows)?;
 
     // Only representative groups set the scale, so a non-representative
     // magnitude can never be read off the axis. Lower-bound bars do
@@ -2858,7 +2953,7 @@ fn bar_chart(
     let labels: Vec<String> = groups.iter().map(|g| g.label.clone()).collect();
     draw_categories(root, &chart, mode, &labels)?;
     draw_x_desc(root, &chart, mode, x_desc)?;
-    draw_legend(root, mode, series, subtitle_extra)?;
+    draw_legend(root, mode, series, &legend_slots, layout.subtitle_extra)?;
     Ok(())
 }
 
@@ -3311,7 +3406,7 @@ fn render_dispatch_latency(
             recorded.push(run.backend.as_str());
         }
     }
-    let (_, subtitle_extra) = frame(
+    let (_, layout) = frame(
         root,
         doc,
         mode,
@@ -3358,16 +3453,17 @@ fn render_dispatch_latency(
     let block_h = LINE
         .saturating_mul(i32::try_from(body.len()).unwrap_or(i32::MAX))
         .saturating_add(SUBTITLE_LINE);
-    let band_top = PLOT_TOP.saturating_add(subtitle_extra);
-    let band_bottom = band_top.saturating_add(MIN_PLOT_PX);
-    if block_h > band_bottom.saturating_sub(band_top) {
+    if block_h > layout.band_bottom.saturating_sub(layout.band_top) {
         return Err(ChartError::Render(format!(
             "the dispatch-latency accounting ({} lines) does not fit the refusal \
              panel's band",
             body.len()
         )));
     }
-    let mut y = band_top + ((band_bottom - band_top).saturating_sub(block_h)).max(0) / 2;
+    // Non-negative by the guard above — no clamp, so an overflow can never
+    // silently pin to band_top again.
+    let mut y =
+        layout.band_top + (layout.band_bottom - layout.band_top).saturating_sub(block_h) / 2;
     for (i, (line, px)) in body.iter().enumerate() {
         let style = centred(theme.secondary, *px);
         root.draw_text(line, &style, (WIDTH as i32 / 2, y))
