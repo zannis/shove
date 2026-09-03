@@ -970,7 +970,10 @@ impl Mode {
     }
 }
 
-fn hex(colour: &RGBColor) -> String {
+/// The one spelling of a colour as uppercase hex (no `#`). Public so the
+/// suite compares colours through the same encoding the whitelist uses,
+/// never a re-spelled literal.
+pub fn hex(colour: &RGBColor) -> String {
     format!("{:02X}{:02X}{:02X}", colour.0, colour.1, colour.2)
 }
 
@@ -1385,8 +1388,12 @@ fn fmt_count(v: f64) -> String {
         // Sub-unit values: one decimal renders every decade below 0.05 as
         // the same "0.0" label, so print just enough decimals to name the
         // value ("0.01", "0.001"). Past six decimals the decimal spelling
-        // (9+ chars) outgrows the ~90px left of the axis and would clip at
-        // the viewBox — exponent form stays short and exact.
+        // (9+ chars) outgrows the space left of the axis — FRAME_MARGIN to
+        // the tick anchor at plot-left minus plotters' 10px label offset,
+        // ~64px at the ~8px/char the rendered LABEL_PX runs — and would
+        // clip at the viewBox; exponent form stays short and exact. The
+        // sub-unit tick test asserts the left-edge fit, so shrinking the
+        // y-label area breaks loudly rather than clipping silently.
         let decades = -v.log10().floor();
         if decades > 6.0 {
             format!("{v:e}")
@@ -1614,8 +1621,8 @@ fn frame<'b>(
         root.margin(
             (70 + subtitle_extra + legend_extra).max(0) as u32,
             reserved,
-            16,
-            16,
+            FRAME_MARGIN as u32,
+            FRAME_MARGIN as u32,
         ),
         FrameLayout {
             subtitle_extra,
@@ -2288,13 +2295,24 @@ where
 
 /// One plotted line: its identity, ink, pre-mapped points and weight class.
 /// Points are mapped into axis coordinates *before* the axis branch, so the
-/// log and linear branches share every drawing decision.
+/// log and linear branches share every drawing decision. `gutter_label` is
+/// decided once, from the raw points, where specs are built — gutter sizing
+/// and label placement both read it, so they cannot disagree.
 struct LineSpec {
     backend: String,
     colour: RGBColor,
+    gutter_label: bool,
     points: Vec<(f64, f64)>,
     shape_only: bool,
 }
+
+/// The frame's outer margin on every canvas edge (`frame` reserves it on
+/// all four sides). Every fit check measures against this — never a
+/// re-spelled 16 that drifts when the frame is retuned.
+const FRAME_MARGIN: i32 = 16;
+
+/// The gap between a line's endpoint dot and its mid-chart end label.
+const END_LABEL_OFFSET: i32 = 8;
 
 /// The end-label gutter's floor: room for the widest *fixed* backend name
 /// (8 chars at the 9px/char cross-host estimate) plus the leader stub and
@@ -2392,25 +2410,6 @@ fn line_chart(
     }
     let (legend_slots, legend_rows) = legend_layout(&legend)?;
     let (area, layout) = frame(root, doc, mode, title, subtitle, &notes, legend_rows)?;
-    // The end-label gutter: carved out of the plot body, not the canvas, so
-    // the labels land between the plot and the frame's right margin — and
-    // sized to the names it will actually hold: only a series reaching the
-    // final category labels in the gutter. A series ending mid-chart labels
-    // at its endpoint (with its own fits-or-flips check in the body), so
-    // its name neither widens the gutter nor trips the gutter's cap.
-    let final_cat = x_labels.len().saturating_sub(1) as f64;
-    let ends_at_final = |points: &[(f64, f64)]| {
-        points
-            .last()
-            .is_some_and(|(x, _)| (*x - final_cat).abs() < f64::EPSILON)
-    };
-    let gutter = end_label_gutter(presences.iter().filter_map(|(b, p)| match p {
-        Presence::Absolute { points, .. } | Presence::ShapeOnly { points, .. } => {
-            ends_at_final(points).then_some(b.as_str())
-        }
-        _ => None,
-    }))?;
-    let area = area.margin(0, 0, 0, gutter);
 
     // Absolute magnitudes come only from representative runs. A shape-only
     // series is drawn against the same box but its values are fractions, so it
@@ -2418,13 +2417,23 @@ fn line_chart(
     let range = absolute_range(presences)?;
 
     // Map every series into axis coordinates up front, so the two axis
-    // branches below can never disagree about what is drawn.
+    // branches below can never disagree about what is drawn — and decide
+    // HERE, once, from the raw points, whether each series' end label lives
+    // in the gutter. Gutter sizing below and label placement in the body
+    // both read `gutter_label`, so they can never disagree about membership.
+    let final_cat = x_labels.len().saturating_sub(1) as f64;
+    let ends_at_final = |points: &[(f64, f64)]| {
+        points
+            .last()
+            .is_some_and(|(x, _)| (*x - final_cat).abs() < f64::EPSILON)
+    };
     let mut specs: Vec<LineSpec> = Vec::new();
     for (backend, presence) in presences {
         match presence {
             Presence::Absolute { points, .. } => specs.push(LineSpec {
                 backend: backend.clone(),
                 colour: colour_of(backend)?,
+                gutter_label: ends_at_final(points),
                 points: points.clone(),
                 shape_only: false,
             }),
@@ -2448,6 +2457,7 @@ fn line_chart(
                 specs.push(LineSpec {
                     backend: backend.clone(),
                     colour: colour_of(backend)?,
+                    gutter_label: ends_at_final(points),
                     points: mapped,
                     shape_only: true,
                 });
@@ -2455,6 +2465,19 @@ fn line_chart(
             Presence::Unsupported(_) | Presence::NotMeasured | Presence::WithheldOnly(_) => {}
         }
     }
+
+    // The end-label gutter: carved out of the plot body, not the canvas, so
+    // the labels land between the plot and the frame's right margin — and
+    // sized to exactly the names it will hold. A series ending mid-chart
+    // labels at its endpoint (with its own fits-or-flips check in the
+    // body), so its name neither widens the gutter nor trips the cap.
+    let gutter = end_label_gutter(
+        specs
+            .iter()
+            .filter(|s| s.gutter_label)
+            .map(|s| s.backend.as_str()),
+    )?;
+    let area = area.margin(0, 0, 0, gutter);
 
     let n = x_labels.len();
     let x_range = -0.35f64..(n as f64 - 0.65);
@@ -2593,11 +2616,13 @@ where
     // forbids).
     let plot = chart.plotting_area().get_pixel_range();
     let (plot_top, plot_bottom) = (plot.1.start, plot.1.end);
-    let plot_right = plot.0.end;
-    let final_cat = x_labels.len().saturating_sub(1) as f64;
+    let (plot_left, plot_right) = (plot.0.start, plot.0.end);
     let half = END_LABEL_SPACING / 2;
     /// One placed end label: where its text anchors, which way it runs, and
-    /// the x-extent it occupies for collision grouping.
+    /// the x-extent `[x0, x1]` it occupies for collision grouping. For a
+    /// gutter label the extent starts at its leader's origin, so the span
+    /// the sweep reasons about covers everything the mark actually draws —
+    /// x0/x1 are NOT derivable from `anchor_x` alone.
     struct EndLabel {
         backend: String,
         endpoint: (i32, i32),
@@ -2617,14 +2642,17 @@ where
         };
         let (px, py) = chart.plotting_area().map_coordinate(&(*x, *y));
         let w = text_px(&spec.backend);
-        let in_gutter = (*x - final_cat).abs() < f64::EPSILON;
-        let (anchor_x, flip, leader) = if in_gutter {
+        let (anchor_x, flip, leader) = if spec.gutter_label {
             // Always fits: the gutter was sized for every name it holds.
             (plot_right.saturating_add(10), false, true)
-        } else if px.saturating_add(8).saturating_add(w) <= WIDTH as i32 - 16 {
-            (px.saturating_add(8), false, false)
-        } else if px.saturating_sub(8).saturating_sub(w) >= 16 {
-            (px.saturating_sub(8), true, false)
+        } else if px.saturating_add(END_LABEL_OFFSET).saturating_add(w)
+            <= WIDTH as i32 - FRAME_MARGIN
+        {
+            (px.saturating_add(END_LABEL_OFFSET), false, false)
+        } else if px.saturating_sub(END_LABEL_OFFSET).saturating_sub(w) >= plot_left {
+            // The flip must clear plot-left, not just the canvas: a label
+            // across the y-label band overprints the axis ticks.
+            (px.saturating_sub(END_LABEL_OFFSET), true, false)
         } else {
             return Err(ChartError::Render(format!(
                 "backend `{}`'s end label fits on neither side of its endpoint — \
@@ -2632,7 +2660,11 @@ where
                 spec.backend
             )));
         };
-        let (x0, x1) = if flip {
+        let (x0, x1) = if leader {
+            // The leader is part of the mark: anything overlapping its span
+            // deconflicts vertically against this label too.
+            (px.saturating_add(6), anchor_x.saturating_add(w))
+        } else if flip {
             (anchor_x.saturating_sub(w), anchor_x)
         } else {
             (anchor_x, anchor_x.saturating_add(w))
@@ -2654,28 +2686,31 @@ where
     // detaches it from its leaderless dot — collision is geometry, never
     // column identity (at a dense sweep the column pitch is narrower than
     // a label). Components come from a sweep over the sorted extents; a
-    // ≤8px horizontal gap still counts as touching, because two labels
-    // that close at one y are unreadable anyway. Within a component: order
-    // by desired y (name-tied), a forward pass pushing collisions down,
-    // then a backward pass pulling the tail back above the bottom edge.
+    // gap under one character advance still counts as touching, because
+    // two labels that close at one y read as one run-on name. Within a
+    // component: order by desired y (name-tied), a forward pass pushing
+    // collisions down, a backward pass pulling the tail back above the
+    // bottom edge — and a loud refusal if the stack needs more height than
+    // the plot band has, instead of silently escaping into the chrome.
+    let touch_gap = text_px("m");
     labels.sort_by(|a, b| (a.x0, a.y, a.backend.as_str()).cmp(&(b.x0, b.y, b.backend.as_str())));
     let mut components: Vec<Vec<usize>> = Vec::new();
     let mut max_x1 = i32::MIN;
     for (i, label) in labels.iter().enumerate() {
-        if components.is_empty() || label.x0 > max_x1.saturating_add(8) {
-            components.push(Vec::new());
-        }
-        if let Some(component) = components.last_mut() {
-            component.push(i);
+        match components.last_mut() {
+            Some(component) if label.x0 <= max_x1.saturating_add(touch_gap) => {
+                component.push(i);
+            }
+            _ => components.push(vec![i]),
         }
         max_x1 = max_x1.max(label.x1);
     }
-    for component in &components {
-        let mut idx = component.clone();
-        idx.sort_by(|&a, &b| {
+    for component in &mut components {
+        component.sort_by(|&a, &b| {
             (labels[a].y, labels[a].backend.as_str())
                 .cmp(&(labels[b].y, labels[b].backend.as_str()))
         });
+        let idx = &*component;
         for k in 1..idx.len() {
             let floor = labels[idx[k - 1]].y.saturating_add(END_LABEL_SPACING);
             if labels[idx[k]].y < floor {
@@ -2690,6 +2725,15 @@ where
             if labels[idx[k]].y > ceiling {
                 labels[idx[k]].y = ceiling;
             }
+        }
+        if let Some(&head) = idx.first()
+            && labels[head].y < plot_top + half
+        {
+            return Err(ChartError::Render(format!(
+                "{} end labels stack taller than the plot band — the chart \
+                 cannot label every series legibly",
+                idx.len()
+            )));
         }
     }
     let rightward = (FONT, VALUE_PX)
@@ -3450,9 +3494,12 @@ fn render_dispatch_latency(
             body.push((line, FOOT_PX));
         }
     }
-    let block_h = LINE
-        .saturating_mul(i32::try_from(body.len()).unwrap_or(i32::MAX))
-        .saturating_add(SUBTITLE_LINE);
+    // One spelling of the block's vertical rhythm: the guard measures the
+    // sum of exactly the advances the drawing loop takes (the sentence gets
+    // a little more air below it than the list lines), so retuning the air
+    // cannot desynchronise the guard from the ink.
+    let advance = |i: usize| -> i32 { if i == 0 { SUBTITLE_LINE + 6 } else { LINE } };
+    let block_h = (0..body.len()).fold(0i32, |h, i| h.saturating_add(advance(i)));
     if block_h > layout.band_bottom.saturating_sub(layout.band_top) {
         return Err(ChartError::Render(format!(
             "the dispatch-latency accounting ({} lines) does not fit the refusal \
@@ -3468,8 +3515,7 @@ fn render_dispatch_latency(
         let style = centred(theme.secondary, *px);
         root.draw_text(line, &style, (WIDTH as i32 / 2, y))
             .map_err(render)?;
-        // The sentence gets a little more air below it than the list lines.
-        y = y.saturating_add(if i == 0 { SUBTITLE_LINE + 6 } else { LINE });
+        y = y.saturating_add(advance(i));
     }
     Ok(())
 }

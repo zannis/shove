@@ -901,9 +901,12 @@ fn est_width(size: f64, content: &str) -> f64 {
 
 /// What a y-axis tick label may look like: `fmt_count`'s output alphabet,
 /// including the exponent spellings ("1e-7") that deep sub-unit floors
-/// produce. Shared by every axis probe so the alphabet cannot drift.
+/// produce, and always starting with a digit — which fences the widened
+/// alphabet against a dash-or-e-named fixture backend whose flipped end
+/// label could stray into the tick band. Shared by every axis probe so the
+/// alphabet cannot drift.
 fn tick_shaped(c: &str) -> bool {
-    !c.is_empty()
+    c.starts_with(|ch: char| ch.is_ascii_digit())
         && c.chars()
             .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | 'k' | 'M' | 'e' | '-'))
 }
@@ -3552,6 +3555,21 @@ fn sub_unit_decade_ticks_carry_distinct_labels() {
         ticks.iter().any(|t| t == "1e-7"),
         "a decade past six decimals must wear exponent form, got {ticks:?}"
     );
+    // Every tick must FIT left of the axis, not merely exist: ticks are
+    // end-anchored, so the estimated extent runs leftward from x, and a
+    // label wider than the y-label area clips at the viewBox. This is the
+    // loud coupling between fmt_count's exponent cutover and the axis
+    // geometry — shrink the y-label area and this fails instead of
+    // shipping clipped magnitudes.
+    for (x, _, size, c) in texts(&svg)
+        .into_iter()
+        .filter(|(x, _, _, c)| *x < Y_TICK_BAND_X && tick_shaped(c))
+    {
+        assert!(
+            x - est_width(size, &c) >= 0.0,
+            "tick {c:?} extends past the left canvas edge (anchor x={x})"
+        );
+    }
     let mut deduped = ticks.clone();
     deduped.sort();
     deduped.dedup();
@@ -3608,10 +3626,10 @@ fn a_mid_chart_end_label_is_not_displaced_by_a_far_away_gutter_label() {
         let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
             .expect("chart should render");
         // kafka's endpoint dot: the rightmost r=4 circle in kafka's hue —
-        // derived from the palette (fixed slot 1), never a literal that a
-        // retune would orphan.
-        let k = Mode::Light.series()[1];
-        let kafka_hex = format!("#{:02X}{:02X}{:02X}", k.0, k.1, k.2);
+        // derived from the palette (fixed slot 1) through the one hex
+        // encoding chartgen owns, never a literal that a retune would
+        // orphan or a re-spelled encoding that could drift in case.
+        let kafka_hex = format!("#{}", chartgen::hex(&Mode::Light.series()[1]));
         let (cx, cy) = circles(&svg)
             .into_iter()
             .filter(|(_, _, r, fill)| *r == 4.0 && *fill == kafka_hex)
@@ -3620,11 +3638,14 @@ fn a_mid_chart_end_label_is_not_displaced_by_a_far_away_gutter_label() {
                 if cx > acc.0 { (cx, cy) } else { acc }
             });
         assert!(cx > f64::MIN, "kafka's endpoint dot not found");
-        // kafka's mid-chart end label: the "kafka" text near the dot (the
-        // legend copy sits far left).
+        // kafka's mid-chart end label: the "kafka" text inside the plot
+        // band. The legend copy is excluded by geometry — legend rows sit at
+        // y ≈ 74–90, end labels at ≥ plot_top + spacing ≈ 103 — never by
+        // emission order, so a draw-order refactor cannot silently point
+        // this probe at the legend.
         let label_y = texts(&svg)
             .into_iter()
-            .filter(|(x, _, _, c)| c == "kafka" && *x > 350.0)
+            .filter(|(x, y, _, c)| c == "kafka" && *x > 350.0 && *y > 100.0)
             .map(|(_, y, _, _)| y)
             .next()
             .expect("kafka's end label not found");
@@ -3732,11 +3753,16 @@ fn labels_in_adjacent_columns_are_still_deconflicted() {
     )));
     let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
         .expect("chart should render");
+    // One parse; the legend copies are excluded by geometry (legend rows at
+    // y ≈ 74–90, end labels inside the plot band ≥ ~103), never by emission
+    // order — a draw-order refactor cannot silently point this at a legend
+    // row and read row spacing as deconfliction.
+    let all_texts = texts(&svg);
     let label_y = |name: &str| -> f64 {
-        texts(&svg)
-            .into_iter()
-            .filter(|(x, _, _, c)| c == name && *x > 300.0)
-            .map(|(_, y, _, _)| y)
+        all_texts
+            .iter()
+            .filter(|(x, y, _, c)| c == name && *x > 300.0 && *y > 100.0)
+            .map(|(_, y, _, _)| *y)
             .next()
             .unwrap_or_else(|| panic!("{name}'s end label not found"))
     };
@@ -3831,7 +3857,9 @@ fn a_mid_chart_label_that_cannot_fit_rightward_flips_left() {
     let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
         .expect("a fit-by-flip label must not refuse the chart");
     // Read the label's own element so the anchor is visible: a flipped
-    // label is end-anchored and its extent runs leftward from x.
+    // label is end-anchored and its extent runs leftward from x. The
+    // legend copy is excluded by geometry (legend rows at y ≈ 74–90, end
+    // labels inside the plot band), never by emission order.
     let chunk = svg
         .split("<text ")
         .skip(1)
@@ -3840,6 +3868,9 @@ fn a_mid_chart_label_that_cannot_fit_rightward_flips_left() {
                 && svg_attr(c, "x")
                     .and_then(|v| v.parse::<f64>().ok())
                     .is_some_and(|x| x > 200.0)
+                && svg_attr(c, "y")
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .is_some_and(|y| y > 100.0)
         })
         .expect("the end label must exist");
     let x: f64 = svg_attr(chunk, "x")
@@ -3858,4 +3889,48 @@ fn a_mid_chart_label_that_cannot_fit_rightward_flips_left() {
         left >= 0.0 && x <= f64::from(chartgen::WIDTH),
         "the flipped label must sit fully on canvas (est. left {left:.0}, x={x})"
     );
+}
+
+// ── Redesign diff-review round-3 guards ─────────────────────────────────────
+
+#[test]
+fn a_label_fitting_neither_side_of_its_endpoint_is_refused() {
+    // A flipped label must clear plot-left — across the y-label band it
+    // overprints the axis ticks. A name too wide for either side of its
+    // endpoint refuses loudly rather than rendering an unreadable axis.
+    // 70 chars ≈ 630 estimated px: too wide to extend right from category 8
+    // of 12 (~300px of room to the frame margin) and too wide to clear
+    // plot-left going leftward (~540px of room) — yet inside the legend's
+    // own budget, so the label refusal is the one that fires.
+    let long_name = format!("{}long-xx", "really-".repeat(9));
+    let counts: Vec<u32> = (0..12).map(|i| 1u32 << i).collect();
+    let rows = |upto: usize| -> String {
+        counts[..upto]
+            .iter()
+            .map(|c| scenario("consume_parallel", "parallel", 64, *c, 9_000.0))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let ending_mid = format!(
+        r#"{{
+          "backend": "{long_name}", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        rows(9)
+    );
+    let reaching_end = format!(
+        r#"{{
+          "backend": "inmemory", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        rows(12)
+    );
+    let doc = parse(&document(&format!("{},{}", reaching_end, ending_mid)));
+    match chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light) {
+        Err(ChartError::Render(msg)) => assert!(
+            msg.contains("neither side"),
+            "the refusal must name the unplaceable label: {msg}"
+        ),
+        other => panic!("an unplaceable end label must refuse to render: {other:?}"),
+    }
 }
