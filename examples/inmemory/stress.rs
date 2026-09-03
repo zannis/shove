@@ -29,8 +29,9 @@ use harness::{DlqDrainFn, HarnessConfig, StressTestTopic, run_all_scenarios};
 /// publish-only flows have no consumer draining behind them, so anything past
 /// the default would wedge on backpressure rather than measure a publish rate.
 /// This is a bound, not a preallocation, so raising it costs nothing until the
-/// messages actually exist. Scenarios larger than this still fail cleanly —
-/// the harness bounds every publish phase by the scenario deadline.
+/// messages actually exist. A scenario larger than this blocks on backpressure
+/// until interrupted — the harness runs every phase to completion, with no
+/// deadline — so the capacity must cover the largest tier that is run.
 const QUEUE_CAPACITY: usize = 1_000_000;
 
 #[tokio::main]
