@@ -45,7 +45,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// No id may fail below this, whatever its measured spread: it is ~5× the
 /// tightest spread the calibration fleet has demonstrated, and keeps every
@@ -85,6 +85,16 @@ pub enum CompareError {
     /// The walk found no `new/estimates.json` anywhere: the bench step
     /// measured nothing, which must fail loudly rather than compare nothing.
     NoEstimates(PathBuf),
+    /// Calibration inputs whose id sets differ: a run that silently dropped
+    /// an id (wrong feature set, renamed bench) must not shrink the baseline
+    /// to the intersection.
+    CalibrationIdMismatch {
+        id: String,
+    },
+    /// Calibration from fewer than two runs: one run has zero spread by
+    /// construction, so every id would get the floor threshold off data that
+    /// demonstrated nothing.
+    CalibrationTooFewRuns(usize),
 }
 
 impl fmt::Display for CompareError {
@@ -111,6 +121,16 @@ impl fmt::Display for CompareError {
                 "no new/estimates.json found under {} — the bench step measured nothing",
                 path.display()
             ),
+            Self::CalibrationIdMismatch { id } => write!(
+                f,
+                "{id} is not present in every calibration run — a run that dropped \
+                 an id must not shrink the baseline to the intersection"
+            ),
+            Self::CalibrationTooFewRuns(n) => write!(
+                f,
+                "calibration needs at least 2 runs, got {n} — one run has zero \
+                 spread by construction"
+            ),
         }
     }
 }
@@ -122,7 +142,7 @@ pub const BASELINE_SCHEMA_VERSION: u32 = 1;
 /// One baseline row. `deny_unknown_fields` is load-bearing: a misspelled
 /// `fail_above_pct` must refuse to parse, not silently deserialize into an id
 /// judged by a default.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BaselineEntry {
     pub mean_ns: f64,
@@ -133,7 +153,7 @@ pub struct BaselineEntry {
 
 /// Where the baseline numbers came from — kept so a stale baseline is visibly
 /// stale in review rather than silently trusted.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provenance {
     pub runner: String,
@@ -143,7 +163,7 @@ pub struct Provenance {
     pub method: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct BaselineDoc {
     schema_version: u32,
@@ -173,6 +193,80 @@ pub fn load_baseline(path: &Path) -> Result<Baseline, CompareError> {
         }
     }
     Ok(Baseline { ids: doc.ids })
+}
+
+// ── Calibration: how thresholds are earned ──────────────────────────────────
+
+/// Build baseline entries from two or more no-op runs: per id, the mean is
+/// the arithmetic mean across runs and the threshold is
+/// `max(`[`FAIL_FLOOR_PCT`]`, 5 × max-vs-min spread)`. The runs must share
+/// one id set — a run that silently dropped a bench target must not shrink
+/// the baseline to the intersection.
+pub fn calibrate(
+    runs: &[BTreeMap<String, f64>],
+) -> Result<BTreeMap<String, BaselineEntry>, CompareError> {
+    if runs.len() < 2 {
+        return Err(CompareError::CalibrationTooFewRuns(runs.len()));
+    }
+    for run in runs {
+        for id in runs.iter().flat_map(|r| r.keys()) {
+            if !run.contains_key(id) {
+                return Err(CompareError::CalibrationIdMismatch { id: id.clone() });
+            }
+        }
+        for (id, mean) in run {
+            positive_finite(id, *mean)?;
+        }
+    }
+    let mut out = BTreeMap::new();
+    for id in runs[0].keys() {
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        let mut sum = 0.0;
+        for run in runs {
+            let v = run[id];
+            min = min.min(v);
+            max = max.max(v);
+            sum += v;
+        }
+        let spread = (max - min) / min;
+        out.insert(
+            id.clone(),
+            BaselineEntry {
+                mean_ns: (sum / runs.len() as f64 * 100.0).round() / 100.0,
+                fail_above_pct: (5.0 * spread * 100.0).round().max(FAIL_FLOOR_PCT),
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// Write a baseline document the loader will accept back.
+pub fn write_baseline(
+    path: &Path,
+    ids: &BTreeMap<String, BaselineEntry>,
+    provenance: Provenance,
+) -> Result<(), CompareError> {
+    let doc = BaselineDoc {
+        schema_version: BASELINE_SCHEMA_VERSION,
+        provenance,
+        ids: ids
+            .iter()
+            .map(|(id, e)| {
+                (
+                    id.clone(),
+                    BaselineEntry {
+                        mean_ns: e.mean_ns,
+                        fail_above_pct: e.fail_above_pct,
+                    },
+                )
+            })
+            .collect(),
+    };
+    let mut raw = serde_json::to_string_pretty(&doc)
+        .map_err(|e| CompareError::Json(path.to_path_buf(), e))?;
+    raw.push('\n');
+    fs::write(path, raw).map_err(|e| CompareError::Io(path.to_path_buf(), e))
 }
 
 // ── Criterion output ────────────────────────────────────────────────────────

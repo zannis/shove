@@ -5,240 +5,240 @@
     "calibrated": "2026-09-03",
     "shove_version": "0.14.0",
     "rust_version": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
-    "method": "3 no-op runs of the Tier A suite on separate ubuntu-latest runners; mean_ns is the arithmetic mean across runs; fail_above_pct = max(50, 5 x max-vs-min spread), so an id fails only well outside its own demonstrated no-op noise."
+    "method": "6 no-op runs of the Tier A suite on separate ubuntu-latest runners; mean_ns is the arithmetic mean across runs; fail_above_pct = max(50, 5 x max-vs-min spread), so an id fails only well outside its own demonstrated no-op noise"
   },
   "ids": {
     "autoscaler_decision/stabilized_threshold": {
-      "mean_ns": 70.57,
-      "fail_above_pct": 264
+      "mean_ns": 79.8,
+      "fail_above_pct": 314.0
     },
     "autoscaler_decision/stabilized_threshold_64_groups": {
-      "mean_ns": 72.93,
-      "fail_above_pct": 244
+      "mean_ns": 82.52,
+      "fail_above_pct": 316.0
     },
     "autoscaler_decision/threshold": {
-      "mean_ns": 7.1,
-      "fail_above_pct": 485
+      "mean_ns": 7.82,
+      "fail_above_pct": 485.0
     },
     "codec/json_decode/1024": {
-      "mean_ns": 242.58,
-      "fail_above_pct": 272
+      "mean_ns": 275.52,
+      "fail_above_pct": 320.0
     },
     "codec/json_decode/64": {
-      "mean_ns": 82.36,
-      "fail_above_pct": 382
+      "mean_ns": 94.47,
+      "fail_above_pct": 454.0
     },
     "codec/json_decode/65536": {
-      "mean_ns": 10760.85,
-      "fail_above_pct": 214
+      "mean_ns": 15881.99,
+      "fail_above_pct": 1489.0
     },
     "codec/json_encode/1024": {
-      "mean_ns": 556.6,
-      "fail_above_pct": 335
+      "mean_ns": 640.58,
+      "fail_above_pct": 419.0
     },
     "codec/json_encode/64": {
-      "mean_ns": 76.2,
-      "fail_above_pct": 331
+      "mean_ns": 86.72,
+      "fail_above_pct": 362.0
     },
     "codec/json_encode/65536": {
-      "mean_ns": 27569.45,
-      "fail_above_pct": 336
+      "mean_ns": 31791.42,
+      "fail_above_pct": 433.0
     },
     "consumer_overhead_dispatch/consumers_1/1024": {
-      "mean_ns": 4153763.2,
-      "fail_above_pct": 734
+      "mean_ns": 4301453.67,
+      "fail_above_pct": 734.0
     },
     "consumer_overhead_dispatch/consumers_1/64": {
-      "mean_ns": 5745125.42,
-      "fail_above_pct": 1262
+      "mean_ns": 6043909.99,
+      "fail_above_pct": 1262.0
     },
     "consumer_overhead_dispatch/consumers_1/65536": {
-      "mean_ns": 26369735.35,
-      "fail_above_pct": 378
+      "mean_ns": 29692082.11,
+      "fail_above_pct": 378.0
     },
     "consumer_overhead_dispatch/consumers_16/1024": {
-      "mean_ns": 10186137.29,
-      "fail_above_pct": 394
+      "mean_ns": 10056036.53,
+      "fail_above_pct": 394.0
     },
     "consumer_overhead_dispatch/consumers_16/64": {
-      "mean_ns": 11475515.58,
-      "fail_above_pct": 371
+      "mean_ns": 11851573.88,
+      "fail_above_pct": 371.0
     },
     "consumer_overhead_dispatch/consumers_16/65536": {
-      "mean_ns": 29294795.32,
-      "fail_above_pct": 534
+      "mean_ns": 31239744.72,
+      "fail_above_pct": 534.0
     },
     "consumer_overhead_dispatch/consumers_256/1024": {
-      "mean_ns": 9995587.8,
-      "fail_above_pct": 261
+      "mean_ns": 10152582.89,
+      "fail_above_pct": 275.0
     },
     "consumer_overhead_dispatch/consumers_256/64": {
-      "mean_ns": 11648257.41,
-      "fail_above_pct": 343
+      "mean_ns": 12038062.71,
+      "fail_above_pct": 343.0
     },
     "consumer_overhead_dispatch/consumers_256/65536": {
-      "mean_ns": 26902647.73,
-      "fail_above_pct": 391
+      "mean_ns": 29134004.58,
+      "fail_above_pct": 391.0
     },
     "consumer_overhead_dispatch/consumers_64/1024": {
-      "mean_ns": 10155180.58,
-      "fail_above_pct": 336
+      "mean_ns": 10154565.92,
+      "fail_above_pct": 354.0
     },
     "consumer_overhead_dispatch/consumers_64/64": {
-      "mean_ns": 11464196.05,
-      "fail_above_pct": 371
+      "mean_ns": 11791072.51,
+      "fail_above_pct": 371.0
     },
     "consumer_overhead_dispatch/consumers_64/65536": {
-      "mean_ns": 31375820.94,
-      "fail_above_pct": 512
+      "mean_ns": 32283684.8,
+      "fail_above_pct": 512.0
     },
     "consumer_overhead_shutdown/1": {
-      "mean_ns": 25391.22,
-      "fail_above_pct": 292
+      "mean_ns": 26000.95,
+      "fail_above_pct": 292.0
     },
     "consumer_overhead_shutdown/16": {
-      "mean_ns": 31632.58,
-      "fail_above_pct": 338
+      "mean_ns": 31532.64,
+      "fail_above_pct": 338.0
     },
     "consumer_overhead_shutdown/256": {
-      "mean_ns": 148367.99,
-      "fail_above_pct": 283
+      "mean_ns": 146078.64,
+      "fail_above_pct": 283.0
     },
     "consumer_overhead_shutdown/64": {
-      "mean_ns": 48455.29,
-      "fail_above_pct": 160
+      "mean_ns": 50254.41,
+      "fail_above_pct": 160.0
     },
     "consumer_overhead_startup/1": {
-      "mean_ns": 4576.45,
-      "fail_above_pct": 153
+      "mean_ns": 4975.3,
+      "fail_above_pct": 180.0
     },
     "consumer_overhead_startup/16": {
-      "mean_ns": 12013.26,
-      "fail_above_pct": 50.0
+      "mean_ns": 13275.35,
+      "fail_above_pct": 187.0
     },
     "consumer_overhead_startup/256": {
-      "mean_ns": 201299.33,
-      "fail_above_pct": 105
+      "mean_ns": 216500.1,
+      "fail_above_pct": 136.0
     },
     "consumer_overhead_startup/64": {
-      "mean_ns": 47695.67,
-      "fail_above_pct": 126
+      "mean_ns": 52827.99,
+      "fail_above_pct": 181.0
     },
     "inmemory_broadcast/broadcast/1024": {
-      "mean_ns": 1967398.16,
-      "fail_above_pct": 547
+      "mean_ns": 1998120.86,
+      "fail_above_pct": 547.0
     },
     "inmemory_broadcast/broadcast/64": {
-      "mean_ns": 2677773.05,
-      "fail_above_pct": 1117
+      "mean_ns": 2932349.64,
+      "fail_above_pct": 1122.0
     },
     "inmemory_broadcast/broadcast/65536": {
-      "mean_ns": 13465002.35,
-      "fail_above_pct": 334
+      "mean_ns": 15293315.79,
+      "fail_above_pct": 386.0
     },
     "inmemory_consume/consume_fifo/1024": {
-      "mean_ns": 377730.09,
-      "fail_above_pct": 225
+      "mean_ns": 373537.46,
+      "fail_above_pct": 234.0
     },
     "inmemory_consume/consume_fifo/64": {
-      "mean_ns": 293219.28,
-      "fail_above_pct": 256
+      "mean_ns": 296491.34,
+      "fail_above_pct": 256.0
     },
     "inmemory_consume/consume_fifo/65536": {
-      "mean_ns": 1969023.8,
-      "fail_above_pct": 205
+      "mean_ns": 2005358.0,
+      "fail_above_pct": 205.0
     },
     "inmemory_consume/consume_parallel/1024": {
-      "mean_ns": 539495.08,
-      "fail_above_pct": 137
+      "mean_ns": 552280.22,
+      "fail_above_pct": 137.0
     },
     "inmemory_consume/consume_parallel/64": {
-      "mean_ns": 487013.35,
-      "fail_above_pct": 134
+      "mean_ns": 511350.61,
+      "fail_above_pct": 138.0
     },
     "inmemory_consume/consume_parallel/65536": {
-      "mean_ns": 1903781.26,
-      "fail_above_pct": 179
+      "mean_ns": 1978807.6,
+      "fail_above_pct": 179.0
     },
     "inmemory_dlq/dlq_drain/1024": {
-      "mean_ns": 297351.7,
-      "fail_above_pct": 115
+      "mean_ns": 314196.17,
+      "fail_above_pct": 142.0
     },
     "inmemory_dlq/dlq_drain/64": {
-      "mean_ns": 235616.06,
-      "fail_above_pct": 152
+      "mean_ns": 249532.34,
+      "fail_above_pct": 152.0
     },
     "inmemory_dlq/dlq_drain/65536": {
-      "mean_ns": 4248746.99,
-      "fail_above_pct": 424
+      "mean_ns": 4107462.36,
+      "fail_above_pct": 424.0
     },
     "inmemory_group/consumer_group/1024": {
-      "mean_ns": 905087.64,
-      "fail_above_pct": 195
+      "mean_ns": 911241.74,
+      "fail_above_pct": 195.0
     },
     "inmemory_group/consumer_group/64": {
-      "mean_ns": 821462.6,
-      "fail_above_pct": 224
+      "mean_ns": 842785.64,
+      "fail_above_pct": 224.0
     },
     "inmemory_group/consumer_group/65536": {
-      "mean_ns": 1925293.36,
-      "fail_above_pct": 148
+      "mean_ns": 1984866.07,
+      "fail_above_pct": 148.0
     },
     "inmemory_publish/publish_batch/1024": {
-      "mean_ns": 106153.29,
-      "fail_above_pct": 623
+      "mean_ns": 121197.82,
+      "fail_above_pct": 715.0
     },
     "inmemory_publish/publish_batch/64": {
-      "mean_ns": 50854.59,
-      "fail_above_pct": 320
+      "mean_ns": 59458.34,
+      "fail_above_pct": 471.0
     },
     "inmemory_publish/publish_batch/65536": {
-      "mean_ns": 3521195.84,
-      "fail_above_pct": 292
+      "mean_ns": 4012601.34,
+      "fail_above_pct": 404.0
     },
     "inmemory_publish/publish_single/1024": {
-      "mean_ns": 1672.0,
-      "fail_above_pct": 631
+      "mean_ns": 1952.14,
+      "fail_above_pct": 750.0
     },
     "inmemory_publish/publish_single/64": {
-      "mean_ns": 858.53,
-      "fail_above_pct": 285
+      "mean_ns": 994.07,
+      "fail_above_pct": 426.0
     },
     "inmemory_publish/publish_single/65536": {
-      "mean_ns": 50921.5,
-      "fail_above_pct": 368
+      "mean_ns": 58530.54,
+      "fail_above_pct": 481.0
     },
     "inmemory_route_outcome/ack/64": {
-      "mean_ns": 493138.6,
-      "fail_above_pct": 125
+      "mean_ns": 511799.74,
+      "fail_above_pct": 125.0
     },
     "inmemory_route_outcome/reject/64": {
-      "mean_ns": 733818.83,
-      "fail_above_pct": 149
+      "mean_ns": 766550.4,
+      "fail_above_pct": 149.0
     },
     "inmemory_supervisor/supervisor/1024": {
-      "mean_ns": 347047.07,
-      "fail_above_pct": 186
+      "mean_ns": 351931.98,
+      "fail_above_pct": 186.0
     },
     "inmemory_supervisor/supervisor/64": {
-      "mean_ns": 314497.77,
-      "fail_above_pct": 210
+      "mean_ns": 319113.45,
+      "fail_above_pct": 210.0
     },
     "inmemory_supervisor/supervisor/65536": {
-      "mean_ns": 2242860.34,
-      "fail_above_pct": 85
+      "mean_ns": 2364864.3,
+      "fail_above_pct": 110.0
     },
     "topology_build/hold_queues_dlq": {
-      "mean_ns": 411.49,
-      "fail_above_pct": 242
+      "mean_ns": 457.09,
+      "fail_above_pct": 248.0
     },
     "topology_build/plain": {
-      "mean_ns": 45.64,
-      "fail_above_pct": 172
+      "mean_ns": 50.61,
+      "fail_above_pct": 289.0
     },
     "topology_build/sequenced_16_shards": {
-      "mean_ns": 268.66,
-      "fail_above_pct": 300
+      "mean_ns": 301.57,
+      "fail_above_pct": 328.0
     }
   }
 }

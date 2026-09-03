@@ -19,7 +19,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use bench_compare::{
-    Baseline, BaselineEntry, CompareError, Verdict, collect_run, compare, load_baseline,
+    Baseline, BaselineEntry, CompareError, Provenance, Verdict, calibrate, collect_run, compare,
+    load_baseline, write_baseline,
 };
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -368,6 +369,70 @@ fn a_threshold_below_the_floor_is_refused_at_load() {
 fn a_missing_baseline_file_is_an_error() {
     let root = scratch("baseline_missing");
     assert!(load_baseline(&root.join("nope.json")).is_err());
+}
+
+// ── Calibration: the earn path for thresholds ───────────────────────────────
+
+#[test]
+fn calibrate_sets_max_of_floor_and_five_times_spread() {
+    // g/stable: means 100,102,104 → spread 4% → 5x = 20% → floor wins: 50.
+    // g/noisy: means 100,150,200 → spread 100% → threshold 500.
+    let runs = [
+        run_of(&[("g/stable", 100.0), ("g/noisy", 100.0)]),
+        run_of(&[("g/stable", 102.0), ("g/noisy", 150.0)]),
+        run_of(&[("g/stable", 104.0), ("g/noisy", 200.0)]),
+    ];
+    let ids = calibrate(&runs).expect("calibrate");
+    assert_eq!(ids["g/stable"].fail_above_pct, 50.0);
+    assert_eq!(ids["g/stable"].mean_ns, 102.0);
+    assert_eq!(ids["g/noisy"].fail_above_pct, 500.0);
+    assert_eq!(ids["g/noisy"].mean_ns, 150.0);
+}
+
+#[test]
+fn calibrate_refuses_mismatched_id_sets() {
+    // A run that silently dropped an id (wrong feature set, renamed bench)
+    // must not shrink the baseline to the intersection.
+    let runs = [
+        run_of(&[("g/a", 100.0), ("g/b", 100.0)]),
+        run_of(&[("g/a", 100.0)]),
+    ];
+    assert!(calibrate(&runs).is_err());
+}
+
+#[test]
+fn calibrate_refuses_a_single_run() {
+    // One run has zero spread by construction: every id would get the floor
+    // threshold off data that demonstrated nothing.
+    let runs = [run_of(&[("g/a", 100.0)])];
+    assert!(calibrate(&runs).is_err());
+}
+
+#[test]
+fn a_written_baseline_round_trips_through_the_loader() {
+    let root = scratch("calibrate_roundtrip");
+    let path = root.join("baseline.json");
+    let runs = [
+        run_of(&[("g/stable", 100.0), ("g/noisy", 100.0)]),
+        run_of(&[("g/stable", 102.0), ("g/noisy", 200.0)]),
+    ];
+    let ids = calibrate(&runs).expect("calibrate");
+    write_baseline(
+        &path,
+        &ids,
+        Provenance {
+            runner: "ubuntu-latest".into(),
+            calibrated: "2026-09-03".into(),
+            shove_version: "0.14.0".into(),
+            rust_version: "rustc 1.91.1".into(),
+            method: "2 no-op runs; fail_above_pct = max(50, 5 x spread)".into(),
+        },
+    )
+    .expect("write");
+    let loaded = load_baseline(&path).expect("load what we wrote");
+    assert_eq!(loaded.ids.len(), 2);
+    assert_eq!(loaded.ids["g/noisy"].fail_above_pct, 500.0);
+    assert_eq!(loaded.ids["g/stable"].fail_above_pct, 50.0);
 }
 
 // ── Report rendering ────────────────────────────────────────────────────────

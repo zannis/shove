@@ -143,19 +143,22 @@ jobs:
   # Runs the in-process criterion suite (no Docker, no secrets) against the
   # committed baseline in benches/baselines/tier-a-ubuntu-latest.json.
   #
-  # Threshold rationale: three no-op calibration runs on separate
-  # ubuntu-latest runners moved the median id 57% and the worst 2.5x with no
-  # code change — the fleet's hardware diversity, not sampling noise (per-run
-  # normalization does not collapse it), and the leg is a max over 58 ids. A
-  # single threshold tight enough to matter would therefore cry wolf weekly
-  # and be ignored within a week, which is worse than no leg. Instead every
-  # id fails at max(50%, 5x its own measured no-op spread), recorded per id
-  # in the baseline: stable ids keep real 50% teeth, ids the fleet swings 2x
-  # still catch catastrophic blowups, and a no-op repeat of the slowest
-  # calibration runner sits provably inside every threshold (leave-one-out
-  # replay of the calibration runs produced zero warnings). A baseline id
-  # that was not measured at all fails closed (a renamed or deleted bench
-  # must refresh the baseline in the same PR).
+  # Threshold rationale: six no-op calibration runs on separate ubuntu-latest
+  # runners moved the median id ~57% and the worst 2.5x with no code change —
+  # the fleet's hardware diversity, not sampling noise (per-run normalization
+  # does not collapse it), and the leg is a max over 58 ids. A single
+  # threshold tight enough to matter would therefore cry wolf weekly and be
+  # ignored within a week, which is worse than no leg. Instead every id fails
+  # at max(50%, 5x its own measured no-op spread), recorded per id in the
+  # baseline. Thresholds are earned, never asserted: an early 3-run
+  # calibration was breached by its own fourth no-op run (heavy tails —
+  # 3 samples understate them), so the committed baseline is earned from six
+  # runs and vetoed by leave-one-out replay (each five judging the sixth:
+  # zero failures). Refresh with the comparator itself:
+  # `bench_compare --write-baseline` over >= 2 fresh runs' criterion trees
+  # (see examples/bench_compare.rs). A baseline id that was not measured at
+  # all fails closed (a renamed or deleted bench must refresh the baseline in
+  # the same PR).
   #
   # Deliberately NOT in require-green-ci.sh's REQUIRED_JOBS: a perf gate this
   # side of runner jitter must not be able to block a release the way the
