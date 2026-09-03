@@ -1222,6 +1222,20 @@ fn schedule_redelivery(
                 return;
             }
             _ = shutdown.cancelled() => {
+                // A simultaneous broker shutdown leaves this arm and the
+                // enqueue's internal broker-shutdown `Err` ready together, and
+                // the unbiased `select!` may land here — so broker shutdown
+                // must be re-checked before the requeue, exactly like the
+                // backoff stage above. Requeueing onto a shut-down broker
+                // would bypass the drop-and-warn path the `result` arm takes.
+                if broker_shutdown.is_cancelled() {
+                    tracing::warn!(
+                        queue = %main_queue,
+                        %message_id,
+                        "broker shut down during redelivery enqueue — message dropped"
+                    );
+                    return;
+                }
                 // Same non-drop as the backoff cut above.
                 tracing::debug!(
                     queue = %main_queue,
