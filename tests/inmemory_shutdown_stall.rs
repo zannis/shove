@@ -107,6 +107,39 @@ impl SequencedTopic for FifoRetryStallTopic {
     }
 }
 
+/// Unsequenced, one 30s hold queue, no DLQ needed: a `Retry` parks in
+/// `schedule_redelivery`'s backoff sleep, which is the wait under test.
+struct RetryBackoffStallTopic;
+impl Topic for RetryBackoffStallTopic {
+    type Message = Msg;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("inmem-shutdown-retry-backoff-stall")
+                .hold_queue(Duration::from_secs(30))
+                .allow_message_loss()
+                .build()
+        })
+    }
+}
+
+/// Unsequenced, no hold queues (zero-delay retry), no DLQ needed: the wait
+/// under test is the retry re-enqueue against the source queue itself.
+struct RetryRepublishStallTopic;
+impl Topic for RetryRepublishStallTopic {
+    type Message = Msg;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("inmem-shutdown-retry-republish-stall")
+                .allow_message_loss()
+                .build()
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -167,7 +200,13 @@ macro_rules! impl_scripted_for {
     };
 }
 
-impl_scripted_for!(RejectStallTopic, FifoRejectStallTopic, FifoRetryStallTopic);
+impl_scripted_for!(
+    RejectStallTopic,
+    FifoRejectStallTopic,
+    FifoRetryStallTopic,
+    RetryBackoffStallTopic,
+    RetryRepublishStallTopic,
+);
 
 /// `(id, delivery_count, retry_count)` captured on each delivery.
 type SeenDeliveries = Arc<Mutex<Vec<(u64, Option<u32>, u32)>>>;
@@ -214,7 +253,13 @@ macro_rules! impl_recording_for {
     };
 }
 
-impl_recording_for!(RejectStallTopic, FifoRejectStallTopic, FifoRetryStallTopic);
+impl_recording_for!(
+    RejectStallTopic,
+    FifoRejectStallTopic,
+    FifoRetryStallTopic,
+    RetryBackoffStallTopic,
+    RetryRepublishStallTopic,
+);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -555,6 +600,216 @@ async fn shutdown_unblocks_a_sequenced_retry_republish_wedged_on_a_full_shard_qu
     assert_eq!(
         republished.2, 1,
         "the wedged republish must survive with its retry state stamped, got {seen:?}"
+    );
+
+    broker.close().await;
+}
+
+/// The unsequenced `Retry` backoff runs in a spawned task, not inline in the
+/// loop — so per-consumer shutdown must reach into that task, cut the sleep,
+/// and requeue the survivor *before* `run()` returns. A backoff that only
+/// raced the broker token left the envelope parked in a detached 30s sleep
+/// that nothing awaited: `run()` returned, and a caller tearing down the
+/// runtime at that point destroyed the message with no requeue.
+#[tokio::test]
+async fn shutdown_cuts_an_unsequenced_retry_backoff_and_requeues_the_survivor() {
+    let (client, broker) = small_broker();
+    broker
+        .topology()
+        .declare::<RetryBackoffStallTopic>()
+        .await
+        .unwrap();
+
+    let publisher = broker.publisher().await.expect("publisher");
+    publisher
+        .publish::<RetryBackoffStallTopic>(&Msg { id: 0 })
+        .await
+        .expect("publish should succeed");
+
+    let handler = ScriptedHandler::new(Outcome::Retry);
+    let shutdown = CancellationToken::new();
+    let consumer = InMemoryConsumer::new(client.clone());
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<RetryBackoffStallTopic, _>(
+                    handler,
+                    (),
+                    ConsumerOptions::<InMemory>::new()
+                        .with_prefetch_count(1)
+                        .with_max_retries(5)
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    assert!(
+        handler.wait_for_calls(1, TIMEOUT).await,
+        "the message must reach the handler"
+    );
+    // Let the `Hold` route spawn the 30s backoff before cancelling.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let cancelled_at = Instant::now();
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("run() must return promptly on the per-consumer token")
+        .expect("consumer task must not panic")
+        .ok();
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(2),
+        "shutdown took {:?} to take effect",
+        cancelled_at.elapsed()
+    );
+
+    // The retry must already be back on the queue: a fresh consumer sees it
+    // long before the 30s backoff would have elapsed, retry state stamped.
+    let survivors = RecordingAckHandler::new();
+    let shutdown2 = CancellationToken::new();
+    let consumer2 = InMemoryConsumer::new(client.clone());
+    let handle2 = tokio::spawn({
+        let survivors = survivors.clone();
+        let shutdown2 = shutdown2.clone();
+        async move {
+            consumer2
+                .run::<RetryBackoffStallTopic, _>(
+                    survivors,
+                    (),
+                    ConsumerOptions::<InMemory>::new()
+                        .with_prefetch_count(1)
+                        .with_shutdown(shutdown2),
+                )
+                .await
+        }
+    });
+    assert!(
+        survivors.wait_for(1, TIMEOUT).await,
+        "the retry parked in its backoff must survive per-consumer shutdown, got {:?}",
+        survivors.seen.lock().await
+    );
+    shutdown2.cancel();
+    handle2.await.unwrap().ok();
+
+    let seen = survivors.seen.lock().await;
+    assert_eq!(seen.len(), 1, "got {seen:?}");
+    assert_eq!(seen[0].0, 0, "got {seen:?}");
+    assert_eq!(
+        seen[0].2, 1,
+        "the requeued retry must keep its stamped retry state, got {seen:?}"
+    );
+
+    broker.close().await;
+}
+
+/// The sibling wait on the unsequenced path: a zero-delay `Retry` re-enqueue
+/// against the source queue the publisher keeps full. The per-consumer token
+/// must cut the enqueue and requeue the survivor at the front of the queue
+/// before `run()` returns — a detached enqueue instead stays parked behind
+/// the full queue and lands at the back (or times out and destroys the
+/// message if nothing ever drains), so the first delivery a fresh consumer
+/// sees is the proof either way.
+#[tokio::test]
+async fn shutdown_unblocks_an_unsequenced_retry_republish_wedged_on_a_full_queue() {
+    let (client, broker) = small_broker();
+    broker
+        .topology()
+        .declare::<RetryRepublishStallTopic>()
+        .await
+        .unwrap();
+
+    let publisher = broker.publisher().await.expect("publisher");
+    let publish_handle = publish_all::<RetryRepublishStallTopic>(publisher, 5);
+
+    let handler = ScriptedHandler::new(Outcome::Retry).with_delay(Duration::from_millis(150));
+    let shutdown = CancellationToken::new();
+    let consumer = InMemoryConsumer::new(client.clone());
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<RetryRepublishStallTopic, _>(
+                    handler,
+                    (),
+                    ConsumerOptions::<InMemory>::new()
+                        .with_prefetch_count(1)
+                        .with_max_retries(5)
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    // Cancel while the first delivery is still inside the handler (its 150ms
+    // hold lets the publisher refill both queue slots): the loop's graceful
+    // drain then routes the `Retry`, whose re-enqueue meets the full queue.
+    assert!(
+        handler.wait_for_calls(1, TIMEOUT).await,
+        "the first message must reach the handler"
+    );
+    let cancelled_at = Instant::now();
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect(
+            "cancelling the per-consumer shutdown token must unblock a retry \
+             re-enqueue wedged behind a full queue, not leave it detached",
+        )
+        .expect("consumer task must not panic")
+        .ok();
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(2),
+        "shutdown took {:?} to take effect",
+        cancelled_at.elapsed()
+    );
+
+    // Drain with an acking consumer. All five messages must surface, and the
+    // cut re-enqueue must already sit at the *front* of the queue (retry
+    // state stamped) — id=1 arriving first means the republish was still
+    // detached when `run()` returned.
+    let survivors = RecordingAckHandler::new();
+    let shutdown2 = CancellationToken::new();
+    let consumer2 = InMemoryConsumer::new(client.clone());
+    let handle2 = tokio::spawn({
+        let survivors = survivors.clone();
+        let shutdown2 = shutdown2.clone();
+        async move {
+            consumer2
+                .run::<RetryRepublishStallTopic, _>(
+                    survivors,
+                    (),
+                    ConsumerOptions::<InMemory>::new()
+                        .with_prefetch_count(1)
+                        .with_shutdown(shutdown2),
+                )
+                .await
+        }
+    });
+    assert!(
+        survivors.wait_for(5, TIMEOUT).await,
+        "all five messages must survive, got {:?}",
+        survivors.seen.lock().await
+    );
+    publish_handle.await.expect("publisher must not panic");
+    shutdown2.cancel();
+    handle2.await.unwrap().ok();
+
+    let seen = survivors.seen.lock().await;
+    let mut ids: Vec<u64> = seen.iter().map(|(id, _, _)| *id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![0, 1, 2, 3, 4], "got {seen:?}");
+    assert_eq!(
+        seen[0].0, 0,
+        "the cut re-enqueue must be requeued at the front before run() \
+         returns, not left to a detached publish, got {seen:?}"
+    );
+    assert_eq!(
+        seen[0].2, 1,
+        "the requeued republish must keep its stamped retry state, got {seen:?}"
     );
 
     broker.close().await;
