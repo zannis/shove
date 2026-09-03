@@ -4256,6 +4256,7 @@ dependencies = [
  "mach2",
  "metrics",
  "metrics-util",
+ "plotters",
  "prost",
  "rand 0.10.1",
  "rdkafka",

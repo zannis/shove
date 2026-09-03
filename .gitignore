@@ -7,3 +7,4 @@ docs/dist/
 .env
 .claude/worktrees/
 docs/superpowers/
+.pr-body.md
