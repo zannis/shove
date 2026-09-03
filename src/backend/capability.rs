@@ -5,8 +5,9 @@
 //! - [`HasBroadcast`] gates `BroadcastSubscriber<B>` / `broadcast_subscriber()`.
 //! - [`HasBatchConsumption`] gates `BatchConsumer<B>` / `Broker::batch_consumer()`.
 //!
-//! SQS implements none of the three, so all three entry points are compile
-//! errors on `Broker<Sqs>` rather than runtime surprises.
+//! SQS implements only [`HasBatchConsumption`] (with a hard 10-message
+//! receive cap — see that trait's doc); the other two entry points are
+//! compile errors on `Broker<Sqs>` rather than runtime surprises.
 
 use std::sync::Arc;
 

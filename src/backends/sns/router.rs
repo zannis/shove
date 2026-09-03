@@ -28,9 +28,8 @@ pub(crate) async fn route_ack(sqs: &aws_sdk_sqs::Client, queue_url: &str, receip
 
 /// Delete up to 10 messages from SQS in a single `DeleteMessageBatch` call.
 ///
-/// Using this instead of 10 individual `DeleteMessage` calls reduces API
-/// round-trips by 10× for a full batch, which is critical for throughput when
-/// multiple consumers are competing on the same queue.
+/// Using this instead of individual `DeleteMessage` calls settles a full
+/// batch in one API round-trip instead of up to ten.
 pub(crate) async fn route_ack_batch(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
