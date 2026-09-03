@@ -264,13 +264,7 @@ async fn reject_with(
 /// parked tag would silently ack the poison instead of dead-lettering it.
 pub(crate) async fn ack_batch_multiple(channel: &Channel, highest_handled_tag: u64) -> Result<()> {
     channel
-        .basic_ack(
-            highest_handled_tag,
-            BasicAckOptions {
-                multiple: true,
-                ..BasicAckOptions::default()
-            },
-        )
+        .basic_ack(highest_handled_tag, BasicAckOptions { multiple: true })
         .await
         .map_err(|e| {
             error!("batch multi-ack failed: {e}");
@@ -381,7 +375,6 @@ pub(crate) async fn reject_batch_multiple(
             BasicNackOptions {
                 multiple: true,
                 requeue: false,
-                ..BasicNackOptions::default()
             },
         )
         .await
@@ -422,7 +415,6 @@ pub(crate) async fn redeliver_batch_multiple(channel: &Channel, highest_tag: u64
             BasicNackOptions {
                 multiple: true,
                 requeue: true,
-                ..BasicNackOptions::default()
             },
         )
         .await

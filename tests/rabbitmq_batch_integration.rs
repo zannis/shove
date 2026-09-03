@@ -25,11 +25,12 @@ use tokio_util::sync::CancellationToken;
 
 use shove::broker::Broker;
 use shove::codec::RawBytesCodec;
-use shove::error::ShoveError;
+use shove::error::{Result as ShoveResult, ShoveError};
 use shove::handler::BatchMessageHandler;
 use shove::markers::RabbitMq as RabbitMqMarker;
 use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
+use shove::publisher::Publisher;
 use shove::rabbitmq::{RabbitMqClient, RabbitMqConfig};
 use shove::topic::{NotSequenced, Topic};
 use shove::topology::{QueueTopology, SequenceFailure, TopologyBuilder};
@@ -496,7 +497,7 @@ impl_misbehaving_for!(PanicTopic, TimeoutDefaultTopic, TimeoutRejectTopic);
 // ---------------------------------------------------------------------------
 
 async fn publish_seq<T>(
-    publisher: &shove::publisher::Publisher<RabbitMqMarker>,
+    publisher: &Publisher<RabbitMqMarker>,
     range: std::ops::Range<u32>,
 ) where
     T: Topic<Message = BatchMessage>,
@@ -515,7 +516,7 @@ struct Rig {
     ctx: TestContext,
     client: RabbitMqClient,
     shutdown: CancellationToken,
-    handle: tokio::task::JoinHandle<shove::error::Result<()>>,
+    handle: tokio::task::JoinHandle<ShoveResult<()>>,
 }
 
 impl Rig {

@@ -2664,6 +2664,8 @@ impl RabbitMqConsumer {
 mod tests {
     use super::*;
 
+    use crate::topology::TopologyBuilder;
+
     #[tokio::test]
     async fn invoke_handler_returns_outcome_without_timeout() {
         let outcome = invoke_handler(async { Outcome::Ack }, None, None, "test-topic", None).await;
@@ -2818,7 +2820,7 @@ mod tests {
                 static TOPOLOGY: std::sync::OnceLock<crate::QueueTopology> =
                     std::sync::OnceLock::new();
                 TOPOLOGY
-                    .get_or_init(|| crate::topology::TopologyBuilder::new("rmq-batch-buf").build())
+                    .get_or_init(|| TopologyBuilder::new("rmq-batch-buf").build())
             }
         }
 
@@ -2871,7 +2873,7 @@ mod tests {
                 static TOPOLOGY: std::sync::OnceLock<crate::QueueTopology> =
                     std::sync::OnceLock::new();
                 TOPOLOGY.get_or_init(|| {
-                    crate::topology::TopologyBuilder::new("rmq-batch-buf-prealloc").build()
+                    TopologyBuilder::new("rmq-batch-buf-prealloc").build()
                 })
             }
         }
