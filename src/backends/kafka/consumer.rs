@@ -1118,10 +1118,15 @@ async fn route_outcome(
                     // distinction rides along as `Lost` rather than being
                     // resolved here.
                     //
-                    // FIFO returns `false`, so its caller skips the commit
-                    // entirely and the message stays put — no loss to record.
+                    // FIFO returns `false`, so its caller skips this message's
+                    // own commit — but the FIFO loop keeps consuming, and a
+                    // later cumulative commit on the partition can retire the
+                    // offset anyway. Hand the pending back so the caller parks
+                    // it as `Lost` against that commit (the same parking the
+                    // FailAll cascade's failed DLQ publish gets) instead of
+                    // settling it survived here.
                     if fifo {
-                        pending.survived();
+                        (false, Some(pending))
                     } else {
                         // `publish_to_dlq` is `Ok(())` when no DLQ is declared,
                         // so reaching this arm at all means one was.
@@ -1130,8 +1135,8 @@ async fn route_outcome(
                             RejectSettlement::Lost
                         );
                         signal_completion(completion, topic, Some(TerminalDiscard::Lost(pending)));
+                        (false, None)
                     }
-                    (false, None)
                 }
             }
         }
@@ -4367,6 +4372,21 @@ impl KafkaConsumer {
                                         // `Retired`: counted iff no DLQ holds
                                         // a copy.
                                         pending.map(TerminalDiscard::Retired),
+                                    );
+                                } else if let Some(pending) = pending {
+                                    // A terminal outcome whose DLQ publish
+                                    // failed: this message's own commit is
+                                    // skipped so it is redelivered — unless a
+                                    // later cumulative commit on the partition
+                                    // retires it first, dropping it with no
+                                    // DLQ copy. Park the discard as `Lost`
+                                    // against that commit, exactly as the
+                                    // FailAll cascade's failed-DLQ arm does
+                                    // above.
+                                    parked.park(
+                                        msg.partition(),
+                                        msg.offset(),
+                                        TerminalDiscard::Lost(pending),
                                     );
                                 }
                                 processing.store(false, Ordering::Release);
