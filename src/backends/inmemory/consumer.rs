@@ -427,6 +427,7 @@ where
         topology,
         options.consumer_group.as_deref(),
         survivors,
+        subscription_closed.is_some(),
     )
     .await;
     // Prompt, never a backoff-length stall: this point is only reached with
@@ -461,16 +462,21 @@ where
 /// one the `Redeliver` arm's comment accepts as inherent.
 ///
 /// For a broadcast subscription the "queue" is the private buffer that is
-/// dropped along with the subscription, so a survivor requeued there is
-/// destroyed with it — the structural deliver-new semantics every other
-/// broadcast shutdown drop already has. The log line below keeps that in the
-/// log-only class rather than making it silent.
+/// dropped along with the subscription the moment the loop returns, so a
+/// survivor requeued there is guaranteed destruction, not survival — nothing
+/// ever pops that buffer again. Unlike an undelivered deliver-new drop, this
+/// message's terminal route was already decided and its failure counted, so
+/// suppressing the discard (the earlier `survived()` verdict) would leave
+/// `messages_discarded_total` silently understating a real destruction.
+/// Those survivors are settled as discarded here instead of requeued
+/// (`broadcast_buffer` is how the caller says the queue is such a buffer).
 async fn requeue_survivors(
     broker: &InMemoryBroker,
     queue: &Arc<QueueState>,
     topology: &'static QueueTopology,
     group: Option<&str>,
     survivors: Vec<(Envelope, metrics::FailReason)>,
+    broadcast_buffer: bool,
 ) {
     if survivors.is_empty() {
         return;
@@ -481,6 +487,22 @@ async fn requeue_survivors(
         for (_, reason) in survivors {
             let pending = metrics::pending_discard(topology.queue(), group, reason, has_dlq);
             lost_to_broker_shutdown(topology, reason.as_label(), pending);
+        }
+        queue.in_flight.fetch_sub(n, Ordering::Release);
+        return;
+    }
+    if broadcast_buffer {
+        let has_dlq = topology.dlq().is_some();
+        for (_, reason) in survivors {
+            tracing::warn!(
+                queue = topology.queue(),
+                reason = reason.as_label(),
+                "per-consumer shutdown cut terminal routing on a broadcast \
+                 subscription — the private buffer is destroyed with the \
+                 subscription, so the message is settled as discarded"
+            );
+            let pending = metrics::pending_discard(topology.queue(), group, reason, has_dlq);
+            pending.confirm_lost();
         }
         queue.in_flight.fetch_sub(n, Ordering::Release);
         return;
@@ -2993,7 +3015,7 @@ mod tests {
         // Broker shutdown lands after the survivor was collected, before
         // the post-drain requeue.
         broker.shutdown();
-        requeue_survivors(&broker, &queue, topology, None, survivors).await;
+        requeue_survivors(&broker, &queue, topology, None, survivors, false).await;
 
         assert!(
             queue.buffer.lock().await.is_empty(),
