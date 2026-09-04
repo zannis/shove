@@ -20,14 +20,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use metrics_util::debugging::{DebuggingRecorder, Snapshotter};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use shove::inmemory::InMemoryBroker;
 use shove::{
     Broker, ConsumerOptions, InMemory, MessageHandler, MessageMetadata, Outcome, TopologyBuilder,
     define_topic,
 };
+use tokio_util::sync::CancellationToken;
 
 const TOPIC: &str = "broadcast_discard_metrics";
+const CUT_TOPIC: &str = "broadcast_reject_cut_metrics";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Ping {
@@ -57,16 +59,42 @@ impl MessageHandler<BroadcastTopic> for AlwaysRetry {
     }
 }
 
-async fn wait_for_subscribers(broker: &InMemoryBroker, n: usize) {
+define_topic!(
+    RejectCutTopic,
+    Ping,
+    TopologyBuilder::new("broadcast_reject_cut_metrics")
+        .broadcast()
+        .build()
+);
+
+/// Cancels the subscriber's own token from inside the handler, then rejects —
+/// so the terminal routing runs with the per-consumer token already
+/// cancelled, the exact shape that hands the envelope back as a "survivor".
+#[derive(Clone)]
+struct CancelThenReject {
+    token: CancellationToken,
+    calls: Arc<AtomicU32>,
+}
+
+impl MessageHandler<RejectCutTopic> for CancelThenReject {
+    type Context = ();
+    async fn handle(&self, _msg: Ping, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.token.cancel();
+        Outcome::Reject
+    }
+}
+
+async fn wait_for_subscribers(broker: &InMemoryBroker, topic: &str, n: usize) {
     for _ in 0..500 {
-        if broker.broadcast_subscriber_count(TOPIC) == n {
+        if broker.broadcast_subscriber_count(topic) == n {
             return;
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     panic!(
         "timed out waiting for {n} subscriber(s); have {}",
-        broker.broadcast_subscriber_count(TOPIC)
+        broker.broadcast_subscriber_count(topic)
     );
 }
 
@@ -93,7 +121,7 @@ async fn broadcast_retry_discards_through_the_existing_no_dlq_path() {
             ConsumerOptions::new().with_max_retries(4),
         )
         .expect("subscribe");
-    wait_for_subscribers(&client, 1).await;
+    wait_for_subscribers(&client, TOPIC, 1).await;
 
     publisher
         .publish::<BroadcastTopic>(&Ping { value: 7 })
@@ -152,5 +180,101 @@ async fn broadcast_retry_discards_through_the_existing_no_dlq_path() {
             .any(|k| k.key().name() == "shove_messages_failed_total"),
         "messages_failed_total fires alongside the discard, as it does for any \
          no-DLQ topology"
+    );
+}
+
+/// A `Reject` routed after the per-consumer token has already been cancelled
+/// is handed back as a "survivor" and requeued — but a broadcast
+/// subscription's queue is the private buffer that is destroyed together with
+/// the subscription the moment the loop returns, so that requeue is
+/// guaranteed destruction, not survival. The message no longer exists, and
+/// `shove_messages_discarded_total` carries exactly that guarantee, so the
+/// discard must still be counted rather than suppressed by the earlier
+/// `survived()` verdict.
+#[tokio::test(flavor = "current_thread")]
+async fn broadcast_reject_cut_by_consumer_shutdown_still_counts_the_discard() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter: Snapshotter = recorder.snapshotter();
+    recorder.install().expect("install debugging recorder");
+
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    let publisher = broker.publisher().await.expect("publisher");
+
+    let calls = Arc::new(AtomicU32::new(0));
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<RejectCutTopic, _>(
+            CancelThenReject {
+                token: subscriber.cancellation_token(),
+                calls: calls.clone(),
+            },
+            ConsumerOptions::new(),
+        )
+        .expect("subscribe");
+    wait_for_subscribers(&client, CUT_TOPIC, 1).await;
+
+    publisher
+        .publish::<RejectCutTopic>(&Ping { value: 7 })
+        .await
+        .expect("publish");
+
+    // The handler cancels the token itself; wait for it to have run, then
+    // drain. By the time `run_until_timeout` returns, the delivery loop has
+    // settled the reject and the subscription (with its private buffer) is
+    // gone.
+    for _ in 0..500 {
+        if calls.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "subscriber exited cleanly: {outcome:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "handler ran exactly once");
+
+    let snapshot = snapshotter.snapshot().into_hashmap();
+
+    let (discarded_key, (_, _, discarded_value)) = snapshot
+        .iter()
+        .find(|(k, _)| k.key().name() == "shove_messages_discarded_total")
+        .unwrap_or_else(|| {
+            let names: Vec<String> = snapshot
+                .keys()
+                .map(|k| k.key().name().to_string())
+                .collect();
+            panic!(
+                "expected `shove_messages_discarded_total` in snapshot — the rejected \
+                 message was destroyed with the subscription's private buffer, which is \
+                 a discard, not a survival; got {names:?}"
+            )
+        });
+
+    let labels: Vec<(String, String)> = discarded_key
+        .key()
+        .labels()
+        .map(|l| (l.key().to_string(), l.value().to_string()))
+        .collect();
+    assert!(
+        labels.iter().any(|(k, v)| k == "topic" && v == CUT_TOPIC),
+        "the discard carries the broadcast topic label; got {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|(k, v)| k == "reason" && v == "rejected"),
+        "the discard is attributed to the handler's Reject; got {labels:?}"
+    );
+    assert_eq!(
+        *discarded_value,
+        DebugValue::Counter(1),
+        "exactly one message was destroyed, so exactly one discard is counted"
+    );
+
+    assert!(
+        snapshot
+            .keys()
+            .any(|k| k.key().name() == "shove_messages_failed_total"),
+        "messages_failed_total was counted when the terminal route was decided"
     );
 }
