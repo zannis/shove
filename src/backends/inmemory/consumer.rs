@@ -276,8 +276,11 @@ where
     let mut next_ticket: u64 = 0;
     let mut next_route: u64 = 0;
     // Envelopes whose DLQ publish the per-consumer token cut short, with
-    // their `in_flight` slots still held; requeued once, after the drain.
-    let mut survivors: Vec<Envelope> = Vec::new();
+    // their `in_flight` slots still held; requeued once, after the drain —
+    // or settled as lost, if broker shutdown lands before that requeue.
+    // Each carries the fail reason its `record_terminal` was counted under,
+    // so the lost path can label the discard truthfully.
+    let mut survivors: Vec<(Envelope, metrics::FailReason)> = Vec::new();
     // Redelivery backoffs spawned by the `Hold` route. Tracked so `run()`
     // never returns with one still in flight: a caller that tears down the
     // runtime after `run()` would otherwise destroy the parked envelope
@@ -418,7 +421,14 @@ where
         &redeliveries,
     )
     .await;
-    requeue_survivors(&broker, &queue, topology.queue(), survivors).await;
+    requeue_survivors(
+        &broker,
+        &queue,
+        topology,
+        options.consumer_group.as_deref(),
+        survivors,
+    )
+    .await;
     // Prompt, never a backoff-length stall: this point is only reached with
     // the per-consumer or broker token cancelled, and every tracked task
     // selects on both — each one wakes to requeue its survivor (consumer
@@ -435,6 +445,21 @@ where
 /// ordering rule the batch path's `requeue_unpublished` documents. Marked
 /// redelivered so a restarted consumer sees the extra delivery.
 ///
+/// Broker shutdown takes precedence here too, re-checked at this final
+/// point because survivors accumulate across the whole drain: a survivor
+/// collected before the broker token fired would otherwise be requeued onto
+/// a queue nothing pops again (the main loop's own prefetch gate stops on
+/// that token), where the broker's `Arc<QueueState>` drop destroys it with
+/// no log and no count — while its earlier `survived()` verdict stands.
+/// Those are settled as lost instead, exactly as
+/// [`route_reject_or_survive`] settles a cut it can already see the broker
+/// token during. Each survivor's failure was counted when its terminal
+/// route was decided, so only the discard is owed here
+/// ([`metrics::pending_discard`], not [`metrics::record_terminal`]). The
+/// held `in_flight` slots are released either way. Only the microscopic
+/// window inside `requeue_front`'s own lock acquisition remains, the same
+/// one the `Redeliver` arm's comment accepts as inherent.
+///
 /// For a broadcast subscription the "queue" is the private buffer that is
 /// dropped along with the subscription, so a survivor requeued there is
 /// destroyed with it — the structural deliver-new semantics every other
@@ -443,31 +468,44 @@ where
 async fn requeue_survivors(
     broker: &InMemoryBroker,
     queue: &Arc<QueueState>,
-    topic: &str,
-    mut survivors: Vec<Envelope>,
+    topology: &'static QueueTopology,
+    group: Option<&str>,
+    survivors: Vec<(Envelope, metrics::FailReason)>,
 ) {
     if survivors.is_empty() {
         return;
     }
+    let n = survivors.len() as u64;
+    if broker.shutdown_token().is_cancelled() {
+        let has_dlq = topology.dlq().is_some();
+        for (_, reason) in survivors {
+            let pending = metrics::pending_discard(topology.queue(), group, reason, has_dlq);
+            lost_to_broker_shutdown(topology, reason.as_label(), pending);
+        }
+        queue.in_flight.fetch_sub(n, Ordering::Release);
+        return;
+    }
     tracing::debug!(
-        queue = topic,
-        count = survivors.len(),
+        queue = topology.queue(),
+        count = n,
         "per-consumer shutdown cut a DLQ publish — requeueing the survivors"
     );
-    let n = survivors.len() as u64;
-    for env in &mut survivors {
+    let mut envs: Vec<Envelope> = survivors.into_iter().map(|(env, _)| env).collect();
+    for env in &mut envs {
         env.mark_redelivery();
     }
-    broker.requeue_front(queue, survivors).await;
+    broker.requeue_front(queue, envs).await;
     queue.in_flight.fetch_sub(n, Ordering::Release);
 }
 
 /// Routes settled outcomes in ticket order. A message whose DLQ publish the
-/// per-consumer token cut short is pushed onto `survivors` with its
-/// `in_flight` slot still held — [`run_concurrent_on`] requeues the whole
-/// vector at the front in one call after the drain (per-message
-/// `requeue_front` calls would invert arrival order) and only then releases
-/// those slots, so a survivor is at worst transiently double-counted, never
+/// per-consumer token cut short is pushed onto `survivors` (with the fail
+/// reason its terminal metrics were counted under) and its `in_flight` slot
+/// still held — [`run_concurrent_on`] requeues the whole vector at the front
+/// in one call after the drain (per-message `requeue_front` calls would
+/// invert arrival order), or settles it as lost if broker shutdown landed
+/// meanwhile (see [`requeue_survivors`]), and only then releases those
+/// slots, so a survivor is at worst transiently double-counted, never
 /// uncounted.
 #[allow(clippy::too_many_arguments)] // run_concurrent_on's loop state, threaded through
 async fn drain_pending(
@@ -478,7 +516,7 @@ async fn drain_pending(
     next_route: &mut u64,
     options: &ConsumerOptionsInner,
     subscription_closed: Option<&CancellationToken>,
-    survivors: &mut Vec<Envelope>,
+    survivors: &mut Vec<(Envelope, metrics::FailReason)>,
     redeliveries: &TaskTracker,
 ) {
     while let Some((env, (outcome, pre_handler_reason))) = pending.remove(next_route) {
@@ -1018,12 +1056,14 @@ where
 // Outcome routing
 // ---------------------------------------------------------------------------
 
-/// Returns the envelope back to the caller when the per-consumer shutdown
-/// token cut a `Dlq`-arm publish wedged on a full DLQ (see
-/// [`route_reject_or_survive`]): the caller must keep its `in_flight` slot
-/// held and requeue it, so the message is never counted in neither gauge.
-/// `Ack` and `Hold` always return `None` — a `Hold` survivor requeues itself
-/// from inside the tracked redelivery task instead.
+/// Returns the envelope back to the caller — paired with the fail reason
+/// its terminal metrics were counted under, so a later loss can be labelled
+/// truthfully — when the per-consumer shutdown token cut a `Dlq`-arm publish
+/// wedged on a full DLQ (see [`route_reject_or_survive`]): the caller must
+/// keep its `in_flight` slot held and requeue it, so the message is never
+/// counted in neither gauge. `Ack` and `Hold` always return `None` — a
+/// `Hold` survivor requeues itself from inside the tracked redelivery task
+/// instead.
 #[allow(clippy::too_many_arguments)] // drain_pending's routing state, threaded through
 async fn route_outcome(
     broker: &InMemoryBroker,
@@ -1037,7 +1077,7 @@ async fn route_outcome(
     pre_handler_reason: Option<metrics::FailReason>,
     options: &ConsumerOptionsInner,
     redeliveries: &TaskTracker,
-) -> Option<Envelope> {
+) -> Option<(Envelope, metrics::FailReason)> {
     let retry_count = get_retry_count(&env.headers);
     match decide_retry(&outcome, retry_count, options.max_retries) {
         RetryDecision::Ack => None,
@@ -1064,6 +1104,7 @@ async fn route_outcome(
                 pending,
             )
             .await
+            .map(|env| (env, fail_reason))
         }
         RetryDecision::Hold { increment } => {
             schedule_redelivery(
@@ -1569,7 +1610,7 @@ fn ingest_envelope<T: Topic>(
 async fn publish_parked(
     flush: &InMemoryFlushCtx<'_>,
     parked: &mut Vec<(u64, Envelope, metrics::FailReason)>,
-) -> Vec<(u64, Envelope)> {
+) -> Vec<Unpublished> {
     let mut unpublished = Vec::new();
     for (ordinal, envelope, reason) in parked.drain(..) {
         if flush.broker_shutdown.is_cancelled() {
@@ -1578,14 +1619,26 @@ async fn publish_parked(
             continue;
         }
         if flush.shutdown.is_cancelled() {
-            unpublished.push((ordinal, envelope));
+            // The failure was counted at ingest (`ingest_envelope`'s
+            // `record_failed`); only a discard could still be owed.
+            unpublished.push(Unpublished {
+                ordinal,
+                envelope,
+                reason,
+                failure_counted: true,
+            });
             continue;
         }
         let pending = metrics::pending_discard(flush.topic, flush.group, reason, true);
-        if let Some(entry) =
+        if let Some((ordinal, envelope)) =
             route_reject_or_park(flush, ordinal, envelope, reason.as_label(), pending).await
         {
-            unpublished.push(entry);
+            unpublished.push(Unpublished {
+                ordinal,
+                envelope,
+                reason,
+                failure_counted: true,
+            });
         }
     }
     unpublished
@@ -1723,16 +1776,61 @@ fn release_in_flight(queue: &QueueState, n: u64) {
     }
 }
 
+/// One envelope held back from a terminal flush for the post-flush requeue,
+/// carrying what its loss accounting needs should broker shutdown land
+/// before that requeue runs (see [`requeue_unpublished`]).
+struct Unpublished {
+    /// Pop ordinal, for restoring arrival order across the handled/parked
+    /// split before the requeue.
+    ordinal: u64,
+    envelope: Envelope,
+    /// The fail reason this envelope's terminal route was decided under —
+    /// keeps a late loss's discard label truthful.
+    reason: metrics::FailReason,
+    /// Whether `messages_failed_total` already counted this envelope —
+    /// ingest counted parked drops, `record_terminal` counted attempted
+    /// publishes. Only the `DeadLetter` loop's consumer-cut pre-check defers
+    /// its count to the post-restart re-reject, so a late loss there owes
+    /// the failure too, mirroring that loop's own broker-cut branch.
+    failure_counted: bool,
+}
+
 /// Put terminal-settlement envelopes that never reached the DLQ (shutdown won
-/// the race in [`route_reject_or_park`]) back onto the main queue instead of
-/// losing them — the same requeue-then-release ordering `Redeliver` uses (see
-/// its own comment): every entry is marked redelivered and restored to
-/// arrival order first, then handed to `requeue_front` before the caller
-/// releases the flush's `in_flight` slots, so a consumer cancelled mid-flush
-/// never has a window where the message is counted nowhere.
-async fn requeue_unpublished(flush: &InMemoryFlushCtx<'_>, mut unpublished: Vec<(u64, Envelope)>) {
-    unpublished.sort_unstable_by_key(|&(ordinal, _)| ordinal);
-    let mut envs: Vec<Envelope> = unpublished.into_iter().map(|(_, env)| env).collect();
+/// the race in [`route_reject_or_park`], or a pre-check skipped the attempt)
+/// back onto the main queue instead of losing them — the same
+/// requeue-then-release ordering `Redeliver` uses (see its own comment):
+/// every entry is marked redelivered and restored to arrival order first,
+/// then handed to `requeue_front` before the caller releases the flush's
+/// `in_flight` slots, so a consumer cancelled mid-flush never has a window
+/// where the message is counted nowhere.
+///
+/// Broker shutdown takes precedence, re-checked here because entries
+/// accumulate across the whole flush: one collected before the broker token
+/// fired would otherwise be requeued onto a queue nothing pops again, where
+/// the broker's `Arc<QueueState>` drop destroys it with no log and no count.
+/// Those are settled as lost instead — the batch twin of
+/// [`requeue_survivors`]'s late check, with each entry's [`Unpublished`]
+/// fields keeping the accounting exact. Only the microscopic window inside
+/// `requeue_front`'s own lock acquisition remains, the same one the
+/// `Redeliver` arm's comment accepts as inherent.
+async fn requeue_unpublished(flush: &InMemoryFlushCtx<'_>, mut unpublished: Vec<Unpublished>) {
+    if flush.broker_shutdown.is_cancelled() {
+        let has_dlq = flush.topology.dlq().is_some();
+        for entry in unpublished {
+            let pending = if entry.failure_counted {
+                metrics::pending_discard(flush.topic, flush.group, entry.reason, has_dlq)
+            } else {
+                metrics::record_terminal(flush.topic, flush.group, entry.reason, has_dlq)
+            };
+            lost_to_broker_shutdown(flush.topology, entry.reason.as_label(), pending);
+        }
+        return;
+    }
+    unpublished.sort_unstable_by_key(|entry| entry.ordinal);
+    let mut envs: Vec<Envelope> = unpublished
+        .into_iter()
+        .map(|entry| entry.envelope)
+        .collect();
     for env in &mut envs {
         env.mark_redelivery();
     }
@@ -1754,7 +1852,7 @@ async fn finish_terminal_flush<T: Topic>(
     batch: &mut InMemoryBatch<T>,
     flush_len: usize,
     redelivery_backoff: &mut Backoff,
-    mut already_unpublished: Vec<(u64, Envelope)>,
+    mut already_unpublished: Vec<Unpublished>,
 ) {
     let parked_unpublished = publish_parked(flush, &mut batch.parked).await;
     already_unpublished.extend(parked_unpublished);
@@ -1785,7 +1883,9 @@ async fn finish_terminal_flush<T: Topic>(
 ///   `Commit` publishes them. Either loop can be cut short by the
 ///   per-consumer shutdown token racing a publish stuck on a full DLQ (see
 ///   [`route_reject_or_park`]); whatever that leaves unpublished is requeued
-///   rather than lost — see [`finish_terminal_flush`].
+///   rather than lost — unless broker shutdown lands before the requeue, in
+///   which case it is settled as lost (see [`finish_terminal_flush`] and
+///   [`requeue_unpublished`]).
 /// - `Redeliver`: the whole batch — handled envelopes plus parked ones,
 ///   sorted back into arrival order by pop ordinal — goes back to
 ///   the front of the queue via `InMemoryBroker::requeue_front`, so the next
@@ -1846,7 +1946,7 @@ async fn flush_inmemory_batch<T, H>(
         }
         BatchSettlement::DeadLetter => {
             let has_dlq = flush.topology.dlq().is_some();
-            let mut unpublished: Vec<(u64, Envelope)> = Vec::new();
+            let mut unpublished: Vec<Unpublished> = Vec::new();
             for (ordinal, envelope) in batch.envelopes.drain(..) {
                 // Either shutdown token may already have fired between
                 // envelopes — stop attempting new publishes rather than
@@ -1867,7 +1967,17 @@ async fn flush_inmemory_batch<T, H>(
                     continue;
                 }
                 if flush.shutdown.is_cancelled() {
-                    unpublished.push((ordinal, envelope));
+                    // No metrics yet: a requeued entry is re-rejected (and
+                    // counted) after restart, so counting here would double
+                    // it. `failure_counted: false` tells a late loss it
+                    // still owes the failure, like the broker-cut branch
+                    // above.
+                    unpublished.push(Unpublished {
+                        ordinal,
+                        envelope,
+                        reason: metrics::FailReason::Rejected,
+                        failure_counted: false,
+                    });
                     continue;
                 }
                 let pending = metrics::record_terminal(
@@ -1885,10 +1995,15 @@ async fn flush_inmemory_batch<T, H>(
                 // per-consumer shutdown token here is what keeps
                 // `with_shutdown` from being inert against a full DLQ — see
                 // `route_reject_or_park`'s doc.
-                if let Some(entry) =
+                if let Some((ordinal, envelope)) =
                     route_reject_or_park(flush, ordinal, envelope, "rejected", pending).await
                 {
-                    unpublished.push(entry);
+                    unpublished.push(Unpublished {
+                        ordinal,
+                        envelope,
+                        reason: metrics::FailReason::Rejected,
+                        failure_counted: true,
+                    });
                 }
             }
             finish_terminal_flush(flush, batch, flush_len, redelivery_backoff, unpublished).await;
@@ -2873,12 +2988,12 @@ mod tests {
         // A survivor recorded earlier in the drain — its in-flight slot is
         // still held, exactly as `drain_pending` leaves it.
         queue.in_flight.fetch_add(1, Ordering::Release);
-        let survivors = vec![envelope(b"survivor")];
+        let survivors = vec![(envelope(b"survivor"), metrics::FailReason::Rejected)];
 
         // Broker shutdown lands after the survivor was collected, before
         // the post-drain requeue.
         broker.shutdown();
-        requeue_survivors(&broker, &queue, topology.queue(), survivors).await;
+        requeue_survivors(&broker, &queue, topology, None, survivors).await;
 
         assert!(
             queue.buffer.lock().await.is_empty(),
@@ -2910,7 +3025,12 @@ mod tests {
         // The per-consumer cut that collected the entry earlier in the flush.
         let consumer_shutdown = CancellationToken::new();
         consumer_shutdown.cancel();
-        let unpublished = vec![(0u64, envelope(b"survivor"))];
+        let unpublished = vec![Unpublished {
+            ordinal: 0,
+            envelope: envelope(b"survivor"),
+            reason: metrics::FailReason::Rejected,
+            failure_counted: true,
+        }];
 
         // Broker shutdown lands after collection, before the requeue.
         broker.shutdown();
