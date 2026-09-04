@@ -2853,4 +2853,75 @@ mod tests {
              settled as lost, not requeued onto the shut-down broker"
         );
     }
+
+    /// A survivor collected while the broker was still up must not be
+    /// requeued once broker shutdown lands before the post-drain requeue:
+    /// `run_concurrent_on`'s own prefetch gate shows nothing pops from the
+    /// queue after the broker token fires, so the requeue parks the message
+    /// where the broker's `Arc<QueueState>` drop destroys it with no log and
+    /// no count — while its earlier `survived()` verdict stands. It must be
+    /// settled as lost instead, with the held in-flight slot still released.
+    #[tokio::test]
+    async fn broker_shutdown_settles_collected_survivors_as_lost() {
+        let broker = InMemoryBroker::with_config(InMemoryConfig {
+            default_capacity: 4,
+        });
+        let topology = dlq_topology();
+        let queue = broker.declare(topology.queue());
+        broker.declare(topology.dlq().expect("topology declares a DLQ"));
+
+        // A survivor recorded earlier in the drain — its in-flight slot is
+        // still held, exactly as `drain_pending` leaves it.
+        queue.in_flight.fetch_add(1, Ordering::Release);
+        let survivors = vec![envelope(b"survivor")];
+
+        // Broker shutdown lands after the survivor was collected, before
+        // the post-drain requeue.
+        broker.shutdown();
+        requeue_survivors(&broker, &queue, topology.queue(), survivors).await;
+
+        assert!(
+            queue.buffer.lock().await.is_empty(),
+            "a survivor whose requeue lost the race against broker shutdown \
+             must be settled as lost, not requeued onto the shut-down broker"
+        );
+        assert_eq!(
+            queue.in_flight.load(Ordering::Acquire),
+            0,
+            "the survivor's held in-flight slot must still be released when \
+             it is settled as lost"
+        );
+    }
+
+    /// The batch-path twin of the survivor test above: entries collected for
+    /// the post-flush requeue (a pre-check cut or a lost publish race earlier
+    /// in the flush) must not be requeued once broker shutdown lands before
+    /// `requeue_unpublished` runs — same silent destruction, same fix:
+    /// settled as lost.
+    #[tokio::test]
+    async fn broker_shutdown_settles_collected_batch_survivors_as_lost() {
+        let broker = InMemoryBroker::with_config(InMemoryConfig {
+            default_capacity: 4,
+        });
+        let topology = dlq_topology();
+        let queue = broker.declare(topology.queue());
+        broker.declare(topology.dlq().expect("topology declares a DLQ"));
+
+        // The per-consumer cut that collected the entry earlier in the flush.
+        let consumer_shutdown = CancellationToken::new();
+        consumer_shutdown.cancel();
+        let unpublished = vec![(0u64, envelope(b"survivor"))];
+
+        // Broker shutdown lands after collection, before the requeue.
+        broker.shutdown();
+        let flush = flush_ctx(&broker, topology, &queue, &consumer_shutdown);
+        requeue_unpublished(&flush, unpublished).await;
+
+        assert!(
+            queue.buffer.lock().await.is_empty(),
+            "a batch survivor whose requeue lost the race against broker \
+             shutdown must be settled as lost, not requeued onto the \
+             shut-down broker"
+        );
+    }
 }
