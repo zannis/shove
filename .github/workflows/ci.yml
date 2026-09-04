@@ -247,11 +247,18 @@ jobs:
             # slow JVM start (~90s), so they get their own runner instead of
             # contending with the `kafka` entry's containers. `protobuf` turns
             # on the framed-protobuf scenario in the cp integration test.
-            features: kafka,kafka-schema-registry,protobuf
+            # `metrics` is required by
+            # metrics_kafka_schema_registry_pre_handler_discard, whose cfg gate
+            # needs kafka + kafka-schema-registry + metrics all at once; this is
+            # the only entry with the middle one, so without `metrics` here that
+            # binary compiles empty in every job and its tests run nowhere.
+            features: kafka,kafka-schema-registry,protobuf,metrics
             # `kafka-schema-registry` implies `kafka`, so without a filter this
             # entry would re-run the entire Kafka suite the `kafka` entry
-            # already covers. Restrict it to the three schema-registry binaries,
-            # plus the `schema_registry::` unit tests in the lib binary.
+            # already covers. Restrict it to the schema-registry binaries
+            # (unanchored: kafka_schema_registry* AND
+            # metrics_kafka_schema_registry_pre_handler_discard), plus the
+            # `schema_registry::` unit tests in the lib binary.
             #
             # That second term is not optional. This is the only matrix entry
             # that enables `kafka-schema-registry`, so `src/schema_registry/`
@@ -262,7 +269,7 @@ jobs:
             # cases are what stop a malformed broker frame from panicking a
             # consumer. The job was green because it ran 13 tests, not because
             # those 31 passed.
-            filter: -E 'binary(/^kafka_schema_registry/) + test(/^schema_registry::/)'
+            filter: -E 'binary(/schema_registry/) + test(/^schema_registry::/)'
           - name: redis-streams
             # Asserted by `metrics_redis_sequenced`, `metrics_redis_malformed`,
             # `metrics_redis_failall` and `metrics_redis_failall_no_dlq`.
