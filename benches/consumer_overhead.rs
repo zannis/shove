@@ -1089,7 +1089,12 @@ fn bench_dispatch(c: &mut Criterion) {
     group.throughput(Throughput::Elements(DISPATCH_MESSAGES));
     group.sampling_mode(SamplingMode::Flat);
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(15));
+    // The 5 s criterion default measurement window is deliberate. This
+    // group used to set 15 s, and back-to-back no-op runs still moved
+    // 20-45% on the scheduler-bound ids: the variance is environmental,
+    // not sampling, so the extra 10 s per id bought precision the
+    // environment immediately discarded -- while tripling the wall-clock
+    // of the bench-tier-a CI leg that runs this suite on every PR.
 
     let warmup_body = payload(WARMUP_PAYLOAD_BYTES);
 

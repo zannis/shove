@@ -1,0 +1,140 @@
+<svg width="960" height="640" viewBox="0 0 960 640" xmlns="http://www.w3.org/2000/svg">
+<rect x="0" y="0" width="960" height="640" opacity="1" fill="#1A1A19" stroke="none"/>
+<rect x="0" y="0" width="959" height="639" opacity="0.1" fill="none" stroke="#FFFFFF"/>
+<text x="24" y="18" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="20.967741935483872" opacity="1" fill="#FFFFFF">
+Throughput vs payload size
+</text>
+<text x="24" y="48" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+consume_parallel — 1 consumer — higher is better
+</text>
+<text x="24" y="518" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+inmemory: partial — not plotted: window under 1 s, too short to publish as a rate at payload size 1 KiB, 64 KiB
+</text>
+<text x="24" y="534" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+kafka: partial — not plotted: window under 1 s, too short to publish as a rate at payload size 1 KiB
+</text>
+<text x="24" y="550" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+sqs: not measured in this document: SQS runs only against LocalStack (non-representative by design) and requires a
+</text>
+<text x="24" y="566" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+LocalStack Pro auth token, which is unavailable in the environment that produced these results
+</text>
+<text x="24" y="582" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
+Generated 2026-09-02T15:08:34Z — shove 0.14.0 — aarch64 (8c / 15 GB)
+</text>
+<text x="24" y="598" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
+aarch64 — 8 cores — 15 GB RAM — Ubuntu 24.04.4 LTS — rustc 1.91.1 (ed61e7d7e 2025-11-07) — handler: zero (no-op)
+</text>
+<text x="24" y="614" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
+10 recorded failure(s) in the dataset — see failures[]
+</text>
+<text x="16" y="285" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781" transform="rotate(270, 16, 285)">
+messages / second — log scale
+</text>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="473" x2="859" y2="473"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="355" x2="859" y2="355"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="237" x2="859" y2="237"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="119" x2="859" y2="119"/>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="89,96 89,473 "/>
+<text x="80" y="473" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+100
+</text>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,473 89,473 "/>
+<text x="80" y="355" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+1.0k
+</text>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,355 89,355 "/>
+<text x="80" y="237" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+10k
+</text>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,237 89,237 "/>
+<text x="80" y="119" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+100k
+</text>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,119 89,119 "/>
+<polyline fill="none" opacity="1" stroke="#3987E5" stroke-width="2" points="189,102 "/>
+<polyline fill="none" opacity="1" stroke="#D95926" stroke-width="2" points="189,139 "/>
+<polyline fill="none" opacity="1" stroke="#D95926" stroke-width="2" points="759,308 "/>
+<polyline fill="none" opacity="1" stroke="#199E70" stroke-width="2" points="189,314 474,307 759,348 "/>
+<polyline fill="none" opacity="1" stroke="#C98500" stroke-width="2" points="189,337 474,334 759,357 "/>
+<polyline fill="none" opacity="1" stroke="#D55181" stroke-width="2" points="189,305 474,305 759,339 "/>
+<circle cx="189" cy="102" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="189" cy="102" r="4" opacity="1" fill="#3987E5" stroke="none" stroke-width="0"/>
+<circle cx="189" cy="139" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="189" cy="139" r="4" opacity="1" fill="#D95926" stroke="none" stroke-width="0"/>
+<circle cx="759" cy="308" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="759" cy="308" r="4" opacity="1" fill="#D95926" stroke="none" stroke-width="0"/>
+<circle cx="189" cy="314" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="189" cy="314" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
+<circle cx="474" cy="307" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="474" cy="307" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
+<circle cx="759" cy="348" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="759" cy="348" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
+<circle cx="189" cy="337" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="189" cy="337" r="4" opacity="1" fill="#C98500" stroke="none" stroke-width="0"/>
+<circle cx="474" cy="334" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="474" cy="334" r="4" opacity="1" fill="#C98500" stroke="none" stroke-width="0"/>
+<circle cx="759" cy="357" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="759" cy="357" r="4" opacity="1" fill="#C98500" stroke="none" stroke-width="0"/>
+<circle cx="189" cy="305" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="189" cy="305" r="4" opacity="1" fill="#D55181" stroke="none" stroke-width="0"/>
+<circle cx="474" cy="305" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="474" cy="305" r="4" opacity="1" fill="#D55181" stroke="none" stroke-width="0"/>
+<circle cx="759" cy="339" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="759" cy="339" r="4" opacity="1" fill="#D55181" stroke="none" stroke-width="0"/>
+<text x="197" y="103" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+inmemory
+</text>
+<polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="765,308 867,308 "/>
+<text x="870" y="308" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+kafka
+</text>
+<polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="765,339 867,339 "/>
+<text x="870" y="339" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+redis
+</text>
+<polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="765,348 867,353 "/>
+<text x="870" y="353" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+nats
+</text>
+<polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="765,357 867,367 "/>
+<text x="870" y="367" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+rabbitmq
+</text>
+<text x="189" y="482" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+64 B
+</text>
+<text x="474" y="482" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+1 KiB
+</text>
+<text x="759" y="482" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+64 KiB
+</text>
+<text x="475" y="502" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+payload size
+</text>
+<rect x="94" y="77" width="14" height="8" opacity="1" fill="#3987E5" stroke="none"/>
+<text x="114" y="74" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+inmemory (single point)
+</text>
+<rect x="345" y="77" width="14" height="8" opacity="1" fill="#D95926" stroke="none"/>
+<text x="365" y="74" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+kafka
+</text>
+<rect x="434" y="77" width="14" height="8" opacity="1" fill="#199E70" stroke="none"/>
+<text x="454" y="74" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+nats
+</text>
+<rect x="514" y="77" width="14" height="8" opacity="1" fill="#C98500" stroke="none"/>
+<text x="534" y="74" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+rabbitmq
+</text>
+<rect x="630" y="77" width="14" height="8" opacity="1" fill="#D55181" stroke="none"/>
+<text x="650" y="74" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+redis
+</text>
+<rect x="719" y="77" width="14" height="8" opacity="1" fill="#008300" stroke="none"/>
+<text x="739" y="74" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+sqs (n/s)
+</text>
+</svg>

@@ -39,6 +39,7 @@ const KAFKA_VERSION: &str = "3.8.0";
 
 #[tokio::main]
 async fn main() {
+    harness::spawn_ctrlc_watcher();
     let container = KafkaImage::default()
         .start()
         .await
@@ -47,6 +48,7 @@ async fn main() {
         .get_host_port_ipv4(apache::KAFKA_PORT)
         .await
         .expect("failed to read Kafka port");
+    let _container = harness::ContainerGuard::new(container);
     let bootstrap = format!("127.0.0.1:{port}");
 
     // One metadata probe and one admin client serve the readiness wait and
@@ -360,8 +362,6 @@ async fn main() {
         },
     )
     .await;
-
-    drop(container);
 }
 
 /// Map the scenario's batch knobs onto shove's [`BatchConsumerOptions`].

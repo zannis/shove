@@ -99,11 +99,14 @@ there rather than restating the table in a third place.
 ## Build / test / lint commands
 
 - **Fast path** (no Docker, no secrets): `cargo nextest run --no-default-features`
-  runs the lib unit tests only. `default = []` in `Cargo.toml`, and every
-  in-memory test file is gated on `feature = "inmemory"`, so under this flag
-  those binaries compile empty and report green having run nothing. (CI's
-  `check` job uses `cargo test --no-default-features` — the same unit-only
-  set; this repo's convention is `cargo nextest run`.)
+  runs the lib unit tests plus the feature-free integration targets, among
+  them `tests/chartgen.rs` (the benchmark chart generator, including the
+  byte-compare of the committed SVGs against the committed results document).
+  `default = []` in `Cargo.toml`, and every in-memory test file is gated on
+  `feature = "inmemory"`, so under this flag the backend test binaries compile
+  empty and report green having run nothing. (CI's `check` job uses
+  `cargo test --no-default-features` — the same set; this repo's convention is
+  `cargo nextest run`.)
 - **In-memory tests, still Docker-free**:
   `cargo nextest run --features inmemory,metrics,sbe,env-config` — the CI
   `coverage` matrix's `inmemory` feature set (authoritative copy in
@@ -136,6 +139,16 @@ there rather than restating the table in a third place.
   — and the two settling paths above that bypass `route_outcome`: broadcast
   (`settle_broadcast_outcome`) and batch (`settle_batch_outcome` plus each
   backend's own batch-flush arms).
+- **Pre-handler drops count toward `messages_discarded_total`**: a message
+  dropped before the handler (oversize, undecodable, batch-accumulation drop)
+  settles a discard under the same rules as a post-handler terminal outcome —
+  via `metrics::record_terminal` / `pending_discard`, confirmed only against a
+  broker-acknowledged retirement, counted iff the message is truly gone (no
+  DLQ, or the DLQ publish failed). A batch path parks its drops and settles
+  them on the flush's commit result. New consume paths (including the batch
+  ports) wire this from day one; the per-backend completeness statement in
+  `src/metrics.rs` (`record_terminal`'s doc) is authoritative and must stay
+  accurate.
 - **Conventional Commits** for commit messages. No CHANGELOG — releases are
   `release: vX.Y.Z` commits.
 - Do **not** add `Co-Authored-By` trailers to commits.

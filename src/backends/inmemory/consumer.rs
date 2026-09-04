@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use super::client::{Envelope, InMemoryBroker, QueueState};
 use super::constants::{
@@ -274,6 +275,17 @@ where
     let mut pending: BTreeMap<u64, (Envelope, Handled)> = BTreeMap::new();
     let mut next_ticket: u64 = 0;
     let mut next_route: u64 = 0;
+    // Envelopes whose DLQ publish the per-consumer token cut short, with
+    // their `in_flight` slots still held; requeued once, after the drain —
+    // or settled as lost, if broker shutdown lands before that requeue.
+    // Each carries the fail reason its `record_terminal` was counted under,
+    // so the lost path can label the discard truthfully.
+    let mut survivors: Vec<(Envelope, metrics::FailReason)> = Vec::new();
+    // Redelivery backoffs spawned by the `Hold` route. Tracked so `run()`
+    // never returns with one still in flight: a caller that tears down the
+    // runtime after `run()` would otherwise destroy the parked envelope
+    // mid-sleep, with no requeue.
+    let redeliveries = TaskTracker::new();
 
     loop {
         // Pull messages up to prefetch.
@@ -340,6 +352,8 @@ where
                                 &mut next_route,
                                 &options,
                                 subscription_closed.as_ref(),
+                                &mut survivors,
+                                &redeliveries,
                             )
                             .await;
                             if inflight.is_empty() {
@@ -360,6 +374,8 @@ where
                                 &mut next_route,
                                 &options,
                                 subscription_closed.as_ref(),
+                                &mut survivors,
+                                &redeliveries,
                             )
                             .await;
                             if inflight.is_empty() {
@@ -401,12 +417,119 @@ where
         &mut next_route,
         &options,
         subscription_closed.as_ref(),
+        &mut survivors,
+        &redeliveries,
     )
     .await;
+    requeue_survivors(
+        &broker,
+        &queue,
+        topology,
+        options.consumer_group.as_deref(),
+        survivors,
+        subscription_closed.is_some(),
+    )
+    .await;
+    // Prompt, never a backoff-length stall: this point is only reached with
+    // the per-consumer or broker token cancelled, and every tracked task
+    // selects on both — each one wakes to requeue its survivor (consumer
+    // token) or drop it with a warning (broker token).
+    redeliveries.close();
+    redeliveries.wait().await;
     options.processing.store(false, Ordering::Release);
     Ok(())
 }
 
+/// Put messages whose DLQ publish the per-consumer token cut short back at
+/// the front of their source queue, then release the `in_flight` slots
+/// [`drain_pending`] kept held for them — requeue-before-release, the same
+/// ordering rule the batch path's `requeue_unpublished` documents. Marked
+/// redelivered so a restarted consumer sees the extra delivery.
+///
+/// Broker shutdown takes precedence here too, re-checked at this final
+/// point because survivors accumulate across the whole drain: a survivor
+/// collected before the broker token fired would otherwise be requeued onto
+/// a queue nothing pops again (the main loop's own prefetch gate stops on
+/// that token), where the broker's `Arc<QueueState>` drop destroys it with
+/// no log and no count — while its earlier `survived()` verdict stands.
+/// Those are settled as lost instead, exactly as
+/// [`route_reject_or_survive`] settles a cut it can already see the broker
+/// token during. Each survivor's failure was counted when its terminal
+/// route was decided, so only the discard is owed here
+/// ([`metrics::pending_discard`], not [`metrics::record_terminal`]). The
+/// held `in_flight` slots are released either way. Only the microscopic
+/// window inside `requeue_front`'s own lock acquisition remains, the same
+/// one the `Redeliver` arm's comment accepts as inherent.
+///
+/// For a broadcast subscription the "queue" is the private buffer that is
+/// dropped along with the subscription the moment the loop returns, so a
+/// survivor requeued there is guaranteed destruction, not survival — nothing
+/// ever pops that buffer again. Unlike an undelivered deliver-new drop, this
+/// message's terminal route was already decided and its failure counted, so
+/// suppressing the discard (the earlier `survived()` verdict) would leave
+/// `messages_discarded_total` silently understating a real destruction.
+/// Those survivors are settled as discarded here instead of requeued
+/// (`broadcast_buffer` is how the caller says the queue is such a buffer).
+async fn requeue_survivors(
+    broker: &InMemoryBroker,
+    queue: &Arc<QueueState>,
+    topology: &'static QueueTopology,
+    group: Option<&str>,
+    survivors: Vec<(Envelope, metrics::FailReason)>,
+    broadcast_buffer: bool,
+) {
+    if survivors.is_empty() {
+        return;
+    }
+    let n = survivors.len() as u64;
+    if broker.shutdown_token().is_cancelled() {
+        let has_dlq = topology.dlq().is_some();
+        for (_, reason) in survivors {
+            let pending = metrics::pending_discard(topology.queue(), group, reason, has_dlq);
+            lost_to_broker_shutdown(topology, reason.as_label(), pending);
+        }
+        queue.in_flight.fetch_sub(n, Ordering::Release);
+        return;
+    }
+    if broadcast_buffer {
+        let has_dlq = topology.dlq().is_some();
+        for (_, reason) in survivors {
+            tracing::warn!(
+                queue = topology.queue(),
+                reason = reason.as_label(),
+                "per-consumer shutdown cut terminal routing on a broadcast \
+                 subscription — the private buffer is destroyed with the \
+                 subscription, so the message is settled as discarded"
+            );
+            let pending = metrics::pending_discard(topology.queue(), group, reason, has_dlq);
+            pending.confirm_lost();
+        }
+        queue.in_flight.fetch_sub(n, Ordering::Release);
+        return;
+    }
+    tracing::debug!(
+        queue = topology.queue(),
+        count = n,
+        "per-consumer shutdown cut a DLQ publish — requeueing the survivors"
+    );
+    let mut envs: Vec<Envelope> = survivors.into_iter().map(|(env, _)| env).collect();
+    for env in &mut envs {
+        env.mark_redelivery();
+    }
+    broker.requeue_front(queue, envs).await;
+    queue.in_flight.fetch_sub(n, Ordering::Release);
+}
+
+/// Routes settled outcomes in ticket order. A message whose DLQ publish the
+/// per-consumer token cut short is pushed onto `survivors` (with the fail
+/// reason its terminal metrics were counted under) and its `in_flight` slot
+/// still held — [`run_concurrent_on`] requeues the whole vector at the front
+/// in one call after the drain (per-message `requeue_front` calls would
+/// invert arrival order), or settles it as lost if broker shutdown landed
+/// meanwhile (see [`requeue_survivors`]), and only then releases those
+/// slots, so a survivor is at worst transiently double-counted, never
+/// uncounted.
+#[allow(clippy::too_many_arguments)] // run_concurrent_on's loop state, threaded through
 async fn drain_pending(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
@@ -415,9 +538,11 @@ async fn drain_pending(
     next_route: &mut u64,
     options: &ConsumerOptionsInner,
     subscription_closed: Option<&CancellationToken>,
+    survivors: &mut Vec<(Envelope, metrics::FailReason)>,
+    redeliveries: &TaskTracker,
 ) {
     while let Some((env, (outcome, pre_handler_reason))) = pending.remove(next_route) {
-        route_outcome(
+        match route_outcome(
             broker,
             topology,
             DeliverySource {
@@ -428,9 +553,15 @@ async fn drain_pending(
             outcome,
             pre_handler_reason,
             options,
+            redeliveries,
         )
-        .await;
-        queue.in_flight.fetch_sub(1, Ordering::Release);
+        .await
+        {
+            Some(survivor) => survivors.push(survivor),
+            None => {
+                queue.in_flight.fetch_sub(1, Ordering::Release);
+            }
+        }
         *next_route += 1;
     }
 }
@@ -667,8 +798,10 @@ async fn run_fifo_shard<T, H>(
                             metrics::FailReason::MaxRetriesExceeded,
                             topology.dlq().is_some(),
                         );
-                        route_reject_sequenced(&broker, topology, env, &key, &poisoned, pending)
-                            .await;
+                        route_reject_sequenced(
+                            &broker, topology, &shard, &shutdown, env, &key, &poisoned, pending,
+                        )
+                        .await;
                     } else {
                         // Inline sleep (blocks this shard until republish completes).
                         let hold_queues = topology.hold_queues();
@@ -700,20 +833,73 @@ async fn run_fifo_shard<T, H>(
                             return;
                         }
 
-                        // `enqueue` only fails once the broker's shutdown token
-                        // is cancelled, so this is the same class as the two
-                        // arms above — but it dropped the message without even
-                        // a log line, which is what made it invisible.
-                        // Shutdown drop: intentionally not counted — see
-                        // `metrics::FailReason`.
+                        // The republish itself can wedge on a full shard
+                        // queue, and `enqueue` only races the *broker* token
+                        // internally — so race the per-consumer token here
+                        // too, exactly as the sleep above does. The clone
+                        // feeds the enqueue; the original survives for the
+                        // cancellation arm.
                         let message_id = message_id_of(&new_env.headers).to_owned();
-                        if broker.enqueue(&shard, new_env).await.is_err() {
-                            warn_shutdown_drop(
-                                &shard_name,
-                                &key,
-                                &message_id,
-                                "broker shutdown rejected a sequenced retry re-enqueue — message dropped",
+                        let republish_cut = tokio::select! {
+                            res = broker.enqueue(&shard, new_env.clone()) => {
+                                if res.is_err() {
+                                    // `enqueue` only fails once the broker's
+                                    // shutdown token is cancelled, so this is
+                                    // the same class as the two arms above —
+                                    // but it dropped the message without even
+                                    // a log line, which is what made it
+                                    // invisible. Shutdown drop: intentionally
+                                    // not counted — see `metrics::FailReason`.
+                                    warn_shutdown_drop(
+                                        &shard_name,
+                                        &key,
+                                        &message_id,
+                                        "broker shutdown rejected a sequenced retry re-enqueue — message dropped",
+                                    );
+                                    finish(&shard, &busy, &options);
+                                    return;
+                                }
+                                false
+                            }
+                            () = shutdown.cancelled() => {
+                                // A simultaneous broker shutdown leaves this
+                                // arm and the enqueue's internal
+                                // broker-shutdown `Err` ready together, and
+                                // the unbiased `select!` may land here — so
+                                // broker shutdown must be re-checked before
+                                // the requeue, exactly like
+                                // `schedule_redelivery`'s enqueue stage.
+                                // Requeueing onto a shut-down broker would
+                                // bypass the drop-and-warn path the `res` arm
+                                // takes. Shutdown drop: intentionally not
+                                // counted — see `metrics::FailReason`.
+                                if broker_shutdown.is_cancelled() {
+                                    warn_shutdown_drop(
+                                        &shard_name,
+                                        &key,
+                                        &message_id,
+                                        "broker shutdown rejected a sequenced retry re-enqueue — message dropped",
+                                    );
+                                    finish(&shard, &busy, &options);
+                                    return;
+                                }
+                                true
+                            }
+                        };
+                        if republish_cut {
+                            // Not a drop: the retry state is already stamped,
+                            // so park the message at the front of the shard
+                            // queue for a restarted consumer to pick up —
+                            // requeue before `finish` releases the in-flight
+                            // slot. The abandoned enqueue cannot land later:
+                            // its push-to-return tail is await-free.
+                            tracing::debug!(
+                                shard = %shard_name,
+                                %key,
+                                %message_id,
+                                "per-consumer shutdown cut a sequenced retry republish — requeueing the survivor"
                             );
+                            broker.requeue_front(&shard, vec![new_env]).await;
                             finish(&shard, &busy, &options);
                             return;
                         }
@@ -735,7 +921,10 @@ async fn run_fifo_shard<T, H>(
                     } else {
                         metrics::record_terminal(queue, group, reason, has_dlq)
                     };
-                    route_reject_sequenced(&broker, topology, env, &key, &poisoned, pending).await;
+                    route_reject_sequenced(
+                        &broker, topology, &shard, &shutdown, env, &key, &poisoned, pending,
+                    )
+                    .await;
                 }
                 Outcome::Defer => unreachable!("Defer normalized to Retry above"),
             }
@@ -776,18 +965,37 @@ async fn pop_or_wait(
 /// The caller supplies `pending` because only the caller knows whether this
 /// retirement is an independent failure ([`metrics::record_terminal`]) or a
 /// cascade that must not be counted as one ([`metrics::pending_discard`]).
+///
+/// The DLQ publish races the per-consumer `shutdown` token (see
+/// [`route_reject_or_survive`]); a survivor goes back to the front of the
+/// shard queue, marked redelivered, before the caller releases its
+/// `in_flight` slot via `finish`. At most one survivor per shard is possible
+/// — the loop is serial and its next cancellation check returns before
+/// another pop — so an immediate single-envelope requeue cannot invert
+/// arrival order. The key is still poisoned on the survive path: the shard
+/// is exiting anyway, and a restart clears poison state by design.
+#[allow(clippy::too_many_arguments)] // same shape as run_fifo_shard, its only caller
 async fn route_reject_sequenced(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
+    shard: &QueueState,
+    shutdown: &CancellationToken,
     env: Envelope,
     key: &str,
     poisoned: &PoisonedKeys,
     pending: metrics::PendingDiscard,
 ) {
-    resolve_reject(
-        route_reject(broker, topology, env, "rejected").await,
-        pending,
-    );
+    if let Some(mut survivor) =
+        route_reject_or_survive(broker, topology, shutdown, env, "rejected", pending).await
+    {
+        tracing::debug!(
+            queue = topology.queue(),
+            %key,
+            "per-consumer shutdown cut a sequenced DLQ publish — requeueing the survivor"
+        );
+        survivor.mark_redelivery();
+        broker.requeue_front(shard, vec![survivor]).await;
+    }
     poisoned.poison(key);
 }
 
@@ -870,6 +1078,15 @@ where
 // Outcome routing
 // ---------------------------------------------------------------------------
 
+/// Returns the envelope back to the caller — paired with the fail reason
+/// its terminal metrics were counted under, so a later loss can be labelled
+/// truthfully — when the per-consumer shutdown token cut a `Dlq`-arm publish
+/// wedged on a full DLQ (see [`route_reject_or_survive`]): the caller must
+/// keep its `in_flight` slot held and requeue it, so the message is never
+/// counted in neither gauge. `Ack` and `Hold` always return `None` — a
+/// `Hold` survivor requeues itself from inside the tracked redelivery task
+/// instead.
+#[allow(clippy::too_many_arguments)] // drain_pending's routing state, threaded through
 async fn route_outcome(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
@@ -881,10 +1098,11 @@ async fn route_outcome(
     // `Reject`. See [`prepare_message`].
     pre_handler_reason: Option<metrics::FailReason>,
     options: &ConsumerOptionsInner,
-) {
+    redeliveries: &TaskTracker,
+) -> Option<(Envelope, metrics::FailReason)> {
     let retry_count = get_retry_count(&env.headers);
     match decide_retry(&outcome, retry_count, options.max_retries) {
-        RetryDecision::Ack => {}
+        RetryDecision::Ack => None,
         RetryDecision::Dlq { reason } => {
             let fail_reason = pre_handler_reason.unwrap_or(match reason {
                 "rejected" => metrics::FailReason::Rejected,
@@ -899,10 +1117,16 @@ async fn route_outcome(
             // In-memory's DLQ enqueue path is `route_reject` for both
             // `Reject` and `max_retries_exceeded`; it does not differentiate
             // the reason beyond the metric recorded above.
-            resolve_reject(
-                route_reject(broker, topology, env, "rejected").await,
+            route_reject_or_survive(
+                broker,
+                topology,
+                &options.shutdown,
+                env,
+                "rejected",
                 pending,
-            );
+            )
+            .await
+            .map(|env| (env, fail_reason))
         }
         RetryDecision::Hold { increment } => {
             schedule_redelivery(
@@ -911,8 +1135,11 @@ async fn route_outcome(
                 source.queue,
                 env,
                 increment,
+                &options.shutdown,
                 source.subscription_closed,
+                redeliveries,
             );
+            None
         }
     }
 }
@@ -940,13 +1167,24 @@ fn resolve_reject(reached_dlq: bool, pending: metrics::PendingDiscard) {
     }
 }
 
+/// Park a `Retry`/`Defer` for its backoff and re-enqueue it, off the consumer
+/// loop so the backoff never blocks a delivery slot. The task is spawned onto
+/// `redeliveries` (awaited by `run_concurrent_on` before `run()` returns) and
+/// races the per-consumer `shutdown` token: a consumer leaving cannot await
+/// the backoff out, so the token cuts it short and requeues the survivor —
+/// retry state already stamped, same as the sequenced republish cut — rather
+/// than leaving the envelope to a detached task a runtime teardown would
+/// destroy.
+#[allow(clippy::too_many_arguments)] // route_outcome's routing state, threaded through
 fn schedule_redelivery(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
     source: &Arc<QueueState>,
     env: Envelope,
     increment: bool,
+    shutdown: &CancellationToken,
     subscription_closed: Option<&CancellationToken>,
+    redeliveries: &TaskTracker,
 ) {
     let retry_count = get_retry_count(&env.headers);
     let hold_queues = topology.hold_queues();
@@ -988,13 +1226,15 @@ fn schedule_redelivery(
     // mid-backoff) still applies to them.
     let target: Option<Arc<QueueState>> = topology.broadcast().then(|| Arc::clone(source));
     let subscription_closed = subscription_closed.cloned();
+    let shutdown = shutdown.clone();
 
-    // Every `return` below destroys the message. None is counted — see
-    // `metrics::FailReason` for why in-process broker drops stay log-only.
-    tokio::spawn(async move {
+    // Every `return` below except the per-consumer requeue arms destroys the
+    // message. None of those drops is counted — see `metrics::FailReason` for
+    // why in-process broker drops stay log-only.
+    redeliveries.spawn(async move {
         let message_id = message_id_of(&env.headers).to_owned();
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
+        let cut = tokio::select! {
+            _ = tokio::time::sleep(delay) => false,
             _ = broker_shutdown.cancelled() => {
                 tracing::warn!(
                     queue = %main_queue,
@@ -1011,7 +1251,8 @@ fn schedule_redelivery(
                 );
                 return;
             }
-        }
+            _ = shutdown.cancelled() => true,
+        };
         // Re-check shutdown after sleep — the broker may have shut down while
         // awaiting capacity.
         if broker_shutdown.is_cancelled() {
@@ -1036,8 +1277,25 @@ fn schedule_redelivery(
                 q
             }
         };
+        if cut {
+            // Not a drop: the retry state is already stamped, so park the
+            // message at the front of its queue for a restarted consumer to
+            // pick up — ahead of the backoff it can no longer sleep out.
+            tracing::debug!(
+                queue = %main_queue,
+                %message_id,
+                "per-consumer shutdown cut a redelivery backoff — requeueing the survivor"
+            );
+            broker_clone.requeue_front(&q, vec![env]).await;
+            return;
+        }
         let redelivery_timeout = Duration::from_secs(30);
-        let enqueue = tokio::time::timeout(redelivery_timeout, broker_clone.enqueue(&q, env));
+        // The clone feeds the enqueue; the original survives for the
+        // per-consumer cancellation arm. The abandoned enqueue cannot land
+        // later: its push-to-return tail is await-free, and the future is
+        // dropped unpolled on `return`.
+        let enqueue =
+            tokio::time::timeout(redelivery_timeout, broker_clone.enqueue(&q, env.clone()));
         tokio::pin!(enqueue);
         let result = tokio::select! {
             result = &mut enqueue => result,
@@ -1047,6 +1305,30 @@ fn schedule_redelivery(
                     %message_id,
                     "subscription closed during redelivery enqueue"
                 );
+                return;
+            }
+            _ = shutdown.cancelled() => {
+                // A simultaneous broker shutdown leaves this arm and the
+                // enqueue's internal broker-shutdown `Err` ready together, and
+                // the unbiased `select!` may land here — so broker shutdown
+                // must be re-checked before the requeue, exactly like the
+                // backoff stage above. Requeueing onto a shut-down broker
+                // would bypass the drop-and-warn path the `result` arm takes.
+                if broker_shutdown.is_cancelled() {
+                    tracing::warn!(
+                        queue = %main_queue,
+                        %message_id,
+                        "broker shut down during redelivery enqueue — message dropped"
+                    );
+                    return;
+                }
+                // Same non-drop as the backoff cut above.
+                tracing::debug!(
+                    queue = %main_queue,
+                    %message_id,
+                    "per-consumer shutdown cut a redelivery enqueue — requeueing the survivor"
+                );
+                broker_clone.requeue_front(&q, vec![env]).await;
                 return;
             }
         };
@@ -1338,27 +1620,47 @@ fn ingest_envelope<T: Topic>(
 /// `DeadLetter` arm and every other reject path.
 ///
 /// Returns whatever entries never got a publish attempt because the
-/// per-consumer or broker shutdown token was already cancelled, plus any
-/// entry whose in-flight publish lost the race against that same
-/// per-consumer token — see [`route_reject_or_park`]'s doc for why only that
-/// token needs racing here (the broker token already races inside
-/// `enqueue`). The caller folds this into the same requeue a `Redeliver`
-/// flush uses, rather than losing the message.
+/// per-consumer shutdown token was already cancelled, plus any entry whose
+/// in-flight publish lost the race against that same per-consumer token —
+/// see [`route_reject_or_park`]'s doc for why only that token needs racing
+/// here (the broker token already races inside `enqueue`). The caller folds
+/// this into the same requeue a `Redeliver` flush uses, rather than losing
+/// the message. A *broker*-shutdown cut is never handed back: the requeue it
+/// would feed lands on a queue nothing drains, so those entries are settled
+/// as lost instead ([`lost_to_broker_shutdown`]), broker precedence exactly
+/// as inside [`route_reject_or_survive`].
 async fn publish_parked(
     flush: &InMemoryFlushCtx<'_>,
     parked: &mut Vec<(u64, Envelope, metrics::FailReason)>,
-) -> Vec<(u64, Envelope)> {
+) -> Vec<Unpublished> {
     let mut unpublished = Vec::new();
     for (ordinal, envelope, reason) in parked.drain(..) {
-        if flush.shutdown.is_cancelled() || flush.broker_shutdown.is_cancelled() {
-            unpublished.push((ordinal, envelope));
+        if flush.broker_shutdown.is_cancelled() {
+            let pending = metrics::pending_discard(flush.topic, flush.group, reason, true);
+            lost_to_broker_shutdown(flush.topology, reason.as_label(), pending);
+            continue;
+        }
+        if flush.shutdown.is_cancelled() {
+            // The failure was counted at ingest (`ingest_envelope`'s
+            // `record_failed`); only a discard could still be owed.
+            unpublished.push(Unpublished {
+                ordinal,
+                envelope,
+                reason,
+                failure_counted: true,
+            });
             continue;
         }
         let pending = metrics::pending_discard(flush.topic, flush.group, reason, true);
-        if let Some(entry) =
+        if let Some((ordinal, envelope)) =
             route_reject_or_park(flush, ordinal, envelope, reason.as_label(), pending).await
         {
-            unpublished.push(entry);
+            unpublished.push(Unpublished {
+                ordinal,
+                envelope,
+                reason,
+                failure_counted: true,
+            });
         }
     }
     unpublished
@@ -1391,16 +1693,100 @@ async fn route_reject_or_park(
     reason: &str,
     pending: metrics::PendingDiscard,
 ) -> Option<(u64, Envelope)> {
+    route_reject_or_survive(
+        flush.broker,
+        flush.topology,
+        flush.shutdown,
+        envelope,
+        reason,
+        pending,
+    )
+    .await
+    .map(|env| (ordinal, env))
+}
+
+/// The shared core of every per-consumer-token DLQ-publish race: batch
+/// ([`route_reject_or_park`]), the unsequenced `Dlq` arm ([`route_outcome`])
+/// and the sequenced terminal routing ([`route_reject_sequenced`]) all funnel
+/// through here, so the single-message paths cannot drift from the batch
+/// mechanics again.
+///
+/// An already-cancelled token skips the publish attempt entirely — the same
+/// per-envelope pre-check [`publish_parked`] does — which also keeps the
+/// outcome deterministic when both select arms would be ready at once.
+///
+/// Returns `None` when the publish completed (landed or was lost —
+/// [`resolve_reject`] already settled `pending` either way). Returns
+/// `Some(envelope)` when the per-consumer token cut the wait instead: the
+/// failure is already counted, `pending.survived()` records that the message
+/// still exists, and the original envelope (not the clone handed to the
+/// abandoned publish) comes back for the caller to requeue. The abandoned
+/// publish cannot land later: `enqueue`'s push-to-return tail is await-free,
+/// so a select branch dropped at a suspension point is always still pre-push.
+///
+/// Broker shutdown takes precedence over a per-consumer cut, on both the
+/// pre-check and the select arm: a survivor handed back with the broker
+/// already shutting down would be requeued onto a queue nothing drains,
+/// where the broker's `Arc<QueueState>` drop destroys it with no log and no
+/// count. It is settled as lost instead — `resolve_reject(false, ..)`, the
+/// same accounting the enqueue-failure path inside [`route_reject`] gets —
+/// so the outcome no longer depends on which ready arm the unbiased
+/// `select!` happens to pick when both tokens cancel in the same poll gap.
+async fn route_reject_or_survive(
+    broker: &InMemoryBroker,
+    topology: &'static QueueTopology,
+    shutdown: &CancellationToken,
+    envelope: Envelope,
+    reason: &str,
+    pending: metrics::PendingDiscard,
+) -> Option<Envelope> {
+    let broker_shutdown = broker.shutdown_token();
+    if shutdown.is_cancelled() {
+        if broker_shutdown.is_cancelled() {
+            lost_to_broker_shutdown(topology, reason, pending);
+            return None;
+        }
+        pending.survived();
+        return Some(envelope);
+    }
     tokio::select! {
-        reached_dlq = route_reject(flush.broker, flush.topology, envelope.clone(), reason) => {
+        reached_dlq = route_reject(broker, topology, envelope.clone(), reason) => {
             resolve_reject(reached_dlq, pending);
             None
         }
-        () = flush.shutdown.cancelled() => {
+        () = shutdown.cancelled() => {
+            if broker_shutdown.is_cancelled() {
+                lost_to_broker_shutdown(topology, reason, pending);
+                return None;
+            }
             pending.survived();
-            Some((ordinal, envelope))
+            Some(envelope)
         }
     }
+}
+
+/// Settle a terminal envelope as lost to broker shutdown instead of handing
+/// it back as a survivor: a survivor is folded into the caller's requeue,
+/// and a requeue onto a shutting-down broker parks the message on a queue
+/// nothing drains, where the broker's `Arc<QueueState>` drop destroys it
+/// with no log and no count. `resolve_reject(false, ..)` is the same
+/// accounting the DLQ-enqueue failure path inside [`route_reject`] gets.
+///
+/// Shared by [`route_reject_or_survive`] (pre-check and select arm) and the
+/// per-envelope batch pre-checks in [`publish_parked`] and
+/// [`flush_inmemory_batch`]'s `DeadLetter` loop, so the batch loops cannot
+/// drift from the single-message broker-precedence rule again.
+fn lost_to_broker_shutdown(
+    topology: &'static QueueTopology,
+    reason: &str,
+    pending: metrics::PendingDiscard,
+) {
+    tracing::warn!(
+        queue = topology.queue(),
+        reason,
+        "broker shut down during a cut DLQ publish — message lost"
+    );
+    resolve_reject(false, pending);
 }
 
 /// Release `n` popped-but-unsettled envelopes back to the queue's in-flight
@@ -1412,16 +1798,61 @@ fn release_in_flight(queue: &QueueState, n: u64) {
     }
 }
 
+/// One envelope held back from a terminal flush for the post-flush requeue,
+/// carrying what its loss accounting needs should broker shutdown land
+/// before that requeue runs (see [`requeue_unpublished`]).
+struct Unpublished {
+    /// Pop ordinal, for restoring arrival order across the handled/parked
+    /// split before the requeue.
+    ordinal: u64,
+    envelope: Envelope,
+    /// The fail reason this envelope's terminal route was decided under —
+    /// keeps a late loss's discard label truthful.
+    reason: metrics::FailReason,
+    /// Whether `messages_failed_total` already counted this envelope —
+    /// ingest counted parked drops, `record_terminal` counted attempted
+    /// publishes. Only the `DeadLetter` loop's consumer-cut pre-check defers
+    /// its count to the post-restart re-reject, so a late loss there owes
+    /// the failure too, mirroring that loop's own broker-cut branch.
+    failure_counted: bool,
+}
+
 /// Put terminal-settlement envelopes that never reached the DLQ (shutdown won
-/// the race in [`route_reject_or_park`]) back onto the main queue instead of
-/// losing them — the same requeue-then-release ordering `Redeliver` uses (see
-/// its own comment): every entry is marked redelivered and restored to
-/// arrival order first, then handed to `requeue_front` before the caller
-/// releases the flush's `in_flight` slots, so a consumer cancelled mid-flush
-/// never has a window where the message is counted nowhere.
-async fn requeue_unpublished(flush: &InMemoryFlushCtx<'_>, mut unpublished: Vec<(u64, Envelope)>) {
-    unpublished.sort_unstable_by_key(|&(ordinal, _)| ordinal);
-    let mut envs: Vec<Envelope> = unpublished.into_iter().map(|(_, env)| env).collect();
+/// the race in [`route_reject_or_park`], or a pre-check skipped the attempt)
+/// back onto the main queue instead of losing them — the same
+/// requeue-then-release ordering `Redeliver` uses (see its own comment):
+/// every entry is marked redelivered and restored to arrival order first,
+/// then handed to `requeue_front` before the caller releases the flush's
+/// `in_flight` slots, so a consumer cancelled mid-flush never has a window
+/// where the message is counted nowhere.
+///
+/// Broker shutdown takes precedence, re-checked here because entries
+/// accumulate across the whole flush: one collected before the broker token
+/// fired would otherwise be requeued onto a queue nothing pops again, where
+/// the broker's `Arc<QueueState>` drop destroys it with no log and no count.
+/// Those are settled as lost instead — the batch twin of
+/// [`requeue_survivors`]'s late check, with each entry's [`Unpublished`]
+/// fields keeping the accounting exact. Only the microscopic window inside
+/// `requeue_front`'s own lock acquisition remains, the same one the
+/// `Redeliver` arm's comment accepts as inherent.
+async fn requeue_unpublished(flush: &InMemoryFlushCtx<'_>, mut unpublished: Vec<Unpublished>) {
+    if flush.broker_shutdown.is_cancelled() {
+        let has_dlq = flush.topology.dlq().is_some();
+        for entry in unpublished {
+            let pending = if entry.failure_counted {
+                metrics::pending_discard(flush.topic, flush.group, entry.reason, has_dlq)
+            } else {
+                metrics::record_terminal(flush.topic, flush.group, entry.reason, has_dlq)
+            };
+            lost_to_broker_shutdown(flush.topology, entry.reason.as_label(), pending);
+        }
+        return;
+    }
+    unpublished.sort_unstable_by_key(|entry| entry.ordinal);
+    let mut envs: Vec<Envelope> = unpublished
+        .into_iter()
+        .map(|entry| entry.envelope)
+        .collect();
     for env in &mut envs {
         env.mark_redelivery();
     }
@@ -1443,7 +1874,7 @@ async fn finish_terminal_flush<T: Topic>(
     batch: &mut InMemoryBatch<T>,
     flush_len: usize,
     redelivery_backoff: &mut Backoff,
-    mut already_unpublished: Vec<(u64, Envelope)>,
+    mut already_unpublished: Vec<Unpublished>,
 ) {
     let parked_unpublished = publish_parked(flush, &mut batch.parked).await;
     already_unpublished.extend(parked_unpublished);
@@ -1474,7 +1905,9 @@ async fn finish_terminal_flush<T: Topic>(
 ///   `Commit` publishes them. Either loop can be cut short by the
 ///   per-consumer shutdown token racing a publish stuck on a full DLQ (see
 ///   [`route_reject_or_park`]); whatever that leaves unpublished is requeued
-///   rather than lost — see [`finish_terminal_flush`].
+///   rather than lost — unless broker shutdown lands before the requeue, in
+///   which case it is settled as lost (see [`finish_terminal_flush`] and
+///   [`requeue_unpublished`]).
 /// - `Redeliver`: the whole batch — handled envelopes plus parked ones,
 ///   sorted back into arrival order by pop ordinal — goes back to
 ///   the front of the queue via `InMemoryBroker::requeue_front`, so the next
@@ -1535,15 +1968,38 @@ async fn flush_inmemory_batch<T, H>(
         }
         BatchSettlement::DeadLetter => {
             let has_dlq = flush.topology.dlq().is_some();
-            let mut unpublished: Vec<(u64, Envelope)> = Vec::new();
+            let mut unpublished: Vec<Unpublished> = Vec::new();
             for (ordinal, envelope) in batch.envelopes.drain(..) {
-                // The per-consumer or broker shutdown token may already have
-                // fired between envelopes — stop attempting new publishes
-                // rather than starting one only to lose the race anyway, but
-                // still walk the remainder so every one of them is collected
-                // for the requeue below instead of silently vanishing.
-                if flush.shutdown.is_cancelled() || flush.broker_shutdown.is_cancelled() {
-                    unpublished.push((ordinal, envelope));
+                // Either shutdown token may already have fired between
+                // envelopes — stop attempting new publishes rather than
+                // starting one only to lose the race anyway. A broker-cut
+                // envelope is settled as lost (the reject still counts:
+                // the handler did fail it, and it will never be redelivered
+                // to try again); a consumer-cut one is collected for the
+                // requeue below, same broker-precedence split as
+                // `route_reject_or_survive` and `publish_parked`.
+                if flush.broker_shutdown.is_cancelled() {
+                    let pending = metrics::record_terminal(
+                        flush.topic,
+                        flush.group,
+                        metrics::FailReason::Rejected,
+                        has_dlq,
+                    );
+                    lost_to_broker_shutdown(flush.topology, "rejected", pending);
+                    continue;
+                }
+                if flush.shutdown.is_cancelled() {
+                    // No metrics yet: a requeued entry is re-rejected (and
+                    // counted) after restart, so counting here would double
+                    // it. `failure_counted: false` tells a late loss it
+                    // still owes the failure, like the broker-cut branch
+                    // above.
+                    unpublished.push(Unpublished {
+                        ordinal,
+                        envelope,
+                        reason: metrics::FailReason::Rejected,
+                        failure_counted: false,
+                    });
                     continue;
                 }
                 let pending = metrics::record_terminal(
@@ -1561,10 +2017,15 @@ async fn flush_inmemory_batch<T, H>(
                 // per-consumer shutdown token here is what keeps
                 // `with_shutdown` from being inert against a full DLQ — see
                 // `route_reject_or_park`'s doc.
-                if let Some(entry) =
+                if let Some((ordinal, envelope)) =
                     route_reject_or_park(flush, ordinal, envelope, "rejected", pending).await
                 {
-                    unpublished.push(entry);
+                    unpublished.push(Unpublished {
+                        ordinal,
+                        envelope,
+                        reason: metrics::FailReason::Rejected,
+                        failure_counted: true,
+                    });
                 }
             }
             finish_terminal_flush(flush, batch, flush_len, redelivery_backoff, unpublished).await;
@@ -2094,6 +2555,7 @@ mod tests {
 
     use super::*;
     use crate::backends::inmemory::client::{Envelope, InMemoryConfig};
+    use crate::codec::JsonCodec;
     use crate::topology::TopologyBuilder;
 
     fn broadcast_topology() -> &'static QueueTopology {
@@ -2107,6 +2569,71 @@ mod tests {
 
     fn envelope(body: &'static [u8]) -> Envelope {
         Envelope::new(Bytes::from_static(body), HashMap::new())
+    }
+
+    fn requeue_topology() -> &'static QueueTopology {
+        static TOPOLOGY: OnceLock<QueueTopology> = OnceLock::new();
+        TOPOLOGY.get_or_init(|| {
+            TopologyBuilder::new("simultaneous-shutdown-enqueue")
+                .allow_message_loss()
+                .build()
+        })
+    }
+
+    /// When the broker token and the per-consumer token cancel in the same
+    /// poll gap while a redelivery enqueue is parked on a full queue, both
+    /// the enqueue's internal broker-shutdown `Err` and the per-consumer arm
+    /// become ready together, and `select!` picks between them at random.
+    /// Broker shutdown must win regardless of the pick: the message is
+    /// dropped, never requeued onto a broker that is already gone — the same
+    /// post-select re-check the backoff stage above already performs.
+    ///
+    /// The loop makes the unbiased pick statistical: pre-fix, each iteration
+    /// requeues with probability ~1/2, so 64 iterations fail with
+    /// overwhelming probability. Post-fix every iteration drops. The
+    /// current-thread test runtime is load-bearing — it guarantees the
+    /// redelivery task is not polled between the two cancellations.
+    #[tokio::test]
+    async fn broker_shutdown_wins_a_simultaneous_enqueue_cut() {
+        for _ in 0..64 {
+            let broker = InMemoryBroker::with_config(InMemoryConfig {
+                default_capacity: 1,
+            });
+            let queue = broker.declare("simultaneous-shutdown-enqueue");
+            broker
+                .enqueue(&queue, envelope(b"fills-capacity"))
+                .await
+                .expect("fill queue to capacity");
+
+            let consumer_shutdown = CancellationToken::new();
+            let redeliveries = TaskTracker::new();
+            schedule_redelivery(
+                &broker,
+                requeue_topology(),
+                &queue,
+                envelope(b"survivor"),
+                true,
+                &consumer_shutdown,
+                None,
+                &redeliveries,
+            );
+            redeliveries.close();
+
+            // Let the task sleep out the zero-delay backoff and park on the
+            // full-queue enqueue select.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            broker.shutdown();
+            consumer_shutdown.cancel();
+            redeliveries.wait().await;
+
+            assert_eq!(
+                queue.buffer.lock().await.len(),
+                1,
+                "a redelivery cut simultaneously with broker shutdown must be \
+                 dropped, not requeued onto the shut-down broker"
+            );
+        }
     }
 
     /// A deferred delivery parked on a full private broadcast buffer must stop
@@ -2126,13 +2653,17 @@ mod tests {
             .expect("fill private buffer");
         let source_weak = Arc::downgrade(&source);
 
+        let consumer_shutdown = CancellationToken::new();
+        let redeliveries = TaskTracker::new();
         schedule_redelivery(
             &broker,
             broadcast_topology(),
             &source,
             envelope(b"deferred"),
             false,
+            &consumer_shutdown,
             Some(subscription.closed_token()),
+            &redeliveries,
         );
 
         // Let the detached task reach the full-buffer capacity wait, then
@@ -2149,5 +2680,390 @@ mod tests {
         })
         .await
         .expect("deferred task retained a departed subscriber's private queue");
+    }
+
+    fn dlq_topology() -> &'static QueueTopology {
+        static TOPOLOGY: OnceLock<QueueTopology> = OnceLock::new();
+        TOPOLOGY.get_or_init(|| {
+            TopologyBuilder::new("simultaneous-shutdown-dlq")
+                .dlq()
+                .build()
+        })
+    }
+
+    /// Both tokens already cancelled when the reject routes: the per-consumer
+    /// pre-check must not hand back a survivor, because the caller's requeue
+    /// would park it on a broker that is already shutting down, where nothing
+    /// drains it and the queue's drop destroys it with no log and no count.
+    /// Broker shutdown takes precedence: the message is settled as lost, the
+    /// same way the DLQ-enqueue failure path reports it.
+    #[tokio::test]
+    async fn broker_shutdown_takes_precedence_over_a_cancelled_consumer_reject() {
+        let broker = InMemoryBroker::with_config(InMemoryConfig {
+            default_capacity: 4,
+        });
+        let topology = dlq_topology();
+        broker.declare(topology.queue());
+        broker.declare(topology.dlq().expect("topology declares a DLQ"));
+
+        broker.shutdown();
+        let consumer_shutdown = CancellationToken::new();
+        consumer_shutdown.cancel();
+
+        let pending =
+            metrics::pending_discard(topology.queue(), None, metrics::FailReason::Rejected, true);
+        let survivor = route_reject_or_survive(
+            &broker,
+            topology,
+            &consumer_shutdown,
+            envelope(b"reject-me"),
+            "rejected",
+            pending,
+        )
+        .await;
+        assert!(
+            survivor.is_none(),
+            "a reject cut after broker shutdown must be dropped, not handed \
+             back for a requeue onto the shut-down broker"
+        );
+    }
+
+    /// When the broker token and the per-consumer token cancel in the same
+    /// poll gap while a DLQ publish is parked on a full DLQ, both the
+    /// enqueue's internal broker-shutdown `Err` and the per-consumer arm
+    /// become ready together, and `select!` picks between them at random.
+    /// Broker shutdown must win regardless of the pick — same statistical
+    /// shape as `broker_shutdown_wins_a_simultaneous_enqueue_cut` above: 64
+    /// current-thread iterations, pre-fix each returns a survivor with
+    /// probability ~1/2.
+    #[tokio::test]
+    async fn broker_shutdown_wins_a_simultaneous_dlq_publish_cut() {
+        for _ in 0..64 {
+            let broker = InMemoryBroker::with_config(InMemoryConfig {
+                default_capacity: 1,
+            });
+            let topology = dlq_topology();
+            broker.declare(topology.queue());
+            let dlq = broker.declare(topology.dlq().expect("topology declares a DLQ"));
+            broker
+                .enqueue(&dlq, envelope(b"fills-dlq"))
+                .await
+                .expect("fill DLQ to capacity");
+
+            let consumer_shutdown = CancellationToken::new();
+            let task = tokio::spawn({
+                let broker = broker.clone();
+                let shutdown = consumer_shutdown.clone();
+                async move {
+                    let pending = metrics::pending_discard(
+                        topology.queue(),
+                        None,
+                        metrics::FailReason::Rejected,
+                        true,
+                    );
+                    route_reject_or_survive(
+                        &broker,
+                        topology,
+                        &shutdown,
+                        envelope(b"reject-me"),
+                        "rejected",
+                        pending,
+                    )
+                    .await
+                }
+            });
+
+            // Let the publish park on the full DLQ's capacity wait.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            broker.shutdown();
+            consumer_shutdown.cancel();
+
+            let survivor = task.await.expect("route task must not panic");
+            assert!(
+                survivor.is_none(),
+                "a DLQ publish cut simultaneously with broker shutdown must \
+                 be dropped, not handed back for a requeue onto the shut-down \
+                 broker"
+            );
+        }
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct FifoMsg {
+        id: u64,
+    }
+
+    fn fifo_republish_topology() -> &'static QueueTopology {
+        static TOPOLOGY: OnceLock<QueueTopology> = OnceLock::new();
+        TOPOLOGY.get_or_init(|| {
+            TopologyBuilder::new("simultaneous-shutdown-fifo-republish")
+                .sequenced(SequenceFailure::Skip)
+                .routing_shards(1)
+                .allow_message_loss()
+                .build()
+        })
+    }
+
+    struct FifoRepublishTopic;
+    impl Topic for FifoRepublishTopic {
+        type Message = FifoMsg;
+        type Codec = JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            fifo_republish_topology()
+        }
+        const SEQUENCE_KEY_FN: Option<fn(&Self::Message) -> String> = Some(Self::sequence_key);
+    }
+    impl SequencedTopic for FifoRepublishTopic {
+        fn sequence_key(msg: &FifoMsg) -> String {
+            msg.id.to_string()
+        }
+    }
+
+    struct RetryHandler;
+    impl MessageHandler<FifoRepublishTopic> for RetryHandler {
+        type Context = ();
+        async fn handle(&self, _: FifoMsg, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Retry
+        }
+    }
+
+    /// The sequenced retry republish has the same simultaneous-cancellation
+    /// race as the redelivery enqueue above: its `select!` races the enqueue
+    /// (whose internal broker-shutdown `Err` arm drops and warns) against the
+    /// per-consumer token, and when both tokens cancel in the same poll gap
+    /// the unbiased pick can land on the per-consumer arm and requeue onto
+    /// the shut-down broker. Broker shutdown must win regardless of the pick.
+    #[tokio::test]
+    async fn broker_shutdown_wins_a_simultaneous_sequenced_republish_cut() {
+        for _ in 0..64 {
+            let broker = InMemoryBroker::with_config(InMemoryConfig {
+                default_capacity: 1,
+            });
+            let shard = broker.declare("simultaneous-shutdown-fifo-republish.shard.0");
+            {
+                // Two envelopes through a capacity-1 queue: popping the first
+                // frees its slot, the second keeps the queue full when the
+                // retry republish runs. Direct pushes (`requeue_front`-style,
+                // capacity deliberately bypassed) — `enqueue` would await the
+                // capacity this test needs exhausted.
+                let mut buf = shard.buffer.lock().await;
+                buf.push_back(envelope(br#"{"id":1}"#));
+                buf.push_back(envelope(br#"{"id":2}"#));
+            }
+            shard.ready.notify_one();
+
+            let consumer_shutdown = CancellationToken::new();
+            let options = ConsumerOptionsInner::defaults_with_shutdown(consumer_shutdown.clone());
+            let handle = tokio::spawn(run_fifo_shard::<FifoRepublishTopic, RetryHandler>(
+                broker.clone(),
+                "simultaneous-shutdown-fifo-republish.shard.0".to_string(),
+                Arc::clone(&shard),
+                fifo_republish_topology(),
+                SequenceFailure::Skip,
+                Arc::new(RetryHandler),
+                Arc::new(()),
+                options,
+                Arc::new(AtomicUsize::new(0)),
+            ));
+
+            // Let the shard pop the first message, run the `Retry` handler,
+            // sleep out the zero-delay backoff, and park on the full-queue
+            // republish enqueue.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            broker.shutdown();
+            consumer_shutdown.cancel();
+            handle.await.expect("shard task must not panic");
+
+            assert_eq!(
+                shard.buffer.lock().await.len(),
+                1,
+                "a sequenced retry republish cut simultaneously with broker \
+                 shutdown must be dropped, not requeued onto the shut-down \
+                 broker"
+            );
+        }
+    }
+
+    /// Build the flush context the batch pre-check tests below drive
+    /// directly — the same shape `run_batch_impl` threads through every
+    /// flush.
+    fn flush_ctx<'a>(
+        broker: &'a InMemoryBroker,
+        topology: &'static QueueTopology,
+        queue: &'a Arc<QueueState>,
+        shutdown: &'a CancellationToken,
+    ) -> InMemoryFlushCtx<'a> {
+        InMemoryFlushCtx {
+            broker,
+            topology,
+            queue,
+            topic: topology.queue(),
+            group: None,
+            shutdown,
+            broker_shutdown: broker.shutdown_token(),
+            handler_timeout: None,
+            handler_timeout_outcome: None,
+        }
+    }
+
+    /// Both tokens already cancelled when the parked pre-handler drops are
+    /// published: `publish_parked`'s per-envelope pre-check must not hand
+    /// them back as 'unpublished' survivors, because the caller folds those
+    /// into the same requeue a `Redeliver` flush uses — onto a broker that is
+    /// already shutting down, where nothing drains the queue and its drop
+    /// destroys the message with no log and no count. Broker shutdown takes
+    /// precedence, exactly as it does inside `route_reject_or_survive`.
+    #[tokio::test]
+    async fn broker_shutdown_takes_precedence_in_the_parked_publish_pre_check() {
+        let broker = InMemoryBroker::with_config(InMemoryConfig {
+            default_capacity: 4,
+        });
+        let topology = dlq_topology();
+        let queue = broker.declare(topology.queue());
+        broker.declare(topology.dlq().expect("topology declares a DLQ"));
+
+        broker.shutdown();
+        let consumer_shutdown = CancellationToken::new();
+        consumer_shutdown.cancel();
+
+        let flush = flush_ctx(&broker, topology, &queue, &consumer_shutdown);
+        let mut parked = vec![(0u64, envelope(b"poison"), metrics::FailReason::Deserialize)];
+        let unpublished = publish_parked(&flush, &mut parked).await;
+        assert!(
+            unpublished.is_empty(),
+            "a parked drop cut after broker shutdown must be settled as \
+             lost, not handed back for a requeue onto the shut-down broker"
+        );
+    }
+
+    struct BatchRejectTopic;
+    impl Topic for BatchRejectTopic {
+        type Message = FifoMsg;
+        type Codec = JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            dlq_topology()
+        }
+    }
+
+    struct BatchRejectHandler;
+    impl BatchMessageHandler<BatchRejectTopic> for BatchRejectHandler {
+        type Context = ();
+        async fn handle_batch(&self, _: Vec<(FifoMsg, MessageMetadata)>, _: &()) -> Outcome {
+            Outcome::Reject
+        }
+    }
+
+    /// Broker shutdown landing before a rejected batch's `DeadLetter` loop
+    /// runs: the loop's per-envelope pre-check must not collect the handled
+    /// envelopes as 'unpublished' survivors for the requeue, for the same
+    /// reason as the parked pre-check above — the requeue lands on a queue
+    /// nothing drains, and the broker's `Arc<QueueState>` drop destroys the
+    /// messages silently. They are settled as lost instead.
+    #[tokio::test]
+    async fn broker_shutdown_takes_precedence_in_the_batch_reject_pre_check() {
+        let broker = InMemoryBroker::with_config(InMemoryConfig {
+            default_capacity: 4,
+        });
+        let topology = dlq_topology();
+        let queue = broker.declare(topology.queue());
+        broker.declare(topology.dlq().expect("topology declares a DLQ"));
+
+        let mut batch = InMemoryBatch::<BatchRejectTopic>::new(4);
+        let env = envelope(br#"{"id":1}"#);
+        batch.push(FifoMsg { id: 1 }, metadata_from(&env), env);
+        // The popped envelope's in-flight slot, normally taken by `pop_one`,
+        // released by the flush's own `release_in_flight`.
+        queue.in_flight.fetch_add(1, Ordering::Release);
+
+        broker.shutdown();
+        let consumer_shutdown = CancellationToken::new();
+
+        let flush = flush_ctx(&broker, topology, &queue, &consumer_shutdown);
+        let mut backoff = batch_redelivery_backoff();
+        flush_inmemory_batch(&flush, &BatchRejectHandler, &(), &mut batch, &mut backoff).await;
+
+        assert!(
+            queue.buffer.lock().await.is_empty(),
+            "a rejected batch envelope cut by broker shutdown must be \
+             settled as lost, not requeued onto the shut-down broker"
+        );
+    }
+
+    /// A survivor collected while the broker was still up must not be
+    /// requeued once broker shutdown lands before the post-drain requeue:
+    /// `run_concurrent_on`'s own prefetch gate shows nothing pops from the
+    /// queue after the broker token fires, so the requeue parks the message
+    /// where the broker's `Arc<QueueState>` drop destroys it with no log and
+    /// no count — while its earlier `survived()` verdict stands. It must be
+    /// settled as lost instead, with the held in-flight slot still released.
+    #[tokio::test]
+    async fn broker_shutdown_settles_collected_survivors_as_lost() {
+        let broker = InMemoryBroker::with_config(InMemoryConfig {
+            default_capacity: 4,
+        });
+        let topology = dlq_topology();
+        let queue = broker.declare(topology.queue());
+        broker.declare(topology.dlq().expect("topology declares a DLQ"));
+
+        // A survivor recorded earlier in the drain — its in-flight slot is
+        // still held, exactly as `drain_pending` leaves it.
+        queue.in_flight.fetch_add(1, Ordering::Release);
+        let survivors = vec![(envelope(b"survivor"), metrics::FailReason::Rejected)];
+
+        // Broker shutdown lands after the survivor was collected, before
+        // the post-drain requeue.
+        broker.shutdown();
+        requeue_survivors(&broker, &queue, topology, None, survivors, false).await;
+
+        assert!(
+            queue.buffer.lock().await.is_empty(),
+            "a survivor whose requeue lost the race against broker shutdown \
+             must be settled as lost, not requeued onto the shut-down broker"
+        );
+        assert_eq!(
+            queue.in_flight.load(Ordering::Acquire),
+            0,
+            "the survivor's held in-flight slot must still be released when \
+             it is settled as lost"
+        );
+    }
+
+    /// The batch-path twin of the survivor test above: entries collected for
+    /// the post-flush requeue (a pre-check cut or a lost publish race earlier
+    /// in the flush) must not be requeued once broker shutdown lands before
+    /// `requeue_unpublished` runs — same silent destruction, same fix:
+    /// settled as lost.
+    #[tokio::test]
+    async fn broker_shutdown_settles_collected_batch_survivors_as_lost() {
+        let broker = InMemoryBroker::with_config(InMemoryConfig {
+            default_capacity: 4,
+        });
+        let topology = dlq_topology();
+        let queue = broker.declare(topology.queue());
+        broker.declare(topology.dlq().expect("topology declares a DLQ"));
+
+        // The per-consumer cut that collected the entry earlier in the flush.
+        let consumer_shutdown = CancellationToken::new();
+        consumer_shutdown.cancel();
+        let unpublished = vec![Unpublished {
+            ordinal: 0,
+            envelope: envelope(b"survivor"),
+            reason: metrics::FailReason::Rejected,
+            failure_counted: true,
+        }];
+
+        // Broker shutdown lands after collection, before the requeue.
+        broker.shutdown();
+        let flush = flush_ctx(&broker, topology, &queue, &consumer_shutdown);
+        requeue_unpublished(&flush, unpublished).await;
+
+        assert!(
+            queue.buffer.lock().await.is_empty(),
+            "a batch survivor whose requeue lost the race against broker \
+             shutdown must be settled as lost, not requeued onto the \
+             shut-down broker"
+        );
     }
 }

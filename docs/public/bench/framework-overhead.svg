@@ -1,0 +1,127 @@
+<svg width="960" height="640" viewBox="0 0 960 640" xmlns="http://www.w3.org/2000/svg">
+<rect x="0" y="0" width="960" height="640" opacity="1" fill="#FCFCFB" stroke="none"/>
+<rect x="0" y="0" width="959" height="639" opacity="0.1" fill="none" stroke="#0B0B0B"/>
+<text x="24" y="18" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="20.967741935483872" opacity="1" fill="#0B0B0B">
+Framework overhead per message
+</text>
+<text x="24" y="48" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#52514E">
+in-process — 64 B payload — least-parallel per flow — what shove itself costs, broker removed —
+</text>
+<text x="24" y="67" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#52514E">
+lower is better
+</text>
+<text x="24" y="486" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+consume_batch: run_batch is implemented only for the Kafka backend; no other backend exposes a batch consume primitive
+</text>
+<text x="24" y="502" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+window under 1 s — too short for the throughput to be a rate, so no cost is published: publish_single (0.008 s),
+</text>
+<text x="24" y="518" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+publish_batch (0.007 s), consume_fifo (0.183 s), broadcast (0.115 s), dlq_drain (0.011 s)
+</text>
+<text x="24" y="534" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+measured at a pinned worker count: consumer_group at 2 workers
+</text>
+<text x="24" y="550" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+supervisor: not a separate measurement — the SQS spelling of consume_parallel (the same run primitive); see that
+</text>
+<text x="24" y="566" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+column
+</text>
+<text x="24" y="582" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
+Generated 2026-09-02T15:08:34Z — shove 0.14.0 — aarch64 (8c / 15 GB)
+</text>
+<text x="24" y="598" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
+aarch64 — 8 cores — 15 GB RAM — Ubuntu 24.04.4 LTS — rustc 1.91.1 (ed61e7d7e 2025-11-07) — handler: zero (no-op)
+</text>
+<text x="24" y="614" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
+10 recorded failure(s) in the dataset — see failures[]
+</text>
+<text x="16" y="278" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781" transform="rotate(270, 16, 278)">
+nanoseconds / message
+</text>
+<line opacity="1" stroke="#E1E0D9" stroke-width="1" x1="90" y1="441" x2="943" y2="441"/>
+<line opacity="1" stroke="#E1E0D9" stroke-width="1" x1="90" y1="407" x2="943" y2="407"/>
+<line opacity="1" stroke="#E1E0D9" stroke-width="1" x1="90" y1="373" x2="943" y2="373"/>
+<line opacity="1" stroke="#E1E0D9" stroke-width="1" x1="90" y1="339" x2="943" y2="339"/>
+<line opacity="1" stroke="#E1E0D9" stroke-width="1" x1="90" y1="305" x2="943" y2="305"/>
+<line opacity="1" stroke="#E1E0D9" stroke-width="1" x1="90" y1="271" x2="943" y2="271"/>
+<line opacity="1" stroke="#E1E0D9" stroke-width="1" x1="90" y1="236" x2="943" y2="236"/>
+<line opacity="1" stroke="#E1E0D9" stroke-width="1" x1="90" y1="202" x2="943" y2="202"/>
+<line opacity="1" stroke="#E1E0D9" stroke-width="1" x1="90" y1="168" x2="943" y2="168"/>
+<line opacity="1" stroke="#E1E0D9" stroke-width="1" x1="90" y1="134" x2="943" y2="134"/>
+<polyline fill="none" opacity="1" stroke="#C3C2B7" stroke-width="1" points="89,115 89,441 "/>
+<text x="80" y="441" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+0.0
+</text>
+<polyline fill="none" opacity="1" stroke="#C3C2B7" stroke-width="1" points="84,441 89,441 "/>
+<text x="80" y="407" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+2.0k
+</text>
+<polyline fill="none" opacity="1" stroke="#C3C2B7" stroke-width="1" points="84,407 89,407 "/>
+<text x="80" y="373" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+4.0k
+</text>
+<polyline fill="none" opacity="1" stroke="#C3C2B7" stroke-width="1" points="84,373 89,373 "/>
+<text x="80" y="339" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+6.0k
+</text>
+<polyline fill="none" opacity="1" stroke="#C3C2B7" stroke-width="1" points="84,339 89,339 "/>
+<text x="80" y="305" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+8.0k
+</text>
+<polyline fill="none" opacity="1" stroke="#C3C2B7" stroke-width="1" points="84,305 89,305 "/>
+<text x="80" y="271" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+10k
+</text>
+<polyline fill="none" opacity="1" stroke="#C3C2B7" stroke-width="1" points="84,271 89,271 "/>
+<text x="80" y="236" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+12k
+</text>
+<polyline fill="none" opacity="1" stroke="#C3C2B7" stroke-width="1" points="84,236 89,236 "/>
+<text x="80" y="202" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+14k
+</text>
+<polyline fill="none" opacity="1" stroke="#C3C2B7" stroke-width="1" points="84,202 89,202 "/>
+<text x="80" y="168" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+16k
+</text>
+<polyline fill="none" opacity="1" stroke="#C3C2B7" stroke-width="1" points="84,168 89,168 "/>
+<text x="80" y="134" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+18k
+</text>
+<polyline fill="none" opacity="1" stroke="#C3C2B7" stroke-width="1" points="84,134 89,134 "/>
+<rect x="220" y="322" width="24" height="119" opacity="1" fill="#2A78D6" stroke="none"/>
+<rect x="224" y="318" width="16" height="5" opacity="1" fill="#2A78D6" stroke="none"/>
+<circle cx="224" cy="322" r="4" opacity="1" fill="#2A78D6" stroke="none" stroke-width="0"/>
+<circle cx="240" cy="322" r="4" opacity="1" fill="#2A78D6" stroke="none" stroke-width="0"/>
+<text x="232" y="315" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+7.2k
+</text>
+<text x="516" y="435" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#52514E">
+n/s
+</text>
+<rect x="788" y="160" width="24" height="281" opacity="1" fill="#2A78D6" stroke="none"/>
+<rect x="792" y="156" width="16" height="5" opacity="1" fill="#2A78D6" stroke="none"/>
+<circle cx="792" cy="160" r="4" opacity="1" fill="#2A78D6" stroke="none" stroke-width="0"/>
+<circle cx="808" cy="160" r="4" opacity="1" fill="#2A78D6" stroke="none" stroke-width="0"/>
+<text x="800" y="153" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+17k
+</text>
+<text x="232" y="450" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#52514E">
+consume_parallel
+</text>
+<text x="516" y="450" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#52514E">
+consume_batch
+</text>
+<text x="800" y="450" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#52514E">
+consumer_group
+</text>
+<text x="517" y="470" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+flow
+</text>
+<rect x="94" y="96" width="14" height="8" opacity="1" fill="#2A78D6" stroke="none"/>
+<text x="114" y="93" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#52514E">
+inmemory — nanoseconds per message
+</text>
+</svg>
