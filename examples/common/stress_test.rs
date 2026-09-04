@@ -39,8 +39,8 @@ use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
@@ -63,6 +63,7 @@ use shove::{
     topic::{SequencedTopic as _, Topic},
     topology::{QueueTopology, SequenceFailure, TopologyBuilder},
 };
+use testcontainers::{ContainerAsync, Image};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -1107,6 +1108,129 @@ pub fn require_docker() {
             "Docker is required to run stress benchmarks. \
              Install Docker Desktop, colima, or podman and ensure the daemon is running."
         ),
+    }
+}
+
+// ── Container lifetime ──────────────────────────────────────────────────────
+
+type Reaper = Box<dyn FnOnce() + Send>;
+type ReaperSlot = Arc<std::sync::Mutex<Option<Reaper>>>;
+
+/// Reapers the `atexit` hook still has to run. A reaper is registered when its
+/// guard is created and emptied by whichever side gets to it first.
+static EXIT_REAPERS: std::sync::Mutex<Vec<ReaperSlot>> = std::sync::Mutex::new(Vec::new());
+static ATEXIT_REGISTERED: Once = Once::new();
+static ATEXIT_OK: AtomicBool = AtomicBool::new(false);
+
+/// Run every reaper a guard has not already run. Rust never runs destructors
+/// on `std::process::exit`, and this harness exits that way on a CLI refusal
+/// and on a failed results-file write — both after the backend's container is
+/// up. Registered with `libc::atexit`, which `process::exit` does honour.
+extern "C" fn reap_at_exit() {
+    let slots = match EXIT_REAPERS.lock() {
+        Ok(mut slots) => std::mem::take(&mut *slots),
+        Err(_) => return,
+    };
+    for slot in slots {
+        if let Some(reap) = slot.lock().ok().and_then(|mut s| s.take()) {
+            reap();
+        }
+    }
+}
+
+/// Runs its reaper exactly once: on drop, or from the `atexit` hook if the
+/// process leaves through `std::process::exit` first.
+struct ReapOnce {
+    slot: ReaperSlot,
+}
+
+impl ReapOnce {
+    fn new(reap: Reaper) -> Self {
+        ATEXIT_REGISTERED.call_once(|| {
+            // SAFETY: `reap_at_exit` is a plain `extern "C" fn()` with no
+            // arguments, exactly the signature `atexit` expects, and it only
+            // touches process-global statics that outlive every caller.
+            ATEXIT_OK.store(unsafe { libc::atexit(reap_at_exit) } == 0, Ordering::SeqCst);
+        });
+        let slot = Arc::new(std::sync::Mutex::new(Some(reap)));
+        if let Ok(mut slots) = EXIT_REAPERS.lock() {
+            slots.push(slot.clone());
+        }
+        Self { slot }
+    }
+}
+
+impl Drop for ReapOnce {
+    fn drop(&mut self) {
+        if let Some(reap) = self.slot.lock().ok().and_then(|mut s| s.take()) {
+            reap();
+        }
+    }
+}
+
+/// Owns a backend's testcontainer for the lifetime of a stress run and
+/// removes it when `main` returns, when a panic unwinds through it, and when
+/// the process leaves through `std::process::exit`. A signal's default action
+/// (SIGTERM, SIGQUIT, SIGKILL, an uncaught fatal signal) and `abort` run
+/// neither destructors nor `atexit` hooks, so they still leak.
+///
+/// Same shape as the shared-container cleanup in `tests/redis_integration.rs`:
+/// `ContainerAsync::rm()` runs synchronously on a fresh single-threaded
+/// runtime in a dedicated OS thread, so it neither re-enters the runtime the
+/// caller is tearing down nor depends on that runtime still being alive when
+/// the `atexit` hook fires. The guard does not lend the container back, so
+/// hand it over only after reading ports and running any setup `exec`s.
+///
+/// Call [`spawn_ctrlc_watcher`] before starting the container so a ctrl-c
+/// during startup is caught instead of taking SIGINT's default action.
+pub struct ContainerGuard {
+    _reap: ReapOnce,
+}
+
+impl ContainerGuard {
+    /// Fail-fast: with no exit hook the harness's refusal exits would leak the
+    /// container, so it is removed here and the process stops instead.
+    pub fn new<I: Image + Send + Sync + 'static>(container: ContainerAsync<I>) -> Self {
+        let reap = ReapOnce::new(Box::new(move || remove_container(container)));
+        if !ATEXIT_OK.load(Ordering::SeqCst) {
+            eprintln!(
+                "cannot register the container exit hook; removing the container and stopping"
+            );
+            drop(reap);
+            std::process::exit(1);
+        }
+        Self { _reap: reap }
+    }
+}
+
+fn remove_container<I: Image + Send + Sync + 'static>(container: ContainerAsync<I>) {
+    let id = container.id().to_string();
+    let worker = std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                // `ContainerAsync::drop` needs a runtime handle and would
+                // panic here; leaking the handle is the only way to leave
+                // the container in a state the hint can still fix.
+                eprintln!(
+                    "warning: could not build a runtime to remove container {id}: {e}\n  \
+                     remove it by hand: docker rm -f {id}"
+                );
+                std::mem::forget(container);
+                return;
+            }
+        };
+        runtime.block_on(async move {
+            if let Err(e) = container.rm().await {
+                eprintln!("warning: failed to remove container {id}: {e}\n  remove it by hand: docker rm -f {id}");
+            }
+        });
+    });
+    if worker.join().is_err() {
+        eprintln!("warning: the container removal thread panicked");
     }
 }
 
@@ -3872,15 +3996,55 @@ fn init_tracing() {
         .try_init();
 }
 
-fn spawn_ctrlc_watcher() -> CancellationToken {
-    let cancel = CancellationToken::new();
-    let clone = cancel.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        eprintln!("\ninterrupted, shutting down gracefully...");
-        clone.cancel();
-    });
-    cancel
+static CANCEL: OnceLock<CancellationToken> = OnceLock::new();
+
+/// Registers the OS-level ctrl-c handler as a side effect of construction,
+/// unlike `tokio::signal::ctrl_c()`, which registers on first poll.
+#[cfg(unix)]
+fn interrupt_listener() -> std::io::Result<tokio::signal::unix::Signal> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+}
+
+#[cfg(windows)]
+fn interrupt_listener() -> std::io::Result<tokio::signal::windows::CtrlC> {
+    tokio::signal::windows::ctrl_c()
+}
+
+/// Install the ctrl-c watcher and return the run's cancellation token.
+/// Idempotent: the first call installs the handler, every call returns the
+/// same token.
+///
+/// Call it before starting a container. Until the handler is installed SIGINT
+/// keeps its default action, which ends the process without running
+/// destructors or `atexit` hooks, so a ctrl-c during an image pull or a
+/// readiness wait would leak the container. The OS handler is registered
+/// synchronously, before this returns, so there is no window between the call
+/// and `start()`. Once installed, a ctrl-c only cancels the token: startup
+/// finishes, the run skips every scenario, the report is written and the
+/// container is removed.
+///
+/// Fail-fast: a process that cannot register the handler stops here, before
+/// it has a container to leak.
+pub fn spawn_ctrlc_watcher() -> CancellationToken {
+    CANCEL
+        .get_or_init(|| {
+            let mut interrupt = match interrupt_listener() {
+                Ok(listener) => listener,
+                Err(e) => {
+                    eprintln!("cannot register the ctrl-c handler: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let cancel = CancellationToken::new();
+            let clone = cancel.clone();
+            tokio::spawn(async move {
+                interrupt.recv().await;
+                eprintln!("\ninterrupted, shutting down gracefully...");
+                clone.cancel();
+            });
+            cancel
+        })
+        .clone()
 }
 
 /// Capability holes for a backend reachable through [`run_all_scenarios`]:
@@ -7540,5 +7704,150 @@ mod tests {
         assert!(err.contains("milliseconds"), "{err}");
         // Zero stays refused too — the parser owns the whole value contract.
         assert!(Cli::try_parse_from(["stress", "--batch-max-age-ms", "0"]).is_err());
+    }
+
+    // ── Container lifetime ──────────────────────────────────────────────
+
+    /// The reaper registry is process-global, so the in-process tests that
+    /// mutate it hold this for their whole body: under a threaded `cargo test`
+    /// one test's `reap_at_exit()` would otherwise run another's reaper.
+    static REAPER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serialize_reaper_test() -> std::sync::MutexGuard<'static, ()> {
+        REAPER_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn counting_reaper(hits: &Arc<std::sync::atomic::AtomicUsize>) -> Reaper {
+        let hits = hits.clone();
+        Box::new(move || {
+            hits.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+
+    #[test]
+    fn a_dropped_guard_reaps_exactly_once_and_the_exit_hook_does_not_repeat_it() {
+        let _serial = serialize_reaper_test();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard = ReapOnce::new(counting_reaper(&hits));
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reaps before drop");
+        drop(guard);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "drop reaps");
+        reap_at_exit();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the exit hook must find the slot already emptied by drop"
+        );
+    }
+
+    #[test]
+    fn the_exit_hook_reaps_a_guard_that_was_never_dropped() {
+        let _serial = serialize_reaper_test();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard = ReapOnce::new(counting_reaper(&hits));
+        std::mem::forget(guard);
+        reap_at_exit();
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the exit hook reaps");
+        reap_at_exit();
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "and only once");
+    }
+
+    /// Child half of [`process_exit_runs_the_reaper`]: only does anything when
+    /// the parent set the marker path, so the test runner sees it as a no-op.
+    #[test]
+    fn process_exit_reaper_child() {
+        let Ok(marker) = std::env::var("SHOVE_REAPER_MARKER") else {
+            return;
+        };
+        let _guard = ReapOnce::new(Box::new(move || {
+            std::fs::write(&marker, b"reaped").expect("write marker");
+        }));
+        // The refusal paths the guard exists for: `process::exit` never runs
+        // destructors, so only the atexit hook can reach the reaper.
+        std::process::exit(2);
+    }
+
+    /// Run one test of this binary in a child process, with `env` set. The
+    /// process-global side effects under test (an `atexit` hook firing, a
+    /// signal handler staying installed) must not leak into the parent.
+    fn run_child_test(name: &str, env: (&str, &std::ffi::OsStr)) -> std::process::ExitStatus {
+        let child_name = format!(
+            "{}::{name}",
+            module_path!()
+                .split_once("::")
+                .map(|(_, rest)| rest)
+                .unwrap_or(module_path!())
+        );
+        std::process::Command::new(std::env::current_exe().expect("current exe"))
+            .args(["--exact", &child_name, "--nocapture"])
+            .env(env.0, env.1)
+            .status()
+            .expect("spawn child test")
+    }
+
+    #[test]
+    fn process_exit_runs_the_reaper() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let marker = std::env::temp_dir().join(format!(
+            "shove-reaper-marker-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let status = run_child_test(
+            "process_exit_reaper_child",
+            ("SHOVE_REAPER_MARKER", marker.as_os_str()),
+        );
+        let reaped = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(reaped, "the atexit hook did not run the reaper before exit");
+        // libtest maps a non-zero child exit to a test failure, which is the
+        // parent's confirmation that the child really left through `exit(2)`
+        // rather than returning normally.
+        assert!(
+            !status.success(),
+            "child must have exited through process::exit"
+        );
+    }
+
+    /// Child half of [`the_ctrlc_watcher_is_live_on_return_and_shares_one_token`].
+    /// The handler must be live the moment `spawn_ctrlc_watcher` returns: a
+    /// SIGINT raised right after it, with no await in between, has to be
+    /// caught (an uninstalled handler would take the default action and kill
+    /// this process) and has to cancel the one shared token.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ctrlc_watcher_child() {
+        if std::env::var_os("SHOVE_CTRLC_CHILD").is_none() {
+            return;
+        }
+        let first = spawn_ctrlc_watcher();
+        let second = spawn_ctrlc_watcher();
+        assert!(!second.is_cancelled());
+        // SAFETY: `raise` is async-signal-safe and only targets this process.
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+        tokio::time::timeout(Duration::from_secs(5), first.cancelled())
+            .await
+            .expect("the watcher must cancel the token after SIGINT");
+        assert!(
+            second.is_cancelled(),
+            "an early caller and the run must share one token"
+        );
+    }
+
+    /// In a child process: the installed handler outlives the test, and a
+    /// threaded `cargo test` run must keep its own SIGINT disposition.
+    #[cfg(unix)]
+    #[test]
+    fn the_ctrlc_watcher_is_live_on_return_and_shares_one_token() {
+        let status = run_child_test("ctrlc_watcher_child", ("SHOVE_CTRLC_CHILD", "1".as_ref()));
+        assert!(
+            status.success(),
+            "child failed or was killed by SIGINT: {status}"
+        );
     }
 }

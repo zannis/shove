@@ -25,13 +25,18 @@
 //! - **Ordered collections only.** `BTreeMap`/`BTreeSet`, never `HashMap` —
 //!   hash iteration order changes the emitted element order run to run.
 //!
-//! ## Charts are theme-neutral by construction
+//! ## Every chart ships as a light/dark pair
 //!
-//! One file per family, legible on both a light and a dark page: the background
-//! is never painted, series are mid-tone, and no fill is white or near-black.
-//! The README is the binding constraint — crates.io renders it on a light
-//! background with no theme-switching mechanism, so `-dark` siblings would be
-//! files the README could never use.
+//! Each family renders twice — `<name>.svg` and `<name>-dark.svg` — from one
+//! render path parameterized by [`Mode`]. Both variants paint their own
+//! surface, so each file is self-contained on *any* page: the light file
+//! stays legible on crates.io (light-only) and docs.rs's dark theme alike,
+//! and the dark sibling exists for surfaces that can select it — GitHub's
+//! `<picture>`/`prefers-color-scheme`, and the docs site's theme toggle
+//! (which an `<img>`-embedded SVG's own media query could never follow; the
+//! embedder picks the file, the same way the repo's `-dark` logo assets
+//! work). Every color in a variant comes from that mode's validated palette,
+//! never from a mid-tone compromise between the two.
 
 #![allow(dead_code)]
 
@@ -39,6 +44,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
+use plotters::coord::cartesian::Cartesian2d;
+use plotters::coord::ranged1d::{Ranged, ValueFormatter};
+use plotters::coord::types::RangedCoordf64;
 use plotters::coord::{CoordTranslate, Shift};
 use plotters::prelude::*;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
@@ -847,15 +855,18 @@ impl Family {
 
     /// The filenames are deliberately stable: the docs and README pages that
     /// will embed these charts reference them by name, so a rename here is a
-    /// breaking change to those pages, not a refactor.
-    pub fn filename(self) -> &'static str {
-        match self {
-            Self::ThroughputVsConsumers => "throughput-vs-consumers.svg",
-            Self::ThroughputVsPayload => "throughput-vs-payload.svg",
-            Self::ParallelVsSequenced => "parallel-vs-sequenced.svg",
-            Self::DispatchLatency => "dispatch-latency.svg",
-            Self::FrameworkOverhead => "framework-overhead.svg",
-        }
+    /// breaking change to those pages, not a refactor. The dark variant is a
+    /// `-dark` sibling, matching how every other themed asset in
+    /// `docs/public/` names its pair.
+    pub fn filename(self, mode: Mode) -> String {
+        let stem = match self {
+            Self::ThroughputVsConsumers => "throughput-vs-consumers",
+            Self::ThroughputVsPayload => "throughput-vs-payload",
+            Self::ParallelVsSequenced => "parallel-vs-sequenced",
+            Self::DispatchLatency => "dispatch-latency",
+            Self::FrameworkOverhead => "framework-overhead",
+        };
+        format!("{stem}{}.svg", mode.file_suffix())
     }
 
     pub fn title(self) -> &'static str {
@@ -869,7 +880,7 @@ impl Family {
     }
 }
 
-// ── Style: mid-tone, background-agnostic ────────────────────────────────────
+// ── Style: one render path, two selected themes ─────────────────────────────
 
 pub const WIDTH: u32 = 960;
 /// Tall enough that a full caption block — every backend's declared holes,
@@ -882,13 +893,172 @@ pub const HEIGHT: u32 = 640;
 /// read is refused rather than published.
 pub const MIN_PLOT_PX: i32 = 150;
 
-/// Text and axis grey. Contrast is ~4.9:1 on white and ~3.6:1 on a typical dark
-/// page background — the best a single file can do without assuming one. All
-/// text is drawn at 14px or larger so the 3:1 large-text threshold applies on
-/// the dark side.
-const INK: RGBColor = RGBColor(0x6E, 0x76, 0x81);
-/// Grid lines: same hue, light enough not to compete with the series.
-const GRID: RGBColor = RGBColor(0x9A, 0xA1, 0xAA);
+/// Which of the two published variants is being rendered.
+///
+/// Everything color-shaped flows through the mode's [`Theme`]; layout, text
+/// content and enforcement semantics are mode-blind by construction, so the
+/// two variants can never disagree about *what* is published, only about the
+/// ink it is published in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Light,
+    Dark,
+}
+
+impl Mode {
+    /// Every mode, in generation order. Fixed, like [`Family::ALL`].
+    pub const ALL: [Mode; 2] = [Mode::Light, Mode::Dark];
+
+    fn theme(self) -> &'static Theme {
+        match self {
+            Mode::Light => &LIGHT,
+            Mode::Dark => &DARK,
+        }
+    }
+
+    /// The filename suffix that makes a family's dark sibling. Stated once,
+    /// here, so a light/dark pair can never drift apart letter by letter.
+    fn file_suffix(self) -> &'static str {
+        match self {
+            Mode::Light => "",
+            Mode::Dark => "-dark",
+        }
+    }
+
+    /// The series palette, public so the tests can assert that every fill in
+    /// a rendered variant comes from its mode's validated set.
+    pub fn series(self) -> [RGBColor; 8] {
+        self.theme().series
+    }
+
+    /// The surface plus the ink roles in fixed order — primary, secondary,
+    /// muted — public so the suite can hold a WCAG floor for every ink
+    /// against the surface it prints on: the whitelist proves a render uses
+    /// only the constants; it cannot catch a typo'd constant itself.
+    pub fn inks(self) -> (RGBColor, [RGBColor; 3]) {
+        let t = self.theme();
+        (t.surface, [t.primary, t.secondary, t.muted])
+    }
+
+    /// The pre-blended muted fills, one per series slot (what shape-only and
+    /// lower-bound bars actually wear) — public for the same reason as
+    /// [`Mode::inks`]: they are the lowest-contrast marks in the system and
+    /// need their own visibility floor.
+    pub fn muted_fills(self) -> [RGBColor; 8] {
+        let t = self.theme();
+        t.series.map(|c| t.blend_muted(c))
+    }
+
+    /// Every hex this mode is allowed to emit: the chrome roles, the series
+    /// slots, and the pre-blended muted fills. The whitelist test renders a
+    /// variant and refuses any color outside this set. Seeded from
+    /// [`Mode::inks`], [`Mode::series`] and [`Mode::muted_fills`] so the
+    /// role inventory is enumerated once — a colour this set knows about is
+    /// a colour the contrast floors also see.
+    pub fn allowed_hexes(self) -> BTreeSet<String> {
+        let t = self.theme();
+        let (surface, inks) = self.inks();
+        let mut set: BTreeSet<String> = [surface, t.grid, t.baseline]
+            .iter()
+            .chain(inks.iter())
+            .map(hex)
+            .collect();
+        for colour in self.series().iter().chain(self.muted_fills().iter()) {
+            set.insert(hex(colour));
+        }
+        set
+    }
+}
+
+/// The one spelling of a colour as uppercase hex (no `#`). Public so the
+/// suite compares colours through the same encoding the whitelist uses,
+/// never a re-spelled literal.
+pub fn hex(colour: &RGBColor) -> String {
+    format!("{:02X}{:02X}{:02X}", colour.0, colour.1, colour.2)
+}
+
+/// The color roles of one mode. Both instances come from the documented,
+/// validator-passed reference palette — light validated against `#fcfcfb`,
+/// dark against `#1a1a19`. The dark column is the same hues re-stepped for
+/// the dark surface, a *selected* palette, never an automatic flip.
+struct Theme {
+    /// The painted chart surface. Exactly one canvas-sized rect per file.
+    surface: RGBColor,
+    /// Title ink.
+    primary: RGBColor,
+    /// Read-out ink: subtitle, captions, category labels, bar value labels,
+    /// the rule-3 "n/s" markers, the refusal-panel sentence, legend text and
+    /// line end-labels. Anything a reader consults for meaning.
+    secondary: RGBColor,
+    /// Furniture ink: axis tick labels, axis descriptions, provenance lines,
+    /// end-label leaders. Present, recessive.
+    muted: RGBColor,
+    /// Hairline gridlines, one step off the surface.
+    grid: RGBColor,
+    /// The axis rule itself.
+    baseline: RGBColor,
+    /// Categorical slots 1–8, in the palette's fixed order. Assignment is by
+    /// entity (backend), never by iteration index — see [`backend_slots`].
+    series: [RGBColor; 8],
+}
+
+impl Theme {
+    /// A muted series fill (shape-only and lower-bound bars), pre-blended to
+    /// an opaque hex: 55% series over the surface. Opaque on purpose — the
+    /// rounded bar caps are same-color shape unions, and translucent fills
+    /// would compound to visible seams where the shapes overlap.
+    fn blend_muted(&self, colour: RGBColor) -> RGBColor {
+        let blend = |c: u8, s: u8| -> u8 {
+            let v = (u16::from(c) * 55 + u16::from(s) * 45 + 50) / 100;
+            // 0..=255 by construction (a convex blend of two u8), but the
+            // clamp keeps the cast checked rather than trusted.
+            u8::try_from(v).unwrap_or(u8::MAX)
+        };
+        RGBColor(
+            blend(colour.0, self.surface.0),
+            blend(colour.1, self.surface.1),
+            blend(colour.2, self.surface.2),
+        )
+    }
+}
+
+const LIGHT: Theme = Theme {
+    surface: RGBColor(0xFC, 0xFC, 0xFB),
+    primary: RGBColor(0x0B, 0x0B, 0x0B),
+    secondary: RGBColor(0x52, 0x51, 0x4E),
+    muted: RGBColor(0x89, 0x87, 0x81),
+    grid: RGBColor(0xE1, 0xE0, 0xD9),
+    baseline: RGBColor(0xC3, 0xC2, 0xB7),
+    series: [
+        RGBColor(0x2A, 0x78, 0xD6), // blue
+        RGBColor(0xEB, 0x68, 0x34), // orange
+        RGBColor(0x1B, 0xAF, 0x7A), // aqua
+        RGBColor(0xED, 0xA1, 0x00), // yellow
+        RGBColor(0xE8, 0x7B, 0xA4), // magenta
+        RGBColor(0x00, 0x83, 0x00), // green
+        RGBColor(0x4A, 0x3A, 0xA7), // violet
+        RGBColor(0xE3, 0x49, 0x48), // red
+    ],
+};
+
+const DARK: Theme = Theme {
+    surface: RGBColor(0x1A, 0x1A, 0x19),
+    primary: RGBColor(0xFF, 0xFF, 0xFF),
+    secondary: RGBColor(0xC3, 0xC2, 0xB7),
+    muted: RGBColor(0x89, 0x87, 0x81),
+    grid: RGBColor(0x2C, 0x2C, 0x2A),
+    baseline: RGBColor(0x38, 0x38, 0x35),
+    series: [
+        RGBColor(0x39, 0x87, 0xE5),
+        RGBColor(0xD9, 0x59, 0x26),
+        RGBColor(0x19, 0x9E, 0x70),
+        RGBColor(0xC9, 0x85, 0x00),
+        RGBColor(0xD5, 0x51, 0x81),
+        RGBColor(0x00, 0x83, 0x00),
+        RGBColor(0x90, 0x85, 0xE9),
+        RGBColor(0xE6, 0x67, 0x67),
+    ],
+};
 
 const FONT: &str = "sans-serif";
 /// Plotters treats these as points and emits roughly `0.806 x` in the SVG's
@@ -898,57 +1068,83 @@ const FONT: &str = "sans-serif";
 /// legible on both a light and a dark page.
 const TITLE_PX: i32 = 26;
 const LABEL_PX: i32 = 18;
-const FOOT_PX: i32 = 18;
-/// Bar value labels: ~12px rendered, the smallest size still legible on both
-/// backgrounds, so a value fits above a narrow grouped bar.
+/// Caption/footer text: ~12px rendered. Smaller than the old 18 on purpose —
+/// the caption block is contract prose, and at the old size it visually
+/// dominated the chart it captions (family 3's twelve lines pushed the plot
+/// toward the MIN_PLOT_PX floor). A consequence worth naming: a shorter
+/// footer means some documents that previously refused via the frame guard
+/// now render — the guard itself is unchanged, the refused set shrinks.
+const FOOT_PX: i32 = 15;
+/// Bar value labels: ~12px rendered, the smallest size still legible, so a
+/// value fits above a narrow grouped bar.
 const VALUE_PX: i32 = 15;
 
-/// The one mid-tone palette every chart draws from. None is white or
-/// near-black, so each reads against a light and a dark page — and because
-/// the backend legend and the per-family series index into the same values,
-/// one hue never means two different things across the five published SVGs.
-pub const PALETTE: [RGBColor; 6] = [
-    RGBColor(0x5B, 0x8F, 0xF9),
-    RGBColor(0xE8, 0x87, 0x3A),
-    RGBColor(0x3F, 0xA6, 0x5C),
-    RGBColor(0xC7, 0x5C, 0x5C),
-    RGBColor(0x9B, 0x6B, 0xD6),
-    RGBColor(0x2F, 0xA8, 0xA8),
+/// A series colour by index, for the fixed per-family series lists (family 3
+/// colors its three *modes*, family 5 its single series). Wraps
+/// deterministically rather than silently reusing the first hue — two series
+/// sharing a colour under distinct legend labels is a chart that cannot be
+/// read. (The fixed lists are 1–3 long; the wrap is a guard, not a plan.)
+fn palette_colour(mode: Mode, i: usize) -> RGBColor {
+    let series = mode.theme().series;
+    series[i % series.len()]
+}
+
+/// The fixed backend→slot map. Color follows the entity: a backend keeps its
+/// hue in every chart, in both modes, whatever else is or isn't plotted.
+const BACKEND_SLOTS: &[(&str, usize)] = &[
+    ("inmemory", 0),
+    ("kafka", 1),
+    ("nats", 2),
+    ("rabbitmq", 3),
+    ("redis", 4),
+    ("sqs", 5),
 ];
 
-/// A series colour by index, wrapping deterministically rather than silently
-/// reusing the first hue — two series sharing a colour under distinct legend
-/// labels is a chart that cannot be read.
-fn palette_colour(i: usize) -> RGBColor {
-    PALETTE[i % PALETTE.len()]
-}
-
-/// Mid-tone series colours keyed by backend.
-fn backend_colour(backend: &str) -> RGBColor {
-    match backend {
-        "inmemory" => PALETTE[0],
-        "kafka" => PALETTE[1],
-        "nats" => PALETTE[2],
-        "rabbitmq" => PALETTE[3],
-        "redis" => PALETTE[4],
-        "sqs" => PALETTE[5],
-        // Deterministic fallback for a backend key added after this file:
-        // a fixed hash of the name, never an iteration index.
-        other => {
-            let seed = other
-                .bytes()
-                .fold(17u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
-            RGBColor(
-                0x50u8.saturating_add((seed % 96) as u8),
-                0x60u8.saturating_add((seed / 96 % 96) as u8),
-                0x70u8.saturating_add((seed / 9216 % 96) as u8),
-            )
-        }
+/// Assign a palette slot to every backend that a line family will draw or
+/// name. Known backends take their fixed slot; a backend this file predates
+/// takes one of the two remaining slots (7 then 8, in `BTreeMap` order —
+/// stable within a document, though not across documents whose *other*
+/// unknowns differ). More than two unknowns is a loud error: the palette has
+/// eight validated hues and a ninth series color would have to be invented,
+/// which is exactly the improvised-hue failure the fixed map exists to
+/// prevent. The durable fix for a real new backend is a slot in
+/// [`BACKEND_SLOTS`], not a bigger escape hatch.
+fn backend_slots<'a, I>(backends: I) -> Result<BTreeMap<&'a str, usize>, ChartError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut slots = BTreeMap::new();
+    let mut next_overflow = BACKEND_SLOTS.len();
+    for backend in backends {
+        let slot = match BACKEND_SLOTS.iter().find(|(name, _)| *name == backend) {
+            Some((_, slot)) => *slot,
+            None => {
+                if next_overflow >= 8 {
+                    return Err(ChartError::Render(format!(
+                        "backend `{backend}` has no palette slot: the fixed map knows \
+                         {} backends and only two unknowns fit the remaining validated \
+                         hues — add the backend to BACKEND_SLOTS",
+                        BACKEND_SLOTS.len()
+                    )));
+                }
+                let slot = next_overflow;
+                next_overflow += 1;
+                slot
+            }
+        };
+        slots.insert(backend, slot);
     }
+    Ok(slots)
 }
 
-fn ink(px: i32) -> TextStyle<'static> {
-    (FONT, px).into_font().color(&INK)
+/// Read-out text: what a reader consults for meaning.
+fn secondary(mode: Mode, px: i32) -> TextStyle<'static> {
+    (FONT, px).into_font().color(&mode.theme().secondary)
+}
+
+/// Furniture text: axis ticks, descriptions, provenance.
+fn muted(mode: Mode, px: i32) -> TextStyle<'static> {
+    (FONT, px).into_font().color(&mode.theme().muted)
 }
 
 // ── How each backend is accounted for in a chart ────────────────────────────
@@ -1186,8 +1382,25 @@ fn fmt_count(v: f64) -> String {
         format!("{:.1}k", v / 1_000.0)
     } else if v >= 10.0 {
         format!("{v:.0}")
-    } else {
+    } else if v >= 0.95 || v <= 0.0 {
         format!("{v:.1}")
+    } else {
+        // Sub-unit values: one decimal renders every decade below 0.05 as
+        // the same "0.0" label, so print just enough decimals to name the
+        // value ("0.01", "0.001"). Past six decimals the decimal spelling
+        // (9+ chars) outgrows the space left of the axis — FRAME_MARGIN to
+        // the tick anchor at plot-left minus plotters' 10px label offset,
+        // ~64px at the ~8px/char the rendered LABEL_PX runs — and would
+        // clip at the viewBox; exponent form stays short and exact. The
+        // sub-unit tick test asserts the left-edge fit, so shrinking the
+        // y-label area breaks loudly rather than clipping silently.
+        let decades = -v.log10().floor();
+        if decades > 6.0 {
+            format!("{v:e}")
+        } else {
+            // 1..=6 by the branch above, so the cast is exact.
+            format!("{:.*}", decades as usize, v)
+        }
     }
 }
 
@@ -1210,15 +1423,16 @@ const LEGEND_ROW: i32 = 16;
 /// the chart's bottom margin plus the reserved gap.
 const PLOT_BOTTOM_GAP: i32 = 26 + 18;
 /// Baseline-to-baseline spacing for the footer lines.
-const LINE: i32 = 19;
+const LINE: i32 = 16;
 /// Characters per footer line.
 ///
 /// An estimate, not a measurement — and deliberately so. `plotters` runs
 /// without the `ttf` feature, so it has no real text metrics either, and an
-/// estimate is the thing that stays equal on every host. Derived from the
-/// usable width (`WIDTH - 2 * GUTTER`) over an average advance of ~0.52em at
-/// the rendered ~14.5px, rounded down for headroom.
-const NOTE_WRAP: usize = 108;
+/// estimate is the thing that stays equal on every host. At the rendered
+/// ~12.1px the usable width (`WIDTH - 2 * GUTTER`) over a ~0.52em average
+/// advance holds ~145 characters; 118 keeps ~150px of slack for wide
+/// fallback fonts (the overflow test checks the same extents at 0.55em).
+const NOTE_WRAP: usize = 118;
 
 /// Break a note across lines at word boundaries so a long `unsupported[]`
 /// reason cannot run off the canvas. A reason that leaves the page is the same
@@ -1271,54 +1485,128 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 /// `notes` carries the `Unsupported` / `NotMeasured` backends. They are printed
 /// as text rather than dropped, because a missing bar and a missing backend are
 /// indistinguishable to a reader otherwise.
+/// Characters per subtitle line — the subtitle renders at [`LABEL_PX`]
+/// (~14.5px), wider than the footer's type, so its wrap is tighter.
+const SUBTITLE_WRAP: usize = 100;
+/// Baseline-to-baseline spacing for wrapped subtitle lines.
+const SUBTITLE_LINE: i32 = 19;
+
+/// What `frame` proved about the canvas it framed: the extra top margin its
+/// wrapped subtitle consumed, and the vertical band `[band_top, band_bottom]`
+/// its guard proved free between the chrome and the footer. Consumers center
+/// or guard against THIS, never against a re-derivation of frame's
+/// internals — the re-derived copy is the one that drifts.
+struct FrameLayout {
+    subtitle_extra: i32,
+    band_top: i32,
+    band_bottom: i32,
+}
+
 fn frame<'b>(
     root: &DrawingArea<SVGBackend<'b>, Shift>,
     doc: &Document,
+    mode: Mode,
     title: &str,
     subtitle: &str,
     notes: &[String],
     legend_rows: i32,
-) -> Result<DrawingArea<SVGBackend<'b>, Shift>, ChartError> {
+) -> Result<(DrawingArea<SVGBackend<'b>, Shift>, FrameLayout), ChartError> {
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
-    // One legend row fits the band under the subtitle; every further row
-    // pushes the chart body down rather than overprinting the plot.
+    let theme = mode.theme();
+
+    // The surface: exactly one canvas-sized rect, in the mode's own surface
+    // color, so the file is self-contained on any page it is embedded in.
+    // The whitelist test counts on there being exactly one.
+    root.fill(&theme.surface).map_err(render)?;
+    // A hairline ring so the chart reads as a deliberate card where the page
+    // plane is close to the surface color. Alpha serializes as an `opacity`
+    // attribute, so the emitted hex stays the primary ink's.
+    root.draw(&Rectangle::new(
+        [(0, 0), (WIDTH as i32 - 1, HEIGHT as i32 - 1)],
+        ShapeStyle {
+            color: theme.primary.mix(0.10),
+            filled: false,
+            stroke_width: 1,
+        },
+    ))
+    .map_err(render)?;
+
+    // One legend row fits the band under the subtitle; every further row —
+    // and every wrapped subtitle line — pushes the chart body down rather
+    // than overprinting the plot.
     let legend_extra = LEGEND_ROW.saturating_mul(legend_rows.saturating_sub(1).max(0));
+    let subtitle_lines = wrap(subtitle, SUBTITLE_WRAP);
+    let subtitle_extra = SUBTITLE_LINE.saturating_mul(
+        i32::try_from(subtitle_lines.len())
+            .unwrap_or(i32::MAX)
+            .saturating_sub(1)
+            .max(0),
+    );
 
     root.draw_text(
         title,
-        &(FONT, TITLE_PX).into_font().color(&INK),
+        &(FONT, TITLE_PX).into_font().color(&theme.primary),
         (GUTTER, 18),
     )
     .map_err(render)?;
-    root.draw_text(subtitle, &ink(LABEL_PX), (GUTTER, 48))
+    for (i, line) in subtitle_lines.iter().enumerate() {
+        root.draw_text(
+            line,
+            &secondary(mode, LABEL_PX),
+            (
+                GUTTER,
+                48i32.saturating_add(
+                    SUBTITLE_LINE.saturating_mul(i32::try_from(i).unwrap_or(i32::MAX)),
+                ),
+            ),
+        )
         .map_err(render)?;
-
-    let mut footer: Vec<String> = notes.iter().flat_map(|n| wrap(n, NOTE_WRAP)).collect();
-    for line in provenance(doc) {
-        footer.extend(wrap(&line, NOTE_WRAP));
     }
 
-    // Lay the block out upward from a fixed bottom, so the last baseline plus
-    // its descender always clears the canvas edge.
+    // The footer: caption notes are read-outs (secondary ink), provenance is
+    // furniture (muted). Both wrap at the same width and share the upward
+    // layout from a fixed bottom, so the last baseline plus its descender
+    // always clears the canvas edge.
+    let mut footer: Vec<(String, bool)> = notes
+        .iter()
+        .flat_map(|n| wrap(n, NOTE_WRAP))
+        .map(|l| (l, false))
+        .collect();
+    for line in provenance(doc) {
+        footer.extend(wrap(&line, NOTE_WRAP).into_iter().map(|l| (l, true)));
+    }
+
     let bottom = HEIGHT as i32 - 26;
     let lines = i32::try_from(footer.len()).unwrap_or(i32::MAX);
     let top_of_footer = bottom.saturating_sub(LINE.saturating_mul(lines.saturating_sub(1)));
-    // The plot body runs from the chart area's top margin (70 + 26) to the
-    // footer top less the reserved gap and bottom margin (18 + 26); below
-    // MIN_PLOT_PX of that, the bars are slivers — and past zero plotters
-    // draws the plot over the legend rather than erroring. A document that
-    // gets here gets a loud refusal instead of a garbage chart. The refusal
-    // panel's sentence sits at y=140, above any footer top this permits.
-    if top_of_footer < PLOT_TOP.saturating_add(legend_extra) + MIN_PLOT_PX + PLOT_BOTTOM_GAP {
+    // The plot body runs from the chart area's top margin to the footer top
+    // less the reserved gap and bottom margin; below MIN_PLOT_PX of that, the
+    // bars are slivers — and past zero plotters draws the plot over the
+    // legend rather than erroring. A document that gets here gets a loud
+    // refusal instead of a garbage chart. The band this guard proves free is
+    // returned in `FrameLayout`; the refusal panel guards and centers
+    // against that, never against a copy of this arithmetic.
+    if top_of_footer
+        < PLOT_TOP
+            .saturating_add(legend_extra)
+            .saturating_add(subtitle_extra)
+            + MIN_PLOT_PX
+            + PLOT_BOTTOM_GAP
+    {
         return Err(ChartError::Render(format!(
             "the caption block ({} lines) leaves no room for the chart body",
             footer.len()
         )));
     }
-    for (i, line) in footer.iter().enumerate() {
+    for (i, (line, is_provenance)) in footer.iter().enumerate() {
+        let style = if *is_provenance {
+            muted(mode, FOOT_PX)
+        } else {
+            secondary(mode, FOOT_PX)
+        };
         root.draw_text(
             line,
-            &ink(FOOT_PX),
+            &style,
             (
                 GUTTER,
                 top_of_footer
@@ -1329,7 +1617,21 @@ fn frame<'b>(
     }
 
     let reserved = (HEIGHT as i32 - top_of_footer + 18).max(0) as u32;
-    Ok(root.margin((70 + legend_extra).max(0) as u32, reserved, 16, 16))
+    Ok((
+        root.margin(
+            (70 + subtitle_extra + legend_extra).max(0) as u32,
+            reserved,
+            FRAME_MARGIN as u32,
+            FRAME_MARGIN as u32,
+        ),
+        FrameLayout {
+            subtitle_extra,
+            band_top: PLOT_TOP
+                .saturating_add(legend_extra)
+                .saturating_add(subtitle_extra),
+            band_bottom: top_of_footer.saturating_sub(PLOT_BOTTOM_GAP),
+        },
+    ))
 }
 
 /// The notes line for each backend that is not plotted.
@@ -1534,6 +1836,7 @@ fn absolute_range(
     presences: &BTreeMap<String, Presence>,
 ) -> Result<Option<(f64, f64)>, ChartError> {
     let mut peak = f64::MIN;
+    let mut floor = f64::MAX;
     let mut seen = false;
     for presence in presences.values() {
         if let Presence::Absolute { points, .. } = presence {
@@ -1541,12 +1844,40 @@ fn absolute_range(
                 if *y > peak {
                     peak = *y;
                 }
+                if *y < floor {
+                    floor = *y;
+                }
                 seen = true;
             }
         }
     }
-    if seen && peak > 0.0 {
-        Ok(Some((0.0, headroom(peak, 1.12)?)))
+    if seen && peak > 0.0 && floor > 0.0 {
+        // The log axis's floor: the decade at or below the smallest plotted
+        // value, so the span is data-driven and never plotters' silent
+        // `end * 1e-5` clamp (which would give every chart five decades of
+        // dead space regardless of the data). `validate` rejects zero and
+        // negative throughput but accepts any positive finite value —
+        // subnormals included — so the representability checks below are
+        // load-bearing, not decoration. `y_lo <= floor <= peak < y_hi`
+        // makes the range strictly ordered.
+        let y_lo = 10f64.powf(floor.log10().floor());
+        if !y_lo.is_finite() || y_lo <= 0.0 {
+            return Err(ChartError::Render(format!(
+                "axis floor {floor:e} has no representable decade"
+            )));
+        }
+        let y_hi = headroom(peak, 1.12)?;
+        // The decade span must stay representable: past ~308 decades the
+        // ratio `y_hi / y_lo` overflows to +inf, the shape-only geometric
+        // mapping multiplies by it, and the i32 pixel cast saturates —
+        // a clean-looking SVG full of garbage coordinates (and plotters
+        // grinds through hundreds of decades of ticks on the way there).
+        if !(y_hi / y_lo).is_finite() {
+            return Err(ChartError::Render(format!(
+                "the axis span [{y_lo:e}, {y_hi:e}] covers more decades than can be drawn"
+            )));
+        }
+        Ok(Some((y_lo, y_hi)))
     } else {
         Ok(None)
     }
@@ -1578,13 +1909,25 @@ fn stroke(colour: RGBColor, width: u32) -> ShapeStyle {
 /// sizes, backends, flows). Plotters' own tick placement is continuous, so it
 /// would put labels between categories; positioning them from the chart's own
 /// coordinate mapping is what keeps a label under the bar it names.
-/// The centred label style shared by the category labels, both chart kinds'
-/// x-axis descriptions and the n/s markers.
-fn centred_label() -> TextStyle<'static> {
-    (FONT, LABEL_PX)
+/// A centred text style in an explicit ink. The callers pick the role:
+/// category labels and the rule-3 "n/s" markers are read-outs (secondary),
+/// the x-axis description is furniture (muted) — one shared style hid that
+/// distinction and had to go.
+fn centred(colour: RGBColor, px: i32) -> TextStyle<'static> {
+    (FONT, px)
         .into_font()
-        .color(&INK)
+        .color(&colour)
         .pos(Pos::new(HPos::Center, VPos::Top))
+}
+
+/// Category labels: identity read-outs under the plot.
+fn category_label(mode: Mode) -> TextStyle<'static> {
+    centred(mode.theme().secondary, LABEL_PX)
+}
+
+/// The x-axis description: axis furniture.
+fn x_desc_label(mode: Mode) -> TextStyle<'static> {
+    centred(mode.theme().muted, LABEL_PX)
 }
 
 /// Draw the x-axis description centred under the plot area — one
@@ -1592,6 +1935,7 @@ fn centred_label() -> TextStyle<'static> {
 fn draw_x_desc<CT>(
     root: &DrawingArea<SVGBackend<'_>, Shift>,
     chart: &ChartContext<'_, SVGBackend<'_>, CT>,
+    mode: Mode,
     x_desc: &str,
 ) -> Result<(), ChartError>
 where
@@ -1600,13 +1944,14 @@ where
     let px = chart.plotting_area().get_pixel_range();
     let (x0, x1) = (px.0.start, px.0.end);
     let y1 = px.1.end;
-    root.draw_text(x_desc, &centred_label(), ((x0 + x1) / 2, y1 + 28))
+    root.draw_text(x_desc, &x_desc_label(mode), ((x0 + x1) / 2, y1 + 28))
         .map_err(|e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string()))
 }
 
 fn draw_categories<CT>(
     root: &DrawingArea<SVGBackend<'_>, Shift>,
     chart: &ChartContext<'_, SVGBackend<'_>, CT>,
+    mode: Mode,
     labels: &[String],
 ) -> Result<(), ChartError>
 where
@@ -1614,7 +1959,7 @@ where
 {
     let area = chart.plotting_area();
     let y_bottom = area.get_pixel_range().1.end;
-    let style = centred_label();
+    let style = category_label(mode);
     for (i, label) in labels.iter().enumerate() {
         let (px, _) = area.map_coordinate(&(i as f64, 0.0));
         root.draw_text(label, &style, (px, y_bottom + 8))
@@ -1628,22 +1973,29 @@ where
 /// Where the legend starts.
 const LEGEND_ORIGIN: (i32, i32) = (94, 74);
 
-/// The estimated width of one legend entry. An estimate rather than a
-/// measurement: text extents are approximated (no ttf feature), and the
-/// estimate is what stays equal across hosts. Saturating: a document-supplied
-/// label has no length bound.
-fn legend_entry_width(label: &str) -> i32 {
+/// The estimated pixel width of a run of label-sized text: 9px per char. An
+/// estimate rather than a measurement — text extents are approximated (no
+/// ttf feature), and the estimate is what stays equal across hosts. One
+/// definition, shared by every fits-or-refuses gate (legend, end-label
+/// gutter, mid-chart labels), so the gates cannot disagree about the same
+/// string. Saturating: a document-supplied label has no length bound.
+fn text_px(label: &str) -> i32 {
     i32::try_from(label.chars().count())
         .unwrap_or(i32::MAX)
         .saturating_mul(9)
-        .saturating_add(44)
+}
+
+/// The estimated width of one legend entry: its text plus the swatch and
+/// inter-entry padding.
+fn legend_entry_width(label: &str) -> i32 {
+    text_px(label).saturating_add(44)
 }
 
 /// Lay the legend out into rows: `(row index, x)` per entry, and the row
 /// count. An entry that does not fit a row by itself has no legible place on
 /// this canvas and is refused rather than drawn off the edge.
 fn legend_layout(entries: &[(String, RGBColor)]) -> Result<(Vec<(i32, i32)>, i32), ChartError> {
-    let right_edge = WIDTH as i32 - 16;
+    let right_edge = WIDTH as i32 - FRAME_MARGIN;
     let mut x = LEGEND_ORIGIN.0;
     let mut row = 0i32;
     let mut slots = Vec::with_capacity(entries.len());
@@ -1664,16 +2016,24 @@ fn legend_layout(entries: &[(String, RGBColor)]) -> Result<(Vec<(i32, i32)>, i32
     Ok((slots, row.saturating_add(1)))
 }
 
+/// Draw the legend into the slots its caller already laid out — the caller
+/// needed `legend_layout` for the row count before framing, so the same
+/// slots are passed through rather than recomputed here.
 fn draw_legend(
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    mode: Mode,
     entries: &[(String, RGBColor)],
+    slots: &[(i32, i32)],
+    y_offset: i32,
 ) -> Result<(), ChartError> {
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
-    let (slots, _) = legend_layout(entries)?;
-    for ((label, colour), (row, x)) in entries.iter().zip(slots) {
+    for ((label, colour), (row, x)) in entries.iter().zip(slots.iter().copied()) {
         let y = LEGEND_ORIGIN
             .1
+            .saturating_add(y_offset)
             .saturating_add(LEGEND_ROW.saturating_mul(row));
+        // The swatch carries the series color; the label wears text ink —
+        // identity comes from the mark beside the text, never the text.
         root.draw(&Rectangle::new(
             [(x, y + 3), (x + 14, y + 11)],
             ShapeStyle {
@@ -1683,7 +2043,7 @@ fn draw_legend(
             },
         ))
         .map_err(render)?;
-        root.draw_text(label, &ink(LABEL_PX), (x + 20, y))
+        root.draw_text(label, &secondary(mode, LABEL_PX), (x + 20, y))
             .map_err(render)?;
     }
     Ok(())
@@ -1705,6 +2065,7 @@ const BASE_CONSUMERS: u32 = 1;
 fn render_throughput_vs_consumers(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    mode: Mode,
 ) -> Result<(), ChartError> {
     let in_slice = |r: &ScenarioResult| {
         canonical_flow(&r.flow) == HEADLINE_FLOW && r.payload_bytes == HEADLINE_PAYLOAD
@@ -1712,6 +2073,7 @@ fn render_throughput_vs_consumers(
     render_line_family(
         doc,
         root,
+        mode,
         Family::ThroughputVsConsumers.title(),
         &format!(
             "{} — {} payload — higher is better",
@@ -1738,6 +2100,7 @@ fn render_throughput_vs_consumers(
 fn render_throughput_vs_payload(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    mode: Mode,
 ) -> Result<(), ChartError> {
     let in_slice = |r: &ScenarioResult| {
         canonical_flow(&r.flow) == HEADLINE_FLOW && r.consumers == BASE_CONSUMERS
@@ -1745,6 +2108,7 @@ fn render_throughput_vs_payload(
     render_line_family(
         doc,
         root,
+        mode,
         Family::ThroughputVsPayload.title(),
         &format!("{HEADLINE_FLOW} — {BASE_CONSUMERS} consumer — higher is better"),
         "throughput-vs-payload",
@@ -1769,6 +2133,7 @@ fn render_throughput_vs_payload(
 fn render_line_family<K, P, KF, LF, FF, FK>(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    mode: Mode,
     title: &str,
     subtitle: &str,
     family_key: &'static str,
@@ -1880,6 +2245,7 @@ where
     line_chart(
         doc,
         root,
+        mode,
         title,
         subtitle,
         "messages / second",
@@ -1927,11 +2293,82 @@ where
     notes
 }
 
-/// Shared line-chart body for families 1 and 2.
+/// One plotted line: its identity, ink, pre-mapped points and weight class.
+/// Points are mapped into axis coordinates *before* the axis branch, so the
+/// log and linear branches share every drawing decision. `gutter_label` is
+/// decided once, from the raw points, where specs are built — gutter sizing
+/// and label placement both read it, so they cannot disagree.
+struct LineSpec {
+    backend: String,
+    colour: RGBColor,
+    gutter_label: bool,
+    points: Vec<(f64, f64)>,
+    shape_only: bool,
+}
+
+/// The frame's outer margin on the left and right canvas edges (the top
+/// carries the 70px title/legend band and the bottom the footer reserve —
+/// this is a horizontal bound only). Every horizontal fit check measures
+/// against this — never a re-spelled 16 that drifts when the frame is
+/// retuned.
+const FRAME_MARGIN: i32 = 16;
+
+/// The gap between a line's endpoint dot and its mid-chart end label.
+const END_LABEL_OFFSET: i32 = 8;
+
+/// Where a gutter label anchors, right of the plot edge.
+const GUTTER_LABEL_INSET: i32 = 10;
+/// Where a gutter leader starts, right of its endpoint dot — shared by the
+/// drawn stroke and the collision extent, which must describe the same ink.
+const LEADER_STUB: i32 = 6;
+/// The gap between a leader's end and its label's first character.
+const LEADER_END_GAP: i32 = 3;
+
+/// The end-label gutter's floor: room for the widest *fixed* backend name
+/// (8 chars at the 9px/char cross-host estimate) plus the leader stub and
+/// padding. The gutter grows beyond this to fit longer names — see
+/// `end_label_gutter`.
+const END_LABEL_GUTTER: i32 = 84;
+/// The anchor inset plus right padding around an end label inside the
+/// gutter. Derived from the inset so "the gutter fits every name it holds"
+/// is structural: a label spans [inset, inset + width] of a gutter at
+/// least [width + inset + 2] wide.
+const END_LABEL_PAD: i32 = GUTTER_LABEL_INSET + 2;
+/// The widest gutter a name may demand before the chart refuses: past a
+/// quarter of the canvas the plot body itself stops being legible.
+const END_LABEL_GUTTER_MAX: i32 = 240;
+
+/// The gutter width for this chart's plotted names: sized to its content
+/// with the legend's own 9px/char estimate, floored at [`END_LABEL_GUTTER`]
+/// (which keeps the fixed six backends' charts stable) and refused past the
+/// cap — the same fits-or-refuses contract `legend_layout` enforces, never
+/// a silent clip at the viewBox edge.
+fn end_label_gutter<'a, I>(plotted: I) -> Result<i32, ChartError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut gutter = END_LABEL_GUTTER;
+    for name in plotted {
+        let need = text_px(name).saturating_add(END_LABEL_PAD);
+        if need > END_LABEL_GUTTER_MAX {
+            return Err(ChartError::Render(format!(
+                "backend `{name}` needs a {need}px end-label gutter (cap \
+                 {END_LABEL_GUTTER_MAX}px) — it cannot be labelled legibly on this canvas"
+            )));
+        }
+        gutter = gutter.max(need);
+    }
+    Ok(gutter)
+}
+/// Minimum vertical spacing between end-labels, and (halved) the clearance
+/// that keeps a clamped label inside the plot band.
+const END_LABEL_SPACING: i32 = 14;
+
 #[allow(clippy::too_many_arguments)]
 fn line_chart(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    mode: Mode,
     title: &str,
     subtitle: &str,
     y_desc: &str,
@@ -1943,123 +2380,410 @@ fn line_chart(
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
     let mut notes = notes_for(doc, presences, x_desc);
     notes.extend_from_slice(extra_notes);
+    // Color follows the backend, through the fixed slot map — never the
+    // iteration index of whatever happens to be plotted. The lookup is total
+    // by construction (`slots` is built from the same keys iterated below),
+    // and if that invariant ever breaks it must break loudly: a silent
+    // fallback hue is exactly the two-series-one-colour failure the slot map
+    // exists to refuse.
+    let slots = backend_slots(presences.keys().map(String::as_str))?;
+    let colour_of = |backend: &str| -> Result<RGBColor, ChartError> {
+        let slot = slots.get(backend).copied().ok_or_else(|| {
+            ChartError::Render(format!(
+                "backend `{backend}` has no palette slot — colour_of only takes presence-map keys"
+            ))
+        })?;
+        Ok(palette_colour(mode, slot))
+    };
     // The legend is known before anything is drawn, and its row count
     // decides where the chart body starts.
-    let legend: Vec<(String, RGBColor)> = presences
-        .iter()
-        .map(|(backend, presence)| {
-            let label = match presence {
-                Presence::Absolute { points, .. } if points.len() == 1 => {
-                    format!("{backend} (single point)")
+    let mut legend: Vec<(String, RGBColor)> = Vec::new();
+    for (backend, presence) in presences {
+        let label = match presence {
+            Presence::Absolute { points, .. } if points.len() == 1 => {
+                format!("{backend} (single point)")
+            }
+            Presence::Absolute { .. } => backend.clone(),
+            Presence::ShapeOnly { .. } => format!("{backend} (shape only)"),
+            // A line chart has no slot to put the rule-3 marker in, so
+            // the legend is the axis-adjacent place a backend with no
+            // line must still appear — otherwise the plot reads as a
+            // smaller sweep and the caption is the only witness.
+            Presence::Unsupported(_) => format!("{backend} (n/s)"),
+            Presence::NotMeasured => format!("{backend} (not measured)"),
+            Presence::WithheldOnly(withheld) => {
+                if withheld.iter().all(|w| w.kind == WithheldKind::Failed) {
+                    format!("{backend} (failed)")
+                } else {
+                    format!("{backend} (withheld)")
                 }
-                Presence::Absolute { .. } => backend.clone(),
-                Presence::ShapeOnly { .. } => format!("{backend} (shape only)"),
-                // A line chart has no slot to put the rule-3 marker in, so
-                // the legend is the axis-adjacent place a backend with no
-                // line must still appear — otherwise the plot reads as a
-                // smaller sweep and the caption is the only witness.
-                Presence::Unsupported(_) => format!("{backend} (n/s)"),
-                Presence::NotMeasured => format!("{backend} (not measured)"),
-                Presence::WithheldOnly(withheld) => {
-                    if withheld.iter().all(|w| w.kind == WithheldKind::Failed) {
-                        format!("{backend} (failed)")
-                    } else {
-                        format!("{backend} (withheld)")
-                    }
-                }
-            };
-            (label, backend_colour(backend))
-        })
-        .collect();
-    let (_, legend_rows) = legend_layout(&legend)?;
-    let area = frame(root, doc, title, subtitle, &notes, legend_rows)?;
+            }
+        };
+        legend.push((label, colour_of(backend)?));
+    }
+    let (legend_slots, legend_rows) = legend_layout(&legend)?;
+    let (area, layout) = frame(root, doc, mode, title, subtitle, &notes, legend_rows)?;
 
     // Absolute magnitudes come only from representative runs. A shape-only
     // series is drawn against the same box but its values are fractions, so it
     // can never be read off the axis.
     let range = absolute_range(presences)?;
-    let absolute_axis = range.is_some();
-    let (y_lo, y_hi) = range.unwrap_or((0.0, 1.0));
 
-    let n = x_labels.len();
-    let mut chart = ChartBuilder::on(&area)
-        .margin_top(26)
-        .margin_bottom(26)
-        .x_label_area_size(0)
-        .y_label_area_size(74)
-        .build_cartesian_2d(-0.35f64..(n as f64 - 0.65), y_lo..y_hi)
-        .map_err(render)?;
-
-    chart
-        .configure_mesh()
-        .disable_x_mesh()
-        .light_line_style(GRID.mix(0.18))
-        .bold_line_style(GRID.mix(0.32))
-        .axis_style(stroke(GRID, 1))
-        .y_desc(if absolute_axis {
-            y_desc.to_string()
-        } else {
-            format!("{y_desc} (relative — no representative run)")
-        })
-        .y_label_style(ink(LABEL_PX))
-        .axis_desc_style(ink(LABEL_PX))
-        .y_label_formatter(&|v: &f64| fmt_count(*v))
-        .x_labels(0)
-        .x_label_formatter(&|_: &f64| String::new())
-        .draw()
-        .map_err(render)?;
-
+    // Map every series into axis coordinates up front, so the two axis
+    // branches below can never disagree about what is drawn — and decide
+    // HERE, once, from the raw points, whether each series' end label lives
+    // in the gutter. Gutter sizing below and label placement in the body
+    // both read `gutter_label`, so they can never disagree about membership.
+    let final_cat = x_labels.len().saturating_sub(1) as f64;
+    let ends_at_final = |points: &[(f64, f64)]| {
+        points
+            .last()
+            .is_some_and(|(x, _)| (*x - final_cat).abs() < f64::EPSILON)
+    };
+    let mut specs: Vec<LineSpec> = Vec::new();
     for (backend, presence) in presences {
-        let colour = backend_colour(backend);
         match presence {
-            Presence::Absolute { points, .. } => {
-                for run_pts in contiguous_runs(points) {
-                    chart
-                        .draw_series(LineSeries::new(run_pts.iter().copied(), stroke(colour, 3)))
-                        .map_err(render)?;
-                }
-                let dot = ShapeStyle {
-                    color: colour.to_rgba(),
-                    filled: true,
-                    stroke_width: 0,
-                };
-                chart
-                    .draw_series(points.iter().map(|(x, y)| Circle::new((*x, *y), 4, dot)))
-                    .map_err(render)?;
-            }
+            Presence::Absolute { points, .. } => specs.push(LineSpec {
+                backend: backend.clone(),
+                colour: colour_of(backend)?,
+                gutter_label: ends_at_final(points),
+                points: points.clone(),
+                shape_only: false,
+            }),
             Presence::ShapeOnly { points, .. } => {
-                // Fractions mapped onto the lower half of the box: the
+                // Fractions mapped onto the lower part of the box: the
                 // curve's shape is preserved, the magnitude is not
                 // recoverable — and a normalised peak drawn at the very top
-                // would tower over every real measurement. Gaps break the
-                // line here too (a bridged gap fabricates shape), and the
-                // dots keep a single-point series visible: a 1-point
-                // polyline renders nothing.
-                let mapped: Vec<(f64, f64)> = points
-                    .iter()
-                    .map(|(x, f)| (*x, y_lo + (y_hi - y_lo) * 0.45 * f))
-                    .collect();
-                for run_pts in contiguous_runs(&mapped) {
-                    chart
-                        .draw_series(LineSeries::new(run_pts.iter().copied(), stroke(colour, 2)))
-                        .map_err(render)?;
-                }
-                let dot = ShapeStyle {
-                    color: colour.to_rgba(),
-                    filled: true,
-                    stroke_width: 0,
+                // would tower over every real measurement. On the log axis
+                // the interpolation is geometric, which is what keeps the
+                // fraction linear in *position*: the point sits at 45%·f of
+                // the band's height exactly. `f ∈ (0, 1]` — a fraction of
+                // the series' own positive maximum — so the f = 0
+                // floor-marker edge is unreachable.
+                let mapped: Vec<(f64, f64)> = match range {
+                    Some((y_lo, y_hi)) => points
+                        .iter()
+                        .map(|(x, f)| (*x, y_lo * (y_hi / y_lo).powf(0.45 * f)))
+                        .collect(),
+                    None => points.iter().map(|(x, f)| (*x, 0.45 * f)).collect(),
                 };
-                chart
-                    .draw_series(mapped.iter().map(|(x, y)| Circle::new((*x, *y), 3, dot)))
-                    .map_err(render)?;
+                specs.push(LineSpec {
+                    backend: backend.clone(),
+                    colour: colour_of(backend)?,
+                    gutter_label: ends_at_final(points),
+                    points: mapped,
+                    shape_only: true,
+                });
             }
             Presence::Unsupported(_) | Presence::NotMeasured | Presence::WithheldOnly(_) => {}
         }
     }
 
-    draw_categories(root, &chart, x_labels)?;
-    draw_x_desc(root, &chart, x_desc)?;
-    draw_legend(root, &legend)?;
+    // The end-label gutter: carved out of the plot body, not the canvas, so
+    // the labels land between the plot and the frame's right margin — and
+    // sized to exactly the names it will hold. A series ending mid-chart
+    // labels at its endpoint (with its own fits-or-flips check in the
+    // body), so its name neither widens the gutter nor trips the cap.
+    let gutter = end_label_gutter(
+        specs
+            .iter()
+            .filter(|s| s.gutter_label)
+            .map(|s| s.backend.as_str()),
+    )?;
+    let area = area.margin(0, 0, 0, gutter);
+
+    let n = x_labels.len();
+    let x_range = -0.35f64..(n as f64 - 0.65);
+    // Only the y-range expression and the axis's self-description differ
+    // between the two axis shapes; the builder chrome is set once and the
+    // mesh chrome lives in `line_mesh`, so the branches cannot drift apart.
+    let mut builder = ChartBuilder::on(&area);
+    builder
+        .margin_top(26)
+        .margin_bottom(26)
+        .x_label_area_size(0)
+        .y_label_area_size(74);
+    match range {
+        Some((y_lo, y_hi)) => {
+            let mut chart = builder
+                .build_cartesian_2d(x_range, (y_lo..y_hi).log_scale())
+                .map_err(render)?;
+            // The axis names its own scale: a reader comparing line gaps
+            // must know they are ratios, not differences.
+            line_mesh(&mut chart, mode, format!("{y_desc} — log scale"))?;
+            line_chart_body(root, &mut chart, mode, &specs, x_labels, x_desc)?;
+        }
+        None => {
+            let mut chart = builder
+                .build_cartesian_2d(x_range, 0.0f64..1.0f64)
+                .map_err(render)?;
+            line_mesh(
+                &mut chart,
+                mode,
+                format!("{y_desc} (relative — no representative run)"),
+            )?;
+            line_chart_body(root, &mut chart, mode, &specs, x_labels, x_desc)?;
+        }
+    }
+    draw_legend(root, mode, &legend, &legend_slots, layout.subtitle_extra)?;
+    Ok(())
+}
+
+/// The line families' shared mesh chrome, generic over the y-axis for the
+/// same reason as `line_chart_body`: a styling tweak must be impossible to
+/// apply to only one of the log/linear branches.
+fn line_mesh<Y>(
+    chart: &mut ChartContext<'_, SVGBackend<'_>, Cartesian2d<RangedCoordf64, Y>>,
+    mode: Mode,
+    y_desc: String,
+) -> Result<(), ChartError>
+where
+    Y: Ranged<ValueType = f64> + ValueFormatter<f64>,
+{
+    let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
+    let theme = mode.theme();
+    chart
+        .configure_mesh()
+        .disable_x_mesh()
+        // Hairline gridlines at the labelled ticks only. On the log axis the
+        // minor lines would lay ~9 hairlines into every decade; a zero-alpha
+        // style is skipped by the backend entirely, so nothing is emitted.
+        .light_line_style(theme.grid.mix(0.0))
+        .bold_line_style(stroke(theme.grid, 1))
+        .axis_style(stroke(theme.baseline, 1))
+        .y_desc(y_desc)
+        .y_label_style(muted(mode, LABEL_PX))
+        .axis_desc_style(muted(mode, LABEL_PX))
+        .y_label_formatter(&|v: &f64| fmt_count(*v))
+        .x_labels(0)
+        .x_label_formatter(&|_: &f64| String::new())
+        .draw()
+        .map_err(render)?;
+    Ok(())
+}
+
+/// Everything a line chart draws inside (and around) the plot body, generic
+/// over the y-axis so the log and linear branches cannot drift apart.
+fn line_chart_body<Y>(
+    root: &DrawingArea<SVGBackend<'_>, Shift>,
+    chart: &mut ChartContext<'_, SVGBackend<'_>, Cartesian2d<RangedCoordf64, Y>>,
+    mode: Mode,
+    specs: &[LineSpec],
+    x_labels: &[String],
+    x_desc: &str,
+) -> Result<(), ChartError>
+where
+    Y: Ranged<ValueType = f64>,
+{
+    let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
+    let theme = mode.theme();
+
+    // Lines first, then markers, so every marker's surface ring reads over
+    // any line it crosses.
+    for spec in specs {
+        let width = if spec.shape_only { 1 } else { 2 };
+        for run_pts in contiguous_runs(&spec.points) {
+            chart
+                .draw_series(LineSeries::new(
+                    run_pts.iter().copied(),
+                    stroke(spec.colour, width),
+                ))
+                .map_err(render)?;
+        }
+    }
+    for spec in specs {
+        let radius = if spec.shape_only { 3 } else { 4 };
+        let dot = ShapeStyle {
+            color: spec.colour.to_rgba(),
+            filled: true,
+            stroke_width: 0,
+        };
+        let ring = ShapeStyle {
+            color: theme.surface.to_rgba(),
+            filled: true,
+            stroke_width: 0,
+        };
+        // The 2px surface ring keeps a marker legible where it crosses
+        // another line. A shape-only series stays second-class: thinner
+        // line, smaller dot, no ring. One batched call per series; the
+        // iterator keeps each ring immediately under its own dot.
+        chart
+            .draw_series(spec.points.iter().flat_map(|&(x, y)| {
+                let ring_element =
+                    (!spec.shape_only).then(|| Circle::new((x, y), radius + 2, ring));
+                ring_element
+                    .into_iter()
+                    .chain(std::iter::once(Circle::new((x, y), radius, dot)))
+            }))
+            .map_err(render)?;
+    }
+
+    // Direct end-labels: the identity relief the legend cannot give (a
+    // legend presupposes color-matching, which is exactly what sub-3:1
+    // contrast and CVD take away). Every plotted series gets its name once,
+    // at its line's end — in the gutter when the line reaches the final
+    // category; otherwise at its endpoint, extending right when the canvas
+    // has room, flipped to end just left of the dot when it does not, and
+    // refused loudly when neither side fits (a leader from a mid-chart
+    // endpoint into the gutter would read as the bridged line rule 2
+    // forbids).
+    let plot = chart.plotting_area().get_pixel_range();
+    let (plot_top, plot_bottom) = (plot.1.start, plot.1.end);
+    let (plot_left, plot_right) = (plot.0.start, plot.0.end);
+    let half = END_LABEL_SPACING / 2;
+    /// One placed end label: where its text anchors, which way it runs, and
+    /// the x-extent `[x0, x1]` it occupies for collision grouping. For a
+    /// gutter label the extent starts at its leader's origin, so the span
+    /// the sweep reasons about covers everything the mark actually draws —
+    /// x0/x1 are NOT derivable from `anchor_x` alone.
+    struct EndLabel {
+        backend: String,
+        endpoint: (i32, i32),
+        anchor_x: i32,
+        /// End-anchored — the text extends leftward from `anchor_x`.
+        flip: bool,
+        /// A gutter label, tied to its line by a leader stub.
+        leader: bool,
+        x0: i32,
+        x1: i32,
+        y: i32,
+    }
+    let mut labels: Vec<EndLabel> = Vec::new();
+    for spec in specs {
+        let Some((x, y)) = spec.points.last() else {
+            continue;
+        };
+        let (px, py) = chart.plotting_area().map_coordinate(&(*x, *y));
+        let w = text_px(&spec.backend);
+        let (anchor_x, flip, leader) = if spec.gutter_label {
+            // Always fits: the gutter was sized for every name it holds.
+            (plot_right.saturating_add(GUTTER_LABEL_INSET), false, true)
+        } else if px.saturating_add(END_LABEL_OFFSET).saturating_add(w)
+            <= WIDTH as i32 - FRAME_MARGIN
+        {
+            (px.saturating_add(END_LABEL_OFFSET), false, false)
+        } else if px.saturating_sub(END_LABEL_OFFSET).saturating_sub(w) >= plot_left {
+            // The flip must clear plot-left, not just the canvas: a label
+            // across the y-label band overprints the axis ticks.
+            (px.saturating_sub(END_LABEL_OFFSET), true, false)
+        } else {
+            return Err(ChartError::Render(format!(
+                "backend `{}`'s end label fits on neither side of its endpoint — \
+                 it cannot be labelled legibly on this canvas",
+                spec.backend
+            )));
+        };
+        let (x0, x1) = if leader {
+            // The leader is part of the mark: anything overlapping its span
+            // deconflicts vertically against this label too. A deliberate
+            // over-approximation — the drawn leader is a diagonal, and this
+            // models its whole span at the label's final y. Erring wide
+            // means MORE vertical separation, never ink overprint; the
+            // residual costs are a rare 14px displacement of a near-final
+            // mid-chart label, and a displaced stack's diagonal passing
+            // near a label the sweep considers separated — both cosmetic
+            // corners, accepted over modelling leaders as segment
+            // obstacles.
+            (px.saturating_add(LEADER_STUB), anchor_x.saturating_add(w))
+        } else if flip {
+            (anchor_x.saturating_sub(w), anchor_x)
+        } else {
+            (anchor_x, anchor_x.saturating_add(w))
+        };
+        labels.push(EndLabel {
+            backend: spec.backend.clone(),
+            endpoint: (px, py),
+            anchor_x,
+            flip,
+            leader,
+            x0,
+            x1,
+            y: py.clamp(plot_top + half, plot_bottom - half),
+        });
+    }
+    // Deterministic slot allocation, per collision component: two labels
+    // can only overprint when their x-extents (nearly) overlap, and
+    // displacing a label vertically away from an extent 700px distant
+    // detaches it from its leaderless dot — collision is geometry, never
+    // column identity (at a dense sweep the column pitch is narrower than
+    // a label). Components come from a sweep over the sorted extents; a
+    // gap under one character advance still counts as touching, because
+    // two labels that close at one y read as one run-on name. Within a
+    // component: order by desired y (name-tied), a forward pass pushing
+    // collisions down, a backward pass pulling the tail back above the
+    // bottom edge — and a loud refusal if the stack needs more height than
+    // the plot band has, instead of silently escaping into the chrome.
+    let touch_gap = text_px("m");
+    labels.sort_by(|a, b| (a.x0, a.y, a.backend.as_str()).cmp(&(b.x0, b.y, b.backend.as_str())));
+    let mut components: Vec<Vec<usize>> = Vec::new();
+    let mut max_x1 = i32::MIN;
+    for (i, label) in labels.iter().enumerate() {
+        match components.last_mut() {
+            Some(component) if label.x0 <= max_x1.saturating_add(touch_gap) => {
+                component.push(i);
+            }
+            _ => components.push(vec![i]),
+        }
+        max_x1 = max_x1.max(label.x1);
+    }
+    for idx in &mut components {
+        idx.sort_by(|&a, &b| {
+            (labels[a].y, labels[a].backend.as_str())
+                .cmp(&(labels[b].y, labels[b].backend.as_str()))
+        });
+        for k in 1..idx.len() {
+            let floor = labels[idx[k - 1]].y.saturating_add(END_LABEL_SPACING);
+            if labels[idx[k]].y < floor {
+                labels[idx[k]].y = floor;
+            }
+        }
+        if let Some(&last) = idx.last() {
+            labels[last].y = labels[last].y.min(plot_bottom - half);
+        }
+        for k in (0..idx.len().saturating_sub(1)).rev() {
+            let ceiling = labels[idx[k + 1]].y.saturating_sub(END_LABEL_SPACING);
+            if labels[idx[k]].y > ceiling {
+                labels[idx[k]].y = ceiling;
+            }
+        }
+        if let Some(&head) = idx.first()
+            && labels[head].y < plot_top + half
+        {
+            return Err(ChartError::Render(format!(
+                "{} end labels stack taller than the plot band — the chart \
+                 cannot label every series legibly",
+                idx.len()
+            )));
+        }
+    }
+    let rightward = (FONT, VALUE_PX)
+        .into_font()
+        .color(&theme.secondary)
+        .pos(Pos::new(HPos::Left, VPos::Center));
+    let leftward = (FONT, VALUE_PX)
+        .into_font()
+        .color(&theme.secondary)
+        .pos(Pos::new(HPos::Right, VPos::Center));
+    for label in &labels {
+        if label.leader {
+            // The leader ties the label to its line across the gutter; it
+            // never spans a category.
+            root.draw(&PathElement::new(
+                vec![
+                    (label.endpoint.0 + LEADER_STUB, label.endpoint.1),
+                    (label.anchor_x - LEADER_END_GAP, label.y),
+                ],
+                stroke(theme.muted, 1),
+            ))
+            .map_err(render)?;
+        }
+        let style = if label.flip { &leftward } else { &rightward };
+        root.draw_text(&label.backend, style, (label.anchor_x, label.y))
+            .map_err(render)?;
+    }
+
+    draw_categories(root, chart, mode, x_labels)?;
+    draw_x_desc(root, chart, mode, x_desc)?;
     Ok(())
 }
 
@@ -2104,6 +2828,7 @@ struct BarGroup {
 fn bar_chart(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    mode: Mode,
     title: &str,
     subtitle: &str,
     y_desc: &str,
@@ -2113,14 +2838,15 @@ fn bar_chart(
     notes: &[String],
 ) -> Result<(), ChartError> {
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
+    let theme = mode.theme();
     if groups.is_empty() {
         return Err(ChartError::NoDataForChart {
             family: "bar-chart",
             slice: title.to_string(),
         });
     }
-    let (_, legend_rows) = legend_layout(series)?;
-    let area = frame(root, doc, title, subtitle, notes, legend_rows)?;
+    let (legend_slots, legend_rows) = legend_layout(series)?;
+    let (area, layout) = frame(root, doc, mode, title, subtitle, notes, legend_rows)?;
 
     // Only representative groups set the scale, so a non-representative
     // magnitude can never be read off the axis. Lower-bound bars do
@@ -2167,16 +2893,18 @@ fn bar_chart(
     chart
         .configure_mesh()
         .disable_x_mesh()
-        .light_line_style(GRID.mix(0.18))
-        .bold_line_style(GRID.mix(0.32))
-        .axis_style(stroke(GRID, 1))
+        // Single-weight hairline grid at the labeled ticks only; a
+        // zero-alpha light style is skipped by the backend entirely.
+        .light_line_style(theme.grid.mix(0.0))
+        .bold_line_style(stroke(theme.grid, 1))
+        .axis_style(stroke(theme.baseline, 1))
         .y_desc(if absolute_axis {
             y_desc.to_string()
         } else {
             format!("{y_desc} (relative — no representative run)")
         })
-        .y_label_style(ink(LABEL_PX))
-        .axis_desc_style(ink(LABEL_PX))
+        .y_label_style(muted(mode, LABEL_PX))
+        .axis_desc_style(muted(mode, LABEL_PX))
         .y_label_formatter(&|v: &f64| fmt_count(*v))
         .x_labels(0)
         .x_label_formatter(&|_: &f64| String::new())
@@ -2187,14 +2915,18 @@ fn bar_chart(
     let slot = 0.76f64;
     let width = slot / series.len().max(1) as f64;
 
+    // The rule-3 marker is a read-out, not furniture: it is the explicit
+    // "this backend cannot do this" claim.
     let marker: TextStyle<'_> = (FONT, LABEL_PX)
         .into_font()
-        .color(&INK)
+        .color(&theme.secondary)
         .pos(Pos::new(HPos::Center, VPos::Bottom));
-    // Smaller than the axis labels so a value fits above a narrow bar.
+    // Smaller than the axis labels so a value fits above a narrow bar. In a
+    // static chart the value label is the only magnitude read-out, so it
+    // wears read-out ink, not furniture ink.
     let value_label: TextStyle<'_> = (FONT, VALUE_PX)
         .into_font()
-        .color(&INK)
+        .color(&theme.secondary)
         .pos(Pos::new(HPos::Center, VPos::Bottom));
 
     let shape_peak_across_groups = groups
@@ -2220,8 +2952,10 @@ fn bar_chart(
                 .fold(0.0f64, |a, b| a.max(b.value))
         };
         for (si, (_, colour)) in series.iter().enumerate() {
+            // Slots tile edge to edge in data space; the pixel-space
+            // inter-bar gap and thickness cap live in `draw_bar`.
             let left = gi as f64 - slot / 2.0 + width * si as f64;
-            let right = left + width * 0.86;
+            let right = left + width;
             let centre = (left + right) / 2.0;
             match group.bars.get(si).copied().flatten() {
                 Some(bar) => {
@@ -2239,23 +2973,18 @@ fn bar_chart(
                     } else {
                         bar.value
                     };
-                    chart
-                        .draw_series(std::iter::once(Rectangle::new(
-                            [(left, 0.0), (right, height)],
-                            ShapeStyle {
-                                // Muted fill for anything the axis numbers do
-                                // not fully describe: a normalised group, or a
-                                // lower-bound bar whose caption carries the ≥.
-                                color: if group.shape_only || bar.lower_bound {
-                                    colour.mix(0.55)
-                                } else {
-                                    colour.to_rgba()
-                                },
-                                filled: true,
-                                stroke_width: 0,
-                            },
-                        )))
-                        .map_err(render)?;
+                    // Muted fill for anything the axis numbers do not fully
+                    // describe: a normalised group, or a lower-bound bar
+                    // whose caption carries the ≥. Pre-blended to an opaque
+                    // hex — the rounded cap below is a same-color shape
+                    // union, and a translucent fill would compound to
+                    // visible seams where its shapes overlap.
+                    let fill = if group.shape_only || bar.lower_bound {
+                        theme.blend_muted(*colour)
+                    } else {
+                        *colour
+                    };
+                    draw_bar(root, &chart, (left, right), height, fill)?;
                     // Every published bar carries its value: one backend a
                     // decade faster than the rest scales a shared linear
                     // axis so the others are a few pixels tall, and a bar
@@ -2286,9 +3015,94 @@ fn bar_chart(
     }
 
     let labels: Vec<String> = groups.iter().map(|g| g.label.clone()).collect();
-    draw_categories(root, &chart, &labels)?;
-    draw_x_desc(root, &chart, x_desc)?;
-    draw_legend(root, series)?;
+    draw_categories(root, &chart, mode, &labels)?;
+    draw_x_desc(root, &chart, mode, x_desc)?;
+    draw_legend(root, mode, series, &legend_slots, layout.subtitle_extra)?;
+    Ok(())
+}
+
+/// The maximum bar thickness. A bar is a mark, not a block: past ~24px the
+/// leftover slot width becomes air, and a 180px saturated slab reads loud
+/// without saying anything more.
+const BAR_MAX_PX: i32 = 24;
+/// The surface-colored gap between adjacent bars in a group.
+const BAR_GAP_PX: i32 = 2;
+
+/// Draw one bar in pixel space: its slot is computed in data coordinates
+/// (which is where the grouping lives), then mapped through the plot's
+/// coordinate translation — the same mechanism the value labels and rule-3
+/// markers already use — so the thickness cap, the inter-bar gap and the
+/// rounded-cap radius are all real pixels, not data units that stretch with
+/// the axis.
+///
+/// The rounded data-end is a same-color shape union: a body rect up to
+/// `top + r`, two `r`-radius circles at the cap corners, and a cap band
+/// between them, overlapping by a pixel to kill anti-aliasing seams. The
+/// radius clamps continuously (`min(4, height/2, width/2)`) so a short or
+/// narrow bar degrades to square rather than switching styles mid-chart.
+/// The baseline end stays square.
+fn draw_bar<CT>(
+    root: &DrawingArea<SVGBackend<'_>, Shift>,
+    chart: &ChartContext<'_, SVGBackend<'_>, CT>,
+    (left, right): (f64, f64),
+    height: f64,
+    fill: RGBColor,
+) -> Result<(), ChartError>
+where
+    CT: CoordTranslate<From = (f64, f64)>,
+{
+    let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
+    let area = chart.plotting_area();
+    let (x0, base_y) = area.map_coordinate(&(left, 0.0));
+    let (x1, top_y) = area.map_coordinate(&(right, height));
+    // The slot in pixels, gap first, then the thickness cap; the bar is
+    // centred in what remains of its slot.
+    let slot_w = x1.saturating_sub(x0);
+    let w = slot_w.saturating_sub(BAR_GAP_PX).clamp(2, BAR_MAX_PX);
+    let cx = x0.saturating_add(slot_w / 2);
+    let bx0 = cx.saturating_sub(w / 2);
+    let bx1 = bx0.saturating_add(w);
+    let (top, bottom) = (top_y.min(base_y), base_y);
+    if bottom <= top {
+        // A zero-height bar draws nothing; the value label (or the shape-only
+        // caption) is the witness, exactly as before.
+        return Ok(());
+    }
+    let style = ShapeStyle {
+        color: fill.to_rgba(),
+        filled: true,
+        stroke_width: 0,
+    };
+    let bar_h = bottom.saturating_sub(top);
+    let r = 4.min(bar_h / 2).min(w / 2).max(0);
+    if r == 0 {
+        root.draw(&Rectangle::new([(bx0, top), (bx1, bottom)], style))
+            .map_err(render)?;
+    } else {
+        // Body below the cap line…
+        root.draw(&Rectangle::new(
+            [(bx0, top.saturating_add(r)), (bx1, bottom)],
+            style,
+        ))
+        .map_err(render)?;
+        // …the cap band between the corner circles (1px overlap downward)…
+        root.draw(&Rectangle::new(
+            [
+                (bx0.saturating_add(r), top),
+                (
+                    bx1.saturating_sub(r),
+                    top.saturating_add(r).saturating_add(1),
+                ),
+            ],
+            style,
+        ))
+        .map_err(render)?;
+        // …and the two rounded corners.
+        for ccx in [bx0.saturating_add(r), bx1.saturating_sub(r)] {
+            root.draw(&Circle::new((ccx, top.saturating_add(r)), r, style))
+                .map_err(render)?;
+        }
+    }
     Ok(())
 }
 
@@ -2318,11 +3132,12 @@ const MODES: &[(&str, &str, &str)] = &[
 fn render_parallel_vs_sequenced(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    render_mode: Mode,
 ) -> Result<(), ChartError> {
     let series: Vec<(String, RGBColor)> = MODES
         .iter()
         .enumerate()
-        .map(|(i, (_, _, label))| ((*label).to_string(), palette_colour(i)))
+        .map(|(i, (_, _, label))| ((*label).to_string(), palette_colour(render_mode, i)))
         .collect();
 
     let mut groups = Vec::new();
@@ -2594,6 +3409,7 @@ fn render_parallel_vs_sequenced(
     bar_chart(
         doc,
         root,
+        render_mode,
         Family::ParallelVsSequenced.title(),
         &format!(
             "{} payload — least-parallel measurement per mode — what ordering \
@@ -2628,9 +3444,11 @@ fn render_parallel_vs_sequenced(
 fn render_dispatch_latency(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    mode: Mode,
 ) -> Result<(), ChartError> {
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
-    let mut notes = vec![
+    let theme = mode.theme();
+    let notes = vec![
         "the v4 dispatch percentiles time publish → handler entry while the whole corpus \
          is published concurrently with the drain: under a saturated backlog that is queue \
          residency (median ≈ half the drain window), which scales with corpus size and the \
@@ -2652,34 +3470,73 @@ fn render_dispatch_latency(
             recorded.push(run.backend.as_str());
         }
     }
-    if !recorded.is_empty() {
-        notes.push(format!(
-            "percentiles recorded and withheld for: {}",
-            recorded.join(", ")
-        ));
-    }
-    if !unmeasured.is_empty() {
-        notes.push(format!(
-            "no measured rows in this document (nothing to withhold): {}",
-            unmeasured.join(", ")
-        ));
-    }
-    frame(
+    let (_, layout) = frame(
         root,
         doc,
+        mode,
         Family::DispatchLatency.title(),
         "v4's dispatch percentiles are not publishable as latency — see caption",
         &notes,
         0,
     )?;
-    root.draw_text(
-        "no publishable dispatch-latency measurement in this document",
-        &centred_label(),
-        // y=140: below the subtitle band, above the lowest footer top the
-        // frame guard permits, so the sentence can never be overprinted.
-        (WIDTH as i32 / 2, 140),
-    )
-    .map_err(render)?;
+    // The panel body: the refusal sentence plus the per-backend accounting,
+    // centered as a block inside the band the frame guard proves free of
+    // both the chrome above (PLOT_TOP shifted by any wrapped subtitle) and
+    // any permitted footer top below. The guard bounds the band, not the
+    // block — a block taller than the band is refused below, exactly as it
+    // was when these lines travelled through the footer and the caption
+    // guard counted them. Every line wraps at NOTE_WRAP (≤ ~810px wide), so
+    // a centered line spans at most [75, 885] and stays inside the canvas
+    // on both edges.
+    let mut body: Vec<(String, i32)> = vec![(
+        "no publishable dispatch-latency measurement in this document".to_string(),
+        LABEL_PX,
+    )];
+    if !recorded.is_empty() {
+        for line in wrap(
+            &format!(
+                "percentiles recorded and withheld for: {}",
+                recorded.join(", ")
+            ),
+            NOTE_WRAP,
+        ) {
+            body.push((line, FOOT_PX));
+        }
+    }
+    if !unmeasured.is_empty() {
+        for line in wrap(
+            &format!(
+                "no measured rows in this document (nothing to withhold): {}",
+                unmeasured.join(", ")
+            ),
+            NOTE_WRAP,
+        ) {
+            body.push((line, FOOT_PX));
+        }
+    }
+    // One spelling of the block's vertical rhythm: the guard measures the
+    // sum of exactly the advances the drawing loop takes (the sentence gets
+    // a little more air below it than the list lines), so retuning the air
+    // cannot desynchronise the guard from the ink.
+    let advance = |i: usize| -> i32 { if i == 0 { SUBTITLE_LINE + 6 } else { LINE } };
+    let block_h = (0..body.len()).fold(0i32, |h, i| h.saturating_add(advance(i)));
+    if block_h > layout.band_bottom.saturating_sub(layout.band_top) {
+        return Err(ChartError::Render(format!(
+            "the dispatch-latency accounting ({} lines) does not fit the refusal \
+             panel's band",
+            body.len()
+        )));
+    }
+    // Non-negative by the guard above — no clamp, so an overflow can never
+    // silently pin to band_top again.
+    let mut y =
+        layout.band_top + (layout.band_bottom - layout.band_top).saturating_sub(block_h) / 2;
+    for (i, (line, px)) in body.iter().enumerate() {
+        let style = centred(theme.secondary, *px);
+        root.draw_text(line, &style, (WIDTH as i32 / 2, y))
+            .map_err(render)?;
+        y = y.saturating_add(advance(i));
+    }
     Ok(())
 }
 
@@ -2688,6 +3545,7 @@ fn render_dispatch_latency(
 fn render_framework_overhead(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    mode: Mode,
 ) -> Result<(), ChartError> {
     let run = doc
         .runs
@@ -2697,7 +3555,7 @@ fn render_framework_overhead(
 
     let series: Vec<(String, RGBColor)> = vec![(
         format!("{IN_PROCESS_BACKEND} — nanoseconds per message"),
-        palette_colour(0),
+        palette_colour(mode, 0),
     )];
 
     // Every flow the schema knows about gets a column: the ones measured carry
@@ -2934,6 +3792,7 @@ fn render_framework_overhead(
     bar_chart(
         doc,
         root,
+        mode,
         Family::FrameworkOverhead.title(),
         &format!(
             "in-process — {} payload — least-parallel per flow — what shove \
@@ -2953,32 +3812,34 @@ fn render_framework_overhead(
 fn render_into(
     doc: &Document,
     family: Family,
+    mode: Mode,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
 ) -> Result<(), ChartError> {
     match family {
-        Family::ThroughputVsConsumers => render_throughput_vs_consumers(doc, root),
-        Family::ThroughputVsPayload => render_throughput_vs_payload(doc, root),
-        Family::ParallelVsSequenced => render_parallel_vs_sequenced(doc, root),
-        Family::DispatchLatency => render_dispatch_latency(doc, root),
-        Family::FrameworkOverhead => render_framework_overhead(doc, root),
+        Family::ThroughputVsConsumers => render_throughput_vs_consumers(doc, root, mode),
+        Family::ThroughputVsPayload => render_throughput_vs_payload(doc, root, mode),
+        Family::ParallelVsSequenced => render_parallel_vs_sequenced(doc, root, mode),
+        Family::DispatchLatency => render_dispatch_latency(doc, root, mode),
+        Family::FrameworkOverhead => render_framework_overhead(doc, root, mode),
     }
 }
 
-/// Render one family to an SVG string. This is what the tests assert against —
-/// the file-writing path below is the same code with a different sink.
-pub fn render_to_string(doc: &Document, family: Family) -> Result<String, ChartError> {
+/// Render one family, in one mode, to an SVG string. This is what the tests
+/// assert against — the file-writing path below is the same code with a
+/// different sink.
+pub fn render_to_string(doc: &Document, family: Family, mode: Mode) -> Result<String, ChartError> {
     validate(doc)?;
-    render_validated(doc, family)
+    render_validated(doc, family, mode)
 }
 
 /// The render body behind [`render_to_string`], for callers that have already
-/// validated — [`generate`] validates once for all five families rather than
+/// validated — [`generate`] validates once for all ten variants rather than
 /// re-walking every row per chart.
-fn render_validated(doc: &Document, family: Family) -> Result<String, ChartError> {
+fn render_validated(doc: &Document, family: Family, mode: Mode) -> Result<String, ChartError> {
     let mut buf = String::new();
     {
         let root = SVGBackend::with_string(&mut buf, (WIDTH, HEIGHT)).into_drawing_area();
-        render_into(doc, family, &root)?;
+        render_into(doc, family, mode, &root)?;
         root.present()
             .map_err(|e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string()))?;
     }
@@ -2996,12 +3857,14 @@ pub fn generate(doc: &Document, out_dir: &Path) -> Result<Vec<String>, ChartErro
     validate(doc)?;
     let mut rendered = Vec::new();
     for family in Family::ALL {
-        rendered.push((family.filename(), render_validated(doc, family)?));
+        for mode in Mode::ALL {
+            rendered.push((family.filename(mode), render_validated(doc, family, mode)?));
+        }
     }
     let mut written = Vec::new();
     for (filename, svg) in rendered {
-        std::fs::write(out_dir.join(filename), svg.as_bytes())?;
-        written.push(filename.to_string());
+        std::fs::write(out_dir.join(&filename), svg.as_bytes())?;
+        written.push(filename);
     }
     Ok(written)
 }

@@ -416,12 +416,29 @@ pub(crate) fn record_discarded(_: &str, _: Option<&str>, _: FailReason) {}
 ///
 /// Scope, in the two directions it is easy to get wrong:
 ///
-/// - **Not everything that discards is counted.** Kafka counts the
-///   terminal-outcome path only; its pre-handler rejections (oversize,
-///   deserialize failure) route to the DLQ without passing through here.
-///   RabbitMQ and the in-memory backend fold every terminal path — pre-handler
-///   included — into one reject helper, so they are complete. Treat the counter
-///   as a lower bound on dropped messages, not a total.
+/// - **Not everything that discards is counted — yet.** The contract is that
+///   a message dropped *before* the handler (oversize, undecodable, or a
+///   batch-accumulation drop) settles a discard under exactly the same rules
+///   as a post-handler terminal outcome: the increment lands iff the message
+///   is truly gone — no DLQ declared, or the DLQ publish failed — and the
+///   retirement was broker-acknowledged. Kafka (all three group-consume
+///   paths), RabbitMQ and the in-memory backend meet that contract on their
+///   **consume** paths: every drop between the topic and the handler is
+///   counted there. No backend's counter is complete outright, because the
+///   DLQ *drain* loops (`run_dlq`) sit outside the contract on all three: a
+///   dead message the drain cannot decode, or that fails its size gate, is
+///   retired with no discard accounting (`backends::kafka::consumer` and
+///   `backends::rabbitmq::consumer` drain arms,
+///   `backends::inmemory::consumer::run_dlq_impl`) — and a drained message
+///   never re-enters a DLQ, so dropping it there is final. NATS and Redis
+///   are further behind: their consume-path pre-handler drops still record
+///   only `messages_failed_total` (`backends::nats::consumer`
+///   oversize/deserialize sites and the batch ingest,
+///   `backends::redis::consumer` oversize/deserialize sites), so on those
+///   two the counter is a lower bound before the drain gap even enters into
+///   it. Read the counter as: complete for consume-path drops on Kafka,
+///   RabbitMQ and InMemory; a lower bound everywhere else, and on every
+///   `run_dlq` drain.
 /// - **Not every terminal outcome is a discard.** SNS/SQS deliberately never
 ///   calls this: its reject path deletes nothing, it makes the message visible
 ///   again for AWS-side redrive. See `backends::sns::router::route_reject`.
