@@ -496,10 +496,8 @@ impl_misbehaving_for!(PanicTopic, TimeoutDefaultTopic, TimeoutRejectTopic);
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn publish_seq<T>(
-    publisher: &Publisher<RabbitMqMarker>,
-    range: std::ops::Range<u32>,
-) where
+async fn publish_seq<T>(publisher: &Publisher<RabbitMqMarker>, range: std::ops::Range<u32>)
+where
     T: Topic<Message = BatchMessage>,
 {
     for seq in range {

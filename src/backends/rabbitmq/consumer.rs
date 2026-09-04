@@ -2819,8 +2819,7 @@ mod tests {
             fn topology() -> &'static crate::QueueTopology {
                 static TOPOLOGY: std::sync::OnceLock<crate::QueueTopology> =
                     std::sync::OnceLock::new();
-                TOPOLOGY
-                    .get_or_init(|| TopologyBuilder::new("rmq-batch-buf").build())
+                TOPOLOGY.get_or_init(|| TopologyBuilder::new("rmq-batch-buf").build())
             }
         }
 
@@ -2872,9 +2871,7 @@ mod tests {
             fn topology() -> &'static crate::QueueTopology {
                 static TOPOLOGY: std::sync::OnceLock<crate::QueueTopology> =
                     std::sync::OnceLock::new();
-                TOPOLOGY.get_or_init(|| {
-                    TopologyBuilder::new("rmq-batch-buf-prealloc").build()
-                })
+                TOPOLOGY.get_or_init(|| TopologyBuilder::new("rmq-batch-buf-prealloc").build())
             }
         }
 
