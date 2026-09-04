@@ -840,12 +840,142 @@ async fn discard_pre_handler(
     );
 }
 
+/// Terminal discards on the FIFO path whose settling commit has not landed
+/// yet, keyed by partition and offset.
+///
+/// The tracker-less twin of [`PartitionTracker::pending_discards`], holding
+/// the same contract: `messages_discarded_total` may only move once a
+/// broker-acknowledged commit has retired the offset. The FIFO loop tolerates
+/// a failed `Sync` commit (it warns and keeps consuming), and Kafka commits
+/// are *cumulative* — the next successful commit on the partition retires
+/// every earlier offset with it. So a discard whose own commit failed cannot
+/// be settled as survived on the spot: the message is only redelivered if no
+/// later commit covers it, which the loop cannot know yet. It parks here
+/// instead, and leaves in exactly two ways: covered by a later landed commit
+/// on its partition (`drain_covered` → confirm), or dropped when the
+/// partition is revoked (`drop_revoked`) or the loop exits — the message is
+/// then redelivered to whoever holds the partition next, an undercount, the
+/// safe direction (the redelivery re-counts it if it is dropped again).
+#[derive(Default)]
+struct FifoParkedDiscards {
+    map: HashMap<i32, BTreeMap<i64, TerminalDiscard>>,
+}
+
+impl FifoParkedDiscards {
+    fn park(&mut self, partition: i32, offset: i64, discard: TerminalDiscard) {
+        self.map
+            .entry(partition)
+            .or_default()
+            .insert(offset, discard);
+    }
+
+    fn has(&self, partition: i32) -> bool {
+        self.map.get(&partition).is_some_and(|m| !m.is_empty())
+    }
+
+    /// Discards retired by a landed commit of `offset` on `partition`
+    /// (`commit_message` commits `offset + 1`, so every parked entry at
+    /// `offset` or below is covered). Returned unsettled, exactly as
+    /// [`PartitionTracker::drain_committable`] hands its discards out: only
+    /// the caller knows the commit's result applies.
+    fn drain_covered(&mut self, partition: i32, offset: i64) -> Vec<TerminalDiscard> {
+        let Some(parked) = self.map.get_mut(&partition) else {
+            return Vec::new();
+        };
+        let remainder = parked.split_off(&(offset + 1));
+        let covered = std::mem::replace(parked, remainder);
+        covered.into_values().collect()
+    }
+
+    /// Drop every discard parked on a revoked partition: this assignment
+    /// epoch will never commit them, and whoever takes the partition over
+    /// redelivers from the last committed offset — the messages survive.
+    fn drop_revoked(&mut self, partitions: &[i32]) {
+        for partition in partitions {
+            if let Some(parked) = self.map.remove(partition) {
+                for discard in parked.into_values() {
+                    discard.survived();
+                }
+            }
+        }
+    }
+
+    /// Apply pending rebalance events: revokes drop their partitions' parked
+    /// discards. Assigns need nothing (a fresh assignment has nothing
+    /// parked), and `CommitFailed` only concerns async commits, which are
+    /// never issued while a partition has parked discards — see
+    /// [`commit_fifo_settling`].
+    fn apply_rebalance_events(&mut self, rx: &std_mpsc::Receiver<RebalanceEvent>) {
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                RebalanceEvent::Revoke(partitions) => self.drop_revoked(&partitions),
+                RebalanceEvent::Assign(_) | RebalanceEvent::CommitFailed(_) => {}
+            }
+        }
+    }
+}
+
+/// Commit a FIFO message and settle discard accounting against the broker's
+/// answer — the one place the FIFO loop's commits happen, so the settle rules
+/// cannot drift between its drop sites.
+///
+/// With no discard riding on this message and nothing parked on its
+/// partition, the commit stays `Async`, off the round-trip tax. Otherwise it
+/// is issued `Sync`, because the accounting needs the broker's answer: on
+/// success the message's own discard (if any) *and* every parked discard the
+/// cumulative commit covers are confirmed; on failure the discard is parked
+/// (see [`FifoParkedDiscards`]) rather than settled as survived — the loop
+/// keeps consuming, and the next landed commit on this partition would retire
+/// the offset anyway, counted or not.
+///
+/// The receive loop applies pending rebalance revokes before each message is
+/// processed (see `FifoParkedDiscards::apply_rebalance_events`), so a discard
+/// parked on a partition this member lost is not confirmed by a commit from
+/// the wrong assignment epoch (its message is already being redelivered
+/// elsewhere, and may be counted there); a revoke racing the current message
+/// is caught by the broker rejecting the commit itself.
+fn commit_fifo_settling(
+    consumer: &KafkaStreamConsumer,
+    msg: &BorrowedMessage<'_>,
+    queue: &str,
+    parked: &mut FifoParkedDiscards,
+    discard: Option<TerminalDiscard>,
+) {
+    let partition = msg.partition();
+    if discard.is_none() && !parked.has(partition) {
+        consumer.commit_message(msg, CommitMode::Async).ok();
+        return;
+    }
+    match consumer.commit_message(msg, CommitMode::Sync) {
+        Ok(()) => {
+            if let Some(discard) = discard {
+                discard.confirm();
+            }
+            for covered in parked.drain_covered(partition, msg.offset()) {
+                covered.confirm();
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                queue,
+                partition,
+                offset = msg.offset(),
+                error = %e,
+                "offset commit failed after a terminal drop; discard parked \
+                 until a later commit covers it or the partition is revoked"
+            );
+            if let Some(discard) = discard {
+                parked.park(partition, msg.offset(), discard);
+            }
+        }
+    }
+}
+
 /// Count and settle a FIFO message dropped before the handler. Retirement is
-/// unchanged — the offset is committed on every arm, as today — but the
+/// unchanged — the offset is committed on every arm, as today — and the
 /// commit that actually drops the message (no DLQ, or the DLQ publish failed)
-/// is issued `Sync` and settles the discard on the broker's answer, exactly
-/// as the FailAll cascade and the post-handler terminal path already do. The
-/// in-DLQ case stays on `Async`, off the round-trip tax.
+/// settles the discard through [`commit_fifo_settling`], exactly as the
+/// FailAll cascade and the post-handler terminal path do.
 #[allow(clippy::too_many_arguments)]
 async fn discard_pre_handler_fifo(
     client: &KafkaClient,
@@ -860,21 +990,23 @@ async fn discard_pre_handler_fifo(
     payload: &[u8],
     key: Option<&[u8]>,
     headers: &HashMap<String, String>,
+    parked: &mut FifoParkedDiscards,
 ) {
     let has_dlq = topology.dlq().is_some();
     let pending = metrics::record_terminal(topic, group, fail_reason, has_dlq);
     let discard = match publish_to_dlq(client, topology, payload, key, headers, dlq_reason).await {
         Ok(()) => match reject_settlement(has_dlq, true) {
             RejectSettlement::InDlq => {
-                // Settling now keeps the ordinary dead-letter path off the
-                // synchronous commit a pending record would force.
+                // The message is in the DLQ, so it exists whatever the commit
+                // does and `confirm` could never count it. Settle now; the
+                // commit helper still upgrades to `Sync` if this partition
+                // has parked discards a landed commit would cover.
                 pending.survived();
-                consumer.commit_message(msg, CommitMode::Async).ok();
-                return;
+                None
             }
             settled => {
                 debug_assert_eq!(settled, RejectSettlement::Retired);
-                TerminalDiscard::Retired(pending)
+                Some(TerminalDiscard::Retired(pending))
             }
         },
         Err(e) => {
@@ -882,25 +1014,10 @@ async fn discard_pre_handler_fifo(
             // `publish_to_dlq` is `Ok(())` when no DLQ is declared, so
             // reaching this arm at all means one was.
             debug_assert_eq!(reject_settlement(has_dlq, false), RejectSettlement::Lost);
-            TerminalDiscard::Lost(pending)
+            Some(TerminalDiscard::Lost(pending))
         }
     };
-    // No DLQ, or the DLQ publish failed: this commit is what actually drops
-    // the message, so it decides the discard accounting. `Async` only queues
-    // the request and reports nothing, so commit synchronously and settle on
-    // the broker's answer.
-    match consumer.commit_message(msg, CommitMode::Sync) {
-        Ok(()) => discard.confirm(),
-        Err(e) => {
-            tracing::warn!(
-                queue,
-                error = %e,
-                "offset commit failed after a pre-handler drop; the message \
-                 stays committed at its previous offset and is redelivered"
-            );
-            discard.survived();
-        }
-    }
+    commit_fifo_settling(consumer, msg, queue, parked, discard);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3847,9 +3964,14 @@ impl KafkaConsumer {
                 let poisoned = poisoned.clone();
                 async move {
                     // FIFO commits per message via commit_message and keeps no
-                    // offset tracker, so rebalance events are irrelevant — the
-                    // receiver is dropped deliberately.
-                    let (rebalance_tx, _) = std_mpsc::channel::<RebalanceEvent>();
+                    // offset tracker — but discards whose settling commit
+                    // failed park per partition until a later commit covers
+                    // them (see `FifoParkedDiscards`), and a parked discard
+                    // must not outlive its partition's assignment, so the
+                    // rebalance receiver is kept and drained by the commit
+                    // helper.
+                    let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
+                    let mut parked = FifoParkedDiscards::default();
                     let consumer = create_stream_consumer(
                         client.base_config(),
                         &group_id,
@@ -3880,6 +4002,12 @@ impl KafkaConsumer {
                                         ));
                                     }
                                 };
+
+                                // Revokes since the last message drop their
+                                // partitions' parked discards *before* any
+                                // commit this iteration could wrongly claim
+                                // them — see `commit_fifo_settling`'s doc.
+                                parked.apply_rebalance_events(&rebalance_rx);
 
                                 // perf-K-5: FIFO is sequential — msg lives through this whole
                                 // iteration (commit_message at the end), so use msg.payload()
@@ -3930,12 +4058,23 @@ impl KafkaConsumer {
                                         // message is redelivered rather than
                                         // silently dropped — the same
                                         // at-least-once rule the routing path
-                                        // below follows.
+                                        // below follows. But the loop keeps
+                                        // consuming, and a later commit on
+                                        // this partition retires the offset
+                                        // cumulatively — so the discard parks
+                                        // rather than settling as survived: if
+                                        // a landed commit does cover it, the
+                                        // message was dropped with no DLQ copy
+                                        // (`Lost`), and only then is counted.
                                         tracing::error!(
                                             error = %dlq_err,
                                             "failed to publish poisoned-key message to DLQ"
                                         );
-                                        pending.survived();
+                                        parked.park(
+                                            msg.partition(),
+                                            msg.offset(),
+                                            TerminalDiscard::Lost(pending),
+                                        );
                                         continue;
                                     }
                                     if topology.dlq().is_some() {
@@ -3951,30 +4090,29 @@ impl KafkaConsumer {
                                         // backlog through this branch, so a
                                         // per-message round trip is a far
                                         // heavier tax than on an ordinary
-                                        // terminal outcome.
+                                        // terminal outcome. (The commit helper
+                                        // still upgrades to `Sync` while this
+                                        // partition has parked discards.)
                                         pending.survived();
-                                        consumer.commit_message(&msg, CommitMode::Async).ok();
+                                        commit_fifo_settling(
+                                            &consumer,
+                                            &msg,
+                                            &queue,
+                                            &mut parked,
+                                            None,
+                                        );
                                         continue;
                                     }
                                     // No DLQ: this commit is what actually
                                     // drops the message, so it decides the
-                                    // discard accounting. `Async` only queues
-                                    // the request and reports nothing, so
-                                    // commit synchronously and settle on the
-                                    // broker's answer.
-                                    match consumer.commit_message(&msg, CommitMode::Sync) {
-                                        Ok(()) => pending.confirm(),
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                queue,
-                                                error = %e,
-                                                "offset commit failed after a poisoned-key \
-                                                 cascade; the message stays committed at its \
-                                                 previous offset and is redelivered"
-                                            );
-                                            pending.survived();
-                                        }
-                                    }
+                                    // discard accounting.
+                                    commit_fifo_settling(
+                                        &consumer,
+                                        &msg,
+                                        &queue,
+                                        &mut parked,
+                                        Some(TerminalDiscard::Retired(pending)),
+                                    );
                                     continue;
                                 }
 
@@ -3999,6 +4137,7 @@ impl KafkaConsumer {
                                         payload_bytes,
                                         key.as_deref(),
                                         &headers,
+                                        &mut parked,
                                     )
                                     .await;
                                     continue;
@@ -4045,6 +4184,7 @@ impl KafkaConsumer {
                                                 payload_bytes,
                                                 key.as_deref(),
                                                 &headers,
+                                                &mut parked,
                                             )
                                             .await;
                                             continue;
@@ -4069,6 +4209,7 @@ impl KafkaConsumer {
                                                 payload_bytes,
                                                 key.as_deref(),
                                                 &headers,
+                                                &mut parked,
                                             )
                                             .await;
                                             continue;
@@ -4097,6 +4238,7 @@ impl KafkaConsumer {
                                                 payload_bytes,
                                                 key.as_deref(),
                                                 &headers,
+                                                &mut parked,
                                             )
                                             .await;
                                             continue;
@@ -4131,6 +4273,7 @@ impl KafkaConsumer {
                                             payload_bytes,
                                             key.as_deref(),
                                             &headers,
+                                            &mut parked,
                                         )
                                         .await;
                                         continue;
@@ -4199,36 +4342,26 @@ impl KafkaConsumer {
                                 // shutdown is how at-least-once delivery survives
                                 // a missed delayed publish on the FIFO path.
                                 if route_ok {
-                                    match pending {
-                                        // A terminal outcome: this commit is
-                                        // what actually drops the message, so
-                                        // it decides the discard accounting.
-                                        // `Async` only queues the request and
-                                        // reports nothing, so commit
-                                        // synchronously here and settle on the
-                                        // broker's answer. Terminal outcomes
-                                        // are rare (rejected, or retries
-                                        // exhausted), so the extra round trip
-                                        // stays off the hot path.
-                                        Some(pending) => {
-                                            match consumer.commit_message(&msg, CommitMode::Sync) {
-                                                Ok(()) => pending.confirm(),
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        queue,
-                                                        error = %e,
-                                                        "offset commit failed after a terminal \
-                                                         outcome; the message stays committed at \
-                                                         its previous offset and is redelivered"
-                                                    );
-                                                    pending.survived();
-                                                }
-                                            }
-                                        }
-                                        None => {
-                                            consumer.commit_message(&msg, CommitMode::Async).ok();
-                                        }
-                                    }
+                                    // A terminal outcome (`Some`) rides its
+                                    // discard into the commit: the commit is
+                                    // what actually drops the message, so it
+                                    // decides the accounting. Terminal
+                                    // outcomes are rare (rejected, or retries
+                                    // exhausted), so the `Sync` round trip
+                                    // stays off the hot path — `None` commits
+                                    // `Async` unless parked discards need a
+                                    // broker-acknowledged cover.
+                                    commit_fifo_settling(
+                                        &consumer,
+                                        &msg,
+                                        &queue,
+                                        &mut parked,
+                                        // `route_outcome`'s FIFO terminal arm
+                                        // settles with plain `confirm`, i.e.
+                                        // `Retired`: counted iff no DLQ holds
+                                        // a copy.
+                                        pending.map(TerminalDiscard::Retired),
+                                    );
                                 }
                                 processing.store(false, Ordering::Release);
                             }
