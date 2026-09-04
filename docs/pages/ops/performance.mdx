@@ -6,9 +6,11 @@ Most `shove` performance questions resolve to four levers: prefetch count, worke
 
 Two conventions hold across every chart. A backend that cannot do a flow
 (`HasBroadcast` / `HasCoordinatedGroups` gate them at compile time) appears as
-an explicit "not supported" marker, never as a zero. And SQS is benched for
-shape only — it runs against LocalStack, so no absolute SQS number is
-published.
+an explicit "not supported" marker, never as a zero. And SQS is not measured
+in this document at all: it only runs against LocalStack (non-representative
+by design), which requires a LocalStack Pro auth token that was unavailable
+where these results were generated — the charts carry an explicit "not
+measured" note for it instead of a plotted series.
 
 ### Throughput vs consumer count
 
@@ -99,8 +101,8 @@ key:
 
 ```sh
 cargo run --release --example inmemory_stress --features inmemory -- \
-    --flow all --payload all --tier moderate --handler fast \
-    --consumers 1,8,32 --results-file benches/results/bench-results.json
+    --flow all --payload all --tier moderate --handler zero \
+    --consumers 1,2,4,8 --results-file benches/results/bench-results.json
 ```
 
 Repeat per backend with its example target and feature flag — note
