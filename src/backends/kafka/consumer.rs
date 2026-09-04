@@ -882,8 +882,14 @@ impl FifoParkedDiscards {
         let Some(parked) = self.map.get_mut(&partition) else {
             return Vec::new();
         };
-        let remainder = parked.split_off(&(offset + 1));
-        let covered = std::mem::replace(parked, remainder);
+        // A commit of `i64::MAX` covers every representable offset.
+        let covered = match offset.checked_add(1) {
+            Some(next) => {
+                let remainder = parked.split_off(&next);
+                std::mem::replace(parked, remainder)
+            }
+            None => std::mem::take(parked),
+        };
         covered.into_values().collect()
     }
 
@@ -5647,6 +5653,98 @@ mod offset_tracker_tests {
 /// committed once per iteration that advanced any offset — roughly once per
 /// message at speed — and consumer close then drained tens of thousands of
 /// in-flight commits for tens of seconds (CAF: post-cancel drain timeouts).
+#[cfg(test)]
+mod fifo_parked_discards_tests {
+    use super::*;
+
+    fn discard() -> TerminalDiscard {
+        TerminalDiscard::Retired(metrics::pending_discard(
+            "q",
+            None,
+            metrics::FailReason::Rejected,
+            false,
+        ))
+    }
+
+    /// A parked discard is handed back once a commit at (or past) its offset
+    /// lands on its partition — and not before. This is the cumulative-commit
+    /// contract: a failed `Sync` commit's discard must stay live, because the
+    /// next landed commit on the partition retires its offset with it.
+    #[test]
+    fn drain_covered_returns_only_covered_offsets() {
+        let mut parked = FifoParkedDiscards::default();
+        parked.park(0, 5, discard());
+        parked.park(0, 9, discard());
+
+        assert!(
+            parked.drain_covered(0, 4).is_empty(),
+            "a commit of offset 4 covers nothing parked"
+        );
+        assert_eq!(
+            parked.drain_covered(0, 5).len(),
+            1,
+            "a commit of offset 5 covers exactly the discard parked at 5"
+        );
+        assert!(parked.has(0), "offset 9 stays parked");
+        assert_eq!(parked.drain_covered(0, i64::MAX).len(), 1);
+        assert!(!parked.has(0));
+    }
+
+    /// Partitions are independent: a commit on one never claims another's
+    /// parked discards.
+    #[test]
+    fn drain_covered_is_scoped_to_the_partition() {
+        let mut parked = FifoParkedDiscards::default();
+        parked.park(0, 5, discard());
+        parked.park(1, 3, discard());
+
+        assert!(parked.drain_covered(1, 2).is_empty());
+        assert_eq!(parked.drain_covered(1, 3).len(), 1);
+        assert!(parked.has(0), "partition 0 is untouched");
+    }
+
+    /// A revoked partition's parked discards are dropped, never confirmed:
+    /// this assignment epoch will not commit them, and the redelivery under
+    /// the next assignment earns its own accounting — confirming here too
+    /// would double-count.
+    #[test]
+    fn revoke_drops_only_the_listed_partitions() {
+        let mut parked = FifoParkedDiscards::default();
+        parked.park(0, 5, discard());
+        parked.park(1, 3, discard());
+
+        parked.drop_revoked(&[0]);
+        assert!(!parked.has(0));
+        assert!(parked.has(1));
+        assert!(
+            parked.drain_covered(0, i64::MAX).is_empty(),
+            "a later commit cannot resurrect a revoked partition's discards"
+        );
+    }
+
+    /// The rebalance drain honours revokes and ignores assigns and async
+    /// commit-failure re-offers — async commits are never issued while a
+    /// partition has parked discards, so `CommitFailed` cannot concern them.
+    #[test]
+    fn apply_rebalance_events_drains_revokes_only() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut parked = FifoParkedDiscards::default();
+        parked.park(0, 1, discard());
+        parked.park(2, 1, discard());
+
+        tx.send(RebalanceEvent::Assign(vec![0])).unwrap();
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tx.send(RebalanceEvent::Revoke(vec![2])).unwrap();
+        parked.apply_rebalance_events(&rx);
+
+        assert!(
+            parked.has(0),
+            "assign/commit-failed must not drop partition 0"
+        );
+        assert!(!parked.has(2), "revoke drops partition 2");
+    }
+}
+
 #[cfg(test)]
 mod async_commit_gate_tests {
     use super::*;
