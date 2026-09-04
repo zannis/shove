@@ -427,7 +427,12 @@ fn bench_consume(c: &mut Criterion) {
     group.throughput(Throughput::Elements(CONSUME_MESSAGES));
     group.sampling_mode(SamplingMode::Flat);
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(15));
+    // The 5 s criterion default measurement window is deliberate. These
+    // groups used to set 15 s, and back-to-back no-op runs still moved
+    // 20-45% on the scheduler-bound ids: the variance is environmental,
+    // not sampling, so the extra 10 s per id bought precision the
+    // environment immediately discarded -- while tripling the wall-clock
+    // of the bench-tier-a CI leg that runs this suite on every PR.
 
     for bytes in PAYLOAD_SIZES {
         let msg = BenchMsg {
@@ -513,7 +518,6 @@ fn bench_consumer_group(c: &mut Criterion) {
     group.throughput(Throughput::Elements(CONSUME_MESSAGES));
     group.sampling_mode(SamplingMode::Flat);
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(15));
 
     for bytes in PAYLOAD_SIZES {
         let msg = BenchMsg {
@@ -575,7 +579,6 @@ fn bench_supervisor(c: &mut Criterion) {
     group.throughput(Throughput::Elements(CONSUME_MESSAGES));
     group.sampling_mode(SamplingMode::Flat);
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(15));
 
     let per_topic = CONSUME_MESSAGES / 4;
 
@@ -677,7 +680,6 @@ fn bench_broadcast(c: &mut Criterion) {
     group.throughput(Throughput::Elements(CONSUME_MESSAGES));
     group.sampling_mode(SamplingMode::Flat);
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(15));
 
     for bytes in PAYLOAD_SIZES {
         let msg = BenchMsg {
@@ -757,7 +759,6 @@ fn bench_dlq_drain(c: &mut Criterion) {
     group.throughput(Throughput::Elements(CONSUME_MESSAGES));
     group.sampling_mode(SamplingMode::Flat);
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(15));
 
     for bytes in PAYLOAD_SIZES {
         let msg = BenchMsg {
@@ -840,7 +841,6 @@ fn bench_route_outcome(c: &mut Criterion) {
     group.throughput(Throughput::Elements(CONSUME_MESSAGES));
     group.sampling_mode(SamplingMode::Flat);
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(15));
 
     let bytes = PAYLOAD_SIZES[0];
     let msg = BenchMsg {
