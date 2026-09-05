@@ -4,23 +4,28 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
 use crate::ConsumerOptions;
+use crate::backend::BatchConsumerOptionsInner;
 use crate::backend::ConsumerOptionsInner;
+use crate::backend::batch_consumer::{
+    BatchSettlement, PREALLOC_CAP, batch_redelivery_backoff, invoke_batch_handler,
+    next_redelivery_delay, settle_batch_outcome,
+};
 use crate::backend::consumer::ConsumerImpl;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
-use crate::handler::MessageHandler;
+use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::markers::Redis;
 use crate::metadata::MessageMetadata;
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::routing::{PoisonedKeys, RetryDecision, decide_retry, hold_index};
-use crate::topic::{SequencedTopic, Topic};
+use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::{HoldQueue, QueueTopology};
 
 use super::client::{RedisClient, RedisConnection};
@@ -217,6 +222,27 @@ impl RedisConsumer {
     {
         let options = crate::ConsumerOptions::<crate::Redis>::new().into_inner();
         <Self as ConsumerImpl>::run_dlq::<T, H>(self, handler, ctx, options).await
+    }
+
+    /// [`BatchConsumerImpl::run_batch`](crate::backend::BatchConsumerImpl)'s
+    /// delegate. No `validate_batch_topic` call here — mirrors InMemory's
+    /// `run_batch_with_inner`: this has exactly one caller,
+    /// `BatchConsumerImpl::run_batch`, itself only reachable through the
+    /// generic `BatchConsumer::run` wrapper, which already ran the guard.
+    /// Redis has no separate public inherent `run_batch` bypassing that
+    /// wrapper the way Kafka's does, so a second check here would only ever
+    /// repeat the first.
+    pub(super) fn run_batch_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: BatchConsumerOptionsInner,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: NotSequenced,
+        H: BatchMessageHandler<T>,
+    {
+        run_batch_impl::<T, H>(self.client.clone(), handler, ctx, options)
     }
 }
 
@@ -2112,6 +2138,833 @@ pub(super) fn hold_level<T>(retry_count: u32, hold_queues: &[T]) -> Option<usize
         None
     } else {
         Some(hold_index(retry_count, hold_queues.len()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batch consumption
+// ---------------------------------------------------------------------------
+//
+// `run_batch_impl` is a separate accumulation loop over its own
+// `XREADGROUP`, never the single-message loop above and never the
+// `RedisConsumerGroupRegistry::register` spawner — the non-concurrent
+// `COUNT 1` clamp (`consumer_group.rs::register`'s `effective_prefetch`)
+// lives in that spawner, so a loop that computes its own COUNT never passes
+// through it.
+//
+// # Why no per-entry lease during accumulation or flush
+//
+// The single-message path holds a lease (`super::lease`) for the duration of
+// one handler call so a foreign reaper cannot race the owner at the handler
+// timeout. Renewing N per-entry leases for a whole batch cycle would be N
+// `EVAL`s per renewal tick — instead this loop widens the *reclaim policy*
+// itself to cover the whole batch cycle (see `run_batch_impl`'s maintenance
+// interest, below) so this process's own sidecar cannot steal a live batch;
+// the ownership guard on every terminal pre-handler write and every
+// `DeadLetter` entry (`may_act_on_entry`, `leased: true` unconditionally)
+// covers foreign sidecars; and `Commit`'s `XACK` / `Redeliver`'s no-write are
+// intrinsically safe against a stolen entry (an `XACK` of a non-pending id is
+// a silent no-op). The reclaim-collision window this leaves is wider than
+// the leased single-message path's — accepted, and at-least-once holds
+// throughout exactly as it does everywhere else in this backend.
+//
+// # PEL replay metadata
+//
+// A history read (`XREADGROUP … STREAMS stream <id>` with `<id> != ">"`)
+// resets the entry's PEL idle clock and increments its server-side delivery
+// counter (visible via `XPENDING`), but leaves `x-retry-count` and
+// `redelivered` untouched — this backend has no `MaxDeliver` concept and
+// shove's Redis `MessageMetadata::delivery_count` is always `None` (see
+// `run_stream_loop_arc`'s comment on why). A `Redeliver` settlement is
+// therefore a re-buffer, matching Kafka's batch seek-back, not InMemory's
+// `mark_redelivery` — the same divergence
+// `src/backend/batch_consumer.rs`'s module doc already states for the
+// generic `Retry`/`Defer` table.
+//
+// # The no-lease design's wider reclaim window, restated precisely
+//
+// See `run_batch_impl`'s maintenance-interest doc for the exact policy this
+// loop registers, and its "without `handler_timeout`" caveat for the one
+// configuration where a dead or reconnected batch consumer's pending entries
+// can strand rather than reclaim.
+
+/// One buffered stream entry's metadata, kept index-parallel with the
+/// decoded message so a `DeadLetter` settlement (or the debug log on a
+/// partial `Commit` ack) can act on the exact bytes/headers/retry-count that
+/// arrived, without re-fetching anything.
+struct RedisBatchEntry {
+    entry_id: String,
+    /// Internal fields, WITH the payload re-inserted (mirrors every
+    /// single-message write-back site above) — `route_to_dlq` needs it to
+    /// write the DLQ copy.
+    fields: HashMap<String, String>,
+    user_headers: Arc<HashMap<String, String>>,
+    retry_count: u32,
+}
+
+/// One in-flight batch. Unlike InMemory's `InMemoryBatch`, there is no
+/// `dropped`/`parked` bookkeeping: a pre-handler drop on this backend settles
+/// immediately (acked or dead-lettered at drop time, never joining the
+/// batch — see the module doc), so `entries`/`messages` only ever hold
+/// entries the handler will actually see, and the size trigger is exactly
+/// `messages.len()`.
+struct RedisBatch<T: Topic> {
+    entries: Vec<RedisBatchEntry>,
+    /// Index-parallel with `entries`.
+    messages: Vec<(T::Message, MessageMetadata)>,
+}
+
+impl<T: Topic> RedisBatch<T> {
+    fn new(max_batch_size: usize) -> Self {
+        let cap = max_batch_size.min(PREALLOC_CAP);
+        Self {
+            entries: Vec::with_capacity(cap),
+            messages: Vec::with_capacity(cap),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        entry_id: String,
+        fields: HashMap<String, String>,
+        user_headers: Arc<HashMap<String, String>>,
+        retry_count: u32,
+        message: T::Message,
+        metadata: MessageMetadata,
+    ) {
+        self.entries.push(RedisBatchEntry {
+            entry_id,
+            fields,
+            user_headers,
+            retry_count,
+        });
+        self.messages.push((message, metadata));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.messages.clear();
+    }
+}
+
+/// Pure headroom computation for the batch's next `XREADGROUP COUNT`: the
+/// remaining room in the batch. Never zero in practice — the caller only
+/// reads when `buffered < max_batch_size` (the size trigger fires first
+/// otherwise) — but the subtraction is saturating regardless, so a caller
+/// error here can never wrap instead of clamping to zero.
+fn batch_headroom(max_batch_size: usize, buffered: usize) -> usize {
+    max_batch_size.saturating_sub(buffered)
+}
+
+/// Pure `BLOCK` computation for a live (`>`) `XREADGROUP` read: `BLOCK_MS`
+/// while no age deadline is armed (an empty buffer — nothing to time out
+/// yet), otherwise the smaller of `BLOCK_MS` and the time left until the
+/// deadline, floored at 1ms. `BLOCK 0` means "block forever" in Redis, so the
+/// floor is load-bearing, not a tuning nicety: a deadline that has *already*
+/// elapsed (this call is merely late reaching the server) must still block
+/// for a positive, if tiny, duration rather than hang the read indefinitely.
+fn batch_block_ms(deadline: Option<Instant>, now: Instant) -> u64 {
+    match deadline {
+        None => BLOCK_MS,
+        Some(d) => {
+            let remaining_ms = d.saturating_duration_since(now).as_millis();
+            let remaining_ms = u64::try_from(remaining_ms).unwrap_or(u64::MAX);
+            remaining_ms.clamp(1, BLOCK_MS)
+        }
+    }
+}
+
+/// Advance a PEL-replay cursor after a non-blocking history read. History
+/// reads are exclusive of the start id, so the next read must begin just
+/// past the last entry actually returned; an empty reply means the PEL is
+/// drained for now, so the caller switches back to live (`>`) reads.
+fn next_replay_cursor(entries: &[(String, Vec<(String, String)>)]) -> Option<String> {
+    entries.last().map(|(id, _)| id.clone())
+}
+
+/// Decode one XREADGROUP-returned entry and either push it onto `batch` or
+/// settle it immediately (acked or dead-lettered) before it ever joins one —
+/// the same pre-handler drop paths as `run_stream_loop_arc` (missing
+/// payload / oversize / undecodable), with two differences: `leased: true`
+/// is passed to `may_act_on_entry` unconditionally (a batch enters the PEL
+/// all at once but is inspected serially — see `may_act_on_entry`'s own doc
+/// — and copying the single-message `handler_timeout_outcome.is_some()`
+/// expression here would make the guard vacuous whenever no override is
+/// configured, the default), and there is no `FailAll`/poisoned-key handling
+/// (the batch path only accepts `NotSequenced` topics).
+#[allow(clippy::too_many_arguments)]
+async fn ingest_batch_entry<T: Topic>(
+    conn: &mut RedisConnection,
+    stream: &str,
+    group: &str,
+    consumer: &str,
+    entry_id: String,
+    fields_vec: Vec<(String, String)>,
+    topic_name: &str,
+    consumer_group: Option<&str>,
+    max_message_size: Option<usize>,
+    batch: &mut RedisBatch<T>,
+) -> Result<()> {
+    let (mut fields, user_headers) = partition_entry_fields(fields_vec);
+    let user_headers = Arc::new(user_headers);
+    let lease = lease::Lease {
+        stream,
+        group,
+        consumer,
+        entry_id: &entry_id,
+    };
+
+    let payload_raw = match fields.remove(PAYLOAD_FIELD) {
+        Some(s) => s,
+        None => {
+            if !may_act_on_entry(conn, &lease, true, &"missing-payload").await {
+                return Ok(());
+            }
+            tracing::warn!(entry_id, "missing payload field — acking and skipping");
+            match xack(conn, stream, group, &entry_id).await {
+                Ok(true) => metrics::record_failed(
+                    topic_name,
+                    consumer_group,
+                    metrics::FailReason::Malformed,
+                ),
+                Ok(false) => {
+                    tracing::debug!(
+                        entry_id,
+                        "corrupt entry was already retired by a reaper — not counting"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(entry_id, error = %e, "XACK failed after skipping corrupt entry");
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::Redis,
+                        metrics::BackendErrorKind::Ack,
+                    );
+                }
+            }
+            return Ok(());
+        }
+    };
+
+    // Same placement as every single-message site: before the size check, so
+    // an oversize payload still lands in the histogram.
+    metrics::record_message_size(topic_name, consumer_group, payload_raw.len());
+
+    let retry_count = fields
+        .get(X_RETRY_COUNT)
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+
+    if let Some(max) = max_message_size
+        && payload_raw.len() > max
+    {
+        if !may_act_on_entry(conn, &lease, true, &"oversize").await {
+            return Ok(());
+        }
+        tracing::warn!(
+            entry_id,
+            size = payload_raw.len(),
+            limit = max,
+            "message exceeds size limit — sending to DLQ"
+        );
+        metrics::record_failed(topic_name, consumer_group, metrics::FailReason::Oversize);
+        fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
+        let topology = T::topology();
+        route_to_dlq(
+            conn,
+            topology,
+            stream,
+            group,
+            &entry_id,
+            &fields,
+            &user_headers,
+            "oversize",
+            retry_count,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let msg: T::Message =
+        match <T::Codec as crate::Codec<T::Message>>::decode(payload_raw.as_bytes()) {
+            Ok(m) => m,
+            Err(e) => {
+                if !may_act_on_entry(conn, &lease, true, &"deserialize").await {
+                    return Ok(());
+                }
+                tracing::warn!(error = %e, entry_id, "deserialization failed — sending to DLQ");
+                metrics::record_failed(
+                    topic_name,
+                    consumer_group,
+                    metrics::FailReason::Deserialize,
+                );
+                fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
+                let topology = T::topology();
+                route_to_dlq(
+                    conn,
+                    topology,
+                    stream,
+                    group,
+                    &entry_id,
+                    &fields,
+                    &user_headers,
+                    "deserialize",
+                    retry_count,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+    let delivery_id = fields
+        .get(X_MESSAGE_ID)
+        .cloned()
+        .unwrap_or_else(|| entry_id.clone());
+    let meta = MessageMetadata {
+        retry_count,
+        delivery_id,
+        redelivered: retry_count > 0,
+        delivery_count: None,
+        headers: Arc::clone(&user_headers),
+    };
+
+    fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
+    batch.push(entry_id, fields, user_headers, retry_count, msg, meta);
+    Ok(())
+}
+
+/// Acknowledge a batch of entry ids in one round trip, reporting how many
+/// were actually removed from the PEL. Fewer than `entry_ids.len()` means a
+/// reaper already reclaimed and redelivered some of them before this call
+/// landed — the batch counterpart of `xack`'s single-entry signal — logged,
+/// never treated as a discard: every message here already ran through the
+/// handler successfully, so a partial ack is a reclaim race, not data loss.
+async fn xack_many(
+    conn: &mut RedisConnection,
+    stream: &str,
+    group: &str,
+    entry_ids: &[&str],
+) -> Result<i64> {
+    if entry_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut cmd = redis::cmd("XACK");
+    cmd.arg(stream).arg(group);
+    for id in entry_ids {
+        cmd.arg(*id);
+    }
+    conn.query::<i64>(&mut cmd)
+        .await
+        .map_err(|e| ShoveError::Connection(format!("XACK (batch) failed: {e}")))
+}
+
+/// What [`flush_redis_batch`] tells its caller about the flush that just ran.
+enum FlushOutcome {
+    /// The batch settled (however: `Commit`, `DeadLetter` or `Redeliver`) and
+    /// is now empty; the read loop may continue.
+    Flushed,
+    /// The batch resolved to `Redeliver` and, while backing off before the
+    /// next replay read, the shutdown token fired. The caller must return
+    /// `Ok(())` immediately rather than loop back — the un-acked batch stays
+    /// pending in the PEL for the reaper, exactly as a graceful shutdown
+    /// leaves it.
+    ShutdownDuringBackoff,
+}
+
+/// Hand the buffered batch to the handler and apply the single returned
+/// [`Outcome`] via the shared [`settle_batch_outcome`] classifier.
+///
+/// - **Commit**: one variadic [`xack_many`]. Resets `redelivery_backoff` and
+///   clears the batch.
+/// - **DeadLetter**: per message, in order — the ownership guard FIRST
+///   (`may_act_on_entry`, `leased: true` unconditionally; `false` skips that
+///   one entry, it is the reaper's now), then
+///   [`metrics::record_terminal`] and [`route_to_dlq`] with this entry's own
+///   `retry_count` as the death count. An `Err` from `route_to_dlq`
+///   propagates immediately (after `pending.survived()`) rather than
+///   continuing the batch — exactly like the single-message `Dlq` arm:
+///   continuing would hammer a dead connection, and the caller's
+///   `run_with_reconnect` wrapper is what recovers. Messages not yet
+///   processed at that point stay in the old consumer name's PEL for the
+///   reaper. On full success: resets backoff, clears the batch.
+/// - **Redeliver** (`Retry`/`Defer`): no ack at all — the whole batch stays
+///   pending. Draws the shared redelivery backoff, `select!`s the delay
+///   against shutdown (shutdown wins ⇒ [`FlushOutcome::ShutdownDuringBackoff`],
+///   entries stay pending — the reaper is the crash/stop safety net), then
+///   arms `*replay_cursor = Some("0")` and clears the batch so the next read
+///   drains the PEL from the start instead of hoping the live `>` cursor
+///   happens to redeliver it. Backoff is deliberately NOT reset here.
+#[allow(clippy::too_many_arguments)]
+async fn flush_redis_batch<T, H>(
+    conn: &mut RedisConnection,
+    topology: &'static QueueTopology,
+    stream: &str,
+    group: &str,
+    consumer: &str,
+    handler: &H,
+    ctx: &H::Context,
+    batch: &mut RedisBatch<T>,
+    handler_timeout: Option<Duration>,
+    handler_timeout_outcome: Option<Outcome>,
+    topic_name: &str,
+    consumer_group: Option<&str>,
+    redelivery_backoff: &mut Backoff,
+    replay_cursor: &mut Option<String>,
+    shutdown: &CancellationToken,
+) -> Result<FlushOutcome>
+where
+    T: Topic,
+    H: BatchMessageHandler<T>,
+{
+    if batch.is_empty() {
+        return Ok(FlushOutcome::Flushed);
+    }
+    let batch_size = batch.len();
+    let messages = std::mem::take(&mut batch.messages);
+
+    let outcome = invoke_batch_handler(
+        || handler.handle_batch(messages, ctx),
+        handler_timeout,
+        handler_timeout_outcome,
+        topic_name,
+        consumer_group,
+        batch_size as u64,
+    )
+    .await;
+
+    match settle_batch_outcome(&outcome) {
+        BatchSettlement::Commit => {
+            let ids: Vec<&str> = batch.entries.iter().map(|e| e.entry_id.as_str()).collect();
+            match xack_many(conn, stream, group, &ids).await {
+                Ok(acked) if (acked as usize) < ids.len() => {
+                    tracing::debug!(
+                        stream,
+                        acked,
+                        expected = ids.len(),
+                        "batch XACK acked fewer entries than requested — a reaper already retired some"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(stream, error = %e, "batch XACK failed");
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::Redis,
+                        metrics::BackendErrorKind::Ack,
+                    );
+                }
+            }
+            *redelivery_backoff = batch_redelivery_backoff();
+            batch.clear();
+            Ok(FlushOutcome::Flushed)
+        }
+        BatchSettlement::DeadLetter => {
+            let has_dlq = topology.dlq().is_some();
+            for entry in batch.entries.drain(..) {
+                let lease = lease::Lease {
+                    stream,
+                    group,
+                    consumer,
+                    entry_id: &entry.entry_id,
+                };
+                if !may_act_on_entry(conn, &lease, true, &"batch-reject").await {
+                    continue;
+                }
+                let pending = metrics::record_terminal(
+                    topic_name,
+                    consumer_group,
+                    metrics::FailReason::Rejected,
+                    has_dlq,
+                );
+                let retired = match route_to_dlq(
+                    conn,
+                    topology,
+                    stream,
+                    group,
+                    &entry.entry_id,
+                    &entry.fields,
+                    &entry.user_headers,
+                    "rejected",
+                    entry.retry_count,
+                )
+                .await
+                {
+                    Ok(retired) => retired,
+                    Err(e) => {
+                        pending.survived();
+                        return Err(e);
+                    }
+                };
+                if retired {
+                    pending.confirm();
+                } else {
+                    pending.survived();
+                }
+            }
+            *redelivery_backoff = batch_redelivery_backoff();
+            batch.clear();
+            Ok(FlushOutcome::Flushed)
+        }
+        BatchSettlement::Redeliver => {
+            let delay = next_redelivery_delay(redelivery_backoff);
+            tracing::warn!(
+                queue = stream,
+                batch_size,
+                ?outcome,
+                delay_ms = delay.as_millis() as u64,
+                "batch handler returned a non-Ack outcome, leaving the batch pending for redelivery"
+            );
+            batch.clear();
+            *replay_cursor = Some("0".to_owned());
+            tokio::select! {
+                () = tokio::time::sleep(delay) => Ok(FlushOutcome::Flushed),
+                () = shutdown.cancelled() => Ok(FlushOutcome::ShutdownDuringBackoff),
+            }
+        }
+    }
+}
+
+/// [`BatchConsumerImpl::run_batch`](crate::backend::BatchConsumerImpl) for
+/// Redis. See the module doc above for the no-lease design and PEL-replay
+/// metadata notes this loop depends on.
+///
+/// # Loop shape
+///
+/// Each iteration: flush if the size trigger has fired
+/// (`batch.len() >= max_batch_size`); otherwise, if shutdown is already
+/// cancelled, flush whatever is buffered and return; otherwise issue one
+/// `XREADGROUP` — `>` (live) or the replay cursor (history), `COUNT`
+/// [`batch_headroom`], `BLOCK` [`batch_block_ms`] on the live path only
+/// (history reads never block) — raced `biased` against shutdown exactly
+/// like `run_stream_loop_arc`, including the `NOGROUP` → retryable mapping.
+/// Every returned entry is decoded via [`ingest_batch_entry`]; the age
+/// deadline arms on the first message pushed into an empty batch and is
+/// never pushed back. After ingesting, the deadline is re-checked and a
+/// flush fires if it has elapsed. `replay_cursor` advances via
+/// [`next_replay_cursor`] after every history read; an empty history reply
+/// switches back to live (`>`) reads. The age/size triggers apply
+/// unchanged during replay, so a PEL larger than `max_batch_size` flushes in
+/// size-capped batches rather than in one read.
+///
+/// A single `XREADGROUP COUNT max BLOCK max_age` per batch was rejected: it
+/// returns as soon as ANY entry exists, so it cannot fill a batch, and it
+/// holds shutdown hostage for up to `max_batch_age`.
+///
+/// The deadline is **disarmed** (`deadline = None`) on every flush — the
+/// size trigger, the age trigger, and the shutdown-triggered partial flush —
+/// so an elapsed deadline is never left armed over an empty buffer (which
+/// would either fire immediately on nothing or spin hot).
+///
+/// # Maintenance interest covers the whole batch cycle
+///
+/// The single-message policy (`handler_timeout`, or 2x it when the consumer
+/// resolves its own timeout) assumes read→settle is bounded by one handler
+/// run. This loop adds an unbounded-by-timeout buffering phase — an early
+/// entry can idle up to `max_batch_age` before the flush even starts, and
+/// nothing resets its idle clock while buffered — so the reclaim policy this
+/// loop registers is the EFFECTIVE timeout `handler_timeout.map(|t|
+/// t.saturating_add(max_batch_age))`, always with `resolves_own_timeout:
+/// true` (this loop always acts at its own deadline: `invoke_batch_handler`'s
+/// timeout arm resolves to `Retry` or the configured
+/// `handler_timeout_outcome`, never "leave it for the reaper" the way the
+/// single-message no-override path does). That doubles again inside
+/// `reclaim_policy`, so the sidecar's threshold is
+/// `2 * (handler_timeout + max_batch_age)` — comfortably past buffer-wait
+/// plus flush. A replay read resets idle on every entry it returns
+/// (empirically confirmed — see the plan's R1), so consecutive `Redeliver`
+/// cycles do not accumulate idle time against this threshold.
+///
+/// The registry's dedup is max-wins (see `super::maintenance`'s module doc),
+/// so this policy cannot be undercut by a co-located single-message consumer
+/// on the same `(stream, group)` — but the converse holds too: a batch guard
+/// on the key delays crash recovery for every co-located single-message
+/// consumer to this same, wider threshold.
+///
+/// `without_handler_timeout()` ⇒ `effective_timeout` is `None` ⇒ reclaim is
+/// disabled while this consumer runs, exactly mirroring the single-message
+/// no-timeout semantics. Entries a dead or reconnected no-timeout batch
+/// consumer leaves pending are then recovered only if some OTHER guard on
+/// the same `(stream, group)` carries a reclaim policy — otherwise they
+/// strand, the same shape as the single-message no-timeout path, wider
+/// because a batch is bigger. (Test 15's reaper is spawned directly, not
+/// through this registry, precisely to make that recovery path provable
+/// without depending on a second consumer being present.)
+///
+/// # No panics, no unchecked arithmetic
+///
+/// No `unwrap`/`expect`/indexing on runtime paths; all arithmetic here is
+/// `saturating`/`checked` — see [`batch_headroom`], [`batch_block_ms`].
+pub(crate) async fn run_batch_impl<T, H>(
+    client: RedisClient,
+    handler: H,
+    ctx: H::Context,
+    options: BatchConsumerOptionsInner,
+) -> Result<()>
+where
+    T: NotSequenced,
+    H: BatchMessageHandler<T>,
+{
+    let topology = T::topology();
+    let stream = topology.queue();
+    let group = client.group().to_owned();
+    let shutdown = options.shutdown.clone();
+    let consumer_group = options.consumer_group.clone();
+    let max_batch_size = options.max_batch_size.max(1);
+    let max_batch_age = options.max_batch_age;
+    let max_message_size = options.max_message_size;
+    let handler_timeout = options.handler_timeout;
+    let handler_timeout_outcome = options.handler_timeout_outcome.clone();
+    let max_reconnect_attempts = options.max_reconnect_attempts;
+
+    let topic_arc: Arc<str> = Arc::from(stream);
+    let group_arc: Option<Arc<str>> = consumer_group.as_deref().map(Arc::from);
+
+    // See the doc above: the effective policy covers buffer-wait + flush,
+    // not just one handler call, and this loop always resolves its own
+    // timeout (never "leave it for the reaper").
+    let effective_timeout = handler_timeout.map(|t| t.saturating_add(max_batch_age));
+    let _maintenance = super::maintenance::acquire(&client, stream, effective_timeout, true);
+
+    let handler = Arc::new(handler);
+    let ctx = Arc::new(ctx);
+
+    run_with_reconnect(&shutdown, stream, max_reconnect_attempts, || {
+        let client = client.clone();
+        let handler = Arc::clone(&handler);
+        let ctx = Arc::clone(&ctx);
+        let group = group.clone();
+        let consumer = RedisConsumer::consumer_name();
+        let shutdown = shutdown.clone();
+        let topic_arc = Arc::clone(&topic_arc);
+        let group_arc = group_arc.clone();
+        let handler_timeout_outcome = handler_timeout_outcome.clone();
+
+        async move {
+            let mut conn = client.dedicated_conn().await?;
+            let mut batch: RedisBatch<T> = RedisBatch::new(max_batch_size);
+            let mut deadline: Option<Instant> = None;
+            let mut redelivery_backoff = batch_redelivery_backoff();
+            let mut replay_cursor: Option<String> = None;
+
+            loop {
+                if batch.len() >= max_batch_size {
+                    match flush_redis_batch(
+                        &mut conn,
+                        topology,
+                        stream,
+                        &group,
+                        &consumer,
+                        handler.as_ref(),
+                        ctx.as_ref(),
+                        &mut batch,
+                        handler_timeout,
+                        handler_timeout_outcome.clone(),
+                        &topic_arc,
+                        group_arc.as_deref(),
+                        &mut redelivery_backoff,
+                        &mut replay_cursor,
+                        &shutdown,
+                    )
+                    .await?
+                    {
+                        FlushOutcome::ShutdownDuringBackoff => return Ok(()),
+                        FlushOutcome::Flushed => {}
+                    }
+                    deadline = None;
+                    continue;
+                }
+
+                if shutdown.is_cancelled() {
+                    let _ = flush_redis_batch(
+                        &mut conn,
+                        topology,
+                        stream,
+                        &group,
+                        &consumer,
+                        handler.as_ref(),
+                        ctx.as_ref(),
+                        &mut batch,
+                        handler_timeout,
+                        handler_timeout_outcome.clone(),
+                        &topic_arc,
+                        group_arc.as_deref(),
+                        &mut redelivery_backoff,
+                        &mut replay_cursor,
+                        &shutdown,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                let headroom = batch_headroom(max_batch_size, batch.len());
+                let is_replay = replay_cursor.is_some();
+
+                let mut cmd = redis::cmd("XREADGROUP");
+                cmd.arg("GROUP").arg(&group).arg(&consumer).arg("COUNT").arg(headroom);
+                if !is_replay {
+                    let block_ms = batch_block_ms(deadline, Instant::now());
+                    cmd.arg("BLOCK").arg(block_ms);
+                }
+                cmd.arg("STREAMS").arg(stream);
+                cmd.arg(replay_cursor.as_deref().unwrap_or(">"));
+
+                let read_fut = conn.query(&mut cmd);
+                let raw_reply: redis::Value = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        let _ = flush_redis_batch(
+                            &mut conn,
+                            topology,
+                            stream,
+                            &group,
+                            &consumer,
+                            handler.as_ref(),
+                            ctx.as_ref(),
+                            &mut batch,
+                            handler_timeout,
+                            handler_timeout_outcome.clone(),
+                            &topic_arc,
+                            group_arc.as_deref(),
+                            &mut redelivery_backoff,
+                            &mut replay_cursor,
+                            &shutdown,
+                        ).await?;
+                        return Ok(());
+                    }
+                    result = read_fut => match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if e.to_string().contains("NOGROUP") {
+                                tracing::warn!(
+                                    stream,
+                                    error = %e,
+                                    "consumer group does not exist — topology may not be declared yet; will retry"
+                                );
+                                return Err(ShoveError::Connection(format!(
+                                    "consumer group does not exist on stream '{stream}': {e}"
+                                )));
+                            }
+                            tracing::warn!(error = %e, stream, "batch XREADGROUP failed");
+                            return Err(e);
+                        }
+                    }
+                };
+
+                let entries = parse_xreadgroup_reply(raw_reply, headroom);
+
+                if is_replay {
+                    replay_cursor = next_replay_cursor(&entries);
+                }
+
+                for (entry_id, fields_vec) in entries {
+                    ingest_batch_entry::<T>(
+                        &mut conn,
+                        stream,
+                        &group,
+                        &consumer,
+                        entry_id,
+                        fields_vec,
+                        &topic_arc,
+                        group_arc.as_deref(),
+                        max_message_size,
+                        &mut batch,
+                    )
+                    .await?;
+                    if deadline.is_none() && !batch.is_empty() {
+                        deadline = Some(Instant::now() + max_batch_age);
+                    }
+                }
+
+                if let Some(d) = deadline
+                    && Instant::now() >= d
+                {
+                    match flush_redis_batch(
+                        &mut conn,
+                        topology,
+                        stream,
+                        &group,
+                        &consumer,
+                        handler.as_ref(),
+                        ctx.as_ref(),
+                        &mut batch,
+                        handler_timeout,
+                        handler_timeout_outcome.clone(),
+                        &topic_arc,
+                        group_arc.as_deref(),
+                        &mut redelivery_backoff,
+                        &mut replay_cursor,
+                        &shutdown,
+                    )
+                    .await?
+                    {
+                        FlushOutcome::ShutdownDuringBackoff => return Ok(()),
+                        FlushOutcome::Flushed => {}
+                    }
+                    deadline = None;
+                }
+            }
+        }
+    })
+    .await
+}
+
+#[cfg(test)]
+mod batch_impl_tests {
+    use super::*;
+
+    #[test]
+    fn headroom_is_the_remaining_room_in_the_batch() {
+        assert_eq!(batch_headroom(10, 0), 10);
+        assert_eq!(batch_headroom(10, 7), 3);
+        assert_eq!(batch_headroom(10, 10), 0);
+        // Saturating: a caller bug must clamp to zero, never wrap.
+        assert_eq!(batch_headroom(10, 11), 0);
+    }
+
+    #[test]
+    fn block_ms_is_block_ms_when_no_deadline_is_armed() {
+        assert_eq!(batch_block_ms(None, Instant::now()), BLOCK_MS);
+    }
+
+    #[test]
+    fn block_ms_is_the_smaller_of_block_ms_and_remaining_time() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(500);
+        assert_eq!(batch_block_ms(Some(deadline), now), 500);
+
+        // Remaining time above BLOCK_MS clamps down to BLOCK_MS.
+        let far_deadline = now + Duration::from_secs(3600);
+        assert_eq!(batch_block_ms(Some(far_deadline), now), BLOCK_MS);
+    }
+
+    #[test]
+    fn block_ms_is_floored_at_one_when_the_deadline_has_already_elapsed() {
+        let now = Instant::now();
+        let past_deadline = now - Duration::from_millis(50);
+        // BLOCK 0 means "block forever" in Redis — must never be emitted.
+        assert_eq!(batch_block_ms(Some(past_deadline), now), 1);
+    }
+
+    #[test]
+    fn replay_cursor_advances_to_the_last_returned_entry_id() {
+        let entries = vec![
+            ("1-1".to_owned(), vec![]),
+            ("1-2".to_owned(), vec![]),
+            ("1-3".to_owned(), vec![]),
+        ];
+        assert_eq!(next_replay_cursor(&entries), Some("1-3".to_owned()));
+    }
+
+    #[test]
+    fn replay_cursor_is_none_on_an_empty_reply() {
+        assert_eq!(next_replay_cursor(&[]), None);
     }
 }
 
