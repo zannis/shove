@@ -1,16 +1,22 @@
 # Performance Tuning
 
-Most `shove` performance questions resolve to four levers: prefetch count, worker count, the concurrent-processing flag, and (negatively) transactional mode. Knowing which lever to pull first — and which to ignore — is what this page is for. The charts below are generated from a committed results document covering all six backends, and each carries its own provenance (shove version, generation date, hardware) in the caption; always measure on your own hardware and workload.
+Most `shove` performance questions resolve to four levers: prefetch count, worker count, the concurrent-processing flag, and (negatively) transactional mode. Knowing which lever to pull first — and which to ignore — is what this page is for. The charts below are generated from a committed results document, and each carries its own provenance (shove version, generation date, hardware) in the caption; always measure on your own hardware and workload.
 
 ## Benchmarks
 
 Two conventions hold across every chart. A backend that cannot do a flow
 (`HasBroadcast` / `HasCoordinatedGroups` gate them at compile time) appears as
-an explicit "not supported" marker, never as a zero. And SQS is not measured
-in this document at all: it only runs against LocalStack (non-representative
-by design), which requires a LocalStack Pro auth token that was unavailable
-where these results were generated — the charts carry an explicit "not
-measured" note for it instead of a plotted series.
+an explicit "not supported" marker, never as a zero. And a backend the results
+document does not contain is never plotted, so absence from a chart means "not
+measured here", not "slow".
+
+The document these charts render from measures the **in-process** and **Kafka**
+backends. NATS, RabbitMQ and Redis are supported by the harness but are not in
+this document yet; SQS additionally only runs against LocalStack
+(non-representative by design), which needs a LocalStack Pro auth token. The
+harness refuses to merge runs measured on different hosts into one document, so
+completing the set means re-measuring every backend back to back on a single
+host rather than appending to what is published here — that rerun is pending.
 
 ### Throughput vs consumer count
 
