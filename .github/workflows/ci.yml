@@ -87,6 +87,14 @@ jobs:
       # no coverage entry compiles on its own -- they are the sets that decide
       # whether `record_message_size` needs its `dead_code` allow.
       #
+      # Minus the `inmemory` five of those coverage entries now carry: that
+      # feature is there to make the `tests/bench_harness_*.rs` bridges
+      # executable, and it is a *second backend*. Adding it here would defeat
+      # the job -- an item that only the in-memory backend keeps alive is
+      # exactly the dead code a single-backend build is meant to expose. So
+      # these rows stay one backend wide, and drift from the matrix by that
+      # one feature on purpose.
+      #
       # `--lib`, not `--all-targets`: the coverage matrix already builds every
       # other target for these same feature sets, so a test that does not
       # compile under one of them fails there. This job adds the lint pass over
