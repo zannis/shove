@@ -11,19 +11,25 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::backend::BatchConsumerOptionsInner;
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+use crate::backend::batch_consumer::{
+    BatchSettlement, batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
+    settle_batch_outcome,
+};
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::router;
 use crate::backends::sns::topology::QueueRegistry;
+use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
-use crate::handler::MessageHandler;
+use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::routing::{drain_timeout_outcome, handler_timeout_outcome, shutdown_drain_timeout};
-use crate::topic::{SequencedTopic, Topic};
+use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, Sqs};
 
@@ -1774,6 +1780,553 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Batch consumption
+// ---------------------------------------------------------------------------
+//
+// [`BatchConsumerImpl`](crate::backend::BatchConsumerImpl) for SQS. SQS is
+// the only batch-consuming backend whose wire primitive is already
+// request-response and already returns up to a fixed cap per call
+// (`ReceiveMessage`), so this loop is **poll-shaped** rather than the
+// select-over-one-envelope-at-a-time shape Kafka's and InMemory's batch
+// loops share: those two accumulate a batch one message at a time because
+// their underlying primitive (a partition poll, an in-process queue pop)
+// hands back one message at a time; SQS's `ReceiveMessage` already hands
+// back up to 10 in one round trip, so accumulating here means looping
+// `ReceiveMessage` calls with shrinking headroom, not selecting over a
+// per-message stream. This is a genuinely different loop shape, not a
+// clause-for-clause port of either existing one — noted for whoever reviews
+// this, since no third copy of the shared select-loop skeleton was
+// extracted; only the flush-invoking/backoff machinery
+// (`invoke_batch_handler`, `batch_redelivery_backoff`,
+// `next_redelivery_delay`) is shared, via `crate::backend::batch_consumer`.
+//
+// # The 10-message cap
+//
+// SQS hard-caps both `ReceiveMessage` (`MaxNumberOfMessages`) and
+// `DeleteMessageBatch`/`ChangeMessageVisibilityBatch` at 10 entries per call.
+// [`validate_sqs_batch_size`] rejects any `max_batch_size > 10` at consumer
+// startup — including the crate-wide default of 500
+// ([`DEFAULT_MAX_BATCH_SIZE`](crate::DEFAULT_MAX_BATCH_SIZE)), which is why
+// this is a startup error rather than a silent clamp: clamping would turn
+// every default-configured SQS batch consumer into a silent 10-message
+// consumer, the "performance regression nobody can see" a clamp would cause
+// to fire for every caller, not just the ones who typed 500 by mistake.
+// Reject forces one explicit, checked line
+// (`with_max_batch_size(10)` or less) that doubles as the caller
+// acknowledging the cap.
+//
+// # Amortisation is bounded, not eliminated
+//
+// The whole point of batch consumption is amortising a sink's per-flush
+// cost (one DB transaction, one HTTP request) across many messages instead
+// of paying it per message. On SQS that amortisation is over **at most 10**
+// messages — a fraction of what Kafka's or InMemory's defaults amortise
+// over. This module makes no throughput or CPU claim about what that cap
+// buys; it only guarantees the mechanics (one `ReceiveMessage`,
+// one flush, one settlement call) stay batched up to that ceiling.
+//
+// # The visibility bound covers receive-to-settle, not batch age alone
+//
+// A message must be accumulated (bounded by `max_batch_age`), flushed
+// (bounded by `handler_timeout`) *and* settled (one bounded API call) before
+// the queue's `VisibilityTimeout` elapses, or it turns visible again
+// mid-flush: a sibling consumer picks it up and processes it a second time,
+// and the eventual settlement call (`DeleteMessageBatch` or
+// `ChangeMessageVisibilityBatch`) partially fails on the now-stale receipt
+// handle — a systematic duplicate-processing hazard on slow flushes, not an
+// occasional one. The crate's own defaults (`max_batch_age` 250ms,
+// `handler_timeout` 30s) already brush SQS's own default `VisibilityTimeout`
+// (30s): raise `VisibilityTimeout` on the queue, or lower `handler_timeout`,
+// so that `max_batch_age + handler_timeout` sits well under whatever
+// `VisibilityTimeout` the queue declares.
+//
+// # `Redeliver`: visibility reset, not a republish
+//
+// A batch-wide `Outcome::Retry`/`Outcome::Defer` resolves to
+// [`BatchSettlement::Redeliver`], settled by [`router::route_requeue_batch`]:
+// one `ChangeMessageVisibilityBatch` call resetting every buffered handle's
+// visibility to the shared backoff's next delay (`next_redelivery_delay`).
+// This is deliberately **not** the single-message `route_retry`'s
+// delete+re-send: a batch-wide outcome carries no sequence key and no
+// per-message retry budget (see
+// [`BatchSettlement`](crate::backend::batch_consumer::BatchSettlement)'s
+// doc), so there is nothing for a retry count to track, and topology
+// `hold_queues` — which key single-message retry delay off a per-message
+// retry count — **do not apply to batch redelivery**; the shared escalating
+// backoff paces it instead. A message that was previously re-sent by the
+// *single-message* retry path carries a frozen `x-retry-count` attribute
+// that batch redeliveries never move (though `ApproximateReceiveCount`,
+// surfaced as `delivery_count`, keeps incrementing on every SQS-side
+// redelivery regardless of which path is redelivering it).
+//
+// # `DeadLetter` is not process-terminal on SQS
+//
+// A batch-wide `Outcome::Reject` resolves to `BatchSettlement::DeadLetter`,
+// settled by [`router::route_reject_batch`]: `messages_failed_total` records
+// once per message, then every handle's visibility resets to 0 immediately
+// — same mechanics as the single-message [`router::route_reject`]. Unlike
+// Kafka's or InMemory's `DeadLetter` arm, this is **not terminal**: shove
+// never publishes to a DLQ on this backend, so whether the batch ever
+// reaches one is entirely up to the queue's *AWS-side* redrive policy
+// (`maxReceiveCount`) — and until redrive fires, a handler that rejects a
+// batch will **re-see the same terminally-rejected batch** on the very next
+// flush, because nothing removed it from the queue. This is why the
+// redelivery backoff resets only on `Commit`, never on `DeadLetter` (see
+// [`flush_sqs_batch`]): an always-Reject handler would otherwise spin
+// receives at full API rate forever. The escalating sleep this loop takes
+// after a `DeadLetter` flush is head-of-line blocking for this consumer —
+// healthy messages sitting behind a rejecting batch wait out each 1→30s
+// delay too, a stall Kafka's genuinely-terminal reject arm cannot produce.
+// With no redrive policy configured, the cycle never ends short of the
+// queue's retention period; [`router::route_reject_batch`] carries the same
+// loud "no DLQ configured" warning [`router::route_reject`] does.
+//
+// # Poison hot-loop
+//
+// An oversized or undecodable message is rejected (visibility → 0)
+// immediately, outside the batch — see "Pre-handler drops" below — and
+// therefore returns on the very next `ReceiveMessage`, still oversized or
+// undecodable, and is rejected again: a tight per-message reject loop, one
+// `record_failed` per round, that only stops once AWS redrive moves it (or,
+// with no redrive policy, never). This is the same property the
+// single-message SQS consumer already has; this doc names it rather than
+// leaving it implied by "settled once".
+//
+// # Pre-handler drops settle immediately, uncounted toward the batch
+//
+// An oversized or undecodable message never enters the batch: it is
+// rejected via the existing single-message [`router::route_reject`] the
+// moment it is decoded, with its true [`metrics::FailReason`] (`Oversize` or
+// `Deserialize`), and does not count toward `flush_len`/`max_batch_size` or
+// arm the age deadline. Kafka and InMemory park an equivalent drop until
+// their batch's flush, because their drops must ride the same commit their
+// batch's other messages retire through (Kafka's offsets must commit past
+// them; InMemory owns the envelope outright until the flush resolves it).
+// Neither reason exists here: every SQS message settles independently by
+// receipt handle, and shove never publishes to a DLQ on this backend, so a
+// drop settled at receive time is exactly as final as one settled at flush
+// time — parking it would only delay a settlement that is already as final
+// as it will ever be. The discard counter (`messages_discarded_total`)
+// stays opted out here, same as every other SQS reject path (see
+// [`router::route_reject`]'s doc) — `messages_failed_total` is the signal.
+//
+// # No separate sequencing-guard call
+//
+// Unlike Kafka, SQS exposes no public inherent `run_batch` entry point that
+// could bypass [`crate::batch_consumer::BatchConsumer::run`]'s
+// `validate_batch_topic` call — [`BatchConsumerImpl::run_batch`] is reached
+// only through that generic wrapper, which already ran the guard. A second
+// check here would only ever repeat the first, exactly as InMemory's
+// `run_batch_impl` documents for its own case.
+//
+// # No `in_flight`/`processing` bookkeeping
+//
+// Every message this loop receives is already `messages_not_visible`
+// broker-side the moment `ReceiveMessage` returns it — SQS itself tracks
+// that, unlike InMemory's in-process queue, which needs its own
+// `in_flight` counter for exactly this. So the backlog-0/in-flight-0 window
+// an autoscaler could otherwise mistake for "nothing outstanding" cannot
+// open here without any extra bookkeeping.
+
+/// SQS's hard per-call cap on `ReceiveMessage`'s `MaxNumberOfMessages` and on
+/// `DeleteMessageBatch`/`ChangeMessageVisibilityBatch`'s entry count.
+const SQS_MAX_BATCH: usize = 10;
+
+/// Reject a batch consumer's configured `max_batch_size` outright when it
+/// exceeds SQS's hard 10-message cap on `ReceiveMessage` and on
+/// `DeleteMessageBatch`/`ChangeMessageVisibilityBatch` — see the module
+/// doc's "The 10-message cap" section for why this rejects instead of
+/// clamping. Pure and unit-tested directly; called before any AWS call and
+/// before the batch buffer's own allocation, mirroring the sequencing
+/// guard's (`validate_batch_topic`) fail-fast shape.
+fn validate_sqs_batch_size(max_batch_size: usize) -> Result<()> {
+    if max_batch_size > SQS_MAX_BATCH {
+        return Err(ShoveError::Validation(format!(
+            "SQS batch consumer max_batch_size ({max_batch_size}) exceeds SQS's hard \
+             {SQS_MAX_BATCH}-message cap on ReceiveMessage and on \
+             DeleteMessageBatch/ChangeMessageVisibilityBatch. This crate's default \
+             max_batch_size (500) also exceeds it — set \
+             `BatchConsumerOptions::with_max_batch_size({SQS_MAX_BATCH})` or less explicitly."
+        )));
+    }
+    Ok(())
+}
+
+/// One in-flight SQS batch: `messages`/`handles` are index-parallel — the
+/// receipt handle for `messages[i]` is `handles[i]` — kept separate (rather
+/// than one `Vec` of a combined struct) because a flush needs to move
+/// `messages` into the handler by value while `handles` survives the flush
+/// to settle afterward.
+///
+/// No `cap`/`PREALLOC_CAP` clamp, unlike Kafka's `BatchBuffer` and
+/// InMemory's `InMemoryBatch`: [`validate_sqs_batch_size`] already bounds
+/// `max_batch_size` to at most [`SQS_MAX_BATCH`] (10) before this is ever
+/// constructed, so sizing the initial allocation to the real cap can never
+/// overflow the way an unclamped `usize::MAX` could on those two backends.
+struct SqsBatch<T: Topic> {
+    messages: Vec<(T::Message, MessageMetadata)>,
+    handles: Vec<String>,
+}
+
+impl<T: Topic> SqsBatch<T> {
+    fn new(max_batch_size: usize) -> Self {
+        Self {
+            messages: Vec::with_capacity(max_batch_size),
+            handles: Vec::with_capacity(max_batch_size),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    fn push(&mut self, message: T::Message, metadata: MessageMetadata, receipt_handle: String) {
+        self.messages.push((message, metadata));
+        self.handles.push(receipt_handle);
+    }
+
+    /// Take both lists for a flush, leaving both empty (capacity retained by
+    /// `Vec::drain`/`mem::take`'s allocation is not preserved here — a fresh
+    /// batch is small and short-lived enough that re-growing to at most 10
+    /// entries costs nothing worth avoiding a second allocation for).
+    fn take(&mut self) -> (Vec<(T::Message, MessageMetadata)>, Vec<String>) {
+        (
+            std::mem::take(&mut self.messages),
+            std::mem::take(&mut self.handles),
+        )
+    }
+}
+
+/// Fields [`flush_sqs_batch`] needs that do not change across flushes —
+/// split out so the flush function's signature does not grow every time a
+/// new one is needed, mirroring Kafka's `BatchFlushCtx` and InMemory's
+/// `InMemoryFlushCtx`.
+struct SqsBatchFlushCtx<'a> {
+    sqs: &'a aws_sdk_sqs::Client,
+    queue_url: &'a str,
+    topology: &'static QueueTopology,
+    topic: &'a str,
+    group: Option<&'a str>,
+    shutdown: &'a CancellationToken,
+    handler_timeout: Option<Duration>,
+    handler_timeout_outcome: Option<Outcome>,
+}
+
+/// Hands the buffered batch to the handler and settles the single returned
+/// [`Outcome`] via the shared [`settle_batch_outcome`] classifier. See the
+/// module doc's "`Redeliver`" and "`DeadLetter` is not process-terminal"
+/// sections for the mechanics each arm below performs.
+async fn flush_sqs_batch<T, H>(
+    flush: &SqsBatchFlushCtx<'_>,
+    handler: &H,
+    ctx: &H::Context,
+    batch: &mut SqsBatch<T>,
+    redelivery_backoff: &mut Backoff,
+) where
+    T: Topic,
+    H: BatchMessageHandler<T>,
+{
+    if batch.is_empty() {
+        return;
+    }
+    let batch_size = batch.len();
+    let (messages, handles) = batch.take();
+
+    let outcome = invoke_batch_handler(
+        || handler.handle_batch(messages, ctx),
+        flush.handler_timeout,
+        flush.handler_timeout_outcome.clone(),
+        flush.topic,
+        flush.group,
+        batch_size as u64,
+    )
+    .await;
+
+    match settle_batch_outcome(&outcome) {
+        BatchSettlement::Commit => {
+            router::route_ack_batch(flush.sqs, flush.queue_url, handles).await;
+            // This flush retired cleanly, so the next `DeadLetter`/`Redeliver`
+            // starts escalating from the beginning again.
+            *redelivery_backoff = batch_redelivery_backoff();
+        }
+        BatchSettlement::DeadLetter => {
+            router::route_reject_batch(
+                flush.sqs,
+                flush.queue_url,
+                &handles,
+                flush.topology,
+                flush.group,
+                metrics::FailReason::Rejected,
+            )
+            .await;
+            // Deliberately NOT reset — see the module doc's "`DeadLetter` is
+            // not process-terminal" section. SQS's DeadLetter arm re-sees
+            // the same batch until AWS redrive moves it, so an always-Reject
+            // handler must still escalate 1s -> 30s instead of spinning
+            // receives at full API rate.
+            let delay = next_redelivery_delay(redelivery_backoff);
+            tracing::warn!(
+                queue = flush.topology.queue(),
+                batch_size,
+                ?outcome,
+                delay_ms = delay.as_millis() as u64,
+                "batch handler rejected; redelivery is paced by AWS redrive, pacing this consumer's re-receive"
+            );
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = flush.shutdown.cancelled() => {}
+            }
+        }
+        BatchSettlement::Redeliver => {
+            // A shutdown-time Retry/Defer must not strand the batch invisible
+            // for the escalated delay: release it NOW, exactly like the
+            // single-message drain's `route_requeue` on shutdown.
+            let delay = if flush.shutdown.is_cancelled() {
+                Duration::ZERO
+            } else {
+                next_redelivery_delay(redelivery_backoff)
+            };
+            tracing::warn!(
+                queue = flush.topology.queue(),
+                batch_size,
+                ?outcome,
+                delay_ms = delay.as_millis() as u64,
+                "batch handler returned a non-Ack outcome, redelivering the whole batch"
+            );
+            // Requeue (the visibility-change call itself) IS the point of no
+            // return: after it, the batch lives broker-side with its delay,
+            // so aborting this task mid-sleep strands nothing — the same
+            // requeue-before-sleep invariant InMemory's `Redeliver` arm
+            // documents.
+            router::route_requeue_batch(flush.sqs, flush.queue_url, &handles, delay).await;
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = flush.shutdown.cancelled() => {}
+            }
+        }
+    }
+}
+
+/// The accumulation loop: poll-shaped, not select-shaped — see the module
+/// doc's opening section for why. Runs one attempt; [`SqsConsumer::run_batch_with_inner`]
+/// wraps this in [`run_with_reconnect`] the same way
+/// [`SqsConsumer::run_with_inner`] wraps [`consume_loop_concurrent`], so a
+/// transient error here restarts with a fresh, empty batch rather than
+/// resuming a partial one — any handles already buffered when the error
+/// happened are made visible immediately (see the `ReceiveMessage`-error arm
+/// below) rather than carried across the reconnect.
+async fn run_batch_loop<T, H>(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    topology: &'static QueueTopology,
+    handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
+    options: &BatchConsumerOptionsInner,
+) -> Result<()>
+where
+    T: NotSequenced,
+    H: BatchMessageHandler<T>,
+{
+    let topic: Arc<str> = Arc::from(topology.queue());
+    let group: Option<Arc<str>> = options.consumer_group.as_deref().map(Arc::from);
+    // Validated `<= SQS_MAX_BATCH` by `validate_sqs_batch_size` before this
+    // loop is ever entered (see `run_batch_with_inner`), and
+    // `BatchConsumerOptions::with_max_batch_size` asserts `n > 0` at the
+    // builder, so `max_batch_size` is already in `1..=SQS_MAX_BATCH` here.
+    let max_batch_size = options.max_batch_size;
+    let max_batch_age = options.max_batch_age;
+    let max_message_size = options.max_message_size;
+    let handler_timeout = options.handler_timeout;
+    let handler_timeout_outcome = options.handler_timeout_outcome.clone();
+
+    let flush_ctx = SqsBatchFlushCtx {
+        sqs,
+        queue_url,
+        topology,
+        topic: &topic,
+        group: group.as_deref(),
+        shutdown: &options.shutdown,
+        handler_timeout,
+        handler_timeout_outcome,
+    };
+
+    let mut batch: SqsBatch<T> = SqsBatch::new(max_batch_size);
+    let mut deadline: Option<tokio::time::Instant> = None;
+    let mut redelivery_backoff = batch_redelivery_backoff();
+
+    tracing::info!(
+        queue_url,
+        max_batch_size,
+        ?max_batch_age,
+        "SQS batch consumer started"
+    );
+
+    loop {
+        if batch.len() >= max_batch_size {
+            flush_sqs_batch(
+                &flush_ctx,
+                handler.as_ref(),
+                ctx.as_ref(),
+                &mut batch,
+                &mut redelivery_backoff,
+            )
+            .await;
+            deadline = None;
+            continue;
+        }
+
+        if let Some(d) = deadline
+            && tokio::time::Instant::now() >= d
+        {
+            flush_sqs_batch(
+                &flush_ctx,
+                handler.as_ref(),
+                ctx.as_ref(),
+                &mut batch,
+                &mut redelivery_backoff,
+            )
+            .await;
+            deadline = None;
+            continue;
+        }
+
+        if options.shutdown.is_cancelled() {
+            if !batch.is_empty() {
+                flush_sqs_batch(
+                    &flush_ctx,
+                    handler.as_ref(),
+                    ctx.as_ref(),
+                    &mut batch,
+                    &mut redelivery_backoff,
+                )
+                .await;
+            }
+            debug!(
+                queue_url,
+                "shutdown signal received, SQS batch consumer stopped"
+            );
+            return Ok(());
+        }
+
+        // Headroom is always > 0 here: the size-trigger check above already
+        // returned/continued when `batch.len() >= max_batch_size`.
+        let headroom = max_batch_size - batch.len();
+
+        // Same short-poll + client-side backoff rationale as
+        // `consume_loop_concurrent` (see its own comment): a server-side long
+        // poll would hold an open connection on LocalStack's serial request
+        // handling for the full wait duration, stacking up across consumers.
+        let receive_result = sqs
+            .receive_message()
+            .queue_url(queue_url)
+            .wait_time_seconds(0)
+            .max_number_of_messages(headroom as i32)
+            .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
+            .message_attribute_names("All")
+            .send()
+            .await;
+
+        let msgs = match receive_result {
+            Ok(output) => output.messages.unwrap_or_default(),
+            Err(e) => {
+                metrics::record_backend_error(
+                    metrics::BackendLabel::SnsSqs,
+                    metrics::BackendErrorKind::Consume,
+                );
+                // Buffered handles did nothing wrong — they are released to
+                // be visible NOW, never the escalated redelivery backoff
+                // delay, so a transient receive error does not additionally
+                // delay messages that were already safely buffered.
+                if !batch.handles.is_empty() {
+                    router::route_requeue_batch(sqs, queue_url, &batch.handles, Duration::ZERO)
+                        .await;
+                }
+                return Err(map_sqs_error(
+                    &format!("SQS ReceiveMessage failed on {queue_url}"),
+                    e,
+                ));
+            }
+        };
+
+        if msgs.is_empty() {
+            let sleep_for = match deadline {
+                Some(d) => {
+                    let now = tokio::time::Instant::now();
+                    if d <= now {
+                        Duration::ZERO
+                    } else {
+                        (d - now).min(Duration::from_millis(500))
+                    }
+                }
+                None => Duration::from_millis(500),
+            };
+            if !sleep_for.is_zero() {
+                tokio::select! {
+                    biased;
+                    _ = options.shutdown.cancelled() => {}
+                    _ = tokio::time::sleep(sleep_for) => {}
+                }
+            }
+            continue;
+        }
+
+        for msg in msgs {
+            let receipt_handle = msg.receipt_handle().unwrap_or_default().to_string();
+            let body = extract_payload(msg.body().unwrap_or_default());
+
+            metrics::record_message_size(&topic, group.as_deref(), body.len());
+
+            // Pre-handler drop: settles immediately via the single-message
+            // `route_reject`, outside the batch — see the module doc's
+            // "Pre-handler drops" section for why this does not park like
+            // Kafka/InMemory.
+            if let Err(e) = validate_message_size(body.len(), max_message_size) {
+                warn!(error = %e, queue_url, "rejecting oversized message (pre-handler drop)");
+                router::route_reject(
+                    sqs,
+                    queue_url,
+                    &receipt_handle,
+                    topology,
+                    group.as_deref(),
+                    metrics::FailReason::Oversize,
+                )
+                .await;
+                continue;
+            }
+
+            let message: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(
+                body.as_bytes(),
+            ) {
+                Ok(m) => m,
+                Err(err) => {
+                    error!(error = %err, queue_url, "failed to deserialize SQS message, rejecting (pre-handler drop)");
+                    router::route_reject(
+                        sqs,
+                        queue_url,
+                        &receipt_handle,
+                        topology,
+                        group.as_deref(),
+                        metrics::FailReason::Deserialize,
+                    )
+                    .await;
+                    continue;
+                }
+            };
+
+            let metadata = extract_metadata(&msg);
+            if batch.is_empty() {
+                deadline = Some(tokio::time::Instant::now() + max_batch_age);
+            }
+            batch.push(message, metadata, receipt_handle);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Consumer trait implementation
 // ---------------------------------------------------------------------------
 
@@ -1999,6 +2552,44 @@ impl SqsConsumer {
             .await
         }
     }
+
+    /// [`BatchConsumerImpl::run_batch`](crate::backend::BatchConsumerImpl) for
+    /// SQS. See the "Batch consumption" module doc above [`run_batch_loop`]
+    /// for the loop's full contract (the 10-message cap, amortisation bound,
+    /// visibility timing, redelivery/reject mechanics).
+    pub(crate) fn run_batch_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: BatchConsumerOptionsInner,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: NotSequenced,
+        H: BatchMessageHandler<T>,
+    {
+        let client = self.client.clone();
+        let queue_registry = self.queue_registry.clone();
+        async move {
+            // Before any AWS call and before `SqsBatch`'s own allocation —
+            // mirrors the sequencing guard's fail-fast shape.
+            validate_sqs_batch_size(options.max_batch_size)?;
+
+            let topology = T::topology();
+            let consumer = SqsConsumer::new(client, queue_registry);
+            let queue_url = consumer.resolve_queue_url(topology.queue()).await?;
+            let handler = Arc::new(handler);
+            let ctx = Arc::new(ctx);
+            let sqs = consumer.client.sqs().clone();
+
+            run_with_reconnect(
+                &options.shutdown,
+                topology.queue(),
+                options.max_reconnect_attempts,
+                || run_batch_loop::<T, H>(&sqs, &queue_url, topology, &handler, &ctx, &options),
+            )
+            .await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2027,5 +2618,57 @@ mod metadata_tests {
             .attributes(MessageSystemAttributeName::ApproximateReceiveCount, "many")
             .build();
         assert_eq!(approximate_receive_count(&msg), None);
+    }
+}
+
+#[cfg(test)]
+mod batch_cap_tests {
+    use super::*;
+    use crate::consumer::DEFAULT_MAX_BATCH_SIZE;
+
+    #[test]
+    fn one_is_ok() {
+        assert!(validate_sqs_batch_size(1).is_ok());
+    }
+
+    #[test]
+    fn ten_is_ok() {
+        assert!(validate_sqs_batch_size(10).is_ok());
+    }
+
+    #[test]
+    fn eleven_is_rejected() {
+        let err = validate_sqs_batch_size(11).expect_err("11 exceeds the SQS cap");
+        assert!(matches!(err, ShoveError::Validation(_)));
+    }
+
+    #[test]
+    fn usize_max_is_rejected() {
+        let err = validate_sqs_batch_size(usize::MAX).expect_err("usize::MAX exceeds the cap");
+        assert!(matches!(err, ShoveError::Validation(_)));
+    }
+
+    /// The crate-wide default (`DEFAULT_MAX_BATCH_SIZE = 500`) is itself
+    /// over the cap — the decisive fact behind rejecting instead of
+    /// clamping (see the module doc's cap-rule rationale): a caller who
+    /// never touches `with_max_batch_size` would otherwise silently get a
+    /// 10-message consumer.
+    #[test]
+    fn the_crate_default_exceeds_the_cap() {
+        let err = validate_sqs_batch_size(DEFAULT_MAX_BATCH_SIZE)
+            .expect_err("the crate default of 500 exceeds the SQS cap of 10");
+        assert!(matches!(err, ShoveError::Validation(_)));
+    }
+
+    #[test]
+    fn error_text_names_both_aws_apis_and_the_cap() {
+        let err = validate_sqs_batch_size(11).expect_err("11 exceeds the cap");
+        let ShoveError::Validation(msg) = err else {
+            panic!("expected ShoveError::Validation, got {err:?}");
+        };
+        assert!(msg.contains("ReceiveMessage"), "message: {msg}");
+        assert!(msg.contains("DeleteMessageBatch"), "message: {msg}");
+        assert!(msg.contains("10"), "message: {msg}");
+        assert!(msg.contains("500"), "message: {msg}");
     }
 }

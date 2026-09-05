@@ -62,29 +62,38 @@ pub struct RabbitMq;
 /// # }
 /// ```
 ///
-/// SQS has no batch-consumption implementation either — see
+/// Unlike the two capabilities above, SQS **does** implement batch
+/// consumption — see
 /// [`HasBatchConsumption`](crate::backend::capability::HasBatchConsumption)
-/// for the authoritative list, where unlike `HasBroadcast` every other row is
-/// *pending* rather than permanently excluded. `batch_consumer()` is
-/// nevertheless a compile error on `Broker<Sqs>` today, same as the other two:
+/// for the authoritative list, where every backend but Kafka, InMemory and
+/// SQS is still *pending* rather than permanently excluded.
+/// `Broker::<Sqs>::batch_consumer()` compiles and runs, with a hard
+/// 10-message cap enforced at consumer startup: SQS's `ReceiveMessage`,
+/// `DeleteMessageBatch` and `ChangeMessageVisibilityBatch` calls all cap out
+/// at 10 entries, so `max_batch_size > 10` — including this crate's
+/// cross-backend default of 500 — is rejected with a
+/// [`ShoveError::Validation`](crate::error::ShoveError::Validation) rather
+/// than silently clamped down to a 10-message consumer nobody asked for:
 ///
-/// ```compile_fail
+/// ```rust,no_run
 /// # #[cfg(feature = "aws-sns-sqs")]
 /// # async fn _x() -> shove::error::Result<()> {
-/// use shove::{Broker, Sqs};
+/// use shove::{BatchConsumerOptions, Broker, Sqs};
 /// use shove::sns::SnsConfig;
 ///
 /// let broker = Broker::<Sqs>::new(SnsConfig {
 ///     region: None,
 ///     endpoint_url: None,
 /// }).await?;
-/// // error: no method named `batch_consumer` for `Broker<Sqs>`
 /// let _ = broker.batch_consumer();
+/// // SQS's hard cap — see `HasBatchConsumption`'s doc for the full contract.
+/// let _ = BatchConsumerOptions::<Sqs>::new().with_max_batch_size(10);
 /// # Ok(())
 /// # }
 /// ```
 ///
-/// The control for the tests above. A `compile_fail` doctest passes on *any*
+/// The control for the two compile-time tests above. A `compile_fail`
+/// doctest passes on *any*
 /// compile error (see the note on [`NotSequenced`](crate::topic::NotSequenced)),
 /// so on its own each would keep passing if the imports rotted or `SnsConfig`
 /// changed shape — it would have become a typo test asserting nothing about

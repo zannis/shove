@@ -78,7 +78,11 @@ rabbitmq-transactional = ["rabbitmq"]
 pub-aws-sns = ["dep:aws-config", "dep:aws-sdk-sns"]
 
 # Complete pubsub with AWS SNS and AWS SQS
-aws-sns-sqs = ["pub-aws-sns", "dep:aws-sdk-sqs"]
+# futures-util: `FutureExt::catch_unwind`, to resolve a panicking batch handler
+# to `Outcome::Retry` (see `backend::batch_consumer::invoke_batch_handler`,
+# shared with Kafka's and InMemory's batch consumers). Same feature-edge move
+# as `redis-streams`/`inmemory` above — wires up a dependency already in the tree.
+aws-sns-sqs = ["pub-aws-sns", "dep:aws-sdk-sqs", "dep:futures-util"]
 
 # Audit traits and default audit topic
 audit = []
