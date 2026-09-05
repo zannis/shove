@@ -24,25 +24,28 @@
 //! `#[allow(dead_code)]`-over-losing-coverage trade `ConsumerOptionsInner`
 //! and `settle_broadcast_outcome` already make.
 //!
-//! Everything else lives in the [`settling`] module, gated on the features
-//! of the backends that implement `HasBatchConsumption` (that trait's doc is
-//! the authoritative list): they share the flush-invoking/backoff machinery
+//! The shared flush-invoking/backoff machinery
 //! ([`settling::invoke_batch_handler`],
 //! [`settling::batch_redelivery_backoff`],
-//! [`settling::next_redelivery_delay`]). Callers path through `settling::`
-//! rather than re-exports, so the module's gate has no re-export copy to
-//! keep in sync. A new batching backend still widens more than that one
-//! cfg, though: [`settling::PREALLOC_CAP`] carries its own deliberately
-//! narrower list (see its doc for why SQS does not join it), and
-//! `mod routing`'s gate in `lib.rs` names the same features because
-//! `settling` depends on it.
+//! [`settling::next_redelivery_delay`]) lives in the [`settling`] module,
+//! gated on the features of the backends that implement
+//! `HasBatchConsumption` (that trait's doc is the authoritative list).
+//! Callers path through `settling::` rather than re-exports, so the
+//! module's gate has no re-export copy to keep in sync. A new batching
+//! backend still widens more than that one cfg, though:
+//! [`settling::PREALLOC_CAP`] carries its own deliberately narrower list
+//! (see its doc for why SQS does not join it), and the feature-listed
+//! gates on `mod retry` and `mod routing` in `lib.rs` — both of which
+//! `settling` imports from — must each stay supersets of this module's
+//! gate. Kafka-only option fields on [`BatchConsumerOptionsInner`] keep
+//! their own narrower cfgs at the module root.
 //!
 //! `TerminalDiscard`, `RejectSettlement` and `reject_settlement` are
 //! narrower still: `#[cfg(feature = "kafka")]` *inside* the [`settling`]
 //! module. Every other backend in the gate finishes settling a reject
 //! before its batch clears, with no later commit that could still fail, so
-//! none of them ever needed
-//! the held-until-confirmed shape this trio exists for: InMemory in
+//! none of them ever needed the held-until-confirmed shape this trio
+//! exists for: InMemory in
 //! `backends::inmemory::consumer::resolve_reject`, Redis in its batch
 //! `DeadLetter` arm (the `XACK`/DLQ route completes before the batch
 //! clears), RabbitMQ on a confirm-mode channel (never transactional), where
@@ -121,12 +124,12 @@ pub(crate) struct BatchConsumerOptionsInner {
 /// batch-consumption primitive implement this; the public
 /// [`BatchConsumer<B>`](crate::batch_consumer::BatchConsumer) delegates here.
 ///
-/// Anchored by each backend's own `impl BatchConsumerImpl` under its feature.
-/// Under `--no-default-features`, and under a feature set naming no batching
-/// backend (`pub-aws-sns` alone), the trait genuinely has no call site —
-/// `dead_code` is expected there and the per-trait allow avoids polluting
-/// those builds with warnings, exactly as [`ConsumerImpl`](crate::backend::ConsumerImpl)
-/// does for the single-message trait.
+/// Anchored by each backend's own `impl BatchConsumerImpl` under its
+/// feature. Unlike [`ConsumerImpl`](crate::backend::ConsumerImpl), it
+/// carries no `dead_code` allow: the ungated
+/// [`BatchConsumer::run`](crate::batch_consumer::BatchConsumer::run) calls
+/// [`run_batch`](Self::run_batch) in every build, implementors present or
+/// not.
 ///
 /// # Who runs the sequencing guard
 ///
@@ -136,7 +139,6 @@ pub(crate) struct BatchConsumerOptionsInner {
 /// that also exposes its **own public** batch entry point bypasses that
 /// wrapper and must call the guard itself — Kafka's `run_batch_inner` is the
 /// model, covering the public `KafkaConsumer::run_batch`.
-#[allow(dead_code)]
 pub(crate) trait BatchConsumerImpl: Send + Sync {
     fn run_batch<T, H>(
         &self,

@@ -61,8 +61,8 @@
 //! # Quickstart
 //!
 //! The example below uses the in-process backend so it needs no external
-//! services. Swap `InMemory` for [`RabbitMq`], [`Sqs`], [`Nats`], or
-//! [`Kafka`] — the topic definition, handler, and every call site stay
+//! services. Swap `InMemory` for [`RabbitMq`], [`Sqs`], [`Nats`], [`Kafka`],
+//! or [`Redis`] — the topic definition, handler, and every call site stay
 //! identical.
 //!
 //! ```no_run

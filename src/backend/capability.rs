@@ -127,12 +127,12 @@ pub trait HasBroadcast: Backend {
 /// | **SQS** | **yes** — hard 10-message `ReceiveMessage`/`DeleteMessageBatch`/`ChangeMessageVisibilityBatch` cap; `max_batch_size > 10` (including the crate default of 500) is rejected at consumer startup, not silently clamped |
 ///
 /// Sealed via `Backend`.
-///
-/// Unlike its two siblings, this trait carries no `on_unimplemented`
-/// diagnostic: every concrete marker implements it, so the bound can only
-/// fail on an underconstrained generic parameter — and there rustc's default
-/// suggestion (add the bound) is the right guidance, with no alternative API
-/// or permanent exclusion for a tailored message to point at.
+// No `on_unimplemented` diagnostic here, unlike the two sibling traits:
+// every concrete marker implements this trait, so the bound can only fail
+// on an underconstrained generic parameter — where rustc's default
+// suggestion (add the bound) is the right guidance, and there is no
+// alternative API or permanent exclusion for a tailored message to point
+// at.
 #[allow(private_interfaces, private_bounds)]
 pub trait HasBatchConsumption: Backend {
     type BatchConsumerImpl: BatchConsumerImpl + Clone + Send + Sync + 'static;

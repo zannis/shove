@@ -2427,10 +2427,9 @@ async fn settle_dropped(
 /// The buffer is left empty on every path; the caller only has to disarm the
 /// deadline.
 ///
-/// The handler itself is invoked through
-/// [`invoke_batch_handler`](crate::backend::batch_consumer::settling::invoke_batch_handler) —
-/// shared across every backend with a batch implementation now, not
-/// Kafka-specific — which supplies the panic containment, timeout and
+/// The handler itself is invoked through [`invoke_batch_handler`] —
+/// shared batching machinery, not Kafka-specific — which supplies the
+/// panic containment, timeout and
 /// instrumentation this flush relies on. See that function's doc for why the
 /// guard exists and why the handler future is built *inside* it.
 async fn flush_batch<T, H>(

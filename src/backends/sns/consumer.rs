@@ -1798,8 +1798,7 @@ where
 // this, since no third copy of the shared select-loop skeleton was
 // extracted; only the flush-invoking/backoff machinery
 // (`invoke_batch_handler`, `batch_redelivery_backoff`,
-// `next_redelivery_delay`) is shared, via
-// `crate::backend::batch_consumer::settling`.
+// `next_redelivery_delay`) is shared, via `backend::batch_consumer::settling`.
 //
 // # The 10-message cap
 //

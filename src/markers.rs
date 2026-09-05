@@ -65,12 +65,12 @@ pub struct RabbitMq;
 /// Unlike the two capabilities above, SQS **does** implement batch
 /// consumption — see
 /// [`HasBatchConsumption`](crate::backend::capability::HasBatchConsumption)
-/// for the authoritative list.
-/// `Broker::<Sqs>::batch_consumer()` compiles and runs, with a hard
-/// 10-message cap enforced at consumer startup: SQS's `ReceiveMessage`,
-/// `DeleteMessageBatch` and `ChangeMessageVisibilityBatch` calls all cap out
-/// at 10 entries, so `max_batch_size > 10` — including this crate's
-/// cross-backend default of 500 — is rejected with a
+/// for the authoritative list. `Broker::<Sqs>::batch_consumer()` compiles
+/// and runs, with a hard 10-message cap enforced at consumer startup:
+/// SQS's `ReceiveMessage`, `DeleteMessageBatch` and
+/// `ChangeMessageVisibilityBatch` calls all cap out at 10 entries, so
+/// `max_batch_size > 10` — including this crate's cross-backend default of
+/// 500 — is rejected with a
 /// [`ShoveError::Validation`](crate::error::ShoveError::Validation) rather
 /// than silently clamped down to a 10-message consumer nobody asked for:
 ///
