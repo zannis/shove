@@ -25,29 +25,29 @@
 //! and `settle_broadcast_outcome` already make.
 //!
 //! Everything else here is gated `#[cfg(any(feature = "kafka", feature =
-//! "inmemory", feature = "redis-streams", feature = "rabbitmq"))]`: these
-//! backends have a batch-consumption implementation and share the
-//! flush-invoking/backoff machinery ([`invoke_batch_handler`],
+//! "inmemory", feature = "redis-streams", feature = "rabbitmq", feature =
+//! "nats"))]`: these backends have a batch-consumption implementation and
+//! share the flush-invoking/backoff machinery ([`invoke_batch_handler`],
 //! [`batch_redelivery_backoff`], [`next_redelivery_delay`]). The gate widens
-//! per-backend as the remaining ports land in turn — NATS and SQS each add
-//! their own feature to
-//! the list the moment their `BatchConsumerImpl` exists, exactly as
+//! per-backend as the remaining ports land in turn — SQS adds its own feature
+//! to the list the moment its `BatchConsumerImpl` exists, exactly as
 //! `broadcast.rs`'s gate widened backend by backend.
 //!
 //! `TerminalDiscard`, `RejectSettlement` and `reject_settlement` are
 //! narrower still: `#[cfg(feature = "kafka")]` *inside* that `any(kafka,
-//! inmemory, redis-streams, rabbitmq)` module. Every other backend in the
-//! gate settles a reject the instant its DLQ hand-off resolves, with no
+//! inmemory, redis-streams, rabbitmq, nats)` module. Every other backend in
+//! the gate settles a reject the instant its DLQ hand-off resolves, with no
 //! later commit that could still fail, so none of them ever needed the
 //! held-until-confirmed shape this trio exists for: InMemory in
 //! `backends::inmemory::consumer::resolve_reject`, Redis in its batch
 //! `DeadLetter` arm (the `XACK`/DLQ route completes before the batch
-//! clears), and RabbitMQ on a confirm-mode channel (never transactional),
-//! where an accepted `basic.nack` retires the delivery with no later commit
-//! to wait on. This is deferred-settlement machinery, kafka-only until a
-//! deferred-settlement backend lands in one of the remaining ports (NATS,
-//! SQS) and widens it — and even then, per the module doc above, never below
-//! `kafka`.
+//! clears), RabbitMQ on a confirm-mode channel (never transactional), where
+//! an accepted `basic.nack` retires the delivery with no later commit to wait
+//! on, and NATS at the server-confirmed `double_ack` (see
+//! `backends::nats::consumer::settle_reject_batch`). This is deferred-
+//! settlement machinery, kafka-only until a deferred-settlement backend lands
+//! in the one remaining port (SQS) and widens it — and even then, per the
+//! module doc above, never below `kafka`.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -237,7 +237,7 @@ mod settle_batch_outcome_tests {
     }
 }
 
-// Gated `any(kafka, inmemory, redis-streams, rabbitmq)` — see the module
+// Gated `any(kafka, inmemory, redis-streams, rabbitmq, nats)` — see the module
 // doc's "Gating" section. Named `settling` rather than after any one backend:
 // it houses the settlement classifier + panic/timeout invariant surface every
 // one of these backends' batch loops route through, plus the terminal-discard
@@ -247,7 +247,8 @@ mod settle_batch_outcome_tests {
     feature = "kafka",
     feature = "inmemory",
     feature = "redis-streams",
-    feature = "rabbitmq"
+    feature = "rabbitmq",
+    feature = "nats"
 ))]
 mod settling {
     use std::future::Future;
@@ -268,9 +269,9 @@ mod settling {
     /// record.
     ///
     /// `kafka`-only: deferred settlement exists because Kafka's offset commit
-    /// is the one point in either backend's batch path where the retirement
-    /// can still fail after the terminal decision is made. See the module
-    /// doc's gating note.
+    /// is the one point in any batching backend's batch path where the
+    /// retirement can still fail after the terminal decision is made. See the
+    /// module doc's gating note.
     #[cfg(feature = "kafka")]
     pub(crate) enum TerminalDiscard {
         /// Dead-lettered, or terminal on a topic with no DLQ. Counts only
@@ -343,11 +344,11 @@ mod settling {
     /// caller is free to pass `usize::MAX`; sizing the initial allocation to
     /// the real cap would then abort the consumer task on
     /// `Vec::with_capacity`'s overflow check before a single message ever
-    /// arrives. Both backends' batch buffers clamp their initial reservation
-    /// to `max_batch_size.min(PREALLOC_CAP)` instead — growth still reaches
-    /// the real `max_batch_size` for a sane size, so this only bounds the
-    /// up-front allocation, an amortisation nicety rather than a correctness
-    /// requirement.
+    /// arrives. Every batching backend's batch buffer clamps its initial
+    /// reservation to `max_batch_size.min(PREALLOC_CAP)` instead — growth
+    /// still reaches the real `max_batch_size` for a sane size, so this only
+    /// bounds the up-front allocation, an amortisation nicety rather than a
+    /// correctness requirement.
     pub(crate) const PREALLOC_CAP: usize = 4096;
 
     /// First delay after redelivering an un-acked batch, escalating to
@@ -706,7 +707,8 @@ mod settling {
     feature = "kafka",
     feature = "inmemory",
     feature = "redis-streams",
-    feature = "rabbitmq"
+    feature = "rabbitmq",
+    feature = "nats"
 ))]
 pub(crate) use settling::{
     PREALLOC_CAP, batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,

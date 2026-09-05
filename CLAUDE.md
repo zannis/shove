@@ -60,8 +60,8 @@ surprises.
   plus an SNS subscription whose lifecycle shove does not manage, and a leaked
   queue costs money forever.
 - `HasBatchConsumption` gates `Broker::batch_consumer` /
-  `BatchConsumer<B>::run`. Kafka, InMemory, Redis and RabbitMQ implement it
-  today; every other backend is pending, not excluded — each gets the
+  `BatchConsumer<B>::run`. Kafka, InMemory, Redis, RabbitMQ and NATS implement
+  it today; every other backend is pending, not excluded — each gets the
   capability the moment its own `BatchConsumerImpl` lands. The primitive exists for
   **handler amortisation** (one flush per N messages instead of one call per
   message), nothing else.
