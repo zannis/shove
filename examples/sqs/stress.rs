@@ -52,6 +52,7 @@ async fn main() {
         std::env::set_var("AWS_REGION", "us-east-1");
     }
 
+    harness::spawn_ctrlc_watcher();
     let container = LocalStack::default()
         .with_env_var("LOCALSTACK_AUTH_TOKEN", auth_token)
         .start()
@@ -61,6 +62,7 @@ async fn main() {
         .get_host_port_ipv4(4566)
         .await
         .expect("failed to read LocalStack port");
+    let _container = harness::ContainerGuard::new(container);
     let endpoint = format!("http://localhost:{port}");
 
     wait_until_ready(&endpoint).await;
@@ -233,8 +235,6 @@ async fn main() {
         },
     )
     .await;
-
-    drop(container);
 }
 
 /// Poll a queue until it reads empty across visible, in-flight, and delayed

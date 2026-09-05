@@ -19,15 +19,20 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+use crate::backend::batch_consumer::{
+    BatchConsumerOptionsInner, BatchSettlement, PREALLOC_CAP, batch_redelivery_backoff,
+    invoke_batch_handler, next_redelivery_delay, settle_batch_outcome,
+};
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::{
     extract_dead_metadata, extract_message_metadata, get_retry_count,
 };
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::backends::rabbitmq::router;
+use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
-use crate::handler::MessageHandler;
+use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::metadata::MessageMetadata;
 use crate::metrics;
 use crate::outcome::Outcome;
@@ -36,7 +41,7 @@ use crate::routing::{
     drain_timeout_outcome, handler_timeout_outcome, hold_index, retries_exhausted,
     shutdown_drain_timeout,
 };
-use crate::topic::{SequencedTopic, Topic};
+use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::{HoldQueue, SequenceFailure};
 use crate::{QueueTopology, RabbitMq};
 
@@ -2117,9 +2122,549 @@ impl RabbitMqConsumer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Batch consumption
+// ---------------------------------------------------------------------------
+
+/// Fallback for the reconnect backoff's impossible-`None` — `Backoff`'s
+/// iterator never ends, so this only exists to keep the reconnect arm free of
+/// panics; it mirrors `Backoff::default()`'s ceiling.
+const RECONNECT_BACKOFF_FALLBACK: Duration = Duration::from_secs(30);
+
+/// The flush threshold (and channel prefetch) actually used for a configured
+/// `max_batch_size`: at least 1, at most `u16::MAX` — AMQP's `basic.qos`
+/// prefetch window is a `u16`, and a batch is held **unacked** inside that
+/// window, so a threshold above it could never fill and every flush would
+/// stall until `max_batch_age`. This effective cap is a documented divergence
+/// from Kafka/InMemory, which honour any configured size (they clamp only the
+/// pre-allocation; that clamp applies here too, separately, in
+/// [`RabbitMqBatch::new`]).
+fn effective_batch_size(configured: usize) -> usize {
+    configured.max(1).min(u16::MAX as usize)
+}
+
+/// One in-flight batch: decoded messages index-parallel with their delivery
+/// tags, plus parked pre-handler drops as `(tag, reason)` pairs. No payload
+/// retention (unlike Kafka's `retain_raw`): a RabbitMQ dead-letter is a
+/// broker-side DLX move on nack, never a republish, so the broker holds the
+/// bytes until the tag settles.
+///
+/// Every tag belongs to the one channel the enclosing [`consume_loop_batch`]
+/// invocation opened, and the batch lives and dies with that invocation — a
+/// batch structurally cannot span channels, which is the AMQP settling
+/// constraint (ack/nack must go to the delivering channel) enforced by shape
+/// rather than by bookkeeping.
+struct RabbitMqBatch<T: Topic> {
+    messages: Vec<(T::Message, MessageMetadata)>,
+    /// Index-parallel with `messages`, ascending: tags are assigned in
+    /// delivery order and ingest follows the stream.
+    handled_tags: Vec<u64>,
+    /// Pre-handler drops, `(delivery_tag, reason)`, ascending and interleaved
+    /// with `handled_tags` in tag order. Counted by [`Self::flush_len`] so an
+    /// all-poison window still trips the size trigger instead of growing for
+    /// the whole `max_batch_age`.
+    parked: Vec<(u64, metrics::FailReason)>,
+    /// Pre-allocation installed by [`Self::take_messages`] —
+    /// `effective_max_batch_size` clamped to [`PREALLOC_CAP`], never the raw
+    /// value, for the same `Vec::with_capacity`-overflow reason both other
+    /// backends clamp it.
+    cap: usize,
+}
+
+impl<T: Topic> RabbitMqBatch<T> {
+    fn new(effective_max_batch_size: usize) -> Self {
+        let prealloc = effective_max_batch_size.min(PREALLOC_CAP);
+        Self {
+            messages: Vec::with_capacity(prealloc),
+            handled_tags: Vec::with_capacity(prealloc),
+            parked: Vec::new(),
+            cap: prealloc,
+        }
+    }
+
+    /// Messages plus every pre-handler drop — the quantity the size trigger
+    /// bounds, and (unlike on Kafka/InMemory, where a no-DLQ drop is
+    /// destroyed early) exactly the number of unacked deliveries this batch
+    /// holds against the channel's prefetch window.
+    fn flush_len(&self) -> usize {
+        self.messages.len() + self.parked.len()
+    }
+
+    /// Counts parked drops too: an all-parked partial window at shutdown must
+    /// still flush (dead-letter), not be abandoned to redeliver and re-count
+    /// its failures on the next start.
+    fn is_empty(&self) -> bool {
+        self.flush_len() == 0
+    }
+
+    fn push(&mut self, message: T::Message, metadata: MessageMetadata, tag: u64) {
+        self.messages.push((message, metadata));
+        self.handled_tags.push(tag);
+    }
+
+    fn park(&mut self, tag: u64, reason: metrics::FailReason) {
+        self.parked.push((tag, reason));
+    }
+
+    fn highest_handled_tag(&self) -> Option<u64> {
+        self.handled_tags.last().copied()
+    }
+
+    /// Highest tag across handled and parked — both vectors are ascending, so
+    /// this is the max of their last elements.
+    fn highest_tag(&self) -> Option<u64> {
+        self.handled_tags
+            .last()
+            .copied()
+            .max(self.parked.last().map(|&(tag, _)| tag))
+    }
+
+    /// Take the handled messages for the handler call, refilling with a fresh
+    /// pre-sized `Vec` rather than `mem::take`'s zero-capacity default — the
+    /// taken `Vec` is genuinely moved into the handler.
+    fn take_messages(&mut self) -> Vec<(T::Message, MessageMetadata)> {
+        std::mem::replace(&mut self.messages, Vec::with_capacity(self.cap))
+    }
+
+    fn clear(&mut self) {
+        self.messages.clear();
+        self.handled_tags.clear();
+        self.parked.clear();
+    }
+}
+
+/// Fields the batch flush needs that do not change across flushes, mirroring
+/// Kafka's `BatchFlushCtx` / InMemory's `InMemoryFlushCtx`.
+struct RabbitMqFlushCtx<'a> {
+    channel: &'a Channel,
+    topology: &'static QueueTopology,
+    topic: &'a str,
+    group: Option<&'a str>,
+    /// Per-consumer token (`options.shutdown`): races the redelivery backoff
+    /// sleep so a wedged handler cannot add the escalated delay to a stop.
+    shutdown: &'a CancellationToken,
+    /// Client-wide token: same race, plus the loop's own abandon arm.
+    client_shutdown: &'a CancellationToken,
+    handler_timeout: Option<Duration>,
+    handler_timeout_outcome: Option<Outcome>,
+}
+
+/// Prepare one freshly-delivered message and either push it into the batch or
+/// park its tag for a dead-letter nack at the flush. The failure is counted
+/// here (per message, at ingest); the *discard* is settled at the flush by
+/// whether the broker accepted the nack — the `record_terminal` split, same
+/// as Kafka's batch ingest.
+fn ingest_batch_delivery<T: Topic>(
+    batch: &mut RabbitMqBatch<T>,
+    received: &ReceivedDelivery,
+    max_message_size: Option<usize>,
+    topic: &str,
+    group: Option<&str>,
+) {
+    let tag = received.delivery.delivery_tag;
+    metrics::record_message_size(topic, group, received.payload.len());
+
+    if let Err(e) = validate_message_size(received.payload.len(), max_message_size) {
+        warn!(error = %e, topic, "oversized message, dropped before the batch handler");
+        metrics::record_failed(topic, group, metrics::FailReason::Oversize);
+        batch.park(tag, metrics::FailReason::Oversize);
+        return;
+    }
+    match <T::Codec as crate::Codec<T::Message>>::decode_owned(received.payload.clone()) {
+        Ok(message) => {
+            let metadata = extract_message_metadata(&received.delivery);
+            batch.push(message, metadata, tag);
+        }
+        Err(e) => {
+            warn!(error = %e, topic, "failed to deserialize message, dropped before the batch handler");
+            metrics::record_failed(topic, group, metrics::FailReason::Deserialize);
+            batch.park(tag, metrics::FailReason::Deserialize);
+        }
+    }
+}
+
+/// Hand the buffered batch to the handler and settle the single returned
+/// [`Outcome`] via the shared [`settle_batch_outcome`] classifier — the same
+/// three-way split Kafka and InMemory use, with RabbitMQ's mechanics in each
+/// arm:
+///
+/// - `Commit`: parked pre-handler drops are individually nacked to the DLX
+///   first (their tags interleave below the handled ones), then one
+///   `basic_ack(multiple: true)` on the highest handled tag retires the whole
+///   batch — the single-frame settle that is this backend's payoff.
+/// - `DeadLetter`: one `basic_nack(multiple: true, requeue: false)` on the
+///   batch's highest tag dead-letters everything broker-side.
+/// - `Redeliver`: one `basic_nack(multiple: true, requeue: true)` — issued
+///   **before** the backoff sleep, so aborting the task mid-backoff cannot
+///   destroy a batch that exists only in this loop; the broker flags the
+///   redeliveries `redelivered`. The sleep paces this consumer only and is
+///   cut short by either shutdown token.
+///
+/// A window whose every message was dropped pre-handler never reaches the
+/// handler at all: it is dead-lettered outright, because routing it through a
+/// handler that answers `Retry` would redeliver the same poison forever — the
+/// no-forward-progress failure Kafka's empty-batch commit arm exists to
+/// prevent.
+///
+/// Every settle error propagates (see the router's batch-settling error
+/// contract): after a failed frame the channel's outstanding-tag set is
+/// unknown, so the only sound recovery is to abandon this channel — the
+/// reconnect loop opens a fresh one and the broker requeues everything
+/// unsettled.
+async fn flush_rabbitmq_batch<T, H>(
+    flush: &RabbitMqFlushCtx<'_>,
+    handler: &H,
+    ctx: &H::Context,
+    batch: &mut RabbitMqBatch<T>,
+    redelivery_backoff: &mut Backoff,
+) -> Result<()>
+where
+    T: Topic,
+    H: BatchMessageHandler<T>,
+{
+    if batch.flush_len() == 0 {
+        return Ok(());
+    }
+    let batch_size = batch.messages.len();
+
+    if batch_size == 0 {
+        // All-poison window: nothing to hand the handler. One multi-nack
+        // dead-letters every parked drop and the window retires.
+        if let Some(highest) = batch.highest_tag() {
+            router::reject_batch_multiple(
+                flush.channel,
+                flush.topology,
+                flush.group,
+                0,
+                &batch.parked,
+                highest,
+            )
+            .await?;
+        }
+        // Terminal progress resets the redelivery backoff — the InMemory
+        // convention (`finish_terminal_flush`); Kafka's all-dropped arm
+        // deliberately differs (no reset). Chosen, not drifted: a queue
+        // alternating poison windows with retried ones re-earns escalation.
+        *redelivery_backoff = batch_redelivery_backoff();
+        batch.clear();
+        return Ok(());
+    }
+
+    let messages = batch.take_messages();
+    let outcome = invoke_batch_handler(
+        || handler.handle_batch(messages, ctx),
+        flush.handler_timeout,
+        flush.handler_timeout_outcome.clone(),
+        flush.topic,
+        flush.group,
+        batch_size as u64,
+    )
+    .await;
+
+    match settle_batch_outcome(&outcome) {
+        BatchSettlement::Commit => {
+            router::settle_parked_batch(flush.channel, flush.topology, flush.group, &batch.parked)
+                .await?;
+            if let Some(highest_handled) = batch.highest_handled_tag() {
+                router::ack_batch_multiple(flush.channel, highest_handled).await?;
+            }
+            *redelivery_backoff = batch_redelivery_backoff();
+            debug!(queue = flush.topology.queue(), batch_size, "batch acked");
+            batch.clear();
+        }
+        BatchSettlement::DeadLetter => {
+            if let Some(highest) = batch.highest_tag() {
+                router::reject_batch_multiple(
+                    flush.channel,
+                    flush.topology,
+                    flush.group,
+                    batch_size,
+                    &batch.parked,
+                    highest,
+                )
+                .await?;
+            }
+            *redelivery_backoff = batch_redelivery_backoff();
+            batch.clear();
+        }
+        BatchSettlement::Redeliver => {
+            let delay = next_redelivery_delay(redelivery_backoff);
+            warn!(
+                queue = flush.topology.queue(),
+                batch_size,
+                ?outcome,
+                delay_ms = delay.as_millis() as u64,
+                "batch handler returned a non-Ack outcome, redelivering the whole batch"
+            );
+            if let Some(highest) = batch.highest_tag() {
+                router::redeliver_batch_multiple(flush.channel, highest).await?;
+            }
+            batch.clear();
+            // The nack above already returned the batch to the broker, so the
+            // sleep only paces THIS consumer's next window; shutdown (either
+            // token) cuts the delay rather than the batch.
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = flush.shutdown.cancelled() => {}
+                () = flush.client_shutdown.cancelled() => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+impl RabbitMqConsumer {
+    /// [`BatchConsumerImpl::run_batch`](crate::backend::BatchConsumerImpl)
+    /// for RabbitMQ. AMQP has no batch receive, so this is a genuine
+    /// accumulator over one consumer stream: take deliveries up to the flush
+    /// threshold or until `max_batch_age` elapses, then flush; the payoff is
+    /// settle-side, where `multiple: true` frames retire the whole batch in
+    /// one round trip (see [`flush_rabbitmq_batch`]).
+    ///
+    /// # Prefetch and the effective batch size
+    ///
+    /// Buffered deliveries are held **unacked**, and AMQP's prefetch window
+    /// (`basic.qos`) is a `u16` — a batch above the prefetch count can never
+    /// fill, stalling every flush until `max_batch_age`. So the channel's
+    /// prefetch is set to the flush threshold, and both are
+    /// `min(max_batch_size, u16::MAX)`: above 65 535 the configured size is
+    /// clamped (with a warning), a documented divergence from Kafka/InMemory,
+    /// which honour any size. The pre-allocation is separately clamped to
+    /// [`PREALLOC_CAP`], as on every backend.
+    ///
+    /// # Sequencing guard
+    ///
+    /// No `validate_batch_topic` call here: this is reachable only through
+    /// the generic [`BatchConsumer::run`](crate::batch_consumer::BatchConsumer::run)
+    /// wrapper, which already ran the guard — the same shape as InMemory.
+    /// RabbitMQ deliberately adds no public inherent `run_batch` (Kafka's
+    /// exists for pre-generic compatibility and re-runs the guard itself).
+    ///
+    /// # Channel lifecycle and reconnects
+    ///
+    /// Each inner-loop invocation opens one confirm-mode channel (never
+    /// transactional — a batch consumer publishes nothing, so there is no
+    /// publish/ack pair for a transaction to make atomic) and its batch is
+    /// local to that invocation. On any retryable error — a dead stream, a
+    /// failed settle frame — the invocation returns and the reconnect loop
+    /// opens a fresh channel; the broker requeues everything unsettled when
+    /// the old channel drops. The loop observes **both** the per-consumer
+    /// token and the client token: after `client.shutdown()` channel creation
+    /// fails retryably forever, and only the client token distinguishes that
+    /// from a broker outage worth redialing.
+    pub(crate) async fn run_batch_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: BatchConsumerOptionsInner,
+    ) -> Result<()>
+    where
+        T: NotSequenced,
+        H: BatchMessageHandler<T>,
+    {
+        let topology = T::topology();
+        let queue = topology.queue();
+        let configured = options.max_batch_size.max(1);
+        let effective_max = effective_batch_size(options.max_batch_size);
+        if configured > effective_max {
+            warn!(
+                queue,
+                configured,
+                effective_max,
+                "max_batch_size exceeds AMQP's u16 prefetch window; clamping the flush threshold"
+            );
+        }
+        let prefetch = effective_max as u16;
+        let shutdown = options.shutdown.clone();
+        let client_shutdown = self.client.shutdown_token();
+        let group = options.consumer_group.clone();
+        let topic: Arc<str> = Arc::from(queue);
+
+        info!(
+            queue,
+            max_batch_size = effective_max,
+            max_batch_age = ?options.max_batch_age,
+            prefetch,
+            "RabbitMQ batch consumer started"
+        );
+
+        let mut backoff = Backoff::default();
+        let mut attempts = 0u32;
+        loop {
+            match self
+                .consume_loop_batch::<T, H>(
+                    &handler,
+                    &ctx,
+                    queue,
+                    topology,
+                    &options,
+                    effective_max,
+                    prefetch,
+                    &shutdown,
+                    &client_shutdown,
+                    &topic,
+                    group.as_deref(),
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    // Token check FIRST: `client.shutdown()` cancels its
+                    // token, waits a short grace, then closes the connection,
+                    // so mid-shutdown errors are expected — counting them
+                    // against `max_reconnect_attempts` (or letting an
+                    // unrecoverable teardown error surface as fatal) would
+                    // misreport a graceful close.
+                    if shutdown.is_cancelled() || client_shutdown.is_cancelled() {
+                        return Ok(());
+                    }
+                    // A non-retryable error (misdeclared queue, auth) never
+                    // heals by redialing.
+                    if !e.is_retryable() {
+                        return Err(e);
+                    }
+                    attempts += 1;
+                    if let Some(max) = options.max_reconnect_attempts
+                        && attempts >= max
+                    {
+                        error!(
+                            queue,
+                            attempts,
+                            error = %e,
+                            "max reconnect attempts reached, giving up"
+                        );
+                        return Err(ShoveError::Connection(format!(
+                            "batch consumer on '{queue}' exhausted {max} reconnect attempt(s): {e}"
+                        )));
+                    }
+                    let delay = backoff.next().unwrap_or(RECONNECT_BACKOFF_FALLBACK);
+                    warn!(
+                        queue,
+                        attempt = attempts,
+                        max_reconnect_attempts = ?options.max_reconnect_attempts,
+                        "batch consumer error, reconnecting in {delay:?}: {e}"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = shutdown.cancelled() => return Ok(()),
+                        _ = client_shutdown.cancelled() => return Ok(()),
+                    }
+                }
+            }
+        }
+    }
+
+    /// One channel's worth of the batch loop: open, accumulate, flush, until
+    /// a shutdown token or an error ends the channel. See
+    /// [`Self::run_batch_with_inner`] for the lifecycle contract.
+    #[allow(clippy::too_many_arguments)]
+    async fn consume_loop_batch<T, H>(
+        &self,
+        handler: &H,
+        ctx: &H::Context,
+        queue: &str,
+        topology: &'static QueueTopology,
+        options: &BatchConsumerOptionsInner,
+        effective_max: usize,
+        prefetch: u16,
+        shutdown: &CancellationToken,
+        client_shutdown: &CancellationToken,
+        topic: &Arc<str>,
+        group: Option<&str>,
+    ) -> Result<()>
+    where
+        T: NotSequenced,
+        H: BatchMessageHandler<T>,
+    {
+        let (channel, mut stream) = open_consumer(&self.client, queue, prefetch, false).await?;
+
+        let flush_ctx = RabbitMqFlushCtx {
+            channel: &channel,
+            topology,
+            topic: topic.as_ref(),
+            group,
+            shutdown,
+            client_shutdown,
+            handler_timeout: options.handler_timeout,
+            handler_timeout_outcome: options.handler_timeout_outcome.clone(),
+        };
+
+        let mut batch: RabbitMqBatch<T> = RabbitMqBatch::new(effective_max);
+        let mut deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        let mut redelivery_backoff = batch_redelivery_backoff();
+
+        loop {
+            if batch.flush_len() >= effective_max {
+                flush_rabbitmq_batch(
+                    &flush_ctx,
+                    handler,
+                    ctx,
+                    &mut batch,
+                    &mut redelivery_backoff,
+                )
+                .await?;
+                deadline = None;
+                continue;
+            }
+
+            let sleep_until_deadline = async {
+                match deadline.as_mut() {
+                    Some(d) => d.await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+
+            tokio::select! {
+                biased;
+
+                () = shutdown.cancelled() => {
+                    // The connection stays up on a per-consumer cancel, so
+                    // the partial batch can still be flushed and settled.
+                    if !batch.is_empty() {
+                        flush_rabbitmq_batch(&flush_ctx, handler, ctx, &mut batch, &mut redelivery_backoff).await?;
+                    }
+                    info!(queue, "shutdown signal received, RabbitMQ batch consumer stopped");
+                    return Ok(());
+                }
+                () = client_shutdown.cancelled() => {
+                    // `client.shutdown()` closes the connection a short grace
+                    // after cancelling this token — flushing here would run
+                    // the handler precisely when its settle is doomed,
+                    // duplicating side effects on redelivery. Abandon
+                    // instead: nothing is acked, the closing connection
+                    // requeues the whole window, and no handler ran twice.
+                    info!(queue, "client shutdown, RabbitMQ batch consumer stopped");
+                    return Ok(());
+                }
+                () = sleep_until_deadline => {
+                    flush_rabbitmq_batch(&flush_ctx, handler, ctx, &mut batch, &mut redelivery_backoff).await?;
+                    deadline = None;
+                }
+                item = stream.next() => {
+                    let received = ReceivedDelivery::new(unwrap_delivery(item, queue)?);
+                    // Armed on ANY ingest — parked included — so an
+                    // all-poison window still flushes by age.
+                    if deadline.is_none() {
+                        deadline = Some(Box::pin(tokio::time::sleep(options.max_batch_age)));
+                    }
+                    ingest_batch_delivery::<T>(
+                        &mut batch,
+                        &received,
+                        options.max_message_size,
+                        topic.as_ref(),
+                        group,
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::topology::TopologyBuilder;
 
     #[tokio::test]
     async fn invoke_handler_returns_outcome_without_timeout() {
@@ -2243,5 +2788,95 @@ mod tests {
         let mut pending: HashMap<String, VecDeque<ReceivedDelivery>> = HashMap::new();
         nack_requeue_all_pending(&mut pending, None).await;
         assert!(pending.is_empty());
+    }
+
+    /// [`effective_batch_size`]: the wire-imposed clamp. A threshold above
+    /// the u16 prefetch window could never fill (the batch is held unacked
+    /// inside it), stalling every flush until `max_batch_age` — the hang the
+    /// clamp exists to prevent.
+    #[test]
+    fn effective_batch_size_clamps_to_the_prefetch_window() {
+        assert_eq!(effective_batch_size(0), 1);
+        assert_eq!(effective_batch_size(1), 1);
+        assert_eq!(effective_batch_size(500), 500);
+        assert_eq!(effective_batch_size(u16::MAX as usize), u16::MAX as usize);
+        assert_eq!(
+            effective_batch_size(u16::MAX as usize + 1),
+            u16::MAX as usize
+        );
+        assert_eq!(effective_batch_size(usize::MAX), u16::MAX as usize);
+    }
+
+    /// [`RabbitMqBatch`]'s accounting: parked pre-handler drops count toward
+    /// the flush threshold (an all-poison window must trip the size trigger),
+    /// and the settle targets are the highest tags of each set.
+    #[test]
+    fn batch_buffer_counts_parked_and_tracks_highest_tags() {
+        struct BufTopic;
+        impl Topic for BufTopic {
+            type Message = ();
+            type Codec = crate::JsonCodec;
+            fn topology() -> &'static crate::QueueTopology {
+                static TOPOLOGY: std::sync::OnceLock<crate::QueueTopology> =
+                    std::sync::OnceLock::new();
+                TOPOLOGY.get_or_init(|| TopologyBuilder::new("rmq-batch-buf").build())
+            }
+        }
+
+        let mut batch: RabbitMqBatch<BufTopic> = RabbitMqBatch::new(8);
+        assert!(batch.is_empty());
+        assert_eq!(batch.highest_tag(), None);
+
+        batch.push((), MessageMetadata::builder().build(), 1);
+        batch.park(2, metrics::FailReason::Oversize);
+        batch.push((), MessageMetadata::builder().build(), 3);
+        batch.park(4, metrics::FailReason::Deserialize);
+
+        assert_eq!(
+            batch.flush_len(),
+            4,
+            "parked drops count toward the size trigger"
+        );
+        assert!(!batch.is_empty());
+        assert_eq!(batch.highest_handled_tag(), Some(3));
+        assert_eq!(
+            batch.highest_tag(),
+            Some(4),
+            "a parked tag can be the batch's highest"
+        );
+
+        let messages = batch.take_messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            batch.parked.len(),
+            2,
+            "take_messages leaves parked for the settle"
+        );
+
+        batch.clear();
+        assert!(batch.is_empty());
+        assert_eq!(batch.highest_tag(), None);
+    }
+
+    /// `with_max_batch_size(usize::MAX)` passes the public `> 0` assert; the
+    /// buffer must clamp its pre-allocation rather than aborting inside
+    /// `Vec::with_capacity` — the same [`PREALLOC_CAP`] trade both other
+    /// backends make.
+    #[test]
+    fn batch_buffer_clamps_the_preallocation_not_the_batch_size() {
+        struct BufTopic;
+        impl Topic for BufTopic {
+            type Message = ();
+            type Codec = crate::JsonCodec;
+            fn topology() -> &'static crate::QueueTopology {
+                static TOPOLOGY: std::sync::OnceLock<crate::QueueTopology> =
+                    std::sync::OnceLock::new();
+                TOPOLOGY.get_or_init(|| TopologyBuilder::new("rmq-batch-buf-prealloc").build())
+            }
+        }
+
+        let batch: RabbitMqBatch<BufTopic> = RabbitMqBatch::new(usize::MAX);
+        assert_eq!(batch.cap, PREALLOC_CAP);
+        assert_eq!(batch.messages.capacity(), PREALLOC_CAP);
     }
 }

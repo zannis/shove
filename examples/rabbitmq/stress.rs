@@ -30,6 +30,7 @@ const RABBITMQ_VERSION: &str = "3.8.22";
 
 #[tokio::main]
 async fn main() {
+    harness::spawn_ctrlc_watcher();
     let container = RabbitMqImage::default()
         .start()
         .await
@@ -47,6 +48,7 @@ async fn main() {
         .await
         .expect("failed to enable consistent-hash plugin");
     let _ = exec.stdout_to_vec().await;
+    let _container = harness::ContainerGuard::new(container);
 
     let uri = format!("amqp://guest:guest@localhost:{port}");
 
@@ -167,8 +169,6 @@ async fn main() {
         },
     )
     .await;
-
-    drop(container);
 }
 
 /// Open and close one AMQP channel — confirms the broker is past startup and

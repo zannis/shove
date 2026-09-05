@@ -25,6 +25,7 @@ const NATS_VERSION: &str = "2.10.14";
 
 #[tokio::main]
 async fn main() {
+    harness::spawn_ctrlc_watcher();
     let cmd = NatsServerCmd::default().with_jetstream();
     let container = NatsImage::default()
         .with_cmd(&cmd)
@@ -35,6 +36,7 @@ async fn main() {
         .get_host_port_ipv4(4222)
         .await
         .expect("failed to read NATS port");
+    let _container = harness::ContainerGuard::new(container);
     let url = format!("nats://localhost:{port}");
 
     wait_until_ready(&url).await;
@@ -111,8 +113,6 @@ async fn main() {
         },
     )
     .await;
-
-    drop(container);
 }
 
 /// Block until JetStream is accepting requests. Testcontainers exits

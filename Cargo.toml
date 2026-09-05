@@ -12,22 +12,44 @@ documentation = "https://docs.rs/shove"
 keywords = ["messaging", "rabbitmq", "pubsub", "consumer-groups", "autoscaling"]
 categories = ["asynchronous"]
 
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
-
+# This list must live in [package] to have any packaging effect: it
+# previously sat below the docs.rs metadata table header, where TOML scoped
+# it to that table and cargo silently ignored it — the docs site and repo
+# tooling shipped in the crate despite it.
 exclude = [
   "docs/",
+  "benches/results/",
+  # Repo tooling that reads repo-only inputs (the results dataset and the
+  # committed SVGs): shipping the targets without their inputs gives the
+  # tarball an example that can only fail and a test that cannot pass.
+  "tests/chartgen.rs",
+  "examples/chartgen.rs",
+  "examples/common/chartgen.rs",
+  # Same reasoning for the Tier A regression comparator: its inputs (the
+  # committed baseline and a criterion output tree) are repo-only.
+  "tests/bench_compare.rs",
+  "examples/bench_compare.rs",
+  "examples/common/bench_compare.rs",
+  "benches/baselines/",
+  ".pr-body.md",
   "package.json",
-  "package-lock.json",
+  "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
+  "plans/",
   "tsconfig.json",
   "vocs.config.tsx",
   "wrangler.toml",
-  "scripts/",
+  # Anchored: the unanchored form also matched tests/scripts/, whose
+  # rmq_setup.sh the packaged .config/nextest.toml requires.
+  "/scripts/",
   ".github/workflows/docs-build.yml",
   ".github/workflows/docs-preview.yml",
   "node_modules/",
 ]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.clippy]
 absolute-paths = "deny"
@@ -36,12 +58,15 @@ absolute-paths = "deny"
 default = []
 
 # RabbitMQ Pubsub
+# futures-util: `FutureExt::catch_unwind`, to resolve a panicking batch
+# flush to `Outcome::Retry` (see `backend::batch_consumer::invoke_batch_handler`).
 rabbitmq = [
   "dep:lapin",
   "dep:futures-lite",
   "dep:reqwest",
   "dep:arc-swap",
   "dep:url",
+  "dep:futures-util",
 ]
 
 # Opt-in exactly-once delivery for RabbitMQ consumers via AMQP transactions.
@@ -195,6 +220,16 @@ rdkafka = { version = "0.39", features = [
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
+# Chart rendering for `examples/chartgen.rs`. `default-features = false` with
+# only `svg_backend`/`line_series` is load-bearing, not tidiness: the default
+# set enables `ttf`, which resolves text extents through system fonts. Those
+# differ between a laptop and `ubuntu-latest`, so every label coordinate — and
+# therefore every byte of the SVG — would move, and the committed-SVG byte-compare
+# would diff red on a run that changed nothing.
+plotters = { version = "0.3.7", default-features = false, features = [
+  "svg_backend",
+  "line_series",
+] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = [
   "rabbitmq",
@@ -424,3 +459,18 @@ required-features = ["redis-streams"]
 name = "redis_audited_consumer"
 path = "examples/redis/audited_consumer.rs"
 required-features = ["redis-streams", "audit"]
+
+# Reads the committed results document and writes the published SVG charts.
+# Deliberately carries no `required-features`: chart regeneration runs
+# it under `--no-default-features`, and a backend feature here would pull
+# librdkafka/libsasl into a job that only reads JSON and writes SVGs.
+[[example]]
+name = "chartgen"
+path = "examples/chartgen.rs"
+
+# Compares a Tier A criterion run against the committed baseline. Same
+# contract as chartgen: reading JSON needs no backend, and the bench-tier-a
+# CI leg runs it under `--no-default-features`.
+[[example]]
+name = "bench_compare"
+path = "examples/bench_compare.rs"

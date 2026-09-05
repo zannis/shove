@@ -6,10 +6,10 @@
 //!
 //! Gated on `kafka` *and* `inmemory` because including the wrapper also
 //! includes the shared harness, whose own test module drives everything over
-//! `shove::InMemory`. No CI test leg enables that pairing, so in CI this file
-//! is type-checked (the `clippy --all-features --all-targets` gate), which
-//! catches a rotted signature; the tests execute on any local
-//! `cargo nextest run --features kafka,inmemory`.
+//! `shove::InMemory`. The tests execute wherever both features are enabled —
+//! locally via `cargo nextest run --features kafka,inmemory`, and in CI on
+//! any coverage-matrix entry whose feature list includes both (which entries
+//! do is `.github/workflows/ci.yml`'s to say, not this file's).
 #![cfg(all(feature = "kafka", feature = "inmemory"))]
 #![allow(dead_code)] // the wrapper's `main` and helpers are along for the ride
 
