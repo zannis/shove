@@ -14,7 +14,7 @@
 #[path = "../examples/common/chartgen.rs"]
 mod chartgen;
 
-use chartgen::{ChartError, Document, Family, Mode};
+use chartgen::{Chart, ChartError, Document, Family, Mode};
 use plotters::style::RGBColor;
 
 /// The x band that can only hold y-axis tick labels: the frame's 16px left
@@ -39,7 +39,7 @@ const PLOT_BAND_MIN_Y: f64 = 100.0;
 fn document(runs: &str) -> String {
     format!(
         r#"{{
-          "schema_version": 4,
+          "schema_version": 6,
           "generated_at": "2026-08-31T22:10:30Z",
           "shove_version": "0.14.0",
           "rust_version": "rustc 1.91.1",
@@ -89,6 +89,38 @@ fn scenario_with_window(
     handler_cost: &str,
     duration_secs: f64,
 ) -> String {
+    row_json(
+        flow,
+        mode,
+        payload,
+        consumers,
+        throughput,
+        handler_cost,
+        duration_secs,
+    )
+}
+
+/// The marker the harness would derive for a zero handler on `flow`: publish
+/// flows carry `no_handler`, the barrier-less flows (`consume_fifo`,
+/// `dlq_drain`) carry `setup_bound`, everything else `framework`.
+fn cost_for(flow: &str) -> &'static str {
+    match flow {
+        "publish_single" | "publish_batch" => "no_handler",
+        "consume_fifo" | "dlq_drain" => "setup_bound",
+        _ => "framework",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn row_json(
+    flow: &str,
+    mode: &str,
+    payload: u64,
+    consumers: u32,
+    throughput: f64,
+    handler_cost: &str,
+    duration_secs: f64,
+) -> String {
     // Since v3 every `consume_batch` row carries its batch knobs, and no
     // other flow's row may carry them.
     let batch_knobs = if flow == "consume_batch" {
@@ -110,14 +142,123 @@ fn scenario_with_window(
     } else {
         "0.4"
     };
+    // Since v6 every row of a method-measured flow names its method and
+    // carries that method's account whose counts derive the row's rate; a
+    // rate too small for the requested window to hold five completions gets
+    // a longer window.
+    let (messages, method_and_drain, duration_secs) =
+        method_fields(flow, throughput, duration_secs);
     format!(
         r#"{{
           "flow": "{flow}", "mode": "{mode}", "payload_bytes": {payload},
-          "tier": "moderate", "messages": 5000, "consumers": {consumers},
+          "tier": "moderate", "messages": {messages}, "consumers": {consumers},
           "handler": "{handler}",
           "handler_cost": "{handler_cost}",
           "setup_secs": {setup_secs},
           {batch_knobs}
+          {method_and_drain}
+          "throughput_msg_per_sec": {throughput},
+          "dispatch_p50_ms": 1.5, "dispatch_p95_ms": 4.0, "dispatch_p99_ms": 9.0,
+          "e2e_p50_ms": 1.5, "e2e_p95_ms": 4.0, "e2e_p99_ms": 9.0,
+          "scaling_efficiency": 1.0, "peak_rss_mb": 1.0, "cpu_pct": 100.0,
+          "duration_secs": {duration_secs:?}
+        }}"#
+    )
+}
+
+/// The flows the harness measures by method (`chartgen::LOAD_FLOWS`).
+const METHOD_FLOWS: &[&str] = &[
+    "consumer_group",
+    "consume_parallel",
+    "consume_batch",
+    "supervisor",
+];
+
+/// The `messages`, the method fields and the window of a fixture row. A
+/// method-measured flow's row is a drain, as the published document's are,
+/// with an account that derives exactly the row's rate (see
+/// [`drain_account_json`]); a rate the requested window cannot hold five
+/// completions of gets a window that can, since every rate on such a row is
+/// re-derived from integer counts. Other flows keep the historical corpus of
+/// 5,000, carry no method, and keep the window they were given.
+fn method_fields(flow: &str, throughput: f64, duration_secs: f64) -> (u64, String, f64) {
+    if !METHOD_FLOWS.contains(&flow) {
+        return (5000, String::new(), duration_secs);
+    }
+    let completions = throughput * duration_secs;
+    assert!(
+        completions.is_finite() && completions <= 1e15,
+        "a fixture rate of {throughput} msg/s over {duration_secs}s has no integer account; \
+         use a flow measured one way only for such a row"
+    );
+    // A non-positive rate keeps its window: the fixture is only asked to be
+    // well-formed JSON there, since `validate` refuses the rate itself first.
+    let duration_secs = if throughput > 0.0 && completions < 5.0 {
+        5.0 / throughput
+    } else {
+        duration_secs
+    };
+    drain_account_json(throughput, duration_secs, 0)
+}
+
+/// `("messages", "method": "drain", "drain": {…})` deriving exactly
+/// `throughput`: `n = throughput × duration` completions inside a window
+/// that opened at `9k − n` and closed at the end target `9k` of a corpus of
+/// `10k`. `duplicates` redeliveries are folded into `deliveries`.
+fn drain_account_json(throughput: f64, duration_secs: f64, duplicates: u64) -> (u64, String, f64) {
+    let n = (throughput * duration_secs).round().max(5.0) as u64;
+    // The window that makes `n / duration` the row's rate to the last bit,
+    // since validation holds the two to floating-point slack.
+    let duration_secs = if throughput > 0.0 {
+        n as f64 / throughput
+    } else {
+        duration_secs
+    };
+    let k = n.div_ceil(9);
+    let corpus = 10 * k;
+    let end = 9 * k;
+    let start = end - n;
+    let deliveries = corpus + duplicates;
+    (
+        corpus,
+        format!(
+            r#""method": "drain",
+          "drain": {{
+            "corpus": {corpus}, "published": {corpus}, "fill_secs": 0.5, "producers": 4,
+            "unique_at_start": {start}, "unique_at_end": {end}, "unique_final": {corpus},
+            "deliveries": {deliveries}, "duplicates": {duplicates}
+          }},"#
+        ),
+        duration_secs,
+    )
+}
+
+/// A `framework` drain row whose account derives exactly the row's rate:
+/// `n = throughput × duration` completions inside a window that opened at
+/// `9k − n` and closed at the end target `9k` of a corpus of `10k`.
+/// `duplicates` redeliveries are folded into `deliveries`.
+fn drain_scenario(
+    flow: &str,
+    payload: u64,
+    consumers: u32,
+    throughput: f64,
+    duration_secs: f64,
+    duplicates: u64,
+) -> String {
+    let (corpus, method_and_drain, duration_secs) =
+        drain_account_json(throughput, duration_secs, duplicates);
+    let batch_knobs = if flow == "consume_batch" {
+        r#""max_batch_size": 500, "max_batch_age_ms": 200,"#
+    } else {
+        ""
+    };
+    format!(
+        r#"{{
+          "flow": "{flow}", "mode": "parallel", "payload_bytes": {payload},
+          "tier": "moderate", "messages": {corpus}, "consumers": {consumers},
+          "handler": "zero (no-op)", "handler_cost": "framework", "setup_secs": 3.1,
+          {batch_knobs}
+          {method_and_drain}
           "throughput_msg_per_sec": {throughput},
           "dispatch_p50_ms": 1.5, "dispatch_p95_ms": 4.0, "dispatch_p99_ms": 9.0,
           "e2e_p50_ms": 1.5, "e2e_p95_ms": 4.0, "e2e_p99_ms": 9.0,
@@ -132,34 +273,27 @@ fn scenario_with_window(
 /// `dlq_drain`) carry `setup_bound`, everything else is a
 /// `framework` row with a separated window.
 fn scenario(flow: &str, mode: &str, payload: u64, consumers: u32, throughput: f64) -> String {
-    let cost = match flow {
-        "publish_single" | "publish_batch" => "no_handler",
-        "consume_fifo" | "dlq_drain" => "setup_bound",
-        _ => "framework",
-    };
-    scenario_with_cost(flow, mode, payload, consumers, throughput, cost)
+    scenario_with_cost(flow, mode, payload, consumers, throughput, cost_for(flow))
 }
 
-/// An in-process run covering the slices every chart family reads.
+/// An in-process run covering the slices every chart family reads; its
+/// consume rows are drains, as the published document's are.
 fn inmemory_run(representative: bool) -> String {
-    let mut rows = Vec::new();
-    for consumers in [1u32, 2, 4] {
-        rows.push(scenario(
-            "consume_parallel",
-            "parallel",
-            1024,
-            consumers,
-            10_000.0 * f64::from(consumers),
-        ));
-    }
-    for payload in [64u64, 1024, 65536] {
-        rows.push(scenario(
+    let consume = |payload: u64, consumers: u32, throughput: f64| {
+        scenario(
             "consume_parallel",
             "parallel",
             payload,
-            1,
-            10_000.0,
-        ));
+            consumers,
+            throughput,
+        )
+    };
+    let mut rows = Vec::new();
+    for consumers in [1u32, 2, 4] {
+        rows.push(consume(1024, consumers, 10_000.0 * f64::from(consumers)));
+    }
+    for payload in [64u64, 1024, 65536] {
+        rows.push(consume(payload, 1, 10_000.0));
         rows.push(scenario("consume_fifo", "fifo", payload, 1, 4_000.0));
         rows.push(scenario("publish_single", "parallel", payload, 1, 50_000.0));
     }
@@ -200,16 +334,23 @@ fn unknown_schema_version_is_rejected() {
     // An *older* version is refused the same as a newer one: through v3 a
     // row's duration included the group-join latency, so its throughput is
     // not a drain rate and must never reach a v4 axis.
-    let raw =
-        document(&inmemory_run(true)).replace("\"schema_version\": 4", "\"schema_version\": 2");
-    let doc = parse(&raw);
+    // v5 in particular: a v5 consume row without a load account was a
+    // live-publish corpus, a v6 one is a drain, and nothing on the row says
+    // which — so the immediate predecessor is refused like any other.
+    for older in [2u32, 5] {
+        let raw = document(&inmemory_run(true)).replace(
+            "\"schema_version\": 6",
+            &format!("\"schema_version\": {older}"),
+        );
+        let doc = parse(&raw);
 
-    match chartgen::validate(&doc) {
-        Err(ChartError::UnsupportedSchemaVersion { found, expected }) => {
-            assert_eq!(found, 2);
-            assert_eq!(expected, 4);
+        match chartgen::validate(&doc) {
+            Err(ChartError::UnsupportedSchemaVersion { found, expected }) => {
+                assert_eq!(found, older);
+                assert_eq!(expected, chartgen::SCHEMA_VERSION);
+            }
+            other => panic!("expected UnsupportedSchemaVersion for v{older}, got {other:?}"),
         }
-        other => panic!("expected UnsupportedSchemaVersion, got {other:?}"),
     }
 }
 
@@ -219,7 +360,7 @@ fn unknown_schema_version_blocks_every_chart() {
     // validate() a caller might forget: a document from another schema must
     // not be able to produce a single chart.
     let raw =
-        document(&inmemory_run(true)).replace("\"schema_version\": 4", "\"schema_version\": 7");
+        document(&inmemory_run(true)).replace("\"schema_version\": 6", "\"schema_version\": 7");
     let doc = parse(&raw);
 
     for family in Family::ALL {
@@ -1091,7 +1232,7 @@ fn a_foreign_version_is_refused_by_version_even_when_fields_are_missing() {
     match chartgen::parse_str(raw) {
         Err(ChartError::UnsupportedSchemaVersion { found, expected }) => {
             assert_eq!(found, 2);
-            assert_eq!(expected, 4);
+            assert_eq!(expected, chartgen::SCHEMA_VERSION);
         }
         other => panic!("expected UnsupportedSchemaVersion, got {other:?}"),
     }
@@ -1191,7 +1332,7 @@ fn a_failed_cell_in_a_slice_is_named_in_the_caption() {
           "failures": [{{
             "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 64,
             "tier": "moderate", "messages": 150000, "consumers": 4,
-            "handler": "zero (no-op)", "error": "timeout after 60s"
+            "handler": "zero (no-op)", "method": "drain", "error": "timeout after 60s"
           }}],
           "unsupported": []
         }}"#,
@@ -1358,7 +1499,7 @@ fn an_empty_run_with_recorded_failures_is_not_silent() {
       "failures": [{
         "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 64,
         "tier": "moderate", "messages": 150000, "consumers": 1,
-        "handler": "zero (no-op)", "error": "broker never became ready"
+        "handler": "zero (no-op)", "method": "drain", "error": "broker never became ready"
       }],
       "unsupported": []
     }"#;
@@ -1845,18 +1986,18 @@ fn the_committed_results_document_renders_every_family() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
     let doc = chartgen::load(&path).expect("the committed results document should load");
 
-    for family in Family::ALL {
+    for chart in Chart::all() {
         for mode in Mode::ALL {
-            let svg = chartgen::render_to_string(&doc, family, mode).unwrap_or_else(|e| {
-                panic!("{family:?} ({mode:?}) should render from the committed doc: {e}")
+            let svg = chartgen::render_chart_to_string(&doc, chart, mode).unwrap_or_else(|e| {
+                panic!("{chart:?} ({mode:?}) should render from the committed doc: {e}")
             });
             assert!(
                 svg.starts_with("<svg"),
-                "{family:?} ({mode:?}) did not produce an SVG"
+                "{chart:?} ({mode:?}) did not produce an SVG"
             );
             assert!(
                 svg.contains(&doc.generated_at),
-                "{family:?} ({mode:?}) lost the provenance date"
+                "{chart:?} ({mode:?}) lost the provenance date"
             );
             // The committed SVGs must be exactly what this code renders from
             // the committed document — anyone who updates one half without
@@ -1864,17 +2005,74 @@ fn the_committed_results_document_renders_every_family() {
             // CI leg.
             let committed = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("docs/public/bench")
-                .join(family.filename(mode));
+                .join(chart.filename(mode));
             let committed = std::fs::read_to_string(&committed)
                 .unwrap_or_else(|e| panic!("read {}: {e}", committed.display()));
             assert!(
                 svg == committed,
-                "{family:?} ({mode:?}): the committed SVG is not what the committed \
+                "{chart:?} ({mode:?}): the committed SVG is not what the committed \
                  document renders — regenerate with `cargo run --no-default-features \
                  --example chartgen -- --input benches/results/bench-results.json \
                  --out-dir docs/public/bench`"
             );
         }
+    }
+}
+
+#[test]
+fn payload_variants_keep_the_headline_filenames_and_name_their_payload() {
+    // The 64 B charts keep the names the docs embed; the larger payloads are
+    // suffixed siblings of the three families that slice on payload. The
+    // payload-axis family and the in-process overhead family have no
+    // variants: one sweeps payload itself, the other measures a fixed
+    // per-message cost.
+    let names: Vec<String> = Chart::all()
+        .into_iter()
+        .map(|c| c.filename(Mode::Light))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "throughput-vs-consumers.svg",
+            "throughput-vs-payload.svg",
+            "parallel-vs-sequenced.svg",
+            "dispatch-latency.svg",
+            "framework-overhead.svg",
+            "throughput-vs-consumers-1kib.svg",
+            "parallel-vs-sequenced-1kib.svg",
+            "dispatch-latency-1kib.svg",
+            "throughput-vs-consumers-64kib.svg",
+            "parallel-vs-sequenced-64kib.svg",
+            "dispatch-latency-64kib.svg",
+        ]
+    );
+    for family in Family::ALL {
+        assert_eq!(
+            family.filename(Mode::Dark),
+            Chart::headline(family).filename(Mode::Dark),
+            "{family:?}: the family's filename must be its headline chart's"
+        );
+    }
+
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let doc = chartgen::load(&path).expect("the committed results document should load");
+    for chart in Chart::all().into_iter().filter(|c| c.payload != 64) {
+        let svg = chartgen::render_chart_to_string(&doc, chart, Mode::Light)
+            .unwrap_or_else(|e| panic!("{chart:?} should render: {e}"));
+        let label = if chart.payload == 1024 {
+            "1 KiB payload"
+        } else {
+            "64 KiB payload"
+        };
+        assert!(
+            svg.contains(label),
+            "{chart:?} does not state its payload in the subtitle"
+        );
+        assert!(
+            !svg.contains("64 B payload"),
+            "{chart:?} still carries the headline payload's subtitle"
+        );
     }
 }
 
@@ -2324,8 +2522,8 @@ fn the_latency_panel_accounts_for_every_backend() {
     let svg = chartgen::render_to_string(&doc, Family::DispatchLatency, Mode::Light)
         .expect("panel should render");
     assert!(
-        svg.contains("inmemory") && svg.contains("withheld"),
-        "the panel must name the backends whose percentiles are withheld"
+        svg.contains("inmemory") && svg.contains("corpus-mode"),
+        "the panel must name the backends whose corpus-mode percentiles are withheld"
     );
     assert!(
         svg.contains("sqs") && svg.contains("no measured rows"),
@@ -2369,7 +2567,7 @@ fn a_failure_without_an_error_is_refused() {
           "backend": "kafka", "representative": true,
           "results": [],
           "failures": [{ "flow": "consume_parallel", "payload_bytes": 64, "consumers": 1,
-                         "handler": "zero (no-op)", "error": " " }],
+                         "handler": "zero (no-op)", "method": "drain", "error": " " }],
           "unsupported": []
         }"#;
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
@@ -2534,23 +2732,24 @@ fn a_sleeping_handler_cell_is_captioned_as_measured_not_as_a_gap() {
 fn an_axis_peak_that_cannot_take_headroom_is_refused() {
     // Headroom is a multiplication; near f64::MAX it overflows to infinity
     // and plotters maps every coordinate to NaN in a clean-looking file.
+    // Since v6 a consume row's rate is re-derived from integer counts, so no
+    // valid method-measured row can carry such a rate; the FIFO lower-bound
+    // bar has no account and still scales the bar chart's axis.
     let huge = format!("{:e}", f64::MAX / 1.05);
     let run = format!(
         r#"{{
           "backend": "kafka", "representative": true,
           "results": [{}], "failures": [], "unsupported": []
         }}"#,
-        scenario("consume_parallel", "parallel", 64, 1, 1.0).replace(
+        scenario("consume_fifo", "fifo", 64, 1, 1.0).replace(
             "\"throughput_msg_per_sec\": 1,",
             &format!("\"throughput_msg_per_sec\": {huge},")
         )
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
-    for family in [Family::ThroughputVsConsumers, Family::ParallelVsSequenced] {
-        match chartgen::render_to_string(&doc, family, Mode::Light) {
-            Err(ChartError::Render(msg)) => assert!(msg.contains("headroom"), "{msg}"),
-            other => panic!("{family:?}: expected a Render refusal, got {other:?}"),
-        }
+    match chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light) {
+        Err(ChartError::Render(msg)) => assert!(msg.contains("headroom"), "{msg}"),
+        other => panic!("expected a Render refusal, got {other:?}"),
     }
 }
 
@@ -2626,9 +2825,14 @@ fn a_failed_bar_cell_is_captioned_as_failed_not_as_a_gap() {
     // A cell in failures[] is an absence with a recorded cause; the bar
     // families must not also call it a gap.
     let failure = |flow: &str| {
+        let method = if flow == "consume_parallel" {
+            r#""method": "drain","#
+        } else {
+            ""
+        };
         format!(
             r#"{{ "flow": "{flow}", "payload_bytes": 64, "consumers": 1, "tier": "moderate",
-                 "handler": "zero (no-op)", "error": "timeout after 60s" }}"#
+                 "handler": "zero (no-op)", {method} "error": "timeout after 60s" }}"#
         )
     };
     let kafka = format!(
@@ -2834,7 +3038,8 @@ fn a_payload_size_outside_the_harness_set_is_refused() {
     let failed = r#"{
           "backend": "nats", "representative": true,
           "results": [],
-          "failures": [{ "flow": "consume_parallel", "payload_bytes": 4096, "consumers": 1, "error": "x" }],
+          "failures": [{ "flow": "consume_parallel", "payload_bytes": 4096, "consumers": 1,
+                         "method": "drain", "error": "x" }],
           "unsupported": []
         }"#;
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), failed)));
@@ -2933,7 +3138,8 @@ fn a_failure_only_line_slice_is_captioned_as_failed_not_as_a_gap() {
           "backend": "kafka", "representative": true,
           "results": [],
           "failures": [{ "flow": "consume_parallel", "payload_bytes": 64, "consumers": 1,
-                         "handler": "zero (no-op)", "error": "timeout after 60s" }],
+                         "handler": "zero (no-op)", "method": "drain",
+                         "error": "timeout after 60s" }],
           "unsupported": []
         }"#;
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
@@ -2997,7 +3203,8 @@ fn a_handler_profile_whose_cells_all_failed_still_reaches_the_provenance() {
           "backend": "kafka", "representative": true,
           "results": [],
           "failures": [{ "flow": "consume_parallel", "payload_bytes": 64, "consumers": 1,
-                         "handler": "heavy (1-5s)", "error": "timeout after 600s" }],
+                         "handler": "heavy (1-5s)", "method": "drain",
+                         "error": "timeout after 600s" }],
           "unsupported": []
         }"#;
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
@@ -3047,7 +3254,7 @@ fn an_unsupported_entry_for_a_flow_unknown_to_the_chart_is_named() {
 #[test]
 fn contradictory_or_duplicate_declarations_are_refused() {
     let failure = r#"{ "flow": "consume_parallel", "payload_bytes": 64, "consumers": 1,
-                       "handler": "zero (no-op)", "error": "timeout" }"#;
+                       "handler": "zero (no-op)", "method": "drain", "error": "timeout" }"#;
     let cases = [
         (
             "failed and declared unsupported",
@@ -3071,7 +3278,7 @@ fn contradictory_or_duplicate_declarations_are_refused() {
             "failure without a handler",
             r#"{ "backend": "kafka", "representative": true, "results": [],
                  "failures": [{ "flow": "consume_parallel", "payload_bytes": 64, "consumers": 1,
-                                "error": "timeout" }],
+                                "method": "drain", "error": "timeout" }],
                  "unsupported": [] }"#
                 .to_string(),
         ),
@@ -3508,28 +3715,11 @@ fn a_refusal_panel_that_cannot_fit_its_band_is_refused() {
     }
 }
 
-#[test]
-fn a_log_axis_spanning_more_decades_than_f64_is_refused() {
-    // validate() accepts any finite positive throughput — including
-    // subnormals like 1e-310. An axis floored there makes y_hi/y_lo overflow
-    // to +inf, and the shape-only geometric mapping would write saturated
-    // garbage coordinates into a clean-looking SVG. Loud refusal instead.
-    let tiny = format!(
-        r#"{{
-          "backend": "kafka", "representative": true,
-          "results": [{}], "failures": [], "unsupported": []
-        }}"#,
-        scenario("consume_parallel", "parallel", 64, 1, 1e-310)
-    );
-    let doc = parse(&document(&format!("{},{}", inmemory_run(true), tiny)));
-    match chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light) {
-        Err(ChartError::Render(msg)) => assert!(
-            msg.contains("decades"),
-            "the refusal must name the unrepresentable span: {msg}"
-        ),
-        other => panic!("an unrepresentable axis span must refuse to render: {other:?}"),
-    }
-}
+// A line-chart row with a subnormal rate (1e-310) used to exercise the log
+// axis's "more decades than f64" refusal. Since v6 every rate on a line-chart
+// flow's row is re-derived from integer counts over a finite window, so no
+// document `validate` accepts can carry one; the refusal stays in the
+// renderer as a guard.
 
 #[test]
 fn sub_unit_decade_ticks_carry_distinct_labels() {
@@ -3934,4 +4124,551 @@ fn a_label_fitting_neither_side_of_its_endpoint_is_refused() {
         ),
         other => panic!("an unplaceable end label must refuse to render: {other:?}"),
     }
+}
+
+// ── Offered-load rows (v5) ───────────────────────────────────────────────────
+
+/// A `framework` consume row that ran one rung of the offered-load ladder.
+/// `achieved` and `processed_at_end` settle the two verdicts exactly as the
+/// harness derives them, so a fixture cannot claim a verdict its numbers
+/// refute.
+#[allow(clippy::too_many_arguments)]
+fn load_scenario(
+    flow: &str,
+    payload: u64,
+    consumers: u32,
+    offered: u64,
+    achieved: f64,
+    processed_at_end: u64,
+    throughput: f64,
+    p50: f64,
+) -> String {
+    let published_at_end = (achieved * 10.0) as u64;
+    let lag = published_at_end.saturating_sub(processed_at_end);
+    let producer_held_rate = achieved >= 0.95 * offered as f64;
+    let consumers_kept_up = lag as f64 <= 0.05 * published_at_end as f64;
+    let producer_bound = !producer_held_rate && consumers_kept_up;
+    let sustained = producer_held_rate && consumers_kept_up;
+    format!(
+        r#"{{
+          "flow": "{flow}", "mode": "parallel", "payload_bytes": {payload},
+          "tier": "moderate", "messages": {published_at_end}, "consumers": {consumers},
+          "handler": "zero (no-op)", "handler_cost": "framework", "setup_secs": 3.1,
+          "throughput_msg_per_sec": {throughput},
+          "dispatch_p50_ms": {p50}, "dispatch_p95_ms": {p95}, "dispatch_p99_ms": {p99},
+          "e2e_p50_ms": {p50}, "e2e_p95_ms": {p95}, "e2e_p99_ms": {p99},
+          "scaling_efficiency": 1.0, "peak_rss_mb": 1.0, "cpu_pct": 100.0,
+          "duration_secs": 10.0,
+          "method": "offered_load",
+          "load": {{
+            "offered_msg_per_sec": {offered}, "window_secs": 10, "producers": 4,
+            "published": {published_at_end}, "published_at_window_end": {published_at_end},
+            "processed_at_window_end": {processed_at_end},
+            "achieved_publish_msg_per_sec": {achieved:?}, "lag_at_window_end": {lag},
+            "peak_lag": {lag}, "drain_secs": 0.2,
+            "producer_bound": {producer_bound}, "sustained": {sustained}
+          }}
+        }}"#,
+        p95 = p50 * 2.0,
+        p99 = p50 * 4.0,
+    )
+}
+
+fn kafka_ladder_run(rows: &[String]) -> String {
+    format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        rows.join(",")
+    )
+}
+
+#[test]
+fn the_latency_family_publishes_bars_off_a_sustained_rung_only() {
+    // Two rungs at one consumer: the 25k one is sustained (its percentiles
+    // are dispatch latency), the 100k one is not (its percentiles are
+    // backlog). The bars come from the highest sustained rung.
+    let run = kafka_ladder_run(&[
+        load_scenario(
+            "consume_parallel",
+            64,
+            1,
+            5_000,
+            4_990.0,
+            49_900,
+            4_990.0,
+            0.9,
+        ),
+        load_scenario(
+            "consume_parallel",
+            64,
+            1,
+            25_000,
+            24_950.0,
+            249_000,
+            24_900.0,
+            0.4,
+        ),
+        load_scenario(
+            "consume_parallel",
+            64,
+            1,
+            100_000,
+            99_800.0,
+            600_000,
+            60_000.0,
+            900.0,
+        ),
+    ]);
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::DispatchLatency, Mode::Light)
+        .expect("chart should render");
+    assert!(
+        svg.contains("kafka at 25k msg/s, 1 consumer"),
+        "the caption names the rung the bars come from: {svg}"
+    );
+    assert!(
+        !svg.contains("900"),
+        "the unsustained rung's backlog residency is not a bar"
+    );
+    assert!(
+        svg.contains("no bar for inmemory") && svg.contains("corpus-mode"),
+        "a backend with only corpus rows is accounted for"
+    );
+    let (full_size, total) = full_size_rects(&svg);
+    assert!(total > full_size, "bars must actually be drawn");
+}
+
+#[test]
+fn a_load_account_on_a_flow_without_a_producer_is_rejected() {
+    let row = load_scenario(
+        "consume_parallel",
+        64,
+        1,
+        5_000,
+        4_990.0,
+        49_900,
+        4_990.0,
+        0.3,
+    )
+    .replace(r#""flow": "consume_parallel""#, r#""flow": "dlq_drain""#)
+    .replace(r#""setup_secs": 3.1"#, r#""setup_secs": null"#)
+    .replace(
+        r#""handler_cost": "framework""#,
+        r#""handler_cost": "setup_bound""#,
+    );
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        kafka_ladder_run(&[row])
+    )));
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow { what, .. }) => {
+            assert!(what.contains("method"), "wrong invariant named: {what}")
+        }
+        other => panic!("expected MalformedRow, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_load_verdict_the_numbers_refute_is_rejected() {
+    let row = load_scenario(
+        "consume_parallel",
+        64,
+        1,
+        100_000,
+        99_800.0,
+        600_000,
+        60_000.0,
+        900.0,
+    )
+    .replace(r#""sustained": false"#, r#""sustained": true"#);
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        kafka_ladder_run(&[row])
+    )));
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow { what, .. }) => {
+            assert!(
+                what.contains("sustained=true"),
+                "wrong invariant named: {what}"
+            )
+        }
+        other => panic!("expected MalformedRow, got {other:?}"),
+    }
+}
+
+// ── Drain rows (v6) ─────────────────────────────────────────────────────────
+
+fn kafka_run_with_failures(rows: &[String], failures: &str) -> String {
+    format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [{failures}], "unsupported": []
+        }}"#,
+        rows.join(",")
+    )
+}
+
+#[test]
+fn a_drain_document_publishes_drain_rows_and_withholds_rungs() {
+    // One drain row makes the document a drain document: its point is the
+    // drain's rate, a sustained rung at a higher rate on the same cell is not
+    // a candidate, and the in-process run — rungs only — is withheld by name
+    // rather than plotted beside a drain on the same axis.
+    let run = kafka_ladder_run(&[
+        drain_scenario("consume_parallel", 64, 1, 60_000.0, 10.0, 0),
+        load_scenario(
+            "consume_parallel",
+            64,
+            1,
+            100_000,
+            99_800.0,
+            998_000,
+            99_800.0,
+            0.4,
+        ),
+        // Rungs only at two consumers: no drain, so no point.
+        load_scenario(
+            "consume_parallel",
+            64,
+            2,
+            100_000,
+            99_800.0,
+            998_000,
+            99_800.0,
+            0.4,
+        ),
+    ]);
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+    assert!(svg.contains("60k"), "the drain's rate is the point: {svg}");
+    assert!(
+        !svg.contains("100k"),
+        "the sustained rung must not supply a point in a drain document"
+    );
+    assert!(
+        svg.contains("drain (inmemory, kafka)") && svg.contains("no producer ran in the window"),
+        "the caption must state the drain rule: {svg}"
+    );
+    assert!(
+        svg.contains("consume_parallel point"),
+        "the caption names the series the rule covers: {svg}"
+    );
+    assert!(
+        !svg.contains("offered-load ladder"),
+        "the ladder rule is not the one this chart publishes"
+    );
+    assert!(
+        svg.contains("offered-load rungs only") && svg.contains("consumers 2"),
+        "the rung-only cell is withheld by name: {svg}"
+    );
+}
+
+#[test]
+fn a_failed_drain_is_not_masked_by_its_sustained_rung() {
+    // Every drain of this run failed, so no drain row exists — the method
+    // is still selected off the failures, and the cell is a failed drain,
+    // not the ceiling its rung sustained.
+    let run = kafka_run_with_failures(
+        &[load_scenario(
+            "consume_parallel",
+            64,
+            1,
+            25_000,
+            24_950.0,
+            249_500,
+            24_950.0,
+            0.3,
+        )],
+        r#"{ "flow": "consume_parallel", "payload_bytes": 64, "consumers": 1,
+             "handler": "zero (no-op)", "method": "drain", "error": "drain stalled" }"#,
+    );
+    // The in-process run carries rungs only, so the failure alone decides.
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+    assert!(
+        !svg.contains("25k"),
+        "the sustained rung must not stand in for the failed drain"
+    );
+    assert!(
+        svg.contains("a failed drain"),
+        "the cell is captioned as a failed drain: {svg}"
+    );
+}
+
+#[test]
+fn the_drain_caption_covers_the_consume_bars_and_leaves_the_fifo_bar_its_own() {
+    // Parallel vs sequenced puts a FIFO bar beside the consume bars. FIFO
+    // has one method and keeps its lower-bound label; the drain caption names
+    // the consume series it covers and nothing else.
+    let run = kafka_ladder_run(&[
+        drain_scenario("consume_parallel", 64, 1, 60_000.0, 10.0, 12),
+        scenario("consume_fifo", "fifo", 64, 1, 4_000.0),
+    ]);
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
+    assert!(svg.contains("drain (inmemory, kafka)"), "{svg}");
+    assert!(svg.contains("consume_parallel point"), "{svg}");
+    assert!(
+        !svg.contains("consume_fifo point"),
+        "the FIFO bar is not a drain and must not be described as one: {svg}"
+    );
+    assert!(
+        svg.contains("kafka saw 12 redeliveries"),
+        "redeliveries are disclosed: {svg}"
+    );
+}
+
+#[test]
+fn a_drain_account_the_numbers_refute_is_rejected() {
+    let good = drain_scenario("consume_parallel", 64, 1, 60_000.0, 10.0, 0);
+    let cases = [
+        (
+            good.replace(r#""duplicates": 0"#, r#""duplicates": 3"#),
+            "duplicates",
+        ),
+        (
+            good.replace(
+                r#""throughput_msg_per_sec": 60000"#,
+                r#""throughput_msg_per_sec": 70000"#,
+            ),
+            "derives",
+        ),
+        (
+            good.replace(r#""unique_at_start": 3"#, r#""unique_at_start": 600000"#),
+            "already consumed",
+        ),
+        (
+            good.replace(r#""fill_secs": 0.5"#, r#""fill_secs": 0.0"#),
+            "fill time",
+        ),
+    ];
+    for (row, invariant) in cases {
+        let doc = parse(&document(&format!(
+            "{},{}",
+            inmemory_run(true),
+            kafka_ladder_run(&[row])
+        )));
+        match chartgen::validate(&doc) {
+            Err(ChartError::MalformedRow { what, .. }) => {
+                assert!(what.contains(invariant), "wrong invariant named: {what}")
+            }
+            other => panic!("expected MalformedRow naming {invariant}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_overhead_chart_names_a_failed_drain_and_a_rung_only_flow_for_what_they_are() {
+    // Both cells have rung rows; neither has a chartable row. The first's
+    // drain failed, the second never ran one. Neither is a sleeping-handler
+    // cell, whatever a zero-handler rung row might look like to the generic
+    // arm.
+    let rung = |flow: &str| load_scenario(flow, 64, 1, 25_000, 24_950.0, 249_500, 24_950.0, 0.3);
+    let batch_rung = load_scenario(
+        "consume_batch",
+        64,
+        1,
+        25_000,
+        24_950.0,
+        249_500,
+        24_950.0,
+        0.3,
+    )
+    .replace(
+        r#""tier": "moderate","#,
+        r#""tier": "moderate", "max_batch_size": 500, "max_batch_age_ms": 200,"#,
+    )
+    .replace(r#""mode": "parallel""#, r#""mode": "batch""#);
+    let run = format!(
+        r#"{{
+          "backend": "inmemory",
+          "broker": {{ "name": "in-process", "version": "n/a", "deployment": "in-process" }},
+          "representative": true,
+          "results": [{},{},{}],
+          "failures": [{{ "flow": "consume_parallel", "payload_bytes": 64, "consumers": 1,
+                         "handler": "zero (no-op)", "method": "drain", "error": "drain stalled" }}],
+          "unsupported": []
+        }}"#,
+        rung("consume_parallel"),
+        batch_rung,
+        scenario("publish_single", "parallel", 64, 1, 50_000.0),
+    );
+    let doc = parse(&document(&run));
+    let svg = chartgen::render_to_string(&doc, Family::FrameworkOverhead, Mode::Light)
+        .expect("chart should render");
+    let caption = texts(&svg)
+        .into_iter()
+        .map(|(_, _, _, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        caption.contains("failed to run") && caption.contains("consume_parallel"),
+        "the failed drain is a failed cell: {caption}"
+    );
+    assert!(
+        caption.contains("offered-load rungs only") && caption.contains("consume_batch"),
+        "the rung-only cell is named as such: {caption}"
+    );
+    assert!(
+        !caption.contains("sleeping-handler"),
+        "a zero-handler rung is not a sleeping-handler row: {caption}"
+    );
+}
+
+#[test]
+fn a_rate_the_counts_refute_is_rejected_on_rungs_and_drains() {
+    let rung = load_scenario(
+        "consume_parallel",
+        64,
+        1,
+        25_000,
+        24_950.0,
+        249_500,
+        24_950.0,
+        0.3,
+    );
+    let drain = drain_scenario("consume_parallel", 64, 1, 60_000.0, 10.0, 0);
+    let cases = [
+        (
+            rung.replace(
+                r#""throughput_msg_per_sec": 24950"#,
+                r#""throughput_msg_per_sec": 30000"#,
+            ),
+            "claims 30000.0 msg/s",
+        ),
+        (
+            rung.replace(
+                r#""achieved_publish_msg_per_sec": 24950.0"#,
+                r#""achieved_publish_msg_per_sec": 26000.0"#,
+            ),
+            "achieved publish rate",
+        ),
+        (
+            rung.replace(
+                r#""processed_at_window_end": 249500"#,
+                r#""processed_at_window_end": 249600"#,
+            ),
+            "counts do not add up",
+        ),
+        (
+            rung.replace(r#""messages": 249500"#, r#""messages": 249400"#),
+            "not the row's messages",
+        ),
+        (
+            drain.replace(r#""messages": 666670"#, r#""messages": 666660"#),
+            "not the row's messages",
+        ),
+    ];
+    for (row, invariant) in cases {
+        let doc = parse(&document(&format!(
+            "{},{}",
+            inmemory_run(true),
+            kafka_ladder_run(&[row])
+        )));
+        match chartgen::validate(&doc) {
+            Err(ChartError::MalformedRow { what, .. }) => {
+                assert!(what.contains(invariant), "wrong invariant named: {what}")
+            }
+            other => panic!("expected MalformedRow naming {invariant}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_method_that_disagrees_with_its_account_is_rejected() {
+    // A drain account under an offered-load method, a rung without a method,
+    // a method on a flow measured one way only, and a failure of a consume
+    // flow that names no method: each is a row the harness cannot write.
+    let drain = drain_scenario("consume_parallel", 64, 1, 60_000.0, 10.0, 0);
+    let rung = load_scenario(
+        "consume_parallel",
+        64,
+        1,
+        25_000,
+        24_950.0,
+        249_500,
+        24_950.0,
+        0.3,
+    );
+    let cases = [
+        (
+            kafka_ladder_run(&[
+                drain.replace(r#""method": "drain""#, r#""method": "offered_load""#)
+            ]),
+            "disagrees",
+        ),
+        (
+            kafka_ladder_run(&[rung.replace(r#""method": "offered_load","#, "")]),
+            "no method",
+        ),
+        (
+            kafka_ladder_run(&[scenario("consume_fifo", "fifo", 64, 1, 4_000.0)
+                .replace(r#""handler_cost""#, r#""method": "drain", "handler_cost""#)]),
+            "measured one way only",
+        ),
+        (
+            kafka_run_with_failures(
+                &[],
+                r#"{ "flow": "consume_parallel", "payload_bytes": 64, "consumers": 1,
+                     "handler": "zero (no-op)", "error": "x" }"#,
+            ),
+            "records no method",
+        ),
+    ];
+    for (run, invariant) in cases {
+        let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+        match chartgen::validate(&doc) {
+            Err(ChartError::MalformedRow { what, .. }) => {
+                assert!(what.contains(invariant), "wrong invariant named: {what}")
+            }
+            other => panic!("expected MalformedRow naming {invariant}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_cell_with_rungs_only_is_withheld_and_never_plotted() {
+    // Sustained or producer-bound, a rung's window contains the harness's own
+    // producer, so it never supplies an absolute point; the cell says so.
+    let run = kafka_ladder_run(&[
+        load_scenario(
+            "consume_parallel",
+            64,
+            1,
+            25_000,
+            24_950.0,
+            249_500,
+            24_950.0,
+            0.3,
+        ),
+        load_scenario(
+            "consume_parallel",
+            64,
+            1,
+            100_000,
+            40_000.0,
+            400_000,
+            40_000.0,
+            0.3,
+        ),
+    ]);
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+    assert!(
+        !svg.contains("25k") && !svg.contains("40k"),
+        "a rung is never a point: {svg}"
+    );
+    assert!(
+        svg.contains("offered-load rungs only") && svg.contains("consumers 1"),
+        "the cell is withheld by name: {svg}"
+    );
+    assert!(!svg.contains("offered-load ladder"), "{svg}");
 }
