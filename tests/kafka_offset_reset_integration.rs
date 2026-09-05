@@ -194,30 +194,38 @@ macro_rules! drain {
 /// shuts down — the window `reset_when_inactive` exists to ride out. Two shapes
 /// occur there:
 ///
-/// - `Validation`: the coordinator still lists members from the group that has
-///   just shut down (see the "must be inactive" note on
-///   `reset_consumer_group_offsets`).
-/// - `Connection` carrying a retriable coordinator code: the client asked a
-///   broker that is not (or no longer) the coordinator (`NotCoordinator`), or
-///   the coordinator is still loading group state
-///   (`CoordinatorLoadInProgress`). Kafka's contract for both is "refresh
-///   metadata and retry"; they are only ever transient.
+/// - `Validation` from the inactive check: the coordinator still lists members
+///   from the group that has just shut down (see the "must be inactive" note on
+///   `reset_consumer_group_offsets`). Matched by its "active member(s)"
+///   wording, because the reset path has one other `Validation` — the
+///   `.broadcast()`-topic rejection — that is permanent misuse.
+/// - `Connection` carrying a retriable coordinator or group-transition code:
+///   the client asked a broker that is not (or no longer) the coordinator, the
+///   coordinator is mid-election or still loading group state, or the broker's
+///   own inactivity guard rejected the commit while the last member was still
+///   leaving. Kafka's contract for all of them is "refresh metadata and
+///   retry"; they are only ever transient. The list matches the coordinator
+///   family in `examples/kafka/stress.rs` plus the commit-side codes named in
+///   `src/backends/kafka/offset_reset.rs`'s advisory-guard note.
 ///
 /// Everything else — transport failures, topology errors — is terminal and must
 /// fail fast so the test never papers over a real regression.
 fn is_transient_coordinator_error(err: &ShoveError) -> bool {
     match err {
-        ShoveError::Validation(_) => true,
+        ShoveError::Validation(msg) => msg.contains("active member"),
         // The offset-reset path wraps rdkafka errors as `Connection` strings,
-        // so the retriable coordinator codes are only recognizable by name —
-        // matched in both their code (`NotCoordinator`) and broker-description
-        // ("Not coordinator") spellings. Deliberately NOT a blanket
-        // `Connection` retry: a transport failure must still fail fast.
+        // so the codes are only recognizable by name. That rendering is
+        // stable: `RDKafkaErrorCode` displays as `{:?} ({description})`, so
+        // the variant name is always present — and the classification test
+        // below builds its fixtures through the real rdkafka types to catch
+        // that format ever drifting. Deliberately NOT a blanket `Connection`
+        // retry: a transport failure must still fail fast.
         ShoveError::Connection(msg) => [
             "NotCoordinator",
-            "Not coordinator",
+            "CoordinatorNotAvailable",
             "CoordinatorLoadInProgress",
-            "Coordinator load in progress",
+            "UnknownMemberId",
+            "RebalanceInProgress",
         ]
         .iter()
         .any(|code| msg.contains(code)),
@@ -237,57 +245,111 @@ async fn reset_when_inactive<T: Topic>(
     loop {
         match broker.reset_consumer_group_offsets::<T>(config, to).await {
             Ok(report) => return report,
-            Err(e) if is_transient_coordinator_error(&e) && Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+            Err(e) if is_transient_coordinator_error(&e) => {
+                // Checked here, not in the match guard, so a transient error
+                // that outlives the deadline is still attributed to the
+                // retried-and-timed-out path rather than falling through to
+                // the fail-fast panic below.
                 if Instant::now() >= deadline {
-                    panic!("coordinator never settled after group shutdown: {e}");
+                    panic!("coordinator never settled after 45s of retries: {e}");
                 }
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
             Err(e) => panic!("offset reset failed: {e}"),
         }
     }
 }
 
-/// The exact shape observed on CI (actions run 33953186608, both nextest
-/// tries): the committed-offsets read hits a broker that is no longer the
-/// coordinator, wrapped as `Connection` by the offset-reset path.
+/// One row per (error, expected classification). The `Connection` fixtures are
+/// rendered through the real `rdkafka` error types — the same ones the
+/// offset-reset path wraps — so a dependency bump that changes the `Display`
+/// format the predicate's substring match depends on turns up here as a red
+/// test instead of a silently dead predicate.
 #[test]
-fn not_coordinator_during_offset_reset_is_transient() {
-    let err = ShoveError::Connection(
-        "failed to read committed offsets for group \
-         'kafka-offset-reset-timetravel-consumer': Meta data fetch error: \
-         NotCoordinator (Broker: Not coordinator)"
-            .to_string(),
-    );
-    assert!(is_transient_coordinator_error(&err));
-}
+fn transient_coordinator_classification() {
+    use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 
-#[test]
-fn coordinator_load_in_progress_is_transient() {
-    let err = ShoveError::Connection(
-        "failed to read committed offsets for group 'g': Meta data fetch \
-         error: CoordinatorLoadInProgress (Broker: Coordinator load in progress)"
-            .to_string(),
-    );
-    assert!(is_transient_coordinator_error(&err));
-}
+    // The wrapping applied at src/backends/kafka/offset_reset.rs's
+    // committed-offsets read — the site the CI flake came through
+    // (actions run 33953186608, both nextest tries, NotCoordinator).
+    let committed_read = |code: RDKafkaErrorCode| {
+        ShoveError::Connection(format!(
+            "failed to read committed offsets for group \
+             'kafka-offset-reset-timetravel-consumer': {}",
+            KafkaError::MetadataFetch(code)
+        ))
+    };
 
-#[test]
-fn group_still_listing_members_is_transient() {
-    let err = ShoveError::Validation("consumer group 'g' still has 1 active member(s)".to_string());
-    assert!(is_transient_coordinator_error(&err));
-}
+    let cases = [
+        (committed_read(RDKafkaErrorCode::NotCoordinator), true),
+        (
+            committed_read(RDKafkaErrorCode::CoordinatorNotAvailable),
+            true,
+        ),
+        (
+            committed_read(RDKafkaErrorCode::CoordinatorLoadInProgress),
+            true,
+        ),
+        // The advisory inactive-check race: the group-list probe saw zero
+        // members but the coordinator had not finished reaping the leaving
+        // member, so its own guard rejects the commit.
+        (
+            ShoveError::Connection(format!(
+                "failed to commit Latest offsets for group 'g' on 'q': {}. \
+                 Kafka only accepts an offset reset while the group is \
+                 inactive — stop every consumer in the group first.",
+                KafkaError::ConsumerCommit(RDKafkaErrorCode::UnknownMemberId)
+            )),
+            true,
+        ),
+        (
+            ShoveError::Connection(format!(
+                "failed to fetch group list for 'g': {}",
+                KafkaError::GroupListFetch(RDKafkaErrorCode::RebalanceInProgress)
+            )),
+            true,
+        ),
+        // The faithful wording of `ensure_group_inactive`'s transient refusal.
+        (
+            ShoveError::Validation(
+                "cannot reset offsets for group 'g' on topic 'q': the group \
+                 has 1 active member(s). Kafka only accepts an offset reset \
+                 while the group is inactive — stop every consumer in the \
+                 group, then reset before starting them again."
+                    .to_string(),
+            ),
+            true,
+        ),
+        // The reset path's other Validation — a `.broadcast()` topic has no
+        // group to re-anchor (src/broker.rs) — is permanent misuse: retrying
+        // it can never succeed and must fail fast.
+        (
+            ShoveError::Validation(
+                "topic 'q' declares `.broadcast()`, so it has no consumer \
+                 group to re-anchor: its subscribers assign partitions \
+                 manually and never commit an offset."
+                    .to_string(),
+            ),
+            false,
+        ),
+        // A dead broker is terminal, not a coordinator transition.
+        (
+            committed_read(RDKafkaErrorCode::BrokerTransportFailure),
+            false,
+        ),
+        (
+            ShoveError::Topology("failed to build target offsets: bad state".to_string()),
+            false,
+        ),
+    ];
 
-#[test]
-fn terminal_errors_are_not_transient() {
-    let transport = ShoveError::Connection(
-        "failed to fetch metadata for 'kafka-offset-reset-ticks': \
-         BrokerTransportFailure (Local: Broker transport failure)"
-            .to_string(),
-    );
-    assert!(!is_transient_coordinator_error(&transport));
-    let topology = ShoveError::Topology("failed to build target offsets: bad state".to_string());
-    assert!(!is_transient_coordinator_error(&topology));
+    for (err, expected) in cases {
+        assert_eq!(
+            is_transient_coordinator_error(&err),
+            expected,
+            "misclassified: {err}"
+        );
+    }
 }
 
 fn ids(prefix: &str, count: u32) -> Vec<String> {
