@@ -3,11 +3,11 @@
 //!
 //! # The `Broker<B>` pattern
 //!
-//! Everything hangs off a single generic hub [`Broker<B>`], parameterised by a
-//! backend marker `B` (one of [`RabbitMq`], [`Sqs`], [`Nats`], [`Kafka`],
-//! [`Redis`], [`InMemory`], each gated on its Cargo feature). The marker binds that
-//! backend's client / publisher / consumer / topology / registry types
-//! together; the generic wrappers below delegate through the sealed
+//! Everything hangs off a single generic hub [`Broker<B>`], parameterised by
+//! a backend marker `B` (one of [`RabbitMq`], [`Sqs`], [`Nats`], [`Kafka`],
+//! [`Redis`], [`InMemory`], each gated on its Cargo feature). The marker
+//! binds that backend's client / publisher / consumer / topology / registry
+//! types together; the generic wrappers below delegate through the sealed
 //! [`Backend`] trait.
 //!
 //! ```text
@@ -148,8 +148,8 @@
 //! - [`define_topic!`] and [`define_sequenced_topic!`] for the typed-topic
 //!   macros.
 //! - Per-backend modules: [`rabbitmq`], [`sns`], [`nats`], [`kafka`],
-//!   [`inmemory`] — expose the config and client types bound to each
-//!   marker.
+//!   [`redis`], [`inmemory`] — expose the config and client types bound to
+//!   each marker.
 //! - The `env-config` feature and the `env` module for optional, prefix-scoped
 //!   `from_env()` constructors for the tuning knobs (consumer range, prefetch,
 //!   autoscaler, Kafka replication, NATS stream config).

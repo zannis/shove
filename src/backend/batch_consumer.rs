@@ -29,18 +29,19 @@
 //! the authoritative list): they share the flush-invoking/backoff machinery
 //! ([`settling::invoke_batch_handler`],
 //! [`settling::batch_redelivery_backoff`],
-//! [`settling::next_redelivery_delay`]). The feature list is written once,
-//! on the module itself — callers path through `settling::` rather than
-//! re-exports, so no second copy of the gate exists to fall out of sync.
-//!
-//! [`settling::PREALLOC_CAP`] stays narrower than the rest of `settling`:
-//! see its own doc comment for why SQS does not join that particular gate.
+//! [`settling::next_redelivery_delay`]). Callers path through `settling::`
+//! rather than re-exports, so the module's gate has no re-export copy to
+//! keep in sync. A new batching backend still widens more than that one
+//! cfg, though: [`settling::PREALLOC_CAP`] carries its own deliberately
+//! narrower list (see its doc for why SQS does not join it), and
+//! `mod routing`'s gate in `lib.rs` names the same features because
+//! `settling` depends on it.
 //!
 //! `TerminalDiscard`, `RejectSettlement` and `reject_settlement` are
 //! narrower still: `#[cfg(feature = "kafka")]` *inside* the [`settling`]
 //! module. Every other backend in the gate finishes settling a reject
-//! before its batch clears,
-//! with no later commit that could still fail, so none of them ever needed
+//! before its batch clears, with no later commit that could still fail, so
+//! none of them ever needed
 //! the held-until-confirmed shape this trio exists for: InMemory in
 //! `backends::inmemory::consumer::resolve_reject`, Redis in its batch
 //! `DeadLetter` arm (the `XACK`/DLQ route completes before the batch
@@ -121,8 +122,8 @@ pub(crate) struct BatchConsumerOptionsInner {
 /// [`BatchConsumer<B>`](crate::batch_consumer::BatchConsumer) delegates here.
 ///
 /// Anchored by each backend's own `impl BatchConsumerImpl` under its feature.
-/// Under `--no-default-features`, and under any feature set naming no backend
-/// with a batch implementation yet, the trait genuinely has no call site —
+/// Under `--no-default-features`, and under a feature set naming no batching
+/// backend (`pub-aws-sns` alone), the trait genuinely has no call site —
 /// `dead_code` is expected there and the per-trait allow avoids polluting
 /// those builds with warnings, exactly as [`ConsumerImpl`](crate::backend::ConsumerImpl)
 /// does for the single-message trait.
@@ -245,11 +246,11 @@ mod settle_batch_outcome_tests {
 }
 
 // Gated on the batching backends' features — see the module doc's "Gating"
-// section; this cfg is the only copy of that list. Named `settling` rather
-// than after any one backend: it houses the settlement classifier +
-// panic/timeout invariant surface every one of these backends' batch loops
-// route through, plus the terminal-discard machinery Kafka's single-message
-// path also depends on (see the module doc's `kafka` note).
+// section. Named `settling` rather than after any one backend: it houses the
+// settlement classifier + panic/timeout invariant surface every one of these
+// backends' batch loops route through, plus the terminal-discard machinery
+// Kafka's single-message path also depends on (see the module doc's `kafka`
+// note).
 #[cfg(any(
     feature = "kafka",
     feature = "inmemory",

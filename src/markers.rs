@@ -65,8 +65,7 @@ pub struct RabbitMq;
 /// Unlike the two capabilities above, SQS **does** implement batch
 /// consumption — see
 /// [`HasBatchConsumption`](crate::backend::capability::HasBatchConsumption)
-/// for the authoritative list, where every backend but Kafka, InMemory and
-/// SQS is still *pending* rather than permanently excluded.
+/// for the authoritative list.
 /// `Broker::<Sqs>::batch_consumer()` compiles and runs, with a hard
 /// 10-message cap enforced at consumer startup: SQS's `ReceiveMessage`,
 /// `DeleteMessageBatch` and `ChangeMessageVisibilityBatch` calls all cap out

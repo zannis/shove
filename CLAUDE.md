@@ -62,8 +62,7 @@ rather than runtime surprises.
 - `HasBatchConsumption` gates `Broker::batch_consumer` /
   `BatchConsumer<B>::run`. The primitive exists for **handler amortisation**
   (one flush per N messages instead of one call per message), nothing else;
-  per-backend caps (e.g. SQS's hard 10-message receive limit) live in the
-  trait's own doc.
+  per-backend size caps live in the trait's own doc.
 
 The trait's own doc comment is the authoritative per-backend list — update it
 there rather than restating the table in a third place.
