@@ -60,10 +60,10 @@ rather than runtime surprises.
   plus an SNS subscription whose lifecycle shove does not manage, and a leaked
   queue costs money forever.
 - `HasBatchConsumption` gates `Broker::batch_consumer` /
-  `BatchConsumer<B>::run`. Every backend implements it (SQS with a hard
-  10-message cap — `max_batch_size > 10` is rejected at consumer startup).
-  The primitive exists for **handler amortisation** (one flush per N messages
-  instead of one call per message), nothing else.
+  `BatchConsumer<B>::run`. The primitive exists for **handler amortisation**
+  (one flush per N messages instead of one call per message), nothing else;
+  per-backend caps (e.g. SQS's hard 10-message receive limit) live in the
+  trait's own doc.
 
 The trait's own doc comment is the authoritative per-backend list — update it
 there rather than restating the table in a third place.

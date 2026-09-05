@@ -19,9 +19,11 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+use crate::backend::batch_consumer::settling::{
+    PREALLOC_CAP, batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
+};
 use crate::backend::batch_consumer::{
-    BatchConsumerOptionsInner, BatchSettlement, PREALLOC_CAP, batch_redelivery_backoff,
-    invoke_batch_handler, next_redelivery_delay, settle_batch_outcome,
+    BatchConsumerOptionsInner, BatchSettlement, settle_batch_outcome,
 };
 use crate::consumer::{DEFAULT_HANDLER_TIMEOUT, validate_message_size};
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};

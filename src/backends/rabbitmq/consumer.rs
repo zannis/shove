@@ -19,9 +19,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+use crate::backend::batch_consumer::settling::{
+    PREALLOC_CAP, batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
+};
 use crate::backend::batch_consumer::{
-    BatchConsumerOptionsInner, BatchSettlement, PREALLOC_CAP, batch_redelivery_backoff,
-    invoke_batch_handler, next_redelivery_delay, settle_batch_outcome,
+    BatchConsumerOptionsInner, BatchSettlement, settle_batch_outcome,
 };
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::{

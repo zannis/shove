@@ -24,22 +24,22 @@
 //! `#[allow(dead_code)]`-over-losing-coverage trade `ConsumerOptionsInner`
 //! and `settle_broadcast_outcome` already make.
 //!
-//! Everything else here is gated `#[cfg(any(feature = "kafka", feature =
-//! "inmemory", feature = "redis-streams", feature = "rabbitmq", feature =
-//! "nats", feature = "aws-sns-sqs"))]`: these backends have a
-//! batch-consumption implementation and share the flush-invoking/backoff
-//! machinery ([`invoke_batch_handler`], [`batch_redelivery_backoff`],
-//! [`next_redelivery_delay`]). That gate widened per-backend as each port
-//! landed, and now names every backend the crate has, exactly as
-//! `broadcast.rs`'s gate widened backend by backend.
+//! Everything else lives in the [`settling`] module, gated on the features
+//! of the backends that implement `HasBatchConsumption` (that trait's doc is
+//! the authoritative list): they share the flush-invoking/backoff machinery
+//! ([`settling::invoke_batch_handler`],
+//! [`settling::batch_redelivery_backoff`],
+//! [`settling::next_redelivery_delay`]). The feature list is written once,
+//! on the module itself — callers path through `settling::` rather than
+//! re-exports, so no second copy of the gate exists to fall out of sync.
 //!
-//! [`PREALLOC_CAP`] stays narrower than the rest of `settling`: see its own
-//! doc comment for why SQS does not join that particular gate.
+//! [`settling::PREALLOC_CAP`] stays narrower than the rest of `settling`:
+//! see its own doc comment for why SQS does not join that particular gate.
 //!
 //! `TerminalDiscard`, `RejectSettlement` and `reject_settlement` are
-//! narrower still: `#[cfg(feature = "kafka")]` *inside* that `any(kafka,
-//! inmemory, redis-streams, rabbitmq, nats, aws-sns-sqs)` module. Every other
-//! backend in the gate finishes settling a reject before its batch clears,
+//! narrower still: `#[cfg(feature = "kafka")]` *inside* the [`settling`]
+//! module. Every other backend in the gate finishes settling a reject
+//! before its batch clears,
 //! with no later commit that could still fail, so none of them ever needed
 //! the held-until-confirmed shape this trio exists for: InMemory in
 //! `backends::inmemory::consumer::resolve_reject`, Redis in its batch
@@ -244,12 +244,12 @@ mod settle_batch_outcome_tests {
     }
 }
 
-// Gated `any(kafka, inmemory, redis-streams, rabbitmq, nats, aws-sns-sqs)` —
-// see the module doc's "Gating" section. Named `settling` rather than after any
-// one backend: it houses the settlement classifier + panic/timeout invariant
-// surface every one of these backends' batch loops route through, plus the
-// terminal-discard machinery Kafka's single-message path also depends on (see
-// the module doc's `kafka` note).
+// Gated on the batching backends' features — see the module doc's "Gating"
+// section; this cfg is the only copy of that list. Named `settling` rather
+// than after any one backend: it houses the settlement classifier +
+// panic/timeout invariant surface every one of these backends' batch loops
+// route through, plus the terminal-discard machinery Kafka's single-message
+// path also depends on (see the module doc's `kafka` note).
 #[cfg(any(
     feature = "kafka",
     feature = "inmemory",
@@ -258,7 +258,7 @@ mod settle_batch_outcome_tests {
     feature = "nats",
     feature = "aws-sns-sqs"
 ))]
-mod settling {
+pub(crate) mod settling {
     use std::future::Future;
     use std::panic::AssertUnwindSafe;
     use std::time::{Duration, Instant};
@@ -728,28 +728,3 @@ mod settling {
         }
     }
 }
-
-#[cfg(any(
-    feature = "kafka",
-    feature = "inmemory",
-    feature = "redis-streams",
-    feature = "rabbitmq",
-    feature = "nats",
-    feature = "aws-sns-sqs"
-))]
-pub(crate) use settling::{batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay};
-
-// Narrower than the re-export above: SQS never calls `PREALLOC_CAP` (see its
-// own doc comment), so folding `aws-sns-sqs` in here would fail the SQS
-// feature-lint row on an unused import.
-#[cfg(any(
-    feature = "kafka",
-    feature = "inmemory",
-    feature = "redis-streams",
-    feature = "rabbitmq",
-    feature = "nats"
-))]
-pub(crate) use settling::PREALLOC_CAP;
-
-#[cfg(feature = "kafka")]
-pub(crate) use settling::{RejectSettlement, TerminalDiscard, reject_settlement};

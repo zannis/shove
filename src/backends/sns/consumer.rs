@@ -13,10 +13,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::backend::BatchConsumerOptionsInner;
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
-use crate::backend::batch_consumer::{
-    BatchSettlement, batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
-    settle_batch_outcome,
+use crate::backend::batch_consumer::settling::{
+    batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
 };
+use crate::backend::batch_consumer::{BatchSettlement, settle_batch_outcome};
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::router;
 use crate::backends::sns::topology::QueueRegistry;
@@ -1798,7 +1798,8 @@ where
 // this, since no third copy of the shared select-loop skeleton was
 // extracted; only the flush-invoking/backoff machinery
 // (`invoke_batch_handler`, `batch_redelivery_backoff`,
-// `next_redelivery_delay`) is shared, via `crate::backend::batch_consumer`.
+// `next_redelivery_delay`) is shared, via
+// `crate::backend::batch_consumer::settling`.
 //
 // # The 10-message cap
 //

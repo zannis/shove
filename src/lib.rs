@@ -1,11 +1,11 @@
 //! Type-safe async pub/sub for Rust on top of RabbitMQ, AWS SNS/SQS, NATS
-//! JetStream, Apache Kafka, or an in-process broker.
+//! JetStream, Apache Kafka, Redis/Valkey Streams, or an in-process broker.
 //!
 //! # The `Broker<B>` pattern
 //!
 //! Everything hangs off a single generic hub [`Broker<B>`], parameterised by a
 //! backend marker `B` (one of [`RabbitMq`], [`Sqs`], [`Nats`], [`Kafka`],
-//! [`InMemory`], each gated on its Cargo feature). The marker binds that
+//! [`Redis`], [`InMemory`], each gated on its Cargo feature). The marker binds that
 //! backend's client / publisher / consumer / topology / registry types
 //! together; the generic wrappers below delegate through the sealed
 //! [`Backend`] trait.
@@ -33,10 +33,8 @@
 //!   `consumer_group()` on `Broker<Sqs>` is a compile error.
 //! - [`HasBroadcast`] separately gates [`Broker::broadcast_subscriber`], for
 //!   ephemeral per-instance fan-out where every instance receives every
-//!   message. It is a **narrower** set than `HasCoordinatedGroups` — see that
-//!   trait for which backends implement it today. SQS is excluded permanently;
-//!   the rest are excluded by the same compile-time gate until their
-//!   implementation lands.
+//!   message. See that trait for which backends implement it and why SQS is
+//!   excluded permanently rather than pending.
 //! - [`HasBatchConsumption`] separately gates [`Broker::batch_consumer`], for
 //!   handler amortisation — buffering up to N messages before one flush.
 //!   Every backend implements it; see that trait for the per-backend caps

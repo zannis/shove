@@ -126,17 +126,13 @@ pub trait HasBroadcast: Backend {
 /// | **NATS** | **yes** |
 /// | **SQS** | **yes** — hard 10-message `ReceiveMessage`/`DeleteMessageBatch`/`ChangeMessageVisibilityBatch` cap; `max_batch_size > 10` (including the crate default of 500) is rejected at consumer startup, not silently clamped |
 ///
-/// Every backend implements this capability. Unlike [`HasBroadcast`], which
-/// excludes SQS permanently, no row here was ever excluded on principle: the
-/// table filled in backend by backend as each batch consumer was implemented,
-/// and `Broker::batch_consumer()` started compiling on each marker the moment
-/// it did.
-///
 /// Sealed via `Backend`.
-#[diagnostic::on_unimplemented(
-    message = "`{Self}` has no batch-consumption implementation yet, so `.batch_consumer()` is unavailable.",
-    note = "Every backend implements `HasBatchConsumption` today (SQS with a hard 10-message receive cap — see that trait's doc), so this diagnostic should be unreachable: the trait is sealed via `Backend`."
-)]
+///
+/// Unlike its two siblings, this trait carries no `on_unimplemented`
+/// diagnostic: every concrete marker implements it, so the bound can only
+/// fail on an underconstrained generic parameter — and there rustc's default
+/// suggestion (add the bound) is the right guidance, with no alternative API
+/// or permanent exclusion for a tailored message to point at.
 #[allow(private_interfaces, private_bounds)]
 pub trait HasBatchConsumption: Backend {
     type BatchConsumerImpl: BatchConsumerImpl + Clone + Send + Sync + 'static;
