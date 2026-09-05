@@ -18,16 +18,16 @@ use tokio_util::sync::CancellationToken;
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, BroadcastImpl, ConsumerImpl, ConsumerOptionsInner,
-    QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
-    capability::{HasBroadcast, HasCoordinatedGroups},
+    AutoscalerBackendImpl, Backend, BatchConsumerImpl, BatchConsumerOptionsInner, BroadcastImpl,
+    ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
+    capability::{HasBatchConsumption, HasBroadcast, HasCoordinatedGroups},
     sealed,
 };
 use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::{Result, ShoveError};
-use crate::handler::MessageHandler;
+use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::markers::RabbitMq;
-use crate::topic::{SequencedTopic, Topic};
+use crate::topic::{NotSequenced, SequencedTopic, Topic};
 
 use super::autoscaler::RabbitMqAutoscalerBackend;
 use super::client::{RabbitMqClient, RabbitMqConfig};
@@ -224,6 +224,31 @@ impl BroadcastImpl for RabbitMqConsumer {
         H: MessageHandler<T>,
     {
         RabbitMqConsumer::run_broadcast_with_inner::<T, H>(self, handler, ctx, options).await
+    }
+}
+
+impl HasBatchConsumption for RabbitMq {
+    // Same consumer type as the shared and broadcast paths — `run_batch`
+    // needs no state `run`/`run_broadcast` don't already carry.
+    type BatchConsumerImpl = RabbitMqConsumer;
+
+    fn make_batch_consumer(client: &Self::Client) -> Self::BatchConsumerImpl {
+        RabbitMqConsumer::new(client.clone())
+    }
+}
+
+impl BatchConsumerImpl for RabbitMqConsumer {
+    async fn run_batch<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: BatchConsumerOptionsInner,
+    ) -> Result<()>
+    where
+        T: NotSequenced,
+        H: BatchMessageHandler<T>,
+    {
+        RabbitMqConsumer::run_batch_with_inner::<T, H>(self, handler, ctx, options).await
     }
 }
 

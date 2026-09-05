@@ -25,26 +25,34 @@
 //! and `settle_broadcast_outcome` already make.
 //!
 //! Everything else here is gated `#[cfg(any(feature = "kafka", feature =
-//! "inmemory", feature = "aws-sns-sqs"))]`: all three backends now have a
-//! batch-consumption implementation and share the flush-invoking/backoff
-//! machinery ([`invoke_batch_handler`], [`batch_redelivery_backoff`],
-//! [`next_redelivery_delay`]). The gate widens per-backend as NATS, RabbitMQ
-//! and Redis land in turn, each adding its own feature to the list the moment
-//! its `BatchConsumerImpl` exists, exactly as `broadcast.rs`'s gate widened
-//! backend by backend.
+//! "inmemory", feature = "redis-streams", feature = "rabbitmq", feature =
+//! "aws-sns-sqs"))]`: these backends have a batch-consumption implementation
+//! and share the flush-invoking/backoff machinery ([`invoke_batch_handler`],
+//! [`batch_redelivery_backoff`], [`next_redelivery_delay`]). The gate widens
+//! per-backend as the remaining port lands — NATS adds its own feature to the
+//! list the moment its `BatchConsumerImpl` exists, exactly as
+//! `broadcast.rs`'s gate widened backend by backend.
 //!
 //! [`PREALLOC_CAP`] stays narrower than the rest of `settling`: see its own
 //! doc comment for why SQS does not join that particular gate.
 //!
 //! `TerminalDiscard`, `RejectSettlement` and `reject_settlement` are
 //! narrower still: `#[cfg(feature = "kafka")]` *inside* that `any(kafka,
-//! inmemory)` module, because InMemory settles a reject the instant its DLQ
-//! hand-off resolves (see `backends::inmemory::consumer::resolve_reject`) and
-//! has no later commit that could still fail — it never needed the
-//! held-until-confirmed shape this trio exists for. This is deferred-
-//! settlement machinery, kafka-only until a deferred-settlement backend
-//! (NATS, RabbitMQ or Redis, in T2–T4) lands and widens it — and even then,
-//! per the module doc above, never below `kafka`.
+//! inmemory, redis-streams, rabbitmq, aws-sns-sqs)` module. Every other
+//! backend in the gate finishes settling a reject before its batch clears,
+//! with no later commit that could still fail, so none of them ever needed
+//! the held-until-confirmed shape this trio exists for: InMemory in
+//! `backends::inmemory::consumer::resolve_reject`, Redis in its batch
+//! `DeadLetter` arm (the `XACK`/DLQ route completes before the batch
+//! clears), RabbitMQ on a confirm-mode channel (never transactional), where
+//! an accepted `basic.nack` retires the delivery with no later commit to
+//! wait on, and SQS in `backends::sns::router::route_reject_batch`, which is
+//! a single `ChangeMessageVisibilityBatch(0)` — shove never publishes to a
+//! DLQ there (AWS redrive owns that), so there is no hand-off whose outcome
+//! a later commit could contradict. This is deferred-settlement machinery,
+//! kafka-only until a deferred-settlement backend lands in the remaining
+//! port (NATS) and widens it — and even then, per the module doc above,
+//! never below `kafka`.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -166,7 +174,7 @@ pub(crate) fn validate_batch_topic<T: Topic>() -> Result<()> {
 /// |---|---|---|
 /// | `Ack` | `Commit` | Every message in the batch retires; offsets/positions advance. |
 /// | `Reject` | `DeadLetter` | Terminal: every message is dead-lettered (or discarded, with no DLQ configured) and retires. |
-/// | `Retry` | `Redeliver` | The whole batch is returned to the backend's redelivery mechanism — a seek-back / re-buffer, not a republish. Shove itself imposes no per-batch retry budget, but a backend-declared delivery cap (NATS `MaxDeliver`, RabbitMQ's quorum delivery-limit, SQS's `maxReceiveCount`) may terminate redelivery per that backend's own semantics regardless. Kafka and InMemory currently redeliver indefinitely — see each backend's own docs for that stronger, backend-specific guarantee. |
+/// | `Retry` | `Redeliver` | The whole batch is returned to the backend's redelivery mechanism — a seek-back / re-buffer, not a republish. Shove itself imposes no per-batch retry budget, but a backend-declared delivery cap (NATS `MaxDeliver`, RabbitMQ's quorum delivery-limit, SQS's `maxReceiveCount`) may terminate redelivery per that backend's own semantics regardless. Kafka, InMemory and Redis currently redeliver indefinitely (streams have no delivery cap) — see each backend's own docs for that stronger, backend-specific guarantee. |
 /// | `Defer` | `Redeliver` | **Identical to `Retry` here.** A batch-wide outcome carries no sequence key, so the `Retry`/`Defer` distinction that matters on the single-message path — spending the retry budget versus not — has no meaning: there is no per-batch budget to spend either way. |
 ///
 /// See [`settle_broadcast_outcome`](crate::backend::broadcast::settle_broadcast_outcome)
@@ -234,12 +242,19 @@ mod settle_batch_outcome_tests {
     }
 }
 
-// Gated `any(kafka, inmemory, aws-sns-sqs)` — see the module doc's "Gating"
-// section. Named `settling` rather than after any one backend: it houses the
-// settlement classifier + panic/timeout invariant surface every batch loop
-// routes through, plus the terminal-discard machinery Kafka's single-message
-// path also depends on (see the module doc's `kafka` note).
-#[cfg(any(feature = "kafka", feature = "inmemory", feature = "aws-sns-sqs"))]
+// Gated `any(kafka, inmemory, redis-streams, rabbitmq, aws-sns-sqs)` — see the
+// module doc's "Gating" section. Named `settling` rather than after any one
+// backend: it houses the settlement classifier + panic/timeout invariant
+// surface every one of these backends' batch loops route through, plus the
+// terminal-discard machinery Kafka's single-message path also depends on (see
+// the module doc's `kafka` note).
+#[cfg(any(
+    feature = "kafka",
+    feature = "inmemory",
+    feature = "redis-streams",
+    feature = "rabbitmq",
+    feature = "aws-sns-sqs"
+))]
 mod settling {
     use std::future::Future;
     use std::panic::AssertUnwindSafe;
@@ -334,21 +349,27 @@ mod settling {
     /// caller is free to pass `usize::MAX`; sizing the initial allocation to
     /// the real cap would then abort the consumer task on
     /// `Vec::with_capacity`'s overflow check before a single message ever
-    /// arrives. Kafka's and InMemory's batch buffers clamp their initial
-    /// reservation to `max_batch_size.min(PREALLOC_CAP)` instead — growth
-    /// still reaches the real `max_batch_size` for a sane size, so this only
-    /// bounds the up-front allocation, an amortisation nicety rather than a
-    /// correctness requirement.
+    /// arrives. Every batch buffer that accepts a caller-chosen size clamps
+    /// its initial reservation to `max_batch_size.min(PREALLOC_CAP)` instead
+    /// — growth still reaches the real `max_batch_size` for a sane size, so
+    /// this only bounds the up-front allocation, an amortisation nicety
+    /// rather than a correctness requirement.
     ///
-    /// `kafka`/`inmemory`-only, narrower than the `settling` module's own
-    /// gate: SQS never calls this. Its batch cap is validated to `<= 10`
-    /// before `SqsBatch::new` ever allocates (`validate_sqs_batch_size`), so
-    /// the prealloc is already bounded at the source and this const has no
-    /// call site there — and, with no `#[allow(dead_code)]` of its own,
-    /// including it in the wider gate would fail the SQS-only feature-lint
-    /// row (`cargo clippy --lib --no-default-features --features
+    /// Deliberately narrower than the `settling` module's own gate: a backend
+    /// whose batch size is bounded before it allocates never calls this. SQS
+    /// is the case today — its cap is validated to `<= 10` before
+    /// `SqsBatch::new` ever allocates (`validate_sqs_batch_size`), so the
+    /// prealloc is already bounded at the source and this const has no call
+    /// site there. With no `#[allow(dead_code)]` of its own, including it in
+    /// the wider gate would fail that backend's feature-lint row (`cargo
+    /// clippy --lib --no-default-features --features
     /// pub-aws-sns,aws-sns-sqs,...`) with an unused-const warning.
-    #[cfg(any(feature = "kafka", feature = "inmemory"))]
+    #[cfg(any(
+        feature = "kafka",
+        feature = "inmemory",
+        feature = "redis-streams",
+        feature = "rabbitmq"
+    ))]
     pub(crate) const PREALLOC_CAP: usize = 4096;
 
     /// First delay after redelivering an un-acked batch, escalating to
@@ -703,10 +724,24 @@ mod settling {
     }
 }
 
-#[cfg(any(feature = "kafka", feature = "inmemory", feature = "aws-sns-sqs"))]
+#[cfg(any(
+    feature = "kafka",
+    feature = "inmemory",
+    feature = "redis-streams",
+    feature = "rabbitmq",
+    feature = "aws-sns-sqs"
+))]
 pub(crate) use settling::{batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay};
 
-#[cfg(any(feature = "kafka", feature = "inmemory"))]
+// Narrower than the re-export above: SQS never calls `PREALLOC_CAP` (see its
+// own doc comment), so folding `aws-sns-sqs` in here would fail the SQS
+// feature-lint row on an unused import.
+#[cfg(any(
+    feature = "kafka",
+    feature = "inmemory",
+    feature = "redis-streams",
+    feature = "rabbitmq"
+))]
 pub(crate) use settling::PREALLOC_CAP;
 
 #[cfg(feature = "kafka")]

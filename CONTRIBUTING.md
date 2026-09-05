@@ -27,7 +27,8 @@ cargo nextest run --no-default-features
 This runs the unit tests plus the Docker-free integration targets, among
 them `tests/chartgen.rs` — the benchmark chart generator, including the
 byte-compare of the committed SVGs in `docs/public/bench/` against
-`benches/results/bench-results.json`. The crate's `default` feature set is
+`benches/results/bench-results.json` (regenerating either is the
+`scripts/bench.sh` runbook in `benches/README.md`). The crate's `default` feature set is
 empty and the in-memory test files are all gated on the `inmemory` feature, so
 under `--no-default-features` the backend test binaries compile to zero tests
 and report green without having run anything.

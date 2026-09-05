@@ -14,12 +14,11 @@
 //! the sweeps are opt-in.
 //!
 //! A sampled core matrix, which is what `benches/results/bench-results.json`
-//! is generated from:
+//! is generated from. It is pinned in `scripts/bench.sh`, one backend per
+//! invocation (runbook: `benches/README.md`):
 //!
 //! ```text
-//! cargo run --release --example inmemory_stress --features inmemory -- \
-//!     --flow all --payload all --tier moderate --handler fast \
-//!     --consumers 1,8,32 --results-file benches/results/bench-results.json
+//! scripts/bench.sh inmemory
 //! ```
 //!
 //! `--results-file` merges into an existing file by backend key, so running
@@ -94,7 +93,62 @@ use tokio_util::sync::CancellationToken;
 /// narrowed `handler_cost`: `framework` now additionally asserts that the
 /// window was a drain, and rows that fail that gained the new `setup_bound`
 /// value. Both are reasons a v3 reader cannot simply ignore the new field.
-pub const RESULTS_SCHEMA_VERSION: u32 = 4;
+///
+/// v5 added the optional `load` account to the consume rows that ran under
+/// `--load-rates`: a paced producer offered a fixed rate for a fixed window
+/// while the consumers ran, and the row records what the producer reached,
+/// the lag at the window's end and the two verdicts derived from them
+/// (`producer_bound`, `sustained`). On those rows `throughput_msg_per_sec`
+/// is the rate the consumers *processed during the window* and `messages` is
+/// what the producer actually published — neither is the corpus size a v4
+/// reader would assume, and a v4 consume row's throughput was bounded by a
+/// single sequential publisher racing the drain, so the two are not
+/// comparable on one axis.
+///
+/// v6 made the measurement method explicit and replaced the live-publish
+/// corpus path on the offered-load flows with a **drain**: the corpus is
+/// published before any consumer starts, and the row's rate is what the
+/// consumers processed from the readiness barrier until nine tenths of the
+/// corpus had been consumed, with no producer in the window. Every row and
+/// every `failures[]` entry of those flows carries `method` (`drain` or
+/// `offered_load`), and a drain row carries the `drain` account. A v5 consume
+/// row without a `load` account was a live-publish corpus whose rate one
+/// sequential publisher bounded; a v6 row without one is a drain. Nothing on
+/// a v5 row says which method produced it, so the two are not merged.
+pub const RESULTS_SCHEMA_VERSION: u32 = 6;
+
+/// Default `--load-window-secs`: long enough for a rate, short enough that a
+/// six-rung ladder over a full consumer sweep finishes in an hour per backend.
+pub const DEFAULT_LOAD_WINDOW_SECS: u64 = 10;
+/// Default `--load-producers`: enough paced tasks that a rate one sequential
+/// publisher cannot reach is still offered, without turning the producer into
+/// the scenario's own load.
+pub const DEFAULT_LOAD_PRODUCERS: u16 = 4;
+
+/// Default `--drain-max-bytes`: the most a drain cell's corpus may occupy,
+/// as `corpus × payload_bytes`, when the flag is not given. 2 GiB keeps a
+/// 64 KiB corpus to a few tens of thousands of messages, which the in-process
+/// backend holds resident and Kafka writes to disk before every cell.
+pub const DEFAULT_DRAIN_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// The share of a drain's corpus left out of the measured window at the end:
+/// the window closes at `corpus − corpus / DRAIN_TAIL_DIVISOR` unique
+/// completions. Partitions (or the shared queue) run dry at different
+/// moments, so the last stretch of a drain runs with fewer active workers
+/// than the row names, and a rate over it would understate the ceiling.
+pub const DRAIN_TAIL_DIVISOR: u64 = 10;
+/// A drain whose readiness barrier passed with at least
+/// `corpus / DRAIN_MAX_START_DIVISOR` unique completions already done is not
+/// measured: most of the corpus was consumed while the group was still
+/// assembling, and the remaining slice is not the steady state the row
+/// claims. The remedy is a larger `--drain-messages`.
+pub const DRAIN_MAX_START_DIVISOR: u64 = 2;
+/// Relative tolerance on a row's rates against the counts and window they
+/// are derived from — `throughput_msg_per_sec` on every drain and rung row,
+/// `achieved_publish_msg_per_sec` on a rung. The harness writes the exact
+/// quotient and the document's decimal text round-trips an `f64` exactly, so
+/// this is floating-point slack, not room for a claim to drift from its
+/// observations.
+pub const RATE_TOLERANCE: f64 = 1e-9;
 
 /// The payload sizes that may appear in `payload_bytes`: 64 B, 1 KiB, 64 KiB.
 pub const PAYLOAD_SIZES: [usize; 3] = [64, 1024, 65536];
@@ -178,6 +232,51 @@ pub struct Cli {
     /// (default: derived from the host).
     #[arg(long)]
     pub hardware_label: Option<String>,
+
+    /// Offered-load ladder for the consume flows (`consumer-group`,
+    /// `consume-parallel`, `consume-batch`, `supervisor`): a comma-separated
+    /// list of publish rates in messages per second, e.g.
+    /// `5000,25000,100000`. Each rate becomes its own scenario: a paced
+    /// producer publishes at that rate for `--load-window-secs` while the
+    /// consumers run alongside it, and the row records whether they kept up
+    /// (`load.sustained`) and whether the producer itself reached the rate
+    /// (`load.producer_bound`). Rungs run in ascending order and a cell's
+    /// ladder stops climbing at the first rung that was not sustained. The
+    /// rungs are the latency measurement; the throughput ceiling is the
+    /// drain every cell runs first (see `--drain-messages`), which this flag
+    /// adds to rather than replaces.
+    #[arg(long)]
+    pub load_rates: Option<RatesArg>,
+
+    /// Seconds each offered-load rung publishes for (default 10). Only
+    /// meaningful with `--load-rates`; refused without it.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub load_window_secs: Option<u64>,
+
+    /// Producer tasks (default 4): paced tasks sharing each rung's rate, and
+    /// the tasks a drain's corpus is published over. More tasks let the
+    /// producer offer a rate one sequential publisher cannot, and fill a
+    /// corpus faster. Refused where no consume flow is selected.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+    pub load_producers: Option<u16>,
+
+    /// Corpus size for the drain scenario of each consume-flow cell
+    /// (`consumer-group`, `consume-parallel`, `consume-batch`,
+    /// `supervisor`). The corpus is published before any consumer starts,
+    /// and the row's rate is what the consumers processed from the readiness
+    /// barrier until nine tenths of it had been consumed. Without this flag
+    /// those flows still run a drain, sized by the tier; the flag only makes
+    /// the corpus large enough for the window to be a rate. Capped by
+    /// `--drain-max-bytes`.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub drain_messages: Option<u64>,
+
+    /// Cap on a drain corpus in bytes (`corpus × payload_bytes`), default
+    /// 2 GiB. A cell whose cap admits no message at its payload is refused
+    /// rather than clamped. Only meaningful with `--drain-messages`; refused
+    /// without it.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub drain_max_bytes: Option<u64>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -304,6 +403,39 @@ impl FromStr for ConsumersArg {
             return Err("no consumer counts selected".to_string());
         }
         Ok(ConsumersArg(counts))
+    }
+}
+
+/// The `--load-rates` ladder: positive rates in messages per second, sorted
+/// ascending and de-duplicated so the ladder climbs monotonically — the
+/// early-exit rule in the run loop depends on that order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RatesArg(pub Vec<u64>);
+
+impl FromStr for RatesArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut rates = Vec::new();
+        for part in s.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let rate: u64 = part.parse().map_err(|_| {
+                format!("load rate '{part}' is not a number of messages per second")
+            })?;
+            if rate == 0 {
+                return Err("a load rate of 0 publishes nothing".to_string());
+            }
+            rates.push(rate);
+        }
+        if rates.is_empty() {
+            return Err("no load rates selected".to_string());
+        }
+        rates.sort_unstable();
+        rates.dedup();
+        Ok(RatesArg(rates))
     }
 }
 
@@ -456,6 +588,18 @@ impl Flow {
             | Flow::PublishBatch
             | Flow::Autoscaler => false,
         }
+    }
+
+    /// Whether the offered-load ladder (`--load-rates`) applies to this flow:
+    /// the flows whose driver runs live consumers behind a readiness barrier
+    /// while a producer publishes into them. Broadcast holds a barrier too but
+    /// is excluded — every subscriber receives the whole stream, so one
+    /// offered rate is `consumers` different consumed rates.
+    pub fn takes_offered_load(&self) -> bool {
+        matches!(
+            self,
+            Flow::ConsumerGroup | Flow::ConsumeParallel | Flow::ConsumeBatch | Flow::Supervisor
+        )
     }
 
     /// The chart grouping key. Redundant with the flow for the consume flows
@@ -805,6 +949,23 @@ impl Default for BatchOptions {
     }
 }
 
+/// One rung of the offered-load ladder a scenario runs at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadRung {
+    pub rate_msg_per_sec: u64,
+    pub window_secs: u64,
+    pub producers: u16,
+}
+
+impl LoadRung {
+    /// The corpus a rung nominally publishes. The row's `messages` records
+    /// what the producer actually published, which is this only when the
+    /// producer held the rate exactly.
+    pub fn nominal_messages(&self) -> u64 {
+        self.rate_msg_per_sec.saturating_mul(self.window_secs)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Scenario {
     pub tier: &'static str,
@@ -820,9 +981,88 @@ pub struct Scenario {
     /// onto the result row by `push_metrics`, so the row's provenance and the
     /// options the driver hands the backend cannot drift apart.
     pub batch_options: Option<BatchOptions>,
+    /// `Some` when this scenario runs one rung of the offered-load ladder
+    /// (`--load-rates`) instead of publishing a fixed corpus; only on flows
+    /// where [`Flow::takes_offered_load`] holds. `messages` is then the
+    /// rung's nominal corpus.
+    pub load: Option<LoadRung>,
+    /// `Some` when this scenario drains a corpus published before its
+    /// consumers start; only on flows where [`Flow::takes_offered_load`]
+    /// holds, and never together with `load`. `messages` is the corpus.
+    pub drain: Option<DrainPlan>,
+}
+
+/// How a scenario of an offered-load flow was measured. Stamped on its row
+/// and on its failure, so a document never has to infer the method from
+/// which account a row happens to carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    /// A corpus published before the consumers started, drained behind the
+    /// readiness barrier. See [`DrainPlan`].
+    Drain,
+    /// One rung of the offered-load ladder. See [`LoadRung`].
+    OfferedLoad,
+}
+
+impl Method {
+    /// The schema's `method` values — a contract, like [`Flow::as_str`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Method::Drain => "drain",
+            Method::OfferedLoad => "offered_load",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Method> {
+        match s {
+            "drain" => Some(Method::Drain),
+            "offered_load" => Some(Method::OfferedLoad),
+            _ => None,
+        }
+    }
+}
+
+/// The corpus a drain scenario publishes before its consumers start, and
+/// the fill tasks that publish it (`--load-producers`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainPlan {
+    pub corpus: u64,
+    pub producers: u16,
+}
+
+impl DrainPlan {
+    /// The corpus `--drain-messages n` yields at one payload under a byte
+    /// cap: `min(n, cap / payload_bytes)`. Zero when the cap admits no
+    /// message at that payload — a selection with such a cell is refused.
+    pub fn capped_corpus(requested: u64, max_bytes: u64, payload_bytes: usize) -> u64 {
+        let by_bytes = max_bytes.checked_div(payload_bytes as u64).unwrap_or(0);
+        requested.min(by_bytes)
+    }
+
+    /// The unique-completion count at which the measured window closes:
+    /// `corpus − corpus / DRAIN_TAIL_DIVISOR`. See [`DRAIN_TAIL_DIVISOR`].
+    pub fn end_target(corpus: u64) -> u64 {
+        corpus.saturating_sub(corpus / DRAIN_TAIL_DIVISOR)
+    }
+
+    /// The unique-completion count at the barrier from which the window is
+    /// no longer representative. See [`DRAIN_MAX_START_DIVISOR`].
+    pub fn max_start(corpus: u64) -> u64 {
+        corpus / DRAIN_MAX_START_DIVISOR
+    }
 }
 
 impl Scenario {
+    /// The measurement method of a scenario on an offered-load flow; `None`
+    /// on every other flow, whose rows carry no `method`.
+    pub fn method(&self) -> Option<Method> {
+        match (self.drain, self.load) {
+            (Some(_), None) => Some(Method::Drain),
+            (None, Some(_)) => Some(Method::OfferedLoad),
+            _ => None,
+        }
+    }
+
     /// How many handler invocations this scenario waits for.
     ///
     /// Broadcast delivers every message to every subscriber, so its total is
@@ -1081,7 +1321,7 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                             cli.concurrent,
                             payload_bytes,
                         ));
-                        scenarios.push(Scenario {
+                        let scenario = Scenario {
                             tier: tier_cfg.name,
                             messages,
                             consumers,
@@ -1091,7 +1331,50 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                             flow,
                             payload_bytes,
                             batch_options,
-                        });
+                            load: None,
+                            drain: None,
+                        };
+                        // The offered-load flows are measured by method, never
+                        // by publishing into live consumers: a drain of a
+                        // corpus published before they start (sized by the
+                        // tier, or by `--drain-messages` under its byte cap),
+                        // then one scenario per ladder rung, ascending, so
+                        // the run loop's early exit sees a cell's rungs in
+                        // order.
+                        if flow.takes_offered_load() {
+                            let producers = cli.load_producers.unwrap_or(DEFAULT_LOAD_PRODUCERS);
+                            let corpus = match cli.drain_messages {
+                                Some(requested) => DrainPlan::capped_corpus(
+                                    requested,
+                                    cli.drain_max_bytes.unwrap_or(DEFAULT_DRAIN_MAX_BYTES),
+                                    payload_bytes,
+                                ),
+                                None => messages,
+                            };
+                            scenarios.push(Scenario {
+                                messages: corpus,
+                                drain: Some(DrainPlan { corpus, producers }),
+                                ..scenario
+                            });
+                            if let Some(RatesArg(rates)) = &cli.load_rates {
+                                for &rate in rates {
+                                    let rung = LoadRung {
+                                        rate_msg_per_sec: rate,
+                                        window_secs: cli
+                                            .load_window_secs
+                                            .unwrap_or(DEFAULT_LOAD_WINDOW_SECS),
+                                        producers,
+                                    };
+                                    scenarios.push(Scenario {
+                                        messages: rung.nominal_messages(),
+                                        load: Some(rung),
+                                        ..scenario
+                                    });
+                                }
+                            }
+                        } else {
+                            scenarios.push(scenario);
+                        }
                     }
                 }
             }
@@ -1476,6 +1759,15 @@ pub struct StressTestHandler {
     /// bases and saturates to zero. With the flag, `dispatch` is "drain start →
     /// handler entry" and `e2e` is "drain start → handler completion".
     epoch_relative: bool,
+    /// Whether this worker has bumped its attach flag yet. Any message is
+    /// evidence that the worker is assigned and polling, not only a
+    /// sentinel: on a drain the corpus sits ahead of the sentinels, so
+    /// waiting for one would hold the barrier until the worker had drained
+    /// its share. Per handler, so the flag is bumped once, not per message.
+    attached: Arc<AtomicBool>,
+    /// The drain's unique-completion tracker, on a drain scenario. See
+    /// [`DrainTracker`].
+    drain: Option<Arc<DrainTracker>>,
 }
 
 impl StressTestHandler {
@@ -1493,11 +1785,18 @@ impl StressTestHandler {
             reject: false,
             attach: None,
             epoch_relative: false,
+            attached: Arc::new(AtomicBool::new(false)),
+            drain: None,
         }
     }
 
     fn with_attach_counter(mut self, attach: Arc<AtomicU64>) -> Self {
         self.attach = Some(attach);
+        self
+    }
+
+    fn with_drain_tracker(mut self, tracker: Arc<DrainTracker>) -> Self {
+        self.drain = Some(tracker);
         self
     }
 
@@ -1537,13 +1836,26 @@ impl StressTestHandler {
         self.attach.is_some() && id == SENTINEL_ID
     }
 
+    /// Bump the worker's attach flag the first time any message reaches
+    /// this handler. Idempotent per handler; a no-op without a flag.
     fn note_attached(&self) {
-        if let Some(attach) = &self.attach {
+        if let Some(attach) = &self.attach
+            && !self.attached.swap(true, Ordering::Relaxed)
+        {
             attach.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    fn observe(&self, received_at: u64, published_at_ns: u64) {
+    fn observe(&self, id: u64, received_at: u64, published_at_ns: u64) {
+        self.processed.fetch_add(1, Ordering::Relaxed);
+        // A drain's percentiles would be backlog residency, not latency, and
+        // nothing publishes them — while recording six million of them is
+        // harness work inside the very window that measures the ceiling. The
+        // completion tracker is all a drain records per message.
+        if let Some(drain) = &self.drain {
+            drain.record(id);
+            return;
+        }
         let base = if self.epoch_relative {
             0
         } else {
@@ -1554,7 +1866,6 @@ impl StressTestHandler {
             enqueue_to_receive_ns: received_at.saturating_sub(base),
             enqueue_to_ack_ns: acked_at.saturating_sub(base),
         });
-        self.processed.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1567,13 +1878,13 @@ where
     type Context = ();
 
     async fn handle(&self, msg: StressTestMsg, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.note_attached();
         if self.is_sentinel(msg.id) {
-            self.note_attached();
             return Outcome::Ack;
         }
         let received_at = self.epoch.elapsed().as_nanos() as u64;
         self.simulate_work().await;
-        self.observe(received_at, msg.published_at_ns);
+        self.observe(msg.id, received_at, msg.published_at_ns);
         if self.reject {
             Outcome::Reject
         } else {
@@ -1586,11 +1897,11 @@ where
     async fn handle_dead(&self, msg: StressTestMsg, _meta: DeadMessageMetadata, _: &()) {
         let received_at = self.epoch.elapsed().as_nanos() as u64;
         self.simulate_work().await;
-        self.observe(received_at, msg.published_at_ns);
+        self.observe(msg.id, received_at, msg.published_at_ns);
     }
 }
 
-/// Batch counterpart of [`StressTestHandler`], for Kafka's `run_batch`.
+/// Batch counterpart of [`StressTestHandler`], for the batch consume flow.
 #[derive(Clone)]
 pub struct StressBatchHandler {
     inner: StressTestHandler,
@@ -1620,14 +1931,11 @@ where
         // arrive together — so without this the barrier's own traffic is
         // counted as drained corpus and recorded as latency. Settled before
         // the simulated work so a sentinel-only batch pays none of it.
-        let mut corpus = 0usize;
-        for (msg, _) in &messages {
-            if self.inner.is_sentinel(msg.id) {
-                self.inner.note_attached();
-            } else {
-                corpus = corpus.saturating_add(1);
-            }
-        }
+        self.inner.note_attached();
+        let corpus = messages
+            .iter()
+            .filter(|(msg, _)| !self.inner.is_sentinel(msg.id))
+            .count();
         if corpus == 0 {
             return Outcome::Ack;
         }
@@ -1637,7 +1945,7 @@ where
         self.inner.simulate_work().await;
         for (msg, _) in &messages {
             if !self.inner.is_sentinel(msg.id) {
-                self.inner.observe(received_at, msg.published_at_ns);
+                self.inner.observe(msg.id, received_at, msg.published_at_ns);
             }
         }
         Outcome::Ack
@@ -1687,6 +1995,24 @@ pub fn noop_purge() -> PurgeFn {
 /// token; one that stops on close may ignore it. Either way the driver must
 /// return promptly once the teardown fires both signals — the harness only
 /// falls back to aborting a driver that responds to neither.
+/// Build a fresh client for one paced producer of the offered-load ladder.
+///
+/// Every `Publisher<B>` cloned from one client shares that client's
+/// connection — on Kafka, one librdkafka producer instance — so cloning the
+/// driver's publisher N times offers no more than one producer can push
+/// (~260k msg/s at 64 B on the committed host), and every consume cell above
+/// that reads `producer_bound`. A backend whose publisher is bounded per
+/// connection supplies this so each producer task publishes over its own;
+/// the harness closes every client it obtains once the rung is over.
+///
+/// Deliberately absent on the in-process backend: its queues live inside the
+/// client, so a second client is a second, empty broker.
+pub type ProducerClientFn<B> = Box<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<<B as Backend>::Client, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub type DlqDrainFn<B> = Box<
     dyn Fn(
             <B as Backend>::Client,
@@ -1750,9 +2076,10 @@ pub type ReadinessProbeFn = Box<
         + Sync,
 >;
 
-/// Drive one backend's batch consume. Supplied by Kafka alone — `run_batch`
-/// exists on no other backend, so the absence of this closure is what makes
-/// `consume_batch` unsupported elsewhere rather than something to fake.
+/// Drive one backend's batch consume. Supplied by the backends implementing
+/// `HasBatchConsumption` (that trait's doc comment is the per-backend list);
+/// the absence of this closure is what makes `consume_batch` unsupported
+/// elsewhere rather than something to fake.
 /// Invoked once per scenario consumer, so the closure must be re-callable.
 /// The [`BatchOptions`] are the scenario's — the wrapper must hand them to
 /// the backend's batch primitive, not re-derive its own. Errors surface
@@ -1806,6 +2133,15 @@ pub struct HarnessConfig<B: Backend> {
     /// wrapper sets 1. The scenario's `consumers` and message volume are
     /// derived from this so the row describes the topology that ran.
     pub fifo_workers: u16,
+    /// See [`ProducerClientFn`] — supplied where one connection cannot offer
+    /// the top of the ladder (Kafka).
+    pub producer_client: Option<ProducerClientFn<B>>,
+    /// The most messages a queue on this backend can hold with no consumer
+    /// draining it, when the backend bounds that at all. A drain scenario
+    /// publishes its whole corpus before any consumer starts, so a corpus
+    /// above this would block the fill forever; the selection refuses it
+    /// instead. `None` for brokers, which spill to disk.
+    pub prefill_capacity: Option<u64>,
     _backend: std::marker::PhantomData<fn() -> B>,
 }
 
@@ -1828,8 +2164,15 @@ impl<B: Backend> HarnessConfig<B> {
             consume_topology: None,
             readiness_probe: None,
             fifo_workers: SEQ_SHARDS,
+            producer_client: None,
+            prefill_capacity: None,
             _backend: std::marker::PhantomData,
         }
+    }
+
+    pub fn with_prefill_capacity(mut self, capacity: u64) -> Self {
+        self.prefill_capacity = Some(capacity);
+        self
     }
 
     pub fn with_prefetch_cap(mut self, cap: u16) -> Self {
@@ -1891,6 +2234,11 @@ impl<B: Backend> HarnessConfig<B> {
         self.fifo_workers = workers.max(1);
         self
     }
+
+    pub fn with_producer_client(mut self, f: ProducerClientFn<B>) -> Self {
+        self.producer_client = Some(f);
+        self
+    }
 }
 
 // ── Scenario execution ──────────────────────────────────────────────────────
@@ -1904,6 +2252,10 @@ struct ScenarioMetrics {
     /// The fixed setup cost this scenario excluded from `duration_secs`, or
     /// `None` when its driver does not separate the two. See [`WindowSplit`].
     setup_secs: Option<f64>,
+    /// The offered-load rung's account, on a scenario that ran one.
+    load: Option<LoadResult>,
+    /// The drain's account, on a scenario that ran one.
+    drain: Option<DrainResult>,
 }
 
 fn default_prefetch(messages: u64, consumers: u16, cap: u16) -> u16 {
@@ -1950,6 +2302,925 @@ fn message_chunks(
         next_id = end;
         Some(chunk)
     })
+}
+
+// ── Offered load ────────────────────────────────────────────────────────────
+
+/// How far under the offered rate the producer may land and still count as
+/// having held it. Below it the consumers were never offered the rate the row
+/// names — see [`load_verdicts`] for what that means with and without a
+/// consumer backlog.
+pub const LOAD_PRODUCER_FLOOR: f64 = 0.95;
+/// The share of the window's published messages the consumers may have been
+/// behind by — when the window closed, and at the worst moment inside it —
+/// for the rung to be `sustained`. A backlog that formed mid-window and was
+/// cleared by the end still spent its residency in the dispatch percentiles,
+/// so the peak is held to the same bound as the end.
+pub const LOAD_SUSTAINED_MAX_LAG_RATIO: f64 = 0.05;
+/// How long the consumers get to drain the residual backlog after the
+/// producer stops before the rung is failed outright rather than measured.
+const LOAD_DRAIN_GRACE: Duration = Duration::from_secs(60);
+/// How often the window's lag is sampled for `peak_lag`.
+const LOAD_LAG_SAMPLE: Duration = Duration::from_millis(50);
+/// A paced producer's idle sleep while it is ahead of its credit line.
+const LOAD_PACE_SLEEP: Duration = Duration::from_millis(1);
+
+/// What one offered-load rung measured, before it is stamped on a row as
+/// [`LoadResult`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LoadOutcome {
+    /// Messages the producer had published when the window closed. The window
+    /// closes once every producer has returned from its last chunk, so this
+    /// is every message the rung published.
+    published_at_window_end: u64,
+    /// Every message the producer published; equal to
+    /// `published_at_window_end`, kept as its own field because the row's
+    /// `messages` is defined as it.
+    published: u64,
+    processed_at_window_end: u64,
+    peak_lag: u64,
+    /// The window as measured, from `start` to the sample that closed it.
+    window: Duration,
+    /// Seconds from the window closing to the last published message being
+    /// processed.
+    drain_secs: f64,
+}
+
+/// The two verdicts a rung's numbers settle — `(producer_bound, sustained)` —
+/// derived in one place so [`validate_run`] re-derives exactly what
+/// [`LoadResult::of`] stamped.
+///
+/// Two facts feed them: whether the producer held the offered rate, and
+/// whether the consumers ended the window keeping up with what was actually
+/// published. `sustained` needs both. `producer_bound` is a producer shortfall
+/// *with* the consumers keeping up — the producer was the limit, and the row
+/// says nothing about the consumers. A shortfall where the consumers also fell
+/// behind is neither: the consumers were offered more than they processed, so
+/// their rate is a real ceiling, whatever stopped the producer short (on the
+/// in-process backend a full queue blocks the publisher — the consumers'
+/// backlog is what throttled it).
+fn load_verdicts(
+    offered_msg_per_sec: u64,
+    achieved_publish_msg_per_sec: f64,
+    published_at_window_end: u64,
+    lag_at_window_end: u64,
+    peak_lag: u64,
+) -> (bool, bool) {
+    let producer_held_rate =
+        achieved_publish_msg_per_sec >= LOAD_PRODUCER_FLOOR * offered_msg_per_sec as f64;
+    let max_lag = LOAD_SUSTAINED_MAX_LAG_RATIO * published_at_window_end as f64;
+    let consumers_kept_up = lag_at_window_end as f64 <= max_lag && peak_lag as f64 <= max_lag;
+    (
+        !producer_held_rate && consumers_kept_up,
+        producer_held_rate && consumers_kept_up,
+    )
+}
+
+/// One paced producer: publishes its share of the rung's rate until the
+/// window closes.
+///
+/// Pacing is by credit, not by tick: at any instant the producer owes
+/// `elapsed × rate` messages and publishes the shortfall, capped at the
+/// backend's publish chunk. A slow publish therefore grows the next chunk
+/// instead of being forgotten, so a producer that *can* hold the rate does
+/// so exactly, and one that cannot shows the shortfall in
+/// `achieved_publish_msg_per_sec` rather than hiding it in a drifting
+/// schedule.
+#[allow(clippy::too_many_arguments)]
+async fn pace_producer<B, T>(
+    publisher: shove::Publisher<B>,
+    rate_msg_per_sec: f64,
+    window: Duration,
+    start: Instant,
+    epoch: Instant,
+    payload_bytes: usize,
+    chunk_size: usize,
+    claimed: Arc<AtomicU64>,
+    published: Arc<AtomicU64>,
+    next_id: Arc<AtomicU64>,
+    cancel: CancellationToken,
+) -> Result<(), String>
+where
+    B: Backend,
+    T: Topic<Message = StressTestMsg>,
+{
+    let payload = payload_of(payload_bytes);
+    let mut sent: u64 = 0;
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= window || cancel.is_cancelled() {
+            return Ok(());
+        }
+        let due = (elapsed.as_secs_f64() * rate_msg_per_sec) as u64;
+        let backlog = due.saturating_sub(sent);
+        if backlog == 0 {
+            tokio::time::sleep(LOAD_PACE_SLEEP).await;
+            continue;
+        }
+        let n = backlog.min(chunk_size.max(1) as u64);
+        let first = next_id.fetch_add(n, Ordering::Relaxed);
+        // Counted as claimed before the publish call: a backend that enqueues
+        // a chunk incrementally lets the consumers see part of it before the
+        // call returns, so the lag sampler measures against what has been
+        // handed to the publisher, not only what it has acknowledged.
+        claimed.fetch_add(n, Ordering::Relaxed);
+        // Stamped once per chunk, immediately before the publish call, for
+        // the same reason `message_chunks` does: allocation is not latency.
+        let published_at_ns = epoch.elapsed().as_nanos() as u64;
+        let chunk: Vec<StressTestMsg> = (0..n)
+            .map(|i| StressTestMsg {
+                id: first.saturating_add(i),
+                published_at_ns,
+                payload: payload.clone(),
+            })
+            .collect();
+        publisher
+            .publish_batch::<T>(&chunk)
+            .await
+            .map_err(|e| format!("publish_batch: {e}"))?;
+        sent = sent.saturating_add(n);
+        published.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Run one offered-load rung against consumers that are already assigned and
+/// polling: `rung.producers` paced tasks publish `rung.rate_msg_per_sec`
+/// between them for `rung.window_secs`, this task samples the lag meanwhile,
+/// and once the producers stop the residual backlog is drained (within
+/// [`LOAD_DRAIN_GRACE`]) so the next scenario starts clean.
+///
+/// The producers are ordinary tasks on the harness's multi-threaded runtime,
+/// so they run in parallel with the consumers rather than interleaved with
+/// them; whether they were starved is visible on the row as
+/// `achieved_publish_msg_per_sec`, never hidden.
+#[allow(clippy::too_many_arguments)]
+async fn run_offered_load<B, T>(
+    pool: ProducerPool<B>,
+    rung: LoadRung,
+    payload_bytes: usize,
+    epoch: Instant,
+    start: Instant,
+    processed: &AtomicU64,
+    chunk_size: usize,
+    cancel: &CancellationToken,
+    drivers: Option<&mut tokio::task::JoinSet<Result<(), String>>>,
+) -> Result<LoadOutcome, String>
+where
+    B: Backend,
+    T: Topic<Message = StressTestMsg>,
+{
+    // The pool was acquired by the driver before the readiness barrier, so
+    // connecting is never inside the window; every client in it is closed
+    // after the rung whatever its outcome.
+    let (publishers, clients) = pool;
+    let outcome = run_offered_load_with::<B, T>(
+        publishers,
+        rung,
+        payload_bytes,
+        epoch,
+        start,
+        processed,
+        chunk_size,
+        cancel,
+        drivers,
+    )
+    .await;
+    close_clients::<B>(clients).await;
+    outcome
+}
+
+/// `drivers`, where the driver supplies its consumer tasks, is watched
+/// through the window: a consumer that dies mid-rung fails the rung with its
+/// cause, since the survivors' rate would otherwise be published under the
+/// row's full worker count.
+#[allow(clippy::too_many_arguments)]
+async fn run_offered_load_with<B, T>(
+    publishers: Vec<shove::Publisher<B>>,
+    rung: LoadRung,
+    payload_bytes: usize,
+    epoch: Instant,
+    start: Instant,
+    processed: &AtomicU64,
+    chunk_size: usize,
+    cancel: &CancellationToken,
+    mut drivers: Option<&mut tokio::task::JoinSet<Result<(), String>>>,
+) -> Result<LoadOutcome, String>
+where
+    B: Backend,
+    T: Topic<Message = StressTestMsg>,
+{
+    let window = Duration::from_secs(rung.window_secs);
+    let claimed = Arc::new(AtomicU64::new(0));
+    let published = Arc::new(AtomicU64::new(0));
+    let next_id = Arc::new(AtomicU64::new(0));
+    let per_producer = rung.rate_msg_per_sec as f64 / publishers.len().max(1) as f64;
+    let mut producers = tokio::task::JoinSet::new();
+    for publisher in publishers {
+        producers.spawn(pace_producer::<B, T>(
+            publisher,
+            per_producer,
+            window,
+            start,
+            epoch,
+            payload_bytes,
+            chunk_size,
+            claimed.clone(),
+            published.clone(),
+            next_id.clone(),
+            cancel.clone(),
+        ));
+    }
+
+    let mut peak_lag = 0u64;
+    loop {
+        let elapsed = start.elapsed();
+        // Against what has been handed to the publisher: conservative by up
+        // to one chunk per producer, never blind to a chunk the consumers
+        // are already processing.
+        let p = claimed.load(Ordering::Relaxed);
+        let c = processed.load(Ordering::Relaxed);
+        peak_lag = peak_lag.max(p.saturating_sub(c));
+        if elapsed >= window {
+            break;
+        }
+        if cancel.is_cancelled() {
+            producers.abort_all();
+            return Err("interrupted".to_string());
+        }
+        // A producer that dies mid-window fails the rung now, with its cause,
+        // rather than after a window in which the offered rate was a lie; so
+        // does a consumer driver, whose survivors would otherwise be published
+        // under the row's full worker count.
+        let sample = tokio::time::sleep(LOAD_LAG_SAMPLE.min(window.saturating_sub(elapsed)));
+        let producer_outcome = match drivers.as_deref_mut() {
+            Some(set) => {
+                tokio::select! {
+                    _ = sample => None,
+                    Some(joined) = producers.join_next() => Some(joined),
+                    Some(joined) = set.join_next() => {
+                        producers.abort_all();
+                        return Err(match joined {
+                            Ok(Err(e)) => format!("consumer driver failed: {e}"),
+                            Ok(Ok(())) => "consumer driver exited during the window".to_string(),
+                            Err(e) => format!("consumer driver panicked: {e}"),
+                        });
+                    }
+                }
+            }
+            None => {
+                tokio::select! {
+                    _ = sample => None,
+                    Some(joined) = producers.join_next() => Some(joined),
+                }
+            }
+        };
+        match producer_outcome {
+            None | Some(Ok(Ok(()))) => {}
+            Some(Ok(Err(e))) => {
+                producers.abort_all();
+                return Err(format!("producer failed: {e}"));
+            }
+            Some(Err(e)) => {
+                producers.abort_all();
+                return Err(format!("producer task panicked: {e}"));
+            }
+        }
+    }
+    // The producers stop at the window's nominal end but each finishes the
+    // chunk it has in flight, and a backend that enqueues a chunk
+    // incrementally lets the consumers process part of it before the publish
+    // call returns. The window therefore closes only once every producer has
+    // returned, and both counts are read at that one instant — otherwise the
+    // processed count could exceed the published one and a lag of zero would
+    // be hiding messages the row never accounted for.
+    // Bounded: a publish that never returns must fail the rung with its
+    // counts, not hold the rest of the matrix.
+    // The window is still open here, so a consumer driver that ends now is
+    // watched exactly as it was during the nominal window.
+    let boundary = tokio::time::sleep(LOAD_DRAIN_GRACE);
+    tokio::pin!(boundary);
+    loop {
+        let driver_ended = async {
+            match drivers.as_deref_mut() {
+                Some(set) => set.join_next().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            joined = producers.join_next() => match joined {
+                None => break,
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(e))) => {
+                    producers.abort_all();
+                    return Err(format!("producer failed: {e}"));
+                }
+                Some(Err(e)) => {
+                    producers.abort_all();
+                    return Err(format!("producer task panicked: {e}"));
+                }
+            },
+            Some(joined) = driver_ended => {
+                producers.abort_all();
+                return Err(match joined {
+                    Ok(Err(e)) => format!("consumer driver failed: {e}"),
+                    Ok(Ok(())) => "consumer driver exited during the window".to_string(),
+                    Err(e) => format!("consumer driver panicked: {e}"),
+                });
+            }
+            _ = cancel.cancelled() => {
+                producers.abort_all();
+                return Err("interrupted".to_string());
+            }
+            _ = &mut boundary => {
+                producers.abort_all();
+                return Err(format!(
+                    "a producer's last chunk did not return within {}s of the window's end \
+                     ({} of {} claimed messages published)",
+                    LOAD_DRAIN_GRACE.as_secs(),
+                    published.load(Ordering::Relaxed),
+                    claimed.load(Ordering::Relaxed)
+                ));
+            }
+        }
+    }
+    let window_closed = Instant::now();
+    let window_measured = window_closed.saturating_duration_since(start);
+    let published = published.load(Ordering::Relaxed);
+    let published_at_window_end = published;
+    let processed_at_window_end = processed.load(Ordering::Relaxed);
+    peak_lag = peak_lag.max(published_at_window_end.saturating_sub(processed_at_window_end));
+
+    let grace = tokio::time::sleep(LOAD_DRAIN_GRACE);
+    tokio::pin!(grace);
+    loop {
+        let c = processed.load(Ordering::Relaxed);
+        if c >= published {
+            break;
+        }
+        if cancel.is_cancelled() {
+            return Err("interrupted".to_string());
+        }
+        tokio::select! {
+            _ = &mut grace => {
+                return Err(format!(
+                    "consumers processed {c} of {published} published messages within {}s of \
+                     the producer stopping",
+                    LOAD_DRAIN_GRACE.as_secs()
+                ));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+
+    Ok(LoadOutcome {
+        published_at_window_end,
+        published,
+        processed_at_window_end,
+        peak_lag,
+        window: window_measured,
+        drain_secs: window_closed.elapsed().as_secs_f64(),
+    })
+}
+
+// ── Drain ───────────────────────────────────────────────────────────────────
+
+/// How long a fill or a drain may go without its count advancing before the
+/// scenario is failed rather than left hanging. A consumer that cannot see
+/// the pre-published corpus would otherwise wait forever, and the harness
+/// deliberately puts no deadline on a phase that *is* progressing.
+const DRAIN_STALL: Duration = Duration::from_secs(60);
+/// How often a fill's or a drain's progress is sampled.
+const DRAIN_PROGRESS_SAMPLE: Duration = Duration::from_millis(50);
+
+/// Unique-completion tracking for one drain.
+///
+/// Corpus ids are dense `0..corpus`, so each is one bit. A handler marks the
+/// bit of every corpus message it completes; the first sighting is a unique
+/// completion, a repeat is a redelivery. Completion is judged on the unique
+/// count, never on invocations: the corpus sits in the broker during the
+/// group's join rebalances, and Kafka's at-least-once delivery can redeliver
+/// records whose offsets were not yet committed — an invocation counter would
+/// reach the corpus size with records still unread, or overshoot it.
+///
+/// The handler whose first sighting takes the unique count to the end
+/// target records the instant, so the measured window closes exactly where
+/// the count crossed it rather than at the next sample.
+pub struct DrainTracker {
+    corpus: u64,
+    end_target: u64,
+    seen: Vec<AtomicU64>,
+    unique: AtomicU64,
+    closed_at: OnceLock<Instant>,
+    /// The first message id at or beyond the corpus to arrive, if any: a
+    /// foreign message on the queue, or a fill that published more than it
+    /// was asked. Either invalidates the drain.
+    fault: OnceLock<u64>,
+}
+
+impl DrainTracker {
+    /// Allocates fallibly: a corpus the host cannot hold a bitmap for fails
+    /// the scenario with the size it asked for instead of aborting the run.
+    pub fn new(corpus: u64) -> Result<Self, String> {
+        let words = usize::try_from(corpus.div_ceil(64)).map_err(|_| {
+            format!(
+                "a corpus of {corpus} messages needs a completion bitmap this host cannot index"
+            )
+        })?;
+        let mut seen: Vec<AtomicU64> = Vec::new();
+        seen.try_reserve_exact(words).map_err(|e| {
+            format!(
+                "cannot allocate the {words}-word completion bitmap for a corpus of {corpus}: {e}"
+            )
+        })?;
+        seen.resize_with(words, || AtomicU64::new(0));
+        Ok(Self {
+            corpus,
+            end_target: DrainPlan::end_target(corpus),
+            seen,
+            unique: AtomicU64::new(0),
+            closed_at: OnceLock::new(),
+            fault: OnceLock::new(),
+        })
+    }
+
+    pub fn corpus(&self) -> u64 {
+        self.corpus
+    }
+
+    pub fn end_target(&self) -> u64 {
+        self.end_target
+    }
+
+    pub fn unique(&self) -> u64 {
+        self.unique.load(Ordering::Acquire)
+    }
+
+    pub fn closed_at(&self) -> Option<Instant> {
+        self.closed_at.get().copied()
+    }
+
+    pub fn fault(&self) -> Option<u64> {
+        self.fault.get().copied()
+    }
+
+    /// Mark one completion of corpus message `id`.
+    pub fn record(&self, id: u64) {
+        // `id < corpus` puts `id / 64` inside the `corpus.div_ceil(64)` words
+        // allocated by `new`, whose `usize` conversion already succeeded for
+        // the larger count — so the two fallible steps below cannot fail
+        // once the range check passed. They are still checked, and a
+        // failure is recorded as a fault rather than indexed.
+        let slot = if id < self.corpus {
+            usize::try_from(id / 64).ok().and_then(|w| self.seen.get(w))
+        } else {
+            None
+        };
+        let Some(slot) = slot else {
+            let _ = self.fault.set(id);
+            return;
+        };
+        let bit = 1u64 << (id % 64);
+        if slot.fetch_or(bit, Ordering::AcqRel) & bit == 0 {
+            let unique = self.unique.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+            if unique == self.end_target {
+                let _ = self.closed_at.set(Instant::now());
+            }
+        }
+    }
+}
+
+/// What the unmeasured fill of a drain scenario did.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FillOutcome {
+    published: u64,
+    fill_secs: f64,
+    producers: u16,
+}
+
+/// A publisher per producer task: over its own connection where the backend
+/// supplies one (see `ProducerClientFn`), else a clone of the driver's. The
+/// clients are returned so the caller closes every one after the phase —
+/// a leaked producer per phase would be hundreds of producer instances by
+/// the end of a sweep.
+async fn acquire_publishers<B: Backend>(
+    publisher: &shove::Publisher<B>,
+    producer_client: Option<&ProducerClientFn<B>>,
+    count: u16,
+) -> Result<(Vec<shove::Publisher<B>>, Vec<B::Client>), String> {
+    let count = count.max(1) as usize;
+    let mut publishers = Vec::with_capacity(count);
+    let mut clients = Vec::new();
+    for _ in 0..count {
+        match producer_client {
+            Some(connect) => {
+                let client = connect().await?;
+                let broker = Broker::<B>::from_client(client.clone());
+                publishers.push(
+                    broker
+                        .publisher()
+                        .await
+                        .map_err(|e| format!("producer publisher: {e}"))?,
+                );
+                clients.push(client);
+            }
+            None => publishers.push(publisher.clone()),
+        }
+    }
+    Ok((publishers, clients))
+}
+
+async fn close_clients<B: Backend>(clients: Vec<B::Client>) {
+    for client in clients {
+        Broker::<B>::from_client(client).close().await;
+    }
+}
+
+/// One unpaced fill task: claims chunks of ids from the shared counter and
+/// publishes them until the corpus is out.
+#[allow(clippy::too_many_arguments)]
+async fn fill_task<B, T>(
+    publisher: shove::Publisher<B>,
+    corpus: u64,
+    payload_bytes: usize,
+    epoch: Instant,
+    chunk_size: usize,
+    next_id: Arc<AtomicU64>,
+    published: Arc<AtomicU64>,
+    cancel: CancellationToken,
+) -> Result<(), String>
+where
+    B: Backend,
+    T: Topic<Message = StressTestMsg>,
+{
+    let payload = payload_of(payload_bytes);
+    let chunk = chunk_size.max(1) as u64;
+    loop {
+        if cancel.is_cancelled() {
+            return Err("interrupted".to_string());
+        }
+        let first = next_id.fetch_add(chunk, Ordering::Relaxed);
+        if first >= corpus {
+            return Ok(());
+        }
+        let end = first.saturating_add(chunk).min(corpus);
+        // Stamped once per chunk, immediately before the publish call, for
+        // the same reason `message_chunks` does: allocation is not latency.
+        let published_at_ns = epoch.elapsed().as_nanos() as u64;
+        let msgs: Vec<StressTestMsg> = (first..end)
+            .map(|id| StressTestMsg {
+                id,
+                published_at_ns,
+                payload: payload.clone(),
+            })
+            .collect();
+        publisher
+            .publish_batch::<T>(&msgs)
+            .await
+            .map_err(|e| format!("publish_batch: {e}"))?;
+        published.fetch_add(end.saturating_sub(first), Ordering::Relaxed);
+    }
+}
+
+/// Publish a drain scenario's corpus with no consumer running, over the same
+/// publisher pool the ladder uses. Unmeasured, so speed matters only for
+/// wall clock; a fill whose published count stops advancing for
+/// [`DRAIN_STALL`] fails the scenario rather than blocking the sweep.
+#[allow(clippy::too_many_arguments)]
+async fn fill_corpus<B, T>(
+    publisher: &shove::Publisher<B>,
+    producer_client: Option<&ProducerClientFn<B>>,
+    producers: u16,
+    corpus: u64,
+    payload_bytes: usize,
+    epoch: Instant,
+    chunk_size: usize,
+    cancel: &CancellationToken,
+) -> Result<FillOutcome, String>
+where
+    B: Backend,
+    T: Topic<Message = StressTestMsg>,
+{
+    let (publishers, clients) = acquire_publishers(publisher, producer_client, producers).await?;
+    let producers = u16::try_from(publishers.len()).unwrap_or(u16::MAX);
+    let started = Instant::now();
+    let published = Arc::new(AtomicU64::new(0));
+    let next_id = Arc::new(AtomicU64::new(0));
+    let mut tasks = tokio::task::JoinSet::new();
+    for publisher in publishers {
+        tasks.spawn(fill_task::<B, T>(
+            publisher,
+            corpus,
+            payload_bytes,
+            epoch,
+            chunk_size,
+            next_id.clone(),
+            published.clone(),
+            cancel.clone(),
+        ));
+    }
+    let mut last_count = 0u64;
+    let mut last_progress = Instant::now();
+    let outcome = loop {
+        let count = published.load(Ordering::Relaxed);
+        if count != last_count {
+            last_count = count;
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() >= DRAIN_STALL {
+            break Err(format!(
+                "fill stalled: {count} of {corpus} messages published, no progress for {}s \
+                 ({:.1}s since the fill began)",
+                DRAIN_STALL.as_secs(),
+                started.elapsed().as_secs_f64()
+            ));
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(DRAIN_PROGRESS_SAMPLE) => {}
+            joined = tasks.join_next() => match joined {
+                None => break Ok(()),
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(e))) => break Err(format!("fill producer failed: {e}")),
+                Some(Err(e)) => break Err(format!("fill producer task panicked: {e}")),
+            },
+        }
+    };
+    tasks.abort_all();
+    close_clients::<B>(clients).await;
+    outcome?;
+    let count = published.load(Ordering::Relaxed);
+    if count != corpus {
+        return Err(format!(
+            "fill published {count} messages of a corpus of {corpus}"
+        ));
+    }
+    Ok(FillOutcome {
+        published: count,
+        fill_secs: started.elapsed().as_secs_f64(),
+        producers,
+    })
+}
+
+/// What one drain measured, before it is stamped on a row as
+/// [`DrainResult`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DrainOutcome {
+    fill: FillOutcome,
+    unique_at_start: u64,
+    unique_at_end: u64,
+    unique_final: u64,
+    deliveries: u64,
+    /// From the readiness barrier to the unique count crossing the end
+    /// target.
+    window: Duration,
+}
+
+/// Run a drain's measured window against consumers that are already
+/// assigned and polling over a pre-filled corpus, then wait for the corpus
+/// to be fully consumed so the next scenario starts clean.
+///
+/// The window is a steady-state slice of the drain: it opens at `start` (the
+/// barrier) with `unique_at_start` completions already done by the workers
+/// that joined first, and closes when the unique count crosses the tracker's
+/// end target, before the tail in which partitions run dry one by one. A
+/// drain that had already consumed [`DrainPlan::max_start`] of its corpus
+/// at the barrier is not measured: most of the corpus went to a group still
+/// assembling, and the slice left is not the steady state the row claims.
+///
+/// Fails, with the counts, when the unique count stops advancing for
+/// [`DRAIN_STALL`], when a message outside the corpus arrives, or — where
+/// `drivers` is supplied — when a consumer driver ends with an error.
+async fn run_drain_window(
+    tracker: &DrainTracker,
+    fill: FillOutcome,
+    start: Instant,
+    unique_at_start: u64,
+    processed: &AtomicU64,
+    cancel: &CancellationToken,
+    mut drivers: Option<&mut tokio::task::JoinSet<Result<(), String>>>,
+) -> Result<DrainOutcome, String> {
+    let corpus = tracker.corpus();
+    if unique_at_start >= DrainPlan::max_start(corpus) {
+        return Err(format!(
+            "{unique_at_start} of {corpus} messages were already consumed when the last \
+             worker was assigned; the window left is not a steady state. Raise \
+             --drain-messages so the group assembles within the first half of the corpus"
+        ));
+    }
+    let mut last_count = unique_at_start;
+    let mut last_progress = Instant::now();
+    loop {
+        if let Some(id) = tracker.fault() {
+            return Err(format!(
+                "a message with id {id} arrived on a drain of {corpus} messages (ids 0..{corpus}): \
+                 the queue held something the fill did not publish"
+            ));
+        }
+        let unique = tracker.unique();
+        if unique >= corpus {
+            break;
+        }
+        if cancel.is_cancelled() {
+            return Err("interrupted".to_string());
+        }
+        if unique != last_count {
+            last_count = unique;
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() >= DRAIN_STALL {
+            return Err(format!(
+                "drain stalled: {unique} of {corpus} unique messages consumed \
+                 ({} deliveries), no progress for {}s, {:.1}s after the barrier",
+                processed.load(Ordering::Relaxed),
+                DRAIN_STALL.as_secs(),
+                start.elapsed().as_secs_f64()
+            ));
+        }
+        match drivers.as_deref_mut() {
+            Some(set) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(DRAIN_PROGRESS_SAMPLE) => {}
+                    Some(joined) = set.join_next() => match joined {
+                        Ok(Err(e)) => return Err(format!("consumer driver failed: {e}")),
+                        // A driver that returns before the corpus is gone leaves
+                        // the survivors doing the row's work under its name.
+                        Ok(Ok(())) => {
+                            return Err("consumer driver exited during the drain".to_string());
+                        }
+                        Err(e) if e.is_cancelled() => {}
+                        Err(e) => return Err(format!("consumer driver panicked: {e}")),
+                    },
+                }
+            }
+            None => tokio::time::sleep(DRAIN_PROGRESS_SAMPLE).await,
+        }
+    }
+    let closed_at = tracker.closed_at().ok_or_else(|| {
+        format!(
+            "the drain consumed all {corpus} messages but never recorded crossing its end \
+             target of {}",
+            tracker.end_target()
+        )
+    })?;
+    Ok(DrainOutcome {
+        fill,
+        unique_at_start,
+        unique_at_end: tracker.end_target(),
+        unique_final: tracker.unique(),
+        deliveries: processed.load(Ordering::Relaxed),
+        window: closed_at.saturating_duration_since(start),
+    })
+}
+
+/// The fill and tracker a drain scenario's driver prepared before spawning
+/// its consumers; [`settle_window`] turns them into the measured outcome.
+struct PendingDrain {
+    fill: FillOutcome,
+    tracker: Arc<DrainTracker>,
+    /// Unique completions when the window opened, read by the driver in the
+    /// same step that takes `start`, so the numerator and the clock share
+    /// one boundary.
+    unique_at_start: u64,
+}
+
+impl PendingDrain {
+    /// The driver's window-opening step: taken together with `start`.
+    fn open_window(&mut self) {
+        self.unique_at_start = self.tracker.unique();
+    }
+}
+
+/// The publishers and clients a rung's paced producers run over, acquired by
+/// the driver before the readiness barrier so connecting is never inside the
+/// window.
+type ProducerPool<B> = (Vec<shove::Publisher<B>>, Vec<<B as Backend>::Client>);
+
+/// A rung scenario's producer pool, or `None` on every other scenario.
+async fn prepare_rung<B: Backend>(
+    hcfg: &HarnessConfig<B>,
+    scenario: &Scenario,
+    publisher: &shove::Publisher<B>,
+) -> Result<Option<ProducerPool<B>>, String> {
+    match scenario.load {
+        Some(rung) => Ok(Some(
+            acquire_publishers(publisher, hcfg.producer_client.as_ref(), rung.producers).await?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// What a consume driver's setup-and-publish phase hands to its teardown.
+struct Window {
+    start: Instant,
+    setup: Option<Duration>,
+    /// `Some` when the phase ran an offered-load rung; the rung has then
+    /// already drained its own backlog.
+    load: Option<LoadOutcome>,
+    /// `Some` on a drain scenario until [`settle_window`] has run it.
+    pending_drain: Option<PendingDrain>,
+    /// The drain's measured outcome, set by [`settle_window`].
+    drain: Option<DrainOutcome>,
+}
+
+impl Window {
+    /// The window of a phase that failed before it could open one.
+    fn failed() -> Self {
+        Self {
+            start: Instant::now(),
+            setup: None,
+            load: None,
+            pending_drain: None,
+            drain: None,
+        }
+    }
+
+    /// The measured window: a rung's own, a drain's slice, or the time from
+    /// `start` to the corpus being drained.
+    fn duration(&self) -> Duration {
+        match (&self.load, &self.drain) {
+            (Some(load), _) => load.window,
+            (None, Some(drain)) => drain.window,
+            (None, None) => self.start.elapsed(),
+        }
+    }
+}
+
+/// Bring a phase's window to completion: a rung has already drained its own
+/// backlog, a drain runs its measured slice and then empties the corpus, and
+/// a live-published corpus (FIFO) waits for its expected count. Where
+/// `drivers` is supplied, a consumer driver ending with an error fails the
+/// wait instead of leaving it to the stall deadline.
+async fn settle_window(
+    window: &mut Window,
+    scenario: &Scenario,
+    processed: &AtomicU64,
+    cancel: &CancellationToken,
+    drivers: Option<&mut tokio::task::JoinSet<Result<(), String>>>,
+) -> Result<(), String> {
+    if window.load.is_some() {
+        return Ok(());
+    }
+    match window.pending_drain.take() {
+        Some(pending) => {
+            window.drain = Some(
+                run_drain_window(
+                    &pending.tracker,
+                    pending.fill,
+                    window.start,
+                    pending.unique_at_start,
+                    processed,
+                    cancel,
+                    drivers,
+                )
+                .await?,
+            );
+            Ok(())
+        }
+        None => match drivers {
+            Some(set) => {
+                await_completion_or_driver_error(
+                    processed,
+                    scenario.expected_processed(),
+                    cancel,
+                    set,
+                )
+                .await
+            }
+            None => await_completion(processed, scenario.expected_processed(), cancel).await,
+        },
+    }
+}
+
+/// A drain scenario's preparation, run before any consumer is spawned: the
+/// completion tracker, then the fill. `None` on every other scenario.
+async fn prepare_drain<B, T>(
+    hcfg: &HarnessConfig<B>,
+    scenario: &Scenario,
+    publisher: &shove::Publisher<B>,
+    epoch: Instant,
+    cancel: &CancellationToken,
+) -> Result<Option<PendingDrain>, String>
+where
+    B: Backend,
+    T: Topic<Message = StressTestMsg>,
+{
+    let Some(plan) = scenario.drain else {
+        return Ok(None);
+    };
+    let tracker = Arc::new(DrainTracker::new(plan.corpus)?);
+    let fill = fill_corpus::<B, T>(
+        publisher,
+        hcfg.producer_client.as_ref(),
+        plan.producers,
+        plan.corpus,
+        scenario.payload_bytes,
+        epoch,
+        hcfg.publish_chunk_size,
+        cancel,
+    )
+    .await?;
+    Ok(Some(PendingDrain {
+        fill,
+        tracker,
+        unique_at_start: 0,
+    }))
 }
 
 /// Wait until `processed` reaches `target` or the run is cancelled.
@@ -2065,7 +3336,45 @@ fn finish(
         cpu_pct: resources.cpu_pct,
         duration_secs: duration.as_secs_f64(),
         setup_secs: setup.map(|d| d.as_secs_f64()),
+        load: None,
+        drain: None,
     }
+}
+
+/// [`finish`] for the drivers that may have run an offered-load rung or a
+/// drain. On a rung the throughput is what the consumers processed *during
+/// the window*, not the corpus over the drain — the producer is still
+/// publishing when the window closes. On a drain it is the unique
+/// completions inside the measured slice over that slice: what the group did
+/// between the barrier and the end target, never the whole corpus over the
+/// whole drain.
+fn finish_window(
+    scenario: &Scenario,
+    window: &Window,
+    duration: Duration,
+    resources: ResourceSnapshot,
+    latencies: LatencyPercentiles,
+) -> Result<ScenarioMetrics, String> {
+    let mut metrics = finish(scenario, duration, window.setup, resources, latencies);
+    let secs = duration.as_secs_f64();
+    if let (Some(outcome), Some(rung)) = (&window.load, scenario.load) {
+        metrics.throughput = if secs > 0.0 {
+            outcome.processed_at_window_end as f64 / secs
+        } else {
+            0.0
+        };
+        metrics.load = Some(LoadResult::of(rung, outcome));
+    }
+    if let (Some(outcome), Some(plan)) = (&window.drain, scenario.drain) {
+        let account = DrainResult::of(plan, outcome)?;
+        metrics.throughput = if secs > 0.0 {
+            account.window_completions() as f64 / secs
+        } else {
+            0.0
+        };
+        metrics.drain = Some(account);
+    }
+    Ok(metrics)
 }
 
 /// Stop a sampler that is only started once the measured window opens.
@@ -2095,6 +3404,10 @@ async fn stop_sampler(sampler: Option<ResourceSampler>) -> ResourceSnapshot {
 /// round is not, so this is deliberately generous. Partitioned backends do not
 /// rely on this — see [`ReadinessProbeFn`].
 const READINESS_OVERSUPPLY: usize = 4;
+/// How long the barrier waits between sentinel rounds.
+const READINESS_ROUND: Duration = Duration::from_millis(200);
+/// How often the barrier checks the attach flags inside a round.
+const READINESS_POLL: Duration = Duration::from_millis(2);
 
 /// Block until every worker has handled at least one message, and return the
 /// wall-clock that took.
@@ -2117,12 +3430,19 @@ const READINESS_OVERSUPPLY: usize = 4;
 /// state — a single member holding every partition — that the barrier exists to
 /// rule out. Sentinels bump only these flags, so a straggler's sentinel
 /// arriving mid-measurement is invisible to `processed` and to the recorder.
+/// `drain`, on a drain scenario, is the corpus tracker: the corpus is being
+/// consumed while the barrier holds, and a drain whose unique count has
+/// started moving and then stops for [`DRAIN_STALL`] with a worker still
+/// unattached fails here with the counts, rather than holding the sweep on a
+/// barrier that will never open. A barrier with no corpus progress at all
+/// keeps its deliberate lack of a deadline.
 async fn await_worker_readiness<B, T>(
     publisher: &shove::Publisher<B>,
     probe: Option<&ReadinessProbeFn>,
     epoch: Instant,
     attach_flags: &[Arc<AtomicU64>],
     cancel: &CancellationToken,
+    drain: Option<&DrainTracker>,
 ) -> Result<(), String>
 where
     B: Backend,
@@ -2134,6 +3454,8 @@ where
             .filter(|c| c.load(Ordering::Relaxed) > 0)
             .count()
     };
+    let mut last_unique = 0u64;
+    let mut last_progress = Instant::now();
     let sentinel = |epoch: Instant| StressTestMsg {
         id: SENTINEL_ID,
         published_at_ns: epoch.elapsed().as_nanos() as u64,
@@ -2163,9 +3485,44 @@ where
                         .map_err(|e| format!("publish readiness sentinels: {e}"))?;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            if attached() == attach_flags.len() {
-                return Ok::<(), String>(());
+            // Poll the flags between rounds rather than sleeping the round
+            // out: on a drain the corpus is already being consumed while the
+            // barrier holds, and every millisecond between the last worker
+            // attaching and the barrier noticing is corpus lost to the
+            // window's start.
+            let round_started = Instant::now();
+            loop {
+                if attached() == attach_flags.len() {
+                    return Ok::<(), String>(());
+                }
+                if let Some(tracker) = drain {
+                    if let Some(id) = tracker.fault() {
+                        return Err(format!(
+                            "a message with id {id} arrived on a drain of {} messages while \
+                             the barrier held: the queue held something the fill did not publish",
+                            tracker.corpus()
+                        ));
+                    }
+                    let unique = tracker.unique();
+                    if unique != last_unique {
+                        last_unique = unique;
+                        last_progress = Instant::now();
+                    } else if unique > 0 && last_progress.elapsed() >= DRAIN_STALL {
+                        return Err(format!(
+                            "drain stalled behind the readiness barrier: {unique} of {} unique \
+                             messages consumed, no progress for {}s, with {} of {} workers \
+                             assigned and polling",
+                            tracker.corpus(),
+                            DRAIN_STALL.as_secs(),
+                            attached(),
+                            attach_flags.len()
+                        ));
+                    }
+                }
+                if round_started.elapsed() >= READINESS_ROUND {
+                    break;
+                }
+                tokio::time::sleep(READINESS_POLL).await;
             }
         }
     };
@@ -2463,6 +3820,18 @@ where
     let recorder = Arc::new(LatencyRecorder::new());
     let processed = Arc::new(AtomicU64::new(0));
 
+    // A drain publishes its corpus before any member exists to consume it,
+    // so the fill sits here, ahead of the registration that brings the
+    // members up.
+    if fifo && scenario.drain.is_some() {
+        return Err("consume_fifo takes no drain".to_string());
+    }
+    let mut pending_drain =
+        prepare_drain::<B, StressTestTopic>(hcfg, scenario, &publisher, epoch, cancel).await?;
+    let tracker = pending_drain.as_ref().map(|p| p.tracker.clone());
+    let barrier_tracker = tracker.clone();
+    let rung_pool = prepare_rung(hcfg, scenario, &publisher).await?;
+
     // Started after the readiness barrier — see `run_scenario_supervisor`.
     let mut sampler: Option<ResourceSampler> = None;
 
@@ -2497,6 +3866,10 @@ where
     let profile = scenario.handler;
     let factory = move || {
         let handler = StressTestHandler::new(epoch, pc.clone(), rec.clone(), profile);
+        let handler = match &tracker {
+            Some(tracker) => handler.with_drain_tracker(tracker.clone()),
+            None => handler,
+        };
         match unclaimed.lock().ok().and_then(|mut u| u.pop()) {
             Some(attach) => handler.with_attach_counter(attach),
             // FIFO (no flags were made), or a member beyond the stamped count
@@ -2550,6 +3923,7 @@ where
                 epoch,
                 &attach_flags,
                 cancel,
+                barrier_tracker.as_deref(),
             )
             .await?;
             Some(setup_started.elapsed())
@@ -2557,40 +3931,79 @@ where
 
         sampler = Some(ResourceSampler::start());
         let start = Instant::now();
-        let chunks = message_chunks(
-            scenario.messages,
-            scenario.payload_bytes,
-            epoch,
-            hcfg.publish_chunk_size,
-        );
-        for chunk in chunks {
-            if fifo {
-                publisher
-                    .publish_batch::<StressSeqTopic>(&chunk)
-                    .await
-                    .map_err(|e| format!("publish_batch: {e}"))?;
-            } else {
-                publisher
-                    .publish_batch::<StressTestTopic>(&chunk)
-                    .await
-                    .map_err(|e| format!("publish_batch: {e}"))?;
+        let load = match (scenario.load, rung_pool, fifo) {
+            (Some(rung), Some(pool), false) => Some(
+                run_offered_load::<B, StressTestTopic>(
+                    pool,
+                    rung,
+                    scenario.payload_bytes,
+                    epoch,
+                    start,
+                    &processed,
+                    hcfg.publish_chunk_size,
+                    cancel,
+                    None,
+                )
+                .await?,
+            ),
+            (Some(_), None, false) => {
+                return Err("rung scenario without a producer pool".to_string());
             }
-        }
-        Ok::<(Instant, Option<Duration>), String>((start, setup))
+            (Some(_), _, true) => {
+                return Err("consume_fifo takes no offered load".to_string());
+            }
+            // FIFO holds no barrier and takes no drain: its corpus is
+            // published into the live shard set, as it always was.
+            (None, _, true) => {
+                let chunks = message_chunks(
+                    scenario.messages,
+                    scenario.payload_bytes,
+                    epoch,
+                    hcfg.publish_chunk_size,
+                );
+                for chunk in chunks {
+                    publisher
+                        .publish_batch::<StressSeqTopic>(&chunk)
+                        .await
+                        .map_err(|e| format!("publish_batch: {e}"))?;
+                }
+                None
+            }
+            // A drain's corpus is already in the queue; the window opens here.
+            (None, _, false) if pending_drain.is_some() => {
+                if let Some(pending) = pending_drain.as_mut() {
+                    pending.open_window();
+                }
+                None
+            }
+            (None, _, false) => {
+                return Err(format!(
+                    "{} scenario has neither a rung nor a drain",
+                    scenario.flow
+                ));
+            }
+        };
+        Ok::<Window, String>(Window {
+            start,
+            setup,
+            load,
+            pending_drain,
+            drain: None,
+        })
     };
     // A publish failure must still fall through to the teardown below: an
     // early `?` here would leave the spawned consumer group running, and a
     // leaked consumer eats the next scenario's messages. Same for a barrier
     // that times out.
-    let ((start, setup), outcome) = match setup_and_publish.await {
-        Ok(window) => (
-            window,
-            await_completion(&processed, scenario.expected_processed(), cancel).await,
-        ),
-        Err(e) => ((Instant::now(), None), Err(e)),
+    let (window, outcome) = match setup_and_publish.await {
+        Ok(mut window) => {
+            let outcome = settle_window(&mut window, scenario, &processed, cancel, None).await;
+            (window, outcome)
+        }
+        Err(e) => (Window::failed(), Err(e)),
     };
 
-    let duration = start.elapsed();
+    let duration = window.duration();
     // Stopped with the window — see `run_scenario_batch`.
     let resources = stop_sampler(sampler).await;
 
@@ -2606,7 +4019,7 @@ where
     outcome?;
 
     let latencies = recorder.compute_percentiles().await;
-    Ok(finish(scenario, duration, setup, resources, latencies))
+    finish_window(scenario, &window, duration, resources, latencies)
 }
 
 /// Broadcast: every subscriber receives every message, so `consumers`
@@ -2701,6 +4114,7 @@ where
             epoch,
             &attach_flags,
             cancel,
+            None,
         )
         .await?;
         let setup = setup_started.elapsed();
@@ -2965,6 +4379,13 @@ where
     // Started after the readiness barrier — see `run_scenario_supervisor`.
     let mut sampler: Option<ResourceSampler> = None;
 
+    // A drain's corpus goes in before any loop is spawned to consume it, and
+    // a rung's producer pool connects before the loops join.
+    let mut pending_drain =
+        prepare_drain::<B, StressTestTopic>(hcfg, scenario, &publisher, epoch, cancel).await?;
+    let tracker = pending_drain.as_ref().map(|p| p.tracker.clone());
+    let rung_pool = prepare_rung(hcfg, scenario, &publisher).await?;
+
     // One batch consumer per scenario consumer, sharing the group — the
     // scenario's `consumers` field and `effective_workers` both say N, so N
     // loops must actually run, not one loop wearing N's label.
@@ -2986,10 +4407,13 @@ where
     for _ in 0..workers {
         let attach = Arc::new(AtomicU64::new(0));
         attach_flags.push(attach.clone());
-        let handler = StressBatchHandler::new(
+        let mut inner =
             StressTestHandler::new(epoch, processed.clone(), recorder.clone(), scenario.handler)
-                .with_attach_counter(attach),
-        );
+                .with_attach_counter(attach);
+        if let Some(tracker) = &tracker {
+            inner = inner.with_drain_tracker(tracker.clone());
+        }
+        let handler = StressBatchHandler::new(inner);
         drivers.spawn(batch(
             client.clone(),
             handler,
@@ -3009,35 +4433,68 @@ where
             epoch,
             &attach_flags,
             cancel,
+            tracker.as_deref(),
         )
         .await?;
         let setup = setup_started.elapsed();
 
         sampler = Some(ResourceSampler::start());
         let start = Instant::now();
-        let chunks = message_chunks(
-            scenario.messages,
-            scenario.payload_bytes,
-            epoch,
-            hcfg.publish_chunk_size,
-        );
-        for chunk in chunks {
-            publisher
-                .publish_batch::<StressTestTopic>(&chunk)
-                .await
-                .map_err(|e| format!("publish_batch: {e}"))?;
+        let load = match (scenario.load, rung_pool) {
+            (Some(rung), Some(pool)) => Some(
+                run_offered_load::<B, StressTestTopic>(
+                    pool,
+                    rung,
+                    scenario.payload_bytes,
+                    epoch,
+                    start,
+                    &processed,
+                    hcfg.publish_chunk_size,
+                    cancel,
+                    Some(&mut drivers),
+                )
+                .await?,
+            ),
+            (Some(_), None) => {
+                return Err("rung scenario without a producer pool".to_string());
+            }
+            // A drain's corpus is already in the topic; the window opens here.
+            (None, _) if pending_drain.is_some() => {
+                if let Some(pending) = pending_drain.as_mut() {
+                    pending.open_window();
+                }
+                None
+            }
+            (None, _) => {
+                return Err(format!(
+                    "{} scenario has neither a rung nor a drain",
+                    scenario.flow
+                ));
+            }
+        };
+        Ok::<Window, String>(Window {
+            start,
+            setup: Some(setup),
+            load,
+            pending_drain,
+            drain: None,
+        })
+    };
+    let (window, outcome) = match setup_and_publish.await {
+        Ok(mut window) => {
+            let outcome = settle_window(
+                &mut window,
+                scenario,
+                &processed,
+                cancel,
+                Some(&mut drivers),
+            )
+            .await;
+            (window, outcome)
         }
-        Ok::<(Instant, Option<Duration>), String>((start, Some(setup)))
+        Err(e) => (Window::failed(), Err(e)),
     };
-    let ((start, setup), outcome) = match setup_and_publish.await {
-        Ok(window) => (
-            window,
-            await_completion_or_driver_error(&processed, scenario.messages, cancel, &mut drivers)
-                .await,
-        ),
-        Err(e) => ((Instant::now(), None), Err(e)),
-    };
-    let duration = start.elapsed();
+    let duration = window.duration();
     // Closed with the window, not after teardown, so cpu_pct and peak RSS
     // describe the same interval as `duration_secs`: the sampler's cpu average
     // divides by its whole lifetime, and a cancelled Kafka batch driver
@@ -3059,7 +4516,7 @@ where
     broker.close().await;
     outcome?;
 
-    Ok(finish(scenario, duration, setup, resources, latencies))
+    finish_window(scenario, &window, duration, resources, latencies)
 }
 
 /// Execute a single supervisor scenario (SQS, and the `consume_parallel` /
@@ -3133,6 +4590,14 @@ where
     // negligible-handler rows to `HandlerCost::SetupBound` rather than letting
     // them keep claiming to measure shove.
     let mut attach_flags: Vec<Arc<AtomicU64>> = Vec::with_capacity(replicas as usize);
+    // A drain publishes its corpus before any replica exists to consume it.
+    if fifo && scenario.drain.is_some() {
+        return Err("consume_fifo takes no drain".to_string());
+    }
+    let mut pending_drain =
+        prepare_drain::<B, StressTestTopic>(hcfg, scenario, &publisher, epoch, cancel).await?;
+    let tracker = pending_drain.as_ref().map(|p| p.tracker.clone());
+    let rung_pool = prepare_rung(hcfg, scenario, &publisher).await?;
     let setup_and_publish = async {
         // Before the registration loop: `setup_secs` runs from the first worker
         // being spawned, and registering N supervisors is part of bringing them
@@ -3150,6 +4615,9 @@ where
                 let attach = Arc::new(AtomicU64::new(0));
                 attach_flags.push(attach.clone());
                 handler = handler.with_attach_counter(attach);
+            }
+            if let Some(tracker) = &tracker {
+                handler = handler.with_drain_tracker(tracker.clone());
             }
             let opts = make_opts(prefetch, scenario.concurrent);
             let mut supervisor = broker.consumer_supervisor();
@@ -3186,6 +4654,7 @@ where
                 epoch,
                 &attach_flags,
                 cancel,
+                tracker.as_deref(),
             )
             .await?;
             Some(setup_started.elapsed())
@@ -3194,37 +4663,76 @@ where
         sampler = Some(ResourceSampler::start());
         let start = Instant::now();
 
-        let chunks = message_chunks(
-            scenario.messages,
-            scenario.payload_bytes,
-            epoch,
-            hcfg.publish_chunk_size,
-        );
-        for chunk in chunks {
-            if fifo {
-                publisher
-                    .publish_batch::<StressSeqTopic>(&chunk)
-                    .await
-                    .map_err(|e| format!("publish_batch: {e}"))?;
-            } else {
-                publisher
-                    .publish_batch::<StressTestTopic>(&chunk)
-                    .await
-                    .map_err(|e| format!("publish_batch: {e}"))?;
+        let load = match (scenario.load, rung_pool, fifo) {
+            (Some(rung), Some(pool), false) => Some(
+                run_offered_load::<B, StressTestTopic>(
+                    pool,
+                    rung,
+                    scenario.payload_bytes,
+                    epoch,
+                    start,
+                    &processed,
+                    hcfg.publish_chunk_size,
+                    cancel,
+                    None,
+                )
+                .await?,
+            ),
+            (Some(_), None, false) => {
+                return Err("rung scenario without a producer pool".to_string());
             }
+            (Some(_), _, true) => {
+                return Err("consume_fifo takes no offered load".to_string());
+            }
+            // FIFO holds no barrier and takes no drain: its corpus is
+            // published into the live shard set, as it always was.
+            (None, _, true) => {
+                let chunks = message_chunks(
+                    scenario.messages,
+                    scenario.payload_bytes,
+                    epoch,
+                    hcfg.publish_chunk_size,
+                );
+                for chunk in chunks {
+                    publisher
+                        .publish_batch::<StressSeqTopic>(&chunk)
+                        .await
+                        .map_err(|e| format!("publish_batch: {e}"))?;
+                }
+                None
+            }
+            // A drain's corpus is already in the queue; the window opens here.
+            (None, _, false) if pending_drain.is_some() => {
+                if let Some(pending) = pending_drain.as_mut() {
+                    pending.open_window();
+                }
+                None
+            }
+            (None, _, false) => {
+                return Err(format!(
+                    "{} scenario has neither a rung nor a drain",
+                    scenario.flow
+                ));
+            }
+        };
+        Ok::<Window, String>(Window {
+            start,
+            setup,
+            load,
+            pending_drain,
+            drain: None,
+        })
+    };
+
+    let (window, outcome) = match setup_and_publish.await {
+        Ok(mut window) => {
+            let outcome = settle_window(&mut window, scenario, &processed, cancel, None).await;
+            (window, outcome)
         }
-        Ok::<(Instant, Option<Duration>), String>((start, setup))
+        Err(e) => (Window::failed(), Err(e)),
     };
 
-    let ((start, setup), outcome) = match setup_and_publish.await {
-        Ok(window) => (
-            window,
-            await_completion(&processed, scenario.expected_processed(), cancel).await,
-        ),
-        Err(e) => ((Instant::now(), None), Err(e)),
-    };
-
-    let duration = start.elapsed();
+    let duration = window.duration();
     // Stopped with the window — see `run_scenario_batch`.
     let resources = stop_sampler(sampler).await;
 
@@ -3240,7 +4748,7 @@ where
     outcome?;
 
     let latencies = recorder.compute_percentiles().await;
-    Ok(finish(scenario, duration, setup, resources, latencies))
+    finish_window(scenario, &window, duration, resources, latencies)
 }
 
 // ── Reporting ───────────────────────────────────────────────────────────────
@@ -3316,6 +4824,153 @@ struct ScenarioResult {
     /// truthful reading of a pre-v3 row.
     #[serde(default)]
     setup_secs: Option<f64>,
+    /// The offered-load account — present on every row that ran under
+    /// `--load-rates`, absent (not defaulted) on every corpus row. On a row
+    /// that carries it, `throughput_msg_per_sec` is the consumers' processing
+    /// rate over the window and `messages` is `load.published`. `default`
+    /// exists only so a prior-version document reaches the version check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    load: Option<LoadResult>,
+    /// How this row was measured — [`Method::as_str`] — present on every row
+    /// of an offered-load flow and absent everywhere else. The account the
+    /// row carries must agree with it: `load` on `offered_load`, `drain` on
+    /// `drain`. Recorded rather than inferred so a reader never has to guess
+    /// a method from which account happens to be present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    method: Option<String>,
+    /// The drain account — present on every `drain` row, absent everywhere
+    /// else. On a row that carries it, `throughput_msg_per_sec` is the unique
+    /// completions inside the measured window over that window and
+    /// `messages` is `drain.corpus`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drain: Option<DrainResult>,
+}
+
+/// What an offered-load rung measured, as stamped on its row. Every field a
+/// verdict is derived from is recorded next to the verdict, so
+/// [`validate_run`] re-derives `producer_bound` and `sustained` through
+/// [`load_verdicts`] rather than trusting them.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+struct LoadResult {
+    /// The rate the producer was asked to hold.
+    offered_msg_per_sec: u64,
+    window_secs: u64,
+    producers: u16,
+    /// Everything the producer published; equal to `published_at_window_end`
+    /// (the window closes only once every producer has returned) and to the
+    /// row's `messages`.
+    published: u64,
+    published_at_window_end: u64,
+    processed_at_window_end: u64,
+    /// `published_at_window_end` over the measured window.
+    achieved_publish_msg_per_sec: f64,
+    /// `published_at_window_end − processed_at_window_end`.
+    lag_at_window_end: u64,
+    peak_lag: u64,
+    /// Seconds the consumers took to clear the residual backlog after the
+    /// producer stopped.
+    drain_secs: f64,
+    /// The producer landed under [`LOAD_PRODUCER_FLOOR`] of the offered rate
+    /// while the consumers kept up with what it did publish: the producer was
+    /// the limit, and the row says nothing about the consumers.
+    producer_bound: bool,
+    /// The producer held the rate and the consumers kept up with it — see
+    /// [`LOAD_SUSTAINED_MAX_LAG_RATIO`].
+    sustained: bool,
+}
+
+impl LoadResult {
+    fn of(rung: LoadRung, outcome: &LoadOutcome) -> Self {
+        let secs = outcome.window.as_secs_f64();
+        let achieved = if secs > 0.0 {
+            outcome.published_at_window_end as f64 / secs
+        } else {
+            0.0
+        };
+        let lag = outcome
+            .published_at_window_end
+            .saturating_sub(outcome.processed_at_window_end);
+        let (producer_bound, sustained) = load_verdicts(
+            rung.rate_msg_per_sec,
+            achieved,
+            outcome.published_at_window_end,
+            lag,
+            outcome.peak_lag,
+        );
+        Self {
+            offered_msg_per_sec: rung.rate_msg_per_sec,
+            window_secs: rung.window_secs,
+            producers: rung.producers,
+            published: outcome.published,
+            published_at_window_end: outcome.published_at_window_end,
+            processed_at_window_end: outcome.processed_at_window_end,
+            achieved_publish_msg_per_sec: achieved,
+            lag_at_window_end: lag,
+            peak_lag: outcome.peak_lag,
+            drain_secs: outcome.drain_secs,
+            producer_bound,
+            sustained,
+        }
+    }
+}
+
+/// What a drain measured, as stamped on its row. Observed counts only, no
+/// derived rates: the fill rate is `corpus / fill_secs`, the row's
+/// `throughput_msg_per_sec` is `(unique_at_end − unique_at_start) /
+/// duration_secs`, and [`validate_run`] re-derives every identity between
+/// these fields rather than trusting them.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+struct DrainResult {
+    /// The corpus the scenario asked for; equal to the row's `messages`.
+    corpus: u64,
+    /// What the fill's counter reached; equal to `corpus` on any row that
+    /// exists, since a short fill fails the scenario.
+    published: u64,
+    fill_secs: f64,
+    /// Fill tasks.
+    producers: u16,
+    /// Unique completions already done when the readiness barrier passed
+    /// (the window opened). Under [`DrainPlan::max_start`] on any row.
+    unique_at_start: u64,
+    /// Unique completions when the window closed: [`DrainPlan::end_target`].
+    unique_at_end: u64,
+    /// Unique completions when the drain finished; equal to `corpus`.
+    unique_final: u64,
+    /// Every handler invocation over the whole drain, sentinels excluded.
+    deliveries: u64,
+    /// `deliveries − unique_final`: redeliveries the consumers saw.
+    duplicates: u64,
+}
+
+impl DrainResult {
+    fn of(plan: DrainPlan, outcome: &DrainOutcome) -> Result<Self, String> {
+        let duplicates = outcome
+            .deliveries
+            .checked_sub(outcome.unique_final)
+            .ok_or_else(|| {
+                format!(
+                    "the drain recorded {} unique completions from only {} deliveries",
+                    outcome.unique_final, outcome.deliveries
+                )
+            })?;
+        Ok(Self {
+            corpus: plan.corpus,
+            published: outcome.fill.published,
+            fill_secs: outcome.fill.fill_secs,
+            producers: outcome.fill.producers,
+            unique_at_start: outcome.unique_at_start,
+            unique_at_end: outcome.unique_at_end,
+            unique_final: outcome.unique_final,
+            deliveries: outcome.deliveries,
+            duplicates,
+        })
+    }
+
+    /// The unique completions inside the measured window — the throughput
+    /// numerator.
+    fn window_completions(&self) -> u64 {
+        self.unique_at_end.saturating_sub(self.unique_at_start)
+    }
 }
 
 /// A scenario that produced no number. Deliberately a minimal identity set —
@@ -3332,6 +4987,12 @@ struct FailedResult {
     messages: u64,
     consumers: u16,
     handler: String,
+    /// The method the failed scenario was attempting — see
+    /// `ScenarioResult::method`. A failure has no numbers, but a chart must
+    /// still know that a *drain* failed here rather than plot the cell's
+    /// sustained rung as its ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    method: Option<String>,
     error: String,
 }
 
@@ -3735,11 +5396,30 @@ fn validate_run(run: &BackendRun) -> Result<(), String> {
                 ));
             }
         }
+        let method = validate_method(run, "result", &r.flow, flow, r.method.as_deref())?;
+        match (method, r.load.is_some(), r.drain.is_some()) {
+            (None, false, false)
+            | (Some(Method::OfferedLoad), true, false)
+            | (Some(Method::Drain), false, true) => {}
+            (method, load, drain) => {
+                return Err(format!(
+                    "run '{}' has a result for flow '{}' whose method ({}) disagrees with the \
+                     account it carries (load: {load}, drain: {drain})",
+                    run.backend,
+                    r.flow,
+                    method.map_or("absent", |m| m.as_str()),
+                ));
+            }
+        }
+        validate_load(run, r, flow)?;
+        validate_drain(run, r)?;
     }
     for f in &run.failures {
         // A failure row records a scenario that produced no number, so it
-        // carries no `handler_cost` to check.
-        check_row(&run.backend, "failure", &f.flow, &f.mode, f.payload_bytes)?;
+        // carries no `handler_cost` to check — but it does record the method
+        // it was attempting.
+        let flow = check_row(&run.backend, "failure", &f.flow, &f.mode, f.payload_bytes)?;
+        validate_method(run, "failure", &f.flow, flow, f.method.as_deref())?;
     }
     let legal_flows: Vec<&str> = Flow::ALL.iter().map(|f| f.as_str()).collect();
     for u in &run.unsupported {
@@ -3761,6 +5441,192 @@ fn validate_run(run: &BackendRun) -> Result<(), String> {
                 run.backend, u.flow
             ));
         }
+    }
+    Ok(())
+}
+
+/// The offered-load account's invariants: only a flow whose driver runs a
+/// paced producer may carry one, its counts must add up, `messages` must be
+/// the rung's published total, and both verdicts must be what
+/// [`load_verdicts`] derives from the recorded numbers — a row that disagrees
+/// is a claim about the consumers that its own numbers refute.
+/// A `method` is present exactly on the offered-load flows, and names one of
+/// the schema's two methods.
+fn validate_method(
+    run: &BackendRun,
+    kind: &str,
+    flow_name: &str,
+    flow: Flow,
+    method: Option<&str>,
+) -> Result<Option<Method>, String> {
+    match (flow.takes_offered_load(), method) {
+        (true, Some(m)) => Method::parse(m).map(Some).ok_or_else(|| {
+            format!(
+                "run '{}' has a {kind} for flow '{flow_name}' with unknown method '{m}'",
+                run.backend
+            )
+        }),
+        (true, None) => Err(format!(
+            "run '{}' has a {kind} for flow '{flow_name}' that records no method; every \
+             row and failure of an offered-load flow says whether it was a drain or a rung",
+            run.backend
+        )),
+        (false, None) => Ok(None),
+        (false, Some(m)) => Err(format!(
+            "run '{}' has a {kind} for flow '{flow_name}' carrying method '{m}', which only \
+             the offered-load flows record",
+            run.backend
+        )),
+    }
+}
+
+/// Whether a row's claimed rate is the one its counts and window derive, to
+/// [`RATE_TOLERANCE`]. The absolute floor lets a rate of zero match itself.
+fn rate_matches(claimed: f64, derived: f64) -> bool {
+    claimed.is_finite() && (claimed - derived).abs() <= (RATE_TOLERANCE * derived).max(1e-9)
+}
+
+/// Every identity a drain account states, re-derived from its own fields.
+fn validate_drain(run: &BackendRun, r: &ScenarioResult) -> Result<(), String> {
+    let Some(d) = &r.drain else {
+        return Ok(());
+    };
+    let refuse = |what: &str| {
+        Err(format!(
+            "run '{}' has a result for flow '{}' whose drain account {what}",
+            run.backend, r.flow
+        ))
+    };
+    if d.corpus == 0 || d.producers == 0 {
+        return refuse("names an empty corpus or no fill producer, which no run can have");
+    }
+    if r.messages != d.corpus {
+        return refuse("does not match the row's `messages`, which must be the corpus");
+    }
+    if d.published != d.corpus {
+        return refuse("records a fill that did not publish the whole corpus");
+    }
+    if d.unique_final != d.corpus {
+        return refuse("records a drain that did not complete the whole corpus");
+    }
+    if d.unique_at_end != DrainPlan::end_target(d.corpus) {
+        return refuse("closed its window at a count other than the corpus's end target");
+    }
+    if d.unique_at_start >= DrainPlan::max_start(d.corpus) || d.unique_at_start >= d.unique_at_end {
+        return refuse(
+            "opened its window with too much of the corpus already consumed to be a steady \
+             state",
+        );
+    }
+    match d.deliveries.checked_sub(d.unique_final) {
+        Some(dups) if dups == d.duplicates => {}
+        _ => return refuse("records duplicates that are not deliveries minus unique completions"),
+    }
+    if !(d.fill_secs.is_finite() && d.fill_secs > 0.0) {
+        return refuse("has a non-finite or non-positive fill time");
+    }
+    if !(r.duration_secs.is_finite() && r.duration_secs > 0.0) {
+        return refuse("sits on a row with a non-positive window");
+    }
+    let derived = d.window_completions() as f64 / r.duration_secs;
+    if !rate_matches(r.throughput_msg_per_sec, derived) {
+        return refuse(&format!(
+            "derives a rate of {derived:.1} msg/s where the row claims {:.1}",
+            r.throughput_msg_per_sec
+        ));
+    }
+    Ok(())
+}
+
+fn validate_load(run: &BackendRun, r: &ScenarioResult, flow: Flow) -> Result<(), String> {
+    let Some(l) = &r.load else {
+        return Ok(());
+    };
+    let refuse = |what: &str| {
+        Err(format!(
+            "run '{}' has a result for flow '{}' whose offered-load account {what}",
+            run.backend, r.flow
+        ))
+    };
+    if !flow.takes_offered_load() {
+        return refuse("belongs to a flow whose driver runs no paced producer");
+    }
+    if l.offered_msg_per_sec == 0 || l.window_secs == 0 || l.producers == 0 {
+        return refuse(
+            "names a rung with a zero rate, window or producer count, which no run can have",
+        );
+    }
+    if !(l.achieved_publish_msg_per_sec.is_finite() && l.achieved_publish_msg_per_sec >= 0.0) {
+        return refuse("has a non-finite or negative achieved publish rate");
+    }
+    if !(l.drain_secs.is_finite() && l.drain_secs >= 0.0) {
+        return refuse("has a non-finite or negative drain time");
+    }
+    if l.published != l.published_at_window_end {
+        return refuse(
+            "records a published total other than the count at the window's end, which closes \
+             only once every producer has returned",
+        );
+    }
+    if l.peak_lag > l.published_at_window_end {
+        return refuse("records a peak lag larger than everything it published");
+    }
+    if l.processed_at_window_end > l.published_at_window_end {
+        return refuse(
+            "records more messages processed than published when the window closed, which \
+             one window cannot contain",
+        );
+    }
+    if l.lag_at_window_end
+        != l.published_at_window_end
+            .saturating_sub(l.processed_at_window_end)
+    {
+        return refuse("records a lag that is not published minus processed at the window's end");
+    }
+    if r.messages != l.published {
+        return refuse(
+            "does not match the row's `messages`, which must be the rung's published total",
+        );
+    }
+    if !(r.duration_secs.is_finite() && r.duration_secs > 0.0) {
+        return refuse("sits on a row with a non-positive window");
+    }
+    if r.duration_secs < l.window_secs as f64 {
+        return refuse(
+            "sits on a row whose measured window is shorter than the rung's nominal window, \
+             which closes only after the nominal window has elapsed",
+        );
+    }
+    let achieved = l.published_at_window_end as f64 / r.duration_secs;
+    if !rate_matches(l.achieved_publish_msg_per_sec, achieved) {
+        return refuse(&format!(
+            "claims an achieved publish rate of {:.1} msg/s where its counts derive {achieved:.1}",
+            l.achieved_publish_msg_per_sec
+        ));
+    }
+    let throughput = l.processed_at_window_end as f64 / r.duration_secs;
+    if !rate_matches(r.throughput_msg_per_sec, throughput) {
+        return refuse(&format!(
+            "derives a processing rate of {throughput:.1} msg/s where the row claims {:.1}",
+            r.throughput_msg_per_sec
+        ));
+    }
+    if l.peak_lag < l.lag_at_window_end {
+        return refuse("records a peak lag below the lag it ended the window with");
+    }
+    let (producer_bound, sustained) = load_verdicts(
+        l.offered_msg_per_sec,
+        l.achieved_publish_msg_per_sec,
+        l.published_at_window_end,
+        l.lag_at_window_end,
+        l.peak_lag,
+    );
+    if l.producer_bound != producer_bound || l.sustained != sustained {
+        return refuse(&format!(
+            "claims producer_bound={} sustained={} where its own numbers derive \
+             producer_bound={producer_bound} sustained={sustained}",
+            l.producer_bound, l.sustained
+        ));
     }
     Ok(())
 }
@@ -3893,6 +5759,9 @@ struct ScalingKey {
     payload_bytes: usize,
     tier: String,
     handler: String,
+    /// The offered rate, or 0 on a corpus row: a consumer sweep is only
+    /// comparable rung against the same rung.
+    offered_msg_per_sec: u64,
 }
 
 impl ScalingKey {
@@ -3902,6 +5771,7 @@ impl ScalingKey {
             payload_bytes: r.payload_bytes,
             tier: r.tier.clone(),
             handler: r.handler.clone(),
+            offered_msg_per_sec: r.load.map_or(0, |l| l.offered_msg_per_sec),
         }
     }
 }
@@ -3974,6 +5844,52 @@ fn print_table(report: &Report) {
     println!("e2e      = publish → handler completion (dispatch + handler work)");
     println!("publish-only flows report the publish call's own latency in both columns");
     println!("dlq_drain reports latency relative to drain start, not original publish");
+    let load_rows: Vec<(&ScenarioResult, &LoadResult)> = report
+        .results
+        .iter()
+        .filter_map(|r| r.load.as_ref().map(|l| (r, l)))
+        .collect();
+    if !load_rows.is_empty() {
+        println!();
+        println!(
+            "Offered-load rungs (MSG/SEC above is what the consumers processed during the window):"
+        );
+        println!(
+            "{:<16} {:>7} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}  VERDICT",
+            "FLOW",
+            "PAYLOAD",
+            "C",
+            "OFFERED",
+            "ACHIEVED",
+            "CONSUMED",
+            "LAG@END",
+            "PEAK LAG",
+            "DRAIN"
+        );
+        println!("{}", "-".repeat(110));
+        for (r, l) in load_rows {
+            let verdict = if l.producer_bound {
+                "producer-bound"
+            } else if l.sustained {
+                "sustained"
+            } else {
+                "not sustained"
+            };
+            println!(
+                "{:<16} {:>7} {:>5} {:>9} {:>9.0} {:>9.0} {:>9} {:>9} {:>6.1}s  {}",
+                r.flow,
+                r.payload_bytes,
+                r.consumers,
+                l.offered_msg_per_sec,
+                l.achieved_publish_msg_per_sec,
+                r.throughput_msg_per_sec,
+                l.lag_at_window_end,
+                l.peak_lag,
+                l.drain_secs,
+                verdict,
+            );
+        }
+    }
     if !report.failures.is_empty() {
         println!("\nFailed scenarios:");
         for f in &report.failures {
@@ -4049,15 +5965,15 @@ pub fn spawn_ctrlc_watcher() -> CancellationToken {
 
 /// Capability holes for a backend reachable through [`run_all_scenarios`]:
 /// coordinated groups and broadcast are both available (the bounds prove it),
-/// so the only hole is batch consume on the five non-Kafka backends.
+/// so the only hole is batch consume on the backends the harness does not wire it for.
 fn unsupported_for_group_backend<B: Backend>(hcfg: &HarnessConfig<B>) -> Vec<Unsupported> {
     let mut out = Vec::new();
     if hcfg.batch_consume.is_none() {
         out.push(Unsupported {
             flow: Flow::ConsumeBatch.as_str().to_string(),
             reason: "the stress harness wires a batch consume flow only for the Kafka \
-                     backend; this reflects harness wiring, not which backends \
-                     implement the primitive (see `HasBatchConsumption`)"
+                     and InMemory backends; this reflects harness wiring, not which \
+                     backends implement the primitive (see `HasBatchConsumption`)"
                 .to_string(),
         });
     }
@@ -4089,8 +6005,8 @@ fn unsupported_for_supervisor_backend<B: Backend>(hcfg: &HarnessConfig<B>) -> Ve
         out.push(Unsupported {
             flow: Flow::ConsumeBatch.as_str().to_string(),
             reason: "the stress harness wires a batch consume flow only for the Kafka \
-                     backend; this reflects harness wiring, not which backends \
-                     implement the primitive (see `HasBatchConsumption`)"
+                     and InMemory backends; this reflects harness wiring, not which \
+                     backends implement the primitive (see `HasBatchConsumption`)"
                 .to_string(),
         });
     }
@@ -4174,12 +6090,44 @@ fn push_metrics(results: &mut Vec<ScenarioResult>, scenario: &Scenario, m: Scena
         m.peak_rss_mb,
         m.duration_secs
     );
+    if let Some(l) = &m.load {
+        eprintln!(
+            "     load: offered {}/s, producer achieved {:.0}/s, lag at window end {} (peak {}), \
+             drained in {:.1}s — {}",
+            l.offered_msg_per_sec,
+            l.achieved_publish_msg_per_sec,
+            l.lag_at_window_end,
+            l.peak_lag,
+            l.drain_secs,
+            if l.producer_bound {
+                "producer-bound"
+            } else if l.sustained {
+                "sustained"
+            } else {
+                "NOT sustained"
+            }
+        );
+    }
+    if let Some(d) = &m.drain {
+        eprintln!(
+            "     drain: corpus {} filled in {:.1}s by {} producers; window opened at {} unique \
+             and closed at {}; {} deliveries ({} duplicates)",
+            d.corpus,
+            d.fill_secs,
+            d.producers,
+            d.unique_at_start,
+            d.unique_at_end,
+            d.deliveries,
+            d.duplicates
+        );
+    }
     results.push(ScenarioResult {
         flow: scenario.flow.as_str().to_string(),
         mode: scenario.flow.mode().as_str().to_string(),
         payload_bytes: scenario.payload_bytes,
         tier: scenario.tier.to_string(),
-        messages: scenario.messages,
+        // A rung's corpus is what its producer managed, not what it was asked.
+        messages: m.load.map_or(scenario.messages, |l| l.published),
         consumers: scenario.consumers,
         handler: scenario.handler.to_string(),
         handler_cost: scenario
@@ -4203,6 +6151,9 @@ fn push_metrics(results: &mut Vec<ScenarioResult>, scenario: &Scenario, m: Scena
         cpu_pct: m.cpu_pct,
         duration_secs: m.duration_secs,
         setup_secs: m.setup_secs,
+        load: m.load,
+        method: scenario.method().map(|m| m.as_str().to_string()),
+        drain: m.drain,
     });
 }
 
@@ -4216,6 +6167,7 @@ fn push_failure(failures: &mut Vec<FailedResult>, scenario: &Scenario, error: St
         messages: scenario.messages,
         consumers: scenario.consumers,
         handler: scenario.handler.to_string(),
+        method: scenario.method().map(|m| m.as_str().to_string()),
         error,
     });
 }
@@ -4354,6 +6306,96 @@ fn inert_batch_flags_note(cli: &Cli, selected: &[Flow], skip: Option<&str>) -> O
     ))
 }
 
+/// Why an invocation's offered-load flags must be refused outright, or `None`
+/// to proceed. Same rule as [`refused_batch_flags`]: a knob nothing in the
+/// invocation reads is the parsed-and-dropped defect at invocation level.
+/// `--load-window-secs` and `--load-producers` shape a ladder only
+/// `--load-rates` creates, and `--load-rates` itself only applies to the flows
+/// [`Flow::takes_offered_load`] names.
+fn refused_load_flags(cli: &Cli, selected: &[Flow]) -> Option<String> {
+    // `--load-producers` is not a dependent: it also sizes a drain's fill,
+    // which every selection with an offered-load flow runs.
+    match &cli.load_rates {
+        None if cli.load_window_secs.is_some() => Some(
+            "--load-window-secs only shapes the offered-load ladder, and no `--load-rates` was \
+             given. Add `--load-rates`, or drop the flag."
+                .to_string(),
+        ),
+        None if cli.load_producers.is_some() && !selected.iter().any(Flow::takes_offered_load) => {
+            Some(format!(
+                "nothing in this invocation reads --load-producers: the selected flows ({}) \
+                 include none of the offered-load flows (consumer-group, consume-parallel, \
+                 consume-batch, supervisor), so there is no ladder and no fill to size.",
+                flow_list(selected),
+            ))
+        }
+        None => None,
+        Some(_) if selected.iter().any(Flow::takes_offered_load) => None,
+        Some(_) => Some(format!(
+            "nothing in this invocation reads --load-rates: the selected flows ({}) include \
+             none of the offered-load flows (consumer-group, consume-parallel, consume-batch, \
+             supervisor). Select one, or drop the flag.",
+            flow_list(selected),
+        )),
+    }
+}
+
+/// The `--drain-*` flags: refused where nothing reads them, and a byte cap
+/// that admits no message at a selected payload is refused rather than
+/// clamped — a corpus of zero measures nothing.
+fn refused_drain_flags(cli: &Cli, selected: &[Flow]) -> Option<String> {
+    let takes_drain = selected.iter().any(Flow::takes_offered_load);
+    match (cli.drain_messages, cli.drain_max_bytes) {
+        (None, Some(_)) => Some(
+            "--drain-max-bytes only caps a `--drain-messages` corpus, and none was given. Add \
+             `--drain-messages`, or drop the flag."
+                .to_string(),
+        ),
+        (None, None) => None,
+        (Some(_), _) if !takes_drain => Some(format!(
+            "nothing in this invocation reads --drain-messages: the selected flows ({}) include \
+             none of the consume flows that drain a corpus (consumer-group, consume-parallel, \
+             consume-batch, supervisor). Select one, or drop the flag.",
+            flow_list(selected),
+        )),
+        (Some(requested), cap) => {
+            let cap = cap.unwrap_or(DEFAULT_DRAIN_MAX_BYTES);
+            cli.payload
+                .0
+                .iter()
+                .find(|&&payload| DrainPlan::capped_corpus(requested, cap, payload) == 0)
+                .map(|&payload| {
+                    format!(
+                        "--drain-max-bytes {cap} admits no message at the {payload} B payload; \
+                         a drain corpus needs at least {payload} bytes. Raise the cap or drop \
+                         that payload."
+                    )
+                })
+        }
+    }
+}
+
+/// A drain corpus the backend's queue cannot hold with no consumer draining
+/// it would block the fill forever; refuse before the sweep runs.
+fn refused_drain_capacity<B: Backend>(
+    hcfg: &HarnessConfig<B>,
+    scenarios: &[Scenario],
+) -> Option<String> {
+    let capacity = hcfg.prefill_capacity?;
+    scenarios
+        .iter()
+        .filter_map(|s| s.drain.map(|d| (s, d.corpus)))
+        .find(|(_, corpus)| *corpus > capacity)
+        .map(|(s, corpus)| {
+            format!(
+                "the {} drain at {} B needs a corpus of {corpus} messages, but this backend's \
+                 queue holds at most {capacity} with no consumer draining it; lower \
+                 --drain-messages or raise the backend's capacity",
+                s.flow, s.payload_bytes
+            )
+        })
+}
+
 /// Build, capability-filter, and guard the scenario list — the one selection
 /// step every entry point goes through, so no runner can wire the flows in
 /// while forgetting the flag guards. `Err` is a refusal to run at all.
@@ -4367,11 +6409,20 @@ fn select_scenarios<B: Backend>(
     if let Some(reason) = refused_batch_flags(cli, &selected) {
         return Err(reason);
     }
+    if let Some(reason) = refused_load_flags(cli, &selected) {
+        return Err(reason);
+    }
+    if let Some(reason) = refused_drain_flags(cli, &selected) {
+        return Err(reason);
+    }
     let scenarios = filter_scenarios(
         hcfg,
         build_scenarios(cli, default_flow, hcfg.fifo_workers),
         supervisor_only,
     );
+    if let Some(reason) = refused_drain_capacity(hcfg, &scenarios) {
+        return Err(reason);
+    }
     let skip = skip_reason(hcfg, Flow::ConsumeBatch, supervisor_only);
     if let Some(note) = inert_batch_flags_note(cli, &selected, skip.as_deref()) {
         eprintln!("{note}");
@@ -4438,8 +6489,21 @@ fn announce_scenario(i: usize, total: usize, scenario: &Scenario) {
         .batch_options
         .map(|o| format!(" | batch={}msg/{}ms", o.max_batch_size, o.max_batch_age_ms))
         .unwrap_or_default();
+    let load_str = scenario
+        .load
+        .map(|l| {
+            format!(
+                " | load={}/s x{}s ({} producers)",
+                l.rate_msg_per_sec, l.window_secs, l.producers
+            )
+        })
+        .unwrap_or_default();
+    let drain_str = scenario
+        .drain
+        .map(|d| format!(" | drain={}msg ({} fill producers)", d.corpus, d.producers))
+        .unwrap_or_default();
     eprintln!(
-        "[{}/{}] {} | {}B | {} | {}msg | {}c{}{} | {} ...",
+        "[{}/{}] {} | {}B | {} | {}msg | {}c{}{}{}{} | {} ...",
         i + 1,
         total,
         scenario.flow,
@@ -4449,8 +6513,62 @@ fn announce_scenario(i: usize, total: usize, scenario: &Scenario) {
         scenario.consumers,
         prefetch_str,
         batch_str,
+        load_str,
+        drain_str,
         scenario.handler,
     );
+}
+
+/// Stops a cell's ladder at the first rung that was not sustained: every
+/// higher rung would re-measure the same ceiling (or the same producer
+/// shortfall) at a window apiece. A failed rung stops the ladder too — its
+/// cause is already recorded, and a higher rate will not cure it. Skipped
+/// rungs are announced, never silently absent.
+#[derive(Default)]
+struct LadderGate {
+    stopped: std::collections::BTreeSet<(String, usize, u16, String)>,
+}
+
+impl LadderGate {
+    fn key(scenario: &Scenario) -> (String, usize, u16, String) {
+        (
+            scenario.flow.as_str().to_string(),
+            scenario.payload_bytes,
+            scenario.consumers,
+            scenario.handler.to_string(),
+        )
+    }
+
+    /// Whether this rung sits above one the cell already failed to sustain.
+    fn skips(&self, scenario: &Scenario) -> bool {
+        scenario.load.is_some() && self.stopped.contains(&Self::key(scenario))
+    }
+
+    fn observe(&mut self, scenario: &Scenario, outcome: &Result<ScenarioMetrics, String>) {
+        if scenario.load.is_none() {
+            return;
+        }
+        let stop = match outcome {
+            Ok(m) => m.load.is_some_and(|l| !l.sustained),
+            Err(_) => true,
+        };
+        if stop {
+            self.stopped.insert(Self::key(scenario));
+        }
+    }
+
+    fn announce_skip(i: usize, total: usize, scenario: &Scenario) {
+        eprintln!(
+            "[{}/{}] {} | {}B | {}c | load={}/s — skipped: a lower rung of this cell was not \
+             sustained",
+            i + 1,
+            total,
+            scenario.flow,
+            scenario.payload_bytes,
+            scenario.consumers,
+            scenario.load.map_or(0, |l| l.rate_msg_per_sec),
+        );
+    }
 }
 
 /// Run every selected scenario against a backend implementing
@@ -4486,11 +6604,16 @@ pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
 
     let mut results: Vec<ScenarioResult> = Vec::new();
     let mut failures: Vec<FailedResult> = Vec::new();
+    let mut ladder = LadderGate::default();
 
     for (i, scenario) in scenarios.iter().enumerate() {
         if cancel.is_cancelled() {
             eprintln!("skipping remaining scenarios");
             break;
+        }
+        if ladder.skips(scenario) {
+            LadderGate::announce_skip(i, scenarios.len(), scenario);
+            continue;
         }
         announce_scenario(i, scenarios.len(), scenario);
 
@@ -4522,6 +6645,7 @@ pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
             }
         };
 
+        ladder.observe(scenario, &outcome);
         match outcome {
             Ok(m) => push_metrics(&mut results, scenario, m),
             Err(e) => push_failure(&mut failures, scenario, e),
@@ -4564,11 +6688,16 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
 
     let mut results: Vec<ScenarioResult> = Vec::new();
     let mut failures: Vec<FailedResult> = Vec::new();
+    let mut ladder = LadderGate::default();
 
     for (i, scenario) in scenarios.iter().enumerate() {
         if cancel.is_cancelled() {
             eprintln!("skipping remaining scenarios");
             break;
+        }
+        if ladder.skips(scenario) {
+            LadderGate::announce_skip(i, scenarios.len(), scenario);
+            continue;
         }
         announce_scenario(i, scenarios.len(), scenario);
 
@@ -4589,6 +6718,7 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
             }
         };
 
+        ladder.observe(scenario, &outcome);
         match outcome {
             Ok(m) => push_metrics(&mut results, scenario, m),
             Err(e) => push_failure(&mut failures, scenario, e),
@@ -4610,7 +6740,7 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
 mod tests {
     use super::*;
     use clap::Parser;
-    use shove::inmemory::{InMemoryConfig, InMemoryConsumer};
+    use shove::inmemory::{InMemoryConfig, InMemoryConsumer, InMemoryConsumerGroupConfig};
 
     fn cli(tier: &str, handler: &str) -> Cli {
         Cli::parse_from(["stress", "--tier", tier, "--handler", handler])
@@ -5182,9 +7312,17 @@ mod tests {
     #[tokio::test]
     async fn batch_teardown_stops_drivers_gracefully() {
         let workers: u16 = 4;
+        // A one-second rung rather than a live-published corpus: the offered-load
+        // flows measure by method, and a drain this small would be consumed
+        // before the barrier could pass.
+        let rung = LoadRung {
+            rate_msg_per_sec: 200,
+            window_secs: 1,
+            producers: 1,
+        };
         let scenario = Scenario {
             tier: "moderate",
-            messages: 40,
+            messages: rung.nominal_messages(),
             consumers: workers,
             handler: HandlerProfile::Zero,
             concurrent: false,
@@ -5192,6 +7330,8 @@ mod tests {
             flow: Flow::ConsumeBatch,
             payload_bytes: 64,
             batch_options: Some(BatchOptions::default()),
+            load: Some(rung),
+            drain: None,
         };
 
         let (batch, _started, clean_exits) = counting_batch_fn();
@@ -5210,6 +7350,136 @@ mod tests {
             clean_exits.load(Ordering::Relaxed),
             workers as u64,
             "every driver must be joined on the graceful path, not aborted"
+        );
+    }
+
+    /// A batch consumer that returns before the corpus is gone leaves the
+    /// survivors doing the row's work under its name; the drain fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_batch_driver_that_exits_cleanly_mid_drain_fails_the_drain() {
+        // A sleeping handler keeps the drain seconds long, so the early exit
+        // below lands well inside it.
+        let corpus = 40;
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: corpus,
+            consumers: 2,
+            handler: HandlerProfile::Slow,
+            concurrent: false,
+            prefetch: Some(1),
+            flow: Flow::ConsumeBatch,
+            payload_bytes: 64,
+            batch_options: Some(BatchOptions::default()),
+            load: None,
+            drain: Some(DrainPlan {
+                corpus,
+                producers: 1,
+            }),
+        };
+        let exits = Arc::new(AtomicU64::new(0));
+        let batch: BatchConsumeFn<shove::InMemory> = {
+            let exits = exits.clone();
+            Box::new(move |client, handler, _opts, stop| {
+                let leaves = exits.fetch_add(1, Ordering::Relaxed) == 0;
+                Box::pin(async move {
+                    // One message in flight per consumer: in-process
+                    // concurrency follows the prefetch, and a hundred
+                    // sleeping handlers at once would finish the corpus
+                    // before the exit below.
+                    let consumer = InMemoryConsumer::new(client);
+                    let run = consumer.run::<StressTestTopic, _>(
+                        OneMessageBatches(handler),
+                        (),
+                        ConsumerOptions::new()
+                            .with_prefetch_count(1)
+                            .with_shutdown(stop),
+                    );
+                    if leaves {
+                        tokio::select! {
+                            r = run => r.map_err(|e| format!("run: {e}")),
+                            _ = tokio::time::sleep(Duration::from_millis(500)) => Ok(()),
+                        }
+                    } else {
+                        run.await.map_err(|e| format!("run: {e}"))
+                    }
+                })
+            })
+        };
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory").with_batch_consume(batch);
+        let cancel = CancellationToken::new();
+        let err = run_scenario_batch(&hcfg, &scenario, &cancel, &|| async {
+            <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                .await
+                .expect("connect InMemory")
+        })
+        .await
+        .err()
+        .expect("a drain with a consumer that left early is not a measurement");
+        assert!(err.contains("exited during the drain"), "{err}");
+    }
+
+    /// A consumer that dies mid-rung fails the rung with its cause: the
+    /// survivors' rate must not be published under the row's worker count.
+    #[tokio::test]
+    async fn a_batch_driver_that_dies_mid_rung_fails_the_rung() {
+        let rung = LoadRung {
+            rate_msg_per_sec: 200,
+            window_secs: 2,
+            producers: 1,
+        };
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: rung.nominal_messages(),
+            consumers: 2,
+            handler: HandlerProfile::Zero,
+            concurrent: false,
+            prefetch: None,
+            flow: Flow::ConsumeBatch,
+            payload_bytes: 64,
+            batch_options: Some(BatchOptions::default()),
+            load: Some(rung),
+            drain: None,
+        };
+        // Two workers: one runs, one attaches and then dies half a second
+        // into the window.
+        let deaths = Arc::new(AtomicU64::new(0));
+        let batch: BatchConsumeFn<shove::InMemory> = {
+            let deaths = deaths.clone();
+            Box::new(move |client, handler, _opts, stop| {
+                let dies = deaths.fetch_add(1, Ordering::Relaxed) == 0;
+                Box::pin(async move {
+                    let consumer = InMemoryConsumer::new(client);
+                    let run = consumer.run::<StressTestTopic, _>(
+                        OneMessageBatches(handler),
+                        (),
+                        ConsumerOptions::new().with_shutdown(stop),
+                    );
+                    if dies {
+                        tokio::select! {
+                            r = run => r.map_err(|e| format!("run: {e}")),
+                            _ = tokio::time::sleep(Duration::from_millis(700)) => {
+                                Err("simulated consumer crash".to_string())
+                            }
+                        }
+                    } else {
+                        run.await.map_err(|e| format!("run: {e}"))
+                    }
+                })
+            })
+        };
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory").with_batch_consume(batch);
+        let cancel = CancellationToken::new();
+        let err = run_scenario_batch(&hcfg, &scenario, &cancel, &|| async {
+            <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                .await
+                .expect("connect InMemory")
+        })
+        .await
+        .err()
+        .expect("a rung with a dead consumer is not a measurement");
+        assert!(
+            err.contains("consumer driver failed") && err.contains("simulated consumer crash"),
+            "{err}"
         );
     }
 
@@ -5362,6 +7632,8 @@ mod tests {
             cpu_pct: 0.0,
             duration_secs: 1.0,
             setup_secs: None,
+            load: None,
+            drain: None,
         }
     }
 
@@ -5376,8 +7648,51 @@ mod tests {
             flow,
             payload_bytes: 64,
             // Mirrors `build_scenarios`: batch options exist exactly on the
-            // flow that has a batch to size.
+            // flow that has a batch to size, and the offered-load flows are
+            // drains unless a rung is asked for.
             batch_options: (flow == Flow::ConsumeBatch).then(BatchOptions::default),
+            load: None,
+            drain: flow.takes_offered_load().then_some(DrainPlan {
+                corpus: 100,
+                producers: 1,
+            }),
+        }
+    }
+
+    /// A drain account every identity in [`validate_drain`] accepts: the
+    /// window opened at zero, closed at the end target, saw no redelivery.
+    fn drain_account(corpus: u64) -> DrainResult {
+        DrainResult {
+            corpus,
+            published: corpus,
+            fill_secs: 0.5,
+            producers: 1,
+            unique_at_start: 0,
+            unique_at_end: DrainPlan::end_target(corpus),
+            unique_final: corpus,
+            deliveries: corpus,
+            duplicates: 0,
+        }
+    }
+
+    /// [`dummy_metrics`] for `scenario`, with the drain account and the rate
+    /// it derives when the scenario is a drain, so the row `push_metrics`
+    /// writes validates.
+    fn metrics_for(
+        scenario: &Scenario,
+        duration_secs: f64,
+        setup_secs: Option<f64>,
+    ) -> ScenarioMetrics {
+        let drain = scenario.drain.map(|d| drain_account(d.corpus));
+        ScenarioMetrics {
+            throughput: drain.map_or(1.0, |d| d.window_completions() as f64 / duration_secs),
+            latencies: LatencyPercentiles::default(),
+            peak_rss_mb: 0.0,
+            cpu_pct: 0.0,
+            duration_secs,
+            setup_secs,
+            load: None,
+            drain,
         }
     }
 
@@ -5708,18 +8023,7 @@ mod tests {
     fn the_handler_cost_marker_reaches_the_row_and_the_document() {
         let scenario = scenario_for(Flow::ConsumeBatch, HandlerProfile::Heavy);
         let mut rows = Vec::new();
-        push_metrics(
-            &mut rows,
-            &scenario,
-            ScenarioMetrics {
-                throughput: 1.0,
-                latencies: LatencyPercentiles::default(),
-                peak_rss_mb: 0.0,
-                cpu_pct: 0.0,
-                duration_secs: 1.0,
-                setup_secs: Some(0.5),
-            },
-        );
+        push_metrics(&mut rows, &scenario, metrics_for(&scenario, 1.0, Some(0.5)));
         assert_eq!(rows[0].handler_cost, HandlerCost::HandlerAmortised.as_str());
 
         let path = temp_path("handler-cost");
@@ -5792,9 +8096,17 @@ mod tests {
         // never existed. Asserting `effective_workers` alone cannot catch
         // that: only counting the loops that actually start can.
         let workers: u16 = 3;
+        // A one-second rung rather than a live-published corpus: the offered-load
+        // flows measure by method, and a drain this small would be consumed
+        // before the barrier could pass.
+        let rung = LoadRung {
+            rate_msg_per_sec: 200,
+            window_secs: 1,
+            producers: 1,
+        };
         let scenario = Scenario {
             tier: "moderate",
-            messages: 30,
+            messages: rung.nominal_messages(),
             consumers: workers,
             handler: HandlerProfile::Zero,
             concurrent: false,
@@ -5802,6 +8114,8 @@ mod tests {
             flow: Flow::ConsumeBatch,
             payload_bytes: 64,
             batch_options: Some(BatchOptions::default()),
+            load: Some(rung),
+            drain: None,
         };
 
         let (batch, started, _clean_exits) = counting_batch_fn();
@@ -5877,6 +8191,7 @@ mod tests {
             Instant::now(),
             &flags,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("barrier");
@@ -5930,6 +8245,7 @@ mod tests {
             Instant::now(),
             &flags,
             &cancel,
+            None,
         )
         .await
         .expect_err("no worker attached");
@@ -5955,9 +8271,17 @@ mod tests {
         // rebalance is not. What must hold: the delay lands in `setup_secs`,
         // and `duration_secs` is the drain that happened after it.
         const STARTUP: Duration = Duration::from_millis(700);
+        // A one-second rung rather than a live-published corpus: the offered-load
+        // flows measure by method, and a drain this small would be consumed
+        // before the barrier could pass.
+        let rung = LoadRung {
+            rate_msg_per_sec: 200,
+            window_secs: 1,
+            producers: 1,
+        };
         let scenario = Scenario {
             tier: "moderate",
-            messages: 20,
+            messages: rung.nominal_messages(),
             consumers: 2,
             handler: HandlerProfile::Zero,
             concurrent: false,
@@ -5965,6 +8289,8 @@ mod tests {
             flow: Flow::ConsumeBatch,
             payload_bytes: 64,
             batch_options: Some(BatchOptions::default()),
+            load: Some(rung),
+            drain: None,
         };
 
         let batch: BatchConsumeFn<shove::InMemory> =
@@ -5999,18 +8325,18 @@ mod tests {
             setup >= STARTUP.as_secs_f64(),
             "setup_secs {setup} did not cover the {STARTUP:?} the workers took to start"
         );
+        // The window is the rung's own second, not that second plus the
+        // startup the workers took.
+        let window = rung.window_secs as f64;
         assert!(
-            metrics.duration_secs < STARTUP.as_secs_f64(),
-            "duration_secs {} still contains worker startup; a 20-message drain \
-             cannot take longer than {STARTUP:?}",
+            metrics.duration_secs >= window
+                && metrics.duration_secs < window + STARTUP.as_secs_f64(),
+            "duration_secs {} still contains worker startup; the rung's window is {window}s",
             metrics.duration_secs
         );
 
-        // And the row it produces claims to measure shove only if that drain
-        // was long enough to be a rate — which a 20-message one is not.
         let mut rows = Vec::new();
         push_metrics(&mut rows, &scenario, metrics);
-        assert_eq!(rows[0].handler_cost, HandlerCost::SetupBound.as_str());
         assert!(
             rows[0].setup_secs.is_some(),
             "setup_secs must reach the row"
@@ -6043,9 +8369,17 @@ mod tests {
         // not be added back up to the interval they describe, and a backend
         // whose per-worker registration is slow reported that cost nowhere.
         let workers: u16 = 2;
+        // A one-second rung rather than a live-published corpus: the offered-load
+        // flows measure by method, and a drain this small would be consumed
+        // before the barrier could pass.
+        let rung = LoadRung {
+            rate_msg_per_sec: 200,
+            window_secs: 1,
+            producers: 1,
+        };
         let scenario = Scenario {
             tier: "moderate",
-            messages: 20,
+            messages: rung.nominal_messages(),
             consumers: workers,
             handler: HandlerProfile::Zero,
             concurrent: false,
@@ -6053,6 +8387,8 @@ mod tests {
             flow: Flow::ConsumeBatch,
             payload_bytes: 64,
             batch_options: Some(BatchOptions::default()),
+            load: Some(rung),
+            drain: None,
         };
 
         let batch: BatchConsumeFn<shove::InMemory> =
@@ -6091,10 +8427,11 @@ mod tests {
             "setup_secs {setup} does not cover the {spawn_loop}s the driver spent \
              spawning {workers} workers"
         );
-        // And the spawn loop stayed out of the drain, which is the half that
-        // was already right.
+        // And the spawn loop stayed out of the window, which is the half that
+        // was already right: the window is the rung's second, not the second
+        // plus the loop.
         assert!(
-            metrics.duration_secs < PER_WORKER_SPAWN.as_secs_f64(),
+            metrics.duration_secs < rung.window_secs as f64 + PER_WORKER_SPAWN.as_secs_f64(),
             "duration_secs {} contains worker startup",
             metrics.duration_secs
         );
@@ -6109,9 +8446,17 @@ mod tests {
         // per replica inside the registration loop, which makes it the hook a
         // test can hang a measurable per-worker cost on.
         let replicas: u16 = 2;
+        // A one-second rung rather than a live-published corpus: the offered-load
+        // flows measure by method, and a drain this small would be consumed
+        // before the barrier could pass.
+        let rung = LoadRung {
+            rate_msg_per_sec: 200,
+            window_secs: 1,
+            producers: 1,
+        };
         let scenario = Scenario {
             tier: "moderate",
-            messages: 20,
+            messages: rung.nominal_messages(),
             consumers: replicas,
             handler: HandlerProfile::Zero,
             concurrent: false,
@@ -6119,6 +8464,8 @@ mod tests {
             flow: Flow::ConsumeParallel,
             payload_bytes: 64,
             batch_options: None,
+            load: Some(rung),
+            drain: None,
         };
 
         let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
@@ -6145,7 +8492,7 @@ mod tests {
              registering {replicas} supervisors"
         );
         assert!(
-            metrics.duration_secs < PER_WORKER_SPAWN.as_secs_f64(),
+            metrics.duration_secs < rung.window_secs as f64 + PER_WORKER_SPAWN.as_secs_f64(),
             "duration_secs {} contains worker startup",
             metrics.duration_secs
         );
@@ -6176,9 +8523,17 @@ mod tests {
                 })
             });
 
+        // A one-second rung rather than a live-published corpus: the offered-load
+        // flows measure by method, and a drain this small would be consumed
+        // before the barrier could pass.
+        let rung = LoadRung {
+            rate_msg_per_sec: 200,
+            window_secs: 1,
+            producers: 1,
+        };
         let scenario = Scenario {
             tier: "moderate",
-            messages: 10,
+            messages: rung.nominal_messages(),
             consumers: 3,
             handler: HandlerProfile::Zero,
             concurrent: false,
@@ -6186,6 +8541,8 @@ mod tests {
             flow: Flow::ConsumeParallel,
             payload_bytes: 64,
             batch_options: None,
+            load: Some(rung),
+            drain: None,
         };
         let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory")
             .with_consume_topology(consume_topology);
@@ -6477,7 +8834,8 @@ mod tests {
                 handler_cost: HandlerCost::Framework.as_str().to_string(),
                 max_batch_size: None,
                 max_batch_age_ms: None,
-                throughput_msg_per_sec: 1.0,
+                throughput_msg_per_sec: drain_account(100).window_completions() as f64
+                    / drain_bound().duration_secs,
                 dispatch_p50_ms: 0.0,
                 dispatch_p95_ms: 0.0,
                 dispatch_p99_ms: 0.0,
@@ -6489,6 +8847,9 @@ mod tests {
                 cpu_pct: 0.0,
                 duration_secs: drain_bound().duration_secs,
                 setup_secs: drain_bound().setup_secs,
+                load: None,
+                method: Some(Method::Drain.as_str().to_string()),
+                drain: Some(drain_account(100)),
             }],
             failures: vec![],
             unsupported: vec![Unsupported {
@@ -6563,21 +8924,16 @@ mod tests {
         let mut run = sample_run("kafka");
         run.unsupported.clear();
         run.results.clear();
-        push_metrics(
-            &mut run.results,
-            &scenario_for(flow, handler),
-            ScenarioMetrics {
-                throughput: 1.0,
-                latencies: LatencyPercentiles::default(),
-                peak_rss_mb: 0.0,
-                cpu_pct: 0.0,
-                // A window that supports a framework claim, so a row's marker
-                // here is decided by its flow and handler rather than by a
-                // too-short drain — that gate has its own tests.
-                duration_secs: drain_bound().duration_secs,
-                setup_secs: recordable_setup(flow),
-            },
+        let scenario = scenario_for(flow, handler);
+        // A window that supports a framework claim, so a row's marker here is
+        // decided by its flow and handler rather than by a too-short drain —
+        // that gate has its own tests.
+        let metrics = metrics_for(
+            &scenario,
+            drain_bound().duration_secs,
+            recordable_setup(flow),
         );
+        push_metrics(&mut run.results, &scenario, metrics);
         run
     }
 
@@ -6648,6 +9004,10 @@ mod tests {
         let mut run = batch_run(Flow::ConsumeBatch, HandlerProfile::Zero);
         run.results[0].setup_secs = Some(6.2);
         run.results[0].duration_secs = 0.05;
+        // The drain account is re-derived against the window too; keep it
+        // consistent so the only claim under test is the marker.
+        run.results[0].throughput_msg_per_sec =
+            drain_account(100).window_completions() as f64 / 0.05;
         // What the row would have been stamped, pre-fix.
         run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
 
@@ -7210,11 +9570,13 @@ mod tests {
             assert!(obj.contains_key(field), "lost pre-existing field {field}");
         }
         // 15 pre-existing + the 3 flow/mode/payload dimensions + the
-        // handler-cost marker + the setup/drain split. The v3 batch keys are
-        // absent here — this is a `consumer_group` row, where absent means
-        // elided, not null.
-        assert_eq!(obj.len(), 20);
+        // handler-cost marker + the setup/drain split + the v6 method and
+        // drain account. The v3 batch keys are absent here — this is a
+        // `consumer_group` row, where absent means elided, not null.
+        assert_eq!(obj.len(), 22, "{:?}", obj.keys().collect::<Vec<_>>());
         assert!(obj.contains_key("handler_cost"));
+        assert_eq!(obj["method"], "drain");
+        assert!(obj.contains_key("drain"));
         // Serialized even when `None`, as an explicit `null`: a reader has to
         // be able to tell "this driver did not separate setup from drain" from
         // "this document predates the field", and an omitted key conflates
@@ -7227,7 +9589,7 @@ mod tests {
             serde_json::to_value(&batch_run(Flow::ConsumeBatch, HandlerProfile::Zero).results[0])
                 .expect("serialize");
         let batch = batch.as_object().expect("object");
-        assert_eq!(batch.len(), 22);
+        assert_eq!(batch.len(), 24);
         assert!(batch.contains_key("max_batch_size"));
         assert!(batch.contains_key("max_batch_age_ms"));
     }
@@ -7326,10 +9688,19 @@ mod tests {
         // hands them over. Capture what arrives rather than trusting the
         // plumbing.
         let configured = nz_batch(50, 125);
+        // A rung rather than a drain: a corpus this small is consumed before
+        // the barrier can pass, which the drain path refuses by design.
+        let rung = LoadRung {
+            rate_msg_per_sec: 500,
+            window_secs: 1,
+            producers: 1,
+        };
         let scenario = Scenario {
             batch_options: Some(configured),
-            messages: 10,
+            messages: rung.nominal_messages(),
             consumers: 1,
+            load: Some(rung),
+            drain: None,
             ..scenario_for(Flow::ConsumeBatch, HandlerProfile::Zero)
         };
 
@@ -7704,6 +10075,796 @@ mod tests {
         assert!(err.contains("milliseconds"), "{err}");
         // Zero stays refused too — the parser owns the whole value contract.
         assert!(Cli::try_parse_from(["stress", "--batch-max-age-ms", "0"]).is_err());
+    }
+
+    // ── Offered load ──
+
+    #[test]
+    fn load_rates_parse_sorted_deduplicated_and_refuse_zero() {
+        let RatesArg(rates) = "25000, 5000,5000,100000".parse().expect("valid ladder");
+        assert_eq!(
+            rates,
+            vec![5_000, 25_000, 100_000],
+            "ascending and deduplicated"
+        );
+        assert!(
+            "0,5000".parse::<RatesArg>().is_err(),
+            "a zero rate publishes nothing"
+        );
+        assert!("abc".parse::<RatesArg>().is_err());
+        assert!(
+            ",".parse::<RatesArg>().is_err(),
+            "an empty ladder has no rungs"
+        );
+    }
+
+    #[test]
+    fn load_flags_are_refused_where_nothing_reads_them() {
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
+        // The dependents without the ladder they shape.
+        let cli = cli_args(&["--load-window-secs", "5"]);
+        let err = select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).unwrap_err();
+        assert!(err.contains("--load-window-secs"), "{err}");
+        // `--load-producers` also sizes a drain's fill, so it is read wherever
+        // an offered-load flow is selected — and refused where none is.
+        let cli = cli_args(&["--load-producers", "2"]);
+        let scenarios = select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false)
+            .expect("the fill reads --load-producers");
+        assert!(
+            scenarios
+                .iter()
+                .filter_map(|s| s.drain)
+                .all(|d| d.producers == 2),
+            "{scenarios:?}"
+        );
+        let cli = cli_args(&["--flow", "publish-batch", "--load-producers", "2"]);
+        let err = select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).unwrap_err();
+        assert!(err.contains("--load-producers"), "{err}");
+        // The ladder with no flow that runs a paced producer.
+        let cli = cli_args(&[
+            "--flow",
+            "publish-batch,consume-fifo",
+            "--load-rates",
+            "5000",
+        ]);
+        let err = select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).unwrap_err();
+        assert!(err.contains("--load-rates"), "{err}");
+        // And accepted where a load flow is selected.
+        let cli = cli_args(&["--flow", "consumer-group", "--load-rates", "5000"]);
+        assert!(select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).is_ok());
+        // Zero is refused at parse time for both dependents.
+        assert!(Cli::try_parse_from(["stress", "--load-window-secs", "0"]).is_err());
+        assert!(Cli::try_parse_from(["stress", "--load-producers", "0"]).is_err());
+    }
+
+    #[test]
+    fn the_ladder_expands_to_one_rung_per_rate_on_load_flows_only() {
+        let cli = cli_args(&[
+            "--flow",
+            "consumer-group,consume-fifo,publish-batch",
+            "--load-rates",
+            "5000,1000",
+            "--load-window-secs",
+            "3",
+            "--load-producers",
+            "2",
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--consumers",
+            "1",
+            "--payload",
+            "64",
+        ]);
+        let scenarios = build_scenarios_cg(&cli);
+        let cell: Vec<&Scenario> = scenarios
+            .iter()
+            .filter(|s| s.flow == Flow::ConsumerGroup)
+            .collect();
+        assert_eq!(
+            cell.len(),
+            3,
+            "the cell's drain, then one scenario per rate: {scenarios:?}"
+        );
+        assert!(
+            cell[0].drain.is_some() && cell[0].load.is_none(),
+            "the drain leads the cell: {:?}",
+            cell[0]
+        );
+        assert_eq!(
+            cell[0].drain.map(|d| d.producers),
+            Some(2),
+            "the fill shares the ladder's producer count"
+        );
+        let rungs = &cell[1..];
+        assert_eq!(
+            rungs[0].load,
+            Some(LoadRung {
+                rate_msg_per_sec: 1_000,
+                window_secs: 3,
+                producers: 2,
+            }),
+            "rungs climb in ascending order"
+        );
+        assert_eq!(rungs[0].messages, 3_000, "a rung's corpus is rate × window");
+        assert!(rungs[0].drain.is_none(), "a rung is not also a drain");
+        assert_eq!(rungs[1].load.map(|l| l.rate_msg_per_sec), Some(5_000));
+        for s in scenarios.iter().filter(|s| s.flow != Flow::ConsumerGroup) {
+            assert!(
+                s.load.is_none() && s.drain.is_none(),
+                "{} takes no offered load and keeps its corpus",
+                s.flow
+            );
+        }
+        // Without the flag the flow is a single drain sized by the tier.
+        let cli = cli_args(&[
+            "--flow",
+            "consumer-group",
+            "--consumers",
+            "1",
+            "--tier",
+            "moderate",
+        ]);
+        let plain = build_scenarios_cg(&cli);
+        assert!(!plain.is_empty());
+        for s in &plain {
+            assert!(s.load.is_none(), "{s:?}");
+            assert_eq!(
+                s.drain.map(|d| d.corpus),
+                Some(s.messages),
+                "the drain's corpus is the tier's: {s:?}"
+            );
+            assert_eq!(s.method(), Some(Method::Drain));
+        }
+    }
+
+    #[test]
+    fn load_verdicts_follow_the_producer_floor_and_lag_ratio() {
+        // Producer held the rate, consumers kept up.
+        assert_eq!(
+            load_verdicts(10_000, 9_900.0, 99_000, 4_000, 4_000),
+            (false, true)
+        );
+        // Consumers left more than 5 % behind: not sustained.
+        assert_eq!(
+            load_verdicts(10_000, 9_900.0, 99_000, 6_000, 6_000),
+            (false, false)
+        );
+        // Consumers caught up by the end but fell more than 5 % behind
+        // mid-window: the backlog's residency is in the percentiles, so not
+        // sustained either.
+        assert_eq!(
+            load_verdicts(10_000, 9_900.0, 99_000, 0, 30_000),
+            (false, false)
+        );
+        // Producer under 95 % of the rate with the consumers keeping up:
+        // producer-bound, and not sustained — the consumers were not offered
+        // the rate.
+        assert_eq!(load_verdicts(10_000, 9_000.0, 90_000, 0, 0), (true, false));
+        // Producer under the rate *and* the consumers behind it: neither. The
+        // consumers were offered more than they processed, so their rate is a
+        // ceiling and the row must not be withheld as the producer's fault.
+        assert_eq!(
+            load_verdicts(10_000, 9_000.0, 90_000, 30_000, 30_000),
+            (false, false)
+        );
+        // Exactly the floor is not under it.
+        assert_eq!(load_verdicts(10_000, 9_500.0, 95_000, 0, 0), (false, true));
+    }
+
+    fn sustained_load(offered: u64, published: u64) -> LoadResult {
+        LoadResult {
+            offered_msg_per_sec: offered,
+            window_secs: 10,
+            producers: 4,
+            published,
+            published_at_window_end: published,
+            processed_at_window_end: published,
+            achieved_publish_msg_per_sec: published as f64 / 10.0,
+            lag_at_window_end: 0,
+            peak_lag: 12,
+            drain_secs: 0.01,
+            producer_bound: false,
+            sustained: true,
+        }
+    }
+
+    #[test]
+    fn validate_run_holds_a_load_account_to_its_own_numbers() {
+        let mut run = sample_run("kafka");
+        run.results[0].load = Some(sustained_load(10_000, 100_000));
+        run.results[0].method = Some(Method::OfferedLoad.as_str().to_string());
+        run.results[0].drain = None;
+        run.results[0].messages = 100_000;
+        run.results[0].duration_secs = 10.0;
+        run.results[0].throughput_msg_per_sec = 10_000.0;
+        validate_run(&run).expect("a consistent account on a consumer_group row is valid");
+
+        // `messages` must be what the producer published.
+        let mut wrong = run.clone();
+        wrong.results[0].messages = 99_999;
+        assert!(validate_run(&wrong).unwrap_err().contains("messages"));
+
+        // A verdict the numbers refute.
+        let mut wrong = run.clone();
+        wrong.results[0].load.as_mut().unwrap().sustained = false;
+        let err = validate_run(&wrong).unwrap_err();
+        assert!(err.contains("sustained=false"), "{err}");
+
+        let mut wrong = run.clone();
+        wrong.results[0].load.as_mut().unwrap().producer_bound = true;
+        assert!(validate_run(&wrong).is_err());
+
+        // A lag that is not published minus processed.
+        let mut wrong = run.clone();
+        wrong.results[0].load.as_mut().unwrap().lag_at_window_end = 1;
+        assert!(validate_run(&wrong).unwrap_err().contains("lag"));
+
+        // A flow whose driver runs no paced producer: refused at the method,
+        // before the account is even read.
+        let mut wrong = run.clone();
+        wrong.results[0].flow = Flow::DlqDrain.as_str().to_string();
+        wrong.results[0].setup_secs = None;
+        wrong.results[0].handler_cost = HandlerCost::SetupBound.as_str().to_string();
+        let err = validate_run(&wrong).unwrap_err();
+        assert!(err.contains("method"), "{err}");
+
+        // The same flow's drain row is valid without a load account.
+        let plain = sample_run("kafka");
+        validate_run(&plain).expect("a drain row carries no load account");
+    }
+
+    #[test]
+    fn a_load_account_round_trips_through_the_document() {
+        let mut run = sample_run("kafka");
+        run.results[0].load = Some(sustained_load(10_000, 100_000));
+        run.results[0].method = Some(Method::OfferedLoad.as_str().to_string());
+        run.results[0].drain = None;
+        run.results[0].messages = 100_000;
+        run.results[0].duration_secs = 10.0;
+        run.results[0].throughput_msg_per_sec = 10_000.0;
+        let json = serde_json::to_string(&run).expect("serialise");
+        assert!(json.contains("\"offered_msg_per_sec\":10000"), "{json}");
+        let back: BackendRun = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back.results[0].load, run.results[0].load);
+        // A corpus row does not carry an empty account.
+        let plain = serde_json::to_string(&sample_run("kafka")).expect("serialise");
+        assert!(!plain.contains("\"load\""), "{plain}");
+    }
+
+    #[test]
+    fn scaling_is_computed_rung_against_the_same_rung() {
+        let base = sample_run("x").results[0].clone();
+        let rung = |consumers: u16, offered: u64, throughput: f64| ScenarioResult {
+            consumers,
+            throughput_msg_per_sec: throughput,
+            load: Some(sustained_load(offered, offered * 10)),
+            messages: offered * 10,
+            ..base.clone()
+        };
+        let mut rows = vec![
+            rung(1, 5_000, 5_000.0),
+            rung(1, 50_000, 50_000.0),
+            rung(4, 50_000, 50_000.0),
+        ];
+        compute_scaling(&mut rows);
+        // The 4-consumer 50k rung is compared with the 1-consumer 50k rung,
+        // not with the 5k rung that happens to share flow, payload and tier.
+        assert_eq!(rows[2].scaling_efficiency, 1.0);
+    }
+
+    #[test]
+    fn the_ladder_gate_stops_a_cell_after_an_unsustained_rung() {
+        let rung = |rate: u64, consumers: u16| Scenario {
+            load: Some(LoadRung {
+                rate_msg_per_sec: rate,
+                window_secs: 1,
+                producers: 1,
+            }),
+            consumers,
+            ..scenario_for(Flow::ConsumerGroup, HandlerProfile::Zero)
+        };
+        let mut gate = LadderGate::default();
+        let mut metrics = dummy_metrics();
+        metrics.load = Some(LoadResult {
+            sustained: false,
+            ..sustained_load(5_000, 5_000)
+        });
+        assert!(!gate.skips(&rung(5_000, 1)));
+        gate.observe(&rung(5_000, 1), &Ok(metrics));
+        assert!(
+            gate.skips(&rung(10_000, 1)),
+            "the next rung of the same cell"
+        );
+        assert!(
+            !gate.skips(&rung(10_000, 4)),
+            "a different consumer count is another cell"
+        );
+        assert!(
+            !gate.skips(&scenario_for(Flow::ConsumerGroup, HandlerProfile::Zero)),
+            "a corpus scenario is never gated"
+        );
+        // A failed rung stops the cell too.
+        let mut gate = LadderGate::default();
+        gate.observe(&rung(5_000, 4), &Err("publish_batch: boom".to_string()));
+        assert!(gate.skips(&rung(10_000, 4)));
+        // A sustained rung lets the ladder climb.
+        let mut gate = LadderGate::default();
+        let mut ok = dummy_metrics();
+        ok.load = Some(sustained_load(5_000, 5_000));
+        gate.observe(&rung(5_000, 2), &Ok(ok));
+        assert!(!gate.skips(&rung(10_000, 2)));
+    }
+
+    /// The whole rung, end to end on the in-process backend: the paced
+    /// producer holds a rate a no-op consumer trivially sustains, so the row
+    /// must say so — with the producer's count as its corpus and the
+    /// consumers' in-window rate as its throughput.
+    #[tokio::test]
+    async fn an_offered_load_rung_reports_what_the_producer_and_consumers_did() {
+        let rung = LoadRung {
+            rate_msg_per_sec: 2_000,
+            window_secs: 1,
+            producers: 2,
+        };
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: rung.nominal_messages(),
+            consumers: 1,
+            handler: HandlerProfile::Zero,
+            concurrent: true,
+            prefetch: None,
+            flow: Flow::ConsumerGroup,
+            payload_bytes: 64,
+            batch_options: None,
+            load: Some(rung),
+            drain: None,
+        };
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
+        let cancel = CancellationToken::new();
+        let metrics = run_scenario_group(
+            &hcfg,
+            &scenario,
+            &cancel,
+            &|consumers, prefetch, _concurrent| {
+                InMemoryConsumerGroupConfig::new(consumers..=consumers)
+                    .with_prefetch_count(prefetch)
+            },
+            &|| async {
+                <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                    .await
+                    .expect("connect InMemory")
+            },
+        )
+        .await
+        .expect("rung");
+
+        let load = metrics.load.expect("a rung stamps its account");
+        assert!(!load.producer_bound, "{load:?}");
+        assert!(load.sustained, "{load:?}");
+        // The credit pacer lands on the rate to within one chunk per
+        // producer: the window closes mid-chunk at worst.
+        assert!(
+            (1_900..=2_000 + 2 * hcfg.publish_chunk_size as u64).contains(&load.published),
+            "{load:?}"
+        );
+        assert!(load.published >= load.published_at_window_end);
+        assert_eq!(
+            load.lag_at_window_end,
+            load.published_at_window_end - load.processed_at_window_end
+        );
+        assert!(metrics.duration_secs >= 1.0, "{}", metrics.duration_secs);
+        assert!(
+            (metrics.throughput - load.processed_at_window_end as f64 / metrics.duration_secs)
+                .abs()
+                < 1.0,
+            "throughput is the in-window processing rate"
+        );
+        assert!(
+            metrics.setup_secs.is_some(),
+            "the barrier still separates setup"
+        );
+        let mut results = Vec::new();
+        push_metrics(&mut results, &scenario, metrics);
+        assert_eq!(results[0].messages, load.published);
+        assert_eq!(results[0].handler_cost, HandlerCost::Framework.as_str());
+    }
+
+    /// The producer-client hook: one client is obtained per paced producer,
+    /// each is closed after the rung, and the rung still measures — here the
+    /// hook hands out clones of the driver's own in-process client, since a
+    /// fresh InMemory client would be a second, empty broker.
+    #[tokio::test]
+    async fn each_paced_producer_gets_its_own_client_and_every_client_is_closed() {
+        let shared = <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+            .await
+            .expect("connect InMemory");
+        let obtained = Arc::new(AtomicU64::new(0));
+        let hook_client = shared.clone();
+        let hook_count = obtained.clone();
+        let producer_client: ProducerClientFn<shove::InMemory> = Box::new(move || {
+            hook_count.fetch_add(1, Ordering::Relaxed);
+            let client = hook_client.clone();
+            Box::pin(async move { Ok(client) })
+        });
+        let rung = LoadRung {
+            rate_msg_per_sec: 2_000,
+            window_secs: 1,
+            producers: 3,
+        };
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: rung.nominal_messages(),
+            consumers: 1,
+            handler: HandlerProfile::Zero,
+            concurrent: true,
+            prefetch: None,
+            flow: Flow::ConsumerGroup,
+            payload_bytes: 64,
+            batch_options: None,
+            load: Some(rung),
+            drain: None,
+        };
+        let hcfg =
+            HarnessConfig::<shove::InMemory>::new("inmemory").with_producer_client(producer_client);
+        let cancel = CancellationToken::new();
+        let connect_client = shared.clone();
+        let metrics = run_scenario_group(
+            &hcfg,
+            &scenario,
+            &cancel,
+            &|consumers, prefetch, _concurrent| {
+                InMemoryConsumerGroupConfig::new(consumers..=consumers)
+                    .with_prefetch_count(prefetch)
+            },
+            &|| {
+                let client = connect_client.clone();
+                async move { client }
+            },
+        )
+        .await
+        .expect("rung");
+        assert_eq!(
+            obtained.load(Ordering::Relaxed),
+            3,
+            "one client per paced producer"
+        );
+        let load = metrics.load.expect("a rung stamps its account");
+        assert!(load.sustained, "{load:?}");
+        assert!(
+            (1_900..=2_000 + 3 * hcfg.publish_chunk_size as u64).contains(&load.published),
+            "three producers still pace the rung's total: {load:?}"
+        );
+    }
+
+    // ── Drain ──
+
+    #[test]
+    fn drain_flags_are_refused_where_nothing_reads_them() {
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
+        // The cap without the corpus it caps.
+        let cli = cli_args(&["--drain-max-bytes", "1024"]);
+        let err = select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).unwrap_err();
+        assert!(err.contains("--drain-max-bytes"), "{err}");
+        // A corpus with no flow that drains one.
+        let cli = cli_args(&["--flow", "publish-batch", "--drain-messages", "1000"]);
+        let err = select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).unwrap_err();
+        assert!(err.contains("--drain-messages"), "{err}");
+        // A cap that admits no message at a selected payload is refused, not
+        // clamped.
+        let cli = cli_args(&[
+            "--drain-messages",
+            "1000",
+            "--drain-max-bytes",
+            "32",
+            "--payload",
+            "64",
+        ]);
+        let err = select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).unwrap_err();
+        assert!(err.contains("64 B"), "{err}");
+        // And accepted where a consume flow is selected.
+        let cli = cli_args(&["--drain-messages", "1000"]);
+        assert!(select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).is_ok());
+        // Zero is refused at parse time for both.
+        assert!(Cli::try_parse_from(["stress", "--drain-messages", "0"]).is_err());
+        assert!(Cli::try_parse_from(["stress", "--drain-max-bytes", "0"]).is_err());
+    }
+
+    #[test]
+    fn a_drain_corpus_the_queue_cannot_hold_is_refused_before_the_sweep() {
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory").with_prefill_capacity(500);
+        let cli = cli_args(&["--flow", "consumer-group", "--drain-messages", "1000"]);
+        let err = select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).unwrap_err();
+        assert!(err.contains("holds at most 500"), "{err}");
+        let cli = cli_args(&["--flow", "consumer-group", "--drain-messages", "500"]);
+        assert!(select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).is_ok());
+    }
+
+    #[test]
+    fn the_byte_cap_sizes_the_drain_corpus_per_payload() {
+        let cli = cli_args(&[
+            "--flow",
+            "consumer-group",
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--consumers",
+            "1",
+            "--payload",
+            "64,1024",
+            "--drain-messages",
+            "5000",
+            "--drain-max-bytes",
+            "64000",
+        ]);
+        let corpora: Vec<(usize, u64)> = build_scenarios_cg(&cli)
+            .iter()
+            .filter_map(|s| s.drain.map(|d| (s.payload_bytes, d.corpus)))
+            .collect();
+        assert_eq!(corpora, vec![(64, 1_000), (1_024, 62)]);
+        assert_eq!(DrainPlan::capped_corpus(5_000, 64_000, 0), 0);
+    }
+
+    #[test]
+    fn a_drain_tracker_counts_unique_completions_exactly_and_faults_on_foreign_ids() {
+        // 70 is not a multiple of 64, so the last word is a partial one.
+        let tracker = DrainTracker::new(70).expect("bitmap");
+        assert_eq!(tracker.end_target(), 63);
+        for id in 0..62 {
+            tracker.record(id);
+        }
+        assert_eq!(tracker.unique(), 62);
+        assert!(tracker.closed_at().is_none(), "the window is still open");
+        tracker.record(5);
+        assert_eq!(tracker.unique(), 62, "a redelivery is not a completion");
+        tracker.record(62);
+        assert_eq!(tracker.unique(), 63);
+        assert!(
+            tracker.closed_at().is_some(),
+            "crossing the end target closes the window"
+        );
+        for id in 63..70 {
+            tracker.record(id);
+        }
+        assert_eq!(tracker.unique(), 70);
+        assert!(tracker.fault().is_none());
+        tracker.record(70);
+        assert_eq!(
+            tracker.fault(),
+            Some(70),
+            "an id outside the corpus is a fault"
+        );
+        assert_eq!(tracker.unique(), 70);
+    }
+
+    #[test]
+    fn validate_run_holds_a_drain_account_to_its_own_numbers() {
+        let run = sample_run("kafka");
+        validate_run(&run).expect("a consistent drain row is valid");
+        fn d(run: &mut BackendRun) -> &mut DrainResult {
+            run.results[0].drain.as_mut().expect("drain account")
+        }
+
+        let mut wrong = run.clone();
+        wrong.results[0].messages = 99;
+        assert!(validate_run(&wrong).unwrap_err().contains("messages"));
+
+        let mut wrong = run.clone();
+        d(&mut wrong).published = 99;
+        assert!(
+            validate_run(&wrong)
+                .unwrap_err()
+                .contains("did not publish")
+        );
+
+        let mut wrong = run.clone();
+        d(&mut wrong).unique_final = 99;
+        assert!(
+            validate_run(&wrong)
+                .unwrap_err()
+                .contains("did not complete")
+        );
+
+        let mut wrong = run.clone();
+        d(&mut wrong).unique_at_end = 80;
+        assert!(validate_run(&wrong).unwrap_err().contains("end target"));
+
+        let mut wrong = run.clone();
+        d(&mut wrong).unique_at_start = 50;
+        assert!(
+            validate_run(&wrong)
+                .unwrap_err()
+                .contains("already consumed")
+        );
+
+        let mut wrong = run.clone();
+        d(&mut wrong).deliveries = 105;
+        assert!(validate_run(&wrong).unwrap_err().contains("duplicates"));
+
+        let mut wrong = run.clone();
+        d(&mut wrong).fill_secs = 0.0;
+        assert!(validate_run(&wrong).unwrap_err().contains("fill time"));
+
+        let mut wrong = run.clone();
+        wrong.results[0].throughput_msg_per_sec *= 1.05;
+        let err = validate_run(&wrong).unwrap_err();
+        assert!(err.contains("derives a rate"), "{err}");
+
+        // The method and the account must agree.
+        let mut wrong = run.clone();
+        wrong.results[0].method = Some(Method::OfferedLoad.as_str().to_string());
+        let err = validate_run(&wrong).unwrap_err();
+        assert!(err.contains("disagrees"), "{err}");
+        let mut wrong = run.clone();
+        wrong.results[0].method = None;
+        let err = validate_run(&wrong).unwrap_err();
+        assert!(err.contains("no method"), "{err}");
+        let mut wrong = run.clone();
+        wrong.results[0].method = Some("guesswork".to_string());
+        let err = validate_run(&wrong).unwrap_err();
+        assert!(err.contains("unknown method"), "{err}");
+
+        // A flow measured one way only carries neither.
+        let mut wrong = run.clone();
+        wrong.results[0].flow = Flow::Broadcast.as_str().to_string();
+        let err = validate_run(&wrong).unwrap_err();
+        assert!(err.contains("only the offered-load flows"), "{err}");
+    }
+
+    #[test]
+    fn a_failure_records_the_method_it_was_attempting() {
+        let mut failures = Vec::new();
+        push_failure(
+            &mut failures,
+            &scenario_for(Flow::ConsumerGroup, HandlerProfile::Zero),
+            "boom".to_string(),
+        );
+        push_failure(
+            &mut failures,
+            &Scenario {
+                load: Some(LoadRung {
+                    rate_msg_per_sec: 5_000,
+                    window_secs: 10,
+                    producers: 4,
+                }),
+                drain: None,
+                ..scenario_for(Flow::ConsumeParallel, HandlerProfile::Zero)
+            },
+            "boom".to_string(),
+        );
+        push_failure(
+            &mut failures,
+            &scenario_for(Flow::PublishBatch, HandlerProfile::Zero),
+            "boom".to_string(),
+        );
+        assert_eq!(failures[0].method.as_deref(), Some("drain"));
+        assert_eq!(failures[1].method.as_deref(), Some("offered_load"));
+        assert_eq!(failures[2].method, None);
+        let mut run = sample_run("kafka");
+        run.failures = failures;
+        validate_run(&run).expect("failures with their methods are valid");
+        run.failures[0].method = None;
+        let err = validate_run(&run).unwrap_err();
+        assert!(
+            err.contains("failure") && err.contains("no method"),
+            "{err}"
+        );
+    }
+
+    /// The whole drain, end to end on the in-process backend: the corpus is
+    /// in the queue before the group exists, the window opens at the barrier
+    /// with part of the corpus already consumed, closes at the end target,
+    /// and the row's counts add up. A sleeping handler keeps the drain
+    /// slower than the barrier's cadence, so the window is a real slice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_drain_measures_the_slice_between_the_barrier_and_the_end_target() {
+        let corpus = 400;
+        let scenario = Scenario {
+            messages: corpus,
+            consumers: 1,
+            concurrent: false,
+            // One message in flight at a time: in-process concurrency follows
+            // the prefetch, and a hundred sleeping handlers at once would
+            // empty the corpus before the barrier's next check.
+            prefetch: Some(1),
+            drain: Some(DrainPlan {
+                corpus,
+                producers: 2,
+            }),
+            ..scenario_for(Flow::ConsumerGroup, HandlerProfile::Fast)
+        };
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
+        let cancel = CancellationToken::new();
+        let metrics = run_scenario_group(
+            &hcfg,
+            &scenario,
+            &cancel,
+            &|consumers, prefetch, _concurrent| {
+                InMemoryConsumerGroupConfig::new(consumers..=consumers)
+                    .with_prefetch_count(prefetch)
+            },
+            &|| async {
+                <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                    .await
+                    .expect("connect InMemory")
+            },
+        )
+        .await
+        .expect("drain");
+
+        let d = metrics.drain.expect("a drain stamps its account");
+        assert_eq!(d.corpus, corpus);
+        assert_eq!(d.published, corpus, "the fill published the whole corpus");
+        assert_eq!(d.producers, 2);
+        assert!(d.fill_secs > 0.0);
+        assert_eq!(d.unique_final, corpus);
+        assert_eq!(d.unique_at_end, DrainPlan::end_target(corpus));
+        assert!(
+            d.unique_at_start < DrainPlan::max_start(corpus),
+            "the barrier passed before half the corpus was gone: {d:?}"
+        );
+        assert_eq!(d.deliveries, corpus, "in-process delivery is exactly once");
+        assert_eq!(d.duplicates, 0);
+        assert!(metrics.load.is_none());
+        assert_eq!(
+            metrics.latencies.dispatch_p99, 0.0,
+            "a drain records no percentiles: they would be backlog residency, and recording \
+             them is harness work inside the window"
+        );
+        assert!(metrics.duration_secs > 0.0);
+        assert!(
+            (metrics.throughput - d.window_completions() as f64 / metrics.duration_secs).abs()
+                < 1e-6,
+            "throughput is the window's completions over the window"
+        );
+        assert!(metrics.setup_secs.is_some(), "the barrier separates setup");
+
+        let mut results = Vec::new();
+        push_metrics(&mut results, &scenario, metrics);
+        assert_eq!(results[0].messages, corpus);
+        assert_eq!(results[0].method.as_deref(), Some("drain"));
+        let mut run = sample_run("inmemory");
+        run.results = results;
+        validate_run(&run).expect("the row the driver wrote validates");
+    }
+
+    /// A corpus a no-op consumer empties before the barrier can pass is not
+    /// measured: the diagnostic names the count and the remedy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_drain_mostly_consumed_before_the_barrier_is_refused() {
+        let corpus = 200;
+        let scenario = Scenario {
+            messages: corpus,
+            consumers: 1,
+            drain: Some(DrainPlan {
+                corpus,
+                producers: 1,
+            }),
+            ..scenario_for(Flow::ConsumerGroup, HandlerProfile::Zero)
+        };
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
+        let cancel = CancellationToken::new();
+        let err = run_scenario_group(
+            &hcfg,
+            &scenario,
+            &cancel,
+            &|consumers, prefetch, _concurrent| {
+                InMemoryConsumerGroupConfig::new(consumers..=consumers)
+                    .with_prefetch_count(prefetch)
+            },
+            &|| async {
+                <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                    .await
+                    .expect("connect InMemory")
+            },
+        )
+        .await
+        .err()
+        .expect("a drain emptied during the barrier is not a measurement");
+        assert!(err.contains("already consumed"), "{err}");
+        assert!(err.contains("--drain-messages"), "{err}");
     }
 
     // ── Container lifetime ──────────────────────────────────────────────
