@@ -16,23 +16,20 @@ measured" note for it instead of a plotted series.
 
 How drain rate scales with consumer count, per backend.
 
-<img alt="Throughput vs consumer count, per backend" className="vocs_Logo vocs_Logo_logoLight" src="/bench/throughput-vs-consumers.svg" />
-<img alt="Throughput vs consumer count, per backend" className="vocs_Logo vocs_Logo_logoDark" src="/bench/throughput-vs-consumers-dark.svg" />
+![Throughput vs consumer count, per backend](/bench/throughput-vs-consumers-dark.svg)
 
 ### Throughput vs payload size
 
 The cost of moving 64 B, 1 KiB and 64 KiB messages through the same flow.
 
-<img alt="Throughput vs payload size, per backend" className="vocs_Logo vocs_Logo_logoLight" src="/bench/throughput-vs-payload.svg" />
-<img alt="Throughput vs payload size, per backend" className="vocs_Logo vocs_Logo_logoDark" src="/bench/throughput-vs-payload-dark.svg" />
+![Throughput vs payload size, per backend](/bench/throughput-vs-payload-dark.svg)
 
 ### Parallel vs sequenced
 
 What ordering costs: the same workload consumed in parallel and through
 sequenced (FIFO) delivery.
 
-<img alt="Parallel vs sequenced throughput, per backend" className="vocs_Logo vocs_Logo_logoLight" src="/bench/parallel-vs-sequenced.svg" />
-<img alt="Parallel vs sequenced throughput, per backend" className="vocs_Logo vocs_Logo_logoDark" src="/bench/parallel-vs-sequenced-dark.svg" />
+![Parallel vs sequenced throughput, per backend](/bench/parallel-vs-sequenced-dark.svg)
 
 ### Dispatch latency
 
@@ -41,16 +38,14 @@ cannot support the claim, the chart refuses on its face instead of plotting a
 misleading number — the accounting for each backend is rendered in the chart
 itself.
 
-<img alt="Dispatch latency percentiles, per backend" className="vocs_Logo vocs_Logo_logoLight" src="/bench/dispatch-latency.svg" />
-<img alt="Dispatch latency percentiles, per backend" className="vocs_Logo vocs_Logo_logoDark" src="/bench/dispatch-latency-dark.svg" />
+![Dispatch latency percentiles, per backend](/bench/dispatch-latency-dark.svg)
 
 ### Framework overhead
 
 What shove itself costs, in nanoseconds per message per flow — measured on the
 in-process backend so no broker round-trip is included.
 
-<img alt="Framework overhead per flow, nanoseconds per message" className="vocs_Logo vocs_Logo_logoLight" src="/bench/framework-overhead.svg" />
-<img alt="Framework overhead per flow, nanoseconds per message" className="vocs_Logo vocs_Logo_logoDark" src="/bench/framework-overhead-dark.svg" />
+![Framework overhead per flow, nanoseconds per message](/bench/framework-overhead-dark.svg)
 
 ## The throughput levers
 

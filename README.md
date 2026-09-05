@@ -111,9 +111,9 @@ Benchmarked across all six backends. The charts are generated from a committed
 results document — never hand-copied — and each one carries its own provenance
 (shove version, generation date, hardware) in the caption.
 
-![Throughput vs consumer count, per backend](https://raw.githubusercontent.com/zannis/shove/main/docs/public/bench/throughput-vs-consumers.svg)
+![Throughput vs consumer count, per backend](https://raw.githubusercontent.com/zannis/shove/main/docs/public/bench/throughput-vs-consumers-dark.svg)
 
-![Framework overhead per flow, nanoseconds per message](https://raw.githubusercontent.com/zannis/shove/main/docs/public/bench/framework-overhead.svg)
+![Framework overhead per flow, nanoseconds per message](https://raw.githubusercontent.com/zannis/shove/main/docs/public/bench/framework-overhead-dark.svg)
 
 Throughput vs payload size, the cost of sequenced ordering, and dispatch latency
 percentiles: [Performance](https://shove.rs/ops/performance). Reproduce with
