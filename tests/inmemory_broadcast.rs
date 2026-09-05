@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -472,6 +473,216 @@ async fn a_second_subscription_to_the_same_topic_is_refused() {
     let _ = subscriber
         .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(2))
         .await;
+}
+
+/// Tracks how many handler invocations overlap, and the highest overlap seen.
+/// The 25ms hold is what turns "spawned concurrently" into an observable
+/// overlap rather than a race the assertion might miss.
+#[derive(Clone)]
+struct ConcurrencyProbe {
+    current: Arc<AtomicUsize>,
+    max_seen: Arc<AtomicUsize>,
+    delivered: Arc<AtomicUsize>,
+}
+
+impl ConcurrencyProbe {
+    fn new() -> Self {
+        Self {
+            current: Arc::new(AtomicUsize::new(0)),
+            max_seen: Arc::new(AtomicUsize::new(0)),
+            delivered: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl MessageHandler<CacheInvalidations> for ConcurrencyProbe {
+    type Context = ();
+    async fn handle(&self, _msg: Invalidate, _meta: MessageMetadata, _ctx: &()) -> Outcome {
+        let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_seen.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        self.current.fetch_sub(1, Ordering::SeqCst);
+        self.delivered.fetch_add(1, Ordering::SeqCst);
+        Outcome::Ack
+    }
+}
+
+/// Poll until `done()` holds, failing the test after ~5s. The broadcast
+/// delivery loop runs on its own task, so tests observe it by waiting, not by
+/// joining.
+async fn wait_until(what: &str, done: impl Fn() -> bool) {
+    for _ in 0..500 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// A broadcast subscription is one delivery loop: messages are handled one at
+/// a time, never `prefetch_count` at a time. NATS and Redis are structurally
+/// serial; this pins the same contract on the backend that reads
+/// `prefetch_count` — with the *default* options, which is where the
+/// divergence lived.
+#[tokio::test]
+async fn default_options_deliver_one_message_at_a_time() {
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    let publisher = broker.publisher().await.expect("publisher");
+
+    let probe = ConcurrencyProbe::new();
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<CacheInvalidations, _>(probe.clone(), ConsumerOptions::new())
+        .expect("subscribe");
+    wait_for_subscribers(&client, "cache-invalidations-bcast", 1).await;
+
+    for key in 1..=6u64 {
+        publisher
+            .publish::<CacheInvalidations>(&Invalidate { key })
+            .await
+            .expect("publish");
+    }
+    let delivered = Arc::clone(&probe.delivered);
+    wait_until("all 6 deliveries", || delivered.load(Ordering::SeqCst) == 6).await;
+
+    subscriber.cancellation_token().cancel();
+    let _ = subscriber
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(2))
+        .await;
+
+    assert_eq!(
+        probe.max_seen.load(Ordering::SeqCst),
+        1,
+        "a broadcast subscription with default options must process messages \
+         one at a time"
+    );
+}
+
+/// Asking for more concurrency must not grant it: `with_prefetch_count` /
+/// `with_concurrent_processing` are overridden by `subscribe`, the same way
+/// `with_max_retries` already is. One reader per process is the primitive's
+/// whole point.
+#[tokio::test]
+async fn with_prefetch_count_cannot_raise_broadcast_concurrency() {
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    let publisher = broker.publisher().await.expect("publisher");
+
+    let probe = ConcurrencyProbe::new();
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<CacheInvalidations, _>(
+            probe.clone(),
+            ConsumerOptions::new()
+                .with_prefetch_count(10)
+                .with_concurrent_processing(true),
+        )
+        .expect("subscribe");
+    wait_for_subscribers(&client, "cache-invalidations-bcast", 1).await;
+
+    for key in 1..=6u64 {
+        publisher
+            .publish::<CacheInvalidations>(&Invalidate { key })
+            .await
+            .expect("publish");
+    }
+    let delivered = Arc::clone(&probe.delivered);
+    wait_until("all 6 deliveries", || delivered.load(Ordering::SeqCst) == 6).await;
+
+    subscriber.cancellation_token().cancel();
+    let _ = subscriber
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(2))
+        .await;
+
+    assert_eq!(
+        probe.max_seen.load(Ordering::SeqCst),
+        1,
+        "an explicit prefetch of 10 must not raise a broadcast subscription's \
+         effective concurrency above 1"
+    );
+}
+
+/// Records delivery order; parks on the first delivery of key 1 until the test
+/// releases it, then defers that delivery once. Everything else is acked.
+#[derive(Clone)]
+struct DeferFirstOnce {
+    order: Arc<Mutex<Vec<u64>>>,
+    released: Arc<AtomicBool>,
+    deferred: Arc<AtomicBool>,
+}
+
+impl DeferFirstOnce {
+    fn new() -> Self {
+        Self {
+            order: Arc::new(Mutex::new(Vec::new())),
+            released: Arc::new(AtomicBool::new(false)),
+            deferred: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl MessageHandler<CacheInvalidations> for DeferFirstOnce {
+    type Context = ();
+    async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _ctx: &()) -> Outcome {
+        self.order.lock().expect("order lock").push(msg.key);
+        if msg.key == 1 && !self.deferred.swap(true, Ordering::SeqCst) {
+            // Hold the delivery slot until the test has published the whole
+            // backlog, so the Defer verifiably has messages behind it.
+            while !self.released.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            return Outcome::Defer;
+        }
+        Outcome::Ack
+    }
+}
+
+/// The documented `Defer` contract (docs/pages/concepts/broadcast.mdx): "a
+/// deferred message is retried **in place**, holding up the messages behind
+/// it". NATS, Redis and Kafka redeliver the same message in-loop before
+/// anything behind it; this pins InMemory to the same order, so a test written
+/// against the test substrate reproduces production ordering.
+#[tokio::test]
+async fn a_deferred_message_is_retried_in_place_before_those_behind_it() {
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    let publisher = broker.publisher().await.expect("publisher");
+
+    let handler = DeferFirstOnce::new();
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<CacheInvalidations, _>(handler.clone(), ConsumerOptions::new())
+        .expect("subscribe");
+    wait_for_subscribers(&client, "cache-invalidations-bcast", 1).await;
+
+    for key in 1..=3u64 {
+        publisher
+            .publish::<CacheInvalidations>(&Invalidate { key })
+            .await
+            .expect("publish");
+    }
+    // 2 and 3 are now buffered behind 1. Let the parked handler defer.
+    handler.released.store(true, Ordering::SeqCst);
+
+    let order = Arc::clone(&handler.order);
+    wait_until("all 4 deliveries (1 deferred once, then 1, 2, 3)", || {
+        order.lock().expect("order lock").len() == 4
+    })
+    .await;
+
+    subscriber.cancellation_token().cancel();
+    let _ = subscriber
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(2))
+        .await;
+
+    assert_eq!(
+        handler.order.lock().expect("order lock").clone(),
+        vec![1, 1, 2, 3],
+        "a deferred broadcast message is retried in place — redelivered before \
+         the messages that were already buffered behind it"
+    );
 }
 
 /// AC8 at the wire level rather than the name level: an ordinary topology still
