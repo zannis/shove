@@ -28,8 +28,8 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::kafka::apache::{self, Kafka as KafkaImage};
 
 use harness::{
-    BatchConsumeFn, ConsumeTopologyFn, DlqDrainFn, HarnessConfig, ReadinessProbeFn,
-    StressTestTopic, run_all_scenarios,
+    BatchConsumeFn, ConsumeTopologyFn, DlqDrainFn, HarnessConfig, ProducerClientFn,
+    ReadinessProbeFn, StressTestTopic, run_all_scenarios,
 };
 
 /// Image tag started by `testcontainers_modules::kafka::apache` (its pinned
@@ -257,10 +257,6 @@ async fn main() {
         })
     });
 
-    // This harness only wires `batch_consume` for Kafka — InMemory also
-    // implements `run_batch` now, but the stress harness's batch scenario
-    // support has not been extended to it, which is why `consume_batch`
-    // lands in every other backend's `unsupported[]` instead of being faked.
     // The harness invokes it once per scenario consumer; each invocation is
     // an independent group member.
     let batch_consume: BatchConsumeFn<Kafka> = Box::new(|client, handler, opts, stop| {
@@ -334,8 +330,22 @@ async fn main() {
         })
     });
 
+    // Each paced producer on its own connection: a Kafka publisher is bounded
+    // by its client's single producer instance, so clones of one publisher
+    // cannot offer the top of the ladder (see `ProducerClientFn`).
+    let producer_bootstrap = bootstrap.clone();
+    let producer_client: ProducerClientFn<Kafka> = Box::new(move || {
+        let bootstrap = producer_bootstrap.clone();
+        Box::pin(async move {
+            <Kafka as Backend>::connect(KafkaConfig::new(&bootstrap))
+                .await
+                .map_err(|e| format!("connect producer client: {e}"))
+        })
+    });
+
     let hcfg = HarnessConfig::<Kafka>::new("kafka")
         .with_purge(purge)
+        .with_producer_client(producer_client)
         .with_broker("Apache Kafka", KAFKA_VERSION, "docker single-node (KRaft)")
         .with_dlq_drain(dlq_drain)
         .with_batch_consume(batch_consume)
