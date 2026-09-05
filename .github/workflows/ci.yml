@@ -225,7 +225,10 @@ jobs:
             features: rabbitmq,audit,rabbitmq-transactional,metrics,sbe,inmemory
           - name: aws-sns-sqs
             # Asserted by `metrics_sqs_sequenced`.
-            features: pub-aws-sns,aws-sns-sqs,audit,metrics,sbe
+            # `inmemory` makes tests/bench_harness_sqs.rs (gated on
+            # aws-sns-sqs+inmemory, for the same reason the Kafka bridge is)
+            # executable here — see the `kafka` entry below.
+            features: pub-aws-sns,aws-sns-sqs,audit,metrics,sbe,inmemory
           - name: nats
             # Asserted by `metrics_nats_failall` and
             # `metrics_nats_failall_no_dlq`. `env-config` runs

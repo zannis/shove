@@ -1216,7 +1216,12 @@ fn flow_list(flows: &[Flow]) -> String {
         .join(", ")
 }
 
-fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scenario> {
+fn build_scenarios(
+    cli: &Cli,
+    default_flow: Flow,
+    fifo_workers: u16,
+    batch_size_cap: Option<NonZeroUsize>,
+) -> Vec<Scenario> {
     let handlers: Vec<HandlerProfile> = match cli.handler {
         HandlerArg::Zero => vec![HandlerProfile::Zero],
         HandlerArg::Fast => vec![HandlerProfile::Fast],
@@ -1241,9 +1246,15 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
 
     // CLI-invariant, so derived once here with the other CLI bindings: the
     // knobs every `consume_batch` scenario runs with (and stamps on its row).
+    // The backend's cap lands here, at the single point of construction, so
+    // the driver and the row are handed the same already-effective value —
+    // see [`HarnessConfig::batch_size_cap`] for why not in the closure.
     let defaults = BatchOptions::default();
     let batch_options = BatchOptions {
-        max_batch_size: cli.batch_max_size.unwrap_or(defaults.max_batch_size),
+        max_batch_size: cli
+            .batch_max_size
+            .unwrap_or(defaults.max_batch_size)
+            .min(batch_size_cap.unwrap_or(NonZeroUsize::MAX)),
         max_batch_age_ms: cli.batch_max_age_ms.unwrap_or(defaults.max_batch_age_ms),
     };
 
@@ -2107,6 +2118,18 @@ pub struct HarnessConfig<B: Backend> {
     pub backend_name: &'static str,
     /// Upper bound for computed default prefetch (e.g. SQS caps at 10).
     pub prefetch_cap: u16,
+    /// Upper bound on a `consume_batch` scenario's `max_batch_size`, where the
+    /// backend's batch primitive refuses anything larger. `None` for the
+    /// backends that accept the harness's cross-backend sizes as-is.
+    ///
+    /// Applied in [`build_scenarios`], not by the wrapper's own
+    /// `BatchConsumeFn`: the scenario's [`BatchOptions`] are what the driver
+    /// runs *and* what the result row records, so clamping at construction is
+    /// what keeps those two from claiming different batch sizes. Clamping in
+    /// the closure instead would run a 10-message batch under a row saying
+    /// 500 — a chart silently comparing unequal batches, which is the whole
+    /// thing this exists to prevent.
+    pub batch_size_cap: Option<NonZeroUsize>,
     /// Maximum batch size for `publish_batch` (some backends have SDK limits).
     pub publish_chunk_size: usize,
     /// Drain the main queue between scenarios.
@@ -2150,6 +2173,7 @@ impl<B: Backend> HarnessConfig<B> {
         Self {
             backend_name,
             prefetch_cap: 100,
+            batch_size_cap: None,
             publish_chunk_size: 1000,
             purge: noop_purge(),
             broker: BrokerInfo {
@@ -2177,6 +2201,15 @@ impl<B: Backend> HarnessConfig<B> {
 
     pub fn with_prefetch_cap(mut self, cap: u16) -> Self {
         self.prefetch_cap = cap;
+        self
+    }
+
+    /// See [`HarnessConfig::batch_size_cap`]. A bench-harness-only accommodation:
+    /// the backend's own refusal stays exactly as shipped, and it is this
+    /// harness — whose scenario sizes are shared across six backends — that
+    /// has to fit itself to the smallest of them.
+    pub fn with_batch_size_cap(mut self, cap: NonZeroUsize) -> Self {
+        self.batch_size_cap = Some(cap);
         self
     }
 
@@ -6396,6 +6429,41 @@ fn refused_drain_capacity<B: Backend>(
         })
 }
 
+/// The operator-facing half of [`HarnessConfig::batch_size_cap`]: the sweep is
+/// about to run a smaller batch than the invocation asked for, so say the
+/// number and say who imposed it.
+///
+/// A note, not a refusal, and deliberately so — the cap is the harness fitting
+/// its cross-backend scenario sizes to the smallest backend, not the operator
+/// making a mistake. An unflagged run hits it too (shove's cross-backend
+/// default of 500 exceeds SQS's 10), so refusing would mean no SQS batch
+/// measurement at all, which is exactly the hole this wiring closes.
+///
+/// Silent when the flow will not run: `skip` being `Some` means the row it
+/// would describe is never written.
+fn clamped_batch_size_note(
+    cli: &Cli,
+    selected: &[Flow],
+    cap: Option<NonZeroUsize>,
+    skip: Option<&str>,
+) -> Option<String> {
+    let cap = cap?;
+    if !selected.contains(&Flow::ConsumeBatch) || skip.is_some() {
+        return None;
+    }
+    let requested = cli
+        .batch_max_size
+        .unwrap_or(BatchOptions::default().max_batch_size);
+    (requested > cap).then(|| {
+        format!(
+            "note: consume-batch runs at max_batch_size {cap}, not {requested} — this \
+             backend's batch primitive refuses anything larger, and the harness clamps \
+             rather than skip the flow. The result rows record {cap}, the size that ran; \
+             a chart comparing them against another backend is comparing unequal batches."
+        )
+    })
+}
+
 /// Build, capability-filter, and guard the scenario list — the one selection
 /// step every entry point goes through, so no runner can wire the flows in
 /// while forgetting the flag guards. `Err` is a refusal to run at all.
@@ -6417,7 +6485,7 @@ fn select_scenarios<B: Backend>(
     }
     let scenarios = filter_scenarios(
         hcfg,
-        build_scenarios(cli, default_flow, hcfg.fifo_workers),
+        build_scenarios(cli, default_flow, hcfg.fifo_workers, hcfg.batch_size_cap),
         supervisor_only,
     );
     if let Some(reason) = refused_drain_capacity(hcfg, &scenarios) {
@@ -6425,6 +6493,11 @@ fn select_scenarios<B: Backend>(
     }
     let skip = skip_reason(hcfg, Flow::ConsumeBatch, supervisor_only);
     if let Some(note) = inert_batch_flags_note(cli, &selected, skip.as_deref()) {
+        eprintln!("{note}");
+    }
+    if let Some(note) =
+        clamped_batch_size_note(cli, &selected, hcfg.batch_size_cap, skip.as_deref())
+    {
         eprintln!("{note}");
     }
     if let Some(path) = cli.results_file.as_deref()
@@ -6755,7 +6828,7 @@ mod tests {
     /// [`build_scenarios`] with the coordinated-group entry point's default
     /// flow, which is what every pre-existing test in this module assumed.
     fn build_scenarios_cg(cli: &Cli) -> Vec<Scenario> {
-        build_scenarios(cli, Flow::ConsumerGroup, SEQ_SHARDS)
+        build_scenarios(cli, Flow::ConsumerGroup, SEQ_SHARDS, None)
     }
 
     // ── Pre-existing scenario-sizing tests ──
@@ -7025,9 +7098,9 @@ mod tests {
         // The group entry point defaults to consumer_group, the supervisor
         // entry point to supervisor — each is what its harness measured
         // before flows were a dimension.
-        let group = build_scenarios(&c, Flow::ConsumerGroup, SEQ_SHARDS);
+        let group = build_scenarios(&c, Flow::ConsumerGroup, SEQ_SHARDS, None);
         assert!(group.iter().all(|s| s.flow == Flow::ConsumerGroup));
-        let sup = build_scenarios(&c, Flow::Supervisor, SEQ_SHARDS);
+        let sup = build_scenarios(&c, Flow::Supervisor, SEQ_SHARDS, None);
         assert!(sup.iter().all(|s| s.flow == Flow::Supervisor));
     }
 
@@ -7041,14 +7114,14 @@ mod tests {
 
         let group = filter_scenarios(
             &hcfg,
-            build_scenarios(&c, Flow::ConsumerGroup, SEQ_SHARDS),
+            build_scenarios(&c, Flow::ConsumerGroup, SEQ_SHARDS, None),
             false,
         );
         assert!(!group.is_empty(), "group default filtered to nothing");
 
         let sup = filter_scenarios(
             &hcfg,
-            build_scenarios(&c, Flow::Supervisor, SEQ_SHARDS),
+            build_scenarios(&c, Flow::Supervisor, SEQ_SHARDS, None),
             true,
         );
         assert!(!sup.is_empty(), "supervisor default filtered to nothing");
@@ -7176,6 +7249,7 @@ mod tests {
             ]),
             Flow::ConsumerGroup,
             1,
+            None,
         );
         assert_eq!(scenarios.len(), 1);
         assert_eq!(scenarios[0].consumers, 1);
@@ -10003,6 +10077,109 @@ mod tests {
         assert_eq!(
             inert_batch_flags_note(&bare, &bare_selected, skip.as_deref()),
             None
+        );
+    }
+
+    #[test]
+    fn the_backends_batch_size_cap_reaches_the_row_that_records_it() {
+        // The whole point of capping at construction rather than inside the
+        // wrapper's closure: `run_scenario_batch` hands the driver
+        // `scenario.batch_options` and `push_result` stamps the row from the
+        // same field, so a capped scenario cannot run one size while claiming
+        // another. Asserted on the scenario, which is that single field.
+        let cli = cli_args(&[
+            "--flow",
+            "consume-batch",
+            "--batch-max-size",
+            "500",
+            "--batch-max-age-ms",
+            "125",
+        ]);
+        let cap = NonZeroUsize::new(10).expect("non-zero");
+
+        let capped = build_scenarios(&cli, Flow::Supervisor, SEQ_SHARDS, Some(cap));
+        let batch: Vec<_> = capped
+            .iter()
+            .filter(|s| s.flow == Flow::ConsumeBatch)
+            .collect();
+        assert!(!batch.is_empty(), "no consume-batch scenario was built");
+        for s in &batch {
+            let opts = s.batch_options.expect("a batch scenario carries options");
+            assert_eq!(opts.max_batch_size, cap);
+            // Only the size is capped — the age is a client-side flush timer
+            // with no broker limit behind it, so clamping it would be the
+            // harness inventing a constraint.
+            assert_eq!(opts.max_batch_age_ms.get(), 125);
+        }
+
+        // No cap → the requested size, unchanged. Without this the assertion
+        // above would also pass on a harness that capped every backend to 10.
+        let uncapped = build_scenarios(&cli, Flow::Supervisor, SEQ_SHARDS, None);
+        let opts = uncapped
+            .iter()
+            .find(|s| s.flow == Flow::ConsumeBatch)
+            .and_then(|s| s.batch_options)
+            .expect("a batch scenario carries options");
+        assert_eq!(opts.max_batch_size.get(), 500);
+
+        // A request already under the cap is left alone rather than raised to
+        // it: the cap is a ceiling, not a size.
+        let small = cli_args(&["--flow", "consume-batch", "--batch-max-size", "4"]);
+        let opts = build_scenarios(&small, Flow::Supervisor, SEQ_SHARDS, Some(cap))
+            .iter()
+            .find(|s| s.flow == Flow::ConsumeBatch)
+            .and_then(|s| s.batch_options)
+            .expect("a batch scenario carries options");
+        assert_eq!(opts.max_batch_size.get(), 4);
+    }
+
+    #[test]
+    fn a_capped_batch_size_is_announced_only_when_the_flow_will_run() {
+        let cap = NonZeroUsize::new(10).expect("non-zero");
+        let cli = cli_args(&["--flow", "consume-batch", "--batch-max-size", "500"]);
+        let selected = selected_flows(&cli, Flow::Supervisor);
+
+        // Capped, flow runs → the operator is told both numbers, so a row
+        // reading 10 under a `--batch-max-size 500` invocation is explained
+        // where it happens rather than in a results file read later.
+        let note = clamped_batch_size_note(&cli, &selected, Some(cap), None)
+            .expect("a bitten cap must be announced");
+        assert!(note.contains("10"), "{note}");
+        assert!(note.contains("500"), "{note}");
+
+        // Uncapped backend, or a cap the request never reaches → nothing to
+        // say. The clamp is silent precisely when it changed nothing.
+        assert_eq!(clamped_batch_size_note(&cli, &selected, None, None), None);
+        let big = NonZeroUsize::new(5_000).expect("non-zero");
+        assert_eq!(
+            clamped_batch_size_note(&cli, &selected, Some(big), None),
+            None
+        );
+
+        // Flow dropped on this backend → the note would describe a row that
+        // is never written; `inert_batch_flags_note` already covers that case.
+        assert_eq!(
+            clamped_batch_size_note(&cli, &selected, Some(cap), Some("unsupported: no closure")),
+            None
+        );
+
+        // Flow not selected at all.
+        let other = cli_args(&["--flow", "consumer-group"]);
+        let other_selected = selected_flows(&other, Flow::ConsumerGroup);
+        assert_eq!(
+            clamped_batch_size_note(&other, &other_selected, Some(cap), None),
+            None
+        );
+
+        // An unflagged invocation is capped too — shove's cross-backend
+        // default exceeds SQS's 10 — so the note fires with no flag passed.
+        let bare = cli_args(&["--flow", "consume-batch"]);
+        let bare_selected = selected_flows(&bare, Flow::Supervisor);
+        let note = clamped_batch_size_note(&bare, &bare_selected, Some(cap), None)
+            .expect("the default size is above the cap, so it is clamped too");
+        assert!(
+            note.contains(&BatchOptions::default().max_batch_size.to_string()),
+            "{note}"
         );
     }
 
