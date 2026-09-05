@@ -219,7 +219,10 @@ jobs:
           # installed each call is a no-op, so no entry gets materially slower.
           - name: rabbitmq
             # Asserted by `metrics_rabbitmq_sequenced`.
-            features: rabbitmq,audit,rabbitmq-transactional,metrics,sbe
+            # `inmemory` makes tests/bench_harness_rabbitmq.rs (gated on
+            # rabbitmq+inmemory, for the same reason the Kafka bridge is)
+            # executable here — see the `kafka` entry below.
+            features: rabbitmq,audit,rabbitmq-transactional,metrics,sbe,inmemory
           - name: aws-sns-sqs
             # Asserted by `metrics_sqs_sequenced`.
             features: pub-aws-sns,aws-sns-sqs,audit,metrics,sbe
@@ -227,7 +230,10 @@ jobs:
             # Asserted by `metrics_nats_failall` and
             # `metrics_nats_failall_no_dlq`. `env-config` runs
             # `topology::nats_env_config_tests` (NatsStreamConfig::from_env).
-            features: nats,audit,metrics,sbe,env-config
+            # `inmemory` makes tests/bench_harness_nats.rs (gated on
+            # nats+inmemory, for the same reason the Kafka bridge is)
+            # executable here — see the `kafka` entry below.
+            features: nats,audit,metrics,sbe,env-config,inmemory
           - name: kafka
             # kafka-msk-iam + test-support compile and run the MSK IAM tests,
             # including the OAUTHBEARER admin integration test (local Kafka
@@ -273,7 +279,10 @@ jobs:
           - name: redis-streams
             # Asserted by `metrics_redis_sequenced`, `metrics_redis_malformed`,
             # `metrics_redis_failall` and `metrics_redis_failall_no_dlq`.
-            features: redis-streams,metrics,sbe
+            # `inmemory` makes tests/bench_harness_redis.rs (gated on
+            # redis-streams+inmemory, for the same reason the Kafka bridge is)
+            # executable here — see the `kafka` entry above.
+            features: redis-streams,metrics,sbe,inmemory
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - if: startsWith(matrix.name, 'kafka')

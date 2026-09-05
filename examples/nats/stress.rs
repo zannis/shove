@@ -9,14 +9,17 @@
 #[path = "../common/stress_test.rs"]
 mod harness;
 
+use std::time::Duration;
+
 use async_nats::jetstream;
+use shove::batch_consumer::BatchConsumerOptions;
 use shove::nats::{NatsConfig, NatsConsumer, NatsConsumerGroupConfig};
-use shove::{Backend, Nats};
+use shove::{Backend, Broker, Nats};
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::nats::{Nats as NatsImage, NatsServerCmd};
 
-use harness::{DlqDrainFn, HarnessConfig, StressTestTopic, run_all_scenarios};
+use harness::{BatchConsumeFn, DlqDrainFn, HarnessConfig, StressTestTopic, run_all_scenarios};
 
 /// Image tag started by `testcontainers_modules::nats` (its pinned default),
 /// recorded in the
@@ -92,10 +95,31 @@ async fn main() {
         })
     });
 
+    // The harness invokes it once per scenario consumer; every invocation
+    // attaches to the same durable pull consumer for the stream, so N
+    // invocations compete for one corpus like N group members. That needs no
+    // topology adjustment — where Kafka has to be declared with a partition
+    // per consumer before a second member can be assigned any work, a
+    // JetStream durable hands its next pull to whichever attached client asks.
+    let batch_consume: BatchConsumeFn<Nats> = Box::new(|client, handler, opts, stop| {
+        Box::pin(async move {
+            Broker::<Nats>::from_client(client)
+                .batch_consumer()
+                .run::<StressTestTopic, _>(
+                    handler,
+                    (),
+                    batch_consumer_options(opts).with_shutdown(stop),
+                )
+                .await
+                .map_err(|e| format!("run_batch: {e}"))
+        })
+    });
+
     let hcfg = HarnessConfig::<Nats>::new("nats")
         .with_purge(purge)
         .with_broker("NATS JetStream", NATS_VERSION, "docker single-node")
-        .with_dlq_drain(dlq_drain);
+        .with_dlq_drain(dlq_drain)
+        .with_batch_consume(batch_consume);
     run_all_scenarios(
         hcfg,
         || {
@@ -115,6 +139,19 @@ async fn main() {
     .await;
 }
 
+/// Map the scenario's batch knobs onto shove's [`BatchConsumerOptions`].
+///
+/// Named (rather than inlined in the closure) so a test can prove the CLI
+/// values end up inside `BatchConsumerOptions` instead of being parsed and
+/// dropped. Everything except the two mapped fields stays at shove's
+/// defaults — the scenario's knobs are handed to the primitive, never
+/// re-derived here.
+fn batch_consumer_options(opts: harness::BatchOptions) -> BatchConsumerOptions<Nats> {
+    BatchConsumerOptions::new()
+        .with_max_batch_size(opts.max_batch_size.get())
+        .with_max_batch_age(Duration::from_millis(opts.max_batch_age_ms.get()))
+}
+
 /// Block until JetStream is accepting requests. Testcontainers exits
 /// `.start()` once nats-server logs that it's listening, but JetStream
 /// initialization can lag a few hundred ms behind. Issuing an account-info
@@ -132,5 +169,29 @@ async fn wait_until_ready(url: &str) {
             panic!("NATS JetStream did not become ready within 30s");
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+// Example targets default to `test = false`, so this module only runs via
+// tests/bench_harness_nats.rs, which pulls this file into a real test target.
+#[cfg(test)]
+mod tests {
+    use std::num::{NonZeroU64, NonZeroUsize};
+
+    use super::*;
+
+    #[test]
+    fn the_cli_batch_knobs_reach_batch_consumer_options() {
+        // The end of the knob's journey: CLI → `Scenario.batch_options` →
+        // `BatchConsumeFn` (both proven in the harness tests) → here, into the
+        // `BatchConsumerOptions` handed to the generic batch consumer. Read
+        // back through shove's getters, not inferred from the builder calls.
+        let opts = harness::BatchOptions {
+            max_batch_size: NonZeroUsize::new(50).expect("non-zero"),
+            max_batch_age_ms: NonZeroU64::new(125).expect("non-zero"),
+        };
+        let mapped = batch_consumer_options(opts);
+        assert_eq!(mapped.max_batch_size(), 50);
+        assert_eq!(mapped.max_batch_age(), Duration::from_millis(125));
     }
 }
