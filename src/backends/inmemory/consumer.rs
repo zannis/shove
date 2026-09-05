@@ -18,6 +18,7 @@ use crate::backend::batch_consumer::{
     BatchConsumerOptionsInner, BatchSettlement, PREALLOC_CAP, batch_redelivery_backoff,
     invoke_batch_handler, next_redelivery_delay, settle_batch_outcome,
 };
+use crate::backend::broadcast::BROADCAST_DEFER_DELAY;
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
@@ -1128,7 +1129,35 @@ async fn route_outcome(
             .await
             .map(|env| (env, fail_reason))
         }
+        // A broadcast `Defer` is retried in place, as on every real backend:
+        // Kafka, NATS and Redis all hand the same message back to the handler
+        // after `BROADCAST_DEFER_DELAY`, before anything queued behind it.
+        // The wait happens right here in the (single, pinned) delivery slot
+        // rather than on a spawned task — the blocking is the documented
+        // contract, not a cost. `requeue_front` rather than `enqueue`: the
+        // deferred message must stay ahead of the backlog, and this consumer
+        // is the only task draining the buffer, so waiting for capacity here
+        // would deadlock against itself. A shutdown token cutting the sleep
+        // still requeues: the private buffer dies with the subscription, so
+        // requeue and drop are the same destruction, and nothing was counted
+        // that would owe a discard log.
+        RetryDecision::Hold { increment: false } if topology.broadcast() => {
+            let mut env = env;
+            env.mark_redelivery();
+            tokio::select! {
+                _ = tokio::time::sleep(BROADCAST_DEFER_DELAY) => {}
+                _ = options.shutdown.cancelled() => {}
+                _ = broker.shutdown_token().cancelled() => {}
+            }
+            broker.requeue_front(source.queue, vec![env]).await;
+            None
+        }
         RetryDecision::Hold { increment } => {
+            // For a broadcast topology this arm is production-unreachable
+            // (`increment: true` needs a retry budget, and `subscribe` pins
+            // `max_retries` to 0), so `schedule_redelivery`'s broadcast target
+            // arm now only serves that defensive case — kept, with its
+            // teardown pinned by `unsubscribe_cancels_a_blocked_broadcast_redelivery`.
             schedule_redelivery(
                 broker,
                 topology,
