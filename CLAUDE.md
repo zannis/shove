@@ -60,11 +60,11 @@ surprises.
   plus an SNS subscription whose lifecycle shove does not manage, and a leaked
   queue costs money forever.
 - `HasBatchConsumption` gates `Broker::batch_consumer` /
-  `BatchConsumer<B>::run`. Kafka and InMemory implement it today; every other
-  backend is pending, not excluded — each gets the capability the moment its
-  own `BatchConsumerImpl` lands. The primitive exists for **handler
-  amortisation** (one flush per N messages instead of one call per message),
-  nothing else.
+  `BatchConsumer<B>::run`. Kafka, InMemory, Redis and RabbitMQ implement it
+  today; every other backend is pending, not excluded — each gets the
+  capability the moment its own `BatchConsumerImpl` lands. The primitive exists for
+  **handler amortisation** (one flush per N messages instead of one call per
+  message), nothing else.
 
 The trait's own doc comment is the authoritative per-backend list — update it
 there rather than restating the table in a third place.
@@ -107,6 +107,19 @@ there rather than restating the table in a third place.
   empty and report green having run nothing. (CI's `check` job uses
   `cargo test --no-default-features` — the same set; this repo's convention is
   `cargo nextest run`.)
+- **Benchmarks**: `scripts/bench.sh <backend>` runs the pinned matrix for one
+  backend into `benches/results/bench-results.json`, and `scripts/bench.sh
+  charts` regenerates the SVGs and runs the byte-compare test. The runbook is
+  `benches/README.md`; the matrix lives only in the script's `MATRIX` array.
+  The consume flows are measured two ways, and every row and failure of
+  those flows records which (`method`): a **drain** (`--drain-messages`), the
+  corpus published before any consumer starts and the rate measured from the
+  readiness barrier to nine tenths consumed with no producer in the window,
+  which is the throughput ceiling the charts publish; and the **offered-load
+  ladder** (`--load-rates`), a paced producer holding a rate while the
+  consumers run, which is where the dispatch-latency percentiles come from.
+  A drain row carries a `drain` account, a rung a `load` account, and on
+  neither is `throughput_msg_per_sec` a corpus over a whole drain.
 - **In-memory tests, still Docker-free**:
   `cargo nextest run --features inmemory,metrics,sbe,env-config` — the CI
   `coverage` matrix's `inmemory` feature set (authoritative copy in

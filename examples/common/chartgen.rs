@@ -27,8 +27,10 @@
 //!
 //! ## Every chart ships as a light/dark pair
 //!
-//! Each family renders twice — `<name>.svg` and `<name>-dark.svg` — from one
-//! render path parameterized by [`Mode`]. Both variants paint their own
+//! Each chart renders twice — `<name>.svg` and `<name>-dark.svg` — from one
+//! render path parameterized by [`Mode`]. The families that slice on a single
+//! payload also render once per larger payload as a `-<payload>` sibling
+//! ([`Chart`]); the unsuffixed file is always the 64 B headline. Both variants paint their own
 //! surface, so each file is self-contained on *any* page: the light file
 //! stays legible on crates.io (light-only) and docs.rs's dark theme alike,
 //! and the dark sibling exists for surfaces that can select it — GitHub's
@@ -64,7 +66,92 @@ use serde::Deserialize;
 /// prior version's throughput values are not drain rates and must never share
 /// an axis with v4 numbers. A chart is exactly the artifact where that goes
 /// unnoticed.
-pub const SCHEMA_VERSION: u32 = 4;
+///
+/// v5 added the optional `load` account to the consume rows that ran under
+/// the harness's offered-load ladder (`--load-rates`). On those rows the
+/// throughput is the consumers' processing rate while a paced producer held
+/// a fixed rate, not a corpus over a drain, and a v4 consume row's number was
+/// bounded by one sequential publisher racing the drain — so the two
+/// versions' consume rates are not comparable either.
+///
+/// v6 made the method explicit: every row and every `failures[]` entry of
+/// the offered-load flows carries `method` (`drain` or `offered_load`), and
+/// the live-publish corpus path those flows ran without `--load-rates` is
+/// gone — a v6 row without a `load` account is a **drain**, a corpus
+/// published before the consumers started and measured from the readiness
+/// barrier to nine tenths consumed, with no producer in the window. A v5
+/// row without a `load` account was the live-publish corpus, and nothing on
+/// it says so, which is why v5 is refused rather than read as v6.
+pub const SCHEMA_VERSION: u32 = 6;
+
+/// The flows whose driver measures by method — a drain or the offered-load
+/// ladder — the harness's `Flow::takes_offered_load`, mirrored. A `method`,
+/// `load` or `drain` on any other flow is a row the harness cannot write.
+pub const LOAD_FLOWS: &[&str] = &[
+    "consumer_group",
+    "consume_parallel",
+    "consume_batch",
+    "supervisor",
+];
+
+/// How a row of a [`LOAD_FLOWS`] flow was measured — the schema's closed
+/// `method` set. Rows of different methods never share an absolute axis: the
+/// throughput charts publish the [`LOAD_FLOWS`] cells from drain rows only,
+/// since a rung's window contains the harness's own producer; rungs feed the
+/// dispatch-latency chart alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    /// One rung of the offered-load ladder: a paced producer held a rate
+    /// while the consumers ran.
+    OfferedLoad,
+    /// A corpus published before the consumers started, measured from the
+    /// readiness barrier until nine tenths of it had been consumed.
+    Drain,
+}
+
+impl Method {
+    fn parse(s: &str) -> Option<Method> {
+        match s {
+            "drain" => Some(Method::Drain),
+            "offered_load" => Some(Method::OfferedLoad),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Method::Drain => "drain",
+            Method::OfferedLoad => "offered_load",
+        }
+    }
+}
+
+/// The harness's `DRAIN_TAIL_DIVISOR`, mirrored: a drain's window closes at
+/// `corpus − corpus / 10` unique completions.
+pub const DRAIN_TAIL_DIVISOR: u64 = 10;
+/// The harness's `DRAIN_MAX_START_DIVISOR`, mirrored: a drain whose window
+/// opened with `corpus / 2` or more already consumed is not a row the
+/// harness writes.
+pub const DRAIN_MAX_START_DIVISOR: u64 = 2;
+/// The harness's `RATE_TOLERANCE`, mirrored: floating-point slack between a
+/// row's rates and the ones its own counts and window derive. The harness
+/// writes the exact quotient and the document's decimal text round-trips an
+/// `f64` exactly, so this is not room for a claim to drift.
+pub const RATE_TOLERANCE: f64 = 1e-9;
+
+/// Whether a claimed rate is the derived one, to [`RATE_TOLERANCE`]. The
+/// absolute floor lets a rate of zero match itself.
+fn rate_matches(claimed: f64, derived: f64) -> bool {
+    claimed.is_finite() && (claimed - derived).abs() <= (RATE_TOLERANCE * derived).max(1e-9)
+}
+
+/// The harness's `LOAD_PRODUCER_FLOOR`, mirrored: under this share of the
+/// offered rate the producer did not hold it.
+pub const LOAD_PRODUCER_FLOOR: f64 = 0.95;
+/// The harness's `LOAD_SUSTAINED_MAX_LAG_RATIO`, mirrored: above this share
+/// of the window's published messages left unprocessed, the rung is not
+/// `sustained`.
+pub const LOAD_SUSTAINED_MAX_LAG_RATIO: f64 = 0.05;
 
 /// The closed `handler_cost` set from the schema contract — what a row's
 /// `throughput_msg_per_sec` is a measurement *of*.
@@ -272,6 +359,17 @@ pub struct FailedRow {
     pub handler: String,
     #[serde(default)]
     pub error: String,
+    /// The method the failed cell was attempting — present on every
+    /// [`LOAD_FLOWS`] failure, so a failed *drain* is known to be one and
+    /// the cell's sustained rung is not plotted in its place.
+    #[serde(default)]
+    pub method: Option<String>,
+}
+
+impl FailedRow {
+    fn method(&self) -> Option<Method> {
+        self.method.as_deref().and_then(Method::parse)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -280,6 +378,11 @@ pub struct ScenarioResult {
     pub mode: String,
     pub payload_bytes: u64,
     pub consumers: u32,
+    /// The row's message count — a drain's corpus, a rung's published total.
+    /// Read so the account's own count can be held to it. `default` for the
+    /// version-gate reason.
+    #[serde(default)]
+    pub messages: u64,
     #[serde(default)]
     pub handler: String,
     /// What `throughput_msg_per_sec` measures — one of [`HANDLER_COSTS`].
@@ -316,12 +419,200 @@ pub struct ScenarioResult {
     /// [`validate`].
     #[serde(default)]
     pub duration_secs: Option<f64>,
+    /// The offered-load account, on a row that ran one rung of the ladder.
+    /// Read for two rules: a `producer_bound` rung never publishes a rate
+    /// (the consumers were not offered the rate the row names), and only a
+    /// `sustained` rung's dispatch percentiles are latency rather than queue
+    /// residency.
+    #[serde(default)]
+    pub load: Option<LoadAccount>,
+    /// Publish → handler-entry percentiles. Published only off a sustained
+    /// offered-load rung — see [`Family::DispatchLatency`].
+    #[serde(default)]
+    pub dispatch_p50_ms: f64,
+    #[serde(default)]
+    pub dispatch_p95_ms: f64,
+    #[serde(default)]
+    pub dispatch_p99_ms: f64,
+    /// How the row was measured — one of [`Method`]'s spellings — present on
+    /// every [`LOAD_FLOWS`] row and absent everywhere else. The account the
+    /// row carries must agree with it. `default` for the version-gate
+    /// reason; a v6 [`LOAD_FLOWS`] row without one is refused by [`validate`].
+    #[serde(default)]
+    pub method: Option<String>,
+    /// The drain account, on a `drain` row — see [`DrainAccount`].
+    #[serde(default)]
+    pub drain: Option<DrainAccount>,
+}
+
+/// What a drain measured — the harness's `DrainResult`. Observed counts
+/// only; every identity between them is re-derived by [`validate`].
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+pub struct DrainAccount {
+    pub corpus: u64,
+    pub published: u64,
+    pub fill_secs: f64,
+    pub producers: u32,
+    pub unique_at_start: u64,
+    pub unique_at_end: u64,
+    pub unique_final: u64,
+    pub deliveries: u64,
+    pub duplicates: u64,
+}
+
+impl DrainAccount {
+    /// The unique completions inside the measured window — the row's
+    /// throughput numerator.
+    fn window_completions(&self) -> u64 {
+        self.unique_at_end.saturating_sub(self.unique_at_start)
+    }
+
+    /// Every identity a drain account states, checked against its own fields.
+    /// `Err` names the first one that fails.
+    fn check(
+        &self,
+        messages_hint: Option<u64>,
+        throughput: f64,
+        window_secs: f64,
+    ) -> Result<(), String> {
+        if self.corpus == 0 || self.producers == 0 {
+            return Err("a drain account names an empty corpus or no fill producer".to_string());
+        }
+        if let Some(messages) = messages_hint
+            && messages != self.corpus
+        {
+            return Err("a drain account's corpus is not the row's messages".to_string());
+        }
+        if self.published != self.corpus || self.unique_final != self.corpus {
+            return Err(
+                "a drain account records a fill or a drain that did not cover the corpus"
+                    .to_string(),
+            );
+        }
+        if self.unique_at_end != self.corpus.saturating_sub(self.corpus / DRAIN_TAIL_DIVISOR) {
+            return Err(
+                "a drain account closed its window at a count other than the end target"
+                    .to_string(),
+            );
+        }
+        if self.unique_at_start >= self.corpus / DRAIN_MAX_START_DIVISOR
+            || self.unique_at_start >= self.unique_at_end
+        {
+            return Err(
+                "a drain account opened its window with too much of the corpus already consumed"
+                    .to_string(),
+            );
+        }
+        if self.deliveries.checked_sub(self.unique_final) != Some(self.duplicates) {
+            return Err(
+                "a drain account's duplicates are not deliveries minus unique completions"
+                    .to_string(),
+            );
+        }
+        if !(self.fill_secs.is_finite() && self.fill_secs > 0.0) {
+            return Err("a drain account's fill time is not a finite positive number".to_string());
+        }
+        if !(window_secs.is_finite() && window_secs > 0.0) {
+            return Err("a drain row has no positive window".to_string());
+        }
+        let derived = self.window_completions() as f64 / window_secs;
+        if !rate_matches(throughput, derived) {
+            return Err(format!(
+                "a drain row claims {throughput:.1} msg/s where its account derives {derived:.1}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// What an offered-load rung measured — the harness's `LoadResult`, read for
+/// the fields the charts and their validation need. Every field a verdict
+/// derives from travels with the verdict, so [`validate`] re-derives both
+/// rather than trusting them.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+pub struct LoadAccount {
+    pub offered_msg_per_sec: u64,
+    /// The rung's nominal window; the row's measured window is at least this,
+    /// since the window closes only after it has elapsed.
+    #[serde(default)]
+    pub window_secs: u64,
+    /// Paced producer tasks.
+    #[serde(default)]
+    pub producers: u32,
+    /// Seconds the consumers took to clear the residual backlog after the
+    /// producers stopped.
+    #[serde(default)]
+    pub drain_secs: f64,
+    pub achieved_publish_msg_per_sec: f64,
+    pub published: u64,
+    pub published_at_window_end: u64,
+    pub processed_at_window_end: u64,
+    pub lag_at_window_end: u64,
+    /// The worst backlog inside the window. Held to the same bound as the
+    /// end lag: a backlog cleared by the end still spent its residency in
+    /// the dispatch percentiles.
+    #[serde(default)]
+    pub peak_lag: u64,
+    pub producer_bound: bool,
+    pub sustained: bool,
+}
+
+impl LoadAccount {
+    /// `(producer_bound, sustained)` as the harness derives them.
+    /// Sustained needs the producer to have held the rate and the consumers to
+    /// have kept up; producer-bound is the shortfall with the consumers keeping
+    /// up. A shortfall with a consumer backlog is neither — the consumers' rate
+    /// is a real ceiling and publishes.
+    fn verdicts(&self) -> (bool, bool) {
+        let producer_held_rate = self.achieved_publish_msg_per_sec
+            >= LOAD_PRODUCER_FLOOR * self.offered_msg_per_sec as f64;
+        let max_lag = LOAD_SUSTAINED_MAX_LAG_RATIO * self.published_at_window_end as f64;
+        let consumers_kept_up =
+            self.lag_at_window_end as f64 <= max_lag && self.peak_lag as f64 <= max_lag;
+        (
+            !producer_held_rate && consumers_kept_up,
+            producer_held_rate && consumers_kept_up,
+        )
+    }
 }
 
 impl ScenarioResult {
-    /// Whether this row's throughput may be published as an absolute value.
+    /// Whether this row's throughput may be published as an absolute value:
+    /// the harness certified the window as shove's own cost, and — on an
+    /// offered-load rung — the producer actually offered the rate. A
+    /// producer-bound rung's processing rate is the producer's ceiling, not
+    /// the consumers', so it publishes nothing.
     fn is_framework(&self) -> bool {
-        self.handler_cost == COST_FRAMEWORK
+        self.handler_cost == COST_FRAMEWORK && !self.is_producer_bound()
+    }
+
+    /// The row's recorded method, on a [`LOAD_FLOWS`] row.
+    fn method(&self) -> Option<Method> {
+        self.method.as_deref().and_then(Method::parse)
+    }
+
+    /// Whether this row belongs on an absolute-throughput axis at all: a
+    /// [`LOAD_FLOWS`] row only as a drain, since a rung's window contains the
+    /// harness's own producer; a row of any other flow has one method.
+    fn is_charted_method(&self) -> bool {
+        !LOAD_FLOWS.contains(&self.flow.as_str()) || self.method() == Some(Method::Drain)
+    }
+
+    /// [`Self::is_framework`] on a chartable method — the one predicate
+    /// every absolute-throughput family plots by.
+    fn is_publishable(&self) -> bool {
+        self.is_framework() && self.is_charted_method()
+    }
+
+    /// An offered-load rung whose producer fell short of the offered rate.
+    fn is_producer_bound(&self) -> bool {
+        self.load.is_some_and(|l| l.producer_bound)
+    }
+
+    /// An offered-load rung the consumers kept up with — the only row whose
+    /// dispatch percentiles measure latency rather than backlog.
+    fn is_sustained_load(&self) -> bool {
+        self.load.is_some_and(|l| l.sustained)
     }
 
     /// Whether the window is long enough for the rate to be published at all
@@ -697,6 +988,142 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
             {
                 return malformed("a non-batch row carries batch knobs");
             }
+            // The method: present exactly on the offered-load flows, and the
+            // account the row carries must be the one its method names —
+            // a drain row with a load account, or a rung without one, is a
+            // row the harness cannot write.
+            let method = match (LOAD_FLOWS.contains(&row.flow.as_str()), &row.method) {
+                (true, Some(m)) => match Method::parse(m) {
+                    Some(method) => Some(method),
+                    None => return malformed(&format!("`{m}` is not a method the schema knows")),
+                },
+                (true, None) => {
+                    return malformed(
+                        "a consume row records no method; every row of these flows says whether \
+                         it was a drain or a rung",
+                    );
+                }
+                (false, None) => None,
+                (false, Some(m)) => {
+                    return malformed(&format!(
+                        "`{}` is measured one way only, so its rows cannot carry method `{m}`",
+                        row.flow
+                    ));
+                }
+            };
+            match (method, row.load.is_some(), row.drain.is_some()) {
+                (None, false, false)
+                | (Some(Method::OfferedLoad), true, false)
+                | (Some(Method::Drain), false, true) => {}
+                (method, load, drain) => {
+                    return malformed(&format!(
+                        "method {} disagrees with the account the row carries (load: {load}, \
+                         drain: {drain})",
+                        method.map_or("absent", Method::as_str)
+                    ));
+                }
+            }
+            if let Some(drain) = &row.drain
+                && let Err(what) = drain.check(
+                    Some(row.messages),
+                    row.throughput_msg_per_sec,
+                    row.duration_secs.unwrap_or(0.0),
+                )
+            {
+                return malformed(&what);
+            }
+            // The offered-load account: only a ladder flow can carry one,
+            // its counts must add up, and both verdicts must be what its own
+            // numbers derive — a `sustained` the lag refutes would publish
+            // backlog residency as latency.
+            if let Some(load) = &row.load {
+                if !LOAD_FLOWS.contains(&row.flow.as_str()) {
+                    return malformed(&format!(
+                        "`{}` runs no paced producer, so its rows cannot carry a load account",
+                        row.flow
+                    ));
+                }
+                if load.offered_msg_per_sec == 0 || load.window_secs == 0 || load.producers == 0 {
+                    return malformed(
+                        "a load account names a rung with a zero rate, window or producer \
+                         count, which no run can have",
+                    );
+                }
+                if !(load.drain_secs.is_finite() && load.drain_secs >= 0.0) {
+                    return malformed(
+                        "a load account's drain time is not a finite non-negative number",
+                    );
+                }
+                if !(load.achieved_publish_msg_per_sec.is_finite()
+                    && load.achieved_publish_msg_per_sec >= 0.0)
+                {
+                    return malformed(
+                        "a load account's achieved publish rate is not a finite non-negative number",
+                    );
+                }
+                if load.published != load.published_at_window_end
+                    || load.processed_at_window_end > load.published_at_window_end
+                    || load.peak_lag < load.lag_at_window_end
+                    || load.peak_lag > load.published_at_window_end
+                    || load.lag_at_window_end
+                        != load
+                            .published_at_window_end
+                            .saturating_sub(load.processed_at_window_end)
+                {
+                    return malformed("a load account's counts do not add up");
+                }
+                if row.messages != load.published {
+                    return malformed("a load account's published total is not the row's messages");
+                }
+                // Both rates are re-derived from the counts and the window: a
+                // claimed rate the counts refute would publish a number no
+                // recorded observation supports.
+                let window_secs = row.duration_secs.unwrap_or(0.0);
+                if !(window_secs.is_finite() && window_secs > 0.0) {
+                    return malformed("an offered-load row has no positive window");
+                }
+                if window_secs < load.window_secs as f64 {
+                    return malformed(
+                        "an offered-load row's measured window is shorter than the rung's \
+                         nominal window, which closes only after the nominal one has elapsed",
+                    );
+                }
+                let achieved = load.published_at_window_end as f64 / window_secs;
+                if !rate_matches(load.achieved_publish_msg_per_sec, achieved) {
+                    return malformed(&format!(
+                        "a load account claims an achieved publish rate of {:.1} msg/s where its \
+                         counts derive {achieved:.1}",
+                        load.achieved_publish_msg_per_sec
+                    ));
+                }
+                let throughput = load.processed_at_window_end as f64 / window_secs;
+                if !rate_matches(row.throughput_msg_per_sec, throughput) {
+                    return malformed(&format!(
+                        "an offered-load row claims {:.1} msg/s where its account derives \
+                         {throughput:.1}",
+                        row.throughput_msg_per_sec
+                    ));
+                }
+                let (producer_bound, sustained) = load.verdicts();
+                if load.producer_bound != producer_bound || load.sustained != sustained {
+                    return malformed(&format!(
+                        "a load account claims producer_bound={} sustained={} where its own \
+                         numbers derive producer_bound={producer_bound} sustained={sustained}",
+                        load.producer_bound, load.sustained
+                    ));
+                }
+                for (what, v) in [
+                    ("dispatch_p50_ms", row.dispatch_p50_ms),
+                    ("dispatch_p95_ms", row.dispatch_p95_ms),
+                    ("dispatch_p99_ms", row.dispatch_p99_ms),
+                ] {
+                    if !(v.is_finite() && v >= 0.0) {
+                        return malformed(&format!(
+                            "{what} on an offered-load row is not a finite non-negative number"
+                        ));
+                    }
+                }
+            }
         }
         // The unsupported[] invariants the writer also enforces: a blank
         // reason renders an unexplained absence, and a flow both measured
@@ -715,6 +1142,38 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
                         f.payload_bytes, PAYLOAD_SIZES
                     ),
                 });
+            }
+            // A failed cell of a method-measured flow says which method it
+            // was attempting: without that, a failed drain is
+            // indistinguishable from a failed rung and the cell's other
+            // method would be plotted in its place.
+            match (LOAD_FLOWS.contains(&f.flow.as_str()), &f.method) {
+                (true, Some(m)) if Method::parse(m).is_none() => {
+                    return Err(ChartError::MalformedRow {
+                        backend: run.backend.clone(),
+                        flow: f.flow.clone(),
+                        what: format!("a failures[] entry with unknown method `{m}`"),
+                    });
+                }
+                (true, None) => {
+                    return Err(ChartError::MalformedRow {
+                        backend: run.backend.clone(),
+                        flow: f.flow.clone(),
+                        what: "a failures[] entry of a consume flow that records no method"
+                            .to_string(),
+                    });
+                }
+                (false, Some(m)) => {
+                    return Err(ChartError::MalformedRow {
+                        backend: run.backend.clone(),
+                        flow: f.flow.clone(),
+                        what: format!(
+                            "a failures[] entry carrying method `{m}` on a flow measured one \
+                             way only"
+                        ),
+                    });
+                }
+                _ => {}
             }
             // A failed cell ran under a profile too, and the provenance line
             // has to name it; blank or unknown is refused like a row's.
@@ -859,14 +1318,26 @@ impl Family {
     /// `-dark` sibling, matching how every other themed asset in
     /// `docs/public/` names its pair.
     pub fn filename(self, mode: Mode) -> String {
-        let stem = match self {
+        Chart::headline(self).filename(mode)
+    }
+
+    fn stem(self) -> &'static str {
+        match self {
             Self::ThroughputVsConsumers => "throughput-vs-consumers",
             Self::ThroughputVsPayload => "throughput-vs-payload",
             Self::ParallelVsSequenced => "parallel-vs-sequenced",
             Self::DispatchLatency => "dispatch-latency",
             Self::FrameworkOverhead => "framework-overhead",
-        };
-        format!("{stem}{}.svg", mode.file_suffix())
+        }
+    }
+
+    /// Whether the family slices on one payload and so renders a variant per
+    /// harness payload. See [`Chart`].
+    pub fn sweeps_payload(self) -> bool {
+        matches!(
+            self,
+            Self::ThroughputVsConsumers | Self::ParallelVsSequenced | Self::DispatchLatency
+        )
     }
 
     pub fn title(self) -> &'static str {
@@ -877,6 +1348,60 @@ impl Family {
             Self::DispatchLatency => "Dispatch latency percentiles",
             Self::FrameworkOverhead => "Framework overhead per message",
         }
+    }
+}
+
+/// One emitted chart: a family at one payload. The payload-axis family and
+/// the in-process overhead family only ever render at the headline payload —
+/// one sweeps payload itself, the other measures a fixed per-message cost —
+/// so [`Chart::all`] carries a single entry for each of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Chart {
+    pub family: Family,
+    pub payload: u64,
+}
+
+impl Chart {
+    /// The family's headline chart, at [`HEADLINE_PAYLOAD`].
+    pub fn headline(family: Family) -> Self {
+        Self {
+            family,
+            payload: HEADLINE_PAYLOAD,
+        }
+    }
+
+    /// Every chart, in generation order: the five headline charts first (the
+    /// files the docs embed, in [`Family::ALL`] order), then the payload
+    /// variants, smallest payload first. Fixed and total over
+    /// [`PAYLOAD_SIZES`], so a new harness payload becomes a new set of files
+    /// here and nowhere else.
+    pub fn all() -> Vec<Self> {
+        let mut charts: Vec<Self> = Family::ALL.into_iter().map(Self::headline).collect();
+        for &payload in PAYLOAD_SIZES.iter().filter(|&&p| p != HEADLINE_PAYLOAD) {
+            charts.extend(
+                Family::ALL
+                    .into_iter()
+                    .filter(|f| f.sweeps_payload())
+                    .map(|family| Self { family, payload }),
+            );
+        }
+        charts
+    }
+
+    /// The headline chart keeps the family's stable filename; a variant
+    /// carries its payload as a lowercase, unit-suffixed stem suffix
+    /// (`-1kib`, `-64kib`) ahead of the mode suffix.
+    pub fn filename(self, mode: Mode) -> String {
+        let stem = self.family.stem();
+        let payload = if self.payload == HEADLINE_PAYLOAD {
+            String::new()
+        } else {
+            format!(
+                "-{}",
+                fmt_payload(self.payload).replace(' ', "").to_lowercase()
+            )
+        };
+        format!("{stem}{payload}{}.svg", mode.file_suffix())
     }
 }
 
@@ -1192,6 +1717,12 @@ enum WithheldKind {
     SetupBound,
     /// Only sleeping-handler rows: the number is the simulated sleep.
     HandlerBound,
+    /// This cell's drain failed: its rungs, whatever they sustained, are not
+    /// its ceiling.
+    DrainFailed,
+    /// The cell has offered-load rungs and no drain row: a rung's window
+    /// contains the harness's own producer, so none of them is a ceiling.
+    RungsOnly,
     /// The harness ran the cell and recorded a failure for it.
     Failed,
     /// No row and no recorded failure for this category — a gap, not a
@@ -1208,6 +1739,15 @@ impl WithheldKind {
             Self::SetupBound => "setup-bound (window includes coordination cost)".to_string(),
             Self::HandlerBound => {
                 "sleeping-handler rows only (the number is the simulated sleep)".to_string()
+            }
+            Self::DrainFailed => format!(
+                "{} (a failed drain; the cell's ladder rungs are not its ceiling)",
+                failed_text()
+            ),
+            Self::RungsOnly => {
+                "offered-load rungs only (a rung's window contains the harness's own producer, \
+                 so it is not a ceiling; no drain row)"
+                    .to_string()
             }
             Self::Failed => failed_text().to_string(),
             Self::Gap => gap_text().to_string(),
@@ -1655,7 +2195,10 @@ fn notes_for(doc: &Document, presences: &BTreeMap<String, Presence>, x_desc: &st
             Presence::WithheldOnly(withheld) => {
                 // A backend whose only presence is failures did not measure
                 // anything; "measured, but" would be the wrong prefix.
-                if withheld.iter().all(|w| w.kind == WithheldKind::Failed) {
+                if withheld
+                    .iter()
+                    .all(|w| matches!(w.kind, WithheldKind::Failed | WithheldKind::DrainFailed))
+                {
                     notes.push(format!(
                         "{backend}: {}",
                         describe_withheld(withheld, x_desc)
@@ -2052,13 +2595,12 @@ fn draw_legend(
 // ── Family 1: throughput vs consumer count ──────────────────────────────────
 
 const HEADLINE_FLOW: &str = "consume_parallel";
-/// The payload the single-payload families slice on. 64 B rather than 1 KiB
-/// deliberately: the framework corpus floor caps by bytes, so the larger
-/// payloads drain in under the 1 s framework window on fast cells and their
-/// rows are honestly `setup_bound` — 64 B is where drain-windowed (`framework`)
-/// rows exist across the consumer sweep. Every chart states its payload in the
-/// subtitle, so the slice is on the chart's face.
-const HEADLINE_PAYLOAD: u64 = 64;
+/// The payload the single-payload families lead with, and the one their
+/// unsuffixed (docs-embedded) file shows. The same families also render once
+/// per larger harness payload as a suffixed sibling — see [`Chart`]. Every
+/// chart states its payload in the subtitle, so the slice is on the chart's
+/// face.
+pub const HEADLINE_PAYLOAD: u64 = 64;
 const OVERHEAD_PAYLOAD: u64 = 64;
 const BASE_CONSUMERS: u32 = 1;
 
@@ -2066,10 +2608,10 @@ fn render_throughput_vs_consumers(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
     mode: Mode,
+    payload: u64,
 ) -> Result<(), ChartError> {
-    let in_slice = |r: &ScenarioResult| {
-        canonical_flow(&r.flow) == HEADLINE_FLOW && r.payload_bytes == HEADLINE_PAYLOAD
-    };
+    let in_slice =
+        |r: &ScenarioResult| canonical_flow(&r.flow) == HEADLINE_FLOW && r.payload_bytes == payload;
     render_line_family(
         doc,
         root,
@@ -2078,19 +2620,19 @@ fn render_throughput_vs_consumers(
         &format!(
             "{} — {} payload — higher is better",
             HEADLINE_FLOW,
-            fmt_payload(HEADLINE_PAYLOAD)
+            fmt_payload(payload)
         ),
         "throughput-vs-consumers",
         format!(
             "{HEADLINE_FLOW} @ {} ({COST_FRAMEWORK} rows)",
-            fmt_payload(HEADLINE_PAYLOAD)
+            fmt_payload(payload)
         ),
         "consumers",
         &[HEADLINE_FLOW],
         in_slice,
         |r| r.consumers,
         |c| format!("{c}"),
-        |f| canonical_flow(&f.flow) == HEADLINE_FLOW && f.payload_bytes == HEADLINE_PAYLOAD,
+        |f| canonical_flow(&f.flow) == HEADLINE_FLOW && f.payload_bytes == payload,
         |f| f.consumers,
     )
 }
@@ -2190,7 +2732,7 @@ where
                     best_by_throughput(
                         run.results
                             .iter()
-                            .filter(|r| in_slice(r) && r.is_framework() && key_of(r) == *k),
+                            .filter(|r| in_slice(r) && r.is_publishable() && key_of(r) == *k),
                     )
                     .map(|r| (i as f64, r.throughput_msg_per_sec))
                 })
@@ -2201,19 +2743,40 @@ where
             // failed cell is left to `failure_notes`, which counts it.
             keys.iter()
                 .filter_map(|k| {
-                    let rows: Vec<&ScenarioResult> = run
+                    let all_rows: Vec<&ScenarioResult> = run
                         .results
                         .iter()
                         .filter(|r| in_slice(r) && key_of(r) == *k)
                         .collect();
-                    if rows.iter().any(|r| r.is_framework()) {
+                    if all_rows.iter().any(|r| r.is_publishable()) {
                         return None;
                     }
-                    let failed = run
-                        .failures
+                    // Only rows of a chartable method explain the cell; a
+                    // consume cell with rungs alone is named as such, and
+                    // one whose drain failed is a failed drain whatever
+                    // its rungs did. A failure of another method (a rung)
+                    // does not make the cell a failed one.
+                    let rows: Vec<&ScenarioResult> = all_rows
                         .iter()
-                        .any(|f| in_failed_slice(f) && failed_key_of(f) == *k);
-                    let kind = if rows.iter().any(|r| r.is_setup_bound()) {
+                        .copied()
+                        .filter(|r| r.is_charted_method())
+                        .collect();
+                    let chartable_failure = |f: &FailedRow| {
+                        !LOAD_FLOWS.contains(&f.flow.as_str()) || f.method() == Some(Method::Drain)
+                    };
+                    let failed = run.failures.iter().any(|f| {
+                        in_failed_slice(f) && failed_key_of(f) == *k && chartable_failure(f)
+                    });
+                    let failed_drain = run.failures.iter().any(|f| {
+                        in_failed_slice(f)
+                            && failed_key_of(f) == *k
+                            && f.method() == Some(Method::Drain)
+                    });
+                    let kind = if rows.is_empty() && failed_drain {
+                        WithheldKind::DrainFailed
+                    } else if rows.is_empty() && !all_rows.is_empty() {
+                        WithheldKind::RungsOnly
+                    } else if rows.iter().any(|r| r.is_setup_bound()) {
                         if rows
                             .iter()
                             .filter(|r| r.is_setup_bound())
@@ -2241,6 +2804,7 @@ where
 
     let labels: Vec<String> = keys.iter().map(label_of).collect();
     let mut extra = alias_notes(doc, in_slice);
+    extra.extend(drain_notes(&doc.runs, in_slice));
     extra.extend(failure_notes(&doc.runs, in_failed_slice));
     line_chart(
         doc,
@@ -2254,6 +2818,59 @@ where
         &presences,
         &extra,
     )
+}
+
+/// The caption lines a drain slice owes its reader: which series the rule
+/// covers (only the consume flows drain; FIFO, publish, broadcast and DLQ
+/// points keep their own captions), what the window was, that no producer
+/// ran inside it, the corpus sizes, and any redeliveries the consumers saw.
+/// Empty when no in-slice row is a drain.
+fn drain_notes<P>(runs: &[BackendRun], in_slice: P) -> Vec<String>
+where
+    P: Fn(&ScenarioResult) -> bool,
+{
+    let mut drained: Vec<&str> = Vec::new();
+    let mut corpora: BTreeSet<u64> = BTreeSet::new();
+    let mut flows: BTreeSet<&str> = BTreeSet::new();
+    let mut duplicates: Vec<String> = Vec::new();
+    for run in runs {
+        let mut dups = 0u64;
+        let mut any = false;
+        for r in run.results.iter().filter(|r| in_slice(r)) {
+            let Some(d) = &r.drain else {
+                continue;
+            };
+            any = true;
+            corpora.insert(d.corpus);
+            flows.insert(canonical_flow(&r.flow));
+            dups = dups.saturating_add(d.duplicates);
+        }
+        if any {
+            drained.push(run.backend.as_str());
+            if dups > 0 {
+                duplicates.push(format!("{} saw {dups} redeliveries", run.backend));
+            }
+        }
+    }
+    let mut notes = Vec::new();
+    if !drained.is_empty() {
+        let corpora: Vec<String> = corpora.iter().map(|c| fmt_count(*c as f64)).collect();
+        notes.push(format!(
+            "drain ({}): each {} point is the processing rate of the consumers from the moment \
+             every worker was assigned until 90 % of a corpus of {} messages, published before \
+             they started, had been consumed; no producer ran in the window",
+            drained.join(", "),
+            flows.iter().copied().collect::<Vec<_>>().join(" / "),
+            corpora.join(" / "),
+        ));
+        if !duplicates.is_empty() {
+            notes.push(format!(
+                "redeliveries counted once: {}",
+                duplicates.join("; ")
+            ));
+        }
+    }
+    notes
 }
 
 /// One caption line per backend whose in-slice rows arrived under an alias:
@@ -2412,7 +3029,10 @@ fn line_chart(
             Presence::Unsupported(_) => format!("{backend} (n/s)"),
             Presence::NotMeasured => format!("{backend} (not measured)"),
             Presence::WithheldOnly(withheld) => {
-                if withheld.iter().all(|w| w.kind == WithheldKind::Failed) {
+                if withheld
+                    .iter()
+                    .all(|w| matches!(w.kind, WithheldKind::Failed | WithheldKind::DrainFailed))
+                {
                     format!("{backend} (failed)")
                 } else {
                     format!("{backend} (withheld)")
@@ -3133,6 +3753,7 @@ fn render_parallel_vs_sequenced(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
     render_mode: Mode,
+    payload: u64,
 ) -> Result<(), ChartError> {
     let series: Vec<(String, RGBColor)> = MODES
         .iter()
@@ -3175,7 +3796,8 @@ fn render_parallel_vs_sequenced(
                     .filter(|r| {
                         r.mode == *mode
                             && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
-                            && r.payload_bytes == HEADLINE_PAYLOAD
+                            && r.payload_bytes == payload
+                            && r.is_charted_method()
                             && (r.is_framework() || r.is_setup_bound())
                             && r.window_ok()
                     })
@@ -3194,10 +3816,13 @@ fn render_parallel_vs_sequenced(
             .iter()
             .enumerate()
             .map(|(mi, (mode, flow, _))| {
+                // Rungs are not candidates for either arm: their window
+                // contains the harness's own producer.
                 let in_mode = |r: &&ScenarioResult| {
                     r.mode == *mode
                         && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
-                        && r.payload_bytes == HEADLINE_PAYLOAD
+                        && r.payload_bytes == payload
+                        && r.is_charted_method()
                 };
                 // Either arm publishes a number, so either arm is held to
                 // the window floor: a lower bound read off a 0.18 s window is
@@ -3307,7 +3932,7 @@ fn render_parallel_vs_sequenced(
                     // A failed cell in this mode is an absence with a
                     // recorded cause — not a gap, and not unsupported.
                     let failed = run.failures.iter().any(|f| {
-                        f.payload_bytes == HEADLINE_PAYLOAD
+                        f.payload_bytes == payload
                             && CONSUME_FLOWS.contains(&canonical_flow(&f.flow))
                             && FLOW_MODES
                                 .iter()
@@ -3377,7 +4002,7 @@ fn render_parallel_vs_sequenced(
     // bump), so they are named rather than refused.
     let mut uncharted: BTreeSet<&str> = BTreeSet::new();
     for r in doc.runs.iter().flat_map(|run| run.results.iter()) {
-        if r.payload_bytes != HEADLINE_PAYLOAD {
+        if r.payload_bytes != payload {
             continue;
         }
         let known_mode = MODES.iter().any(|(mode, _, _)| r.mode == *mode);
@@ -3399,11 +4024,14 @@ fn render_parallel_vs_sequenced(
         ));
     }
 
+    notes.extend(drain_notes(&doc.runs, |r| {
+        CONSUME_FLOWS.contains(&canonical_flow(&r.flow)) && r.payload_bytes == payload
+    }));
     notes.extend(alias_notes(doc, |r| {
-        r.payload_bytes == HEADLINE_PAYLOAD && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
+        r.payload_bytes == payload && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
     }));
     notes.extend(failure_notes(&doc.runs, |f| {
-        f.payload_bytes == HEADLINE_PAYLOAD && CONSUME_FLOWS.contains(&canonical_flow(&f.flow))
+        f.payload_bytes == payload && CONSUME_FLOWS.contains(&canonical_flow(&f.flow))
     }));
 
     bar_chart(
@@ -3414,7 +4042,7 @@ fn render_parallel_vs_sequenced(
         &format!(
             "{} payload — least-parallel measurement per mode — what ordering \
              costs — higher is better",
-            fmt_payload(HEADLINE_PAYLOAD)
+            fmt_payload(payload)
         ),
         "messages / second",
         "backend",
@@ -3445,79 +4073,172 @@ fn render_dispatch_latency(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
     mode: Mode,
+    payload: u64,
+) -> Result<(), ChartError> {
+    // Only a sustained offered-load rung measures dispatch latency: the
+    // consumers kept pace with the producer, so publish → handler entry is
+    // the per-message dispatch cost and not the message's wait in a backlog.
+    // Per backend, the rung published is the highest sustained rate at the
+    // least-parallel worker count that sustained one — the same
+    // least-parallel policy families 3 and 5 use.
+    let in_slice = |r: &ScenarioResult| {
+        canonical_flow(&r.flow) == HEADLINE_FLOW
+            && r.payload_bytes == payload
+            && r.is_framework()
+            && r.is_sustained_load()
+            && r.window_ok()
+    };
+    let mut groups = Vec::new();
+    let mut at: Vec<String> = Vec::new();
+    let mut without: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for run in &doc.runs {
+        let candidates: Vec<&ScenarioResult> = run.results.iter().filter(|r| in_slice(r)).collect();
+        let Some(min_workers) = candidates.iter().map(|r| r.consumers).min() else {
+            // The reason is read off this slice's rungs, not the run's: a
+            // producer-bound rung at another payload says nothing about this
+            // one.
+            let rungs: Vec<&ScenarioResult> = run
+                .results
+                .iter()
+                .filter(|r| {
+                    canonical_flow(&r.flow) == HEADLINE_FLOW
+                        && r.payload_bytes == payload
+                        && r.load.is_some()
+                })
+                .collect();
+            let reason = if !rungs.is_empty() && rungs.iter().all(|r| r.is_producer_bound()) {
+                "every rung producer-bound"
+            } else if !rungs.is_empty() {
+                "no rung sustained"
+            } else if run.results.is_empty() {
+                "no measured rows"
+            } else {
+                "no offered-load rows (drain percentiles are backlog residency, not latency)"
+            };
+            without
+                .entry(reason)
+                .or_default()
+                .push(run.backend.as_str());
+            continue;
+        };
+        let Some(row) = candidates
+            .iter()
+            .filter(|r| r.consumers == min_workers)
+            .max_by_key(|r| r.load.map_or(0, |l| l.offered_msg_per_sec))
+        else {
+            continue;
+        };
+        at.push(format!(
+            "{} at {} msg/s, {} {}",
+            run.backend,
+            fmt_count(row.load.map_or(0, |l| l.offered_msg_per_sec) as f64),
+            row.consumers,
+            if row.consumers == 1 {
+                "consumer"
+            } else {
+                "consumers"
+            }
+        ));
+        groups.push(BarGroup {
+            label: run.backend.clone(),
+            bars: vec![
+                Some(Bar::absolute(row.dispatch_p50_ms)),
+                Some(Bar::absolute(row.dispatch_p95_ms)),
+                Some(Bar::absolute(row.dispatch_p99_ms)),
+            ],
+            shape_only: !run.representative,
+        });
+    }
+
+    if groups.is_empty() {
+        return render_latency_refusal(doc, root, mode, &without);
+    }
+
+    let series: Vec<(String, RGBColor)> = ["p50", "p95", "p99"]
+        .iter()
+        .enumerate()
+        .map(|(i, label)| ((*label).to_string(), palette_colour(mode, i)))
+        .collect();
+    let mut notes = vec![
+        "dispatch = publish → handler entry, measured while a paced producer held the offered \
+         rate and the consumers kept up (a sustained offered-load rung); the backlog a \
+         corpus-mode row would add is absent by construction"
+            .to_string(),
+        format!("highest sustained rung per backend: {}", at.join("; ")),
+    ];
+    for (reason, backends) in &without {
+        notes.push(format!("no bar for {}: {reason}", backends.join(", ")));
+    }
+    for run in doc.runs.iter().filter(|r| !r.representative) {
+        if groups.iter().any(|g| g.label == run.backend) {
+            notes.push(shape_only_note(run));
+        }
+    }
+    bar_chart(
+        doc,
+        root,
+        mode,
+        Family::DispatchLatency.title(),
+        &format!(
+            "{} — {} payload — sustained offered load — lower is better",
+            HEADLINE_FLOW,
+            fmt_payload(payload)
+        ),
+        "milliseconds",
+        "backend",
+        &series,
+        &groups,
+        &notes,
+    )
+}
+
+/// The latency family when the document holds no sustained offered-load
+/// rung to publish: a provenanced refusal panel that says why, per backend,
+/// rather than bars drawn from a field that is not latency.
+fn render_latency_refusal(
+    doc: &Document,
+    root: &DrawingArea<SVGBackend<'_>, Shift>,
+    mode: Mode,
+    without: &BTreeMap<&str, Vec<&str>>,
 ) -> Result<(), ChartError> {
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
     let theme = mode.theme();
     let notes = vec![
-        "the v4 dispatch percentiles time publish → handler entry while the whole corpus \
-         is published concurrently with the drain: under a saturated backlog that is queue \
-         residency (median ≈ half the drain window), which scales with corpus size and the \
-         publish/drain rate ratio — not a per-message dispatch cost, and not comparable \
-         across backends"
+        "a corpus-mode row's dispatch percentiles time publish → handler entry while the \
+         whole corpus is published concurrently with the drain: under a saturated backlog that \
+         is queue residency (median ≈ half the drain window), not a per-message dispatch cost, \
+         and not comparable across backends"
             .to_string(),
-        "bars will be published once the harness measures dispatch latency under matched \
-         load"
+        "bars are published only off a sustained offered-load rung (`--load-rates`), where \
+         the consumers kept pace with the producer and no backlog formed"
             .to_string(),
     ];
-    // The shared reason withholds every cell, but "withheld" and "never
-    // measured" are different facts about a backend, and a panel naming
-    // none of them cannot show which is which.
-    let (mut recorded, mut unmeasured): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
-    for run in &doc.runs {
-        if run.results.is_empty() {
-            unmeasured.push(run.backend.as_str());
-        } else {
-            recorded.push(run.backend.as_str());
-        }
-    }
     let (_, layout) = frame(
         root,
         doc,
         mode,
         Family::DispatchLatency.title(),
-        "v4's dispatch percentiles are not publishable as latency — see caption",
+        "no sustained offered-load rung in this document — see caption",
         &notes,
         0,
     )?;
     // The panel body: the refusal sentence plus the per-backend accounting,
     // centered as a block inside the band the frame guard proves free of
-    // both the chrome above (PLOT_TOP shifted by any wrapped subtitle) and
-    // any permitted footer top below. The guard bounds the band, not the
-    // block — a block taller than the band is refused below, exactly as it
-    // was when these lines travelled through the footer and the caption
-    // guard counted them. Every line wraps at NOTE_WRAP (≤ ~810px wide), so
-    // a centered line spans at most [75, 885] and stays inside the canvas
-    // on both edges.
+    // both the chrome above and any permitted footer top below. Every line
+    // wraps at NOTE_WRAP (≤ ~810px wide), so a centered line spans at most
+    // [75, 885] and stays inside the canvas on both edges.
     let mut body: Vec<(String, i32)> = vec![(
         "no publishable dispatch-latency measurement in this document".to_string(),
         LABEL_PX,
     )];
-    if !recorded.is_empty() {
-        for line in wrap(
-            &format!(
-                "percentiles recorded and withheld for: {}",
-                recorded.join(", ")
-            ),
-            NOTE_WRAP,
-        ) {
-            body.push((line, FOOT_PX));
-        }
-    }
-    if !unmeasured.is_empty() {
-        for line in wrap(
-            &format!(
-                "no measured rows in this document (nothing to withhold): {}",
-                unmeasured.join(", ")
-            ),
-            NOTE_WRAP,
-        ) {
+    for (reason, backends) in without {
+        for line in wrap(&format!("{reason}: {}", backends.join(", ")), NOTE_WRAP) {
             body.push((line, FOOT_PX));
         }
     }
     // One spelling of the block's vertical rhythm: the guard measures the
-    // sum of exactly the advances the drawing loop takes (the sentence gets
-    // a little more air below it than the list lines), so retuning the air
-    // cannot desynchronise the guard from the ink.
+    // sum of exactly the advances the drawing loop takes, so retuning the
+    // air cannot desynchronise the guard from the ink.
     let advance = |i: usize| -> i32 { if i == 0 { SUBTITLE_LINE + 6 } else { LINE } };
     let block_h = (0..body.len()).fold(0i32, |h, i| h.saturating_add(advance(i)));
     if block_h > layout.band_bottom.saturating_sub(layout.band_top) {
@@ -3567,6 +4288,7 @@ fn render_framework_overhead(
     let mut setup_bound: Vec<&str> = Vec::new();
     let mut short_window: Vec<String> = Vec::new();
     let mut sleeping: Vec<&str> = Vec::new();
+    let mut rungs_only: Vec<&str> = Vec::new();
     let mut failed: Vec<&str> = Vec::new();
     let mut aliased: Vec<String> = Vec::new();
     let mut pinned_workers: Vec<String> = Vec::new();
@@ -3586,7 +4308,7 @@ fn render_framework_overhead(
         // messages in milliseconds, and the reciprocal of that is not a cost.
         let is_publish = |r: &&ScenarioResult| r.handler_cost == COST_NO_HANDLER;
         let publishable =
-            |r: &&ScenarioResult| r.is_framework() || (is_publish(r) && r.window_ok());
+            |r: &&ScenarioResult| r.is_publishable() || (is_publish(r) && r.window_ok());
         let min_workers = run
             .results
             .iter()
@@ -3660,11 +4382,34 @@ fn render_framework_overhead(
                     setup_bound.push(flow);
                 }
             }
+            // A consume flow whose drain failed is a failed cell whatever its
+            // rungs did, and one with rungs alone has no chartable row: a
+            // rung's window contains the harness's own producer. Both come
+            // before the sleeping-handler arm, which a rung row would
+            // otherwise satisfy.
+            None if run.failures.iter().any(|f| {
+                f.flow == *flow
+                    && f.payload_bytes == OVERHEAD_PAYLOAD
+                    && f.method() == Some(Method::Drain)
+            }) =>
+            {
+                failed.push(*flow);
+            }
+            None if run.results.iter().any(|r| in_flow(&r))
+                && !run
+                    .results
+                    .iter()
+                    .filter(in_flow)
+                    .any(|r| r.is_charted_method()) =>
+            {
+                rungs_only.push(*flow);
+            }
             None if run.results.iter().any(|r| in_flow(&r)) => sleeping.push(*flow),
-            None if run
-                .failures
-                .iter()
-                .any(|f| f.flow == *flow && f.payload_bytes == OVERHEAD_PAYLOAD) =>
+            None if run.failures.iter().any(|f| {
+                f.flow == *flow
+                    && f.payload_bytes == OVERHEAD_PAYLOAD
+                    && (!LOAD_FLOWS.contains(&f.flow.as_str()) || f.method() == Some(Method::Drain))
+            }) =>
             {
                 failed.push(*flow);
             }
@@ -3724,6 +4469,13 @@ fn render_framework_overhead(
             sleeping.join(", ")
         ));
     }
+    if !rungs_only.is_empty() {
+        notes.push(format!(
+            "offered-load rungs only (a rung's window contains the harness's own producer, so \
+             no cost is published): {}",
+            rungs_only.join(", ")
+        ));
+    }
     if !failed.is_empty() {
         notes.push(format!("{}: {}", failed_text(), failed.join(", ")));
     }
@@ -3769,6 +4521,9 @@ fn render_framework_overhead(
     // Any worker count: the bars are taken at each flow's least-parallel
     // measurement, so pinning this to one count would publish a failed cell
     // as a benign gap.
+    notes.extend(drain_notes(std::slice::from_ref(run), |r| {
+        r.payload_bytes == OVERHEAD_PAYLOAD
+    }));
     notes.extend(failure_notes(std::slice::from_ref(run), |f| {
         KNOWN_FLOWS.contains(&f.flow.as_str()) && f.payload_bytes == OVERHEAD_PAYLOAD
     }));
@@ -3811,42 +4566,52 @@ fn render_framework_overhead(
 
 fn render_into(
     doc: &Document,
-    family: Family,
+    chart: Chart,
     mode: Mode,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
 ) -> Result<(), ChartError> {
-    match family {
-        Family::ThroughputVsConsumers => render_throughput_vs_consumers(doc, root, mode),
+    let payload = chart.payload;
+    match chart.family {
+        Family::ThroughputVsConsumers => render_throughput_vs_consumers(doc, root, mode, payload),
         Family::ThroughputVsPayload => render_throughput_vs_payload(doc, root, mode),
-        Family::ParallelVsSequenced => render_parallel_vs_sequenced(doc, root, mode),
-        Family::DispatchLatency => render_dispatch_latency(doc, root, mode),
+        Family::ParallelVsSequenced => render_parallel_vs_sequenced(doc, root, mode, payload),
+        Family::DispatchLatency => render_dispatch_latency(doc, root, mode, payload),
         Family::FrameworkOverhead => render_framework_overhead(doc, root, mode),
     }
 }
 
-/// Render one family, in one mode, to an SVG string. This is what the tests
-/// assert against — the file-writing path below is the same code with a
-/// different sink.
+/// Render one family's headline chart, in one mode, to an SVG string. This is
+/// what most tests assert against — the file-writing path below is the same
+/// code with a different sink.
 pub fn render_to_string(doc: &Document, family: Family, mode: Mode) -> Result<String, ChartError> {
-    validate(doc)?;
-    render_validated(doc, family, mode)
+    render_chart_to_string(doc, Chart::headline(family), mode)
 }
 
-/// The render body behind [`render_to_string`], for callers that have already
-/// validated — [`generate`] validates once for all ten variants rather than
-/// re-walking every row per chart.
-fn render_validated(doc: &Document, family: Family, mode: Mode) -> Result<String, ChartError> {
+/// [`render_to_string`] for any chart, payload variants included.
+pub fn render_chart_to_string(
+    doc: &Document,
+    chart: Chart,
+    mode: Mode,
+) -> Result<String, ChartError> {
+    validate(doc)?;
+    render_validated(doc, chart, mode)
+}
+
+/// The render body behind [`render_chart_to_string`], for callers that have
+/// already validated — [`generate`] validates once for every variant rather
+/// than re-walking every row per chart.
+fn render_validated(doc: &Document, chart: Chart, mode: Mode) -> Result<String, ChartError> {
     let mut buf = String::new();
     {
         let root = SVGBackend::with_string(&mut buf, (WIDTH, HEIGHT)).into_drawing_area();
-        render_into(doc, family, mode, &root)?;
+        render_into(doc, chart, mode, &root)?;
         root.present()
             .map_err(|e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string()))?;
     }
     Ok(buf)
 }
 
-/// Render every family into `out_dir`, which must already exist.
+/// Render every chart into `out_dir`, which must already exist.
 ///
 /// Every family renders to memory before any file is written: render-stage
 /// refusals (a missing in-process run, unusable percentiles, an oversized
@@ -3856,9 +4621,9 @@ fn render_validated(doc: &Document, family: Family, mode: Mode) -> Result<String
 pub fn generate(doc: &Document, out_dir: &Path) -> Result<Vec<String>, ChartError> {
     validate(doc)?;
     let mut rendered = Vec::new();
-    for family in Family::ALL {
+    for chart in Chart::all() {
         for mode in Mode::ALL {
-            rendered.push((family.filename(mode), render_validated(doc, family, mode)?));
+            rendered.push((chart.filename(mode), render_validated(doc, chart, mode)?));
         }
     }
     let mut written = Vec::new();

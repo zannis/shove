@@ -120,20 +120,21 @@ pub trait HasBroadcast: Backend {
 /// |---|---|
 /// | **Kafka** | **yes** |
 /// | **InMemory** | **yes** |
+/// | **Redis** (`redis-streams`) | **yes** |
 /// | **RabbitMQ** | **yes** — effective batch size is capped at `u16::MAX` (AMQP's prefetch window is `u16`, and a batch is held unacked inside it) |
 /// | **NATS** | not yet (pending) |
-/// | **Redis** (`redis-streams`) | not yet (pending) |
 /// | **SQS** | not yet (pending) — will land with a documented 10-message receive cap |
 ///
-/// Unlike [`HasBroadcast`]'s permanent exclusion of SQS, every *pending* row
-/// above is pending, not excluded: each backend gets this capability as its
-/// own batch consumer is implemented, and `Broker::batch_consumer()` starts
-/// compiling on that marker the moment it does.
+/// Unlike [`HasBroadcast`]'s permanent exclusion of SQS, every row above other
+/// than Kafka, InMemory, Redis and RabbitMQ is *pending*, not excluded: each
+/// backend gets this capability as its own batch consumer is implemented, and
+/// `Broker::batch_consumer()` starts compiling on that marker the moment it
+/// does.
 ///
 /// Sealed via `Backend`.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` has no batch-consumption implementation yet, so `.batch_consumer()` is unavailable.",
-    note = "Kafka, InMemory and RabbitMQ implement `HasBatchConsumption` today. NATS, Redis and SQS are pending — SQS will land with a documented 10-message receive cap. Use a single-message consumer in the meantime."
+    note = "Kafka, InMemory, Redis (redis-streams) and RabbitMQ implement `HasBatchConsumption` today. NATS and SQS are pending — SQS will land with a documented 10-message receive cap. Use a single-message consumer in the meantime."
 )]
 #[allow(private_interfaces, private_bounds)]
 pub trait HasBatchConsumption: Backend {

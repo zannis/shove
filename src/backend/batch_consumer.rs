@@ -25,26 +25,29 @@
 //! and `settle_broadcast_outcome` already make.
 //!
 //! Everything else here is gated `#[cfg(any(feature = "kafka", feature =
-//! "inmemory", feature = "rabbitmq"))]`: these backends have a
-//! batch-consumption implementation and share the flush-invoking/backoff
-//! machinery ([`invoke_batch_handler`], [`batch_redelivery_backoff`],
-//! [`next_redelivery_delay`]). The gate widens per-backend as the remaining
-//! ports land in turn — NATS, Redis, SQS each add their own feature to
+//! "inmemory", feature = "redis-streams", feature = "rabbitmq"))]`: these
+//! backends have a batch-consumption implementation and share the
+//! flush-invoking/backoff machinery ([`invoke_batch_handler`],
+//! [`batch_redelivery_backoff`], [`next_redelivery_delay`]). The gate widens
+//! per-backend as the remaining ports land in turn — NATS and SQS each add
+//! their own feature to
 //! the list the moment their `BatchConsumerImpl` exists, exactly as
 //! `broadcast.rs`'s gate widened backend by backend.
 //!
 //! `TerminalDiscard`, `RejectSettlement` and `reject_settlement` are
 //! narrower still: `#[cfg(feature = "kafka")]` *inside* that `any(kafka,
-//! inmemory)` module, because InMemory settles a reject the instant its DLQ
-//! hand-off resolves (see `backends::inmemory::consumer::resolve_reject`) and
-//! has no later commit that could still fail — it never needed the
-//! held-until-confirmed shape this trio exists for. RabbitMQ's batch consumer
-//! stays out for the same reason from the other direction: it settles on a
-//! confirm-mode channel (never transactional), where an accepted
-//! `basic.nack` retires the delivery with no later commit to wait on. This
-//! is deferred-settlement machinery, kafka-only until a deferred-settlement
-//! backend (NATS or Redis, in the remaining ports) lands and widens it — and
-//! even then, per the module doc above, never below `kafka`.
+//! inmemory, redis-streams, rabbitmq)` module. Every other backend in the
+//! gate settles a reject the instant its DLQ hand-off resolves, with no
+//! later commit that could still fail, so none of them ever needed the
+//! held-until-confirmed shape this trio exists for: InMemory in
+//! `backends::inmemory::consumer::resolve_reject`, Redis in its batch
+//! `DeadLetter` arm (the `XACK`/DLQ route completes before the batch
+//! clears), and RabbitMQ on a confirm-mode channel (never transactional),
+//! where an accepted `basic.nack` retires the delivery with no later commit
+//! to wait on. This is deferred-settlement machinery, kafka-only until a
+//! deferred-settlement backend lands in one of the remaining ports (NATS,
+//! SQS) and widens it — and even then, per the module doc above, never below
+//! `kafka`.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -166,7 +169,7 @@ pub(crate) fn validate_batch_topic<T: Topic>() -> Result<()> {
 /// |---|---|---|
 /// | `Ack` | `Commit` | Every message in the batch retires; offsets/positions advance. |
 /// | `Reject` | `DeadLetter` | Terminal: every message is dead-lettered (or discarded, with no DLQ configured) and retires. |
-/// | `Retry` | `Redeliver` | The whole batch is returned to the backend's redelivery mechanism — a seek-back / re-buffer, not a republish. Shove itself imposes no per-batch retry budget, but a backend-declared delivery cap (NATS `MaxDeliver`, RabbitMQ's quorum delivery-limit, SQS's `maxReceiveCount`) may terminate redelivery per that backend's own semantics regardless. Kafka and InMemory currently redeliver indefinitely — see each backend's own docs for that stronger, backend-specific guarantee. |
+/// | `Retry` | `Redeliver` | The whole batch is returned to the backend's redelivery mechanism — a seek-back / re-buffer, not a republish. Shove itself imposes no per-batch retry budget, but a backend-declared delivery cap (NATS `MaxDeliver`, RabbitMQ's quorum delivery-limit, SQS's `maxReceiveCount`) may terminate redelivery per that backend's own semantics regardless. Kafka, InMemory and Redis currently redeliver indefinitely (streams have no delivery cap) — see each backend's own docs for that stronger, backend-specific guarantee. |
 /// | `Defer` | `Redeliver` | **Identical to `Retry` here.** A batch-wide outcome carries no sequence key, so the `Retry`/`Defer` distinction that matters on the single-message path — spending the retry budget versus not — has no meaning: there is no per-batch budget to spend either way. |
 ///
 /// See [`settle_broadcast_outcome`](crate::backend::broadcast::settle_broadcast_outcome)
@@ -234,13 +237,18 @@ mod settle_batch_outcome_tests {
     }
 }
 
-// Gated `any(kafka, inmemory, rabbitmq)` — see the module doc's "Gating"
-// section. Named
-// `settling` rather than after either backend: it houses the settlement
-// classifier + panic/timeout invariant surface both backends' batch loops
-// route through, plus the terminal-discard machinery Kafka's single-message
-// path also depends on (see the module doc's `kafka` note).
-#[cfg(any(feature = "kafka", feature = "inmemory", feature = "rabbitmq"))]
+// Gated `any(kafka, inmemory, redis-streams, rabbitmq)` — see the module
+// doc's "Gating" section. Named `settling` rather than after any one backend:
+// it houses the settlement classifier + panic/timeout invariant surface every
+// one of these backends' batch loops route through, plus the terminal-discard
+// machinery Kafka's single-message path also depends on (see the module doc's
+// `kafka` note).
+#[cfg(any(
+    feature = "kafka",
+    feature = "inmemory",
+    feature = "redis-streams",
+    feature = "rabbitmq"
+))]
 mod settling {
     use std::future::Future;
     use std::panic::AssertUnwindSafe;
@@ -694,7 +702,12 @@ mod settling {
     }
 }
 
-#[cfg(any(feature = "kafka", feature = "inmemory", feature = "rabbitmq"))]
+#[cfg(any(
+    feature = "kafka",
+    feature = "inmemory",
+    feature = "redis-streams",
+    feature = "rabbitmq"
+))]
 pub(crate) use settling::{
     PREALLOC_CAP, batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
 };
