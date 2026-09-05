@@ -18,16 +18,16 @@ use tokio_util::sync::CancellationToken;
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, BroadcastImpl, ConsumerImpl, ConsumerOptionsInner,
-    QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
-    capability::{HasBroadcast, HasCoordinatedGroups},
+    AutoscalerBackendImpl, Backend, BatchConsumerImpl, BatchConsumerOptionsInner, BroadcastImpl,
+    ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
+    capability::{HasBatchConsumption, HasBroadcast, HasCoordinatedGroups},
     sealed,
 };
 use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::Result;
-use crate::handler::MessageHandler;
+use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::markers::Nats;
-use crate::topic::{SequencedTopic, Topic};
+use crate::topic::{NotSequenced, SequencedTopic, Topic};
 
 use super::autoscaler::{JetStreamStatsProvider, NatsAutoscalerBackend, NatsQueueStatsProvider};
 use super::client::{NatsClient, NatsConfig};
@@ -120,6 +120,31 @@ impl HasBroadcast for Nats {
 
     fn make_broadcast(client: &Self::Client) -> Self::BroadcastImpl {
         NatsConsumer::new(client.clone())
+    }
+}
+
+impl HasBatchConsumption for Nats {
+    // Same consumer type as the competing-consumer and broadcast paths —
+    // `run_batch` needs no state `run`/`run_broadcast` don't already carry.
+    type BatchConsumerImpl = NatsConsumer;
+
+    fn make_batch_consumer(client: &Self::Client) -> Self::BatchConsumerImpl {
+        NatsConsumer::new(client.clone())
+    }
+}
+
+impl BatchConsumerImpl for NatsConsumer {
+    async fn run_batch<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: BatchConsumerOptionsInner,
+    ) -> Result<()>
+    where
+        T: NotSequenced,
+        H: BatchMessageHandler<T>,
+    {
+        NatsConsumer::run_batch_inner::<T, H>(self, handler, ctx, options).await
     }
 }
 

@@ -60,11 +60,9 @@ rather than runtime surprises.
   plus an SNS subscription whose lifecycle shove does not manage, and a leaked
   queue costs money forever.
 - `HasBatchConsumption` gates `Broker::batch_consumer` /
-  `BatchConsumer<B>::run`. Kafka, InMemory, Redis, RabbitMQ and SQS implement
-  it today (SQS with a hard 10-message cap — `max_batch_size > 10` is
-  rejected at consumer startup); every other backend is pending, not excluded
-  — each gets the capability the moment its own `BatchConsumerImpl` lands. The
-  primitive exists for **handler amortisation** (one flush per N messages
+  `BatchConsumer<B>::run`. Every backend implements it (SQS with a hard
+  10-message cap — `max_batch_size > 10` is rejected at consumer startup).
+  The primitive exists for **handler amortisation** (one flush per N messages
   instead of one call per message), nothing else.
 
 The trait's own doc comment is the authoritative per-backend list — update it

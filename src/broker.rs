@@ -172,8 +172,9 @@ impl<B: HasBatchConsumption> Broker<B> {
     /// N messages before invoking the handler once with the whole batch,
     /// instead of once per message.
     ///
-    /// Gated on [`HasBatchConsumption`], which not every backend implements
-    /// yet — see that trait for the authoritative list.
+    /// Gated on [`HasBatchConsumption`] — see that trait for the
+    /// authoritative per-backend list and the caps that apply to each
+    /// (SQS's is a hard 10 messages).
     pub fn batch_consumer(&self) -> BatchConsumer<B> {
         BatchConsumer::new(&self.client)
     }

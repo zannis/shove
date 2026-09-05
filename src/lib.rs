@@ -38,9 +38,9 @@
 //!   the rest are excluded by the same compile-time gate until their
 //!   implementation lands.
 //! - [`HasBatchConsumption`] separately gates [`Broker::batch_consumer`], for
-//!   handler amortisation — buffering up to N messages before one flush. See
-//!   that trait for which backends implement it today; the rest are excluded
-//!   by the same compile-time gate until their implementation lands.
+//!   handler amortisation — buffering up to N messages before one flush.
+//!   Every backend implements it; see that trait for the per-backend caps
+//!   that apply.
 //!
 //! # Feature flags
 //!
