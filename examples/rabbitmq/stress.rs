@@ -15,13 +15,14 @@ use std::time::Duration;
 use lapin::options::{QueueDeclareOptions, QueueDeleteOptions};
 use lapin::types::FieldTable;
 use lapin::{Connection, ConnectionProperties};
+use shove::batch_consumer::BatchConsumerOptions;
 use shove::rabbitmq as rmq;
-use shove::{Backend, RabbitMq, Topic};
+use shove::{Backend, Broker, RabbitMq, Topic};
 use testcontainers::core::ExecCommand;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::rabbitmq::RabbitMq as RabbitMqImage;
 
-use harness::{DlqDrainFn, HarnessConfig, StressTestTopic, run_all_scenarios};
+use harness::{BatchConsumeFn, DlqDrainFn, HarnessConfig, StressTestTopic, run_all_scenarios};
 
 /// Image tag started by `testcontainers_modules::rabbitmq` (its pinned
 /// default), recorded in the
@@ -147,11 +148,32 @@ async fn main() {
         })
     });
 
+    // The harness invokes it once per scenario consumer; every invocation
+    // opens its own channel and basic.consumes the same queue, so N
+    // invocations are N competing consumers over one corpus. That needs no
+    // topology adjustment — where Kafka has to be declared with a partition
+    // per consumer before a second member can be assigned any work, an AMQP
+    // queue round-robins deliveries across whoever is subscribed.
+    let batch_consume: BatchConsumeFn<RabbitMq> = Box::new(|client, handler, opts, stop| {
+        Box::pin(async move {
+            Broker::<RabbitMq>::from_client(client)
+                .batch_consumer()
+                .run::<StressTestTopic, _>(
+                    handler,
+                    (),
+                    batch_consumer_options(opts).with_shutdown(stop),
+                )
+                .await
+                .map_err(|e| format!("run_batch: {e}"))
+        })
+    });
+
     let hcfg = HarnessConfig::<RabbitMq>::new("rabbitmq")
         .with_purge(purge)
         .with_broker("RabbitMQ", RABBITMQ_VERSION, "docker single-node")
         .with_dlq_drain(dlq_drain)
-        .with_dlq_depth(dlq_depth);
+        .with_dlq_depth(dlq_depth)
+        .with_batch_consume(batch_consume);
     run_all_scenarios(
         hcfg,
         || {
@@ -171,6 +193,21 @@ async fn main() {
     .await;
 }
 
+/// Map the scenario's batch knobs onto shove's [`BatchConsumerOptions`].
+///
+/// Named (rather than inlined in the closure) so a test can prove the CLI
+/// values end up inside `BatchConsumerOptions` instead of being parsed and
+/// dropped. Everything except the two mapped fields stays at shove's
+/// defaults — the scenario's knobs are handed to the primitive, never
+/// re-derived here. (This backend clamps `max_batch_size` to AMQP's u16
+/// prefetch window inside `run_batch`, which is the primitive's business,
+/// not this mapping's.)
+fn batch_consumer_options(opts: harness::BatchOptions) -> BatchConsumerOptions<RabbitMq> {
+    BatchConsumerOptions::new()
+        .with_max_batch_size(opts.max_batch_size.get())
+        .with_max_batch_age(Duration::from_millis(opts.max_batch_age_ms.get()))
+}
+
 /// Open and close one AMQP channel — confirms the broker is past startup and
 /// the just-enabled `consistent_hash_exchange` plugin is loaded. Replaces a
 /// blind `sleep(2s)` that was previously racing slow CI hosts.
@@ -187,5 +224,29 @@ async fn wait_until_ready(uri: &str) {
             panic!("RabbitMQ did not become ready within 30s");
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+// Example targets default to `test = false`, so this module only runs via
+// tests/bench_harness_rabbitmq.rs, which pulls this file into a real test target.
+#[cfg(test)]
+mod tests {
+    use std::num::{NonZeroU64, NonZeroUsize};
+
+    use super::*;
+
+    #[test]
+    fn the_cli_batch_knobs_reach_batch_consumer_options() {
+        // The end of the knob's journey: CLI → `Scenario.batch_options` →
+        // `BatchConsumeFn` (both proven in the harness tests) → here, into the
+        // `BatchConsumerOptions` handed to the generic batch consumer. Read
+        // back through shove's getters, not inferred from the builder calls.
+        let opts = harness::BatchOptions {
+            max_batch_size: NonZeroUsize::new(50).expect("non-zero"),
+            max_batch_age_ms: NonZeroU64::new(125).expect("non-zero"),
+        };
+        let mapped = batch_consumer_options(opts);
+        assert_eq!(mapped.max_batch_size(), 50);
+        assert_eq!(mapped.max_batch_age(), Duration::from_millis(125));
     }
 }
