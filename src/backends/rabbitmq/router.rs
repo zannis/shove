@@ -1,3 +1,4 @@
+use lapin::Channel;
 use lapin::message::Delivery;
 use lapin::options::{BasicAckOptions, BasicNackOptions};
 use lapin::types::{AMQPValue, FieldTable};
@@ -225,6 +226,202 @@ async fn reject_with(
     }
     pending.confirm();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Batch settling — `multiple: true` frames over one channel's delivery tags.
+//
+// Used only by the batch consumer (`consumer.rs::run_batch_with_inner`),
+// which always runs on a plain confirm-mode channel: there is no
+// `ChannelPublisher` here because the batch path never publishes (RabbitMQ
+// dead-letters broker-side via the DLX bound at declare time) and never opens
+// a transactional channel, so there is no `commit_if_tx` to run either.
+//
+// Error contract, deliberately different from the single-message helpers
+// above: every function here returns `Err(ShoveError::Connection)` on a
+// failed frame instead of logging and continuing. After a failed or partial
+// settle the channel's outstanding-tag set is unknown, so a later
+// `multiple: true` frame could silently cover leftovers the handler never
+// acked — the only sound recovery is to abandon the channel and reconnect
+// (dropping it makes the broker requeue everything unsettled). The error is
+// constructed directly rather than through `map_lapin_error` so it is always
+// retryable and can never be classified `ShoveError::Topology`, which would
+// kill the consumer instead of reconnecting it.
+//
+// Tag-ordering constraint every caller must hold: a `multiple: true` frame
+// settles all *outstanding* tags up to and including the target, and RabbitMQ
+// raises a 406 channel error if the target tag itself is already settled —
+// so the target must be the highest still-unsettled tag of the set being
+// retired. Already-settled tags *below* the target are skipped harmlessly.
+// ---------------------------------------------------------------------------
+
+/// `basic_ack(multiple: true)` on the highest still-unsettled handled tag —
+/// the one-frame settle that is the batch consumer's payoff on this backend.
+///
+/// On the Commit arm the parked pre-handler drops must be individually
+/// settled *first* ([`settle_parked_batch`]): parked tags interleave with
+/// handled ones, and a multi-ack targeting a handled tag above an unsettled
+/// parked tag would silently ack the poison instead of dead-lettering it.
+pub(crate) async fn ack_batch_multiple(channel: &Channel, highest_handled_tag: u64) -> Result<()> {
+    channel
+        .basic_ack(highest_handled_tag, BasicAckOptions { multiple: true })
+        .await
+        .map_err(|e| {
+            error!("batch multi-ack failed: {e}");
+            ShoveError::Connection(format!("batch multi-ack failed: {e}"))
+        })
+}
+
+/// Individually nack (`requeue: false`) each parked pre-handler drop so the
+/// broker dead-letters it via the DLX (or drops it, with none bound), before
+/// the Commit arm's multi-ack.
+///
+/// The failure was already counted at ingest (`record_failed`), so this
+/// settles a [`metrics::pending_discard`] per entry — the same
+/// counted-once split `record_terminal` bundles (see `metrics.rs`) and the
+/// same discard-held-until-the-broker-accepted-the-nack contract as
+/// [`route_reject`]. Runs to completion with no shutdown-token checks: a
+/// nack cannot block on DLQ capacity (the DLX move is broker-side), and
+/// stopping between these nacks and the multi-ack would strand the whole
+/// handled batch unacked — guaranteed duplicate processing bought for
+/// nothing.
+pub(crate) async fn settle_parked_batch(
+    channel: &Channel,
+    topology: &QueueTopology,
+    group: Option<&str>,
+    parked: &[(u64, metrics::FailReason)],
+) -> Result<()> {
+    let has_dlq = topology.dlq().is_some();
+    for &(tag, reason) in parked {
+        if !has_dlq {
+            warn!(
+                queue = topology.queue(),
+                "dropping pre-handler-rejected message on queue with no DLQ configured"
+            );
+        }
+        let pending = metrics::pending_discard(topology.queue(), group, reason, has_dlq);
+        match channel
+            .basic_nack(
+                tag,
+                BasicNackOptions {
+                    requeue: false,
+                    ..BasicNackOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(()) => pending.confirm(),
+            Err(e) => {
+                error!("batch parked-drop nack failed: {e}");
+                pending.survived();
+                return Err(ShoveError::Connection(format!(
+                    "batch parked-drop nack failed: {e}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Dead-letter an entire batch — handled messages and parked pre-handler
+/// drops alike — with one `basic_nack(multiple: true, requeue: false)` on the
+/// highest tag. Every tag in the batch is still unsettled when this runs, so
+/// the prefix frame covers exactly the batch (deliveries the broker has
+/// already handed lapin but this loop has not ingested carry higher tags).
+///
+/// Serves both the handler-`Reject` arm and the all-poison window (an empty
+/// `handled_count` with parked entries): the accounting differs per message —
+/// a handled reject is a fresh terminal failure (`record_terminal`), a parked
+/// drop's failure was already counted at ingest (`pending_discard` only) —
+/// but the frame is the same, and every discard settles on the broker
+/// accepting the nack, `survived()` on a failed frame (the delivery stays
+/// unacked and redelivers, so counting it would be a false data-loss alert).
+pub(crate) async fn reject_batch_multiple(
+    channel: &Channel,
+    topology: &QueueTopology,
+    group: Option<&str>,
+    handled_count: usize,
+    parked: &[(u64, metrics::FailReason)],
+    highest_tag: u64,
+) -> Result<()> {
+    let has_dlq = topology.dlq().is_some();
+    if !has_dlq {
+        warn!(
+            queue = topology.queue(),
+            batch = handled_count + parked.len(),
+            "rejecting batch on queue with no DLQ configured — messages will be discarded"
+        );
+    }
+    let mut pendings = Vec::with_capacity(handled_count + parked.len());
+    for _ in 0..handled_count {
+        pendings.push(metrics::record_terminal(
+            topology.queue(),
+            group,
+            metrics::FailReason::Rejected,
+            has_dlq,
+        ));
+    }
+    for &(_, reason) in parked {
+        pendings.push(metrics::pending_discard(
+            topology.queue(),
+            group,
+            reason,
+            has_dlq,
+        ));
+    }
+    match channel
+        .basic_nack(
+            highest_tag,
+            BasicNackOptions {
+                multiple: true,
+                requeue: false,
+            },
+        )
+        .await
+    {
+        Ok(()) => {
+            pendings
+                .into_iter()
+                .for_each(metrics::PendingDiscard::confirm);
+            Ok(())
+        }
+        Err(e) => {
+            error!("batch multi-nack (reject) failed: {e}");
+            pendings
+                .into_iter()
+                .for_each(metrics::PendingDiscard::survived);
+            Err(ShoveError::Connection(format!(
+                "batch multi-nack (reject) failed: {e}"
+            )))
+        }
+    }
+}
+
+/// Redeliver an entire batch with one `basic_nack(multiple: true,
+/// requeue: true)` on its highest tag. The broker requeues every delivery
+/// and flags the re-deliveries `redelivered` — this backend's equivalent of
+/// InMemory's `mark_redelivery()` (AMQP 0-9-1 carries no delivery counter,
+/// so `MessageMetadata::delivery_count` stays `None`, as its table
+/// documents). No retry counters move: per the shared
+/// [`BatchSettlement`](crate::backend::batch_consumer::BatchSettlement)
+/// table this is a re-buffer, not a republish — and since shove declares
+/// classic queues (no `x-queue-type`, so no quorum delivery-limit), a
+/// handler stuck returning `Retry` redelivers indefinitely here, exactly as
+/// on Kafka and InMemory.
+pub(crate) async fn redeliver_batch_multiple(channel: &Channel, highest_tag: u64) -> Result<()> {
+    channel
+        .basic_nack(
+            highest_tag,
+            BasicNackOptions {
+                multiple: true,
+                requeue: true,
+            },
+        )
+        .await
+        .map_err(|e| {
+            error!("batch multi-nack (redeliver) failed: {e}");
+            ShoveError::Connection(format!("batch multi-nack (redeliver) failed: {e}"))
+        })
 }
 
 pub(crate) async fn nack_requeue(delivery: &Delivery, publisher: &ChannelPublisher) -> Result<()> {
