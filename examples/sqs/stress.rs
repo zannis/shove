@@ -10,17 +10,41 @@
 #[path = "../common/stress_test.rs"]
 mod harness;
 
+use std::num::NonZeroUsize;
+use std::time::Duration;
+
 use aws_sdk_sqs::types::QueueAttributeName;
+use shove::batch_consumer::BatchConsumerOptions;
 use shove::sns::{SnsConfig, SqsConsumer};
-use shove::{Backend, ConsumerOptions, Sqs, Topic};
+use shove::{Backend, Broker, ConsumerOptions, Sqs, Topic};
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::localstack::LocalStack;
 
-use harness::{DlqDrainFn, HarnessConfig, StressTestTopic, run_supervisor_scenarios};
+use harness::{
+    BatchConsumeFn, DlqDrainFn, HarnessConfig, StressTestTopic, run_supervisor_scenarios,
+};
 
 /// SQS caps `ReceiveMessage` batches at 10.
 const SQS_PREFETCH_CAP: u16 = 10;
+
+/// The same 10, reached through the batch consumer instead of the prefetch
+/// path: `ReceiveMessage`, `DeleteMessageBatch` and
+/// `ChangeMessageVisibilityBatch` all cap out at 10 entries, so shove's SQS
+/// batch consumer *rejects* `max_batch_size > 10` at startup rather than
+/// clamping it (`src/backends/sns/consumer.rs::validate_sqs_batch_size`) —
+/// shipped behaviour this benchmark has no business softening.
+///
+/// The harness's scenario sizes are shared across all six backends and its
+/// default is shove's cross-backend 500, so without this the SQS batch
+/// scenario would die on a `ShoveError::Validation` before the first message.
+/// Handing the cap to the harness (rather than clamping inside
+/// `batch_consumer_options`) is what makes the *result row* record 10 as well
+/// — see `HarnessConfig::batch_size_cap`. Any SQS batch bar is therefore a
+/// 10-message batch, and is not comparing like-for-like against a backend
+/// that ran 500; the numbers are LocalStack's regardless (see
+/// `not_representative` below).
+const SQS_BATCH_SIZE_CAP: NonZeroUsize = NonZeroUsize::new(10).expect("10 is non-zero");
 
 /// Image tag started by `testcontainers_modules::localstack` (its pinned
 /// default), recorded in the results provenance so a reader knows which
@@ -198,8 +222,31 @@ async fn main() {
         })
     });
 
+    // The harness invokes it once per scenario consumer; every invocation
+    // long-polls the same queue with its own `ReceiveMessage` loop, so N
+    // invocations split one corpus like N supervisor pollers. That needs no
+    // topology adjustment — where Kafka has to be declared with a partition
+    // per consumer before a second member can be assigned any work, an SQS
+    // queue hands each message to whichever receiver asked for it, which is
+    // the same property that lets this backend use the supervisor path at all
+    // rather than a coordinated group.
+    let batch_consume: BatchConsumeFn<Sqs> = Box::new(|client, handler, opts, stop| {
+        Box::pin(async move {
+            Broker::<Sqs>::from_client(client)
+                .batch_consumer()
+                .run::<StressTestTopic, _>(
+                    handler,
+                    (),
+                    batch_consumer_options(opts).with_shutdown(stop),
+                )
+                .await
+                .map_err(|e| format!("run_batch: {e}"))
+        })
+    });
+
     let hcfg = HarnessConfig::<Sqs>::new("sqs")
         .with_prefetch_cap(SQS_PREFETCH_CAP)
+        .with_batch_size_cap(SQS_BATCH_SIZE_CAP)
         .with_publish_chunk_size(SQS_PUBLISH_CHUNK)
         .with_purge(purge)
         .with_broker(
@@ -212,7 +259,8 @@ async fn main() {
         // Enforcing it here rather than in prose is the point.
         .not_representative()
         .with_dlq_drain(dlq_drain)
-        .with_dlq_depth(dlq_depth);
+        .with_dlq_depth(dlq_depth)
+        .with_batch_consume(batch_consume);
 
     run_supervisor_scenarios(
         hcfg,
@@ -235,6 +283,25 @@ async fn main() {
         },
     )
     .await;
+}
+
+/// Map the scenario's batch knobs onto shove's [`BatchConsumerOptions`].
+///
+/// Named (rather than inlined in the closure) so a test can prove the CLI
+/// values end up inside `BatchConsumerOptions` instead of being parsed and
+/// dropped. Everything except the two mapped fields stays at shove's
+/// defaults — the scenario's knobs are handed to the primitive, never
+/// re-derived here.
+///
+/// Byte-identical to the other five backends' mapping, including on this
+/// backend's one hard limit: [`SQS_BATCH_SIZE_CAP`] is applied by the harness
+/// when it builds the scenario, so what arrives here is already an accepted
+/// size and the row already records it. Re-clamping here would be the second
+/// source of truth that arrangement exists to avoid.
+fn batch_consumer_options(opts: harness::BatchOptions) -> BatchConsumerOptions<Sqs> {
+    BatchConsumerOptions::new()
+        .with_max_batch_size(opts.max_batch_size.get())
+        .with_max_batch_age(Duration::from_millis(opts.max_batch_age_ms.get()))
 }
 
 /// Poll a queue until it reads empty across visible, in-flight, and delayed
@@ -343,5 +410,56 @@ async fn wait_until_ready(endpoint: &str) {
             panic!("LocalStack SQS did not become ready within 60s");
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+// Example targets default to `test = false`, so this module only runs via
+// tests/bench_harness_sqs.rs, which pulls this file into a real test target.
+#[cfg(test)]
+mod tests {
+    use std::num::{NonZeroU64, NonZeroUsize};
+
+    use super::*;
+
+    #[test]
+    fn the_cli_batch_knobs_reach_batch_consumer_options() {
+        // The end of the knob's journey: CLI → `Scenario.batch_options` →
+        // `BatchConsumeFn` (both proven in the harness tests) → here, into the
+        // `BatchConsumerOptions` handed to the generic batch consumer. Read
+        // back through shove's getters, not inferred from the builder calls.
+        //
+        // Sized at the SQS cap rather than the other backends' 50: the
+        // harness has already clamped by the time it calls this, so a size
+        // above 10 is a value this function is never handed on this backend.
+        let opts = harness::BatchOptions {
+            max_batch_size: SQS_BATCH_SIZE_CAP,
+            max_batch_age_ms: NonZeroU64::new(125).expect("non-zero"),
+        };
+        let mapped = batch_consumer_options(opts);
+        assert_eq!(mapped.max_batch_size(), SQS_BATCH_SIZE_CAP.get());
+        assert_eq!(mapped.max_batch_age(), Duration::from_millis(125));
+    }
+
+    #[test]
+    fn the_sqs_cap_bites_an_unflagged_run() {
+        // The cap is not a defensive nicety for an operator who passes an
+        // absurd `--batch-max-size`: shove's cross-backend default already
+        // exceeds it, so *every* SQS batch run is clamped and the row that
+        // records 10 is the normal case, not the exception. Were the default
+        // ever lowered to 10 or below, this fails and the comments above —
+        // which tell a reader an unflagged run is clamped — would need
+        // rewriting rather than quietly going stale.
+        assert!(
+            shove::DEFAULT_KAFKA_MAX_BATCH_SIZE > SQS_BATCH_SIZE_CAP.get(),
+            "shove's default batch size {} no longer exceeds the SQS cap {}",
+            shove::DEFAULT_KAFKA_MAX_BATCH_SIZE,
+            SQS_BATCH_SIZE_CAP.get(),
+        );
+        // And the clamp the harness applies lands exactly on the cap, not
+        // merely somewhere below the default.
+        let clamped = NonZeroUsize::new(shove::DEFAULT_KAFKA_MAX_BATCH_SIZE)
+            .expect("shove's default batch size is non-zero")
+            .min(SQS_BATCH_SIZE_CAP);
+        assert_eq!(clamped, SQS_BATCH_SIZE_CAP);
     }
 }
