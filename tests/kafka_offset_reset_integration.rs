@@ -21,6 +21,7 @@ use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
 use shove::topic::Topic;
 use shove::topology::TopologyBuilder;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use testcontainers::runners::AsyncRunner;
@@ -233,6 +234,42 @@ fn is_transient_coordinator_error(err: &ShoveError) -> bool {
     }
 }
 
+/// How a `retry_transient_until` loop ended. Split from the panics in
+/// `reset_when_inactive` so the deadline behaviour is unit-testable without a
+/// broker.
+enum RetryOutcome<T> {
+    Settled(T),
+    DeadlineExceeded(ShoveError),
+    Terminal(ShoveError),
+}
+
+/// Drives `attempt` until it succeeds, retrying only the transient
+/// coordinator-transition races (see `is_transient_coordinator_error`) with a
+/// 500ms pause between attempts, bounded by `deadline`; any other error ends
+/// the loop immediately.
+async fn retry_transient_until<T, F, Fut>(deadline: Instant, mut attempt: F) -> RetryOutcome<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, ShoveError>>,
+{
+    loop {
+        match attempt().await {
+            Ok(value) => return RetryOutcome::Settled(value),
+            Err(e) if is_transient_coordinator_error(&e) => {
+                // The check sits after the pause, immediately before the next
+                // attempt would launch: one attempt issues several RPCs, so a
+                // pre-sleep check would let an error caught just inside the
+                // deadline start one more full attempt past it.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if Instant::now() >= deadline {
+                    return RetryOutcome::DeadlineExceeded(e);
+                }
+            }
+            Err(e) => return RetryOutcome::Terminal(e),
+        }
+    }
+}
+
 /// Re-anchor, retrying only the transient coordinator-transition races (see
 /// `is_transient_coordinator_error`) from a group that has just shut down,
 /// bounded by a 45s deadline; any other error fails immediately.
@@ -242,22 +279,53 @@ async fn reset_when_inactive<T: Topic>(
     to: KafkaOffsetReset,
 ) -> KafkaOffsetResetReport {
     let deadline = Instant::now() + Duration::from_secs(45);
-    loop {
-        match broker.reset_consumer_group_offsets::<T>(config, to).await {
-            Ok(report) => return report,
-            Err(e) if is_transient_coordinator_error(&e) => {
-                // Checked here, not in the match guard, so a transient error
-                // that outlives the deadline is still attributed to the
-                // retried-and-timed-out path rather than falling through to
-                // the fail-fast panic below.
-                if Instant::now() >= deadline {
-                    panic!("coordinator never settled after 45s of retries: {e}");
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            Err(e) => panic!("offset reset failed: {e}"),
+    let attempt = || broker.reset_consumer_group_offsets::<T>(config, to);
+    match retry_transient_until(deadline, attempt).await {
+        RetryOutcome::Settled(report) => report,
+        RetryOutcome::DeadlineExceeded(e) => {
+            panic!("coordinator never settled after 45s of retries: {e}")
         }
+        RetryOutcome::Terminal(e) => panic!("offset reset failed: {e}"),
     }
+}
+
+/// The deadline must bound when an attempt may *start*, not just how long
+/// transient errors keep being tolerated: one reset attempt issues several
+/// RPCs (group list, fetch/commit offsets), so an attempt that begins at the
+/// boundary runs unbounded past the promised 45s. Paused time makes the
+/// schedule exact — attempts fire every 500ms and the loop must give up at the
+/// deadline instead of launching one more.
+#[tokio::test(start_paused = true)]
+async fn no_retry_attempt_starts_at_or_after_the_deadline() {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let starts = std::sync::Mutex::new(Vec::new());
+
+    let outcome = retry_transient_until::<(), _, _>(deadline, || {
+        starts
+            .lock()
+            .expect("start recorder poisoned")
+            .push(Instant::now());
+        async {
+            Err(ShoveError::Connection(
+                "failed to read committed offsets for group 'g': Meta data \
+                 fetch error: NotCoordinator (Broker: Not coordinator)"
+                    .to_string(),
+            ))
+        }
+    })
+    .await;
+
+    assert!(
+        matches!(outcome, RetryOutcome::DeadlineExceeded(_)),
+        "a never-settling transient error must end as DeadlineExceeded"
+    );
+    let starts = starts.lock().expect("start recorder poisoned");
+    assert!(!starts.is_empty(), "the loop never attempted at all");
+    let late = starts.iter().filter(|s| **s >= deadline).count();
+    assert_eq!(
+        late, 0,
+        "{late} attempt(s) started at or after the 45s deadline"
+    );
 }
 
 /// One row per (error, expected classification). The `Connection` fixtures are
