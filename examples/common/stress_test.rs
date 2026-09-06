@@ -6004,8 +6004,8 @@ fn unsupported_for_group_backend<B: Backend>(hcfg: &HarnessConfig<B>) -> Vec<Uns
     if hcfg.batch_consume.is_none() {
         out.push(Unsupported {
             flow: Flow::ConsumeBatch.as_str().to_string(),
-            reason: "the stress harness wires a batch consume flow only for the Kafka \
-                     and InMemory backends; this reflects harness wiring, not which \
+            reason: "this backend's stress binary does not wire a batch consume \
+                     flow; that is harness wiring, not a statement about which \
                      backends implement the primitive (see `HasBatchConsumption`)"
                 .to_string(),
         });
@@ -6037,8 +6037,8 @@ fn unsupported_for_supervisor_backend<B: Backend>(hcfg: &HarnessConfig<B>) -> Ve
     if hcfg.batch_consume.is_none() {
         out.push(Unsupported {
             flow: Flow::ConsumeBatch.as_str().to_string(),
-            reason: "the stress harness wires a batch consume flow only for the Kafka \
-                     and InMemory backends; this reflects harness wiring, not which \
+            reason: "this backend's stress binary does not wire a batch consume \
+                     flow; that is harness wiring, not a statement about which \
                      backends implement the primitive (see `HasBatchConsumption`)"
                 .to_string(),
         });

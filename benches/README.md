@@ -171,12 +171,21 @@ Run backends one after another, never in parallel. Two harnesses on one host
 contend for CPU and skew each other's windows, and two merges into the same
 document race.
 
-Kafka is the reference backend for the batched-consume flow, and the only one
-besides in-memory the harness wires it for. Its batch and parallel scenarios
-declare one partition per consumer so every group member gets work. Its
-`publish_single` row is bounded by librdkafka's default 5 ms `linger.ms`,
-because the publisher awaits each delivery report. That is shove's default
-configuration and is what the row is meant to show.
+Every backend's stress binary wires the batch-consume driver, so
+`consume_batch` is measured wherever the backend implements
+`HasBatchConsumption` rather than recorded as a capability hole. SQS is the
+one backend whose batch size does not come from the matrix: `ReceiveMessage`,
+`DeleteMessageBatch` and `ChangeMessageVisibilityBatch` all cap at 10 entries,
+shove's SQS batch consumer rejects a larger `max_batch_size` at startup rather
+than clamping it, and the matrix's size exceeds that. The harness clamps to 10
+when it builds the scenario and the row records 10, so an SQS batch bar is a
+10-message batch and is not like-for-like against a backend that ran 500.
+
+Kafka is the reference backend for the batched-consume flow. Its batch and
+parallel scenarios declare one partition per consumer so every group member
+gets work. Its `publish_single` row is bounded by librdkafka's default 5 ms
+`linger.ms`, because the publisher awaits each delivery report. That is
+shove's default configuration and is what the row is meant to show.
 
 Budget about an hour per Docker backend for the full matrix: per consume
 cell a fill of up to six million messages, a drain of several seconds, three
