@@ -146,6 +146,12 @@ shove::define_topic!(
     TopologyBuilder::new("nats-batch-idle").build()
 );
 
+shove::define_topic!(
+    SupplyTopic,
+    BatchMessage,
+    TopologyBuilder::new("nats-batch-supply").build()
+);
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -261,6 +267,30 @@ impl RecordingBatchHandler {
         self.batches().into_iter().flatten().collect()
     }
 
+    /// Wait until at least `n` distinct `seq` values have been handled.
+    /// Counts unique values so an at-least-once redelivery cannot satisfy
+    /// the wait early.
+    async fn wait_for_seen(&self, n: usize, timeout: Duration) -> bool {
+        let unique = |batches: &Vec<Vec<u32>>| {
+            let mut seen: Vec<u32> = batches.iter().flatten().copied().collect();
+            seen.sort_unstable();
+            seen.dedup();
+            seen.len()
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            if unique(&self.batches.lock().unwrap()) >= n {
+                return true;
+            }
+            tokio::select! {
+                _ = self.signal.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return unique(&self.batches.lock().unwrap()) >= n;
+                }
+            }
+        }
+    }
+
     /// Wait until at least `n` batches have been flushed.
     async fn wait_for_batches(&self, n: usize, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
@@ -310,6 +340,7 @@ impl_recording_for!(
     PoisonTopic,
     OversizeTopic,
     IdleTopic,
+    SupplyTopic,
 );
 
 // ---------------------------------------------------------------------------
@@ -596,6 +627,82 @@ async fn batch_flushes_on_max_batch_age() {
     let mut seen = handler.seen();
     seen.sort_unstable();
     assert_eq!(seen, vec![0, 1, 2]);
+    broker.close().await;
+}
+
+/// CAF regression: with several workers attached to the bootstrap durable, a
+/// pre-filled stream must drain at the speed of supply, not at
+/// `max_batch_size / max_batch_age`.
+///
+/// JetStream serves every concurrent pull request on a durable from one shared
+/// `max_ack_pending` budget. When the bootstrap sized that budget to a single
+/// batch, two workers' overlapping pulls each received a *partial* fill, and a
+/// partial pull cannot terminate by count — it stays pinned open until the
+/// server-side `expires` (= `max_batch_age`) fires. Throughput then collapses
+/// to `budget / age` no matter how many messages are waiting.
+///
+/// With 3,000 messages, size 100 and age 500ms, the expiry-bound behaviour
+/// needs ≈ (3000/100) × 0.5s = 15s to drain; a supply-bound drain takes a
+/// couple of seconds at most. The 6s ceiling sits between the two with margin
+/// on both sides, and the clock starts only after the fully-awaited publish
+/// loop, so publish RTTs on a slow box are not inside the asserted window.
+#[tokio::test]
+async fn a_prefilled_stream_drains_bound_by_supply_not_age() {
+    const MESSAGES: u32 = 3_000;
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<SupplyTopic>().await.unwrap();
+    publish_seq::<SupplyTopic>(&broker, 0..MESSAGES).await;
+
+    let handler = RecordingBatchHandler::new();
+    let shutdown = CancellationToken::new();
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let h = handler.clone();
+        let sc = shutdown.clone();
+        let consumer = broker.batch_consumer();
+        handles.push(tokio::spawn(async move {
+            consumer
+                .run::<SupplyTopic, _>(
+                    h,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(100)
+                        .with_max_batch_age(Duration::from_millis(500))
+                        .with_shutdown(sc),
+                )
+                .await
+        }));
+    }
+
+    // The deadline is deliberately far above the buggy floor so a regression
+    // fails on the measured elapsed time below, not on a hung wait.
+    let started = Instant::now();
+    let drained = handler
+        .wait_for_seen(MESSAGES as usize, Duration::from_secs(40))
+        .await;
+    let elapsed = started.elapsed();
+    shutdown.cancel();
+    for handle in handles {
+        handle.await.unwrap().ok();
+    }
+
+    assert!(
+        drained,
+        "expected all {MESSAGES} messages to be consumed, saw {} unique",
+        {
+            let mut seen = handler.seen();
+            seen.sort_unstable();
+            seen.dedup();
+            seen.len()
+        }
+    );
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "drain took {elapsed:?}: bound by max_batch_age (expiry-bound floor \
+         ≈ 15s), not by supply"
+    );
     broker.close().await;
 }
 

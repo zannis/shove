@@ -1740,15 +1740,29 @@ impl NatsConsumer {
     ///
     /// Binds the same durable (`{queue}-consumer`) as the single-message
     /// path. The fallback `create_consumer` — which applies **only** when
-    /// nothing pre-declared that durable — sizes `max_ack_pending` to
-    /// `max_batch_size` and `ack_wait` to [`derive_batch_ack_wait`]. A
-    /// pre-declared durable keeps whatever the registry gave it; since the
+    /// nothing pre-declared that durable — leaves `max_ack_pending`
+    /// **unbounded** (`-1`) and sizes `ack_wait` to [`derive_batch_ack_wait`].
+    /// Unbounded is deliberate: JetStream serves every concurrent pull request
+    /// on the durable from that one budget, and any finite value invites the
+    /// pathology where N attached workers split it, no request can fill to
+    /// `max_messages`, and every partial pull sits open until `expires` —
+    /// collapsing throughput to `budget / max_batch_age` while the stream is
+    /// full. In-flight exposure stays bounded without the budget's help: each
+    /// worker keeps at most one outstanding pull of at most `max_batch_size`
+    /// messages and settles it at flush.
+    ///
+    /// A pre-declared durable keeps whatever the registry gave it; since the
     /// server stops delivering at the unacked budget and this loop acks only
     /// at flush, the per-pull size is **clamped to the durable's
     /// `max_ack_pending`** (when positive and smaller) with a startup warning
     /// — the clamp plus the request expiry guarantees forward progress in
-    /// ≤budget-sized batches rather than a silent deadlock. A second warning
-    /// fires when the durable's `ack_wait` is below the batch window plus the
+    /// ≤budget-sized batches rather than a silent deadlock. A budget that
+    /// covers only a single batch (this includes durables created by the
+    /// pre-unbounded bootstrap, which persist server-side across an upgrade)
+    /// draws its own warning: one worker runs fine, but concurrent workers
+    /// split it and flushes go expiry-bound — recreate the durable or raise
+    /// its budget for multi-worker use. A further warning fires when the
+    /// durable's `ack_wait` is below the batch window plus the
     /// handler-timeout margin, where a slow flush risks mid-flight redelivery
     /// (duplicates, never loss).
     ///
@@ -1831,7 +1845,14 @@ impl NatsConsumer {
                             .create_consumer(PullConsumerConfig {
                                 durable_name: Some(consumer_name.clone()),
                                 ack_policy: AckPolicy::Explicit,
-                                max_ack_pending: i64::try_from(max_batch_size).unwrap_or(i64::MAX),
+                                // Unbounded on purpose — see the doc block: a
+                                // finite budget is split across every attached
+                                // worker's pull request, and a request that
+                                // cannot fill to `max_messages` waits out the
+                                // whole `expires` window even when the stream
+                                // has supply. Flight stays bounded by the pull
+                                // requests themselves (≤ one batch per worker).
+                                max_ack_pending: -1,
                                 ack_wait: batch_ack_wait,
                                 ..Default::default()
                             })
@@ -1861,8 +1882,27 @@ impl NatsConsumer {
                         );
                         b
                     }
+                    Ok(b) if b >= max_batch_size && b < max_batch_size.saturating_mul(2) => {
+                        // Most likely a durable created by the bootstrap
+                        // before it went unbounded (which wrote exactly one
+                        // batch of budget, and persists server-side across an
+                        // upgrade). Fine for one worker; concurrent workers
+                        // split the budget, no pull can fill, and every flush
+                        // waits out the full window.
+                        tracing::warn!(
+                            queue,
+                            max_batch_size,
+                            max_ack_pending = budget,
+                            "the durable's max_ack_pending covers only a single \
+                             batch; with more than one attached batch worker, \
+                             concurrent pulls split the budget and flushes \
+                             become expiry-bound — recreate the durable (or \
+                             raise its budget) for multi-worker use"
+                        );
+                        max_batch_size
+                    }
                     // Zero/negative budget means unbounded, and a budget at or
-                    // above the batch size needs no clamp.
+                    // above twice the batch size needs no clamp and no warning.
                     _ => max_batch_size,
                 };
                 if !ack_wait.is_zero() && ack_wait < batch_ack_wait {
