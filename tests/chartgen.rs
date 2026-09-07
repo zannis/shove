@@ -1394,7 +1394,7 @@ fn a_failed_cell_in_a_slice_is_named_in_the_caption() {
     let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
         .expect("chart should render");
     assert!(
-        svg.contains("kafka: 1 cell(s) in this slice failed to run"),
+        svg.contains("kafka: 1 cell in this slice failed to run"),
         "a failed cell must be named in the caption"
     );
     assert!(
@@ -1434,11 +1434,11 @@ fn failure_captions_group_the_backends_that_lost_the_same_count() {
         .expect("chart should render");
 
     assert!(
-        svg.contains("kafka, nats: 1 cell(s) in this slice failed to run"),
+        svg.contains("kafka, nats: 1 cell in this slice failed to run"),
         "backends that lost the same count share one caption line"
     );
     assert_eq!(
-        svg.matches("cell(s) in this slice failed to run").count(),
+        svg.matches("in this slice failed to run").count(),
         1,
         "the two backends share one line rather than taking one each"
     );
@@ -1484,12 +1484,56 @@ fn failure_captions_keep_backends_with_different_counts_apart() {
         .expect("chart should render");
 
     assert!(
-        svg.contains("nats: 1 cell(s) in this slice failed to run"),
+        svg.contains("nats: 1 cell in this slice failed to run"),
         "a backend that lost one cell says one"
     );
     assert!(
-        svg.contains("kafka: 2 cell(s) in this slice failed to run"),
+        svg.contains("kafka: 2 cells in this slice failed to run"),
         "a backend that lost two says two"
+    );
+}
+
+#[test]
+fn the_grouped_failure_note_fits_one_caption_line_with_every_backend_named() {
+    // Grouping backends onto one line only saves that line if the grouped
+    // sentence itself fits: a caption line is NOTE_WRAP characters, and the
+    // wording wrapped onto a second line as soon as three backends were
+    // named. The worst case is the whole sealed backend set losing the same
+    // cell — which is the expected shape here, since the cell the published
+    // document already fails on ("consumed before assembly" at 64 KiB) fails
+    // harder the faster the backend, so a faster host loses it on more of
+    // them. That lands in `parallel-vs-sequenced`, the family with the least
+    // caption headroom, so a wrap here is the difference between a chart and
+    // a refusal.
+    let failing = |backend: &str| {
+        format!(
+            r#"{{
+              "backend": "{backend}", "representative": true,
+              "results": [{}],
+              "failures": [{{
+                "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 64,
+                "tier": "moderate", "messages": 150000, "consumers": 8,
+                "handler": "zero (no-op)", "method": "drain", "error": "timeout after 60s"
+              }}],
+              "unsupported": []
+            }}"#,
+            scenario("consume_parallel", "parallel", 64, 1, 9_000.0)
+        )
+    };
+    let runs = ["inmemory", "kafka", "nats", "rabbitmq", "redis", "sqs"]
+        .map(failing)
+        .join(",");
+    let doc = parse(&document(&runs));
+
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+
+    assert!(
+        svg.contains(
+            "inmemory, kafka, nats, rabbitmq, redis, sqs: 1 cell in this slice failed to run \
+             — absent, not zero; see failures[]"
+        ),
+        "the grouped note must stay on one line with every backend named"
     );
 }
 
@@ -1661,7 +1705,7 @@ fn an_empty_run_with_recorded_failures_is_not_silent() {
     let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
         .expect("chart should render");
     assert!(
-        svg.contains("kafka: 1 cell(s) in this slice failed to run"),
+        svg.contains("kafka: 1 cell in this slice failed to run"),
         "the failed cell must surface in the caption"
     );
 }
