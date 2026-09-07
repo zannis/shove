@@ -2319,22 +2319,38 @@ fn shape_only_note(run: &BackendRun) -> String {
 /// Caption lines for cells the harness ran and could not measure in a chart's
 /// slice. A failed cell is absent from `results[]`, and an unexplained
 /// absence reads as a smaller sweep — or, worse, as a capability hole.
+///
+/// One line per *count*, not one per backend. The sentence is the same for
+/// every backend that lost the same number of cells, and the slices a failure
+/// lands in are the ones already carrying the mode notes, the batch knobs and
+/// the drain account — the caption block has a fixed budget before the chart
+/// body has no room left, so restating the sentence per backend is what turns
+/// a second failed backend into a refusal. Backends sharing a count are named
+/// in document order; the lines run fewest failures first.
 fn failure_notes<P>(runs: &[BackendRun], in_slice: P) -> Vec<String>
 where
     P: Fn(&FailedRow) -> bool,
 {
-    let mut notes = Vec::new();
+    let mut by_count: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
     for run in runs {
         let failed = run.failures.iter().filter(|f| in_slice(f)).count();
         if failed > 0 {
-            notes.push(format!(
-                "{}: {failed} cell(s) in this slice failed to run — absent, \
-                 not zero; see failures[] in the results document",
-                run.backend
-            ));
+            by_count
+                .entry(failed)
+                .or_default()
+                .push(run.backend.as_str());
         }
     }
-    notes
+    by_count
+        .into_iter()
+        .map(|(failed, backends)| {
+            format!(
+                "{}: {failed} cell(s) in this slice failed to run — absent, \
+                 not zero; see failures[] in the results document",
+                backends.join(", ")
+            )
+        })
+        .collect()
 }
 
 /// The best-observed row by throughput. First-wins on exact ties, which keeps
