@@ -20,9 +20,14 @@
 //! [`BatchConsumerOptionsInner`], [`BatchConsumerImpl`],
 //! [`validate_batch_topic`], [`BatchSettlement`] and [`settle_batch_outcome`]
 //! are ungated, so their unit tests run under `cargo nextest run
-//! --no-default-features` with no backend compiled at all — the same
+//! --no-default-features` with no backend compiled at all. For the ones with
+//! no ungated call site that is the same
 //! `#[allow(dead_code)]`-over-losing-coverage trade `ConsumerOptionsInner`
-//! and `settle_broadcast_outcome` already make.
+//! and `settle_broadcast_outcome` already make. [`BatchConsumerImpl`] is the
+//! exception: it carries no such allow, because the ungated
+//! [`BatchConsumer::run`](crate::batch_consumer::BatchConsumer::run) calls
+//! [`run_batch`](BatchConsumerImpl::run_batch) in every build, implementors
+//! present or not — see the trait's own doc.
 //!
 //! The shared flush-invoking/backoff machinery
 //! ([`settling::invoke_batch_handler`],
@@ -34,11 +39,13 @@
 //! module's gate has no re-export copy to keep in sync. A new batching
 //! backend still widens more than that one cfg, though:
 //! [`settling::PREALLOC_CAP`] carries its own deliberately narrower list
-//! (see its doc for why SQS does not join it), and the feature-listed
-//! gates on `mod retry` and `mod routing` in `lib.rs` — both of which
-//! `settling` imports from — must each stay supersets of this module's
-//! gate. Kafka-only option fields on [`BatchConsumerOptionsInner`] keep
-//! their own narrower cfgs at the module root.
+//! (see its doc for why SQS does not join it); the feature-listed gates on
+//! `mod retry` and `mod routing` in `lib.rs` — both of which `settling`
+//! imports from — must each stay supersets of this module's gate; and the
+//! new backend's own Cargo feature must pull `dep:futures-util`, which
+//! `settling` imports unconditionally for `FutureExt::catch_unwind`.
+//! Kafka-only option fields on [`BatchConsumerOptionsInner`] keep their own
+//! narrower cfgs at the module root.
 //!
 //! `TerminalDiscard`, `RejectSettlement` and `reject_settlement` are
 //! narrower still: `#[cfg(feature = "kafka")]` *inside* the [`settling`]

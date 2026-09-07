@@ -2168,8 +2168,8 @@ struct RabbitMqBatch<T: Topic> {
     parked: Vec<(u64, metrics::FailReason)>,
     /// Pre-allocation installed by [`Self::take_messages`] —
     /// `effective_max_batch_size` clamped to [`PREALLOC_CAP`], never the raw
-    /// value, for the same `Vec::with_capacity`-overflow reason both other
-    /// backends clamp it.
+    /// value, for the same `Vec::with_capacity`-overflow reason every other
+    /// backend that clamps it does.
     cap: usize,
 }
 
@@ -2430,9 +2430,12 @@ impl RabbitMqConsumer {
     /// fill, stalling every flush until `max_batch_age`. So the channel's
     /// prefetch is set to the flush threshold, and both are
     /// `min(max_batch_size, u16::MAX)`: above 65 535 the configured size is
-    /// clamped (with a warning), a documented divergence from Kafka/InMemory,
-    /// which honour any size. The pre-allocation is separately clamped to
-    /// [`PREALLOC_CAP`], as on every backend.
+    /// clamped (with a warning), a documented divergence from the backends
+    /// that honour any configured size. SQS diverges the other way — it
+    /// rejects a size above its 10-message cap at consumer startup rather
+    /// than clamping. The pre-allocation is separately clamped to
+    /// [`PREALLOC_CAP`], as on every backend whose configured size is
+    /// otherwise unbounded.
     ///
     /// # Sequencing guard
     ///
@@ -2862,8 +2865,8 @@ mod tests {
 
     /// `with_max_batch_size(usize::MAX)` passes the public `> 0` assert; the
     /// buffer must clamp its pre-allocation rather than aborting inside
-    /// `Vec::with_capacity` — the same [`PREALLOC_CAP`] trade both other
-    /// backends make.
+    /// `Vec::with_capacity` — the same [`PREALLOC_CAP`] trade every other
+    /// backend that clamps it makes.
     #[test]
     fn batch_buffer_clamps_the_preallocation_not_the_batch_size() {
         struct BufTopic;

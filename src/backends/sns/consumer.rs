@@ -1898,10 +1898,11 @@ where
 // rejected via the existing single-message [`router::route_reject`] the
 // moment it is decoded, with its true [`metrics::FailReason`] (`Oversize` or
 // `Deserialize`), and does not count toward `flush_len`/`max_batch_size` or
-// arm the age deadline. Kafka and InMemory park an equivalent drop until
-// their batch's flush, because their drops must ride the same commit their
-// batch's other messages retire through (Kafka's offsets must commit past
-// them; InMemory owns the envelope outright until the flush resolves it).
+// arm the age deadline. The backends whose drops must ride the same commit
+// their batch's other messages retire through park an equivalent drop until
+// their batch's flush instead (Kafka's offsets must commit past them;
+// InMemory owns the envelope outright until the flush resolves it; RabbitMQ
+// holds the tag unacked in the prefetch window until the flush settles it).
 // Neither reason exists here: every SQS message settles independently by
 // receipt handle, and shove never publishes to a DLQ on this backend, so a
 // drop settled at receive time is exactly as final as one settled at flush
@@ -1958,11 +1959,11 @@ fn validate_sqs_batch_size(max_batch_size: usize) -> Result<()> {
 /// `messages` into the handler by value while `handles` survives the flush
 /// to settle afterward.
 ///
-/// No `cap`/`PREALLOC_CAP` clamp, unlike Kafka's `BatchBuffer` and
-/// InMemory's `InMemoryBatch`: [`validate_sqs_batch_size`] already bounds
-/// `max_batch_size` to at most [`SQS_MAX_BATCH`] (10) before this is ever
-/// constructed, so sizing the initial allocation to the real cap can never
-/// overflow the way an unclamped `usize::MAX` could on those two backends.
+/// No `cap`/`PREALLOC_CAP` clamp, unlike every other batching backend's
+/// buffer: [`validate_sqs_batch_size`] already bounds `max_batch_size` to at
+/// most [`SQS_MAX_BATCH`] (10) before this is ever constructed, so sizing the
+/// initial allocation to the real cap can never overflow the way an unclamped
+/// `usize::MAX` could where the configured size is unbounded.
 struct SqsBatch<T: Topic> {
     messages: Vec<(T::Message, MessageMetadata)>,
     handles: Vec<String>,
