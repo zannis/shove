@@ -267,39 +267,6 @@ impl RecordingBatchHandler {
         self.batches().into_iter().flatten().collect()
     }
 
-    /// Wait until at least `n` distinct `seq` values have been handled.
-    /// Counts unique values so an at-least-once redelivery cannot satisfy
-    /// the wait early.
-    async fn wait_for_seen(&self, n: usize, timeout: Duration) -> bool {
-        let unique = |batches: &Vec<Vec<u32>>| {
-            let mut seen: Vec<u32> = batches.iter().flatten().copied().collect();
-            seen.sort_unstable();
-            seen.dedup();
-            seen.len()
-        };
-        let deadline = Instant::now() + timeout;
-        loop {
-            // Enrolled on the waitlist *before* the count is read. `record`
-            // signals with `notify_waiters`, which stores no permit, so a
-            // flush landing between the check and the await would otherwise
-            // be lost and this would sit to `deadline` — which the caller
-            // measures, so a lost wakeup reads as a slow drain.
-            let notified = self.signal.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            if unique(&self.batches.lock().unwrap()) >= n {
-                return true;
-            }
-            tokio::select! {
-                () = notified => {}
-                _ = tokio::time::sleep_until(deadline) => {
-                    return unique(&self.batches.lock().unwrap()) >= n;
-                }
-            }
-        }
-    }
-
     /// Wait until at least `n` batches have been flushed.
     async fn wait_for_batches(&self, n: usize, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
@@ -650,19 +617,35 @@ async fn batch_flushes_on_max_batch_age() {
 /// server-side `expires` (= `max_batch_age`) fires. Throughput then collapses
 /// to `budget / age` no matter how many messages are waiting.
 ///
-/// With 3,000 messages, size 100 and age 500ms, the expiry-bound behaviour
-/// needs ≈ (3000/100) × 0.5s = 15s to drain; a supply-bound drain takes a
-/// couple of seconds. The ceiling is derived from that floor rather than
-/// hardcoded, at 60% of it, so it sits between the two behaviours with
-/// ≥1.6x margin on both sides — measured 15.1s bound / ~2s supply-bound. The
-/// clock starts only after the fully-awaited publish loop, so publish RTTs on
-/// a slow box are not inside the asserted window, and the elapsed time is
-/// printed either way so a CI failure shows which side of the gap it landed.
+/// Two gates, deliberately: one on the mechanism and one on the clock.
+///
+/// The **mechanism** gate is the primary one, because it does not depend on
+/// how fast the machine is. Under the bug every concurrent pull gets a partial
+/// fill, so almost no flushed batch reaches `max_batch_size`; when supply is
+/// what bounds the drain, nearly all of them do (only the tail is short). This
+/// is asserted on the recorded batch sizes, with no clock in it — which
+/// matters because the `nats` CI leg runs this suite under
+/// `cargo llvm-cov nextest`, fully instrumented, on a shared runner.
+///
+/// The **clock** gate is the acceptance criterion stated literally: with 3,000
+/// messages at size 100 and age 500ms the expiry-bound drain needs
+/// ≈ (3000/100) × 0.5s = 15s, so the ceiling is derived from that floor at 60%
+/// of it rather than hardcoded. Measured on an idle host: 12.6s and 13.1s
+/// bound, 0.76s supply-bound — so the ceiling has ~1.4x margin over the defect
+/// and ~11.8x headroom under a correct run, which is the room instrumentation
+/// and runner contention have to eat into. The clock starts after the
+/// fully-awaited publish loop, so publish RTTs are outside the window, and
+/// the elapsed time is printed either way.
+///
+/// The two-worker premise is asserted, not assumed: a silently dead second
+/// worker would turn this into a single-worker drain, which is the one
+/// configuration the bug never affected, and it would pass.
 #[tokio::test]
 async fn a_prefilled_stream_drains_bound_by_supply_not_age() {
     const MESSAGES: u32 = 3_000;
     const BATCH_SIZE: u32 = 100;
     const BATCH_AGE: Duration = Duration::from_millis(500);
+    const WORKERS: usize = 2;
 
     // What the bug costs: one `max_batch_age` window per batch, whatever the
     // supply. Anything at or above this is the defect, not a slow runner.
@@ -674,10 +657,13 @@ async fn a_prefilled_stream_drains_bound_by_supply_not_age() {
     broker.topology().declare::<SupplyTopic>().await.unwrap();
     publish_seq::<SupplyTopic>(&broker, 0..MESSAGES).await;
 
-    let handler = RecordingBatchHandler::new();
+    // One handler per worker rather than a shared one: which worker flushed
+    // what is exactly the evidence the two-worker premise needs.
+    let handlers: Vec<RecordingBatchHandler> =
+        (0..WORKERS).map(|_| RecordingBatchHandler::new()).collect();
     let shutdown = CancellationToken::new();
     let mut handles = Vec::new();
-    for _ in 0..2 {
+    for handler in &handlers {
         let h = handler.clone();
         let sc = shutdown.clone();
         let consumer = broker.batch_consumer();
@@ -695,31 +681,75 @@ async fn a_prefilled_stream_drains_bound_by_supply_not_age() {
         }));
     }
 
-    // The deadline is deliberately far above the buggy floor so a regression
-    // fails on the measured elapsed time below, not on a hung wait.
+    // Distinct `seq` values across every worker, so an at-least-once
+    // redelivery cannot satisfy the wait early.
+    let unique_seen = |handlers: &[RecordingBatchHandler]| {
+        let mut seen: Vec<u32> = handlers
+            .iter()
+            .flat_map(RecordingBatchHandler::seen)
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        seen.len()
+    };
+
+    // A 10ms poll rather than the handlers' `Notify`: the drain is what this
+    // test measures, and a poll cannot lose a wakeup and bill the wait to the
+    // measurement. The 40s bound is far above the buggy floor so a regression
+    // fails on the assertions below, not on a hung wait.
     let started = Instant::now();
-    let drained = handler
-        .wait_for_seen(MESSAGES as usize, Duration::from_secs(40))
-        .await;
-    let elapsed = started.elapsed();
-    shutdown.cancel();
-    for handle in handles {
-        handle.await.unwrap().ok();
+    let deadline = started + Duration::from_secs(40);
+    while unique_seen(&handlers) < MESSAGES as usize && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    let elapsed = started.elapsed();
+    let seen = unique_seen(&handlers);
+    shutdown.cancel();
+    let outcomes: Vec<_> = {
+        let mut v = Vec::new();
+        for handle in handles {
+            v.push(handle.await.unwrap());
+        }
+        v
+    };
+
+    let per_worker: Vec<usize> = handlers.iter().map(|h| h.batches().len()).collect();
+    let sizes: Vec<usize> = handlers
+        .iter()
+        .flat_map(|h| h.batches())
+        .map(|b| b.len())
+        .collect();
+    let full = sizes.iter().filter(|n| **n >= BATCH_SIZE as usize).count();
     eprintln!(
-        "drained {MESSAGES} in {elapsed:?} (ceiling {ceiling:?}, \
-         expiry-bound floor {expiry_bound_floor:?})"
+        "drained {seen}/{MESSAGES} in {elapsed:?} (ceiling {ceiling:?}, expiry-bound \
+         floor {expiry_bound_floor:?}); {full}/{} batches reached {BATCH_SIZE}; \
+         per-worker flushes {per_worker:?}",
+        sizes.len()
     );
 
+    for (worker, outcome) in outcomes.iter().enumerate() {
+        assert!(
+            outcome.is_ok(),
+            "batch worker {worker} returned an error: {outcome:?}"
+        );
+    }
     assert!(
-        drained,
-        "expected all {MESSAGES} messages to be consumed, saw {} unique",
-        {
-            let mut seen = handler.seen();
-            seen.sort_unstable();
-            seen.dedup();
-            seen.len()
-        }
+        per_worker.iter().all(|n| *n > 0),
+        "every worker must have flushed at least one batch, or this is not the \
+         multi-worker configuration the bug needed: {per_worker:?}"
+    );
+    assert_eq!(
+        seen, MESSAGES as usize,
+        "expected all {MESSAGES} messages to be consumed"
+    );
+    // The mechanism: a pull that cannot fill is the bug. Half is a wide
+    // margin either way — under the defect essentially none fill, and when
+    // supply bounds the drain only the tail batches are short.
+    assert!(
+        full * 2 > sizes.len(),
+        "only {full} of {} flushed batches reached {BATCH_SIZE}: pulls are \
+         being served partial fills and waiting out max_batch_age",
+        sizes.len()
     );
     assert!(
         elapsed < ceiling,
