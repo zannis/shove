@@ -2358,10 +2358,16 @@ where
     by_count
         .into_iter()
         .map(|(failed, backends)| {
+            // Every word here is spent against a caption line the tightest
+            // family has one to spare of: naming the six backends and the
+            // count is what the reader cannot reconstruct, and "see
+            // failures[]" already says where — the provenance line under it
+            // names the document.
             format!(
-                "{}: {failed} cell(s) in this slice failed to run — absent, \
-                 not zero; see failures[] in the results document",
-                backends.join(", ")
+                "{}: {failed} cell{} in this slice failed to run — absent, \
+                 not zero; see failures[]",
+                backends.join(", "),
+                if failed == 1 { "" } else { "s" },
             )
         })
         .collect()
