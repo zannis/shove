@@ -1403,6 +1403,96 @@ fn a_failed_cell_in_a_slice_is_named_in_the_caption() {
     );
 }
 
+#[test]
+fn failure_captions_group_the_backends_that_lost_the_same_count() {
+    // The note names a backend and a count, and says the same sentence about
+    // both. A line per backend spends the caption budget restating it: the
+    // slice a failure is most likely to land in already carries the mode
+    // notes, the batch knobs, the drain account and the provenance, so on a
+    // six-backend document two failed backends are the difference between a
+    // chart and a refusal. Backends that lost the same number of cells share
+    // a line, named in document order.
+    let failing = |backend: &str, consumers: u32| {
+        format!(
+            r#"{{
+              "backend": "{backend}", "representative": true,
+              "results": [{}],
+              "failures": [{{
+                "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 64,
+                "tier": "moderate", "messages": 150000, "consumers": {consumers},
+                "handler": "zero (no-op)", "method": "drain", "error": "timeout after 60s"
+              }}],
+              "unsupported": []
+            }}"#,
+            scenario("consume_parallel", "parallel", 64, 1, 9_000.0)
+        )
+    };
+    let runs = [inmemory_run(true), failing("kafka", 4), failing("nats", 8)].join(",");
+    let doc = parse(&document(&runs));
+
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+
+    assert!(
+        svg.contains("kafka, nats: 1 cell(s) in this slice failed to run"),
+        "backends that lost the same count share one caption line"
+    );
+    assert_eq!(
+        svg.matches("cell(s) in this slice failed to run").count(),
+        1,
+        "the two backends share one line rather than taking one each"
+    );
+    assert!(
+        svg.contains("absent, not zero"),
+        "the grouped line must still say how to read the absence"
+    );
+}
+
+#[test]
+fn failure_captions_keep_backends_with_different_counts_apart() {
+    // Grouping is by what the line says. Two backends that lost different
+    // numbers of cells do not say the same thing, so they keep their own
+    // lines — ordered by count, so the ordering does not depend on which
+    // backend the harness happened to measure first.
+    let failed_cell = |consumers: u32| {
+        format!(
+            r#"{{
+              "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 64,
+              "tier": "moderate", "messages": 150000, "consumers": {consumers},
+              "handler": "zero (no-op)", "method": "drain", "error": "timeout after 60s"
+            }}"#
+        )
+    };
+    let run = |backend: &str, failures: &str| {
+        format!(
+            r#"{{
+              "backend": "{backend}", "representative": true,
+              "results": [{}], "failures": [{failures}], "unsupported": []
+            }}"#,
+            scenario("consume_parallel", "parallel", 64, 1, 9_000.0)
+        )
+    };
+    let runs = [
+        inmemory_run(true),
+        run("kafka", &format!("{},{}", failed_cell(4), failed_cell(8))),
+        run("nats", &failed_cell(4)),
+    ]
+    .join(",");
+    let doc = parse(&document(&runs));
+
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+
+    assert!(
+        svg.contains("nats: 1 cell(s) in this slice failed to run"),
+        "a backend that lost one cell says one"
+    );
+    assert!(
+        svg.contains("kafka: 2 cell(s) in this slice failed to run"),
+        "a backend that lost two says two"
+    );
+}
+
 // ── Family 3 slices plain consume flows at their own worker counts ──────────
 
 #[test]
