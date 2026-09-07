@@ -1878,31 +1878,41 @@ impl NatsConsumer {
                             "clamping the per-pull batch size to the consumer's \
                              max_ack_pending — a batch larger than the unacked budget \
                              can never fill, and every flush would wait out the full \
-                             window"
+                             window; the budget is shared by every attached worker, so \
+                             size it at max_batch_size x workers to keep flushes \
+                             supply-bound rather than expiry-bound"
                         );
                         b
                     }
                     Ok(b) if b >= max_batch_size && b < max_batch_size.saturating_mul(2) => {
-                        // Most likely a durable created by the bootstrap
-                        // before it went unbounded (which wrote exactly one
-                        // batch of budget, and persists server-side across an
-                        // upgrade). Fine for one worker; concurrent workers
-                        // split the budget, no pull can fill, and every flush
-                        // waits out the full window.
+                        // The band is `[size, 2*size)` because that is where a
+                        // *second* worker provably cannot fill: two concurrent
+                        // pulls need 2*size of budget between them. It also
+                        // catches the durable this bootstrap wrote before it
+                        // went unbounded (exactly one batch of budget, which
+                        // persists server-side across an upgrade). A budget at
+                        // or above 2*size is left alone even though it is still
+                        // too small for enough workers — the consumer cannot
+                        // know how many will attach, so the warning names the
+                        // rule instead of guessing the count.
                         tracing::warn!(
                             queue,
                             max_batch_size,
                             max_ack_pending = budget,
                             "the durable's max_ack_pending covers only a single \
-                             batch; with more than one attached batch worker, \
-                             concurrent pulls split the budget and flushes \
-                             become expiry-bound — recreate the durable (or \
-                             raise its budget) for multi-worker use"
+                             batch, and it is shared by every attached worker: \
+                             fine for one, but a second worker's concurrent pull \
+                             splits the budget so neither can fill and both \
+                             flushes go expiry-bound. Size the budget at \
+                             max_batch_size x workers (or recreate the durable to \
+                             take shove's unbounded default) before running more \
+                             than one batch worker"
                         );
                         max_batch_size
                     }
                     // Zero/negative budget means unbounded, and a budget at or
-                    // above twice the batch size needs no clamp and no warning.
+                    // above twice the batch size fits at least two concurrent
+                    // pulls, so it needs no clamp and no warning.
                     _ => max_batch_size,
                 };
                 if !ack_wait.is_zero() && ack_wait < batch_ack_wait {

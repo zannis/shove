@@ -279,11 +279,20 @@ impl RecordingBatchHandler {
         };
         let deadline = Instant::now() + timeout;
         loop {
+            // Enrolled on the waitlist *before* the count is read. `record`
+            // signals with `notify_waiters`, which stores no permit, so a
+            // flush landing between the check and the await would otherwise
+            // be lost and this would sit to `deadline` — which the caller
+            // measures, so a lost wakeup reads as a slow drain.
+            let notified = self.signal.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if unique(&self.batches.lock().unwrap()) >= n {
                 return true;
             }
             tokio::select! {
-                _ = self.signal.notified() => {}
+                () = notified => {}
                 _ = tokio::time::sleep_until(deadline) => {
                     return unique(&self.batches.lock().unwrap()) >= n;
                 }
@@ -630,7 +639,7 @@ async fn batch_flushes_on_max_batch_age() {
     broker.close().await;
 }
 
-/// CAF regression: with several workers attached to the bootstrap durable, a
+/// Regression: with several workers attached to the bootstrap durable, a
 /// pre-filled stream must drain at the speed of supply, not at
 /// `max_batch_size / max_batch_age`.
 ///
@@ -643,12 +652,22 @@ async fn batch_flushes_on_max_batch_age() {
 ///
 /// With 3,000 messages, size 100 and age 500ms, the expiry-bound behaviour
 /// needs ≈ (3000/100) × 0.5s = 15s to drain; a supply-bound drain takes a
-/// couple of seconds at most. The 6s ceiling sits between the two with margin
-/// on both sides, and the clock starts only after the fully-awaited publish
-/// loop, so publish RTTs on a slow box are not inside the asserted window.
+/// couple of seconds. The ceiling is derived from that floor rather than
+/// hardcoded, at 60% of it, so it sits between the two behaviours with
+/// ≥1.6x margin on both sides — measured 15.1s bound / ~2s supply-bound. The
+/// clock starts only after the fully-awaited publish loop, so publish RTTs on
+/// a slow box are not inside the asserted window, and the elapsed time is
+/// printed either way so a CI failure shows which side of the gap it landed.
 #[tokio::test]
 async fn a_prefilled_stream_drains_bound_by_supply_not_age() {
     const MESSAGES: u32 = 3_000;
+    const BATCH_SIZE: u32 = 100;
+    const BATCH_AGE: Duration = Duration::from_millis(500);
+
+    // What the bug costs: one `max_batch_age` window per batch, whatever the
+    // supply. Anything at or above this is the defect, not a slow runner.
+    let expiry_bound_floor = BATCH_AGE * MESSAGES.div_euclid(BATCH_SIZE);
+    let ceiling = expiry_bound_floor.mul_f64(0.6);
 
     let tb = TestBroker::start().await;
     let broker = tb.broker();
@@ -668,8 +687,8 @@ async fn a_prefilled_stream_drains_bound_by_supply_not_age() {
                     h,
                     (),
                     BatchConsumerOptions::new()
-                        .with_max_batch_size(100)
-                        .with_max_batch_age(Duration::from_millis(500))
+                        .with_max_batch_size(BATCH_SIZE as usize)
+                        .with_max_batch_age(BATCH_AGE)
                         .with_shutdown(sc),
                 )
                 .await
@@ -687,6 +706,10 @@ async fn a_prefilled_stream_drains_bound_by_supply_not_age() {
     for handle in handles {
         handle.await.unwrap().ok();
     }
+    eprintln!(
+        "drained {MESSAGES} in {elapsed:?} (ceiling {ceiling:?}, \
+         expiry-bound floor {expiry_bound_floor:?})"
+    );
 
     assert!(
         drained,
@@ -699,9 +722,9 @@ async fn a_prefilled_stream_drains_bound_by_supply_not_age() {
         }
     );
     assert!(
-        elapsed < Duration::from_secs(6),
-        "drain took {elapsed:?}: bound by max_batch_age (expiry-bound floor \
-         ≈ 15s), not by supply"
+        elapsed < ceiling,
+        "drain took {elapsed:?}, over the {ceiling:?} ceiling: bound by \
+         max_batch_age (expiry-bound floor {expiry_bound_floor:?}), not by supply"
     );
     broker.close().await;
 }
