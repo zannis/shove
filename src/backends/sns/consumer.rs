@@ -2284,8 +2284,8 @@ where
 
             // Pre-handler drop: settles immediately via the single-message
             // `route_reject`, outside the batch — see the module doc's
-            // "Pre-handler drops" section for why this does not park like
-            // Kafka/InMemory.
+            // "Pre-handler drops" section for why this does not park until
+            // the flush the way the parking backends do.
             if let Err(e) = validate_message_size(body.len(), max_message_size) {
                 warn!(error = %e, queue_url, "rejecting oversized message (pre-handler drop)");
                 router::route_reject(

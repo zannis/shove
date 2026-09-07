@@ -2138,9 +2138,10 @@ const RECONNECT_BACKOFF_FALLBACK: Duration = Duration::from_secs(30);
 /// prefetch window is a `u16`, and a batch is held **unacked** inside that
 /// window, so a threshold above it could never fill and every flush would
 /// stall until `max_batch_age`. This effective cap is a documented divergence
-/// from Kafka/InMemory, which honour any configured size (they clamp only the
+/// from the backends that honour any configured size (they clamp only the
 /// pre-allocation; that clamp applies here too, separately, in
-/// [`RabbitMqBatch::new`]).
+/// [`RabbitMqBatch::new`]). SQS diverges the other way, rejecting a size
+/// above its 10-message cap rather than clamping.
 fn effective_batch_size(configured: usize) -> usize {
     configured.max(1).min(u16::MAX as usize)
 }
@@ -2291,8 +2292,8 @@ fn ingest_batch_delivery<T: Topic>(
 
 /// Hand the buffered batch to the handler and settle the single returned
 /// [`Outcome`] via the shared [`settle_batch_outcome`] classifier — the same
-/// three-way split Kafka and InMemory use, with RabbitMQ's mechanics in each
-/// arm:
+/// three-way split every batching backend routes through, with RabbitMQ's
+/// mechanics in each arm:
 ///
 /// - `Commit`: parked pre-handler drops are individually nacked to the DLX
 ///   first (their tags interleave below the handled ones), then one

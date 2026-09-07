@@ -407,7 +407,8 @@ pub(crate) async fn reject_batch_multiple(
 /// table this is a re-buffer, not a republish — and since shove declares
 /// classic queues (no `x-queue-type`, so no quorum delivery-limit), a
 /// handler stuck returning `Retry` redelivers indefinitely here, exactly as
-/// on Kafka and InMemory.
+/// on the other backends that declare no delivery cap — see that same table
+/// for which those are.
 pub(crate) async fn redeliver_batch_multiple(channel: &Channel, highest_tag: u64) -> Result<()> {
     channel
         .basic_nack(
