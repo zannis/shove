@@ -2434,8 +2434,9 @@ impl RabbitMqConsumer {
     /// that honour any configured size. SQS diverges the other way — it
     /// rejects a size above its 10-message cap at consumer startup rather
     /// than clamping. The pre-allocation is separately clamped to
-    /// [`PREALLOC_CAP`], as on every backend whose configured size is
-    /// otherwise unbounded.
+    /// [`PREALLOC_CAP`], as on every batching backend except SQS — 65 535 is
+    /// still 16x that cap, so the clamp is load-bearing here too; only SQS's
+    /// 10-message ceiling bounds the allocation on its own.
     ///
     /// # Sequencing guard
     ///
