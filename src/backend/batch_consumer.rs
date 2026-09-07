@@ -20,14 +20,15 @@
 //! [`BatchConsumerOptionsInner`], [`BatchConsumerImpl`],
 //! [`validate_batch_topic`], [`BatchSettlement`] and [`settle_batch_outcome`]
 //! are ungated, so their unit tests run under `cargo nextest run
-//! --no-default-features` with no backend compiled at all. For the ones with
-//! no ungated call site that is the same
-//! `#[allow(dead_code)]`-over-losing-coverage trade `ConsumerOptionsInner`
-//! and `settle_broadcast_outcome` already make. [`BatchConsumerImpl`] is the
-//! exception: it carries no such allow, because the ungated
-//! [`BatchConsumer::run`](crate::batch_consumer::BatchConsumer::run) calls
-//! [`run_batch`](BatchConsumerImpl::run_batch) in every build, implementors
-//! present or not — see the trait's own doc.
+//! --no-default-features` with no backend compiled at all. Whichever of them
+//! a backend-free build leaves dead carries its own `#[allow(dead_code)]` —
+//! the same allow-over-losing-coverage trade `ConsumerOptionsInner` and
+//! `settle_broadcast_outcome` already make; each allow's own comment says
+//! which shape it covers, since the two differ (no caller at all, versus
+//! fields only *read* behind a feature gate). The rest need no allow because
+//! the ungated [`BatchConsumer::run`](crate::batch_consumer::BatchConsumer::run)
+//! reaches them in every build, implementors present or not. Check the
+//! attribute at each item rather than inferring it from this list.
 //!
 //! The shared flush-invoking/backoff machinery
 //! ([`settling::invoke_batch_handler`],
