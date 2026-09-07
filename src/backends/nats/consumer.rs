@@ -1747,9 +1747,16 @@ impl NatsConsumer {
     /// pathology where N attached workers split it, no request can fill to
     /// `max_messages`, and every partial pull sits open until `expires` —
     /// collapsing throughput to `budget / max_batch_age` while the stream is
-    /// full. In-flight exposure stays bounded without the budget's help: each
-    /// worker keeps at most one outstanding pull of at most `max_batch_size`
-    /// messages and settles it at flush.
+    /// full. In-flight exposure stays bounded without the budget's help: in
+    /// steady state each worker keeps at most one outstanding pull of at most
+    /// `max_batch_size` messages and settles it at flush. The exception is a
+    /// flapping connection — the server keeps serving an abandoned pull
+    /// request until its `expires`, and with no budget to cap it those
+    /// messages stay ack-pending for the full `ack_wait`. The failed cycle
+    /// Naks everything it actually received (see the `stream_error` arm) and
+    /// `run_with_reconnect` backs off between cycles, so the accumulation is
+    /// bounded by that rate rather than unbounded — but it is more than one
+    /// batch per worker while a server is flapping.
     ///
     /// A pre-declared durable keeps whatever the registry gave it; since the
     /// server stops delivering at the unacked budget and this loop acks only
