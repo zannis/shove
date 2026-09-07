@@ -371,11 +371,14 @@ pub(crate) mod settling {
     /// requirement.
     ///
     /// Deliberately narrower than the `settling` module's own gate: a backend
-    /// whose batch size is bounded before it allocates never calls this. SQS
-    /// is the case today — its cap is validated to `<= 10` before
-    /// `SqsBatch::new` ever allocates (`validate_sqs_batch_size`), so the
-    /// prealloc is already bounded at the source and this const has no call
-    /// site there. With no `#[allow(dead_code)]` of its own, including it in
+    /// whose batch size is bounded *below this cap* before it allocates never
+    /// calls this, because clamping to it would be a no-op. SQS is the case
+    /// today — its cap is validated to `<= 10` before `SqsBatch::new` ever
+    /// allocates (`validate_sqs_batch_size`), so the prealloc is already
+    /// bounded at the source and this const has no call site there. A bound
+    /// that merely exists is not enough: RabbitMQ bounds its size too, at
+    /// `u16::MAX`, but 65 535 is 16x this cap, so it clamps like the
+    /// unbounded backends do. With no `#[allow(dead_code)]` of its own, including it in
     /// the wider gate would fail that backend's feature-lint row (`cargo
     /// clippy --lib --no-default-features --features
     /// pub-aws-sns,aws-sns-sqs,...`) with an unused-const warning.

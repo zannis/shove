@@ -1898,12 +1898,13 @@ where
 // rejected via the existing single-message [`router::route_reject`] the
 // moment it is decoded, with its true [`metrics::FailReason`] (`Oversize` or
 // `Deserialize`), and does not count toward `flush_len`/`max_batch_size` or
-// arm the age deadline. The backends whose drops must ride the same commit
-// their batch's other messages retire through park an equivalent drop until
-// their batch's flush instead (Kafka's offsets must commit past them;
-// InMemory owns the envelope outright until the flush resolves it; RabbitMQ
-// holds the tag unacked in the prefetch window until the flush settles it).
-// Neither reason exists here: every SQS message settles independently by
+// arm the age deadline. Backends whose drops cannot be settled apart from
+// the batch park an equivalent drop until the flush instead, each for its own
+// reason: Kafka's offsets must commit past them; InMemory owns the envelope
+// outright until the flush resolves it; RabbitMQ leaves the tag unacked, so a
+// parked drop still occupies the channel's prefetch window and has to be
+// counted by `flush_len` (see its doc) to keep the size trigger honest. None
+// of those reasons exists here: every SQS message settles independently by
 // receipt handle, and shove never publishes to a DLQ on this backend, so a
 // drop settled at receive time is exactly as final as one settled at flush
 // time — parking it would only delay a settlement that is already as final

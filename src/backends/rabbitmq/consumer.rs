@@ -2168,8 +2168,12 @@ struct RabbitMqBatch<T: Topic> {
     parked: Vec<(u64, metrics::FailReason)>,
     /// Pre-allocation installed by [`Self::take_messages`] —
     /// `effective_max_batch_size` clamped to [`PREALLOC_CAP`], never the raw
-    /// value, for the same `Vec::with_capacity`-overflow reason every other
-    /// backend that clamps it does.
+    /// value. Not for the `Vec::with_capacity` overflow abort that motivates
+    /// the clamp on backends honouring any size: [`effective_batch_size`] has
+    /// already bounded this to `u16::MAX`, which cannot overflow. It is the
+    /// other half of [`PREALLOC_CAP`]'s job — 65 535 is 16x that cap, so
+    /// clamping still avoids a large up-front reservation for a batch that
+    /// may never fill.
     cap: usize,
 }
 
