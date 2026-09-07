@@ -4016,8 +4016,17 @@ fn render_parallel_vs_sequenced(
     notes.extend(mode_notes(&qualifiers));
 
     // One note when every backend's batch bar ran the same knobs (the usual
-    // case), per-backend notes when they differ — never silence, because the
+    // case), attributed notes when they differ — never silence, because the
     // knobs are what the bar's number means.
+    //
+    // Attributed does not mean one line per backend. A backend differs from
+    // the rest only rarely — SQS clamps to `ReceiveMessage`'s 10 while the
+    // matrix pins 500 for everyone else — so a line per backend spends six
+    // lines saying two things. The caption block has a fixed budget before
+    // the chart body has no room left, and the same slice also carries a
+    // drain note, the mode notes and the provenance; six backends is over
+    // it. Backends that ran the same knobs share one line, named in document
+    // order; the lines themselves run smallest batch first.
     let configs: BTreeSet<(u64, u64)> = batch_knobs.iter().map(|(_, s, a)| (*s, *a)).collect();
     match configs.len() {
         0 => {}
@@ -4028,9 +4037,15 @@ fn render_parallel_vs_sequenced(
             ));
         }
         _ => {
-            for (backend, size, age) in &batch_knobs {
+            for (size, age) in &configs {
+                let sharing: Vec<&str> = batch_knobs
+                    .iter()
+                    .filter(|(_, s, a)| (s, a) == (size, age))
+                    .map(|(backend, _, _)| backend.as_str())
+                    .collect();
                 notes.push(format!(
-                    "{backend} / batch: up to {size} messages or {age} ms per batch"
+                    "{} / batch: up to {size} messages or {age} ms per batch",
+                    sharing.join(", "),
                 ));
             }
         }
