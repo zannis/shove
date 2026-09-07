@@ -1959,6 +1959,7 @@ impl NatsConsumer {
                     let mut acks: Vec<Message> = Vec::with_capacity(prealloc);
                     let mut saw_messages = false;
                     let mut interrupted = false;
+                    let mut stream_error: Option<ShoveError> = None;
 
                     loop {
                         tokio::select! {
@@ -1974,9 +1975,10 @@ impl NatsConsumer {
                                         metrics::BackendLabel::Nats,
                                         metrics::BackendErrorKind::Consume,
                                     );
-                                    return Err(ShoveError::Connection(format!(
+                                    stream_error = Some(ShoveError::Connection(format!(
                                         "batch pull stream error on {queue}: {e}"
                                     )));
+                                    break;
                                 }
                                 Some(Ok(msg)) => {
                                     saw_messages = true;
@@ -1994,6 +1996,30 @@ impl NatsConsumer {
                                 }
                             }
                         }
+                    }
+
+                    if let Some(err) = stream_error {
+                        // This cycle took delivery of `acks` but never reached
+                        // the flush, so nothing handled them and nothing
+                        // settled them. `run_with_reconnect` retries, and
+                        // without the budget that used to cap it (the durable
+                        // is unbounded now) every failed cycle inside one
+                        // `ack_wait` window would leave another batch parked
+                        // ack-pending until that window expired. Nak instead:
+                        // best-effort, at-least-once holds either way, and the
+                        // retry sees them immediately. Same shape as the
+                        // shutdown arm below.
+                        for msg in acks {
+                            if let Err(e) = msg.ack_with(AckKind::Nak(None)).await {
+                                tracing::error!(
+                                    error = %e,
+                                    queue,
+                                    "failed to nak an unhandled batch message after a \
+                                     pull stream error; it redelivers on ack_wait"
+                                );
+                            }
+                        }
+                        return Err(err);
                     }
 
                     if interrupted {

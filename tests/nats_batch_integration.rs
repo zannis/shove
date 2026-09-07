@@ -627,15 +627,18 @@ async fn batch_flushes_on_max_batch_age() {
 /// matters because the `nats` CI leg runs this suite under
 /// `cargo llvm-cov nextest`, fully instrumented, on a shared runner.
 ///
-/// The **clock** gate is the acceptance criterion stated literally: with 3,000
-/// messages at size 100 and age 500ms the expiry-bound drain needs
-/// ≈ (3000/100) × 0.5s = 15s, so the ceiling is derived from that floor at 60%
-/// of it rather than hardcoded. Measured on an idle host: 12.6s and 13.1s
-/// bound, 0.76s supply-bound — so the ceiling has ~1.4x margin over the defect
-/// and ~11.8x headroom under a correct run, which is the room instrumentation
-/// and runner contention have to eat into. The clock starts after the
-/// fully-awaited publish loop, so publish RTTs are outside the window, and
-/// the elapsed time is printed either way.
+/// The **clock** gate covers what the mechanism gate cannot: a regression that
+/// fills its batches but still spends a window per round (no pipelining) would
+/// pass the fill check. Full batches means `MESSAGES / BATCH_SIZE` flushes
+/// split across the workers, so that shape costs
+/// `(3000/100 / 2) × 0.5s = 7.5s`; the shared-budget defect costs the full
+/// `(3000/100) × 0.5s = 15s`. The ceiling is 40% of that floor — 6s — which
+/// sits below both. Measured on an idle host: 267ms supply-bound, 13.1s and
+/// 15.2s under the defect. That is ~22x headroom for instrumentation
+/// (`cargo llvm-cov` on the CI leg) and runner contention to eat into before a
+/// correct run goes red. The clock starts after the fully-awaited publish
+/// loop, so publish RTTs are outside the window, and the elapsed time is
+/// printed either way.
 ///
 /// The two-worker premise is asserted, not assumed: a silently dead second
 /// worker would turn this into a single-worker drain, which is the one
@@ -650,7 +653,7 @@ async fn a_prefilled_stream_drains_bound_by_supply_not_age() {
     // What the bug costs: one `max_batch_age` window per batch, whatever the
     // supply. Anything at or above this is the defect, not a slow runner.
     let expiry_bound_floor = BATCH_AGE * MESSAGES.div_euclid(BATCH_SIZE);
-    let ceiling = expiry_bound_floor.mul_f64(0.6);
+    let ceiling = expiry_bound_floor.mul_f64(0.4);
 
     let tb = TestBroker::start().await;
     let broker = tb.broker();
