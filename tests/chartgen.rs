@@ -1580,7 +1580,18 @@ fn a_pathological_caption_block_is_a_loud_error_not_a_garbage_chart() {
     )));
     match chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light) {
         Err(ChartError::Render(msg)) => {
-            assert!(msg.contains("leaves no room"), "wrong error: {msg}")
+            assert!(msg.contains("leaves no room"), "wrong error: {msg}");
+            // The chart step runs after the whole measurement sequence, so the
+            // refusal has to say which of eleven charts refused and what it had
+            // to spend — otherwise trimming the caption starts with a search.
+            assert!(
+                msg.contains("Parallel vs sequenced consume"),
+                "the refusal must name the chart: {msg}"
+            );
+            assert!(
+                msg.contains("budget is") && msg.contains("lines"),
+                "the refusal must name the budget it went over: {msg}"
+            );
         }
         Ok(_) => panic!("a caption block taller than the canvas rendered a chart"),
         other => panic!("expected a Render refusal, got {other:?}"),

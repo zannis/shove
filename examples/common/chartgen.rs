@@ -2133,8 +2133,22 @@ fn frame<'b>(
             + MIN_PLOT_PX
             + PLOT_BOTTOM_GAP
     {
+        // Name the chart and the budget it went over. The chart step runs
+        // after the whole measurement sequence, so this message is read hours
+        // from the decision that caused it; "the caption block is too tall"
+        // alone leaves the reader to work out which of eleven charts refused,
+        // and by how much, before they can trim anything.
+        let budget = (bottom
+            - (PLOT_TOP
+                .saturating_add(legend_extra)
+                .saturating_add(subtitle_extra)
+                + MIN_PLOT_PX
+                + PLOT_BOTTOM_GAP))
+            / LINE
+            + 1;
         return Err(ChartError::Render(format!(
-            "the caption block ({} lines) leaves no room for the chart body",
+            "`{title}`: the caption block ({} lines) leaves no room for the chart body \
+             — this chart's budget is {budget} lines",
             footer.len()
         )));
     }
