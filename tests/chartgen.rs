@@ -548,6 +548,58 @@ fn a_published_batch_bar_names_its_knobs() {
 }
 
 #[test]
+fn batch_knob_captions_group_the_backends_that_share_them() {
+    // The knobs are per backend only because one backend can differ. Once
+    // any two disagree the caption used to degenerate to a line per backend,
+    // so a six-backend document spent six lines saying two things — and the
+    // caption block has a fixed budget before the chart body has no room
+    // left. Backends that ran the same knobs share a line.
+    let batch = |backend: &str, size: u64| {
+        format!(
+            r#"{{
+              "backend": "{backend}", "representative": true,
+              "results": [{}], "failures": [], "unsupported": []
+            }}"#,
+            scenario("consume_batch", "batch", 64, 1, 80_000.0).replace(
+                r#""max_batch_size": 500"#,
+                &format!(r#""max_batch_size": {size}"#)
+            )
+        )
+    };
+    // Five backends on the pinned size, one clamped — the shape the published
+    // matrix produces, SQS capping `ReceiveMessage` at 10.
+    let runs = [
+        inmemory_run(true),
+        batch("kafka", 500),
+        batch("nats", 500),
+        batch("rabbitmq", 500),
+        batch("redis", 500),
+        batch("sqs", 10),
+    ]
+    .join(",");
+    let doc = parse(&document(&runs));
+
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("a six-backend document must still leave room for the chart body");
+
+    assert!(
+        svg.contains(
+            "kafka, nats, rabbitmq, redis / batch: up to 500 messages or 200 ms per batch"
+        ),
+        "backends sharing the knobs must share one caption line"
+    );
+    assert!(
+        svg.contains("sqs / batch: up to 10 messages or 200 ms per batch"),
+        "the backend that differs must still be named with its own knobs"
+    );
+    assert_eq!(
+        svg.matches("ms per batch").count(),
+        2,
+        "one line per distinct knob pair, not one per backend"
+    );
+}
+
+#[test]
 fn a_sleeping_handler_row_never_reaches_a_throughput_chart() {
     // A handler_bound row's throughput is the simulated sleep, not shove.
     // Its magnitude must not appear in any throughput family — not as a bar,
