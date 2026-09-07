@@ -1,0 +1,29 @@
+README.md
+  s_cfdd642a628b79::t_9062af95db44c5 110-116
+docs/pages/ops/performance.mdx
+  s_8bb27fccf7f7c5::t_036b2631cb408d 3,9-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "30adb593936dd153798ae5409a9cc887ddbd53ff",
+  "prompts": {},
+  "sessions": {
+    "s_8bb27fccf7f7c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a9797535-826e-402a-aa74-83cc894a061d",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_cfdd642a628b79": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07c10-1142-7582-9c5b-64e62a6287b5",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
