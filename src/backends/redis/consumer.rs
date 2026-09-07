@@ -11,10 +11,10 @@ use tokio_util::sync::CancellationToken;
 use crate::ConsumerOptions;
 use crate::backend::BatchConsumerOptionsInner;
 use crate::backend::ConsumerOptionsInner;
-use crate::backend::batch_consumer::{
-    BatchSettlement, PREALLOC_CAP, batch_redelivery_backoff, invoke_batch_handler,
-    next_redelivery_delay, settle_batch_outcome,
+use crate::backend::batch_consumer::settling::{
+    PREALLOC_CAP, batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
 };
+use crate::backend::batch_consumer::{BatchSettlement, settle_batch_outcome};
 use crate::backend::consumer::ConsumerImpl;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};

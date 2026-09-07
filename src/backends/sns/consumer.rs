@@ -13,10 +13,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::backend::BatchConsumerOptionsInner;
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
-use crate::backend::batch_consumer::{
-    BatchSettlement, batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
-    settle_batch_outcome,
+use crate::backend::batch_consumer::settling::{
+    batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
 };
+use crate::backend::batch_consumer::{BatchSettlement, settle_batch_outcome};
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::router;
 use crate::backends::sns::topology::QueueRegistry;
@@ -1798,7 +1798,7 @@ where
 // this, since no third copy of the shared select-loop skeleton was
 // extracted; only the flush-invoking/backoff machinery
 // (`invoke_batch_handler`, `batch_redelivery_backoff`,
-// `next_redelivery_delay`) is shared, via `crate::backend::batch_consumer`.
+// `next_redelivery_delay`) is shared, via `backend::batch_consumer::settling`.
 //
 // # The 10-message cap
 //
@@ -1898,11 +1898,13 @@ where
 // rejected via the existing single-message [`router::route_reject`] the
 // moment it is decoded, with its true [`metrics::FailReason`] (`Oversize` or
 // `Deserialize`), and does not count toward `flush_len`/`max_batch_size` or
-// arm the age deadline. Kafka and InMemory park an equivalent drop until
-// their batch's flush, because their drops must ride the same commit their
-// batch's other messages retire through (Kafka's offsets must commit past
-// them; InMemory owns the envelope outright until the flush resolves it).
-// Neither reason exists here: every SQS message settles independently by
+// arm the age deadline. Backends whose drops cannot be settled apart from
+// the batch park an equivalent drop until the flush instead, each for its own
+// reason: Kafka's offsets must commit past them; InMemory owns the envelope
+// outright until the flush resolves it; RabbitMQ leaves the tag unacked, so a
+// parked drop still occupies the channel's prefetch window and has to be
+// counted by `flush_len` (see its doc) to keep the size trigger honest. None
+// of those reasons exists here: every SQS message settles independently by
 // receipt handle, and shove never publishes to a DLQ on this backend, so a
 // drop settled at receive time is exactly as final as one settled at flush
 // time — parking it would only delay a settlement that is already as final
@@ -1958,11 +1960,11 @@ fn validate_sqs_batch_size(max_batch_size: usize) -> Result<()> {
 /// `messages` into the handler by value while `handles` survives the flush
 /// to settle afterward.
 ///
-/// No `cap`/`PREALLOC_CAP` clamp, unlike Kafka's `BatchBuffer` and
-/// InMemory's `InMemoryBatch`: [`validate_sqs_batch_size`] already bounds
-/// `max_batch_size` to at most [`SQS_MAX_BATCH`] (10) before this is ever
-/// constructed, so sizing the initial allocation to the real cap can never
-/// overflow the way an unclamped `usize::MAX` could on those two backends.
+/// No `cap`/`PREALLOC_CAP` clamp, unlike every other batching backend's
+/// buffer: [`validate_sqs_batch_size`] already bounds `max_batch_size` to at
+/// most [`SQS_MAX_BATCH`] (10) before this is ever constructed, so sizing the
+/// initial allocation to the real cap can never overflow the way an unclamped
+/// `usize::MAX` could where the configured size is unbounded.
 struct SqsBatch<T: Topic> {
     messages: Vec<(T::Message, MessageMetadata)>,
     handles: Vec<String>,
@@ -2282,8 +2284,8 @@ where
 
             // Pre-handler drop: settles immediately via the single-message
             // `route_reject`, outside the batch — see the module doc's
-            // "Pre-handler drops" section for why this does not park like
-            // Kafka/InMemory.
+            // "Pre-handler drops" section for why this does not park until
+            // the flush the way the parking backends do.
             if let Err(e) = validate_message_size(body.len(), max_message_size) {
                 warn!(error = %e, queue_url, "rejecting oversized message (pre-handler drop)");
                 router::route_reject(

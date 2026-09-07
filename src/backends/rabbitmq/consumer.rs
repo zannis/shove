@@ -19,9 +19,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+use crate::backend::batch_consumer::settling::{
+    PREALLOC_CAP, batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
+};
 use crate::backend::batch_consumer::{
-    BatchConsumerOptionsInner, BatchSettlement, PREALLOC_CAP, batch_redelivery_backoff,
-    invoke_batch_handler, next_redelivery_delay, settle_batch_outcome,
+    BatchConsumerOptionsInner, BatchSettlement, settle_batch_outcome,
 };
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::{
@@ -2136,9 +2138,10 @@ const RECONNECT_BACKOFF_FALLBACK: Duration = Duration::from_secs(30);
 /// prefetch window is a `u16`, and a batch is held **unacked** inside that
 /// window, so a threshold above it could never fill and every flush would
 /// stall until `max_batch_age`. This effective cap is a documented divergence
-/// from Kafka/InMemory, which honour any configured size (they clamp only the
+/// from the backends that honour any configured size (they clamp only the
 /// pre-allocation; that clamp applies here too, separately, in
-/// [`RabbitMqBatch::new`]).
+/// [`RabbitMqBatch::new`]). SQS diverges the other way, rejecting a size
+/// above its 10-message cap rather than clamping.
 fn effective_batch_size(configured: usize) -> usize {
     configured.max(1).min(u16::MAX as usize)
 }
@@ -2166,8 +2169,12 @@ struct RabbitMqBatch<T: Topic> {
     parked: Vec<(u64, metrics::FailReason)>,
     /// Pre-allocation installed by [`Self::take_messages`] —
     /// `effective_max_batch_size` clamped to [`PREALLOC_CAP`], never the raw
-    /// value, for the same `Vec::with_capacity`-overflow reason both other
-    /// backends clamp it.
+    /// value. Not for the `Vec::with_capacity` overflow abort that motivates
+    /// the clamp on backends honouring any size: [`effective_batch_size`] has
+    /// already bounded this to `u16::MAX`, which cannot overflow. It is the
+    /// other half of [`PREALLOC_CAP`]'s job — 65 535 is 16x that cap, so
+    /// clamping still avoids a large up-front reservation for a batch that
+    /// may never fill.
     cap: usize,
 }
 
@@ -2285,8 +2292,8 @@ fn ingest_batch_delivery<T: Topic>(
 
 /// Hand the buffered batch to the handler and settle the single returned
 /// [`Outcome`] via the shared [`settle_batch_outcome`] classifier — the same
-/// three-way split Kafka and InMemory use, with RabbitMQ's mechanics in each
-/// arm:
+/// three-way split every batching backend routes through, with RabbitMQ's
+/// mechanics in each arm:
 ///
 /// - `Commit`: parked pre-handler drops are individually nacked to the DLX
 ///   first (their tags interleave below the handled ones), then one
@@ -2428,9 +2435,13 @@ impl RabbitMqConsumer {
     /// fill, stalling every flush until `max_batch_age`. So the channel's
     /// prefetch is set to the flush threshold, and both are
     /// `min(max_batch_size, u16::MAX)`: above 65 535 the configured size is
-    /// clamped (with a warning), a documented divergence from Kafka/InMemory,
-    /// which honour any size. The pre-allocation is separately clamped to
-    /// [`PREALLOC_CAP`], as on every backend.
+    /// clamped (with a warning), a documented divergence from the backends
+    /// that honour any configured size. SQS diverges the other way — it
+    /// rejects a size above its 10-message cap at consumer startup rather
+    /// than clamping. The pre-allocation is separately clamped to
+    /// [`PREALLOC_CAP`], as on every batching backend except SQS — 65 535 is
+    /// still 16x that cap, so the clamp is load-bearing here too; only SQS's
+    /// 10-message ceiling bounds the allocation on its own.
     ///
     /// # Sequencing guard
     ///
@@ -2860,8 +2871,8 @@ mod tests {
 
     /// `with_max_batch_size(usize::MAX)` passes the public `> 0` assert; the
     /// buffer must clamp its pre-allocation rather than aborting inside
-    /// `Vec::with_capacity` — the same [`PREALLOC_CAP`] trade both other
-    /// backends make.
+    /// `Vec::with_capacity` — the same [`PREALLOC_CAP`] trade every other
+    /// backend that clamps it makes.
     #[test]
     fn batch_buffer_clamps_the_preallocation_not_the_batch_size() {
         struct BufTopic;

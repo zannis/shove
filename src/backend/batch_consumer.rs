@@ -20,28 +20,40 @@
 //! [`BatchConsumerOptionsInner`], [`BatchConsumerImpl`],
 //! [`validate_batch_topic`], [`BatchSettlement`] and [`settle_batch_outcome`]
 //! are ungated, so their unit tests run under `cargo nextest run
-//! --no-default-features` with no backend compiled at all — the same
-//! `#[allow(dead_code)]`-over-losing-coverage trade `ConsumerOptionsInner`
-//! and `settle_broadcast_outcome` already make.
+//! --no-default-features` with no backend compiled at all. Whichever of them
+//! a backend-free build leaves dead carries its own `#[allow(dead_code)]` —
+//! the same allow-over-losing-coverage trade `ConsumerOptionsInner` and
+//! `settle_broadcast_outcome` already make; each allow's own comment says
+//! which shape it covers, since the two differ (no caller at all, versus
+//! fields only *read* behind a feature gate). The rest need no allow because
+//! the ungated [`BatchConsumer::run`](crate::batch_consumer::BatchConsumer::run)
+//! reaches them in every build, implementors present or not. Check the
+//! attribute at each item rather than inferring it from this list.
 //!
-//! Everything else here is gated `#[cfg(any(feature = "kafka", feature =
-//! "inmemory", feature = "redis-streams", feature = "rabbitmq", feature =
-//! "nats", feature = "aws-sns-sqs"))]`: these backends have a
-//! batch-consumption implementation and share the flush-invoking/backoff
-//! machinery ([`invoke_batch_handler`], [`batch_redelivery_backoff`],
-//! [`next_redelivery_delay`]). That gate widened per-backend as each port
-//! landed, and now names every backend the crate has, exactly as
-//! `broadcast.rs`'s gate widened backend by backend.
-//!
-//! [`PREALLOC_CAP`] stays narrower than the rest of `settling`: see its own
-//! doc comment for why SQS does not join that particular gate.
+//! The shared flush-invoking/backoff machinery
+//! ([`settling::invoke_batch_handler`],
+//! [`settling::batch_redelivery_backoff`],
+//! [`settling::next_redelivery_delay`]) lives in the [`settling`] module,
+//! gated on the features of the backends that implement
+//! `HasBatchConsumption` (that trait's doc is the authoritative list).
+//! Callers path through `settling::` rather than re-exports, so the
+//! module's gate has no re-export copy to keep in sync. A new batching
+//! backend still widens more than that one cfg, though:
+//! [`settling::PREALLOC_CAP`] carries its own deliberately narrower list
+//! (see its doc for why SQS does not join it); the feature-listed gates on
+//! `mod retry` and `mod routing` in `lib.rs` — both of which `settling`
+//! imports from — must each stay supersets of this module's gate; and the
+//! new backend's own Cargo feature must pull `dep:futures-util`, which
+//! `settling` imports unconditionally for `FutureExt::catch_unwind`.
+//! Kafka-only option fields on [`BatchConsumerOptionsInner`] keep their own
+//! narrower cfgs at the module root.
 //!
 //! `TerminalDiscard`, `RejectSettlement` and `reject_settlement` are
-//! narrower still: `#[cfg(feature = "kafka")]` *inside* that `any(kafka,
-//! inmemory, redis-streams, rabbitmq, nats, aws-sns-sqs)` module. Every other
-//! backend in the gate finishes settling a reject before its batch clears,
-//! with no later commit that could still fail, so none of them ever needed
-//! the held-until-confirmed shape this trio exists for: InMemory in
+//! narrower still: `#[cfg(feature = "kafka")]` *inside* the [`settling`]
+//! module. Every other backend in the gate finishes settling a reject
+//! before its batch clears, with no later commit that could still fail, so
+//! none of them ever needed the held-until-confirmed shape this trio
+//! exists for: InMemory in
 //! `backends::inmemory::consumer::resolve_reject`, Redis in its batch
 //! `DeadLetter` arm (the `XACK`/DLQ route completes before the batch
 //! clears), RabbitMQ on a confirm-mode channel (never transactional), where
@@ -120,12 +132,12 @@ pub(crate) struct BatchConsumerOptionsInner {
 /// batch-consumption primitive implement this; the public
 /// [`BatchConsumer<B>`](crate::batch_consumer::BatchConsumer) delegates here.
 ///
-/// Anchored by each backend's own `impl BatchConsumerImpl` under its feature.
-/// Under `--no-default-features`, and under any feature set naming no backend
-/// with a batch implementation yet, the trait genuinely has no call site —
-/// `dead_code` is expected there and the per-trait allow avoids polluting
-/// those builds with warnings, exactly as [`ConsumerImpl`](crate::backend::ConsumerImpl)
-/// does for the single-message trait.
+/// Anchored by each backend's own `impl BatchConsumerImpl` under its
+/// feature. Unlike [`ConsumerImpl`](crate::backend::ConsumerImpl), it
+/// carries no `dead_code` allow: the ungated
+/// [`BatchConsumer::run`](crate::batch_consumer::BatchConsumer::run) calls
+/// [`run_batch`](Self::run_batch) in every build, implementors present or
+/// not.
 ///
 /// # Who runs the sequencing guard
 ///
@@ -135,7 +147,6 @@ pub(crate) struct BatchConsumerOptionsInner {
 /// that also exposes its **own public** batch entry point bypasses that
 /// wrapper and must call the guard itself — Kafka's `run_batch_inner` is the
 /// model, covering the public `KafkaConsumer::run_batch`.
-#[allow(dead_code)]
 pub(crate) trait BatchConsumerImpl: Send + Sync {
     fn run_batch<T, H>(
         &self,
@@ -244,12 +255,12 @@ mod settle_batch_outcome_tests {
     }
 }
 
-// Gated `any(kafka, inmemory, redis-streams, rabbitmq, nats, aws-sns-sqs)` —
-// see the module doc's "Gating" section. Named `settling` rather than after any
-// one backend: it houses the settlement classifier + panic/timeout invariant
-// surface every one of these backends' batch loops route through, plus the
-// terminal-discard machinery Kafka's single-message path also depends on (see
-// the module doc's `kafka` note).
+// Gated on the batching backends' features — see the module doc's "Gating"
+// section. Named `settling` rather than after any one backend: it houses the
+// settlement classifier + panic/timeout invariant surface every one of these
+// backends' batch loops route through, plus the terminal-discard machinery
+// Kafka's single-message path also depends on (see the module doc's `kafka`
+// note).
 #[cfg(any(
     feature = "kafka",
     feature = "inmemory",
@@ -258,7 +269,7 @@ mod settle_batch_outcome_tests {
     feature = "nats",
     feature = "aws-sns-sqs"
 ))]
-mod settling {
+pub(crate) mod settling {
     use std::future::Future;
     use std::panic::AssertUnwindSafe;
     use std::time::{Duration, Instant};
@@ -360,11 +371,14 @@ mod settling {
     /// requirement.
     ///
     /// Deliberately narrower than the `settling` module's own gate: a backend
-    /// whose batch size is bounded before it allocates never calls this. SQS
-    /// is the case today — its cap is validated to `<= 10` before
-    /// `SqsBatch::new` ever allocates (`validate_sqs_batch_size`), so the
-    /// prealloc is already bounded at the source and this const has no call
-    /// site there. With no `#[allow(dead_code)]` of its own, including it in
+    /// whose batch size is bounded *below this cap* before it allocates never
+    /// calls this, because clamping to it would be a no-op. SQS is the case
+    /// today — its cap is validated to `<= 10` before `SqsBatch::new` ever
+    /// allocates (`validate_sqs_batch_size`), so the prealloc is already
+    /// bounded at the source and this const has no call site there. A bound
+    /// that merely exists is not enough: RabbitMQ bounds its size too, at
+    /// `u16::MAX`, but 65 535 is 16x this cap, so it clamps like the
+    /// unbounded backends do. With no `#[allow(dead_code)]` of its own, including it in
     /// the wider gate would fail that backend's feature-lint row (`cargo
     /// clippy --lib --no-default-features --features
     /// pub-aws-sns,aws-sns-sqs,...`) with an unused-const warning.
@@ -728,28 +742,3 @@ mod settling {
         }
     }
 }
-
-#[cfg(any(
-    feature = "kafka",
-    feature = "inmemory",
-    feature = "redis-streams",
-    feature = "rabbitmq",
-    feature = "nats",
-    feature = "aws-sns-sqs"
-))]
-pub(crate) use settling::{batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay};
-
-// Narrower than the re-export above: SQS never calls `PREALLOC_CAP` (see its
-// own doc comment), so folding `aws-sns-sqs` in here would fail the SQS
-// feature-lint row on an unused import.
-#[cfg(any(
-    feature = "kafka",
-    feature = "inmemory",
-    feature = "redis-streams",
-    feature = "rabbitmq",
-    feature = "nats"
-))]
-pub(crate) use settling::PREALLOC_CAP;
-
-#[cfg(feature = "kafka")]
-pub(crate) use settling::{RejectSettlement, TerminalDiscard, reject_settlement};

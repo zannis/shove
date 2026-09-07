@@ -14,9 +14,11 @@ use super::constants::{
 };
 use super::topology::InMemoryTopologyDeclarer;
 use crate::backend::ConsumerOptionsInner;
+use crate::backend::batch_consumer::settling::{
+    PREALLOC_CAP, batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
+};
 use crate::backend::batch_consumer::{
-    BatchConsumerOptionsInner, BatchSettlement, PREALLOC_CAP, batch_redelivery_backoff,
-    invoke_batch_handler, next_redelivery_delay, settle_batch_outcome,
+    BatchConsumerOptionsInner, BatchSettlement, settle_batch_outcome,
 };
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
