@@ -2825,28 +2825,37 @@ where
 /// points keep their own captions), what the window was, that no producer
 /// ran inside it, the corpus sizes, and any redeliveries the consumers saw.
 /// Empty when no in-slice row is a drain.
+///
+/// The corpus is stated **per backend as soon as the backends disagree**. A
+/// drain rate is a rate whatever the corpus size, but the corpus is what sets
+/// the window length, and a slice where one backend ran a deliberately
+/// smaller one is a documented deviation the reader has to be able to see. An
+/// unattributed set ("6M / 30k") names both sizes and tells nobody which bar
+/// is which, which is worse than either naming one or naming them all — so
+/// the flat sentence is kept only for the case it is actually true of, every
+/// backend on the same corpus.
 fn drain_notes<P>(runs: &[BackendRun], in_slice: P) -> Vec<String>
 where
     P: Fn(&ScenarioResult) -> bool,
 {
     let mut drained: Vec<&str> = Vec::new();
-    let mut corpora: BTreeSet<u64> = BTreeSet::new();
+    let mut per_backend: Vec<(&str, BTreeSet<u64>)> = Vec::new();
     let mut flows: BTreeSet<&str> = BTreeSet::new();
     let mut duplicates: Vec<String> = Vec::new();
     for run in runs {
         let mut dups = 0u64;
-        let mut any = false;
+        let mut corpora: BTreeSet<u64> = BTreeSet::new();
         for r in run.results.iter().filter(|r| in_slice(r)) {
             let Some(d) = &r.drain else {
                 continue;
             };
-            any = true;
             corpora.insert(d.corpus);
             flows.insert(canonical_flow(&r.flow));
             dups = dups.saturating_add(d.duplicates);
         }
-        if any {
+        if !corpora.is_empty() {
             drained.push(run.backend.as_str());
+            per_backend.push((run.backend.as_str(), corpora));
             if dups > 0 {
                 duplicates.push(format!("{} saw {dups} redeliveries", run.backend));
             }
@@ -2854,15 +2863,36 @@ where
     }
     let mut notes = Vec::new();
     if !drained.is_empty() {
-        let corpora: Vec<String> = corpora.iter().map(|c| fmt_count(*c as f64)).collect();
+        // Every backend on one corpus reads as one number; the moment two
+        // disagree the sentence stops naming a size and a second line
+        // attributes them.
+        let uniform = per_backend
+            .iter()
+            .all(|(_, c)| *c == per_backend[0].1)
+            .then(|| fmt_counts(&per_backend[0].1));
+        let corpus_clause = match &uniform {
+            Some(sizes) => format!("a corpus of {sizes} messages"),
+            None => "its corpus".to_string(),
+        };
         notes.push(format!(
             "drain ({}): each {} point is the processing rate of the consumers from the moment \
-             every worker was assigned until 90 % of a corpus of {} messages, published before \
+             every worker was assigned until 90 % of {}, published before \
              they started, had been consumed; no producer ran in the window",
             drained.join(", "),
             flows.iter().copied().collect::<Vec<_>>().join(" / "),
-            corpora.join(" / "),
+            corpus_clause,
         ));
+        if uniform.is_none() {
+            notes.push(format!(
+                "corpus differs by backend: {} — a smaller corpus is a shorter window, not a \
+                 different measurement",
+                per_backend
+                    .iter()
+                    .map(|(b, c)| format!("{b} {}", fmt_counts(c)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
         if !duplicates.is_empty() {
             notes.push(format!(
                 "redeliveries counted once: {}",
@@ -2871,6 +2901,16 @@ where
         }
     }
     notes
+}
+
+/// Corpus sizes as they read in a caption: one backend's slice can span
+/// payload legs whose byte cap sized them differently, so this is a set.
+fn fmt_counts(corpora: &BTreeSet<u64>) -> String {
+    corpora
+        .iter()
+        .map(|c| fmt_count(*c as f64))
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 /// One caption line per backend whose in-slice rows arrived under an alias:
