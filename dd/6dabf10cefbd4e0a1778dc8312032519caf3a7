@@ -1,0 +1,63 @@
+benches/results/bench-results.json
+  s_1a5ac5ada4ff0e::t_8a94f566155ead 3,11252-16476,21618,21860,22162,22865,22902,23531,23791,23868,23899,23929,23948,24177,24285,24526,24667,24748,24781,24850,25571,25868,26040,26099,26203,26364
+docs/public/bench/dispatch-latency-1kib-dark.svg
+  s_1a5ac5ada4ff0e::t_b8943fbe8cca06 17,20,23,29,90-94,97-101,104-108,111-115,118-122,125-129,132-157,160-164,167-171,174-178,181-185,188-192,195,198,201-204,207
+docs/public/bench/dispatch-latency-1kib.svg
+  s_1a5ac5ada4ff0e::t_26e721c687e232 17,20,23,29,90-94,97-101,104-108,111-115,118-122,125-129,132-157,160-164,167-171,174-178,181-185,188-192,195,198,201-204,207
+docs/public/bench/dispatch-latency-64kib-dark.svg
+  s_1a5ac5ada4ff0e::t_2fb32c8882fef2 17,20,23,29,75-79,82-86,89-93,96-100,103-107,110-114,117-142,145-149,152-156,159-163,166-170,173-177,180,183,186-189,192
+docs/public/bench/dispatch-latency-64kib.svg
+  s_1a5ac5ada4ff0e::t_1eb26aab71566a 17,20,23,29,75-79,82-86,89-93,96-100,103-107,110-114,117-142,145-149,152-156,159-163,166-170,173-177,180,183,186-189,192
+docs/public/bench/dispatch-latency-dark.svg
+  s_1a5ac5ada4ff0e::t_5565cfd5a2e640 17,20,23,29,65-69,72-76,79-83,86-90,93-97,100-104,107-132,135-139,142-146,149-153,156-160,163-167,170,173,176-179,182
+docs/public/bench/dispatch-latency.svg
+  s_1a5ac5ada4ff0e::t_3e4bdb7a975850 17,20,23,29,65-69,72-76,79-83,86-90,93-97,100-104,107-132,135-139,142-146,149-153,156-160,163-167,170,173,176-179,182
+docs/public/bench/framework-overhead-dark.svg
+  s_1a5ac5ada4ff0e::t_331b2b302f39bd 38,44
+docs/public/bench/framework-overhead.svg
+  s_1a5ac5ada4ff0e::t_25616c9892116a 38,44
+docs/public/bench/parallel-vs-sequenced-1kib-dark.svg
+  s_1a5ac5ada4ff0e::t_94479071039bdf 14,17,20,32,35,44,50,96-100,103,106-110,113-117,120,123-127,130-155,158-159,162-166,169-173,176,179-183,186,189,192-195,198
+docs/public/bench/parallel-vs-sequenced-1kib.svg
+  s_1a5ac5ada4ff0e::t_db27a173dbbf21 14,17,20,32,35,44,50,96-100,103,106-110,113-117,120,123-127,130-155,158-159,162-166,169-173,176,179-183,186,189,192-195,198
+docs/public/bench/parallel-vs-sequenced-64kib-dark.svg
+  s_1a5ac5ada4ff0e::t_a8960d0089e1f7 10,13-15,17,20,23,26,29,32,35,44,47,56,59,65,67,70-78,80-81,84-85,88-89,92-93,96-97,100-101,104-105,108-109,112-113,116,121,124-128,131,134-138,141-145,148-152,155-180,183-187,190-194,197-201,204,207-211,214,217,220-223,226,229
+docs/public/bench/parallel-vs-sequenced-64kib.svg
+  s_1a5ac5ada4ff0e::t_a697b76cf36d70 10,13-15,17,20,23,26,29,32,35,44,47,56,59,65,67,70-78,80-81,84-85,88-89,92-93,96-97,100-101,104-105,108-109,112-113,116,121,124-128,131,134-138,141-145,148-152,155-180,183-187,190-194,197-201,204,207-211,214,217,220-223,226,229
+docs/public/bench/parallel-vs-sequenced-dark.svg
+  s_1a5ac5ada4ff0e::t_17c09ecb4b96a4 14,17,23,35,38,47,53,89-93,96,99-103,106-110,113,116-120,123-148,151,154-158,161-162,165,168-172,175,178,181-184,187
+docs/public/bench/parallel-vs-sequenced.svg
+  s_1a5ac5ada4ff0e::t_ccec8f8aa3038d 14,17,23,35,38,47,53,89-93,96,99-103,106-110,113,116-120,123-148,151,154-158,161-162,165,168-172,175,178,181-184,187
+docs/public/bench/throughput-vs-consumers-1kib-dark.svg
+  s_1a5ac5ada4ff0e::t_a476af00a4ce96 11,14,17,20,26,129,148-155,180-183,215,217-220,223-224
+docs/public/bench/throughput-vs-consumers-1kib.svg
+  s_1a5ac5ada4ff0e::t_0389de7873b768 11,14,17,20,26,129,148-155,180-183,215,217-220,223-224
+docs/public/bench/throughput-vs-consumers-64kib-dark.svg
+  s_1a5ac5ada4ff0e::t_572a9e0f56cfed 26,29,32,38,44,121,126-133,158-161,185,187-190,193-194
+docs/public/bench/throughput-vs-consumers-64kib.svg
+  s_1a5ac5ada4ff0e::t_bea8f279331959 26,29,32,38,44,121,126-133,158-161,185,187-190,193-194
+docs/public/bench/throughput-vs-consumers-dark.svg
+  s_1a5ac5ada4ff0e::t_4776b724c6ea19 11,14,17,20,26,129,148-155,180-183,215,217-220,223-224
+docs/public/bench/throughput-vs-consumers.svg
+  s_1a5ac5ada4ff0e::t_6d726983f6567b 11,14,17,20,26,129,148-155,180-183,215,217-220,223-224
+docs/public/bench/throughput-vs-payload-dark.svg
+  s_1a5ac5ada4ff0e::t_288651bdec668d 17,20,23,29,35,58,69-74,93-96,125,127-130,133-134
+docs/public/bench/throughput-vs-payload.svg
+  s_1a5ac5ada4ff0e::t_0e8c9c621e5315 17,20,23,29,35,58,69-74,93-96,125,127-130,133-134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "dd6dabf10cefbd4e0a1778dc8312032519caf3a7",
+  "prompts": {},
+  "sessions": {
+    "s_1a5ac5ada4ff0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f193bc98-253b-491e-beb5-e72c144577b8",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
