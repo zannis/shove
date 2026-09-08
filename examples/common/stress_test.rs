@@ -3512,9 +3512,19 @@ where
                 None => {
                     let round: Vec<StressTestMsg> =
                         (0..per_round).map(|_| sentinel(epoch)).collect();
-                    publisher
-                        .publish_batch::<T>(&round)
+                    // Bounded: the stall guard below only arms once a worker
+                    // has consumed something, so a sentinel publish that never
+                    // returns would otherwise hold the whole sweep, not just
+                    // this cell (the NATS publisher did exactly that before
+                    // its in-flight ack budget was driven concurrently).
+                    tokio::time::timeout(DRAIN_STALL, publisher.publish_batch::<T>(&round))
                         .await
+                        .map_err(|_| {
+                            format!(
+                                "publish readiness sentinels: no ack within {}s",
+                                DRAIN_STALL.as_secs()
+                            )
+                        })?
                         .map_err(|e| format!("publish readiness sentinels: {e}"))?;
                 }
             }
