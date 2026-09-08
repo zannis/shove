@@ -1,0 +1,14 @@
+.github/workflows/ci.yml
+  h_f81d3033687456 180-187
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "b9fb03523e58da5b15a3bd372de0905d30e870aa",
+  "prompts": {},
+  "humans": {
+    "h_f81d3033687456": {
+      "author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
