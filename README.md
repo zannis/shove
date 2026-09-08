@@ -110,10 +110,9 @@ Full semantics: [Outcomes & Delivery](https://shove.rs/concepts/outcomes).
 The charts are generated from a committed results document — never hand-copied —
 and each one carries its own provenance (shove version, generation date,
 hardware) in the caption. The harness runs against every backend; the currently
-published document measures the in-process, Kafka, RabbitMQ and Redis backends,
-and a plotted series appears only for a backend the document actually contains.
-NATS is absent until a publisher fix lands, and SQS is absent because it runs only
-against LocalStack. See
+published document measures the in-process, Kafka, NATS, RabbitMQ and Redis
+backends, and a plotted series appears only for a backend the document actually
+contains. SQS is absent because it runs only against LocalStack. See
 [Measurement methodology](https://shove.rs/ops/performance#measurement-methodology)
 for what is measured and what is still pending.
 
