@@ -10,12 +10,13 @@ an explicit "not supported" marker, never as a zero. And a backend the results
 document does not contain is never plotted, so absence from a chart means "not
 measured here", not "slow".
 
-The document these charts render from measures the **in-process**, **Kafka**,
-**NATS**, **RabbitMQ** and **Redis** backends. SQS is the one backend absent: it
-runs only against LocalStack (non-representative by design), needs a LocalStack
-Pro auth token, and is not in this document. The harness refuses to merge runs
-measured on different hosts into one document, so completing the set means
-measuring SQS on the same host as the published runs.
+The document these charts render from measures all six backends: **in-process**,
+**Kafka**, **NATS**, **RabbitMQ**, **Redis** and **SQS**. The SQS rows measure
+LocalStack, which is non-representative of the AWS service by design, and run a
+smaller corpus than the other backends; the rows and the charts record both
+(see the benchmark runbook's "The SQS corpus deviation"). Every run was measured
+on the same host: the harness refuses to merge runs from different hosts into
+one document.
 
 ### Throughput vs consumer count
 

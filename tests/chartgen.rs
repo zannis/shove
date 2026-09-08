@@ -2556,17 +2556,41 @@ fn a_caption_a_few_lines_over_budget_grows_the_canvas_instead_of_refusing() {
             "text baseline y={y} is outside the grown canvas of {height}: {content:?}"
         );
     }
-    let ticks: Vec<f64> = texts(&svg)
-        .into_iter()
-        .filter(|(x, _, _, t)| *x < Y_TICK_BAND_X && (t.ends_with('k') || t == "0.0"))
-        .map(|(_, y, _, _)| y)
-        .collect();
-    let span =
-        ticks.iter().cloned().fold(0.0, f64::max) - ticks.iter().cloned().fold(f64::MAX, f64::min);
+    // The plot's actual vertical extent is the y axis itself: plotters draws
+    // it as a two-point polyline with one x, and it is the longest such line
+    // on the canvas. Tick labels stop short of the boundaries, so a
+    // tick-based span would let an undersized plot through.
+    let axis_span = vertical_axis_span(&svg).expect("the chart draws a y axis");
     assert!(
-        span >= chartgen::MIN_PLOT_PX as f64 * 0.8,
-        "the plot body spans only {span:.0}px on the grown canvas"
+        axis_span >= f64::from(chartgen::MIN_PLOT_PX),
+        "the plot body spans only {axis_span:.0}px on the grown canvas, under the \
+         {}px minimum",
+        chartgen::MIN_PLOT_PX
     );
+}
+
+/// The vertical span of the longest two-point vertical polyline in `svg`: the
+/// y axis, which bounds the plot body exactly.
+fn vertical_axis_span(svg: &str) -> Option<f64> {
+    svg.split("<polyline")
+        .skip(1)
+        .filter_map(|chunk| svg_attr(chunk, "points"))
+        .filter_map(|points| {
+            let pts: Vec<(f64, f64)> = points
+                .split_whitespace()
+                .filter_map(|p| {
+                    let (x, y) = p.split_once(',')?;
+                    Some((x.parse().ok()?, y.parse().ok()?))
+                })
+                .collect();
+            match pts.as_slice() {
+                [(x1, y1), (x2, y2)] if x1 == x2 => Some((y1 - y2).abs()),
+                _ => None,
+            }
+        })
+        .fold(None, |best: Option<f64>, span| {
+            Some(best.map_or(span, |b| b.max(span)))
+        })
 }
 
 #[test]
