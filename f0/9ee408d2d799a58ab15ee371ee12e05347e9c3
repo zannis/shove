@@ -1,0 +1,19 @@
+tests/chartgen.rs
+  s_1a5ac5ada4ff0e::t_deccdd89fc7d42 2559-2563,2565-2593
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "f09ee408d2d799a58ab15ee371ee12e05347e9c3",
+  "prompts": {},
+  "sessions": {
+    "s_1a5ac5ada4ff0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f193bc98-253b-491e-beb5-e72c144577b8",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
