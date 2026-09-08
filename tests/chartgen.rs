@@ -5117,3 +5117,223 @@ fn the_short_window_note_fits_one_caption_line() {
         "the short-window note must stay on one caption line: {svg}"
     );
 }
+
+// ── Caption line budget: the headroom itself ────────────────────────────────
+
+/// The x every caption line is drawn at (`GUTTER`) and the ceiling that
+/// separates the caption's font size from the title's and the subtitle's.
+///
+/// A hand-synced copy like [`Y_TICK_BAND_X`]: chartgen draws the caption at
+/// `GUTTER` in `FOOT_PX` and scales a declared px by 1/1.24 on the way into
+/// the SVG, so the caption lands at ~12.1 px against the subtitle's ~14.5 and
+/// the title's ~21. The title and subtitle share the gutter x, so the size is
+/// what separates them; no other text in the frame is drawn at this x.
+const CAPTION_X: f64 = 24.0;
+const CAPTION_PX_CEILING: f64 = 13.0;
+
+/// The number of lines `frame()` drew into the caption block.
+fn caption_lines(svg: &str) -> usize {
+    texts(svg)
+        .into_iter()
+        .filter(|(x, _, size, _)| *x == CAPTION_X && *size < CAPTION_PX_CEILING)
+        .count()
+}
+
+/// One row of the `parallel-vs-sequenced` 64 KiB slice.
+///
+/// Method-measured flows get a drain account deriving exactly `throughput`
+/// (`duplicates` redeliveries folded in); the barrier-less `consume_fifo`
+/// carries no method, as the harness emits it.
+#[allow(clippy::too_many_arguments)]
+fn slice_row(
+    flow: &str,
+    mode: &str,
+    throughput: f64,
+    duration_secs: f64,
+    duplicates: u64,
+    batch: Option<(u64, u64)>,
+    cost: &str,
+) -> String {
+    let batch_knobs = match batch {
+        Some((size, age)) => format!(r#""max_batch_size": {size}, "max_batch_age_ms": {age},"#),
+        None => String::new(),
+    };
+    let (messages, method_and_drain, duration_secs, setup_secs) = if METHOD_FLOWS.contains(&flow) {
+        let (corpus, account, secs) = drain_account_json(throughput, duration_secs, duplicates);
+        (corpus, account, secs, "0.4")
+    } else {
+        (5000, String::new(), duration_secs, "null")
+    };
+    format!(
+        r#"{{
+          "flow": "{flow}", "mode": "{mode}", "payload_bytes": 65536,
+          "tier": "moderate", "messages": {messages}, "consumers": 1,
+          "handler": "zero (no-op)", "handler_cost": "{cost}", "setup_secs": {setup_secs},
+          {batch_knobs}
+          {method_and_drain}
+          "throughput_msg_per_sec": {throughput},
+          "dispatch_p50_ms": 1.5, "dispatch_p95_ms": 4.0, "dispatch_p99_ms": 9.0,
+          "e2e_p50_ms": 1.5, "e2e_p95_ms": 4.0, "e2e_p99_ms": 9.0,
+          "scaling_efficiency": 1.0, "peak_rss_mb": 1.0, "cpu_pct": 100.0,
+          "duration_secs": {duration_secs:?}
+        }}"#
+    )
+}
+
+/// The six-backend shape CAF-889's rerun produces, at the payload the
+/// `parallel-vs-sequenced` family's tightest slice reads.
+///
+/// Every caption entry that slice carries in the real document is present:
+/// the grouped fifo lower bound and sqs's shape-only variant of it, the mode
+/// note, in-memory's unpublishable window, its declared batch hole, the two
+/// batch-knob groups (sqs clamps to `ReceiveMessage`'s 10), the drain rule,
+/// the per-backend corpus deviation, the supervisor alias, a recorded
+/// failure and the three provenance lines.
+///
+/// `duplicates` redeliveries on one backend add `drain_notes`' "redeliveries
+/// counted once" line — the ordinary outcome (RabbitMQ redelivering on an
+/// unacked channel, SQS re-driving past a visibility timeout) that this
+/// slice had no room for before `df0d954`.
+///
+/// `extra_note_rows` rows carry a flow this chart does not know. Such a row
+/// contributes no bar, no series and no legend row — it moves the caption's
+/// height and nothing else the budget is computed from — so it is how this
+/// test adds "two further notes" without perturbing the layout it is
+/// measuring.
+fn six_backend_slice(duplicates: u64, extra_note_rows: usize) -> String {
+    let mut runs = vec![format!(
+        r#"{{ "backend": "inmemory",
+              "broker": {{ "name": "in-process", "version": "n/a", "deployment": "in-process" }},
+              "representative": true, "results": [{},{}], "failures": [],
+              "unsupported": [{{ "flow": "consume_batch", "reason": "run_batch is Kafka-only" }}] }}"#,
+        slice_row(
+            "consume_parallel",
+            "parallel",
+            9_000.0,
+            0.4,
+            0,
+            None,
+            "setup_bound"
+        ),
+        slice_row("consume_fifo", "fifo", 4_000.0, 2.0, 0, None, "setup_bound"),
+    )];
+    for (i, backend) in ["kafka", "nats", "rabbitmq", "redis"].iter().enumerate() {
+        // One backend records the redeliveries; the drain note names it.
+        let duplicates = if i == 0 { duplicates } else { 0 };
+        runs.push(format!(
+            r#"{{ "backend": "{backend}", "representative": true,
+                  "results": [{},{},{}], "failures": [], "unsupported": [] }}"#,
+            slice_row(
+                "consume_parallel",
+                "parallel",
+                9_000.0,
+                2.0,
+                duplicates,
+                None,
+                "framework"
+            ),
+            slice_row(
+                "consume_batch",
+                "batch",
+                9_500.0,
+                2.0,
+                0,
+                Some((500, 200)),
+                "framework"
+            ),
+            slice_row("consume_fifo", "fifo", 4_000.0, 2.0, 0, None, "setup_bound"),
+        ));
+    }
+    let mut sqs_rows = vec![
+        slice_row("supervisor", "parallel", 900.0, 2.0, 0, None, "framework"),
+        slice_row(
+            "consume_batch",
+            "batch",
+            950.0,
+            2.0,
+            0,
+            Some((10, 200)),
+            "framework",
+        ),
+        slice_row("consume_fifo", "fifo", 400.0, 2.0, 0, None, "setup_bound"),
+    ];
+    for k in 0..extra_note_rows {
+        // Long enough that the note naming it wraps: one such row is the two
+        // further caption lines the acceptance criterion asks for, and the
+        // test asserts that growth rather than trusting this length.
+        let flow = format!("unknown_flow_{k}_{}", "x".repeat(96));
+        sqs_rows.push(slice_row(
+            &flow,
+            "parallel",
+            100.0,
+            2.0,
+            0,
+            None,
+            "setup_bound",
+        ));
+    }
+    runs.push(format!(
+        r#"{{ "backend": "sqs", "representative": false,
+              "broker": {{ "name": "LocalStack", "version": "x", "deployment": "localstack" }},
+              "results": [{}],
+              "failures": [{{ "flow": "consume_parallel", "mode": "parallel",
+                              "payload_bytes": 65536, "tier": "moderate", "messages": 1000,
+                              "consumers": 1, "handler": "zero (no-op)", "method": "drain",
+                              "error": "timeout after 60s" }}],
+              "unsupported": [] }}"#,
+        sqs_rows.join(",")
+    ));
+    document(&runs.join(","))
+}
+
+/// Renders the tightest slice, turning a refusal into a failure that names
+/// the arithmetic — `frame()`'s message carries both the lines used and the
+/// budget, which is the whole diagnosis.
+fn render_tightest_slice(doc: &Document) -> String {
+    let chart = chartgen::Chart {
+        family: Family::ParallelVsSequenced,
+        payload: 65536,
+    };
+    chartgen::render_chart_to_string(doc, chart, Mode::Light)
+        .unwrap_or_else(|e| panic!("the tightest slice must render: {e}"))
+}
+
+#[test]
+fn the_tightest_slice_keeps_two_caption_lines_spare_at_six_backends() {
+    // The budget itself, not a wording. `0e5f930`'s refusal arrives at the
+    // chart step — hours after the measurement run that caused it, at the end
+    // of a six-backend evening, with nothing published — so the margin has to
+    // be asserted while it still exists rather than discovered by a run that
+    // writes no charts.
+    //
+    // Asserting the margin rather than a sentence is deliberate: the two
+    // notes `df0d954` reworded onto one line each are guarded above by their
+    // text, which fails when someone rewords them. This fails when the budget
+    // is next *approached*, whatever spends it — a seventh backend, a new
+    // note, a wider corpus deviation — which is the failure the wording tests
+    // cannot see coming.
+    let doc = parse(&six_backend_slice(12, 0));
+    let svg = render_tightest_slice(&doc);
+    let used = caption_lines(&svg);
+
+    // The fixture is the tight case, not the comfortable one: a document
+    // whose backends all drained cleanly is a line shorter and would prove
+    // less than it appears to.
+    assert!(
+        joined_text(&svg).contains("redeliveries counted once"),
+        "the fixture must be the redelivery case this margin is measured against: {svg}"
+    );
+
+    // Two further notes still render. `render_tightest_slice` panics with
+    // `frame()`'s own "(N lines) … budget is B lines" if they do not.
+    let padded = parse(&six_backend_slice(12, 1));
+    let padded_svg = render_tightest_slice(&padded);
+
+    // Without this the test would pass vacuously if the padding ever stopped
+    // adding lines — it would prove the same document renders twice.
+    assert_eq!(
+        caption_lines(&padded_svg),
+        used + 2,
+        "the padding must add exactly two caption lines for this to prove two lines of headroom"
+    );
+}
