@@ -1,0 +1,23 @@
+benches/README.md
+  s_1a5ac5ada4ff0e::t_f46d7274206a0c 216-220
+examples/common/stress_test.rs
+  s_1a5ac5ada4ff0e::t_90a01c0adae3a4 274-282,7292-7320,7323-7325
+scripts/bench.sh
+  s_1a5ac5ada4ff0e::t_3717cd2144f85d 75-78,162
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "6d3ecaab358b60c1ce5e6e50560c6877cebc7839",
+  "prompts": {},
+  "sessions": {
+    "s_1a5ac5ada4ff0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f193bc98-253b-491e-beb5-e72c144577b8",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
