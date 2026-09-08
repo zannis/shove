@@ -1,0 +1,19 @@
+src/backends/sns/publisher.rs
+  s_1a5ac5ada4ff0e::t_6174a6e931daf8 22-63,390-405,409,411-416,709-754
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "903b5b0e32b1968f4cb7115cf4ba87d0fa633bc5",
+  "prompts": {},
+  "sessions": {
+    "s_1a5ac5ada4ff0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f193bc98-253b-491e-beb5-e72c144577b8",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
