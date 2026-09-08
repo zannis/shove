@@ -177,6 +177,14 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # rust-cache prunes plain files out of target/ but keeps the directory
+      # tree, so a cache hit hands criterion every previous run's <id>/base
+      # emptied of its sample.json, and criterion logs a "Failed to access
+      # file" error per id while trying to compare against that phantom
+      # previous run. This leg judges against the committed baseline
+      # document, never against the previous run, so start with no tree.
+      - name: Drop the criterion tree the cache restored
+        run: rm -rf target/criterion
       - name: Run the Tier A criterion suite
         run: >
           cargo bench --no-default-features --features inmemory
