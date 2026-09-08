@@ -1,0 +1,21 @@
+.github/workflows/ci.yml
+  s_1a5ac5ada4ff0e::t_62aa87e230356f 33-36,48-102,137-138,183-184,195-196,240-241,267-268
+CONTRIBUTING.md
+  s_1a5ac5ada4ff0e::t_329992c4b78e70 138-142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "a536a4d7017d768a231c23fe3f400e731b940919",
+  "prompts": {},
+  "sessions": {
+    "s_1a5ac5ada4ff0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f193bc98-253b-491e-beb5-e72c144577b8",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
