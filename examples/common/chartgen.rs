@@ -2281,7 +2281,7 @@ fn failed_text() -> &'static str {
 fn short_window_text() -> String {
     format!(
         "measured, but every window under {MIN_PUBLISHABLE_WINDOW_SECS} s — too short \
-         for the throughput to be a rate, so none is published (not even as a lower bound)"
+         to publish as a rate, even a lower bound"
     )
 }
 
@@ -4001,8 +4001,8 @@ fn render_parallel_vs_sequenced(
                             "lower bound (muted bar) — this window cannot separate setup \
                              from drain, so the true rate is at least the bar shown"
                         } else {
-                            "lower bound from a window that cannot separate setup from drain; \
-                             the bar is shape only, so its height is not the bound"
+                            "lower bound from a window mixing setup and drain; shape only, \
+                             so its height is not the bound"
                         };
                         qualifiers
                             .entry(text.to_string())
