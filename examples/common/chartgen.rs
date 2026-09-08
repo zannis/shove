@@ -2133,8 +2133,22 @@ fn frame<'b>(
             + MIN_PLOT_PX
             + PLOT_BOTTOM_GAP
     {
+        // Name the chart and the budget it went over. The chart step runs
+        // after the whole measurement sequence, so this message is read hours
+        // from the decision that caused it; "the caption block is too tall"
+        // alone leaves the reader to work out which of eleven charts refused,
+        // and by how much, before they can trim anything.
+        let budget = (bottom
+            - (PLOT_TOP
+                .saturating_add(legend_extra)
+                .saturating_add(subtitle_extra)
+                + MIN_PLOT_PX
+                + PLOT_BOTTOM_GAP))
+            / LINE
+            + 1;
         return Err(ChartError::Render(format!(
-            "the caption block ({} lines) leaves no room for the chart body",
+            "`{title}`: the caption block ({} lines) leaves no room for the chart body \
+             — this chart's budget is {budget} lines",
             footer.len()
         )));
     }
@@ -2319,22 +2333,44 @@ fn shape_only_note(run: &BackendRun) -> String {
 /// Caption lines for cells the harness ran and could not measure in a chart's
 /// slice. A failed cell is absent from `results[]`, and an unexplained
 /// absence reads as a smaller sweep — or, worse, as a capability hole.
+///
+/// One line per *count*, not one per backend. The sentence is the same for
+/// every backend that lost the same number of cells, and the slices a failure
+/// lands in are the ones already carrying the mode notes, the batch knobs and
+/// the drain account — the caption block has a fixed budget before the chart
+/// body has no room left, so restating the sentence per backend is what turns
+/// a second failed backend into a refusal. Backends sharing a count are named
+/// in document order; the lines run fewest failures first.
 fn failure_notes<P>(runs: &[BackendRun], in_slice: P) -> Vec<String>
 where
     P: Fn(&FailedRow) -> bool,
 {
-    let mut notes = Vec::new();
+    let mut by_count: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
     for run in runs {
         let failed = run.failures.iter().filter(|f| in_slice(f)).count();
         if failed > 0 {
-            notes.push(format!(
-                "{}: {failed} cell(s) in this slice failed to run — absent, \
-                 not zero; see failures[] in the results document",
-                run.backend
-            ));
+            by_count
+                .entry(failed)
+                .or_default()
+                .push(run.backend.as_str());
         }
     }
-    notes
+    by_count
+        .into_iter()
+        .map(|(failed, backends)| {
+            // Every word here is spent against a caption line the tightest
+            // family has one to spare of: naming the six backends and the
+            // count is what the reader cannot reconstruct, and "see
+            // failures[]" already says where — the provenance line under it
+            // names the document.
+            format!(
+                "{}: {failed} cell{} in this slice failed to run — absent, \
+                 not zero; see failures[]",
+                backends.join(", "),
+                if failed == 1 { "" } else { "s" },
+            )
+        })
+        .collect()
 }
 
 /// The best-observed row by throughput. First-wins on exact ties, which keeps
@@ -2833,7 +2869,9 @@ where
 /// unattributed set ("6M / 30k") names both sizes and tells nobody which bar
 /// is which, which is worse than either naming one or naming them all — so
 /// the flat sentence is kept only for the case it is actually true of, every
-/// backend on the same corpus.
+/// backend on the same corpus. Attributed, the backends sharing a corpus are
+/// grouped onto one entry rather than one each: they disagree because one
+/// deviates, so an entry each spends caption lines restating the pinned size.
 fn drain_notes<P>(runs: &[BackendRun], in_slice: P) -> Vec<String>
 where
     P: Fn(&ScenarioResult) -> bool,
@@ -2883,14 +2921,37 @@ where
             corpus_clause,
         ));
         if uniform.is_none() {
+            // Attributed does not mean one entry per backend. The backends
+            // disagree because one of them deviates — the matrix pins a single
+            // corpus and SQS alone runs a smaller one — so an entry each
+            // repeats the same sizes five times to say one thing. This note
+            // shares the caption block with the mode, lower-bound and batch
+            // notes, and that block has a fixed budget before the chart body
+            // has no room left; the repetition is what spends the line.
+            // Backends on the same corpus are grouped and named in document
+            // order, as are the groups themselves — which puts the pinned
+            // corpus before the deviation that differs from it. Groups are
+            // separated by `;` so a group's backend list cannot be misread as
+            // running into the next group.
+            let mut groups: Vec<(&BTreeSet<u64>, Vec<&str>)> = Vec::new();
+            for (backend, corpora) in &per_backend {
+                match groups.iter_mut().find(|(c, _)| *c == corpora) {
+                    Some((_, sharing)) => sharing.push(backend),
+                    None => groups.push((corpora, vec![backend])),
+                }
+            }
             notes.push(format!(
                 "corpus differs by backend: {} — a smaller corpus is a shorter window, not a \
                  different measurement",
-                per_backend
+                groups
                     .iter()
-                    .map(|(b, c)| format!("{b} {}", fmt_counts(c)))
+                    .map(|(corpora, sharing)| format!(
+                        "{} {}",
+                        sharing.join(", "),
+                        fmt_counts(corpora)
+                    ))
                     .collect::<Vec<_>>()
-                    .join(", "),
+                    .join("; "),
             ));
         }
         if !duplicates.is_empty() {
@@ -4016,8 +4077,17 @@ fn render_parallel_vs_sequenced(
     notes.extend(mode_notes(&qualifiers));
 
     // One note when every backend's batch bar ran the same knobs (the usual
-    // case), per-backend notes when they differ — never silence, because the
+    // case), attributed notes when they differ — never silence, because the
     // knobs are what the bar's number means.
+    //
+    // Attributed does not mean one line per backend. A backend differs from
+    // the rest only rarely — SQS clamps to `ReceiveMessage`'s 10 while the
+    // matrix pins 500 for everyone else — so a line per backend spends six
+    // lines saying two things. The caption block has a fixed budget before
+    // the chart body has no room left, and the same slice also carries a
+    // drain note, the mode notes and the provenance; six backends is over
+    // it. Backends that ran the same knobs share one line, named in document
+    // order; the lines themselves run smallest batch first.
     let configs: BTreeSet<(u64, u64)> = batch_knobs.iter().map(|(_, s, a)| (*s, *a)).collect();
     match configs.len() {
         0 => {}
@@ -4028,9 +4098,15 @@ fn render_parallel_vs_sequenced(
             ));
         }
         _ => {
-            for (backend, size, age) in &batch_knobs {
+            for (size, age) in &configs {
+                let sharing: Vec<&str> = batch_knobs
+                    .iter()
+                    .filter(|(_, s, a)| (s, a) == (size, age))
+                    .map(|(backend, _, _)| backend.as_str())
+                    .collect();
                 notes.push(format!(
-                    "{backend} / batch: up to {size} messages or {age} ms per batch"
+                    "{} / batch: up to {size} messages or {age} ms per batch",
+                    sharing.join(", "),
                 ));
             }
         }

@@ -548,6 +548,58 @@ fn a_published_batch_bar_names_its_knobs() {
 }
 
 #[test]
+fn batch_knob_captions_group_the_backends_that_share_them() {
+    // The knobs are per backend only because one backend can differ. Once
+    // any two disagree the caption used to degenerate to a line per backend,
+    // so a six-backend document spent six lines saying two things — and the
+    // caption block has a fixed budget before the chart body has no room
+    // left. Backends that ran the same knobs share a line.
+    let batch = |backend: &str, size: u64| {
+        format!(
+            r#"{{
+              "backend": "{backend}", "representative": true,
+              "results": [{}], "failures": [], "unsupported": []
+            }}"#,
+            scenario("consume_batch", "batch", 64, 1, 80_000.0).replace(
+                r#""max_batch_size": 500"#,
+                &format!(r#""max_batch_size": {size}"#)
+            )
+        )
+    };
+    // Five backends on the pinned size, one clamped — the shape the published
+    // matrix produces, SQS capping `ReceiveMessage` at 10.
+    let runs = [
+        inmemory_run(true),
+        batch("kafka", 500),
+        batch("nats", 500),
+        batch("rabbitmq", 500),
+        batch("redis", 500),
+        batch("sqs", 10),
+    ]
+    .join(",");
+    let doc = parse(&document(&runs));
+
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("a six-backend document must still leave room for the chart body");
+
+    assert!(
+        svg.contains(
+            "kafka, nats, rabbitmq, redis / batch: up to 500 messages or 200 ms per batch"
+        ),
+        "backends sharing the knobs must share one caption line"
+    );
+    assert!(
+        svg.contains("sqs / batch: up to 10 messages or 200 ms per batch"),
+        "the backend that differs must still be named with its own knobs"
+    );
+    assert_eq!(
+        svg.matches("ms per batch").count(),
+        2,
+        "one line per distinct knob pair, not one per backend"
+    );
+}
+
+#[test]
 fn a_sleeping_handler_row_never_reaches_a_throughput_chart() {
     // A handler_bound row's throughput is the simulated sleep, not shove.
     // Its magnitude must not appear in any throughput family — not as a bar,
@@ -1342,12 +1394,146 @@ fn a_failed_cell_in_a_slice_is_named_in_the_caption() {
     let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
         .expect("chart should render");
     assert!(
-        svg.contains("kafka: 1 cell(s) in this slice failed to run"),
+        svg.contains("kafka: 1 cell in this slice failed to run"),
         "a failed cell must be named in the caption"
     );
     assert!(
         svg.contains("absent, not zero"),
         "the caption must say how to read the absence"
+    );
+}
+
+#[test]
+fn failure_captions_group_the_backends_that_lost_the_same_count() {
+    // The note names a backend and a count, and says the same sentence about
+    // both. A line per backend spends the caption budget restating it: the
+    // slice a failure is most likely to land in already carries the mode
+    // notes, the batch knobs, the drain account and the provenance, so on a
+    // six-backend document two failed backends are the difference between a
+    // chart and a refusal. Backends that lost the same number of cells share
+    // a line, named in document order.
+    let failing = |backend: &str, consumers: u32| {
+        format!(
+            r#"{{
+              "backend": "{backend}", "representative": true,
+              "results": [{}],
+              "failures": [{{
+                "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 64,
+                "tier": "moderate", "messages": 150000, "consumers": {consumers},
+                "handler": "zero (no-op)", "method": "drain", "error": "timeout after 60s"
+              }}],
+              "unsupported": []
+            }}"#,
+            scenario("consume_parallel", "parallel", 64, 1, 9_000.0)
+        )
+    };
+    let runs = [inmemory_run(true), failing("kafka", 4), failing("nats", 8)].join(",");
+    let doc = parse(&document(&runs));
+
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+
+    assert!(
+        svg.contains("kafka, nats: 1 cell in this slice failed to run"),
+        "backends that lost the same count share one caption line"
+    );
+    assert_eq!(
+        svg.matches("in this slice failed to run").count(),
+        1,
+        "the two backends share one line rather than taking one each"
+    );
+    assert!(
+        svg.contains("absent, not zero"),
+        "the grouped line must still say how to read the absence"
+    );
+}
+
+#[test]
+fn failure_captions_keep_backends_with_different_counts_apart() {
+    // Grouping is by what the line says. Two backends that lost different
+    // numbers of cells do not say the same thing, so they keep their own
+    // lines — ordered by count, so the ordering does not depend on which
+    // backend the harness happened to measure first.
+    let failed_cell = |consumers: u32| {
+        format!(
+            r#"{{
+              "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 64,
+              "tier": "moderate", "messages": 150000, "consumers": {consumers},
+              "handler": "zero (no-op)", "method": "drain", "error": "timeout after 60s"
+            }}"#
+        )
+    };
+    let run = |backend: &str, failures: &str| {
+        format!(
+            r#"{{
+              "backend": "{backend}", "representative": true,
+              "results": [{}], "failures": [{failures}], "unsupported": []
+            }}"#,
+            scenario("consume_parallel", "parallel", 64, 1, 9_000.0)
+        )
+    };
+    let runs = [
+        inmemory_run(true),
+        run("kafka", &format!("{},{}", failed_cell(4), failed_cell(8))),
+        run("nats", &failed_cell(4)),
+    ]
+    .join(",");
+    let doc = parse(&document(&runs));
+
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+
+    assert!(
+        svg.contains("nats: 1 cell in this slice failed to run"),
+        "a backend that lost one cell says one"
+    );
+    assert!(
+        svg.contains("kafka: 2 cells in this slice failed to run"),
+        "a backend that lost two says two"
+    );
+}
+
+#[test]
+fn the_grouped_failure_note_fits_one_caption_line_with_every_backend_named() {
+    // Grouping backends onto one line only saves that line if the grouped
+    // sentence itself fits: a caption line is NOTE_WRAP characters, and the
+    // wording wrapped onto a second line as soon as three backends were
+    // named. The worst case is the whole sealed backend set losing the same
+    // cell — which is the expected shape here, since the cell the published
+    // document already fails on ("consumed before assembly" at 64 KiB) fails
+    // harder the faster the backend, so a faster host loses it on more of
+    // them. That lands in `parallel-vs-sequenced`, the family with the least
+    // caption headroom, so a wrap here is the difference between a chart and
+    // a refusal.
+    let failing = |backend: &str| {
+        format!(
+            r#"{{
+              "backend": "{backend}", "representative": true,
+              "results": [{}],
+              "failures": [{{
+                "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 64,
+                "tier": "moderate", "messages": 150000, "consumers": 8,
+                "handler": "zero (no-op)", "method": "drain", "error": "timeout after 60s"
+              }}],
+              "unsupported": []
+            }}"#,
+            scenario("consume_parallel", "parallel", 64, 1, 9_000.0)
+        )
+    };
+    let runs = ["inmemory", "kafka", "nats", "rabbitmq", "redis", "sqs"]
+        .map(failing)
+        .join(",");
+    let doc = parse(&document(&runs));
+
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+
+    assert!(
+        svg.contains(
+            "inmemory, kafka, nats, rabbitmq, redis, sqs: 1 cell in this slice failed to run \
+             — absent, not zero; see failures[]"
+        ),
+        "the grouped note must stay on one line with every backend named"
     );
 }
 
@@ -1438,7 +1624,18 @@ fn a_pathological_caption_block_is_a_loud_error_not_a_garbage_chart() {
     )));
     match chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light) {
         Err(ChartError::Render(msg)) => {
-            assert!(msg.contains("leaves no room"), "wrong error: {msg}")
+            assert!(msg.contains("leaves no room"), "wrong error: {msg}");
+            // The chart step runs after the whole measurement sequence, so the
+            // refusal has to say which of eleven charts refused and what it had
+            // to spend — otherwise trimming the caption starts with a search.
+            assert!(
+                msg.contains("Parallel vs sequenced consume"),
+                "the refusal must name the chart: {msg}"
+            );
+            assert!(
+                msg.contains("budget is") && msg.contains("lines"),
+                "the refusal must name the budget it went over: {msg}"
+            );
         }
         Ok(_) => panic!("a caption block taller than the canvas rendered a chart"),
         other => panic!("expected a Render refusal, got {other:?}"),
@@ -1508,7 +1705,7 @@ fn an_empty_run_with_recorded_failures_is_not_silent() {
     let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
         .expect("chart should render");
     assert!(
-        svg.contains("kafka: 1 cell(s) in this slice failed to run"),
+        svg.contains("kafka: 1 cell in this slice failed to run"),
         "the failed cell must surface in the caption"
     );
 }
@@ -4487,7 +4684,7 @@ fn a_backend_that_drained_a_smaller_corpus_is_named_in_the_caption() {
         .expect("chart should render");
     let caption = joined_text(&svg);
     assert!(
-        caption.contains("corpus differs by backend: inmemory 22k, kafka 2.2k"),
+        caption.contains("corpus differs by backend: inmemory 22k; kafka 2.2k"),
         "each backend's corpus is named: {caption}"
     );
     assert!(
@@ -4497,6 +4694,46 @@ fn a_backend_that_drained_a_smaller_corpus_is_named_in_the_caption() {
     assert!(
         caption.contains("no producer ran in the window"),
         "the drain rule itself still stands: {caption}"
+    );
+}
+
+#[test]
+fn backends_sharing_a_corpus_are_grouped_into_one_caption_entry() {
+    // The shape the six-backend rerun actually produces: one matrix pins a
+    // corpus for everyone and a single backend deviates because it is too
+    // slow to drain the pinned one in a sane wall clock. An entry per backend
+    // would restate the pinned size once per backend to say one thing, and
+    // the parallel-vs-sequenced slice this note shares a caption block with
+    // sits one line under its budget at six backends.
+    let shared = ["kafka", "nats", "rabbitmq", "redis"].map(|backend| {
+        format!(
+            r#"{{ "backend": "{backend}", "representative": true,
+                  "results": [{}], "failures": [], "unsupported": [] }}"#,
+            consumer_axis_drains(10_000.0).join(",")
+        )
+    });
+    let deviating = format!(
+        r#"{{ "backend": "sqs", "representative": true,
+              "results": [{}], "failures": [], "unsupported": [] }}"#,
+        consumer_axis_drains(1_000.0).join(",")
+    );
+    let runs = format!("{},{},{}", inmemory_run(true), shared.join(","), deviating);
+    let doc = parse(&document(&runs));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+    let caption = joined_text(&svg);
+    assert!(
+        caption.contains(
+            "corpus differs by backend: inmemory, kafka, nats, rabbitmq, redis 22k; sqs 2.2k"
+        ),
+        "backends on one corpus share an entry, the deviation keeps its own: {caption}"
+    );
+    // The point of grouping is the line it buys back, so the sizes must be
+    // stated once each rather than once per backend.
+    assert_eq!(
+        caption.matches("22k").count(),
+        1,
+        "the shared corpus is stated once, not once per backend: {caption}"
     );
 }
 
