@@ -110,8 +110,8 @@ Full semantics: [Outcomes & Delivery](https://shove.rs/concepts/outcomes).
 The charts are generated from a committed results document — never hand-copied —
 and each one carries its own provenance (shove version, generation date,
 hardware) in the caption. The harness runs against every backend; the currently
-published document measures the in-process and Kafka backends, and a plotted
-series appears only for a backend the document actually contains. See
+published document measures the in-process, Kafka, RabbitMQ and Redis backends,
+and a plotted series appears only for a backend the document actually contains. See
 [Measurement methodology](https://shove.rs/ops/performance#measurement-methodology)
 for what is measured and what is still pending.
 

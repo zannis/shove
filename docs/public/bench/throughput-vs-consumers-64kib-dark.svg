@@ -7,76 +7,158 @@ Throughput vs consumer count
 <text x="24" y="48" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
 consume_parallel — 64 KiB payload — higher is better
 </text>
-<text x="24" y="486" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+<text x="24" y="438" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
 inmemory: measured, but no drain rate is published for this slice — window under 1 s, too short to publish as a rate
 </text>
-<text x="24" y="502" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+<text x="24" y="454" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
 at consumers 1, 2, 4, 8
 </text>
-<text x="24" y="518" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+<text x="24" y="470" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
 kafka: partial — not plotted: window under 1 s, too short to publish as a rate at consumers 1, 4, 8
 </text>
+<text x="24" y="486" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+rabbitmq: partial — not plotted: failed to run — absent, not zero; see failures[] in the results document (a failed
+</text>
+<text x="24" y="502" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+drain; the cell&apos;s ladder rungs are not its ceiling) at consumers 8
+</text>
+<text x="24" y="518" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+drain (inmemory, kafka, rabbitmq, redis): each consume_parallel point is the processing rate of the consumers from the
+</text>
 <text x="24" y="534" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
-drain (inmemory, kafka): each consume_parallel point is the processing rate of the consumers from the moment every
+moment every worker was assigned until 90 % of a corpus of 49k messages, published before they started, had been
 </text>
 <text x="24" y="550" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
-worker was assigned until 90 % of a corpus of 49k messages, published before they started, had been consumed; no
+consumed; no producer ran in the window
 </text>
 <text x="24" y="566" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
-producer ran in the window
+rabbitmq, redis: 1 cell in this slice failed to run — absent, not zero; see failures[]
 </text>
 <text x="24" y="582" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-Generated 2026-09-04T13:16:16Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
+Generated 2026-09-07T13:47:38Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
 </text>
 <text x="24" y="598" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
 Apple M4 Max — 16 cores — 64 GB RAM — macOS 26.6.2 — rustc 1.91.1 (ed61e7d7e 2025-11-07) — handler: zero (no-op)
 </text>
 <text x="24" y="614" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-1 recorded failure(s) in the dataset — see failures[]
+9 recorded failure(s) in the dataset — see failures[]
 </text>
-<text x="16" y="269" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781" transform="rotate(270, 16, 269)">
+<text x="16" y="245" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781" transform="rotate(270, 16, 245)">
 messages / second — log scale
 </text>
-<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="441" x2="859" y2="441"/>
-<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="285" x2="859" y2="285"/>
-<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="193" x2="859" y2="193"/>
-<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="128" x2="859" y2="128"/>
-<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="89,96 89,441 "/>
-<text x="80" y="441" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="393" x2="859" y2="393"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="340" x2="859" y2="340"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="308" x2="859" y2="308"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="286" x2="859" y2="286"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="269" x2="859" y2="269"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="255" x2="859" y2="255"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="243" x2="859" y2="243"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="232" x2="859" y2="232"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="223" x2="859" y2="223"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="215" x2="859" y2="215"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="215" x2="859" y2="215"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="161" x2="859" y2="161"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="130" x2="859" y2="130"/>
+<line opacity="1" stroke="#2C2C2A" stroke-width="1" x1="90" y1="107" x2="859" y2="107"/>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="89,96 89,393 "/>
+<text x="80" y="393" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+1.0k
+</text>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,393 89,393 "/>
+<text x="80" y="340" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+2.0k
+</text>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,340 89,340 "/>
+<text x="80" y="308" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+3.0k
+</text>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,308 89,308 "/>
+<text x="80" y="286" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+4.0k
+</text>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,286 89,286 "/>
+<text x="80" y="269" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+5.0k
+</text>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,269 89,269 "/>
+<text x="80" y="255" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+6.0k
+</text>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,255 89,255 "/>
+<text x="80" y="243" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+7.0k
+</text>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,243 89,243 "/>
+<text x="80" y="232" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+8.0k
+</text>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,232 89,232 "/>
+<text x="80" y="223" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+9.0k
+</text>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,223 89,223 "/>
+<text x="80" y="215" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
 10k
 </text>
-<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,441 89,441 "/>
-<text x="80" y="285" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,215 89,215 "/>
+<text x="80" y="215" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+10k
+</text>
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,215 89,215 "/>
+<text x="80" y="161" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
 20k
 </text>
-<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,285 89,285 "/>
-<text x="80" y="193" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,161 89,161 "/>
+<text x="80" y="130" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
 30k
 </text>
-<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,193 89,193 "/>
-<text x="80" y="128" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,130 89,130 "/>
+<text x="80" y="107" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
 40k
 </text>
-<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,128 89,128 "/>
-<polyline fill="none" opacity="1" stroke="#D95926" stroke-width="2" points="370,122 "/>
-<circle cx="370" cy="122" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
-<circle cx="370" cy="122" r="4" opacity="1" fill="#D95926" stroke="none" stroke-width="0"/>
-<text x="378" y="122" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+<polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,107 89,107 "/>
+<polyline fill="none" opacity="1" stroke="#D95926" stroke-width="2" points="370,105 "/>
+<polyline fill="none" opacity="1" stroke="#C98500" stroke-width="2" points="162,368 370,219 578,232 "/>
+<polyline fill="none" opacity="1" stroke="#D55181" stroke-width="2" points="162,242 370,210 578,173 786,151 "/>
+<circle cx="370" cy="105" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="370" cy="105" r="4" opacity="1" fill="#D95926" stroke="none" stroke-width="0"/>
+<circle cx="162" cy="368" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="162" cy="368" r="4" opacity="1" fill="#C98500" stroke="none" stroke-width="0"/>
+<circle cx="370" cy="219" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="370" cy="219" r="4" opacity="1" fill="#C98500" stroke="none" stroke-width="0"/>
+<circle cx="578" cy="232" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="578" cy="232" r="4" opacity="1" fill="#C98500" stroke="none" stroke-width="0"/>
+<circle cx="162" cy="242" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="162" cy="242" r="4" opacity="1" fill="#D55181" stroke="none" stroke-width="0"/>
+<circle cx="370" cy="210" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="370" cy="210" r="4" opacity="1" fill="#D55181" stroke="none" stroke-width="0"/>
+<circle cx="578" cy="173" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="578" cy="173" r="4" opacity="1" fill="#D55181" stroke="none" stroke-width="0"/>
+<circle cx="786" cy="151" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="786" cy="151" r="4" opacity="1" fill="#D55181" stroke="none" stroke-width="0"/>
+<text x="378" y="105" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
 kafka
 </text>
-<text x="162" y="450" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+<text x="586" y="232" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+rabbitmq
+</text>
+<polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="792,151 867,151 "/>
+<text x="870" y="151" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+redis
+</text>
+<text x="162" y="402" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
 1
 </text>
-<text x="370" y="450" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+<text x="370" y="402" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
 2
 </text>
-<text x="578" y="450" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+<text x="578" y="402" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
 4
 </text>
-<text x="786" y="450" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+<text x="786" y="402" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
 8
 </text>
-<text x="475" y="470" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
+<text x="475" y="422" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781">
 consumers
 </text>
 <rect x="94" y="77" width="14" height="8" opacity="1" fill="#3987E5" stroke="none"/>
@@ -86,5 +168,13 @@ inmemory (withheld)
 <rect x="309" y="77" width="14" height="8" opacity="1" fill="#D95926" stroke="none"/>
 <text x="329" y="74" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
 kafka (single point)
+</text>
+<rect x="533" y="77" width="14" height="8" opacity="1" fill="#C98500" stroke="none"/>
+<text x="553" y="74" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+rabbitmq
+</text>
+<rect x="649" y="77" width="14" height="8" opacity="1" fill="#D55181" stroke="none"/>
+<text x="669" y="74" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#C3C2B7">
+redis
 </text>
 </svg>
