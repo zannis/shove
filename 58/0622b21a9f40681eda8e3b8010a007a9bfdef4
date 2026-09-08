@@ -1,0 +1,27 @@
+examples/kafka/stress.rs
+  s_1a5ac5ada4ff0e::t_9284926dd0d0bf 363-371
+examples/nats/stress.rs
+  s_1a5ac5ada4ff0e::t_316287d4580073 128-136
+examples/rabbitmq/stress.rs
+  s_1a5ac5ada4ff0e::t_6f7dab5e504134 210-218
+examples/redis/stress.rs
+  s_1a5ac5ada4ff0e::t_ba82b4d3c2694e 167-175
+examples/sqs/stress.rs
+  s_1a5ac5ada4ff0e::t_4b54f25a28a047 274-282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "580622b21a9f40681eda8e3b8010a007a9bfdef4",
+  "prompts": {},
+  "sessions": {
+    "s_1a5ac5ada4ff0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f193bc98-253b-491e-beb5-e72c144577b8",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
