@@ -1,0 +1,75 @@
+docs/public/bench/dispatch-latency-64kib-dark.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,13,16-18,20,23,29,31,34-35,37-43,46-47,50,54-55,58-59,62-63,66-79,82-86,89-93,96-100,103-107,110-114,117-159,162,165-171
+docs/public/bench/parallel-vs-sequenced.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,12-13,15-16,18-19,21,32,35,38,41,47,53,128-129,131-132,138-139,142-143,145-146,152-153,161-162,164-165
+docs/public/bench/parallel-vs-sequenced-64kib.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,12-13,15-16,18,56,62,157-158,164-165,171-172,178-179,181-182,188-189,197-198,200-201
+docs/public/bench/throughput-vs-consumers-64kib.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,13,16,18-19,21-22,24-25,27,38,44,62,65-66,69-70,73-74,77-78,81-82,85-86,89-90,93-94,97-98,105-106,116,119-120,123-124,139,143-144,147-148,172-179
+docs/pages/ops/performance.mdx
+  s_1a5ac5ada4ff0e::t_adb9100c1d98dc 13-20
+docs/public/bench/throughput-vs-consumers.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 11,14,17,20,26,32-38,40-44,46-49,52,55-76,78-82,84,87-103,106-107,110-111,114-115,118-119,122-123,126-164,167-168,171-178,202-209
+docs/public/bench/throughput-vs-payload-dark.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,13,16-18,20,23,29,35,37,40-45,47-49,51-52,55-80,83,86-94,97,100,103,114-121
+docs/public/bench/framework-overhead.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 38,44
+docs/public/bench/parallel-vs-sequenced-64kib-dark.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,12-13,15-16,18,56,62,157-158,164-165,171-172,178-179,181-182,188-189,197-198,200-201
+docs/public/bench/dispatch-latency-dark.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,13,16-18,20,23,29,31,34-38,40-41,44-45,48-49,52-53,56-57,60,65-69,72-76,79-83,86-90,93-97,100-104,107-149,152,155-161
+docs/public/bench/parallel-vs-sequenced-1kib-dark.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,12-13,15-16,18,29,32,35,38,44,50,135-136,139-140,146-147,153-154,156-157,163-164,172-173,175-176
+docs/public/bench/parallel-vs-sequenced-dark.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,12-13,15-16,18-19,21,32,35,38,41,47,53,128-129,131-132,138-139,142-143,145-146,152-153,161-162,164-165
+docs/public/bench/throughput-vs-consumers-1kib-dark.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 11,14,17,20,26,129-130,147-162,171-178,202-209
+docs/public/bench/throughput-vs-consumers-64kib-dark.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,13,16,18-19,21-22,24-25,27,38,44,62,65-66,69-70,73-74,77-78,81-82,85-86,89-90,93-94,97-98,105-106,116,119-120,123-124,139,143-144,147-148,172-179
+docs/public/bench/throughput-vs-payload.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,13,16-18,20,23,29,35,37,40-45,47-49,51-52,55-80,83,86-94,97,100,103,114-121
+README.md
+  s_1a5ac5ada4ff0e::t_adb9100c1d98dc 113-114
+docs/public/bench/dispatch-latency-64kib.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,13,16-18,20,23,29,31,34-35,37-43,46-47,50,54-55,58-59,62-63,66-79,82-86,89-93,96-100,103-107,110-114,117-159,162,165-171
+docs/public/bench/throughput-vs-consumers-dark.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 11,14,17,20,26,32-38,40-44,46-49,52,55-76,78-82,84,87-103,106-107,110-111,114-115,118-119,122-123,126-164,167-168,171-178,202-209
+docs/public/bench/dispatch-latency-1kib-dark.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,13,16-18,20,23,29,31,34-42,44-46,49-50,53-54,57-58,61-62,65-84,86-94,97-101,104-108,111-115,118-122,125-129,132-174,177,180-186
+docs/public/bench/dispatch-latency.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,13,16-18,20,23,29,31,34-38,40-41,44-45,48-49,52-53,56-57,60,65-69,72-76,79-83,86-90,93-97,100-104,107-149,152,155-161
+docs/public/bench/dispatch-latency-1kib.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,13,16-18,20,23,29,31,34-42,44-46,49-50,53-54,57-58,61-62,65-84,86-94,97-101,104-108,111-115,118-122,125-129,132-174,177,180-186
+docs/public/bench/framework-overhead-dark.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 38,44
+docs/public/bench/parallel-vs-sequenced-1kib.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 10,12-13,15-16,18,29,32,35,38,44,50,135-136,139-140,146-147,153-154,156-157,163-164,172-173,175-176
+docs/public/bench/throughput-vs-consumers-1kib.svg
+  s_1a5ac5ada4ff0e::t_277dcc26894ae7 11,14,17,20,26,129-130,147-162,171-178,202-209
+benches/results/bench-results.json
+  s_958719939db809::t_d57a0c4035e3b9 3,6079,6185,6269,6395,6426,6508,6661,6730,6741,6749,6853,6924,6961,6989,7008,7069,7143,7301,7354,7389,7671,7856,7886,7893,7974,8007,8046,8078,8085,8415,8417,8482,8649,8773,8820,8916,8953,8965,8990,9138,9175,9214,9216,9289,9328,9340,9367,9369,9442,9554,9638,9697,9771,9783,9879,9960,10083,10102,10161,10343,10418,10420,10457,10571,10642,10649,10661,10724,10838,10920,10981,11090,11251-21343
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "e65b1d04eed22497b15056ef199080a77e1f5549",
+  "prompts": {},
+  "sessions": {
+    "s_1a5ac5ada4ff0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f193bc98-253b-491e-beb5-e72c144577b8",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_958719939db809": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9620525-5ac5-4f68-9906-54d787a376ed",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
