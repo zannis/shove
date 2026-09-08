@@ -141,8 +141,9 @@ that were **sustained**: the consumers ended the window, and never fell
 mid-window, more than 5 percent behind what was published.
 
 The matrix lives in one place, the `MATRIX` array in `scripts/bench.sh`.
-Do not pass the same knob again after `--`, the harness rejects a repeated
-argument.
+Naming one of its knobs again after `--` replaces the pinned copy rather than
+adding a second one — see "Extra harness arguments" for when that is the right
+thing to do and what it costs.
 
 ## Running one backend
 
@@ -289,8 +290,35 @@ scripts/bench.sh kafka -- --prefetch 200
 scripts/bench.sh kafka -- --hardware-label "c7g.2xlarge"
 ```
 
-Rows produced with a non-default knob are not comparable with the published
-ones. Keep them in a separate results file.
+A knob the matrix **does** pin replaces the pinned copy instead of being
+appended after it. clap rejects a repeated argument outright ("cannot be used
+multiple times"), so appending would kill the run before its first scenario:
+
+```sh
+# The readiness smoke: one cell, minutes rather than hours, into scratch.
+scripts/bench.sh nats -- --flow consume-batch --payload 64 --consumers 2 \
+  --drain-messages 200000 --results-file /tmp/nats-smoke.json
+```
+
+Each replacement is announced on stderr and written into the run's log
+header, because a row measured with a different corpus, ladder or tier is not
+comparable with the published ones. Keep such rows in a separate results
+file.
+
+This is a one-off escape hatch, not how a per-backend value gets set. SQS's
+corpus is not passed this way — it is `SQS_DRAIN_MESSAGES` in the script, so
+every SQS run gets it without anyone remembering to. A knob that should apply
+to every run of a backend belongs there too; overriding a pinned knob after
+`--` replaces the deviation for that one run and drops the `deviation:` line
+from its log.
+
+To see the argv a run would use without building or starting anything, add
+`--dry-run`; it prints the resolved arguments one per line and exits, which is
+worth doing before committing an hour to a cell:
+
+```sh
+scripts/bench.sh sqs --dry-run -- --drain-messages 60000
+```
 
 ## Reading a run
 
