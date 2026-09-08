@@ -4984,3 +4984,77 @@ fn a_cell_with_rungs_only_is_withheld_and_never_plotted() {
     );
     assert!(!svg.contains("offered-load ladder"), "{svg}");
 }
+
+// ── Caption line budget: notes that must not wrap (CAF-1122) ────────────────
+
+#[test]
+fn the_shape_only_fifo_lower_bound_note_fits_one_caption_line() {
+    // `parallel-vs-sequenced` is the family with the least caption headroom,
+    // and on a six-backend document its 64 KiB slice ran at 20 of a 21-line
+    // budget — one redelivery anywhere in the slice adds `drain_notes`'
+    // "redeliveries counted once" line and takes it to 21/21, after which any
+    // further note makes `frame()` refuse and write *no* charts at all.
+    //
+    // This note and its representative twin state one concept in two entries
+    // because a shape-only bar's height is normalised, so it cannot carry the
+    // "at least the bar shown" bound. They stay separate on purpose — see
+    // `a_shape_only_bar_carries_no_value_and_no_absolute_bound`, which guards
+    // sqs against the absolute claim — so the line is bought by wording, not
+    // by merging them and walking the bound back in a trailing clause.
+    let run = format!(
+        r#"{{
+          "backend": "sqs", "representative": false,
+          "broker": {{ "name": "LocalStack", "version": "x", "deployment": "localstack" }},
+          "results": [{},{}], "failures": [],
+          "unsupported": [{{ "flow": "consume_batch", "reason": "no batch on sqs" }}]
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 900.0),
+        scenario("consume_fifo", "fifo", 64, 1, 400.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
+
+    assert!(
+        svg.contains(
+            "sqs / sequenced (fifo): lower bound from a window mixing setup and drain; \
+             shape only, so its height is not the bound"
+        ),
+        "the shape-only lower-bound note must stay on one caption line: {svg}"
+    );
+}
+
+#[test]
+fn the_short_window_note_fits_one_caption_line() {
+    // Same budget, same family. A backend whose every window in the slice is
+    // under the publishable floor is captioned rather than dropped, and that
+    // caption sits in the block that has the least room to spare.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{},{},{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario_with_window(
+            "consume_parallel",
+            "parallel",
+            64,
+            1,
+            9_000.0,
+            "setup_bound",
+            0.4
+        ),
+        scenario_with_window("consume_batch", "batch", 64, 1, 9_500.0, "setup_bound", 0.4),
+        scenario("consume_fifo", "fifo", 64, 1, 4_000.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
+
+    assert!(
+        svg.contains(
+            "measured, but every window under 1 s — too short to publish as a rate, \
+             even a lower bound"
+        ),
+        "the short-window note must stay on one caption line: {svg}"
+    );
+}
