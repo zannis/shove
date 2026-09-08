@@ -19,6 +19,48 @@ use crate::topic::Topic;
 /// Maximum number of messages in a single SNS PublishBatch call.
 const SNS_BATCH_LIMIT: usize = 10;
 
+/// Maximum total message size of a single SNS PublishBatch call, in bytes:
+/// 256 KiB across every entry's body and attributes. Ten 64 KiB bodies are
+/// 640 KiB, so a chunk cut by count alone is refused whole by the service.
+const SNS_BATCH_BYTE_LIMIT: usize = 262_144;
+
+/// Bytes an entry's message group id, deduplication id and shard attribute
+/// add on top of its body, counted generously: SNS bills attribute names,
+/// types and values toward the call's total, and the exact figure buys
+/// nothing over a bound that never under-counts.
+const SNS_BATCH_ENTRY_OVERHEAD: usize = 64;
+
+/// Split `sizes` (one entry's byte size each, in publish order) into
+/// consecutive chunks holding at most `max_entries` entries and at most
+/// `max_bytes` in total. An entry larger than `max_bytes` on its own travels
+/// alone, so the service rejects that one entry rather than a whole chunk.
+fn batch_chunk_ranges(
+    sizes: &[usize],
+    max_entries: usize,
+    max_bytes: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for (i, &size) in sizes.iter().enumerate() {
+        let over_count = count >= max_entries.max(1);
+        let over_bytes = count > 0 && bytes.saturating_add(size) > max_bytes;
+        if over_count || over_bytes {
+            ranges.push(start..i);
+            start = i;
+            count = 0;
+            bytes = 0;
+        }
+        count = count.saturating_add(1);
+        bytes = bytes.saturating_add(size);
+    }
+    if count > 0 {
+        ranges.push(start..sizes.len());
+    }
+    ranges
+}
+
 /// Derive a deterministic SNS `MessageDeduplicationId` from the serialised
 /// payload.  Using the same ID for every attempt of the same payload means
 /// SNS FIFO can deduplicate within its 5-minute window even when a publish
@@ -345,19 +387,33 @@ impl SnsPublisher {
             Err(e) => return BatchReport::wholly_unattempted(total, e),
         };
 
-        // Chunk into groups of 10 and send. Track which *indices* each chunk
-        // resolved so the wrapper can record accurate per-message counters and
-        // hand the caller exact re-publish indices — the API-level
-        // `Result<()>` collapses the split that SNS actually reports.
+        // Chunk by the service's two limits, ten entries and 256 KiB per
+        // call, and send. Track which *indices* each chunk resolved so the
+        // wrapper can record accurate per-message counters and hand the
+        // caller exact re-publish indices — the API-level `Result<()>`
+        // collapses the split that SNS actually reports.
+        let sizes: Vec<usize> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, payload)| {
+                let key_bytes = routing_keys
+                    .as_ref()
+                    .and_then(|keys| keys.get(i))
+                    .map_or(0, |key| key.len().saturating_add(SNS_BATCH_ENTRY_OVERHEAD));
+                payload.len().saturating_add(key_bytes)
+            })
+            .collect();
         let mut failed_idx: Vec<usize> = Vec::new();
         let mut unattempted_idx: Vec<usize> = Vec::new();
         let mut first_err: Option<ShoveError> = None;
-        let mut chunk_start: usize = 0;
-        for chunk in entries.chunks(SNS_BATCH_LIMIT) {
+        for chunk_range in batch_chunk_ranges(&sizes, SNS_BATCH_LIMIT, SNS_BATCH_BYTE_LIMIT) {
             // Entry ids are the global index (`.id(i.to_string())` above), so
-            // this range is exactly the records in this chunk.
-            let chunk_range = chunk_start..chunk_start.saturating_add(chunk.len());
-            chunk_start = chunk_range.end;
+            // this range is exactly the records in this chunk. `sizes` and
+            // `entries` are both 1:1 with `payloads`, so the range is always
+            // in bounds; an empty `get` would be a bug, not a batch to send.
+            let Some(chunk) = entries.get(chunk_range.clone()) else {
+                continue;
+            };
 
             let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
             let mut chunk_err: Option<ShoveError> = None;
@@ -649,5 +705,51 @@ mod tests {
         let id = content_dedup_id(r#"{"foo":"bar"}"#);
         assert_eq!(id.len(), 16);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // SNS PublishBatch caps a call at 10 entries *and* 256 KiB of total
+    // message size, so chunking by count alone sends ten 64 KiB records in one
+    // call and the service refuses the whole chunk.
+    #[test]
+    fn ten_small_entries_fit_one_chunk() {
+        let sizes = [100; 10];
+        assert_eq!(
+            batch_chunk_ranges(&sizes, SNS_BATCH_LIMIT, SNS_BATCH_BYTE_LIMIT),
+            vec![0..10]
+        );
+    }
+
+    #[test]
+    fn the_entry_count_still_caps_a_chunk_at_ten() {
+        let sizes = [100; 25];
+        assert_eq!(
+            batch_chunk_ranges(&sizes, SNS_BATCH_LIMIT, SNS_BATCH_BYTE_LIMIT),
+            vec![0..10, 10..20, 20..25]
+        );
+    }
+
+    #[test]
+    fn the_byte_limit_splits_a_chunk_before_the_count_limit_does() {
+        // Four 64 KiB bodies are exactly 256 KiB; a fifth would exceed it.
+        let sizes = [65_536; 10];
+        assert_eq!(
+            batch_chunk_ranges(&sizes, SNS_BATCH_LIMIT, SNS_BATCH_BYTE_LIMIT),
+            vec![0..4, 4..8, 8..10]
+        );
+    }
+
+    #[test]
+    fn an_entry_over_the_byte_limit_travels_alone_so_sns_rejects_only_it() {
+        let sizes = [300_000, 10, 10];
+        assert_eq!(
+            batch_chunk_ranges(&sizes, SNS_BATCH_LIMIT, SNS_BATCH_BYTE_LIMIT),
+            vec![0..1, 1..3]
+        );
+    }
+
+    #[test]
+    fn no_entries_means_no_chunks() {
+        let sizes: [usize; 0] = [];
+        assert!(batch_chunk_ranges(&sizes, SNS_BATCH_LIMIT, SNS_BATCH_BYTE_LIMIT).is_empty());
     }
 }

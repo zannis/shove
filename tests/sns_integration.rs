@@ -457,6 +457,53 @@ async fn publish_batch_over_limit_chunks() {
 }
 
 #[tokio::test]
+async fn publish_batch_of_large_bodies_is_chunked_by_bytes() {
+    // SNS caps a PublishBatch call at 256 KiB across its entries as well as
+    // at ten entries. Ten 64 KiB bodies cut by count alone are one 640 KiB
+    // call, which the service refuses whole; cut by bytes they are three.
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SimpleWork>().await;
+
+    let publisher = setup.broker.publisher().await.expect("publisher");
+
+    let sqs_client = broker.sqs_client().await;
+    let raw_sns = broker.raw_sns_client().await;
+    let topic_arn = setup
+        .topic_registry()
+        .get("simple-work")
+        .await
+        .expect("ARN should exist");
+    let queue_url = broker
+        .subscribe_sqs_to_sns(&raw_sns, &sqs_client, &topic_arn, "batch-bytes-verify")
+        .await;
+
+    let body = "x".repeat(64 * 1024);
+    let messages: Vec<SimpleMessage> = (0..10)
+        .map(|i| SimpleMessage {
+            id: format!("large-{i}"),
+            content: body.clone(),
+        })
+        .collect();
+
+    publisher
+        .publish_batch::<SimpleWork>(&messages)
+        .await
+        .expect("a batch over the byte limit is split, not refused");
+
+    let received = broker
+        .receive_messages(&sqs_client, &queue_url, 10, Duration::from_secs(20))
+        .await;
+
+    assert_eq!(
+        received.len(),
+        10,
+        "expected 10 messages, got {}",
+        received.len()
+    );
+}
+
+#[tokio::test]
 async fn publish_sequenced_sets_group_id() {
     let broker = TestBroker::start().await;
     let setup = TestSetup::new(&broker).await;
