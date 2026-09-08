@@ -208,6 +208,17 @@ slice's backends disagree the charts name them ("corpus differs by backend:
 an SQS row changes — a rate is a rate — but a shorter window is a noisier
 estimate, which is why the size is on the chart and not just in the script.
 
+The FIFO cell deviates too, and separately, because the drain deviation never
+reaches it: `consume_fifo` holds no barrier and takes no drain, so it publishes
+the tier's 5 000 messages per shard and consumes them through the sequenced
+path. LocalStack serves that path at a few messages per second, which makes
+each of the three FIFO cells (one per payload) a ten-hour cell. SQS runs
+**100 per FIFO worker** instead (one worker per shard on this backend), set
+as `SQS_FIFO_MESSAGES` in `scripts/bench.sh` and passed as `--fifo-messages`,
+which replaces the tier's per-consumer count in the same unit; every other
+backend runs the tier's count. The row records the corpus it ran in
+`messages`.
+
 Kafka is the reference backend for the batched-consume flow. Its batch and
 parallel scenarios declare one partition per consumer so every group member
 gets work. Its `publish_single` row is bounded by librdkafka's default 5 ms
