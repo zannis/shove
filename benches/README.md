@@ -25,7 +25,7 @@ Every published row is measured with the same sampled core matrix:
 | `--handler zero` | no-op handler | measures shove and the broker, not simulated work |
 | `--consumers 1,2,4,8` | four points on the scaling curve | the sampling lever for the published matrix |
 | `--concurrent` | concurrent processing within each consumer | without it every consumer handles one message at a time, and the parallel flows measure ack round trips instead of throughput |
-| `--drain-messages 6000000` | the drain corpus for the consume flows | see below; sized so the group assembles well inside the first half of the corpus on the fastest cell and the window still lasts several seconds |
+| `--drain-messages 6000000` | the drain corpus for the consume flows | see below; sized so the group assembles well inside the first half of the corpus on the fastest cell and the window still lasts several seconds. **SQS is the one exception, at 60 000** — see "The SQS corpus deviation" |
 | `--drain-max-bytes 3221225472` | cap on `corpus × payload_bytes` | 3 GiB: 6 M messages at 64 B, 3 M at 1 KiB, about 49 k at 64 KiB — the in-process backend holds the corpus resident and Kafka writes it to disk before every cell |
 | `--load-rates …` | the offered-load ladder for the consume flows | see below; three rungs, because the ladder measures latency at a sustained rate and the ceiling comes from the drain |
 | `--load-window-secs 10` | how long each rung holds its rate | long enough for a rate |
@@ -181,15 +181,61 @@ than clamping it, and the matrix's size exceeds that. The harness clamps to 10
 when it builds the scenario and the row records 10, so an SQS batch bar is a
 10-message batch and is not like-for-like against a backend that ran 500.
 
+### The SQS corpus deviation
+
+SQS is also the one backend that does not drain the matrix's corpus. It runs
+**60 000** messages, set as `SQS_DRAIN_MESSAGES` in `scripts/bench.sh` and
+substituted into the matrix for that target only; every other knob is shared.
+The script prints a `deviation:` line at the top of the SQS log.
+
+The corpus is a message *count*, and six million was sized for the fastest
+cell — in-process at ~4.7 M msg/s, where it buys a window of about a second.
+Measured against LocalStack, SQS drains at ~900 msg/s and fills at ~660, so
+the same count buys a 1.7-hour window to measure what a minute measures, and
+the pass as a whole runs about 51 hours. The deviation exists because one
+count means two different things on backends three orders of magnitude apart,
+not to spare SQS a fair measurement.
+
+Everything that makes a drain row a rate still holds at 60 000: the window
+runs tens of seconds against a 1 s floor, the group assembles in the first
+handful of messages, and `--drain-max-bytes` still binds the 64 KiB leg at
+49 152, so that leg is not deviated at all.
+
+It is recorded in two places rather than only here. Every drain row carries
+`drain.corpus`, so the document says what each cell drained; and when a
+slice's backends disagree the charts name them ("corpus differs by backend:
+… sqs 60k") instead of listing the sizes unattributed. Nothing about reading
+an SQS row changes — a rate is a rate — but a shorter window is a noisier
+estimate, which is why the size is on the chart and not just in the script.
+
 Kafka is the reference backend for the batched-consume flow. Its batch and
 parallel scenarios declare one partition per consumer so every group member
 gets work. Its `publish_single` row is bounded by librdkafka's default 5 ms
 `linger.ms`, because the publisher awaits each delivery report. That is
 shove's default configuration and is what the row is meant to show.
 
-Budget about an hour per Docker backend for the full matrix: per consume
-cell a fill of up to six million messages, a drain of several seconds, three
-rungs of ten seconds each, and group setup around each.
+Budget per consume cell a fill of up to six million messages, a drain of
+several seconds, three rungs of ten seconds each, and group setup around
+each. A backend's wall clock is set by its drain rate, because the corpus is
+a count: the slower the backend, the longer the same corpus takes to fill and
+drain while measuring exactly the same thing.
+
+An hour is the right order for the fast backends and roughly half what the
+slow ones want. One 64 B, two-consumer `consume_batch` drain per backend, run
+back to back on one idle 8-core Linux host, measured these rates — a guide
+for scheduling, not published numbers:
+
+| backend | msg/s | full matrix |
+|---|---|---|
+| `inmemory` | ~1 100 000 | minutes |
+| `kafka` | ~240 000 | about an hour |
+| `redis` | ~166 000 | about an hour |
+| `nats` | ~48 000 | about an hour |
+| `rabbitmq` | ~18 000 | closer to two |
+| `sqs` | ~900 | about an hour, and only because of the corpus deviation above |
+
+Ratios move with the host; the ordering does not. Time one cell before
+committing an evening to a backend nobody has measured here.
 
 ## Results document and provenance
 

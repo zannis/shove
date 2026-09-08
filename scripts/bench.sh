@@ -47,6 +47,28 @@ MATRIX=(
   --load-producers 8
 )
 
+# The one documented deviation from the matrix above, and the only backend
+# that gets one.
+#
+# The corpus is a message *count*, and it was sized for the fastest cell —
+# in-process at ~4.7 M msg/s, where six million messages buy a window of
+# about a second. SQS measures LocalStack at ~900 msg/s and fills at ~660,
+# so the same count buys a 1.7-hour window to measure what a minute would,
+# and the pass as a whole runs about 51 hours. That is the count meaning two
+# different things on two backends, not SQS being slow in a way worth
+# publishing 51 hours to show.
+#
+# Everything that makes a drain row a rate still holds at this size: the
+# window runs tens of seconds (the floor chartgen publishes at is 1 s), the
+# group assembles in the first handful of messages, and the byte cap still
+# binds the 64 KiB leg at 49 152, so that leg is unchanged. The row records
+# `drain.corpus`, so the deviation is in the document rather than only here,
+# and the charts name the backend whose corpus differs.
+#
+# This is a per-backend corpus, not a second matrix: every other knob is
+# shared, so the flows and the axes stay comparable.
+SQS_DRAIN_MESSAGES=60000
+
 usage() {
   sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-2}"
@@ -99,6 +121,18 @@ fi
 if [ "$target" = sqs ]; then
   [ -n "${LOCALSTACK_AUTH_TOKEN:-}" ] \
     || die "LOCALSTACK_AUTH_TOKEN is not set; run through 'dotenvx run -- scripts/bench.sh sqs'"
+
+  # Substituted into the matrix rather than appended after it: the harness
+  # rejects a knob given twice, so a deviation has to replace the value.
+  deviated=0
+  for i in "${!MATRIX[@]}"; do
+    if [ "${MATRIX[$i]}" = --drain-messages ]; then
+      MATRIX[$((i + 1))]="$SQS_DRAIN_MESSAGES"
+      deviated=1
+    fi
+  done
+  [ "$deviated" = 1 ] \
+    || die "the matrix has no --drain-messages for the sqs corpus deviation to replace"
 fi
 
 if [ "$fresh" = 1 ] && [ -f "$RESULTS_FILE" ]; then
@@ -112,6 +146,9 @@ log="$LOG_DIR/$target-$(date -u +%Y%m%dT%H%M%SZ).log"
 
 echo "backend:  $target ($example, --features $features)"
 echo "matrix:   ${MATRIX[*]} ${extra[*]:-}"
+if [ "$target" = sqs ]; then
+  echo "deviation: drain corpus $SQS_DRAIN_MESSAGES, not the pinned 6000000 — see the comment in this script"
+fi
 echo "results:  $RESULTS_FILE"
 echo "log:      $log"
 
