@@ -641,6 +641,13 @@ impl ScenarioResult {
 /// that a bad results document cannot produce a clean-looking chart.
 #[derive(Debug)]
 pub enum ChartError {
+    /// A caption block that overran the canvas by a bounded number of lines
+    /// at the base [`HEIGHT`]. Never surfaced by the public render entry
+    /// points: they catch it and render again on a canvas grown by exactly
+    /// `extra_lines` caption lines (see [`MAX_CAPTION_GROWTH_LINES`]).
+    CaptionOverflow {
+        extra_lines: i32,
+    },
     /// Rule 1 — a document from a schema this generator does not understand.
     UnsupportedSchemaVersion {
         found: u32,
@@ -698,6 +705,11 @@ pub enum ChartError {
 impl fmt::Display for ChartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CaptionOverflow { extra_lines } => write!(
+                f,
+                "caption block overruns the base canvas by {extra_lines} line(s); the \
+                 renderer grows the canvas and renders again"
+            ),
             Self::UnsupportedSchemaVersion { found, expected } => write!(
                 f,
                 "unsupported schema_version {found}: this chartgen understands \
@@ -1408,11 +1420,21 @@ impl Chart {
 // ── Style: one render path, two selected themes ─────────────────────────────
 
 pub const WIDTH: u32 = 960;
-/// Tall enough that a full caption block — every backend's declared holes,
-/// the lower-bound and worker-count qualifiers, three provenance lines — still
-/// leaves the plot body [`MIN_PLOT_PX`] high. At 560 the committed ordering
-/// chart's nineteen caption lines squeezed the bars into ~50px.
+/// The base canvas height: tall enough that a full caption block — every
+/// backend's declared holes, the lower-bound and worker-count qualifiers,
+/// three provenance lines — still leaves the plot body [`MIN_PLOT_PX`] high.
+/// At 560 the committed ordering chart's nineteen caption lines squeezed the
+/// bars into ~50px. A caption that overruns this by up to
+/// [`MAX_CAPTION_GROWTH_LINES`] lines grows the canvas by exactly those lines
+/// instead of being refused: six backends' worth of qualifiers is a real
+/// document, not a pathology (the six-backend document's ordering chart
+/// carried 23 lines against a budget of 21).
 pub const HEIGHT: u32 = 640;
+/// The most caption lines the canvas may grow by past [`HEIGHT`]. Beyond it
+/// the caption is a defect in the document or the notes, and the chart is
+/// refused with the budget it went over rather than published as a footnote
+/// with a sliver of plot on top.
+pub const MAX_CAPTION_GROWTH_LINES: i32 = 8;
 /// The least plot-body height the frame will render. Below this the bars are
 /// slivers between the legend and the caption, and a chart that cannot be
 /// read is refused rather than published.
@@ -2057,12 +2079,16 @@ fn frame<'b>(
     // The surface: exactly one canvas-sized rect, in the mode's own surface
     // color, so the file is self-contained on any page it is embedded in.
     // The whitelist test counts on there being exactly one.
+    // The canvas may stand taller than `HEIGHT` on a retry (see
+    // `render_validated`), so every vertical anchor reads the area's own
+    // height rather than the constant.
+    let canvas_h = i32::try_from(root.dim_in_pixel().1).unwrap_or(HEIGHT as i32);
     root.fill(&theme.surface).map_err(render)?;
     // A hairline ring so the chart reads as a deliberate card where the page
     // plane is close to the surface color. Alpha serializes as an `opacity`
     // attribute, so the emitted hex stays the primary ink's.
     root.draw(&Rectangle::new(
-        [(0, 0), (WIDTH as i32 - 1, HEIGHT as i32 - 1)],
+        [(0, 0), (WIDTH as i32 - 1, canvas_h - 1)],
         ShapeStyle {
             color: theme.primary.mix(0.10),
             filled: false,
@@ -2116,7 +2142,7 @@ fn frame<'b>(
         footer.extend(wrap(&line, NOTE_WRAP).into_iter().map(|l| (l, true)));
     }
 
-    let bottom = HEIGHT as i32 - 26;
+    let bottom = canvas_h - 26;
     let lines = i32::try_from(footer.len()).unwrap_or(i32::MAX);
     let top_of_footer = bottom.saturating_sub(LINE.saturating_mul(lines.saturating_sub(1)));
     // The plot body runs from the chart area's top margin to the footer top
@@ -2138,14 +2164,21 @@ fn frame<'b>(
         // from the decision that caused it; "the caption block is too tall"
         // alone leaves the reader to work out which of eleven charts refused,
         // and by how much, before they can trim anything.
-        let budget = (bottom
-            - (PLOT_TOP
-                .saturating_add(legend_extra)
-                .saturating_add(subtitle_extra)
-                + MIN_PLOT_PX
-                + PLOT_BOTTOM_GAP))
-            / LINE
-            + 1;
+        let floor = PLOT_TOP
+            .saturating_add(legend_extra)
+            .saturating_add(subtitle_extra)
+            + MIN_PLOT_PX
+            + PLOT_BOTTOM_GAP;
+        let budget = (bottom - floor) / LINE + 1;
+        // A bounded overrun at the base height is not a refusal but a
+        // request for a taller canvas: `render_validated` renders again with
+        // exactly the missing lines added. Only a second overrun (the canvas
+        // already grown) or a runaway caption reaches the refusal below.
+        let deficit = floor.saturating_sub(top_of_footer);
+        let extra_lines = deficit.saturating_add(LINE - 1) / LINE;
+        if canvas_h == HEIGHT as i32 && extra_lines <= MAX_CAPTION_GROWTH_LINES {
+            return Err(ChartError::CaptionOverflow { extra_lines });
+        }
         return Err(ChartError::Render(format!(
             "`{title}`: the caption block ({} lines) leaves no room for the chart body \
              — this chart's budget is {budget} lines",
@@ -2170,7 +2203,7 @@ fn frame<'b>(
         .map_err(render)?;
     }
 
-    let reserved = (HEIGHT as i32 - top_of_footer + 18).max(0) as u32;
+    let reserved = (canvas_h - top_of_footer + 18).max(0) as u32;
     Ok((
         root.margin(
             (70 + subtitle_extra + legend_extra).max(0) as u32,
@@ -4717,9 +4750,20 @@ pub fn render_chart_to_string(
 /// already validated — [`generate`] validates once for every variant rather
 /// than re-walking every row per chart.
 fn render_validated(doc: &Document, chart: Chart, mode: Mode) -> Result<String, ChartError> {
+    match render_at(doc, chart, mode, HEIGHT) {
+        Err(ChartError::CaptionOverflow { extra_lines }) => {
+            let grown =
+                HEIGHT.saturating_add(u32::try_from(extra_lines.saturating_mul(LINE)).unwrap_or(0));
+            render_at(doc, chart, mode, grown)
+        }
+        other => other,
+    }
+}
+
+fn render_at(doc: &Document, chart: Chart, mode: Mode, height: u32) -> Result<String, ChartError> {
     let mut buf = String::new();
     {
-        let root = SVGBackend::with_string(&mut buf, (WIDTH, HEIGHT)).into_drawing_area();
+        let root = SVGBackend::with_string(&mut buf, (WIDTH, height)).into_drawing_area();
         render_into(doc, chart, mode, &root)?;
         root.present()
             .map_err(|e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string()))?;

@@ -2511,6 +2511,65 @@ fn identical_explanations_across_modes_collapse_to_one_caption_line() {
 }
 
 #[test]
+fn a_caption_a_few_lines_over_budget_grows_the_canvas_instead_of_refusing() {
+    // Six backends' worth of qualifiers is a real document, not a pathology:
+    // the six-backend results document's ordering chart carried 23 caption
+    // lines against a budget of 21 and was refused. A bounded overflow grows
+    // the canvas by exactly the lines it needs and keeps the plot body at its
+    // minimum; only a runaway caption is still refused (the test below).
+    let filler = "x".repeat(120);
+    let runs: Vec<String> = (0..2)
+        .map(|i| {
+            format!(
+                r#"{{
+                  "backend": "backend{i}", "representative": true,
+                  "results": [{}], "failures": [],
+                  "unsupported": [
+                    {{ "flow": "consume_parallel", "reason": "{filler}-a{i}" }},
+                    {{ "flow": "consume_fifo", "reason": "{filler}-b{i}" }},
+                    {{ "flow": "consume_batch", "reason": "{filler}-c{i}" }}
+                  ]
+                }}"#,
+                scenario("publish_single", "parallel", 64, 1, 10_000.0)
+            )
+        })
+        .collect();
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        runs.join(",")
+    )));
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("a caption a few lines over budget grows the canvas rather than refusing");
+    let root = svg.split('>').next().unwrap_or_default();
+    let height: f64 = svg_attr(root, "height")
+        .and_then(|v| v.parse().ok())
+        .expect("the svg root declares its height");
+    assert!(
+        height > f64::from(chartgen::HEIGHT),
+        "the canvas must grow past {} to seat the caption, got {height}",
+        chartgen::HEIGHT
+    );
+    for (_, y, _, content) in texts(&svg) {
+        assert!(
+            (0.0..=height).contains(&y),
+            "text baseline y={y} is outside the grown canvas of {height}: {content:?}"
+        );
+    }
+    let ticks: Vec<f64> = texts(&svg)
+        .into_iter()
+        .filter(|(x, _, _, t)| *x < Y_TICK_BAND_X && (t.ends_with('k') || t == "0.0"))
+        .map(|(_, y, _, _)| y)
+        .collect();
+    let span =
+        ticks.iter().cloned().fold(0.0, f64::max) - ticks.iter().cloned().fold(f64::MAX, f64::min);
+    assert!(
+        span >= chartgen::MIN_PLOT_PX as f64 * 0.8,
+        "the plot body spans only {span:.0}px on the grown canvas"
+    );
+}
+
+#[test]
 fn the_plot_body_keeps_a_minimum_height_under_a_tall_caption() {
     // The frame refuses a caption block that leaves the plot under a
     // readable height, rather than rendering bars a few pixels tall. The
