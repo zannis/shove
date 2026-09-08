@@ -48,8 +48,11 @@ async fn main() {
         Box::pin(async move {
             // Drop every key the topology owns — the next scenario's declare
             // recreates them together with the consumer groups. XGROUP CREATE
-            // uses MKSTREAM so this is safe. DEL is idempotent, so absent
-            // keys cost nothing.
+            // uses MKSTREAM so this is safe. UNLINK rather than DEL: DEL
+            // reclaims a six-million-entry stream synchronously and outlives
+            // the client's response timeout, while UNLINK unlinks the key at
+            // once and reclaims it in the background. Both are idempotent,
+            // so absent keys cost nothing.
             //
             // The set is derived from the topology handed in: main stream,
             // DLQ stream, hold-queue streams and their `:pending` sorted
@@ -78,7 +81,10 @@ async fn main() {
                 .get_multiplexed_async_connection()
                 .await
                 .map_err(|e| format!("connect: {e}"))?;
-            let _: i64 = conn.del(&keys).await.map_err(|e| format!("DEL: {e}"))?;
+            let _: i64 = conn
+                .unlink(&keys)
+                .await
+                .map_err(|e| format!("UNLINK: {e}"))?;
             Ok(())
         })
     });
