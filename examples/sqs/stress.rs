@@ -274,9 +274,16 @@ async fn main() {
                 harness::connect_with_retries("SNS/SQS", 10, Duration::from_secs(1), || {
                     let cfg = cfg.clone();
                     async move {
-                        <Sqs as Backend>::connect(cfg)
+                        // `connect` only builds SDK clients and never touches
+                        // LocalStack, so the retry has nothing to retry on
+                        // unless the endpoint is actually asked something.
+                        let client = <Sqs as Backend>::connect(cfg)
                             .await
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| e.to_string())?;
+                        <Sqs as Backend>::ping(&client, Duration::from_secs(5))
+                            .await
+                            .map_err(|e| format!("ping: {e}"))?;
+                        Ok(client)
                     }
                 })
                 .await

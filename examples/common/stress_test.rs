@@ -283,10 +283,13 @@ pub struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub fifo_messages: Option<u64>,
 
-    /// Cap on a drain corpus in bytes (`corpus × payload_bytes`), default
-    /// 2 GiB. A cell whose cap admits no message at its payload is refused
-    /// rather than clamped. Only meaningful with `--drain-messages`; refused
-    /// without it.
+    /// Cap in bytes, default 2 GiB, on two things a cell may leave resident
+    /// on the broker: a drain corpus (`corpus × payload_bytes`), which is
+    /// clamped to it, and an offered-load rung's backlog
+    /// (`lag × payload_bytes`), past which the rung's producers stop and the
+    /// rung is recorded as not sustained. A cell whose cap admits no message
+    /// at its payload is refused rather than clamped. Refused when nothing
+    /// reads it: no `--drain-messages` and no `--load-rates`.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub drain_max_bytes: Option<u64>,
 }
@@ -2432,6 +2435,11 @@ pub const LOAD_SUSTAINED_MAX_LAG_RATIO: f64 = 0.05;
 const LOAD_DRAIN_GRACE: Duration = Duration::from_secs(60);
 /// How often the window's lag is sampled for `peak_lag`.
 const LOAD_LAG_SAMPLE: Duration = Duration::from_millis(50);
+/// How long a rung stopped by the backlog cap waits for the consumers to work
+/// off what was published before moving on. The cap bounds the backlog's
+/// bytes, not the time slow consumers take to clear it; what is left after
+/// this is the next cell's purge's business, and the measurement stands.
+const LOAD_CAPPED_DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// A paced producer's idle sleep while it is ahead of its credit line.
 const LOAD_PACE_SLEEP: Duration = Duration::from_millis(1);
 
@@ -2449,6 +2457,10 @@ struct LoadOutcome {
     published: u64,
     processed_at_window_end: u64,
     peak_lag: u64,
+    /// The backlog cap stopped the producers before the nominal window ran
+    /// out; the rung is not sustained by definition and its window is the
+    /// time it actually ran.
+    backlog_capped: bool,
     /// The window as measured, from `start` to the sample that closed it.
     window: Duration,
     /// Seconds from the window closing to the last published message being
@@ -2785,7 +2797,12 @@ where
     let processed_at_window_end = processed.load(Ordering::Relaxed);
     peak_lag = peak_lag.max(published_at_window_end.saturating_sub(processed_at_window_end));
 
-    let grace = tokio::time::sleep(LOAD_DRAIN_GRACE);
+    let grace_for = if backlog_capped {
+        LOAD_CAPPED_DRAIN_GRACE
+    } else {
+        LOAD_DRAIN_GRACE
+    };
+    let grace = tokio::time::sleep(grace_for);
     tokio::pin!(grace);
     loop {
         let c = processed.load(Ordering::Relaxed);
@@ -2797,10 +2814,20 @@ where
         }
         tokio::select! {
             _ = &mut grace => {
+                if backlog_capped {
+                    // The measurement closed when the cap fired; the leftover
+                    // is cleanup, and the next cell's purge does it.
+                    println!(
+                        "     load: {c} of {published} published messages processed within {}s of \
+                         the cap; the rest is left to the next cell's purge",
+                        grace_for.as_secs()
+                    );
+                    break;
+                }
                 return Err(format!(
                     "consumers processed {c} of {published} published messages within {}s of \
                      the producer stopping",
-                    LOAD_DRAIN_GRACE.as_secs()
+                    grace_for.as_secs()
                 ));
             }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}
@@ -2812,6 +2839,7 @@ where
         published,
         processed_at_window_end,
         peak_lag,
+        backlog_capped,
         window: window_measured,
         drain_secs: window_closed.elapsed().as_secs_f64(),
     })
@@ -5022,6 +5050,13 @@ struct LoadResult {
     /// while the consumers kept up with what it did publish: the producer was
     /// the limit, and the row says nothing about the consumers.
     producer_bound: bool,
+    /// The backlog cap stopped the producers early (see
+    /// [`HarnessConfig::load_backlog_cap_bytes`]). Such a rung is never
+    /// `sustained`, and its `duration_secs` is the window it actually ran
+    /// rather than the nominal one. Absent on rows written before the cap
+    /// existed, which never stopped early.
+    #[serde(default)]
+    backlog_capped: bool,
     /// The producer held the rate and the consumers kept up with it — see
     /// [`LOAD_SUSTAINED_MAX_LAG_RATIO`].
     sustained: bool,
@@ -5045,6 +5080,9 @@ impl LoadResult {
             lag,
             outcome.peak_lag,
         );
+        // A rung the cap stopped has shown the consumers cannot keep up,
+        // whatever the lag ratio at the moment it stopped says.
+        let sustained = sustained && !outcome.backlog_capped;
         Self {
             offered_msg_per_sec: rung.rate_msg_per_sec,
             window_secs: rung.window_secs,
@@ -5057,6 +5095,7 @@ impl LoadResult {
             peak_lag: outcome.peak_lag,
             drain_secs: outcome.drain_secs,
             producer_bound,
+            backlog_capped: outcome.backlog_capped,
             sustained,
         }
     }
@@ -5739,10 +5778,11 @@ fn validate_load(run: &BackendRun, r: &ScenarioResult, flow: Flow) -> Result<(),
     if !(r.duration_secs.is_finite() && r.duration_secs > 0.0) {
         return refuse("sits on a row with a non-positive window");
     }
-    if r.duration_secs < l.window_secs as f64 {
+    if r.duration_secs < l.window_secs as f64 && !l.backlog_capped {
         return refuse(
             "sits on a row whose measured window is shorter than the rung's nominal window, \
-             which closes only after the nominal window has elapsed",
+             which closes only after the nominal window has elapsed unless the backlog cap \
+             stopped it",
         );
     }
     let achieved = l.published_at_window_end as f64 / r.duration_secs;
@@ -5769,6 +5809,7 @@ fn validate_load(run: &BackendRun, r: &ScenarioResult, flow: Flow) -> Result<(),
         l.lag_at_window_end,
         l.peak_lag,
     );
+    let sustained = sustained && !l.backlog_capped;
     if l.producer_bound != producer_bound || l.sustained != sustained {
         return refuse(&format!(
             "claims producer_bound={} sustained={} where its own numbers derive \
@@ -6494,9 +6535,13 @@ fn refused_load_flags(cli: &Cli, selected: &[Flow]) -> Option<String> {
 fn refused_drain_flags(cli: &Cli, selected: &[Flow]) -> Option<String> {
     let takes_drain = selected.iter().any(Flow::takes_offered_load);
     match (cli.drain_messages, cli.drain_max_bytes) {
+        // Without a corpus the cap still bounds a ladder rung's backlog, so a
+        // load-only invocation may set it; with neither, nothing reads it.
+        (None, Some(_)) if takes_drain && cli.load_rates.is_some() => None,
         (None, Some(_)) => Some(
-            "--drain-max-bytes only caps a `--drain-messages` corpus, and none was given. Add \
-             `--drain-messages`, or drop the flag."
+            "--drain-max-bytes caps a `--drain-messages` corpus and an offered-load rung's \
+             backlog, and this invocation has neither. Add `--drain-messages` or \
+             `--load-rates` on a consume flow, or drop the flag."
                 .to_string(),
         ),
         (None, None) => None,
@@ -10685,6 +10730,8 @@ mod tests {
             peak_lag: 12,
             drain_secs: 0.01,
             producer_bound: false,
+
+            backlog_capped: false,
             sustained: true,
         }
     }
@@ -10963,6 +11010,41 @@ mod tests {
             load.peak_lag >= 500,
             "the cap fires at 500 messages of backlog: {load:?}"
         );
+        assert!(
+            load.backlog_capped,
+            "the account says the cap stopped it: {load:?}"
+        );
+        // A capped rung is a measurement, so its row must survive the
+        // document's own validation, which otherwise refuses a window shorter
+        // than the rung's nominal one and re-derives the verdicts.
+        let mut run = sample_run("inmemory");
+        run.unsupported.clear();
+        run.results.clear();
+        push_metrics(&mut run.results, &scenario, metrics);
+        validate_run(&run).expect("a capped rung's row is a valid, recordable measurement");
+    }
+
+    #[test]
+    fn the_byte_cap_flag_is_accepted_for_a_ladder_without_a_drain_corpus() {
+        // `--drain-max-bytes` also caps a rung's backlog, so a load-only
+        // invocation may set it without `--drain-messages`; without a ladder
+        // either, nothing reads it and it is still refused.
+        let with_ladder = cli_args(&[
+            "--flow",
+            "consume-parallel",
+            "--load-rates",
+            "5000",
+            "--drain-max-bytes",
+            "1024",
+        ]);
+        assert_eq!(
+            refused_drain_flags(&with_ladder, &[Flow::ConsumeParallel]),
+            None
+        );
+        let without_ladder = cli_args(&["--flow", "consume-parallel", "--drain-max-bytes", "1024"]);
+        let err = refused_drain_flags(&without_ladder, &[Flow::ConsumeParallel])
+            .expect("nothing reads the cap without a corpus or a ladder");
+        assert!(err.contains("--drain-max-bytes"), "{err}");
     }
 
     #[tokio::test]
