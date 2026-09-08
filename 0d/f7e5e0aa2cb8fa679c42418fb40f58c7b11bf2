@@ -1,0 +1,21 @@
+src/backends/nats/publisher.rs
+  s_1a5ac5ada4ff0e::t_cf45057a2b9abb 8-9,198-217,221-233,239-240,253-262,272-298
+tests/nats_batch_publish_inflight.rs
+  s_1a5ac5ada4ff0e::t_bd03f989f279d3 1-100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "0df7e5e0aa2cb8fa679c42418fb40f58c7b11bf2",
+  "prompts": {},
+  "sessions": {
+    "s_1a5ac5ada4ff0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f193bc98-253b-491e-beb5-e72c144577b8",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
