@@ -271,6 +271,15 @@ pub struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub drain_messages: Option<u64>,
 
+    /// Corpus per shard for the `consume-fifo` cell, in place of the tier's
+    /// per-consumer count. FIFO holds no barrier and takes no drain, so this
+    /// is the only knob that sizes it; every other flow keeps the tier's
+    /// count. It exists for a backend whose FIFO path is slow enough that
+    /// the tier's corpus stops being a cell and becomes a day (SQS on
+    /// LocalStack). The row records the corpus it ran in `messages`.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub fifo_messages: Option<u64>,
+
     /// Cap on a drain corpus in bytes (`corpus × payload_bytes`), default
     /// 2 GiB. A cell whose cap admits no message at its payload is refused
     /// rather than clamped. Only meaningful with `--drain-messages`; refused
@@ -1317,6 +1326,10 @@ fn build_scenarios(
                     // width instead of holding it constant.
                     let tier_messages = match flow {
                         Flow::Broadcast => per_consumer,
+                        Flow::ConsumeFifo => cli
+                            .fifo_messages
+                            .unwrap_or(per_consumer)
+                            .saturating_mul(consumers as u64),
                         _ => per_consumer.saturating_mul(consumers as u64),
                     };
                     // Only the flow with a batch to size carries the knobs;
@@ -7270,6 +7283,56 @@ mod tests {
         assert_eq!(scenarios.len(), 1);
         assert_eq!(scenarios[0].consumers, 1);
         assert_eq!(scenarios[0].messages, 5_000);
+    }
+
+    #[test]
+    fn the_fifo_corpus_can_be_deviated_per_shard() {
+        // SQS on LocalStack drains a FIFO shard at a few messages per second,
+        // so the tier's 5,000 per shard is a ten-hour cell three times over.
+        // The knob sizes the FIFO corpus per shard and leaves every other
+        // flow on the tier's count, the same shape as the drain deviation.
+        let fifo = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consume-fifo",
+            "--consumers",
+            "8",
+            "--fifo-messages",
+            "100",
+        ]));
+        assert_eq!(fifo.len(), 1);
+        assert_eq!(fifo[0].messages, 100 * SEQ_SHARDS as u64);
+
+        // Compared against the same build without the knob rather than a
+        // literal: the parallel corpus is the tier's count raised to the
+        // framework floor, and this test is about the knob, not the floor.
+        let parallel_args = [
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consume-parallel",
+            "--consumers",
+            "8",
+        ];
+        let baseline: Vec<u64> = build_scenarios_cg(&cli_args(&parallel_args))
+            .iter()
+            .map(|s| s.messages)
+            .collect();
+        let mut with_knob = parallel_args.to_vec();
+        with_knob.extend(["--fifo-messages", "100"]);
+        let deviated: Vec<u64> = build_scenarios_cg(&cli_args(&with_knob))
+            .iter()
+            .map(|s| s.messages)
+            .collect();
+        assert_eq!(
+            deviated, baseline,
+            "--fifo-messages must not resize any other flow"
+        );
     }
 
     #[test]
