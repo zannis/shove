@@ -126,7 +126,9 @@ successfully
 ([`.github/scripts/require-green-ci.sh`](.github/scripts/require-green-ci.sh)).
 
 **A missing run fails the gate.** `ci.yml` has a `paths:` filter, so a commit
-that touches only workflows or docs gets no run at all — which is how v0.13.0
+that touches only workflows, docs, bench charts or the bench results document
+gets no run at all (charts and the results document get `charts.yml`, which
+runs only the chartgen byte-compare) — which is how v0.13.0
 came to be published from a commit no test job ever saw. The checks that were
 green on it (CodeQL, the docs Workers build) say nothing about the crate, so
 the gate names the `ci.yml` legs it wants rather than accepting "all checks
@@ -135,7 +137,7 @@ passed". An unfinished run is not a pass either.
 The practical consequence: **cut a release from a commit that actually ran
 CI**. If `main`'s head is a docs- or workflow-only commit, the gate will stop
 the release; release from before it, or land a change under one of `ci.yml`'s
-`paths:` entries first. On a `bump: <x>` dispatch the release commit is created
+`paths:` entries first. The same holds for a chart-only or results-only commit. On a `bump: <x>` dispatch the release commit is created
 by the job and has no CI of its own by construction, so the gate checks its
 parent and a follow-up step asserts the release commit differs from that parent
 by nothing but the version bump.

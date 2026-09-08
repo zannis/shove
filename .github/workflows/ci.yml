@@ -3,16 +3,20 @@ name: CI
 on:
   push:
     branches: [main]
+    # Code paths only. `benches/**` is spelled out so the results document
+    # and the bench README stay out, and the committed charts are absent on
+    # purpose: a chart-only or results-only change is checked by
+    # charts.yml, which runs just the chartgen byte-compare instead of this
+    # whole matrix. Such a commit has no ci.yml run, and the release gate
+    # refuses it the way it already refuses a docs-only commit
+    # (.github/scripts/require-green-ci.sh).
     paths:
       - 'src/**'
       - 'tests/**'
-      - 'benches/**'
+      - 'benches/*.rs'
+      - 'benches/common/**'
+      - 'benches/baselines/**'
       - 'examples/**'
-      # The committed bench charts are asserted byte-for-byte against the
-      # committed results document by tests/chartgen.rs (in `check`). Without
-      # this entry a PR that only hand-edits an SVG never runs ci.yml at all,
-      # so the one check that would catch it never executes.
-      - 'docs/public/bench/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
@@ -22,9 +26,10 @@ on:
     paths:
       - 'src/**'
       - 'tests/**'
-      - 'benches/**'
+      - 'benches/*.rs'
+      - 'benches/common/**'
+      - 'benches/baselines/**'
       - 'examples/**'
-      - 'docs/public/bench/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'

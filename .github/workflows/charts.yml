@@ -1,0 +1,33 @@
+name: Charts
+
+# The committed bench charts are asserted byte-for-byte against the committed
+# results document by tests/chartgen.rs. That test also runs inside ci.yml's
+# `check`, but ci.yml is triggered by code paths only, so a change made of
+# nothing but charts or the results document would otherwise never be checked.
+# This workflow runs exactly that one test for exactly those paths; a change
+# that also touches code runs both, and the byte-compare is cheap enough to
+# pay twice.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/public/bench/**'
+      - 'benches/results/**'
+      - '.github/workflows/charts.yml'
+  pull_request:
+    paths:
+      - 'docs/public/bench/**'
+      - 'benches/results/**'
+      - '.github/workflows/charts.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  byte-compare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test --no-default-features --test chartgen
