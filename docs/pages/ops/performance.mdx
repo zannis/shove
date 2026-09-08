@@ -11,13 +11,11 @@ document does not contain is never plotted, so absence from a chart means "not
 measured here", not "slow".
 
 The document these charts render from measures the **in-process**, **Kafka**,
-**RabbitMQ** and **Redis** backends. NATS is supported by the harness but is not
-in this document yet: the drain fill deadlocks in the NATS publisher's in-flight
-ack budget, and the run waits on that fix. SQS only runs against LocalStack
-(non-representative by design), needs a LocalStack Pro auth token, and is not in
-this document either. The harness refuses to merge runs measured on different
-hosts into one document, so completing the set means measuring the remaining
-backends on the same host as the published runs.
+**NATS**, **RabbitMQ** and **Redis** backends. SQS is the one backend absent: it
+runs only against LocalStack (non-representative by design), needs a LocalStack
+Pro auth token, and is not in this document. The harness refuses to merge runs
+measured on different hosts into one document, so completing the set means
+measuring SQS on the same host as the published runs.
 
 ### Throughput vs consumer count
 
