@@ -1323,13 +1323,19 @@ fn build_scenarios(
                     // stamping a default on any other row would claim options
                     // a run never had.
                     let batch_options = (flow == Flow::ConsumeBatch).then_some(batch_options);
+                    // FIFO concurrency comes from shards, not from concurrent
+                    // dispatch inside a shard, which would break per-key
+                    // ordering: Redis's `register_fifo` refuses the flag and
+                    // the other backends would only ignore it. So `--concurrent`
+                    // shapes every flow but this one.
+                    let concurrent = cli.concurrent && flow != Flow::ConsumeFifo;
                     for &payload_bytes in &cli.payload.0 {
                         // Inside the payload loop, because the floor is capped
                         // by bytes and so differs per tier.
                         let messages = tier_messages.max(framework_corpus_floor(
                             flow,
                             h,
-                            cli.concurrent,
+                            concurrent,
                             payload_bytes,
                         ));
                         let scenario = Scenario {
@@ -1337,7 +1343,7 @@ fn build_scenarios(
                             messages,
                             consumers,
                             handler: h,
-                            concurrent: cli.concurrent,
+                            concurrent,
                             prefetch: cli.prefetch,
                             flow,
                             payload_bytes,
@@ -7254,6 +7260,48 @@ mod tests {
         assert_eq!(scenarios.len(), 1);
         assert_eq!(scenarios[0].consumers, 1);
         assert_eq!(scenarios[0].messages, 5_000);
+    }
+
+    #[test]
+    fn fifo_scenarios_never_ask_for_concurrent_processing() {
+        // FIFO concurrency comes from shards, not from concurrent dispatch
+        // inside a shard, which would break per-key ordering. Redis's
+        // `register_fifo` refuses the flag outright, so with `--concurrent`
+        // in the pinned matrix every Redis FIFO cell failed at registration
+        // while RabbitMQ, which ignores the flag on FIFO, measured its cells.
+        // The flag therefore shapes every flow but this one.
+        let fifo = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consume-fifo",
+            "--consumers",
+            "8",
+            "--concurrent",
+        ]));
+        assert_eq!(fifo.len(), 1);
+        assert!(
+            !fifo[0].concurrent,
+            "a FIFO scenario must not carry --concurrent"
+        );
+
+        let parallel = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consume-parallel",
+            "--consumers",
+            "8",
+            "--concurrent",
+        ]));
+        assert!(
+            parallel.iter().all(|s| s.concurrent),
+            "--concurrent still shapes the other flows"
+        );
     }
 
     #[test]
