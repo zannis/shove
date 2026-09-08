@@ -213,9 +213,11 @@ reaches it: `consume_fifo` holds no barrier and takes no drain, so it publishes
 the tier's 5 000 messages per shard and consumes them through the sequenced
 path. LocalStack serves that path at a few messages per second, which makes
 each of the three FIFO cells (one per payload) a ten-hour cell. SQS runs
-**100 per shard** instead, set as `SQS_FIFO_MESSAGES` in `scripts/bench.sh`
-and passed as `--fifo-messages`; every other backend runs the tier's count.
-The row records the corpus it ran in `messages`.
+**100 per FIFO worker** instead (one worker per shard on this backend), set
+as `SQS_FIFO_MESSAGES` in `scripts/bench.sh` and passed as `--fifo-messages`,
+which replaces the tier's per-consumer count in the same unit; every other
+backend runs the tier's count. The row records the corpus it ran in
+`messages`.
 
 Kafka is the reference backend for the batched-consume flow. Its batch and
 parallel scenarios declare one partition per consumer so every group member

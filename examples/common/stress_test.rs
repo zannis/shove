@@ -271,12 +271,15 @@ pub struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub drain_messages: Option<u64>,
 
-    /// Corpus per shard for the `consume-fifo` cell, in place of the tier's
-    /// per-consumer count. FIFO holds no barrier and takes no drain, so this
-    /// is the only knob that sizes it; every other flow keeps the tier's
-    /// count. It exists for a backend whose FIFO path is slow enough that
-    /// the tier's corpus stops being a cell and becomes a day (SQS on
-    /// LocalStack). The row records the corpus it ran in `messages`.
+    /// Corpus per FIFO worker for the `consume-fifo` cell, in place of the
+    /// tier's per-consumer count and in the same unit: the cell's corpus is
+    /// this value times the workers the backend reports for FIFO (one per
+    /// shard on most backends, one in total on Kafka), exactly as the tier's
+    /// count is. FIFO holds no barrier and takes no drain, so this is the
+    /// only knob that sizes it; every other flow keeps the tier's count. It
+    /// exists for a backend whose FIFO path is slow enough that the tier's
+    /// corpus stops being a cell and becomes a day (SQS on LocalStack). The
+    /// row records the corpus it ran in `messages`.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub fifo_messages: Option<u64>,
 
@@ -7286,11 +7289,40 @@ mod tests {
     }
 
     #[test]
-    fn the_fifo_corpus_can_be_deviated_per_shard() {
+    fn the_fifo_corpus_override_is_per_worker_like_the_tier() {
+        // Kafka's wrapper reports one FIFO worker, and the tier already sizes
+        // its corpus for that one worker (see the test above). The override
+        // replaces the tier's per-consumer count in the same unit, so it
+        // must not silently multiply by the shard count instead.
+        let scenarios = build_scenarios(
+            &cli_args(&[
+                "--tier",
+                "moderate",
+                "--handler",
+                "zero",
+                "--flow",
+                "consume-fifo",
+                "--consumers",
+                "8",
+                "--fifo-messages",
+                "100",
+            ]),
+            Flow::ConsumerGroup,
+            1,
+            None,
+        );
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(scenarios[0].consumers, 1);
+        assert_eq!(scenarios[0].messages, 100);
+    }
+
+    #[test]
+    fn the_fifo_corpus_can_be_deviated_per_worker() {
         // SQS on LocalStack drains a FIFO shard at a few messages per second,
         // so the tier's 5,000 per shard is a ten-hour cell three times over.
-        // The knob sizes the FIFO corpus per shard and leaves every other
-        // flow on the tier's count, the same shape as the drain deviation.
+        // The knob sizes the FIFO corpus per worker (one per shard here) and
+        // leaves every other flow on the tier's count, the same shape as the
+        // drain deviation.
         let fifo = build_scenarios_cg(&cli_args(&[
             "--tier",
             "moderate",

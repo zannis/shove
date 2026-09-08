@@ -72,9 +72,10 @@ SQS_DRAIN_MESSAGES=60000
 # never reaches it: it publishes the tier's 5 000 messages per shard and
 # consumes them through the sequenced path, which LocalStack serves at a few
 # messages per second. That is a ten-hour cell three times over (one per
-# payload) for a number that measures LocalStack. 100 per shard keeps the
-# cell a few minutes long and, as with the drain, the row records the corpus
-# it ran (`messages`).
+# payload) for a number that measures LocalStack. 100 per FIFO worker (one
+# per shard on this backend), the tier's own unit, keeps the cell a few
+# minutes long and, as with the drain, the row records the corpus it ran
+# (`messages`).
 SQS_FIFO_MESSAGES=100
 
 usage() {
@@ -158,7 +159,7 @@ log="$LOG_DIR/$target-$(date -u +%Y%m%dT%H%M%SZ).log"
 echo "backend:  $target ($example, --features $features)"
 echo "matrix:   ${MATRIX[*]} ${extra[*]:-}"
 if [ "$target" = sqs ]; then
-  echo "deviation: drain corpus $SQS_DRAIN_MESSAGES, not the pinned 6000000, and FIFO corpus $SQS_FIFO_MESSAGES per shard — see the comments in this script"
+  echo "deviation: drain corpus $SQS_DRAIN_MESSAGES, not the pinned 6000000, and FIFO corpus $SQS_FIFO_MESSAGES per FIFO worker — see the comments in this script"
 fi
 echo "results:  $RESULTS_FILE"
 echo "log:      $log"
