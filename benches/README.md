@@ -181,6 +181,18 @@ than clamping it, and the matrix's size exceeds that. The harness clamps to 10
 when it builds the scenario and the row records 10, so an SQS batch bar is a
 10-message batch and is not like-for-like against a backend that ran 500.
 
+### The backlog cap on the ladder
+
+An offered-load rung the consumers cannot sustain builds a backlog on the
+broker for as long as the producers run, and at 64 KiB the 25 000/s rung
+offers 1.6 GB/s to a container in an 8 GB VM: Redis stopped answering under
+it and took the rest of the pass down. A rung's producers therefore stop as
+soon as `lag x payload_bytes` passes the drain byte cap (`--drain-max-bytes`,
+default 2 GiB), the rung is recorded as not sustained with the window it
+actually ran, and the ladder skips the rungs above it as it already does
+after any unsustained rung. A sustained rung never approaches the cap, so
+nothing that passes is changed by it.
+
 ### The SQS corpus deviation
 
 SQS is also the one backend that does not drain the matrix's corpus. It runs

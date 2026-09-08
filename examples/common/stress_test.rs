@@ -1416,6 +1416,46 @@ fn build_scenarios(
     scenarios
 }
 
+/// Connect to a broker, retrying a transient failure with doubling delays
+/// (capped at ten seconds) up to `attempts` times, and panic only when the
+/// broker stays down. A stress binary's per-scenario connect used to give
+/// up on the first failure, so a broker still recovering from a heavy cell
+/// (Redis after a 64 KiB rung, 2026-09-08) ended the whole pass instead of
+/// the one cell. The panic is the fail-fast the harness wants for a broker
+/// that is really gone; a retry is what it wants for one that is catching
+/// its breath.
+pub async fn connect_with_retries<C, F, Fut>(
+    label: &str,
+    attempts: u32,
+    first_delay: Duration,
+    connect: F,
+) -> C
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<C, String>>,
+{
+    let attempts = attempts.max(1);
+    let mut delay = first_delay;
+    let mut last = String::new();
+    for attempt in 1..=attempts {
+        match connect().await {
+            Ok(client) => return client,
+            Err(e) => {
+                last = e;
+                if attempt < attempts {
+                    eprintln!(
+                        "{label}: connect attempt {attempt}/{attempts} failed ({last}); retrying \
+                         in {delay:?}"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(Duration::from_secs(10));
+                }
+            }
+        }
+    }
+    panic!("{label}: could not connect after {attempts} attempts: {last}")
+}
+
 /// Panic if Docker is unreachable. Shared by all container-backed backends.
 pub fn require_docker() {
     match std::process::Command::new("docker").arg("info").output() {
@@ -2152,6 +2192,14 @@ pub struct HarnessConfig<B: Backend> {
     /// 500 — a chart silently comparing unequal batches, which is the whole
     /// thing this exists to prevent.
     pub batch_size_cap: Option<NonZeroUsize>,
+    /// The most backlog, in bytes (`lag x payload_bytes`), an offered-load rung
+    /// may build before its producers are stopped and the rung recorded as
+    /// not sustained. An unsustained rung's backlog is resident on the broker,
+    /// so the same cap that keeps a drain corpus in memory keeps a rung from
+    /// burying the broker: at 64 KiB and 25 000/s a rung offers 1.6 GB/s, and
+    /// Redis stopped answering under it. `--drain-max-bytes` overrides the
+    /// default, [`DEFAULT_DRAIN_MAX_BYTES`].
+    pub load_backlog_cap_bytes: u64,
     /// Maximum batch size for `publish_batch` (some backends have SDK limits).
     pub publish_chunk_size: usize,
     /// Drain the main queue between scenarios.
@@ -2196,6 +2244,7 @@ impl<B: Backend> HarnessConfig<B> {
             backend_name,
             prefetch_cap: 100,
             batch_size_cap: None,
+            load_backlog_cap_bytes: DEFAULT_DRAIN_MAX_BYTES,
             publish_chunk_size: 1000,
             purge: noop_purge(),
             broker: BrokerInfo {
@@ -2232,6 +2281,12 @@ impl<B: Backend> HarnessConfig<B> {
     /// has to fit itself to the smallest of them.
     pub fn with_batch_size_cap(mut self, cap: NonZeroUsize) -> Self {
         self.batch_size_cap = Some(cap);
+        self
+    }
+
+    /// See [`HarnessConfig::load_backlog_cap_bytes`].
+    pub fn with_load_backlog_cap_bytes(mut self, cap: u64) -> Self {
+        self.load_backlog_cap_bytes = cap;
         self
     }
 
@@ -2513,6 +2568,7 @@ async fn run_offered_load<B, T>(
     pool: ProducerPool<B>,
     rung: LoadRung,
     payload_bytes: usize,
+    backlog_cap_bytes: u64,
     epoch: Instant,
     start: Instant,
     processed: &AtomicU64,
@@ -2532,6 +2588,7 @@ where
         publishers,
         rung,
         payload_bytes,
+        backlog_cap_bytes,
         epoch,
         start,
         processed,
@@ -2553,6 +2610,7 @@ async fn run_offered_load_with<B, T>(
     publishers: Vec<shove::Publisher<B>>,
     rung: LoadRung,
     payload_bytes: usize,
+    backlog_cap_bytes: u64,
     epoch: Instant,
     start: Instant,
     processed: &AtomicU64,
@@ -2587,6 +2645,7 @@ where
     }
 
     let mut peak_lag = 0u64;
+    let mut backlog_capped = false;
     loop {
         let elapsed = start.elapsed();
         // Against what has been handed to the publisher: conservative by up
@@ -2594,7 +2653,25 @@ where
         // are already processing.
         let p = claimed.load(Ordering::Relaxed);
         let c = processed.load(Ordering::Relaxed);
-        peak_lag = peak_lag.max(p.saturating_sub(c));
+        let lag = p.saturating_sub(c);
+        peak_lag = peak_lag.max(lag);
+        // An unsustained rung's backlog sits on the broker. Past the byte cap
+        // the rung has already shown the consumers cannot keep up; letting
+        // the producers run out the window only buries the broker (Redis
+        // stopped answering under a 64 KiB rung at 25 000/s), and a broker
+        // that stops answering takes every later cell with it. Stop here;
+        // the lag makes the verdict "not sustained" and the ladder skips the
+        // rungs above.
+        if lag.saturating_mul(payload_bytes as u64) > backlog_cap_bytes {
+            producers.abort_all();
+            backlog_capped = true;
+            println!(
+                "     load: backlog of {lag} messages x {payload_bytes} B passed the {backlog_cap_bytes} B \
+                 cap at {:.1}s — producers stopped, rung not sustained",
+                elapsed.as_secs_f64()
+            );
+            break;
+        }
         if elapsed >= window {
             break;
         }
@@ -2654,6 +2731,9 @@ where
     // watched exactly as it was during the nominal window.
     let boundary = tokio::time::sleep(LOAD_DRAIN_GRACE);
     tokio::pin!(boundary);
+    // Producers stopped by the backlog cap were aborted, not asked to finish
+    // their chunk: reap them and go straight to the drain.
+    while backlog_capped && producers.join_next().await.is_some() {}
     loop {
         let driver_ended = async {
             match drivers.as_deref_mut() {
@@ -4002,6 +4082,7 @@ where
                     pool,
                     rung,
                     scenario.payload_bytes,
+                    hcfg.load_backlog_cap_bytes,
                     epoch,
                     start,
                     &processed,
@@ -4511,6 +4592,7 @@ where
                     pool,
                     rung,
                     scenario.payload_bytes,
+                    hcfg.load_backlog_cap_bytes,
                     epoch,
                     start,
                     &processed,
@@ -4734,6 +4816,7 @@ where
                     pool,
                     rung,
                     scenario.payload_bytes,
+                    hcfg.load_backlog_cap_bytes,
                     epoch,
                     start,
                     &processed,
@@ -6690,7 +6773,7 @@ impl LadderGate {
 /// and unreachable for SQS: the exclusion is a compile-time fact, not a
 /// runtime skip.
 pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
-    hcfg: HarnessConfig<B>,
+    mut hcfg: HarnessConfig<B>,
     connect: Connect,
     make_cfg: MkCfg,
 ) where
@@ -6702,6 +6785,9 @@ pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
     init_tracing();
 
     let cli = Cli::parse();
+    if let Some(cap) = cli.drain_max_bytes {
+        hcfg.load_backlog_cap_bytes = cap;
+    }
     let cancel = spawn_ctrlc_watcher();
     let scenarios = select_scenarios_or_exit(&cli, &hcfg, Flow::ConsumerGroup, false);
 
@@ -6771,7 +6857,7 @@ pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
 /// Run every selected scenario against a supervisor-only backend (SQS). See
 /// [`run_all_scenarios`] for the closure contract.
 pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
-    hcfg: HarnessConfig<B>,
+    mut hcfg: HarnessConfig<B>,
     connect: Connect,
     make_opts: MkOpts,
 ) where
@@ -6783,6 +6869,9 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
     init_tracing();
 
     let cli = Cli::parse();
+    if let Some(cap) = cli.drain_max_bytes {
+        hcfg.load_backlog_cap_bytes = cap;
+    }
     let cancel = spawn_ctrlc_watcher();
     // `Flow::Supervisor`, not `ConsumerGroup`: the group flow is unsupported
     // here and would be filtered out, leaving the default invocation running
@@ -10805,6 +10894,102 @@ mod tests {
     /// each is closed after the rung, and the rung still measures — here the
     /// hook hands out clones of the driver's own in-process client, since a
     /// fresh InMemory client would be a second, empty broker.
+    #[tokio::test]
+    async fn a_rung_whose_backlog_reaches_the_byte_cap_is_stopped_early() {
+        // An unsustained rung's backlog is the broker's problem, not the
+        // consumers': at 64 KiB and 25 000/s the producer offers 1.6 GB/s to
+        // a container in an 8 GB VM, and Redis stopped answering under it
+        // (2026-09-08), taking the rest of the pass down with it. The byte
+        // cap that keeps a drain corpus resident keeps a rung's backlog
+        // resident too: once lag x payload passes it the producers stop, the
+        // rung is not sustained, and the ladder skips the rungs above.
+        let rung = LoadRung {
+            rate_msg_per_sec: 20_000,
+            window_secs: 5,
+            producers: 2,
+        };
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: rung.nominal_messages(),
+            consumers: 1,
+            handler: HandlerProfile::Slow,
+            concurrent: true,
+            prefetch: None,
+            flow: Flow::ConsumerGroup,
+            payload_bytes: 64,
+            batch_options: None,
+            load: Some(rung),
+            drain: None,
+        };
+        // A sleeping handler so one consumer cannot keep up with 20 000/s
+        // even with a hundred in flight; the cap, not the handler, is under
+        // test. 500 messages of backlog at 64 B; the in-process queue holds
+        // far more, so the cap fires first. Small publish chunks so the drain
+        // after the stop is seconds of sleeping handler, not minutes.
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory")
+            .with_load_backlog_cap_bytes(64 * 500)
+            .with_publish_chunk_size(20);
+        let cancel = CancellationToken::new();
+        let started = Instant::now();
+        let metrics = run_scenario_group(
+            &hcfg,
+            &scenario,
+            &cancel,
+            &|consumers, prefetch, _concurrent| {
+                InMemoryConsumerGroupConfig::new(consumers..=consumers)
+                    .with_prefetch_count(prefetch)
+            },
+            &|| async {
+                let capacity = NonZeroUsize::new(100_000).expect("non-zero");
+                <shove::InMemory as Backend>::connect(
+                    InMemoryConfig::default().with_default_capacity(capacity),
+                )
+                .await
+                .expect("connect InMemory")
+            },
+        )
+        .await
+        .expect("a capped rung is a measurement, not an error");
+        let load = metrics.load.expect("a rung stamps its account");
+        assert!(!load.sustained, "{load:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the rung must stop when the backlog reaches the cap, not run out its {}s window \
+             (took {:?})",
+            rung.window_secs,
+            started.elapsed()
+        );
+        assert!(
+            load.peak_lag >= 500,
+            "the cap fires at 500 messages of backlog: {load:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_with_retries_survives_a_broker_that_answers_on_the_third_try() {
+        // A stress binary's per-scenario connect used to `expect` on the
+        // first failure, so a broker that was momentarily unreachable after
+        // a heavy cell ended the whole pass (Redis, 2026-09-08). Transient
+        // means retry; only a broker that stays down is a fail-fast.
+        let attempts = Arc::new(AtomicU64::new(0));
+        let a = attempts.clone();
+        let client: u32 =
+            connect_with_retries("test broker", 5, Duration::from_millis(1), move || {
+                let a = a.clone();
+                async move {
+                    let n = a.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n < 3 {
+                        Err(format!("attempt {n} refused"))
+                    } else {
+                        Ok(42u32)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(client, 42);
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
     #[tokio::test]
     async fn each_paced_producer_gets_its_own_client_and_every_client_is_closed() {
         let shared = <shove::InMemory as Backend>::connect(InMemoryConfig::default())
