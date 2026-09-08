@@ -271,9 +271,15 @@ async fn main() {
                 endpoint_url: Some(endpoint),
             };
             async move {
-                <Sqs as Backend>::connect(cfg)
-                    .await
-                    .expect("connect SNS/SQS")
+                harness::connect_with_retries("SNS/SQS", 10, Duration::from_secs(1), || {
+                    let cfg = cfg.clone();
+                    async move {
+                        <Sqs as Backend>::connect(cfg)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                })
+                .await
             }
         },
         |prefetch, concurrent| {

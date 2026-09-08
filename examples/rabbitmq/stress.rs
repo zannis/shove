@@ -207,9 +207,15 @@ async fn main() {
         || {
             let uri = uri.clone();
             async move {
-                <RabbitMq as Backend>::connect(rmq::RabbitMqConfig::new(&uri))
-                    .await
-                    .expect("connect RabbitMQ")
+                harness::connect_with_retries("RabbitMQ", 10, Duration::from_secs(1), || {
+                    let uri = uri.clone();
+                    async move {
+                        <RabbitMq as Backend>::connect(rmq::RabbitMqConfig::new(&uri))
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                })
+                .await
             }
         },
         |consumers, prefetch, concurrent| {
