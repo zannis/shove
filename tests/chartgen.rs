@@ -4350,9 +4350,14 @@ fn a_drain_document_publishes_drain_rows_and_withholds_rungs() {
         !svg.contains("100k"),
         "the sustained rung must not supply a point in a drain document"
     );
+    // The caption wraps at NOTE_WRAP, so the rule is asserted against the
+    // text nodes joined rather than the raw SVG: where the line happens to
+    // break is not part of the claim.
+    let caption = joined_text(&svg);
     assert!(
-        svg.contains("drain (inmemory, kafka)") && svg.contains("no producer ran in the window"),
-        "the caption must state the drain rule: {svg}"
+        caption.contains("drain (inmemory, kafka)")
+            && caption.contains("no producer ran in the window"),
+        "the caption must state the drain rule: {caption}"
     );
     assert!(
         svg.contains("consume_parallel point"),
@@ -4422,6 +4427,76 @@ fn the_drain_caption_covers_the_consume_bars_and_leaves_the_fifo_bar_its_own() {
     assert!(
         svg.contains("kafka saw 12 redeliveries"),
         "redeliveries are disclosed: {svg}"
+    );
+}
+
+/// Every text node of a chart in reading order. A caption sentence wraps
+/// across nodes at [`chartgen::NOTE_WRAP`], so a phrase is asserted against
+/// this rather than the raw SVG, which would make the assertion a claim
+/// about where the line happened to break.
+fn joined_text(svg: &str) -> String {
+    texts(svg)
+        .into_iter()
+        .map(|(_, _, _, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Consumer-axis drain rows for the second backend, all at one rate so the
+/// run has a single corpus: `rate` picks whether it matches the in-process
+/// run's cell on that axis (10k msg/s over the fixture's 2 s window) or
+/// deviates from it.
+fn consumer_axis_drains(rate: f64) -> Vec<String> {
+    [1u32, 2, 4]
+        .into_iter()
+        .map(|consumers| drain_scenario("consume_parallel", 64, consumers, rate, 2.0, 0))
+        .collect()
+}
+
+#[test]
+fn one_shared_corpus_is_stated_once_and_never_attributed() {
+    // Both backends drained the same corpus — what every published chart
+    // renders today, since one matrix pins one corpus. The caption names it
+    // once; per-backend attribution here would be noise.
+    let run = kafka_ladder_run(&consumer_axis_drains(10_000.0));
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+    let caption = joined_text(&svg);
+    assert!(
+        caption.contains("a corpus of 22k messages"),
+        "a shared corpus is stated in the drain sentence: {caption}"
+    );
+    assert!(
+        !caption.contains("corpus differs by backend"),
+        "backends that agree are not attributed: {caption}"
+    );
+}
+
+#[test]
+fn a_backend_that_drained_a_smaller_corpus_is_named_in_the_caption() {
+    // The deviation this exists for: a backend too slow to drain the pinned
+    // corpus in a sane wall clock runs a smaller one. A bare set
+    // ("22k / 2.2k") names both sizes and attributes neither, so the reader
+    // cannot tell which series had the shorter window — which is the whole
+    // difference between a documented deviation and a footnote nobody can
+    // apply.
+    let run = kafka_ladder_run(&consumer_axis_drains(1_000.0));
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+    let caption = joined_text(&svg);
+    assert!(
+        caption.contains("corpus differs by backend: inmemory 22k, kafka 2.2k"),
+        "each backend's corpus is named: {caption}"
+    );
+    assert!(
+        !caption.contains("a corpus of"),
+        "the flat sentence must not claim one corpus the backends did not share: {caption}"
+    );
+    assert!(
+        caption.contains("no producer ran in the window"),
+        "the drain rule itself still stands: {caption}"
     );
 }
 
