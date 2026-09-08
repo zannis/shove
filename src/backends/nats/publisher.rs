@@ -5,6 +5,8 @@ use async_nats::HeaderMap;
 use async_nats::header::NATS_MESSAGE_ID;
 use async_nats::jetstream;
 use bytes::Bytes;
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use uuid::Uuid;
 
 use crate::backend::PublisherImpl;
@@ -193,30 +195,49 @@ impl NatsPublisher {
         let total = messages.len();
         debug_assert_eq!(prepared.len(), total);
 
-        // Fire all publishes, then await all acks — O(1 RTT) instead of O(N RTT).
-        // Submission and ack are tracked separately so the wrapper can
-        // attribute partial-failure counters to what NATS actually accepted
-        // before we surface the first error. Each ack carries its own index so
-        // a sparse ack failure is reported at the record it belongs to rather
-        // than collapsed into a count.
-        let mut ack_futures = Vec::with_capacity(total);
-        // No `failed` counterpart: nothing on the submission side can produce an
-        // explicit rejection, because the record has not reached the server yet.
+        // Submit and settle concurrently. async-nats caps a JetStream context
+        // at 5,000 in-flight acks and, by default, blocks a publish until a
+        // permit frees; a permit is released only when its ack future is
+        // polled to completion or dropped. Submitting every record before
+        // awaiting any ack therefore deadlocks as soon as the callers sharing
+        // this client hold more than the cap between them: each waits for a
+        // permit that only its own un-polled acks can release. So every
+        // publish is driven alongside the acks already pending, and the
+        // pending set is drained once submission ends. Submission and ack are
+        // still tracked separately so the wrapper can attribute
+        // partial-failure counters to what NATS actually accepted, and each
+        // ack carries its own index so a sparse failure is reported at the
+        // record it belongs to rather than collapsed into a count.
+        let js = self.client.jetstream();
+        let mut pending = FuturesUnordered::new();
+        let mut ack_rejected: Vec<usize> = Vec::new();
+        let mut ack_unconfirmed: Vec<usize> = Vec::new();
+        // No `failed` counterpart on the submission side: nothing there can
+        // produce an explicit rejection, because the record has not reached
+        // the server yet.
         let mut unattempted: Vec<usize> = Vec::new();
         let mut first_err: Option<ShoveError> = None;
         for (i, (subject, headers, payload)) in prepared.into_iter().enumerate() {
-            match self
-                .client
-                .jetstream()
-                .publish_with_headers(subject, headers, payload)
-                .await
-            {
-                Ok(ack) => ack_futures.push((i, ack)),
+            // Pinned outside the select loop so an ack landing first does not
+            // cancel a publish that may already be on the wire.
+            let mut publish = std::pin::pin!(js.publish_with_headers(subject, headers, payload));
+            let submitted = loop {
+                tokio::select! {
+                    submitted = &mut publish => break submitted,
+                    Some((settled, outcome)) = pending.next(), if !pending.is_empty() => {
+                        settle_ack(settled, outcome, &mut ack_rejected, &mut ack_unconfirmed, &mut first_err);
+                    }
+                }
+            };
+            match submitted {
+                Ok(ack) => pending.push(async move { (i, ack.await.map(drop)) }),
                 Err(e) => {
                     metrics::record_backend_error(
                         metrics::BackendLabel::Nats,
                         metrics::BackendErrorKind::Publish,
                     );
+                    // A submission error takes precedence over any ack error
+                    // already recorded.
                     first_err = Some(ShoveError::Connection(format!("batch publish failed: {e}")));
                     // `publish_with_headers` returns before the record is on
                     // the wire: it fails on subject validation, the payload-size
@@ -229,38 +250,49 @@ impl NatsPublisher {
                 }
             }
         }
-
-        // Drain every already-submitted ack even if submission broke early:
-        // those messages were accepted by NATS and must be counted, not
-        // abandoned. A submission error takes precedence in `first_err`; an
-        // ack error only replaces it when nothing has failed yet.
-        let mut ack_rejected: Vec<usize> = Vec::new();
-        let mut ack_unconfirmed: Vec<usize> = Vec::new();
-        for (i, ack) in ack_futures {
-            if let Err(e) = ack.await {
-                metrics::record_backend_error(
-                    metrics::BackendLabel::Nats,
-                    metrics::BackendErrorKind::Publish,
-                );
-                if ack_error_is_explicit_rejection(&e) {
-                    ack_rejected.push(i);
-                } else {
-                    ack_unconfirmed.push(i);
-                }
-                if first_err.is_none() {
-                    first_err = Some(ShoveError::Connection(format!(
-                        "batch publish ack failed: {e}"
-                    )));
-                }
-            }
+        // Drain every submitted ack even if submission broke early: those
+        // messages were accepted by NATS and must be counted, not abandoned.
+        while let Some((settled, outcome)) = pending.next().await {
+            settle_ack(
+                settled,
+                outcome,
+                &mut ack_rejected,
+                &mut ack_unconfirmed,
+                &mut first_err,
+            );
         }
         if first_err.is_none() {
             return BatchReport::all_succeeded();
         }
-        // Ack results all sit below the submission break, so prepending them
-        // keeps the set ascending.
         ack_unconfirmed.extend(unattempted);
         BatchReport::sparse(ack_rejected, ack_unconfirmed, first_err)
+    }
+}
+
+/// Record one settled publish ack for the batch report. A submission error
+/// already in `first_err` keeps precedence; an ack error only fills an empty
+/// slot.
+fn settle_ack(
+    index: usize,
+    outcome: std::result::Result<(), jetstream::context::PublishError>,
+    rejected: &mut Vec<usize>,
+    unconfirmed: &mut Vec<usize>,
+    first_err: &mut Option<ShoveError>,
+) {
+    let Err(e) = outcome else { return };
+    metrics::record_backend_error(
+        metrics::BackendLabel::Nats,
+        metrics::BackendErrorKind::Publish,
+    );
+    if ack_error_is_explicit_rejection(&e) {
+        rejected.push(index);
+    } else {
+        unconfirmed.push(index);
+    }
+    if first_err.is_none() {
+        *first_err = Some(ShoveError::Connection(format!(
+            "batch publish ack failed: {e}"
+        )));
     }
 }
 
