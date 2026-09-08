@@ -1,0 +1,23 @@
+.github/workflows/charts.yml
+  s_1a5ac5ada4ff0e::t_97d6aaab97820f 1-33
+.github/workflows/ci.yml
+  s_1a5ac5ada4ff0e::t_8d4c54f0f7439e 6-12,16-18,29-31
+CONTRIBUTING.md
+  s_1a5ac5ada4ff0e::t_b71d0cd34ec883 129-131,140
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "3bb75f34130df5c05528149976a3411285694abb",
+  "prompts": {},
+  "sessions": {
+    "s_1a5ac5ada4ff0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f193bc98-253b-491e-beb5-e72c144577b8",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
