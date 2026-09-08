@@ -363,9 +363,16 @@ async fn main() {
                 harness::connect_with_retries("Kafka", 10, Duration::from_secs(1), || {
                     let bootstrap = bootstrap.clone();
                     async move {
-                        <Kafka as Backend>::connect(KafkaConfig::new(&bootstrap))
+                        // `connect` only builds the producer and never
+                        // contacts the broker, so the retry has nothing to
+                        // retry on unless the cluster is actually asked.
+                        let client = <Kafka as Backend>::connect(KafkaConfig::new(&bootstrap))
                             .await
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| e.to_string())?;
+                        <Kafka as Backend>::ping(&client, Duration::from_secs(5))
+                            .await
+                            .map_err(|e| format!("ping: {e}"))?;
+                        Ok(client)
                     }
                 })
                 .await
