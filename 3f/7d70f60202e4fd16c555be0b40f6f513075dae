@@ -1,0 +1,21 @@
+examples/common/stress_test.rs
+  s_1a5ac5ada4ff0e::t_9db920b0794b2a 286-292,2438-2442,2460-2463,2800-2805,2817-2826,2830,2842,5053-5059,5083-5085,5098,5781,5784-5785,5812,6538-6540,6542-6544,10733-10734,11013-11047
+examples/sqs/stress.rs
+  s_1a5ac5ada4ff0e::t_e1ad97cdd06512 277-280,282-286
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "3f7d70f60202e4fd16c555be0b40f6f513075dae",
+  "prompts": {},
+  "sessions": {
+    "s_1a5ac5ada4ff0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f193bc98-253b-491e-beb5-e72c144577b8",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
