@@ -1,0 +1,19 @@
+examples/rabbitmq/stress.rs
+  s_1a5ac5ada4ff0e::t_528ae1e8af66a5 32-36,57-73
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "edd235087fa1e7e684f946dae432beae0dd7a36d",
+  "prompts": {},
+  "sessions": {
+    "s_1a5ac5ada4ff0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f193bc98-253b-491e-beb5-e72c144577b8",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
