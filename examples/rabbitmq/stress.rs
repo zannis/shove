@@ -18,7 +18,7 @@ use lapin::{Connection, ConnectionProperties};
 use shove::batch_consumer::BatchConsumerOptions;
 use shove::rabbitmq as rmq;
 use shove::{Backend, Broker, RabbitMq, Topic};
-use testcontainers::core::ExecCommand;
+use testcontainers::core::{CmdWaitFor, ExecCommand};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::rabbitmq::RabbitMq as RabbitMqImage;
 
@@ -28,6 +28,11 @@ use harness::{BatchConsumeFn, DlqDrainFn, HarnessConfig, StressTestTopic, run_al
 /// default), recorded in the
 /// results provenance so a reader knows which server produced the numbers.
 const RABBITMQ_VERSION: &str = "3.8.22";
+
+/// Fraction of the container's memory the broker may hold before its memory
+/// alarm blocks publishers; see the `set_vm_memory_high_watermark` exec in
+/// `main` for why the image default is too low for the 64 KiB corpus.
+const RABBITMQ_MEMORY_HIGH_WATERMARK: &str = "0.8";
 
 #[tokio::main]
 async fn main() {
@@ -48,6 +53,29 @@ async fn main() {
         ]))
         .await
         .expect("failed to enable consistent-hash plugin");
+    let _ = exec.stdout_to_vec().await;
+    // The 64 KiB drain corpus is 3.2 GB of queued messages, and the image's
+    // default high watermark (0.4 of the Docker VM's memory, about 3.4 GB
+    // on an 8 GB VM) sits right on top of it. Tripping the memory alarm
+    // blocks the connection that is also registering the consumers, so on
+    // an eight-consumer cell the last workers register seconds late and
+    // the barrier rightly refuses a window most of the corpus has already
+    // left. Raise the watermark so the corpus stays resident and unpaged;
+    // the alarm is protecting a broker nothing else shares. The exit-code
+    // condition is what makes the `expect` mean "the watermark was raised":
+    // without it a failing rabbitmqctl would leave the default in place and
+    // the run would proceed into the very alarm this guards against.
+    let mut exec = container
+        .exec(
+            ExecCommand::new([
+                "rabbitmqctl",
+                "set_vm_memory_high_watermark",
+                RABBITMQ_MEMORY_HIGH_WATERMARK,
+            ])
+            .with_cmd_ready_condition(CmdWaitFor::exit_code(0)),
+        )
+        .await
+        .expect("failed to raise the RabbitMQ memory high watermark");
     let _ = exec.stdout_to_vec().await;
     let _container = harness::ContainerGuard::new(container);
 
