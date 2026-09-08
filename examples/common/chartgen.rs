@@ -2869,7 +2869,9 @@ where
 /// unattributed set ("6M / 30k") names both sizes and tells nobody which bar
 /// is which, which is worse than either naming one or naming them all — so
 /// the flat sentence is kept only for the case it is actually true of, every
-/// backend on the same corpus.
+/// backend on the same corpus. Attributed, the backends sharing a corpus are
+/// grouped onto one entry rather than one each: they disagree because one
+/// deviates, so an entry each spends caption lines restating the pinned size.
 fn drain_notes<P>(runs: &[BackendRun], in_slice: P) -> Vec<String>
 where
     P: Fn(&ScenarioResult) -> bool,
@@ -2919,14 +2921,37 @@ where
             corpus_clause,
         ));
         if uniform.is_none() {
+            // Attributed does not mean one entry per backend. The backends
+            // disagree because one of them deviates — the matrix pins a single
+            // corpus and SQS alone runs a smaller one — so an entry each
+            // repeats the same sizes five times to say one thing. This note
+            // shares the caption block with the mode, lower-bound and batch
+            // notes, and that block has a fixed budget before the chart body
+            // has no room left; the repetition is what spends the line.
+            // Backends on the same corpus are grouped and named in document
+            // order, as are the groups themselves — which puts the pinned
+            // corpus before the deviation that differs from it. Groups are
+            // separated by `;` so a group's backend list cannot be misread as
+            // running into the next group.
+            let mut groups: Vec<(&BTreeSet<u64>, Vec<&str>)> = Vec::new();
+            for (backend, corpora) in &per_backend {
+                match groups.iter_mut().find(|(c, _)| *c == corpora) {
+                    Some((_, sharing)) => sharing.push(backend),
+                    None => groups.push((corpora, vec![backend])),
+                }
+            }
             notes.push(format!(
                 "corpus differs by backend: {} — a smaller corpus is a shorter window, not a \
                  different measurement",
-                per_backend
+                groups
                     .iter()
-                    .map(|(b, c)| format!("{b} {}", fmt_counts(c)))
+                    .map(|(corpora, sharing)| format!(
+                        "{} {}",
+                        sharing.join(", "),
+                        fmt_counts(corpora)
+                    ))
                     .collect::<Vec<_>>()
-                    .join(", "),
+                    .join("; "),
             ));
         }
         if !duplicates.is_empty() {

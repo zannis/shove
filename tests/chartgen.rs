@@ -4684,7 +4684,7 @@ fn a_backend_that_drained_a_smaller_corpus_is_named_in_the_caption() {
         .expect("chart should render");
     let caption = joined_text(&svg);
     assert!(
-        caption.contains("corpus differs by backend: inmemory 22k, kafka 2.2k"),
+        caption.contains("corpus differs by backend: inmemory 22k; kafka 2.2k"),
         "each backend's corpus is named: {caption}"
     );
     assert!(
@@ -4694,6 +4694,46 @@ fn a_backend_that_drained_a_smaller_corpus_is_named_in_the_caption() {
     assert!(
         caption.contains("no producer ran in the window"),
         "the drain rule itself still stands: {caption}"
+    );
+}
+
+#[test]
+fn backends_sharing_a_corpus_are_grouped_into_one_caption_entry() {
+    // The shape the six-backend rerun actually produces: one matrix pins a
+    // corpus for everyone and a single backend deviates because it is too
+    // slow to drain the pinned one in a sane wall clock. An entry per backend
+    // would restate the pinned size once per backend to say one thing, and
+    // the parallel-vs-sequenced slice this note shares a caption block with
+    // sits one line under its budget at six backends.
+    let shared = ["kafka", "nats", "rabbitmq", "redis"].map(|backend| {
+        format!(
+            r#"{{ "backend": "{backend}", "representative": true,
+                  "results": [{}], "failures": [], "unsupported": [] }}"#,
+            consumer_axis_drains(10_000.0).join(",")
+        )
+    });
+    let deviating = format!(
+        r#"{{ "backend": "sqs", "representative": true,
+              "results": [{}], "failures": [], "unsupported": [] }}"#,
+        consumer_axis_drains(1_000.0).join(",")
+    );
+    let runs = format!("{},{},{}", inmemory_run(true), shared.join(","), deviating);
+    let doc = parse(&document(&runs));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+    let caption = joined_text(&svg);
+    assert!(
+        caption.contains(
+            "corpus differs by backend: inmemory, kafka, nats, rabbitmq, redis 22k; sqs 2.2k"
+        ),
+        "backends on one corpus share an entry, the deviation keeps its own: {caption}"
+    );
+    // The point of grouping is the line it buys back, so the sizes must be
+    // stated once each rather than once per backend.
+    assert_eq!(
+        caption.matches("22k").count(),
+        1,
+        "the shared corpus is stated once, not once per backend: {caption}"
     );
 }
 
