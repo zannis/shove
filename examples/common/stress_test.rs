@@ -7522,8 +7522,9 @@ mod tests {
         // pinned matrix made every Redis FIFO cell fail at registration while
         // the backends that still discarded it measured theirs. Every
         // consumer-group `register_fifo` refuses it now, so a FIFO scenario
-        // must never ask for it -- including the supervisor rows, where it
-        // would be accepted and would only clamp prefetch.
+        // must never ask for it -- including the supervisor rows, where no
+        // guard would catch the mistake: the flag is simply accepted there,
+        // and leaving it false is what clamps prefetch to 1.
         let fifo = build_scenarios_cg(&cli_args(&[
             "--tier",
             "moderate",

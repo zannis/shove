@@ -287,9 +287,10 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
     }
 
     /// Register a handler for a [`SequencedTopic`]: one poller per routing
-    /// shard on the sharded backends (Redis, NATS, RabbitMQ, SQS), or a single
-    /// task covering the assigned partitions on Kafka, which gets its per-key
-    /// ordering from partition assignment rather than from shard queues.
+    /// shard on the sharded backends (Redis, NATS, RabbitMQ, SQS, InMemory),
+    /// or a single task covering the assigned partitions on Kafka, which gets
+    /// its per-key ordering from partition assignment rather than from shard
+    /// queues.
     ///
     /// Unlike every backend's `ConsumerGroupConfig`-based `register_fifo`,
     /// which rejects `concurrent_processing(true)`, this path accepts
@@ -309,12 +310,15 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
     ///   order *within* a key is preserved.
     /// - **Redis** reads prefetch as a batch size only; its shard loop still
     ///   handles one message at a time.
-    /// - **Kafka and NATS** discard it. Their FIFO paths read neither the flag
-    ///   nor `prefetch_count` (NATS pins `max_ack_pending: 1`).
+    /// - **Kafka, NATS and InMemory** discard it. Their FIFO paths read
+    ///   neither the flag nor `prefetch_count` (NATS pins
+    ///   `max_ack_pending: 1`; InMemory's shards share a busy counter).
     ///
     /// It is never an ordering hazard on any of them. But note the residual
     /// inconsistency this leaves: on Kafka and NATS the same flag is a hard
-    /// error via `consumer_group()` and silently inert here.
+    /// error via `consumer_group()` and silently inert here. InMemory is not
+    /// inconsistent in that way — its `ConsumerGroupConfig` has no such flag
+    /// at all, so only `ConsumerOptions` can carry one.
     ///
     /// [`ConsumerOptions::concurrent_processing`]: crate::consumer::ConsumerOptions::concurrent_processing
     /// [`ConsumerOptions::into_inner`]: crate::consumer::ConsumerOptions
