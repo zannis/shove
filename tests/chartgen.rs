@@ -4451,6 +4451,157 @@ fn load_scenario(
     )
 }
 
+/// An offered-load row the harness's backlog cap stopped at 2.7 s of a 10 s
+/// window: 25 000/s offered and held, 67 500 published, 50 000 processed, so
+/// 17 500 of lag (26 %) and not sustained. `backlog_capped` is what makes
+/// the short window legitimate; without it the same row is malformed.
+fn capped_rung_row(backlog_capped: bool) -> String {
+    let flag = if backlog_capped {
+        r#""backlog_capped": true,"#
+    } else {
+        ""
+    };
+    format!(
+        r#"{{
+          "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 65536,
+          "tier": "moderate", "messages": 67500, "consumers": 1,
+          "handler": "zero (no-op)", "handler_cost": "framework", "setup_secs": 3.1,
+          "throughput_msg_per_sec": 18518.518518518518,
+          "dispatch_p50_ms": 400.0, "dispatch_p95_ms": 800.0, "dispatch_p99_ms": 1600.0,
+          "e2e_p50_ms": 400.0, "e2e_p95_ms": 800.0, "e2e_p99_ms": 1600.0,
+          "scaling_efficiency": 1.0, "peak_rss_mb": 1.0, "cpu_pct": 100.0,
+          "duration_secs": 2.7,
+          "method": "offered_load",
+          "load": {{
+            "offered_msg_per_sec": 25000, "window_secs": 10, "producers": 8,
+            "published": 67500, "published_at_window_end": 67500,
+            "processed_at_window_end": 50000,
+            "achieved_publish_msg_per_sec": 25000.0, "lag_at_window_end": 17500,
+            "peak_lag": 17500, "drain_secs": 5.0,
+            "producer_bound": false, {flag} "sustained": false
+          }}
+        }}"#
+    )
+}
+
+#[test]
+fn a_rung_the_backlog_cap_stopped_is_a_valid_row_with_its_shorter_window() {
+    // The harness stops a rung's producers once its backlog passes the byte
+    // cap and records the window it actually ran, flagged `backlog_capped`.
+    // Such a row is a measurement (not sustained, by definition), not a
+    // malformed one: the first six-backend document with a capped rung must
+    // render rather than be refused.
+    let doc = parse(&document(&kafka_ladder_run(&[
+        load_scenario(
+            "consume_parallel",
+            65536,
+            1,
+            5_000,
+            5_000.0,
+            50_000,
+            5_000.0,
+            1.0,
+        ),
+        capped_rung_row(true),
+    ])));
+    chartgen::render_to_string(&doc, Family::DispatchLatency, Mode::Light)
+        .expect("a capped rung's shorter window is legitimate");
+}
+
+#[test]
+fn a_short_window_without_the_cap_flag_is_still_malformed() {
+    // The flag is the only thing that licenses a short window; a row that
+    // simply stopped early is still a document defect.
+    let doc = parse(&document(&kafka_ladder_run(&[
+        load_scenario(
+            "consume_parallel",
+            65536,
+            1,
+            5_000,
+            5_000.0,
+            50_000,
+            5_000.0,
+            1.0,
+        ),
+        capped_rung_row(false),
+    ])));
+    let err = chartgen::render_to_string(&doc, Family::DispatchLatency, Mode::Light)
+        .expect_err("an unflagged short window is refused");
+    assert!(
+        err.to_string().contains("shorter than the rung"),
+        "wrong refusal: {err}"
+    );
+}
+
+/// A capped row whose consumers kept up: 67 500 published, 67 000 processed,
+/// 500 of lag (under the 5 % threshold) with the producer holding the rate.
+/// Only the cap makes it not sustained, so this row is what proves the
+/// verdict honours the flag.
+fn capped_rung_row_kept_up(claimed_sustained: bool) -> String {
+    format!(
+        r#"{{
+          "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 65536,
+          "tier": "moderate", "messages": 67500, "consumers": 1,
+          "handler": "zero (no-op)", "handler_cost": "framework", "setup_secs": 3.1,
+          "throughput_msg_per_sec": 24814.814814814815,
+          "dispatch_p50_ms": 40.0, "dispatch_p95_ms": 80.0, "dispatch_p99_ms": 160.0,
+          "e2e_p50_ms": 40.0, "e2e_p95_ms": 80.0, "e2e_p99_ms": 160.0,
+          "scaling_efficiency": 1.0, "peak_rss_mb": 1.0, "cpu_pct": 100.0,
+          "duration_secs": 2.7,
+          "method": "offered_load",
+          "load": {{
+            "offered_msg_per_sec": 25000, "window_secs": 10, "producers": 8,
+            "published": 67500, "published_at_window_end": 67500,
+            "processed_at_window_end": 67000,
+            "achieved_publish_msg_per_sec": 25000.0, "lag_at_window_end": 500,
+            "peak_lag": 500, "drain_secs": 0.1,
+            "producer_bound": false, "backlog_capped": true, "sustained": {claimed_sustained}
+          }}
+        }}"#
+    )
+}
+
+#[test]
+fn the_cap_makes_a_rung_not_sustained_even_when_its_consumers_kept_up() {
+    // With 500 of lag on 67 500 published the numbers alone would call the
+    // rung sustained; the cap says otherwise, as the harness derives it. A
+    // row that claims sustained anyway is refused as inconsistent.
+    let ok = parse(&document(&kafka_ladder_run(&[
+        load_scenario(
+            "consume_parallel",
+            65536,
+            1,
+            5_000,
+            5_000.0,
+            50_000,
+            5_000.0,
+            1.0,
+        ),
+        capped_rung_row_kept_up(false),
+    ])));
+    chartgen::render_to_string(&ok, Family::DispatchLatency, Mode::Light)
+        .expect("a capped rung that kept up is not sustained, and renders");
+    let inconsistent = parse(&document(&kafka_ladder_run(&[
+        load_scenario(
+            "consume_parallel",
+            65536,
+            1,
+            5_000,
+            5_000.0,
+            50_000,
+            5_000.0,
+            1.0,
+        ),
+        capped_rung_row_kept_up(true),
+    ])));
+    let err = chartgen::render_to_string(&inconsistent, Family::DispatchLatency, Mode::Light)
+        .expect_err("a capped rung claiming sustained contradicts its own account");
+    assert!(
+        err.to_string().contains("sustained"),
+        "wrong refusal: {err}"
+    );
+}
+
 fn kafka_ladder_run(rows: &[String]) -> String {
     format!(
         r#"{{
