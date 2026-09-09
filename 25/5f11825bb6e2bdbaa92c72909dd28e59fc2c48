@@ -1,0 +1,19 @@
+benches/README.md
+  s_1a5ac5ada4ff0e::t_1547aee9945048 190-199
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "255f11825bb6e2bdbaa92c72909dd28e59fc2c48",
+  "prompts": {},
+  "sessions": {
+    "s_1a5ac5ada4ff0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f193bc98-253b-491e-beb5-e72c144577b8",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
