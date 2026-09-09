@@ -26,7 +26,7 @@ Every published row is measured with the same sampled core matrix:
 | `--consumers 1,2,4,8` | four points on the scaling curve | the sampling lever for the published matrix |
 | `--concurrent` | concurrent processing within each consumer | without it every consumer handles one message at a time, and the parallel flows measure ack round trips instead of throughput |
 | `--drain-messages 6000000` | the drain corpus for the consume flows | see below; sized so the group assembles well inside the first half of the corpus on the fastest cell and the window still lasts several seconds. **SQS is the one exception, at 60 000** — see "The SQS corpus deviation" |
-| `--drain-max-bytes 3221225472` | cap on `corpus × payload_bytes` | 3 GiB: 6 M messages at 64 B, 3 M at 1 KiB, about 49 k at 64 KiB — the in-process backend holds the corpus resident and Kafka writes it to disk before every cell |
+| `--drain-max-bytes 3221225472` | cap on `corpus × payload_bytes` | 3 GiB: 6 M messages at 64 B, 3 M at 1 KiB, about 49 k at 64 KiB — what the 8 GB Docker VM holds, and every containerised backend stages its corpus inside it. **In-process is the one exception, at 32 GiB** — see "The in-process byte cap deviation" |
 | `--load-rates …` | the offered-load ladder for the consume flows | see below; three rungs, because the ladder measures latency at a sustained rate and the ceiling comes from the drain |
 | `--load-window-secs 10` | how long each rung holds its rate | long enough for a rate |
 | `--load-producers 8` | paced producer tasks sharing each rung's rate, and fill tasks for the drain | one sequential publisher tops out near 70k msg/s on Kafka; on Kafka each task gets its own connection, because publishers cloned from one client share one producer instance and cap near 260k msg/s together |
@@ -264,6 +264,59 @@ for scheduling, not published numbers:
 
 Ratios move with the host; the ordering does not. Time one cell before
 committing an evening to a backend nobody has measured here.
+
+### The in-process byte cap deviation
+
+In-process is the one backend that does not cap its drain corpus at the
+matrix's 3 GiB. It runs **32 GiB**, set as `INMEMORY_DRAIN_MAX_BYTES` in
+`scripts/bench.sh` and substituted into the matrix for that target only; every
+other knob, including `--drain-messages`, is shared. The script prints a
+`deviation:` line at the top of the in-process log.
+
+This is the mirror image of the SQS deviation. SQS drains a smaller corpus
+because it is the only backend slow enough that the pinned *count* means
+something else there; in-process is allowed a larger one because it is the only
+backend fast enough that the pinned *byte cap* does. At 3 GiB the 64 KiB leg is
+49 152 messages, and the 2026-09-08 run drained every one of the in-process
+64 KiB cells in 0.09-0.46 s — under the 1 s floor, so the harness marked all
+eleven rows `setup_bound` and the charts withheld all eleven. The fastest
+backend in the set published no 64 KiB consume rate at all.
+
+Why only in-process gets it: 3 GiB is not a cautious number for the others, it
+is the containerised limit. Every other backend stages its corpus inside the
+8 GB Docker VM — Redis and NATS in container memory, Kafka through its page
+cache — where 3 GiB is already over a third of the VM, and where a 3.2 GB
+backlog has already taken Redis down mid-pass (see the backlog cap). In-process
+stages its corpus in the harness process on the 64 GB host and never starts a
+container, so it is the one backend whose cap can rise without touching the VM.
+
+At 32 GiB the 64 KiB leg drains 524 288 messages, which puts the fastest cell
+(`consumer_group` at two consumers, 514 k msg/s) at about 0.9 s and the other
+ten at 1.0-5.0 s: the leg publishes instead of being withheld whole. Resident
+cost is ~34 GB. Clearing that last cell as well would need ~40 GiB, and
+`MIN_FRAMEWORK_CORPUS_MESSAGES`'s own doc declines to chase a window that
+hardware speed keeps moving — a cell landing under the floor is withheld and
+captioned exactly as before, which costs one bar rather than the pass.
+
+It moves the 1 KiB leg too, by design: at 3 GiB that leg is byte-bound at
+3 145 728, and 32 GiB puts it back on the pinned count of 6 000 000 where the
+64 B leg already sits. In-process then runs two of its three legs on the
+matrix's own corpus rather than one, and the single 1 KiB cell that drained in
+0.97 s clears the floor as well. It costs about forty seconds and 6 GiB rather
+than 3 GiB resident.
+
+As with the SQS deviation it is recorded on the rows, not only here: every
+drain row carries `drain.corpus`, and where a slice's backends disagree the
+charts name them ("corpus differs by backend: inmemory 524k; …") rather than
+listing sizes unattributed.
+
+One thing it does **not** fix, so a rerun is not read as fixing it: of the four
+cells that failed "consumed before assembly" at 64 KiB with eight consumers,
+in-process was one and this clears it, but the other three are RabbitMQ, whose
+eight-consumer group assembly ran through 37 000-46 300 messages. Putting that
+well under half a corpus needs ~196 k messages, or 12 GiB inside an 8 GB VM.
+Those three are a group-assembly cost rather than a corpus size, and they are
+expected to fail again.
 
 ## Results document and provenance
 
