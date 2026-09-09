@@ -136,13 +136,15 @@ impl RedisConsumer {
 impl RedisConsumer {
     /// Run the non-FIFO consumer loop until `options.shutdown` is cancelled.
     ///
-    /// Always uses the sequential single-message XREADGROUP dispatch path.
-    /// To opt into concurrent in-flight dispatch (semaphore-gated), register
-    /// the topic through [`RedisConsumerGroupRegistry`] with
-    /// [`RedisConsumerGroupConfig::with_concurrent_processing(true)`].
+    /// Honours [`ConsumerOptions::with_concurrent_processing`]: with it on,
+    /// each XREADGROUP-returned entry is dispatched to its own task with
+    /// in-flight handlers capped at `prefetch_count` (the semaphore-gated
+    /// path a [`RedisConsumerGroupRegistry`] member takes); with it off,
+    /// `prefetch_count` reaches this backend as `1` and entries are handled
+    /// one at a time.
     ///
+    /// [`ConsumerOptions::with_concurrent_processing`]: crate::consumer::ConsumerOptions::with_concurrent_processing
     /// [`RedisConsumerGroupRegistry`]: super::consumer_group::RedisConsumerGroupRegistry
-    /// [`RedisConsumerGroupConfig::with_concurrent_processing(true)`]: super::consumer_group::RedisConsumerGroupConfig::with_concurrent_processing
     pub async fn run<T, H>(
         &self,
         handler: H,
@@ -259,6 +261,18 @@ impl ConsumerImpl for RedisConsumer {
     {
         let client = self.client.clone();
         async move {
+            // `ConsumerOptions::into_inner` pins `prefetch_count` to 1 when
+            // `concurrent_processing` is off, so a prefetch above 1 is the
+            // caller asking for concurrent dispatch: the same rule the group
+            // registry applies when it picks a member's loop. Until this
+            // dispatch existed a direct consumer ignored the flag and the
+            // benchmark's consume_parallel flow sat 10 to 30x below
+            // consumer_group on this backend.
+            if options.prefetch_count > 1 {
+                return RedisConsumer::new(client)
+                    .run_concurrent::<T, H>(handler, ctx, options)
+                    .await;
+            }
             let topology = T::topology();
             let stream = topology.queue();
             run_stream_loop::<T, H>(

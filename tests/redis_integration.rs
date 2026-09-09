@@ -2747,6 +2747,90 @@ impl Topic for SequentialTopic {
 }
 
 // ---------------------------------------------------------------------------
+// Concurrent-processing test, direct consumer: `RedisConsumer::run` (what the
+// supervisor drives) must honour `ConsumerOptions::with_concurrent_processing`
+// exactly as the group registry does. It used to take the sequential
+// single-message path regardless, which is why the benchmark's
+// consume_parallel flow sat 10 to 30x below consumer_group on this backend.
+// ---------------------------------------------------------------------------
+
+struct ConcurrentRunTopic;
+impl Topic for ConcurrentRunTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-concurrent-run").build())
+    }
+}
+
+#[tokio::test]
+async fn a_direct_consumer_honours_concurrent_processing_like_a_group_does() {
+    let broker = make_broker("redis-int-concurrent-run").await;
+    broker
+        .topology()
+        .declare::<ConcurrentRunTopic>()
+        .await
+        .expect("declare");
+    let publisher = broker.publisher().await.expect("publisher");
+    let total: usize = 10;
+    for i in 0..total {
+        publisher
+            .publish::<ConcurrentRunTopic>(&Order { id: i as u64 })
+            .await
+            .expect("publish");
+    }
+    let count = Arc::new(AtomicUsize::new(0));
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>);
+    impl MessageHandler<ConcurrentRunTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+    // The supervisor is the public path to a direct consumer, and what the
+    // benchmark's consume_parallel flow drives.
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<ConcurrentRunTopic, _>(
+            H(Arc::clone(&count)),
+            ConsumerOptions::<Redis>::new()
+                .with_prefetch_count(total as u16)
+                .with_concurrent_processing(true),
+        )
+        .expect("register");
+    let probe = count.clone();
+    let started = std::time::Instant::now();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= total,
+            Duration::from_secs(10),
+        )
+        .await;
+    };
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    let elapsed = started.elapsed();
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        total,
+        "all {total} messages must be processed"
+    );
+    // Sequential dispatch is ~2000ms (10 x 200ms); one concurrent wave is
+    // ~200ms. Same headroom as the group test below.
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "a direct consumer with concurrent_processing took {elapsed:?}; expected < 900ms \
+         (sequential would be ~2s)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Concurrent-processing test: handlers run in parallel up to prefetch_count
 // ---------------------------------------------------------------------------
 //
