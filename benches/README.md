@@ -202,9 +202,11 @@ Redis needs one more guard the cap cannot give: its streams keep consumed
 entries until the reaper's next `XTRIM MINID` sweep, so a 64 KiB rung at
 25 000/s pushes acknowledged but untrimmed entries into memory at 1.6 GB/s
 with no lag to cap. The stress container therefore runs `redis-server` with
-`maxmemory 4gb` and `noeviction`: a stream that outgrows it fails its XADD,
+`maxmemory 6gb` and `noeviction`: a stream that outgrows it fails its XADD,
 which the harness records as that cell's failure, instead of the process
-being killed and every later cell dying with it.
+being killed and every later cell dying with it. Because `UNLINK` frees in
+the background and `maxmemory` counts what is not yet freed, the purge waits
+for `lazyfree_pending_objects` to reach zero before the next cell starts.
 
 ### The SQS corpus deviation
 
