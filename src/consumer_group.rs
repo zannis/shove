@@ -18,6 +18,33 @@ use crate::handler::MessageHandler;
 use crate::markers::Kafka;
 use crate::topic::{SequencedTopic, Topic};
 
+/// The error a backend's `register_fifo` returns when its
+/// `ConsumerGroupConfig` carries `concurrent_processing(true)`.
+///
+/// Shared so the three backends whose FIFO consumer is **serial** — Redis,
+/// Kafka and NATS — refuse the flag with one wording instead of three copies
+/// of the string. Each of those loops handles one message at a time (Redis and
+/// NATS per shard, Kafka per assigned partition set), so the flag cannot be
+/// honoured there: dispatching concurrently inside a shard is exactly what
+/// would break the per-key ordering the caller asked for by using a sequenced
+/// topic. Refusing at registration beats discarding the flag and leaving the
+/// caller believing FIFO consumption runs concurrently.
+///
+/// Deliberately **not** used by RabbitMQ or by
+/// [`ConsumerSupervisor::register_fifo`](crate::consumer_supervisor::ConsumerSupervisor::register_fifo)
+/// (the SQS FIFO path). Those two loops are cross-key concurrent and per-key
+/// serialised — they hold at most one in-flight message per sequence key and
+/// bound the rest by prefetch — so concurrency there does not break ordering
+/// and this message would be false. See each one's own doc comment.
+#[cfg(any(feature = "kafka", feature = "nats", feature = "redis-streams"))]
+pub(crate) fn reject_fifo_concurrency(queue: &str) -> ShoveError {
+    ShoveError::Topology(format!(
+        "topic '{queue}' is sequenced; `concurrent_processing` on a FIFO consumer would \
+         break per-key ordering. Drop `with_concurrent_processing(true)` or use \
+         `register` for unsequenced topics."
+    ))
+}
+
 pub struct ConsumerGroup<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static = ()> {
     pub(crate) inner: B::RegistryImpl,
     client: B::Client,

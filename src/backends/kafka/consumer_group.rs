@@ -948,6 +948,13 @@ impl KafkaConsumerGroupRegistry {
     /// Declares the topology for `T` before creating the group. The group is
     /// **not** started — call [`start_all`] separately.
     ///
+    /// Rejects configs with `concurrent_processing(true)`: Kafka's FIFO
+    /// consumer is a single task handling one message at a time, which is
+    /// what makes per-key ordering hold (every message for a key lands in
+    /// the same partition). Concurrent dispatch cannot be honoured here
+    /// without breaking that, so the flag is refused at registration rather
+    /// than silently discarded.
+    ///
     /// [`start_all`]: Self::start_all
     pub async fn register_fifo<T, H>(
         &mut self,
@@ -959,6 +966,12 @@ impl KafkaConsumerGroupRegistry {
         T: SequencedTopic + 'static,
         H: MessageHandler<T> + 'static,
     {
+        if config.concurrent_processing() {
+            return Err(crate::consumer_group::reject_fifo_concurrency(
+                T::topology().queue(),
+            ));
+        }
+
         let mut config = config;
         config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
             config.handler_timeout,
@@ -1766,6 +1779,92 @@ mod tests {
             assert_eq!(subjects.len(), 2);
             assert!(subjects.iter().any(|s| s.as_ref() == "orders-value"));
             assert!(subjects.iter().any(|s| s.as_ref() == "orders-dlq-value"));
+        }
+    }
+
+    // -- FIFO registration rejects `concurrent_processing(true)` --
+
+    mod fifo_concurrency_guard {
+        use super::*;
+        use crate::topology::{SequenceFailure, TopologyBuilder};
+        use crate::{MessageMetadata, Outcome, define_sequenced_topic};
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct GuardEntry {
+            account_id: String,
+        }
+
+        define_sequenced_topic!(
+            GuardLedger,
+            GuardEntry,
+            |msg| msg.account_id.clone(),
+            TopologyBuilder::new("kafka-fifo-concurrency-guard")
+                .sequenced(SequenceFailure::FailAll)
+                .hold_queue(Duration::from_millis(50))
+                .dlq()
+                .build()
+        );
+
+        struct NoopHandler;
+        impl MessageHandler<GuardLedger> for NoopHandler {
+            type Context = ();
+            async fn handle(&self, _: GuardEntry, _: MessageMetadata, _: &()) -> Outcome {
+                Outcome::Ack
+            }
+        }
+
+        fn registry() -> KafkaConsumerGroupRegistry {
+            KafkaConsumerGroupRegistry::from_groups(HashMap::new())
+        }
+
+        /// An explicitly-set `concurrent_processing(true)` must fail at
+        /// registration rather than be silently discarded. Kafka's FIFO consumer handles one message at a time.
+        #[tokio::test]
+        async fn register_fifo_rejects_concurrent_processing() {
+            let config = KafkaConsumerGroupConfig::new(1..=4).with_concurrent_processing(true);
+
+            let err = registry()
+                .register_fifo::<GuardLedger, _>(config, || NoopHandler, ())
+                .await
+                .expect_err("concurrent_processing(true) must be rejected on a FIFO consumer");
+
+            let ShoveError::Topology(msg) = err else {
+                panic!("expected ShoveError::Topology, got {err:?}");
+            };
+            assert!(
+                msg.contains("kafka-fifo-concurrency-guard"),
+                "message must name the offending topic: {msg}"
+            );
+            assert!(
+                msg.contains("is sequenced")
+                    && msg.contains("break per-key ordering")
+                    && msg.contains("with_concurrent_processing(true)"),
+                "message must match the shared FIFO-concurrency wording: {msg}"
+            );
+        }
+
+        /// Negative control: the guard is conditional on the flag, not
+        /// unconditional on FIFO registration. With the flag off the call
+        /// runs past the guard and only then fails on the absent client —
+        /// so a passing reject test above cannot be an artefact of
+        /// `register_fifo` refusing everything.
+        #[tokio::test]
+        async fn register_fifo_admits_non_concurrent_config() {
+            let config = KafkaConsumerGroupConfig::new(1..=4).with_concurrent_processing(false);
+
+            let err = registry()
+                .register_fifo::<GuardLedger, _>(config, || NoopHandler, ())
+                .await
+                .expect_err("a client-less registry cannot finish registering");
+
+            let ShoveError::Topology(msg) = err else {
+                panic!("expected ShoveError::Topology, got {err:?}");
+            };
+            assert!(
+                msg.contains("registry has no client"),
+                "expected to reach the client lookup past the guard, got: {msg}"
+            );
         }
     }
 }

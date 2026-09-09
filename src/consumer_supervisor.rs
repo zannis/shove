@@ -286,6 +286,32 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
         Ok(())
     }
 
+    /// Register a handler for a [`SequencedTopic`], one poller per routing
+    /// shard.
+    ///
+    /// Unlike the serial-FIFO backends' `register_fifo` (Redis, Kafka, NATS —
+    /// see
+    /// [`reject_fifo_concurrency`](crate::consumer_group::reject_fifo_concurrency)),
+    /// this path does **not** reject
+    /// [`ConsumerOptions::concurrent_processing`]. That is deliberate, for two
+    /// independent reasons:
+    ///
+    /// - It is honoured here, not discarded:
+    ///   [`ConsumerOptions::into_inner`] clamps `prefetch_count` to 1 when the
+    ///   flag is false, so the setting already has an effect on this path.
+    /// - Concurrency here does not cost ordering. The sequenced shard loop
+    ///   holds at most one in-flight message per sequence key and queues the
+    ///   rest behind it, bounding total in-flight work by prefetch. So
+    ///   prefetch buys concurrency *across* keys while order *within* a key is
+    ///   preserved — which is the point of the flag, not a violation of FIFO.
+    ///
+    /// Rejecting it would also break every existing caller: unlike the
+    /// per-backend `ConsumerGroupConfig`s, which default the flag to `false`,
+    /// [`ConsumerOptions::new`] defaults it to `true`.
+    ///
+    /// [`ConsumerOptions::concurrent_processing`]: crate::consumer::ConsumerOptions::concurrent_processing
+    /// [`ConsumerOptions::into_inner`]: crate::consumer::ConsumerOptions
+    /// [`ConsumerOptions::new`]: crate::consumer::ConsumerOptions::new
     pub async fn register_fifo<T, H>(
         &mut self,
         handler: H,
