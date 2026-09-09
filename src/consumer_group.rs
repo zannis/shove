@@ -30,18 +30,43 @@ use crate::topic::{SequencedTopic, Topic};
 /// topic. Refusing at registration beats discarding the flag and leaving the
 /// caller believing FIFO consumption runs concurrently.
 ///
-/// Deliberately **not** used by RabbitMQ or by
+/// Deliberately **not** used by RabbitMQ — which refuses the flag too, but for
+/// a different reason and so with different wording, see
+/// [`reject_fifo_concurrency_prefetch_controlled`] — nor by
 /// [`ConsumerSupervisor::register_fifo`](crate::consumer_supervisor::ConsumerSupervisor::register_fifo)
-/// (the SQS FIFO path). Those two loops are cross-key concurrent and per-key
-/// serialised — they hold at most one in-flight message per sequence key and
-/// bound the rest by prefetch — so concurrency there does not break ordering
-/// and this message would be false. See each one's own doc comment.
+/// (the SQS FIFO path), which accepts it. Those two loops are cross-key
+/// concurrent and per-key serialised — they hold at most one in-flight message
+/// per sequence key and bound the rest by prefetch — so concurrency there does
+/// not break ordering and *this* message would be false of them.
 #[cfg(any(feature = "kafka", feature = "nats", feature = "redis-streams"))]
 pub(crate) fn reject_fifo_concurrency(queue: &str) -> ShoveError {
     ShoveError::Topology(format!(
         "topic '{queue}' is sequenced; `concurrent_processing` on a FIFO consumer would \
          break per-key ordering. Drop `with_concurrent_processing(true)` or use \
          `register` for unsequenced topics."
+    ))
+}
+
+/// The error RabbitMQ's `register_fifo` returns for
+/// `concurrent_processing(true)`.
+///
+/// Same refusal as [`reject_fifo_concurrency`], different reason. RabbitMQ's
+/// FIFO shard loop is *already* concurrent: it dispatches distinct sequence
+/// keys in parallel, holds at most one in-flight message per key, and bounds
+/// the total by `prefetch_count`. So the ordering argument the serial backends
+/// give does not apply here, and stating it would be false. What is true is
+/// that `concurrent_processing` is not the knob: the FIFO path never reads it,
+/// and `prefetch_count` is what governs concurrency. Rejecting an explicitly
+/// set flag beats discarding it, and the message points at the knob that does
+/// work instead.
+#[cfg(feature = "rabbitmq")]
+pub(crate) fn reject_fifo_concurrency_prefetch_controlled(queue: &str) -> ShoveError {
+    ShoveError::Topology(format!(
+        "topic '{queue}' is sequenced; `concurrent_processing` is not the concurrency \
+         control for a FIFO consumer — each shard already dispatches distinct sequence \
+         keys concurrently and serialises each key, bounded by `prefetch_count`. Drop \
+         `with_concurrent_processing(true)` and set `with_prefetch_count(n)` instead, \
+         or use `register` for unsequenced topics."
     ))
 }
 

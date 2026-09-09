@@ -5587,6 +5587,62 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
     ctx.cleanup().await;
 }
 
+/// `register_fifo` refuses an explicitly-set `concurrent_processing(true)`
+/// rather than discarding it, which is what it used to do.
+///
+/// The refusal matches the serial-FIFO backends, but its *reason* does not: a
+/// RabbitMQ FIFO shard already dispatches distinct sequence keys concurrently
+/// and serialises each key. So this message has to point at `prefetch_count`,
+/// the knob that actually governs that concurrency, rather than claim ordering
+/// would break — which would be false here. The last assertion pins that.
+#[tokio::test]
+async fn consumer_group_register_fifo_rejects_concurrent_processing() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology().declare::<OrderTopic>().await.unwrap();
+
+    let mut group = b.consumer_group();
+    let result = group
+        .register_fifo::<OrderTopic, _>(
+            #[allow(clippy::absolute_paths)]
+            shove::consumer_group::ConsumerGroupConfig::new(
+                RabbitMqConsumerGroupConfig::default().with_concurrent_processing(true),
+            ),
+            CountingHandler::new,
+        )
+        .await;
+
+    match result {
+        Err(shove::ShoveError::Topology(msg)) => {
+            assert!(
+                msg.contains("test-orders"),
+                "message must name the offending topic: {msg}"
+            );
+            assert!(
+                msg.contains("Drop `with_concurrent_processing(true)`")
+                    && msg.contains("with_prefetch_count(n)"),
+                "message must name prefetch_count as the knob that works: {msg}"
+            );
+            assert!(
+                !msg.contains("break per-key ordering"),
+                "a RabbitMQ FIFO shard is concurrent across keys, so the serial \
+                 backends' ordering wording would be false here: {msg}"
+            );
+        }
+        other => panic!("expected Topology error, got {other:?}"),
+    }
+
+    // A refused registration must still leave the group drainable.
+    let outcome = group
+        .run_until_timeout(std::future::ready(()), Duration::from_millis(200))
+        .await;
+    assert!(outcome.is_clean(), "outcome was {outcome:?}");
+
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
 // --- hold_queue_timeout eviction ---
 
 /// Verify that a sequence key stuck in `AwaitingRetry` is dead-lettered within
