@@ -164,9 +164,15 @@ async fn main() {
         || {
             let url = url.clone();
             async move {
-                <Redis as Backend>::connect(RedisConfig::new(RedisMode::Standalone { url }))
-                    .await
-                    .expect("connect Redis")
+                harness::connect_with_retries("Redis", 10, Duration::from_secs(1), || {
+                    let url = url.clone();
+                    async move {
+                        <Redis as Backend>::connect(RedisConfig::new(RedisMode::Standalone { url }))
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                })
+                .await
             }
         },
         |consumers, prefetch, concurrent| {
