@@ -1359,11 +1359,10 @@ fn build_scenarios(
                     // stamping a default on any other row would claim options
                     // a run never had.
                     let batch_options = (flow == Flow::ConsumeBatch).then_some(batch_options);
-                    // FIFO concurrency comes from shards, not from concurrent
-                    // dispatch inside a shard, which would break per-key
-                    // ordering: Redis's `register_fifo` refuses the flag and
-                    // the other backends would only ignore it. So `--concurrent`
-                    // shapes every flow but this one.
+                    // FIFO concurrency comes from the shard fan-out, not from
+                    // this flag: every backend's `register_fifo` now refuses
+                    // `concurrent_processing(true)` rather than discarding it.
+                    // So `--concurrent` shapes every flow but this one.
                     let concurrent = cli.concurrent && flow != Flow::ConsumeFifo;
                     for &payload_bytes in &cli.payload.0 {
                         // Inside the payload loop, because the floor is capped
@@ -7515,12 +7514,11 @@ mod tests {
 
     #[test]
     fn fifo_scenarios_never_ask_for_concurrent_processing() {
-        // FIFO concurrency comes from shards, not from concurrent dispatch
-        // inside a shard, which would break per-key ordering. Redis's
-        // `register_fifo` refuses the flag outright, so with `--concurrent`
-        // in the pinned matrix every Redis FIFO cell failed at registration
-        // while RabbitMQ, which ignores the flag on FIFO, measured its cells.
-        // The flag therefore shapes every flow but this one.
+        // FIFO concurrency comes from the shard fan-out, not from this flag.
+        // Redis's `register_fifo` refused it first, which is why `--concurrent`
+        // in the pinned matrix made every Redis FIFO cell fail at registration
+        // while the backends that still discarded it measured theirs. Every
+        // backend refuses it now, so a FIFO scenario must never ask for it.
         let fifo = build_scenarios_cg(&cli_args(&[
             "--tier",
             "moderate",

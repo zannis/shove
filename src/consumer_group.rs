@@ -30,14 +30,19 @@ use crate::topic::{SequencedTopic, Topic};
 /// topic. Refusing at registration beats discarding the flag and leaving the
 /// caller believing FIFO consumption runs concurrently.
 ///
-/// Deliberately **not** used by RabbitMQ — which refuses the flag too, but for
-/// a different reason and so with different wording, see
-/// [`reject_fifo_concurrency_prefetch_controlled`] — nor by
-/// [`ConsumerSupervisor::register_fifo`](crate::consumer_supervisor::ConsumerSupervisor::register_fifo)
-/// (the SQS FIFO path), which accepts it. Those two loops are cross-key
-/// concurrent and per-key serialised — they hold at most one in-flight message
-/// per sequence key and bound the rest by prefetch — so concurrency there does
-/// not break ordering and *this* message would be false of them.
+/// Deliberately **not** used by RabbitMQ, which refuses the flag too but for a
+/// different reason and so with different wording — see
+/// [`reject_fifo_concurrency_prefetch_controlled`]. RabbitMQ's FIFO shard loop
+/// is cross-key concurrent and per-key serialised, holding at most one
+/// in-flight message per sequence key and bounding the rest by prefetch, so
+/// concurrency there does not break ordering and *this* message would be false
+/// of it.
+///
+/// Also not used by
+/// [`ConsumerSupervisor::register_fifo`](crate::consumer_supervisor::ConsumerSupervisor::register_fifo),
+/// which accepts the flag on every backend — it is honoured there via prefetch
+/// clamping, and defaults to `true`, so a guard would reject a default config.
+/// See that method's own doc for the full reasoning.
 #[cfg(any(feature = "kafka", feature = "nats", feature = "redis-streams"))]
 pub(crate) fn reject_fifo_concurrency(queue: &str) -> ShoveError {
     ShoveError::Topology(format!(
@@ -160,6 +165,11 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
     /// Returns an error if:
     /// - `T`'s topology has no sequencing config — use [`register`] instead.
     /// - The topic is already registered in this registry.
+    /// - `config` sets `concurrent_processing(true)`. Every backend whose
+    ///   `ConsumerGroupConfig` carries that flag refuses it here rather than
+    ///   discarding it; the error names what to drop. (InMemory has no such
+    ///   flag.) Concurrency for a FIFO topic comes from the shard fan-out,
+    ///   and on RabbitMQ additionally from `prefetch_count`.
     /// - Topology declaration fails (e.g. broker unreachable).
     ///
     /// [`register`]: Self::register

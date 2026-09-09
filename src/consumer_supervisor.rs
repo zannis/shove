@@ -289,25 +289,28 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
     /// Register a handler for a [`SequencedTopic`], one poller per routing
     /// shard.
     ///
-    /// Unlike the serial-FIFO backends' `register_fifo` (Redis, Kafka, NATS —
-    /// see
-    /// [`reject_fifo_concurrency`](crate::consumer_group::reject_fifo_concurrency)),
-    /// this path does **not** reject
-    /// [`ConsumerOptions::concurrent_processing`]. That is deliberate, for two
-    /// independent reasons:
+    /// Unlike every backend's `ConsumerGroupConfig`-based `register_fifo`,
+    /// which rejects `concurrent_processing(true)`, this path accepts
+    /// [`ConsumerOptions::concurrent_processing`]. That is deliberate:
     ///
-    /// - It is honoured here, not discarded:
+    /// - It is honoured here rather than discarded.
     ///   [`ConsumerOptions::into_inner`] clamps `prefetch_count` to 1 when the
     ///   flag is false, so the setting already has an effect on this path.
-    /// - Concurrency here does not cost ordering. The sequenced shard loop
-    ///   holds at most one in-flight message per sequence key and queues the
-    ///   rest behind it, bounding total in-flight work by prefetch. So
-    ///   prefetch buys concurrency *across* keys while order *within* a key is
-    ///   preserved — which is the point of the flag, not a violation of FIFO.
+    /// - Rejecting it would break every existing caller. Unlike the
+    ///   per-backend `ConsumerGroupConfig`s, which default the flag to
+    ///   `false`, [`ConsumerOptions::new`] defaults it to **`true`** — so the
+    ///   guard would fire on a default, unmodified `ConsumerOptions`.
     ///
-    /// Rejecting it would also break every existing caller: unlike the
-    /// per-backend `ConsumerGroupConfig`s, which default the flag to `false`,
-    /// [`ConsumerOptions::new`] defaults it to `true`.
+    /// This method is generic over every backend, and what the flag buys
+    /// varies by the backend's FIFO loop. On SQS and RabbitMQ the sequenced
+    /// shard loop holds at most one in-flight message per sequence key and
+    /// bounds the rest by prefetch, so prefetch buys concurrency *across*
+    /// keys while order *within* a key is preserved. On the serial-FIFO
+    /// backends (Redis, Kafka, NATS) a shard handles one message at a time
+    /// regardless, so the flag changes only how much is fetched, not how much
+    /// runs at once. It is never an ordering hazard on any of them — but note
+    /// the consequence that on those backends the same flag is refused via
+    /// `consumer_group()` and quietly ineffective via `consumer_supervisor()`.
     ///
     /// [`ConsumerOptions::concurrent_processing`]: crate::consumer::ConsumerOptions::concurrent_processing
     /// [`ConsumerOptions::into_inner`]: crate::consumer::ConsumerOptions
