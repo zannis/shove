@@ -12,6 +12,7 @@ mod harness;
 use std::time::Duration;
 
 use redis::AsyncCommands;
+use redis::aio::MultiplexedConnection;
 use shove::batch_consumer::BatchConsumerOptions;
 use shove::redis::{RedisConfig, RedisConsumer, RedisConsumerGroupConfig, RedisMode};
 use shove::{Backend, Broker, Redis, Topic};
@@ -31,10 +32,13 @@ const REDIS_VERSION: &str = "7.0";
 /// sweep, so a 64 KiB rung at 25 000/s pushes 1.6 GB/s of acknowledged but
 /// untrimmed entries into memory faster than any backlog cap can see; on
 /// 2026-09-09 the broker was OOM-killed mid-rung twice, and a dead broker
-/// takes every later cell with it, where a refused XADD costs one. 4 GiB
-/// leaves the 3.2 GB 64 KiB drain corpus resident with room for the stream's
-/// own overhead inside the 8 GB Docker VM.
-const REDIS_MAXMEMORY: &str = "4gb";
+/// takes every later cell with it, where a refused XADD costs one. 6 GiB:
+/// the 1 KiB drain corpus is 3.1 M entries, each carrying its id, field name
+/// and stream-node overhead on top of its 1 KiB body, plus a consumer
+/// group's pending-entries list while it drains, and at 4 GiB that corpus
+/// and the 3.2 GB 64 KiB one both refused their fills. The Docker VM has
+/// 16 GB.
+const REDIS_MAXMEMORY: &str = "6gb";
 
 #[tokio::main]
 async fn main() {
@@ -103,7 +107,13 @@ async fn main() {
                 .unlink(&keys)
                 .await
                 .map_err(|e| format!("UNLINK: {e}"))?;
-            Ok(())
+            // UNLINK frees in the background, and `maxmemory` counts what has
+            // not been freed yet: without this wait the next cell's first
+            // XADDs land on a broker still reclaiming a multi-gigabyte
+            // stream and are refused with OOM (2026-09-09, 17 cells of one
+            // pass). Wait for the lazy-free queue to drain before handing
+            // the broker to the next cell.
+            wait_for_lazyfree(&mut conn).await
         })
     });
 
@@ -219,6 +229,34 @@ fn batch_consumer_options(opts: harness::BatchOptions) -> BatchConsumerOptions<R
 /// Redis logs "Ready to accept connections", but the multiplexed-connection
 /// handshake can still race; this confirms the server actually serves a
 /// command before the first scenario starts measuring.
+/// Block until Redis reports no objects pending lazy free, bounded so a
+/// broker that never drains fails the purge loudly rather than hanging the
+/// sweep. `INFO memory` carries `lazyfree_pending_objects` on Redis 4+.
+async fn wait_for_lazyfree(conn: &mut MultiplexedConnection) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let info: String = redis::cmd("INFO")
+            .arg("memory")
+            .query_async(conn)
+            .await
+            .map_err(|e| format!("INFO memory: {e}"))?;
+        let pending = info
+            .lines()
+            .find_map(|l| l.strip_prefix("lazyfree_pending_objects:"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if pending == 0 {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "purge: {pending} objects still pending lazy free after 120s"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 async fn wait_until_ready(url: &str) {
     let client = redis::Client::open(url).expect("build Redis probe client");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
