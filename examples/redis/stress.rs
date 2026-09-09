@@ -25,11 +25,29 @@ use harness::{BatchConsumeFn, DlqDrainFn, HarnessConfig, StressTestTopic, run_al
 /// results provenance so a reader knows which server produced the numbers.
 const REDIS_VERSION: &str = "7.0";
 
+/// `maxmemory` for the stress container, with `noeviction` so a stream that
+/// outgrows it fails its XADD instead of the process being killed. Redis
+/// Streams keep consumed entries until the reaper's next `XTRIM MINID`
+/// sweep, so a 64 KiB rung at 25 000/s pushes 1.6 GB/s of acknowledged but
+/// untrimmed entries into memory faster than any backlog cap can see; on
+/// 2026-09-09 the broker was OOM-killed mid-rung twice, and a dead broker
+/// takes every later cell with it, where a refused XADD costs one. 4 GiB
+/// leaves the 3.2 GB 64 KiB drain corpus resident with room for the stream's
+/// own overhead inside the 8 GB Docker VM.
+const REDIS_MAXMEMORY: &str = "4gb";
+
 #[tokio::main]
 async fn main() {
     harness::spawn_ctrlc_watcher();
     let container = RedisImage::default()
         .with_tag("7.0")
+        .with_cmd([
+            "redis-server",
+            "--maxmemory",
+            REDIS_MAXMEMORY,
+            "--maxmemory-policy",
+            "noeviction",
+        ])
         .start()
         .await
         .expect("failed to start Redis container");

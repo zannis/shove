@@ -198,6 +198,14 @@ survived a 3.2 GB corpus and died under a 3.2 GB backlog minutes later). A
 sustained rung never approaches the cap, so nothing that passes is changed
 by it.
 
+Redis needs one more guard the cap cannot give: its streams keep consumed
+entries until the reaper's next `XTRIM MINID` sweep, so a 64 KiB rung at
+25 000/s pushes acknowledged but untrimmed entries into memory at 1.6 GB/s
+with no lag to cap. The stress container therefore runs `redis-server` with
+`maxmemory 4gb` and `noeviction`: a stream that outgrows it fails its XADD,
+which the harness records as that cell's failure, instead of the process
+being killed and every later cell dying with it.
+
 ### The SQS corpus deviation
 
 SQS is also the one backend that does not drain the matrix's corpus. It runs
