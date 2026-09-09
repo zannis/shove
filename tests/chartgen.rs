@@ -2541,10 +2541,7 @@ fn a_caption_a_few_lines_over_budget_grows_the_canvas_instead_of_refusing() {
     )));
     let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
         .expect("a caption a few lines over budget grows the canvas rather than refusing");
-    let root = svg.split('>').next().unwrap_or_default();
-    let height: f64 = svg_attr(root, "height")
-        .and_then(|v| v.parse().ok())
-        .expect("the svg root declares its height");
+    let height = canvas_height(&svg);
     assert!(
         height > f64::from(chartgen::HEIGHT),
         "the canvas must grow past {} to seat the caption, got {height}",
@@ -5163,6 +5160,20 @@ fn caption_lines(svg: &str) -> usize {
         .count()
 }
 
+/// The canvas height `frame()` settled on, as the SVG root declares it.
+///
+/// Since `52e27b1` a caption up to [`chartgen::MAX_CAPTION_GROWTH_LINES`] over
+/// budget is not refused — the canvas grows by exactly the lines it needs. So
+/// a render returning `Ok` no longer says the caption fit the budget, and this
+/// is what distinguishes the two: a height past `HEIGHT` means the budget was
+/// already gone and the growth allowance paid for it.
+fn canvas_height(svg: &str) -> f64 {
+    let root = svg.split('>').next().unwrap_or_default();
+    svg_attr(root, "height")
+        .and_then(|v| v.parse().ok())
+        .expect("the svg root declares its height")
+}
+
 /// One row of the `parallel-vs-sequenced` 64 KiB slice.
 ///
 /// Method-measured flows get a drain account deriving exactly `throughput`
@@ -5340,6 +5351,19 @@ fn the_tightest_slice_keeps_two_caption_lines_spare_at_six_backends() {
     let svg = render_tightest_slice(&doc);
     let used = caption_lines(&svg);
 
+    // The slice must fit the budget on the base canvas. `52e27b1` landed the
+    // growth allowance between this test's branch point and its merge, which
+    // silently dissolved the property the test was written to hold: with a
+    // caption up to `MAX_CAPTION_GROWTH_LINES` over budget absorbed by a
+    // taller canvas, "it still rendered" became true whether the headroom
+    // existed or not. Spending the allowance is the budget being gone, not
+    // headroom, so the height is asserted rather than the `Ok`.
+    assert_eq!(
+        canvas_height(&svg),
+        f64::from(chartgen::HEIGHT),
+        "the tightest slice must seat its caption within the budget, not by growing the canvas"
+    );
+
     // The fixture is the tight case, not the comfortable one: a document
     // whose backends all drained cleanly is a line shorter and would prove
     // less than it appears to.
@@ -5352,6 +5376,17 @@ fn the_tightest_slice_keeps_two_caption_lines_spare_at_six_backends() {
     // `frame()`'s own "(N lines) … budget is B lines" if they do not.
     let padded = parse(&six_backend_slice(12, 1));
     let padded_svg = render_tightest_slice(&padded);
+
+    // The two lines of headroom the criterion asks for: the further notes seat
+    // inside the budget too, on the same base canvas. This is the assertion
+    // that fails when the budget is next approached — whatever spends it — and
+    // it fails while the margin still exists, which is the whole point of
+    // asserting the margin rather than a sentence.
+    assert_eq!(
+        canvas_height(&padded_svg),
+        f64::from(chartgen::HEIGHT),
+        "two further caption lines must fit the budget, leaving the growth allowance unspent"
+    );
 
     // Without this the test would pass vacuously if the padding ever stopped
     // adding lines — it would prove the same document renders twice.
