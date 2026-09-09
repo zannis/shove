@@ -1,0 +1,26 @@
+tests/chartgen.rs
+  h_f81d3033687456 4454-4535
+examples/common/chartgen.rs
+  s_1a5ac5ada4ff0e::t_8bcab0aeecdc1c 557-564,582,1105,1108-1109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "1ff85b46f383e052ec62a07d9cc7e38937a67fc8",
+  "prompts": {},
+  "humans": {
+    "h_f81d3033687456": {
+      "author": "zannis <zkalampoukis@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_1a5ac5ada4ff0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f193bc98-253b-491e-beb5-e72c144577b8",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
