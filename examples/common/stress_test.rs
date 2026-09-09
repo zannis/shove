@@ -2814,6 +2814,12 @@ where
     let published_at_window_end = published;
     let processed_at_window_end = processed.load(Ordering::Relaxed);
     peak_lag = peak_lag.max(published_at_window_end.saturating_sub(processed_at_window_end));
+    // The samples measured lag against chunks *claimed* by the producers,
+    // conservative by up to a chunk each; a rung the cap stopped mid-chunk
+    // never published some of those, and a lag larger than everything
+    // published is not a lag the consumers ever faced (the document's
+    // validation refuses such a row, and with it the whole write).
+    peak_lag = peak_lag.min(published_at_window_end);
 
     let grace_for = if backlog_capped {
         LOAD_CAPPED_DRAIN_GRACE
@@ -11029,6 +11035,10 @@ mod tests {
         assert!(
             load.backlog_capped,
             "the account says the cap stopped it: {load:?}"
+        );
+        assert!(
+            load.peak_lag <= load.published_at_window_end,
+            "a stop mid-chunk must not record a lag above what was published: {load:?}"
         );
         // A capped rung is a measurement, so its row must survive the
         // document's own validation, which otherwise refuses a window shorter
