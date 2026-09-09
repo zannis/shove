@@ -130,6 +130,18 @@ pub const DEFAULT_LOAD_PRODUCERS: u16 = 4;
 /// 64 KiB corpus to a few tens of thousands of messages, which the in-process
 /// backend holds resident and Kafka writes to disk before every cell.
 pub const DEFAULT_DRAIN_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Default `--load-backlog-max-bytes`: the most backlog (`lag × payload_bytes`)
+/// an offered-load rung may build before its producers are stopped. Lower
+/// than the drain cap on purpose: a drain corpus sits on an idle broker before
+/// the consumers start, while a rung's backlog piles onto a broker that is
+/// also serving the consumers and still reclaiming the previous cell — Redis
+/// stopped answering under a 3.2 GB backlog on 2026-09-08 having drained a
+/// 3.2 GB corpus minutes earlier. A rung a gigabyte behind is unsustained by
+/// any definition, so nothing that passes is changed by stopping there.
+pub const DEFAULT_LOAD_BACKLOG_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+// The backlog cap protects a busier broker than the drain cap does, so it
+// must never default above it.
+const _: () = assert!(DEFAULT_LOAD_BACKLOG_MAX_BYTES < DEFAULT_DRAIN_MAX_BYTES);
 /// The share of a drain's corpus left out of the measured window at the end:
 /// the window closes at `corpus − corpus / DRAIN_TAIL_DIVISOR` unique
 /// completions. Partitions (or the shared queue) run dry at different
@@ -283,15 +295,20 @@ pub struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub fifo_messages: Option<u64>,
 
-    /// Cap in bytes, default 2 GiB, on two things a cell may leave resident
-    /// on the broker: a drain corpus (`corpus × payload_bytes`), which is
-    /// clamped to it, and an offered-load rung's backlog
-    /// (`lag × payload_bytes`), past which the rung's producers stop and the
-    /// rung is recorded as not sustained. A cell whose cap admits no message
-    /// at its payload is refused rather than clamped. Refused when nothing
-    /// reads it: no `--drain-messages` and no `--load-rates`.
+    /// Cap on a drain corpus in bytes (`corpus × payload_bytes`), default
+    /// 2 GiB. A cell whose cap admits no message at its payload is refused
+    /// rather than clamped. Only meaningful with `--drain-messages`; refused
+    /// without it.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub drain_max_bytes: Option<u64>,
+
+    /// Cap on an offered-load rung's backlog in bytes (`lag × payload_bytes`),
+    /// default 1 GiB. Past it the rung's producers stop and the rung is
+    /// recorded as not sustained with the window it actually ran; the ladder
+    /// skips the rungs above. Lower than the drain cap because the backlog
+    /// piles onto a broker that is also serving the consumers.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub load_backlog_max_bytes: Option<u64>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -2197,11 +2214,10 @@ pub struct HarnessConfig<B: Backend> {
     pub batch_size_cap: Option<NonZeroUsize>,
     /// The most backlog, in bytes (`lag x payload_bytes`), an offered-load rung
     /// may build before its producers are stopped and the rung recorded as
-    /// not sustained. An unsustained rung's backlog is resident on the broker,
-    /// so the same cap that keeps a drain corpus in memory keeps a rung from
-    /// burying the broker: at 64 KiB and 25 000/s a rung offers 1.6 GB/s, and
-    /// Redis stopped answering under it. `--drain-max-bytes` overrides the
-    /// default, [`DEFAULT_DRAIN_MAX_BYTES`].
+    /// not sustained. An unsustained rung's backlog is resident on the broker:
+    /// at 64 KiB and 25 000/s a rung offers 1.6 GB/s, and Redis stopped
+    /// answering under it. `--load-backlog-max-bytes` overrides the default,
+    /// [`DEFAULT_LOAD_BACKLOG_MAX_BYTES`].
     pub load_backlog_cap_bytes: u64,
     /// Maximum batch size for `publish_batch` (some backends have SDK limits).
     pub publish_chunk_size: usize,
@@ -2247,7 +2263,7 @@ impl<B: Backend> HarnessConfig<B> {
             backend_name,
             prefetch_cap: 100,
             batch_size_cap: None,
-            load_backlog_cap_bytes: DEFAULT_DRAIN_MAX_BYTES,
+            load_backlog_cap_bytes: DEFAULT_LOAD_BACKLOG_MAX_BYTES,
             publish_chunk_size: 1000,
             purge: noop_purge(),
             broker: BrokerInfo {
@@ -6535,13 +6551,9 @@ fn refused_load_flags(cli: &Cli, selected: &[Flow]) -> Option<String> {
 fn refused_drain_flags(cli: &Cli, selected: &[Flow]) -> Option<String> {
     let takes_drain = selected.iter().any(Flow::takes_offered_load);
     match (cli.drain_messages, cli.drain_max_bytes) {
-        // Without a corpus the cap still bounds a ladder rung's backlog, so a
-        // load-only invocation may set it; with neither, nothing reads it.
-        (None, Some(_)) if takes_drain && cli.load_rates.is_some() => None,
         (None, Some(_)) => Some(
-            "--drain-max-bytes caps a `--drain-messages` corpus and an offered-load rung's \
-             backlog, and this invocation has neither. Add `--drain-messages` or \
-             `--load-rates` on a consume flow, or drop the flag."
+            "--drain-max-bytes only caps a `--drain-messages` corpus, and none was given. Add \
+             `--drain-messages`, or drop the flag."
                 .to_string(),
         ),
         (None, None) => None,
@@ -6830,7 +6842,7 @@ pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
     init_tracing();
 
     let cli = Cli::parse();
-    if let Some(cap) = cli.drain_max_bytes {
+    if let Some(cap) = cli.load_backlog_max_bytes {
         hcfg.load_backlog_cap_bytes = cap;
     }
     let cancel = spawn_ctrlc_watcher();
@@ -6914,7 +6926,7 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
     init_tracing();
 
     let cli = Cli::parse();
-    if let Some(cap) = cli.drain_max_bytes {
+    if let Some(cap) = cli.load_backlog_max_bytes {
         hcfg.load_backlog_cap_bytes = cap;
     }
     let cancel = spawn_ctrlc_watcher();
@@ -11025,26 +11037,19 @@ mod tests {
     }
 
     #[test]
-    fn the_byte_cap_flag_is_accepted_for_a_ladder_without_a_drain_corpus() {
-        // `--drain-max-bytes` also caps a rung's backlog, so a load-only
-        // invocation may set it without `--drain-messages`; without a ladder
-        // either, nothing reads it and it is still refused.
-        let with_ladder = cli_args(&[
-            "--flow",
-            "consume-parallel",
-            "--load-rates",
-            "5000",
-            "--drain-max-bytes",
-            "1024",
-        ]);
+    fn the_backlog_cap_has_its_own_flag_and_a_lower_default_than_the_drain_cap() {
+        // The two caps bound different things: a drain corpus sits on an idle
+        // broker, a rung's backlog piles onto one that is also serving the
+        // consumers. Redis survived a 3.2 GB drain corpus and died under a
+        // 3.2 GB backlog minutes later, so the backlog cap is its own knob
+        // with a default a third of the drain cap's.
+        let cli = cli_args(&["--load-backlog-max-bytes", "1024"]);
+        assert_eq!(cli.load_backlog_max_bytes, Some(1024));
+        assert!(Cli::try_parse_from(["stress", "--load-backlog-max-bytes", "0"]).is_err());
         assert_eq!(
-            refused_drain_flags(&with_ladder, &[Flow::ConsumeParallel]),
-            None
+            HarnessConfig::<shove::InMemory>::new("inmemory").load_backlog_cap_bytes,
+            DEFAULT_LOAD_BACKLOG_MAX_BYTES
         );
-        let without_ladder = cli_args(&["--flow", "consume-parallel", "--drain-max-bytes", "1024"]);
-        let err = refused_drain_flags(&without_ladder, &[Flow::ConsumeParallel])
-            .expect("nothing reads the cap without a corpus or a ladder");
-        assert!(err.contains("--drain-max-bytes"), "{err}");
     }
 
     #[tokio::test]

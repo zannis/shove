@@ -187,11 +187,16 @@ An offered-load rung the consumers cannot sustain builds a backlog on the
 broker for as long as the producers run, and at 64 KiB the 25 000/s rung
 offers 1.6 GB/s to a container in an 8 GB VM: Redis stopped answering under
 it and took the rest of the pass down. A rung's producers therefore stop as
-soon as `lag x payload_bytes` passes the drain byte cap (`--drain-max-bytes`,
-default 2 GiB), the rung is recorded as not sustained with the window it
-actually ran, and the ladder skips the rungs above it as it already does
-after any unsustained rung. A sustained rung never approaches the cap, so
-nothing that passes is changed by it.
+soon as `lag x payload_bytes` passes the backlog cap (`--load-backlog-max-bytes`,
+default 1 GiB), the rung is recorded as not sustained with the window it
+actually ran and `backlog_capped` set on its row, and the ladder skips the
+rungs above it as it already does after any unsustained rung. The cap is
+lower than the drain cap on purpose: a drain corpus sits on an idle broker
+before the consumers start, while a rung's backlog piles onto a broker that
+is also serving the consumers and still reclaiming the previous cell (Redis
+survived a 3.2 GB corpus and died under a 3.2 GB backlog minutes later). A
+sustained rung never approaches the cap, so nothing that passes is changed
+by it.
 
 ### The SQS corpus deviation
 
