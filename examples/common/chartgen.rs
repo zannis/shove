@@ -554,6 +554,14 @@ pub struct LoadAccount {
     #[serde(default)]
     pub peak_lag: u64,
     pub producer_bound: bool,
+    /// The harness's backlog cap stopped the rung's producers before the
+    /// nominal window ran out (see the harness's `--load-backlog-max-bytes`).
+    /// Such a row's measured window is the time it actually ran, and its
+    /// verdict is not sustained whatever its lag ratio says; the harness
+    /// re-derives both the same way. Absent, hence false, on rows written
+    /// before the cap existed.
+    #[serde(default)]
+    pub backlog_capped: bool,
     pub sustained: bool,
 }
 
@@ -571,7 +579,7 @@ impl LoadAccount {
             self.lag_at_window_end as f64 <= max_lag && self.peak_lag as f64 <= max_lag;
         (
             !producer_held_rate && consumers_kept_up,
-            producer_held_rate && consumers_kept_up,
+            producer_held_rate && consumers_kept_up && !self.backlog_capped,
         )
     }
 }
@@ -1094,10 +1102,11 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
                 if !(window_secs.is_finite() && window_secs > 0.0) {
                     return malformed("an offered-load row has no positive window");
                 }
-                if window_secs < load.window_secs as f64 {
+                if window_secs < load.window_secs as f64 && !load.backlog_capped {
                     return malformed(
                         "an offered-load row's measured window is shorter than the rung's \
-                         nominal window, which closes only after the nominal one has elapsed",
+                         nominal window, which closes only after the nominal one has elapsed \
+                         unless the harness's backlog cap stopped it",
                     );
                 }
                 let achieved = load.published_at_window_end as f64 / window_secs;
