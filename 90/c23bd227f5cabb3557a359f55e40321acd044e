@@ -1,0 +1,14 @@
+tests/chartgen.rs
+  h_f81d3033687456 4454-4535
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "90c23bd227f5cabb3557a359f55e40321acd044e",
+  "prompts": {},
+  "humans": {
+    "h_f81d3033687456": {
+      "author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
