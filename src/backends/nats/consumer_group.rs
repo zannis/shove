@@ -16,6 +16,7 @@ use crate::backends::nats::client::NatsClient;
 use crate::backends::nats::consumer::{NatsConsumer, derive_ack_wait};
 use crate::backends::nats::topology::NatsTopologyDeclarer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
+use crate::consumer_group::reject_fifo_concurrency;
 use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
@@ -774,9 +775,7 @@ impl NatsConsumerGroupRegistry {
         H: MessageHandler<T> + 'static,
     {
         if config.concurrent_processing() {
-            return Err(crate::consumer_group::reject_fifo_concurrency(
-                T::topology().queue(),
-            ));
+            return Err(reject_fifo_concurrency(T::topology().queue()));
         }
 
         let mut config = config;

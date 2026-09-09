@@ -16,6 +16,7 @@ use crate::backends::kafka::client::KafkaClient;
 use crate::backends::kafka::consumer::KafkaConsumer;
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
+use crate::consumer_group::reject_fifo_concurrency;
 use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
@@ -967,9 +968,7 @@ impl KafkaConsumerGroupRegistry {
         H: MessageHandler<T> + 'static,
     {
         if config.concurrent_processing() {
-            return Err(crate::consumer_group::reject_fifo_concurrency(
-                T::topology().queue(),
-            ));
+            return Err(reject_fifo_concurrency(T::topology().queue()));
         }
 
         let mut config = config;

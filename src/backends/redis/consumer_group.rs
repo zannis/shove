@@ -20,6 +20,7 @@ use crate::consumer::{
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, HandlerTimeoutConfig,
     resolve_handler_timeout,
 };
+use crate::consumer_group::reject_fifo_concurrency;
 use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally, SupervisorOutcome};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
@@ -718,9 +719,7 @@ impl RedisConsumerGroupRegistry {
         H: MessageHandler<T> + 'static,
     {
         if config.concurrent_processing() {
-            return Err(crate::consumer_group::reject_fifo_concurrency(
-                T::topology().queue(),
-            ));
+            return Err(reject_fifo_concurrency(T::topology().queue()));
         }
 
         let mut config = config;
