@@ -1,0 +1,21 @@
+benches/README.md
+  s_8b9066047fa71f::t_16d212224cce81 201-208
+examples/redis/stress.rs
+  s_8b9066047fa71f::t_1109d5ba81bdfc 28-38,44-50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "28d7ad23b3f44e48198143a789f62e02b5cb7934",
+  "prompts": {},
+  "sessions": {
+    "s_8b9066047fa71f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b9af9755-65c8-4de6-aec9-5891b9528439",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
