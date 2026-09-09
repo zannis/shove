@@ -23,13 +23,13 @@ msg/s, 1 consumer; rabbitmq at 25k msg/s, 1 consumer; redis at 5.0k msg/s, 1 con
 no bar for sqs: no rung sustained
 </text>
 <text x="24" y="582" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-Generated 2026-09-08T16:10:59Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
+Generated 2026-09-09T14:35:31Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
 </text>
 <text x="24" y="598" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
 Apple M4 Max — 16 cores — 64 GB RAM — macOS 26.6.2 — rustc 1.91.1 (ed61e7d7e 2025-11-07) — handler: zero (no-op)
 </text>
 <text x="24" y="614" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-12 recorded failure(s) in the dataset — see failures[]
+10 recorded failure(s) in the dataset — see failures[]
 </text>
 <text x="16" y="277" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781" transform="rotate(270, 16, 277)">
 milliseconds
@@ -128,26 +128,26 @@ milliseconds
 <text x="559" y="362" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
 6.4
 </text>
-<rect x="631" y="423" width="24" height="34" opacity="1" fill="#3987E5" stroke="none"/>
-<rect x="635" y="419" width="16" height="5" opacity="1" fill="#3987E5" stroke="none"/>
-<circle cx="635" cy="423" r="4" opacity="1" fill="#3987E5" stroke="none" stroke-width="0"/>
-<circle cx="651" cy="423" r="4" opacity="1" fill="#3987E5" stroke="none" stroke-width="0"/>
-<text x="643" y="416" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
-2.7
+<rect x="631" y="425" width="24" height="32" opacity="1" fill="#3987E5" stroke="none"/>
+<rect x="635" y="421" width="16" height="5" opacity="1" fill="#3987E5" stroke="none"/>
+<circle cx="635" cy="425" r="4" opacity="1" fill="#3987E5" stroke="none" stroke-width="0"/>
+<circle cx="651" cy="425" r="4" opacity="1" fill="#3987E5" stroke="none" stroke-width="0"/>
+<text x="643" y="418" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+2.5
 </text>
-<rect x="674" y="367" width="24" height="90" opacity="1" fill="#D95926" stroke="none"/>
-<rect x="678" y="363" width="16" height="5" opacity="1" fill="#D95926" stroke="none"/>
-<circle cx="678" cy="367" r="4" opacity="1" fill="#D95926" stroke="none" stroke-width="0"/>
-<circle cx="694" cy="367" r="4" opacity="1" fill="#D95926" stroke="none" stroke-width="0"/>
-<text x="687" y="360" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
-6.5
+<rect x="674" y="379" width="24" height="78" opacity="1" fill="#D95926" stroke="none"/>
+<rect x="678" y="375" width="16" height="5" opacity="1" fill="#D95926" stroke="none"/>
+<circle cx="678" cy="379" r="4" opacity="1" fill="#D95926" stroke="none" stroke-width="0"/>
+<circle cx="694" cy="379" r="4" opacity="1" fill="#D95926" stroke="none" stroke-width="0"/>
+<text x="687" y="372" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+5.7
 </text>
-<rect x="717" y="256" width="24" height="201" opacity="1" fill="#199E70" stroke="none"/>
-<rect x="721" y="252" width="16" height="5" opacity="1" fill="#199E70" stroke="none"/>
-<circle cx="721" cy="256" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
-<circle cx="737" cy="256" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
-<text x="730" y="249" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
-14
+<rect x="717" y="329" width="24" height="128" opacity="1" fill="#199E70" stroke="none"/>
+<rect x="721" y="325" width="16" height="5" opacity="1" fill="#199E70" stroke="none"/>
+<circle cx="721" cy="329" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
+<circle cx="737" cy="329" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
+<text x="730" y="322" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+9.2
 </text>
 <rect x="802" y="446" width="24" height="11" opacity="1" fill="#3987E5" stroke="none"/>
 <rect x="806" y="442" width="16" height="5" opacity="1" fill="#3987E5" stroke="none"/>

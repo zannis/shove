@@ -38,13 +38,13 @@ is a shorter window, not a different measurement
 redis: 1 cell in this slice failed to run — absent, not zero; see failures[]
 </text>
 <text x="24" y="582" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-Generated 2026-09-08T16:10:59Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
+Generated 2026-09-09T14:35:31Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
 </text>
 <text x="24" y="598" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
 Apple M4 Max — 16 cores — 64 GB RAM — macOS 26.6.2 — rustc 1.91.1 (ed61e7d7e 2025-11-07) — handler: zero (no-op)
 </text>
 <text x="24" y="614" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-12 recorded failure(s) in the dataset — see failures[]
+10 recorded failure(s) in the dataset — see failures[]
 </text>
 <text x="16" y="237" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781" transform="rotate(270, 16, 237)">
 messages / second — log scale
@@ -68,7 +68,7 @@ messages / second — log scale
 <polyline fill="none" opacity="1" stroke="#2A78D6" stroke-width="2" points="189,101 474,102 "/>
 <polyline fill="none" opacity="1" stroke="#EB6834" stroke-width="2" points="189,176 474,190 "/>
 <polyline fill="none" opacity="1" stroke="#1BAF7A" stroke-width="2" points="189,188 474,194 759,278 "/>
-<polyline fill="none" opacity="1" stroke="#EDA100" stroke-width="2" points="189,248 474,257 759,363 "/>
+<polyline fill="none" opacity="1" stroke="#EDA100" stroke-width="2" points="189,254 474,249 759,250 "/>
 <polyline fill="none" opacity="1" stroke="#E87BA4" stroke-width="2" points="189,274 474,275 759,294 "/>
 <polyline fill="none" opacity="1" stroke="#008300" stroke-width="1" points="189,251 474,260 759,317 "/>
 <circle cx="189" cy="101" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
@@ -85,12 +85,12 @@ messages / second — log scale
 <circle cx="474" cy="194" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
 <circle cx="759" cy="278" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
 <circle cx="759" cy="278" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
-<circle cx="189" cy="248" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
-<circle cx="189" cy="248" r="4" opacity="1" fill="#EDA100" stroke="none" stroke-width="0"/>
-<circle cx="474" cy="257" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
-<circle cx="474" cy="257" r="4" opacity="1" fill="#EDA100" stroke="none" stroke-width="0"/>
-<circle cx="759" cy="363" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
-<circle cx="759" cy="363" r="4" opacity="1" fill="#EDA100" stroke="none" stroke-width="0"/>
+<circle cx="189" cy="254" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
+<circle cx="189" cy="254" r="4" opacity="1" fill="#EDA100" stroke="none" stroke-width="0"/>
+<circle cx="474" cy="249" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
+<circle cx="474" cy="249" r="4" opacity="1" fill="#EDA100" stroke="none" stroke-width="0"/>
+<circle cx="759" cy="250" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
+<circle cx="759" cy="250" r="4" opacity="1" fill="#EDA100" stroke="none" stroke-width="0"/>
 <circle cx="189" cy="274" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
 <circle cx="189" cy="274" r="4" opacity="1" fill="#E87BA4" stroke="none" stroke-width="0"/>
 <circle cx="474" cy="275" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
@@ -106,6 +106,10 @@ inmemory
 <text x="482" y="190" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 kafka
 </text>
+<polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="765,250 867,250 "/>
+<text x="870" y="250" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+rabbitmq
+</text>
 <polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="765,278 867,278 "/>
 <text x="870" y="278" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 nats
@@ -117,10 +121,6 @@ redis
 <polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="765,317 867,317 "/>
 <text x="870" y="317" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 sqs
-</text>
-<polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="765,363 867,363 "/>
-<text x="870" y="363" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
-rabbitmq
 </text>
 <text x="189" y="386" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#52514E">
 64 B
