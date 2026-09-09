@@ -1359,11 +1359,13 @@ fn build_scenarios(
                     // stamping a default on any other row would claim options
                     // a run never had.
                     let batch_options = (flow == Flow::ConsumeBatch).then_some(batch_options);
-                    // FIFO concurrency comes from shards, not from concurrent
-                    // dispatch inside a shard, which would break per-key
-                    // ordering: Redis's `register_fifo` refuses the flag and
-                    // the other backends would only ignore it. So `--concurrent`
-                    // shapes every flow but this one.
+                    // FIFO concurrency does not come from this flag, so
+                    // `--concurrent` shapes every flow but this one. On the
+                    // consumer-group path every backend whose config carries
+                    // the flag now refuses it outright. On the supervisor path
+                    // (SQS) it is still accepted, so forcing it false here is
+                    // our choice to keep the row comparable -- it clamps
+                    // prefetch to 1 rather than tripping a guard.
                     let concurrent = cli.concurrent && flow != Flow::ConsumeFifo;
                     for &payload_bytes in &cli.payload.0 {
                         // Inside the payload loop, because the floor is capped
@@ -7515,12 +7517,14 @@ mod tests {
 
     #[test]
     fn fifo_scenarios_never_ask_for_concurrent_processing() {
-        // FIFO concurrency comes from shards, not from concurrent dispatch
-        // inside a shard, which would break per-key ordering. Redis's
-        // `register_fifo` refuses the flag outright, so with `--concurrent`
-        // in the pinned matrix every Redis FIFO cell failed at registration
-        // while RabbitMQ, which ignores the flag on FIFO, measured its cells.
-        // The flag therefore shapes every flow but this one.
+        // FIFO concurrency does not come from this flag. Redis's
+        // `register_fifo` refused it first, which is why `--concurrent` in the
+        // pinned matrix made every Redis FIFO cell fail at registration while
+        // the backends that still discarded it measured theirs. Every
+        // consumer-group `register_fifo` refuses it now, so a FIFO scenario
+        // must never ask for it -- including the supervisor rows, where no
+        // guard would catch the mistake: the flag is simply accepted there,
+        // and leaving it false is what clamps prefetch to 1.
         let fifo = build_scenarios_cg(&cli_args(&[
             "--tier",
             "moderate",

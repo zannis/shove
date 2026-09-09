@@ -18,6 +18,65 @@ use crate::handler::MessageHandler;
 use crate::markers::Kafka;
 use crate::topic::{SequencedTopic, Topic};
 
+/// The error a backend's `register_fifo` returns when its
+/// `ConsumerGroupConfig` carries `concurrent_processing(true)`.
+///
+/// Shared so the three backends whose FIFO consumer is **serial** — Redis,
+/// Kafka and NATS — refuse the flag with one wording instead of three copies
+/// of the string. Each of those loops handles one message at a time (Redis and
+/// NATS per shard, Kafka per assigned partition set), so the flag cannot be
+/// honoured there: dispatching concurrently inside a shard is exactly what
+/// would break the per-key ordering the caller asked for by using a sequenced
+/// topic. Refusing at registration beats discarding the flag and leaving the
+/// caller believing FIFO consumption runs concurrently.
+///
+/// Deliberately **not** used by RabbitMQ, which refuses the flag too but for a
+/// different reason and so with different wording — see
+/// [`reject_fifo_concurrency_prefetch_controlled`]. RabbitMQ's FIFO shard loop
+/// is cross-key concurrent and per-key serialised, holding at most one
+/// in-flight message per sequence key and bounding the rest by prefetch, so
+/// concurrency there does not break ordering and *this* message would be false
+/// of it.
+///
+/// Also not used by
+/// [`ConsumerSupervisor::register_fifo`](crate::consumer_supervisor::ConsumerSupervisor::register_fifo),
+/// which accepts the flag on every backend because `ConsumerOptions` defaults
+/// it to `true` — a guard there would reject a default, unmodified config. That
+/// leaves the flag a hard error via `consumer_group()` and silently inert via
+/// `consumer_supervisor()` on Kafka and NATS; see that method's own doc for the
+/// per-backend detail.
+#[cfg(any(feature = "kafka", feature = "nats", feature = "redis-streams"))]
+pub(crate) fn reject_fifo_concurrency(queue: &str) -> ShoveError {
+    ShoveError::Topology(format!(
+        "topic '{queue}' is sequenced; `concurrent_processing` on a FIFO consumer would \
+         break per-key ordering. Drop `with_concurrent_processing(true)` or use \
+         `register` for unsequenced topics."
+    ))
+}
+
+/// The error RabbitMQ's `register_fifo` returns for
+/// `concurrent_processing(true)`.
+///
+/// Same refusal as [`reject_fifo_concurrency`], different reason. RabbitMQ's
+/// FIFO shard loop is *already* concurrent: it dispatches distinct sequence
+/// keys in parallel, holds at most one in-flight message per key, and bounds
+/// the total by `prefetch_count`. So the ordering argument the serial backends
+/// give does not apply here, and stating it would be false. What is true is
+/// that `concurrent_processing` is not the knob: the FIFO path never reads it,
+/// and `prefetch_count` is what governs concurrency. Rejecting an explicitly
+/// set flag beats discarding it, and the message points at the knob that does
+/// work instead.
+#[cfg(feature = "rabbitmq")]
+pub(crate) fn reject_fifo_concurrency_prefetch_controlled(queue: &str) -> ShoveError {
+    ShoveError::Topology(format!(
+        "topic '{queue}' is sequenced; `concurrent_processing` is not the concurrency \
+         control for a FIFO consumer — each shard already dispatches distinct sequence \
+         keys concurrently and serialises each key, bounded by `prefetch_count`. Drop \
+         `with_concurrent_processing(true)` and set `with_prefetch_count(n)` instead, \
+         or use `register` for unsequenced topics."
+    ))
+}
+
 pub struct ConsumerGroup<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static = ()> {
     pub(crate) inner: B::RegistryImpl,
     client: B::Client,
@@ -108,6 +167,13 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
     /// Returns an error if:
     /// - `T`'s topology has no sequencing config — use [`register`] instead.
     /// - The topic is already registered in this registry.
+    /// - `config` sets `concurrent_processing(true)`. Every backend whose
+    ///   `ConsumerGroupConfig` carries that flag refuses it here rather than
+    ///   discarding it; the error names what to drop. (InMemory has no such
+    ///   flag.) FIFO throughput scales by other means instead: the shard
+    ///   fan-out on Redis, NATS and RabbitMQ, partition assignment across
+    ///   instances on Kafka, and on RabbitMQ additionally `prefetch_count`,
+    ///   which bounds how many distinct sequence keys run at once.
     /// - Topology declaration fails (e.g. broker unreachable).
     ///
     /// [`register`]: Self::register

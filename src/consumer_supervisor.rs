@@ -286,6 +286,43 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
         Ok(())
     }
 
+    /// Register a handler for a [`SequencedTopic`]: one poller per routing
+    /// shard on the sharded backends (Redis, NATS, RabbitMQ, SQS, InMemory),
+    /// or a single task covering the assigned partitions on Kafka, which gets
+    /// its per-key ordering from partition assignment rather than from shard
+    /// queues.
+    ///
+    /// Unlike every backend's `ConsumerGroupConfig`-based `register_fifo`,
+    /// which rejects `concurrent_processing(true)`, this path accepts
+    /// [`ConsumerOptions::concurrent_processing`]. That is deliberate:
+    /// rejecting it would break every existing caller, because unlike the
+    /// per-backend `ConsumerGroupConfig`s — which default the flag to `false`
+    /// — [`ConsumerOptions::new`] defaults it to **`true`**, so the guard
+    /// would fire on a default, unmodified `ConsumerOptions`.
+    ///
+    /// This method is generic over every backend, and what the flag buys
+    /// varies by the backend's FIFO loop:
+    ///
+    /// - **SQS and RabbitMQ** honour it. Their sequenced shard loop holds at
+    ///   most one in-flight message per sequence key and bounds the rest by
+    ///   prefetch (which [`ConsumerOptions::into_inner`] clamps to 1 when the
+    ///   flag is false), so prefetch buys concurrency *across* keys while
+    ///   order *within* a key is preserved.
+    /// - **Redis** reads prefetch as a batch size only; its shard loop still
+    ///   handles one message at a time.
+    /// - **Kafka, NATS and InMemory** discard it. Their FIFO paths read
+    ///   neither the flag nor `prefetch_count` (NATS pins
+    ///   `max_ack_pending: 1`; InMemory's shards share a busy counter).
+    ///
+    /// It is never an ordering hazard on any of them. But note the residual
+    /// inconsistency this leaves: on Kafka and NATS the same flag is a hard
+    /// error via `consumer_group()` and silently inert here. InMemory is not
+    /// inconsistent in that way — its `ConsumerGroupConfig` has no such flag
+    /// at all, so only `ConsumerOptions` can carry one.
+    ///
+    /// [`ConsumerOptions::concurrent_processing`]: crate::consumer::ConsumerOptions::concurrent_processing
+    /// [`ConsumerOptions::into_inner`]: crate::consumer::ConsumerOptions
+    /// [`ConsumerOptions::new`]: crate::consumer::ConsumerOptions::new
     pub async fn register_fifo<T, H>(
         &mut self,
         handler: H,
