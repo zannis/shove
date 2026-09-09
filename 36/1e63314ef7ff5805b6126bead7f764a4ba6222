@@ -1,0 +1,14 @@
+examples/rabbitmq/stress.rs
+  h_f81d3033687456 34-40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "361e63314ef7ff5805b6126bead7f764a4ba6222",
+  "prompts": {},
+  "humans": {
+    "h_f81d3033687456": {
+      "author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
