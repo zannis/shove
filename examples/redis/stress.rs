@@ -40,6 +40,11 @@ const REDIS_VERSION: &str = "7.0";
 /// 16 GB.
 const REDIS_MAXMEMORY: &str = "6gb";
 
+/// The prefix every harness topology's keys share (`shove-stress-bench`,
+/// `shove-stress-bench-seq`, `shove-stress-bench-bcast` and their DLQ, hold
+/// and shard keys), which is what the purge sweeps.
+const HARNESS_KEY_PREFIX: &str = "shove-stress-bench";
+
 #[tokio::main]
 async fn main() {
     harness::spawn_ctrlc_watcher();
@@ -65,48 +70,36 @@ async fn main() {
     wait_until_ready(&url).await;
 
     let purge_url = url.clone();
-    let purge: harness::PurgeFn = Box::new(move |topology| {
+    let purge: harness::PurgeFn = Box::new(move |_topology| {
         let url = purge_url.clone();
         Box::pin(async move {
-            // Drop every key the topology owns — the next scenario's declare
-            // recreates them together with the consumer groups. XGROUP CREATE
-            // uses MKSTREAM so this is safe. UNLINK rather than DEL: DEL
+            // Drop every key the harness owns, not only the next scenario's
+            // topology: under `maxmemory` a stream a previous cell left
+            // behind on another topology (the parallel topic before a FIFO
+            // cell, say, after a rung the reaper never got to trim) still
+            // counts, and the next cell's XADDs would be refused for memory
+            // the next cell's own purge could not see. Every harness topology
+            // is named under one prefix, and this database holds nothing
+            // else, so KEYS is exact here. UNLINK rather than DEL: DEL
             // reclaims a six-million-entry stream synchronously and outlives
             // the client's response timeout, while UNLINK unlinks the key at
-            // once and reclaims it in the background. Both are idempotent,
-            // so absent keys cost nothing.
-            //
-            // The set is derived from the topology handed in: main stream,
-            // DLQ stream, hold-queue streams and their `:pending` sorted
-            // sets, and for a sequenced topology the per-shard streams plus
-            // their own hold pairs (`src/backends/redis/topology.rs` naming).
-            let mut keys: Vec<String> = vec![topology.queue().to_string()];
-            if let Some(dlq) = topology.dlq() {
-                keys.push(dlq.to_string());
-            }
-            for hq in topology.hold_queues() {
-                keys.push(hq.name().to_string());
-                keys.push(format!("{}:pending", hq.name()));
-            }
-            if let Some(seq) = topology.sequencing() {
-                for shard in 0..seq.routing_shards() {
-                    keys.push(format!("{}-seq-{shard}", topology.queue()));
-                    for hq in topology.shard_hold_queue_names(shard) {
-                        keys.push(hq.name().to_string());
-                        keys.push(format!("{}:pending", hq.name()));
-                    }
-                }
-            }
-
+            // once and reclaims it in the background. Both are idempotent.
             let client = redis::Client::open(url).map_err(|e| format!("client: {e}"))?;
             let mut conn = client
                 .get_multiplexed_async_connection()
                 .await
                 .map_err(|e| format!("connect: {e}"))?;
-            let _: i64 = conn
-                .unlink(&keys)
+            let keys: Vec<String> = redis::cmd("KEYS")
+                .arg(format!("{HARNESS_KEY_PREFIX}*"))
+                .query_async(&mut conn)
                 .await
-                .map_err(|e| format!("UNLINK: {e}"))?;
+                .map_err(|e| format!("KEYS: {e}"))?;
+            if !keys.is_empty() {
+                let _: i64 = conn
+                    .unlink(&keys)
+                    .await
+                    .map_err(|e| format!("UNLINK: {e}"))?;
+            }
             // UNLINK frees in the background, and `maxmemory` counts what has
             // not been freed yet: without this wait the next cell's first
             // XADDs land on a broker still reclaiming a multi-gigabyte
@@ -233,7 +226,8 @@ fn batch_consumer_options(opts: harness::BatchOptions) -> BatchConsumerOptions<R
 /// broker that never drains fails the purge loudly rather than hanging the
 /// sweep. `INFO memory` carries `lazyfree_pending_objects` on Redis 4+.
 async fn wait_for_lazyfree(conn: &mut MultiplexedConnection) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let started = std::time::Instant::now();
+    let bound = std::time::Duration::from_secs(120);
     loop {
         let info: String = redis::cmd("INFO")
             .arg("memory")
@@ -248,9 +242,10 @@ async fn wait_for_lazyfree(conn: &mut MultiplexedConnection) -> Result<(), Strin
         if pending == 0 {
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
+        if started.elapsed() >= bound {
             return Err(format!(
-                "purge: {pending} objects still pending lazy free after 120s"
+                "purge: {pending} objects still pending lazy free after {}s",
+                bound.as_secs()
             ));
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
