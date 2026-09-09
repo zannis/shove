@@ -1,0 +1,19 @@
+examples/redis/stress.rs
+  s_1a5ac5ada4ff0e::t_3b649657f8ecfa 15,35-41,110-116,232-259
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "d85aca1b2a964900d88ef5bcb6f0c389e0a60a81",
+  "prompts": {},
+  "sessions": {
+    "s_1a5ac5ada4ff0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f193bc98-253b-491e-beb5-e72c144577b8",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
