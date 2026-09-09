@@ -11,70 +11,70 @@ Parallel vs sequenced consume
 sqs: shape only — not representative (LocalStack, not AWS); magnitudes are not published
 </text>
 <text x="24" y="310" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
-redis / sequenced (fifo): failed to run — absent, not zero; see failures[] in the results document
+inmemory, kafka, nats, rabbitmq, redis / sequenced (fifo): lower bound (muted bar) — this window cannot separate setup
 </text>
 <text x="24" y="326" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
-inmemory, kafka, nats, rabbitmq / sequenced (fifo): lower bound (muted bar) — this window cannot separate setup from
+from drain, so the true rate is at least the bar shown
 </text>
 <text x="24" y="342" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
-drain, so the true rate is at least the bar shown
-</text>
-<text x="24" y="358" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 sqs / sequenced (fifo): lower bound from a window mixing setup and drain; shape only, so its height is not the bound
 </text>
-<text x="24" y="374" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+<text x="24" y="358" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 kafka / parallel: measured at 2 workers (no worker count is shared by the measured modes, so the bars are not directly
 </text>
-<text x="24" y="390" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+<text x="24" y="374" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 comparable)
 </text>
-<text x="24" y="406" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+<text x="24" y="390" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 rabbitmq / sequenced (fifo): measured at 8 workers (no worker count is shared by the measured modes, so the bars are
 </text>
-<text x="24" y="422" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+<text x="24" y="406" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 not directly comparable)
 </text>
+<text x="24" y="422" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+nats, redis, sqs / parallel, batch; inmemory, nats, redis, sqs / sequenced (fifo): measured at 8 workers (the
+</text>
 <text x="24" y="438" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
-nats, sqs / parallel, batch; inmemory, nats, sqs / sequenced (fifo): measured at 8 workers (the least-parallel count
+least-parallel count the measured modes share)
 </text>
 <text x="24" y="454" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
-the measured modes share)
-</text>
-<text x="24" y="470" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 inmemory / parallel, batch: measured, but every window under 1 s — too short to publish as a rate, even a lower bound
 </text>
-<text x="24" y="486" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+<text x="24" y="470" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 sqs / batch: up to 10 messages or 250 ms per batch
 </text>
-<text x="24" y="502" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+<text x="24" y="486" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 kafka, nats, rabbitmq, redis / batch: up to 500 messages or 250 ms per batch
 </text>
-<text x="24" y="518" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+<text x="24" y="502" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 drain (inmemory, kafka, nats, rabbitmq, redis, sqs): each consume_batch / consume_parallel point is the processing
 </text>
-<text x="24" y="534" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+<text x="24" y="518" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 rate of the consumers from the moment every worker was assigned until 90 % of a corpus of 49k messages, published
 </text>
-<text x="24" y="550" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+<text x="24" y="534" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 before they started, had been consumed; no producer ran in the window
 </text>
-<text x="24" y="566" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+<text x="24" y="550" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 sqs: measured as supervisor — this backend&apos;s spelling of consume_parallel (the same run primitive)
 </text>
-<text x="24" y="582" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+<text x="24" y="566" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 inmemory, rabbitmq: 1 cell in this slice failed to run — absent, not zero; see failures[]
 </text>
+<text x="24" y="582" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+nats: 2 cells in this slice failed to run — absent, not zero; see failures[]
+</text>
 <text x="24" y="598" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
-nats, redis: 2 cells in this slice failed to run — absent, not zero; see failures[]
+redis: 6 cells in this slice failed to run — absent, not zero; see failures[]
 </text>
 <text x="24" y="614" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-Generated 2026-09-09T14:35:31Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
+Generated 2026-09-09T20:15:34Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
 </text>
 <text x="24" y="630" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
 Apple M4 Max — 16 cores — 64 GB RAM — macOS 26.6.2 — rustc 1.91.1 (ed61e7d7e 2025-11-07) — handler: zero (no-op)
 </text>
 <text x="24" y="646" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-10 recorded failure(s) in the dataset — see failures[]
+14 recorded failure(s) in the dataset — see failures[]
 </text>
 <text x="16" y="173" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781" transform="rotate(270, 16, 173)">
 messages / second
@@ -206,22 +206,26 @@ n/s
 <text x="623" y="147" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 30k
 </text>
-<rect x="681" y="230" width="24" height="19" opacity="1" fill="#2A78D6" stroke="none"/>
-<rect x="685" y="226" width="16" height="5" opacity="1" fill="#2A78D6" stroke="none"/>
-<circle cx="685" cy="230" r="4" opacity="1" fill="#2A78D6" stroke="none" stroke-width="0"/>
-<circle cx="701" cy="230" r="4" opacity="1" fill="#2A78D6" stroke="none" stroke-width="0"/>
-<text x="693" y="223" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
-7.1k
+<rect x="681" y="176" width="24" height="73" opacity="1" fill="#2A78D6" stroke="none"/>
+<rect x="685" y="172" width="16" height="5" opacity="1" fill="#2A78D6" stroke="none"/>
+<circle cx="685" cy="176" r="4" opacity="1" fill="#2A78D6" stroke="none" stroke-width="0"/>
+<circle cx="701" cy="176" r="4" opacity="1" fill="#2A78D6" stroke="none" stroke-width="0"/>
+<text x="693" y="169" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+24k
 </text>
-<text x="729" y="243" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#52514E">
-n/s
+<rect x="717" y="240" width="24" height="9" opacity="1" fill="#F3AB8E" stroke="none"/>
+<rect x="721" y="236" width="16" height="5" opacity="1" fill="#F3AB8E" stroke="none"/>
+<circle cx="721" cy="240" r="4" opacity="1" fill="#F3AB8E" stroke="none" stroke-width="0"/>
+<circle cx="737" cy="240" r="4" opacity="1" fill="#F3AB8E" stroke="none" stroke-width="0"/>
+<text x="729" y="233" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+≥4.2k
 </text>
-<rect x="753" y="199" width="24" height="50" opacity="1" fill="#1BAF7A" stroke="none"/>
-<rect x="757" y="195" width="16" height="5" opacity="1" fill="#1BAF7A" stroke="none"/>
-<circle cx="757" cy="199" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
-<circle cx="773" cy="199" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
-<text x="765" y="192" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
-17k
+<rect x="753" y="140" width="24" height="109" opacity="1" fill="#1BAF7A" stroke="none"/>
+<rect x="757" y="136" width="16" height="5" opacity="1" fill="#1BAF7A" stroke="none"/>
+<circle cx="757" cy="140" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
+<circle cx="773" cy="140" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
+<text x="765" y="133" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+35k
 </text>
 <rect x="823" y="193" width="24" height="56" opacity="1" fill="#89B3E7" stroke="none"/>
 <rect x="827" y="189" width="16" height="5" opacity="1" fill="#89B3E7" stroke="none"/>
