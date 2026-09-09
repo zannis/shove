@@ -31,8 +31,13 @@ const RABBITMQ_VERSION: &str = "3.8.22";
 
 /// Fraction of the container's memory the broker may hold before its memory
 /// alarm blocks publishers; see the `set_vm_memory_high_watermark` exec in
-/// `main` for why the image default is too low for the 64 KiB corpus.
-const RABBITMQ_MEMORY_HIGH_WATERMARK: &str = "0.8";
+/// `main` for why the image default (0.4) is too low for the 64 KiB corpus.
+/// 0.6 rather than higher: at 0.8 the broker was allowed to grow to about
+/// 6.2 GB of an 8 GB VM over a full pass of six-million-message fills, and
+/// on 2026-09-09 the VM thrashed and the broker stopped heartbeating at cell
+/// 34 of 168. 0.6 (about 4.7 GB) still clears the 3.2 GB corpus with its
+/// overhead and leaves the VM room to breathe.
+const RABBITMQ_MEMORY_HIGH_WATERMARK: &str = "0.6";
 
 #[tokio::main]
 async fn main() {
