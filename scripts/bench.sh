@@ -25,8 +25,9 @@ LOG_DIR="target/bench-logs"
 #   the harness process can bound it. `--drain-messages` sizes the corpus so
 #   that on the fastest cell the group assembles well inside the first half
 #   of it and the window still lasts several seconds; `--drain-max-bytes`
-#   caps the 64 KiB corpus at 3 GiB (about 49 k messages), which the
-#   in-process backend holds resident and Kafka writes to disk per cell.
+#   caps the 64 KiB corpus at 3 GiB (about 49 k messages), which fits the
+#   8 GB Docker VM every containerised backend stages its corpus in — see
+#   "The in-process byte cap deviation" for the one backend that does not.
 # - The offered-load ladder is the latency measurement: a paced producer
 #   holds each rate for the window while the consumers run, and only a rung
 #   the consumers kept up with has dispatch percentiles that are latency
@@ -47,8 +48,10 @@ MATRIX=(
   --load-producers 8
 )
 
-# The one documented deviation from the matrix above, and the only backend
-# that gets one.
+# The first of the two documented deviations from the matrix above. Both are
+# per-backend substitutions of a single knob, both exist because one number
+# means two different things at opposite ends of the backend set, and both
+# are recorded on every row they touch — see the two runbook sections.
 #
 # The corpus is a message *count*, and it was sized for the fastest cell —
 # in-process at ~4.7 M msg/s, where six million messages buy a window of
@@ -78,6 +81,55 @@ SQS_DRAIN_MESSAGES=60000
 # (`messages`).
 SQS_FIFO_MESSAGES=100
 
+# The second deviation, and the mirror image of the first: SQS drains a
+# smaller corpus because it is the only backend slow enough that the pinned
+# count means something else there, and in-process is allowed a larger one
+# because it is the only backend fast enough that the pinned *byte cap* does.
+#
+# At the matrix's 3 GiB the 64 KiB leg is 49 152 messages, and the 2026-09-08
+# run drained every one of the in-process 64 KiB cells in 0.09-0.46 s. That is
+# under `MIN_FRAMEWORK_WINDOW_SECS`, so the harness marked all eleven rows
+# `setup_bound` and the charts withheld all eleven and captioned why. The
+# fastest backend in the set published no 64 KiB consume rate at all.
+#
+# Why this is in-process's deviation alone: 3 GiB is not a conservative number
+# for the others, it is the containerised limit. Every other backend stages its
+# corpus inside the 8 GB Docker VM (Redis and NATS in container memory, Kafka
+# through its page cache), where 3 GiB is already over a third of the VM and
+# where a 3.2 GB backlog has already taken Redis down mid-pass — see the
+# backlog cap. In-process stages its corpus in the harness process on the
+# 64 GB host and never starts a container, so it is the one backend where the
+# cap can rise without touching the VM.
+#
+# Sized from that run's fastest 64 KiB drain (514 k msg/s, `consumer_group` at
+# two consumers): 32 GiB is 524 288 messages, which puts that cell at ~0.9 s
+# and the other ten at 1.0-5.0 s, so the leg publishes instead of being
+# withheld whole. Resident cost is ~34 GB of the 64 GB host. Clearing the last
+# cell too would need ~40 GiB, and the harness's own floor doc declines to
+# chase a window that hardware speed keeps moving; a cell that lands under the
+# floor is withheld and captioned exactly as today, which loses one bar rather
+# than the pass.
+#
+# It moves the 1 KiB leg as well, and that is intended rather than incidental:
+# at 3 GiB that leg is byte-bound at 3 145 728, and 32 GiB puts it back on the
+# pinned count of 6 000 000, where the 64 B leg already sits. So in-process
+# runs two of its three legs on the matrix's own corpus instead of one, and the
+# single 1 KiB cell that drained in 0.97 s clears the floor too. It costs about
+# forty seconds of extra wall clock and 6 GiB rather than 3 GiB resident.
+#
+# `QUEUE_CAPACITY` in examples/inmemory/stress.rs is 8 000 000 and is a bound
+# rather than a preallocation, so it already covers 524 288; the harness's
+# `refused_drain_capacity` gate is what would catch it otherwise.
+#
+# What it does not fix, so the run is not read as fixing it: the four cells
+# that failed "consumed before assembly" at 64 KiB / 8 consumers. In-process
+# was one of them and this clears it, but the other three are RabbitMQ, whose
+# eight-consumer group assembly ran through 37 000-46 300 messages. Putting
+# that well under half a corpus needs ~196 k messages, which is 12 GiB in an
+# 8 GB VM. RabbitMQ's three failures are a group-assembly cost, not a corpus
+# size, and they are expected to fail again.
+INMEMORY_DRAIN_MAX_BYTES=34359738368
+
 usage() {
   sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-2}"
@@ -86,6 +138,21 @@ usage() {
 die() {
   echo "bench.sh: $*" >&2
   exit 1
+}
+
+# Replace a knob's value in MATRIX in place, rather than appending a second
+# copy: the harness rejects a knob given twice, so a per-backend deviation has
+# to substitute. Dies when the knob is absent, so a deviation can never
+# silently stop deviating if the matrix above is edited.
+substitute_knob() {
+  local knob="$1" value="$2" i found=0
+  for i in "${!MATRIX[@]}"; do
+    if [ "${MATRIX[$i]}" = "$knob" ]; then
+      MATRIX[$((i + 1))]="$value"
+      found=1
+    fi
+  done
+  [ "$found" = 1 ] || die "the matrix has no $knob for the $target deviation to replace"
 }
 
 [ $# -ge 1 ] || usage
@@ -131,20 +198,14 @@ if [ "$target" = sqs ]; then
   [ -n "${LOCALSTACK_AUTH_TOKEN:-}" ] \
     || die "LOCALSTACK_AUTH_TOKEN is not set; run through 'dotenvx run -- scripts/bench.sh sqs'"
 
-  # Substituted into the matrix rather than appended after it: the harness
-  # rejects a knob given twice, so a deviation has to replace the value.
-  deviated=0
-  for i in "${!MATRIX[@]}"; do
-    if [ "${MATRIX[$i]}" = --drain-messages ]; then
-      MATRIX[$((i + 1))]="$SQS_DRAIN_MESSAGES"
-      deviated=1
-    fi
-  done
-  [ "$deviated" = 1 ] \
-    || die "the matrix has no --drain-messages for the sqs corpus deviation to replace"
+  substitute_knob --drain-messages "$SQS_DRAIN_MESSAGES"
   # Appended rather than substituted: the matrix carries no --fifo-messages,
   # because every other backend runs the tier's FIFO corpus.
   MATRIX+=(--fifo-messages "$SQS_FIFO_MESSAGES")
+fi
+
+if [ "$target" = inmemory ]; then
+  substitute_knob --drain-max-bytes "$INMEMORY_DRAIN_MAX_BYTES"
 fi
 
 if [ "$fresh" = 1 ] && [ -f "$RESULTS_FILE" ]; then
@@ -160,6 +221,9 @@ echo "backend:  $target ($example, --features $features)"
 echo "matrix:   ${MATRIX[*]} ${extra[*]:-}"
 if [ "$target" = sqs ]; then
   echo "deviation: drain corpus $SQS_DRAIN_MESSAGES, not the pinned 6000000, and FIFO corpus $SQS_FIFO_MESSAGES per FIFO worker — see the comments in this script"
+fi
+if [ "$target" = inmemory ]; then
+  echo "deviation: drain byte cap $INMEMORY_DRAIN_MAX_BYTES, not the pinned 3221225472, so the 64 KiB leg drains 524288 messages rather than 49152 and the 1 KiB leg the pinned 6000000 rather than 3145728 — see the comments in this script"
 fi
 echo "results:  $RESULTS_FILE"
 echo "log:      $log"
