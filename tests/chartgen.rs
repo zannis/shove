@@ -4533,6 +4533,75 @@ fn a_short_window_without_the_cap_flag_is_still_malformed() {
     );
 }
 
+/// A capped row whose consumers kept up: 67 500 published, 67 000 processed,
+/// 500 of lag (under the 5 % threshold) with the producer holding the rate.
+/// Only the cap makes it not sustained, so this row is what proves the
+/// verdict honours the flag.
+fn capped_rung_row_kept_up(claimed_sustained: bool) -> String {
+    format!(
+        r#"{{
+          "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 65536,
+          "tier": "moderate", "messages": 67500, "consumers": 1,
+          "handler": "zero (no-op)", "handler_cost": "framework", "setup_secs": 3.1,
+          "throughput_msg_per_sec": 24814.814814814815,
+          "dispatch_p50_ms": 40.0, "dispatch_p95_ms": 80.0, "dispatch_p99_ms": 160.0,
+          "e2e_p50_ms": 40.0, "e2e_p95_ms": 80.0, "e2e_p99_ms": 160.0,
+          "scaling_efficiency": 1.0, "peak_rss_mb": 1.0, "cpu_pct": 100.0,
+          "duration_secs": 2.7,
+          "method": "offered_load",
+          "load": {{
+            "offered_msg_per_sec": 25000, "window_secs": 10, "producers": 8,
+            "published": 67500, "published_at_window_end": 67500,
+            "processed_at_window_end": 67000,
+            "achieved_publish_msg_per_sec": 25000.0, "lag_at_window_end": 500,
+            "peak_lag": 500, "drain_secs": 0.1,
+            "producer_bound": false, "backlog_capped": true, "sustained": {claimed_sustained}
+          }}
+        }}"#
+    )
+}
+
+#[test]
+fn the_cap_makes_a_rung_not_sustained_even_when_its_consumers_kept_up() {
+    // With 500 of lag on 67 500 published the numbers alone would call the
+    // rung sustained; the cap says otherwise, as the harness derives it. A
+    // row that claims sustained anyway is refused as inconsistent.
+    let ok = parse(&document(&kafka_ladder_run(&[
+        load_scenario(
+            "consume_parallel",
+            65536,
+            1,
+            5_000,
+            5_000.0,
+            50_000,
+            5_000.0,
+            1.0,
+        ),
+        capped_rung_row_kept_up(false),
+    ])));
+    chartgen::render_to_string(&ok, Family::DispatchLatency, Mode::Light)
+        .expect("a capped rung that kept up is not sustained, and renders");
+    let inconsistent = parse(&document(&kafka_ladder_run(&[
+        load_scenario(
+            "consume_parallel",
+            65536,
+            1,
+            5_000,
+            5_000.0,
+            50_000,
+            5_000.0,
+            1.0,
+        ),
+        capped_rung_row_kept_up(true),
+    ])));
+    let err = chartgen::render_to_string(&inconsistent, Family::DispatchLatency, Mode::Light)
+        .expect_err("a capped rung claiming sustained contradicts its own account");
+    assert!(
+        err.to_string().contains("sustained"),
+        "wrong refusal: {err}"
+    );
+}
+
 fn kafka_ladder_run(rows: &[String]) -> String {
     format!(
         r#"{{
