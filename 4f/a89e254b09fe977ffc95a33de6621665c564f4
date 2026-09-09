@@ -1,0 +1,56 @@
+docs/public/bench/dispatch-latency-1kib-dark.svg
+  h_f81d3033687456 20,26,32,38-41,43-46,52,55-56,59-60,63-64,67-68,71-72,75-76,79-80,83-84,87-92,95-99,102-106,109-113,116-120,123-127,131-134,137-141,144-148,151-170,173-176,179-183,186-190
+docs/public/bench/dispatch-latency-1kib.svg
+  h_f81d3033687456 20,26,32,38-41,43-46,52,55-56,59-60,63-64,67-68,71-72,75-76,79-80,83-84,87-92,95-99,102-106,109-113,116-120,123-127,131-134,137-141,144-148,151-170,173-176,179-183,186-190
+docs/public/bench/dispatch-latency-64kib-dark.svg
+  h_f81d3033687456 20,26,32,38-45,51,54-55,58-59,62-63,66-67,70-71,74-75,78-82,84,87-91,94-98,101-105,108-112,115-119,122-126,129-133,136-140,143-148,150-155,162,165-168,171-175,178-182
+docs/public/bench/dispatch-latency-64kib.svg
+  h_f81d3033687456 20,26,32,38-45,51,54-55,58-59,62-63,66-67,70-71,74-75,78-82,84,87-91,94-98,101-105,108-112,115-119,122-126,129-133,136-140,143-148,150-155,162,165-168,171-175,178-182
+docs/public/bench/dispatch-latency-dark.svg
+  h_f81d3033687456 26,32,131-150
+docs/public/bench/dispatch-latency.svg
+  h_f81d3033687456 26,32,131-150
+docs/public/bench/framework-overhead-dark.svg
+  h_f81d3033687456 38,44
+docs/public/bench/framework-overhead.svg
+  h_f81d3033687456 38,44
+docs/public/bench/parallel-vs-sequenced-1kib-dark.svg
+  h_f81d3033687456 62,68,169-174,178-185
+docs/public/bench/parallel-vs-sequenced-1kib.svg
+  h_f81d3033687456 62,68,169-174,178-185
+docs/public/bench/parallel-vs-sequenced-64kib-dark.svg
+  h_f81d3033687456 65,68,71,77,188-207
+docs/public/bench/parallel-vs-sequenced-64kib.svg
+  h_f81d3033687456 65,68,71,77,188-207
+docs/public/bench/parallel-vs-sequenced-dark.svg
+  h_f81d3033687456 65,71,159-160,162-164,168
+docs/public/bench/parallel-vs-sequenced.svg
+  h_f81d3033687456 65,71,159-160,162-164,168
+docs/public/bench/throughput-vs-consumers-1kib-dark.svg
+  h_f81d3033687456 32,38,142,169-176,209-212
+docs/public/bench/throughput-vs-consumers-1kib.svg
+  h_f81d3033687456 32,38,142,169-176,209-212
+docs/public/bench/throughput-vs-consumers-64kib-dark.svg
+  h_f81d3033687456 44,50,128,141-146,162
+docs/public/bench/throughput-vs-consumers-64kib.svg
+  h_f81d3033687456 44,50,128,141-146,162
+docs/public/bench/throughput-vs-consumers-dark.svg
+  h_f81d3033687456 32,38,142,169-176,205-206,209-210
+docs/public/bench/throughput-vs-consumers.svg
+  h_f81d3033687456 32,38,142,169-176,205-206,209-210
+docs/public/bench/throughput-vs-payload-dark.svg
+  h_f81d3033687456 41,47,71,88-93,109-112
+docs/public/bench/throughput-vs-payload.svg
+  h_f81d3033687456 41,47,71,88-93,109-112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "4fa89e254b09fe977ffc95a33de6621665c564f4",
+  "prompts": {},
+  "humans": {
+    "h_f81d3033687456": {
+      "author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
