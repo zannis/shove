@@ -1359,10 +1359,13 @@ fn build_scenarios(
                     // stamping a default on any other row would claim options
                     // a run never had.
                     let batch_options = (flow == Flow::ConsumeBatch).then_some(batch_options);
-                    // FIFO concurrency comes from the shard fan-out, not from
-                    // this flag: every backend's `register_fifo` now refuses
-                    // `concurrent_processing(true)` rather than discarding it.
-                    // So `--concurrent` shapes every flow but this one.
+                    // FIFO concurrency does not come from this flag, so
+                    // `--concurrent` shapes every flow but this one. On the
+                    // consumer-group path every backend whose config carries
+                    // the flag now refuses it outright. On the supervisor path
+                    // (SQS) it is still accepted, so forcing it false here is
+                    // our choice to keep the row comparable -- it clamps
+                    // prefetch to 1 rather than tripping a guard.
                     let concurrent = cli.concurrent && flow != Flow::ConsumeFifo;
                     for &payload_bytes in &cli.payload.0 {
                         // Inside the payload loop, because the floor is capped
@@ -7514,11 +7517,13 @@ mod tests {
 
     #[test]
     fn fifo_scenarios_never_ask_for_concurrent_processing() {
-        // FIFO concurrency comes from the shard fan-out, not from this flag.
-        // Redis's `register_fifo` refused it first, which is why `--concurrent`
-        // in the pinned matrix made every Redis FIFO cell fail at registration
-        // while the backends that still discarded it measured theirs. Every
-        // backend refuses it now, so a FIFO scenario must never ask for it.
+        // FIFO concurrency does not come from this flag. Redis's
+        // `register_fifo` refused it first, which is why `--concurrent` in the
+        // pinned matrix made every Redis FIFO cell fail at registration while
+        // the backends that still discarded it measured theirs. Every
+        // consumer-group `register_fifo` refuses it now, so a FIFO scenario
+        // must never ask for it -- including the supervisor rows, where it
+        // would be accepted and would only clamp prefetch.
         let fifo = build_scenarios_cg(&cli_args(&[
             "--tier",
             "moderate",

@@ -40,9 +40,11 @@ use crate::topic::{SequencedTopic, Topic};
 ///
 /// Also not used by
 /// [`ConsumerSupervisor::register_fifo`](crate::consumer_supervisor::ConsumerSupervisor::register_fifo),
-/// which accepts the flag on every backend — it is honoured there via prefetch
-/// clamping, and defaults to `true`, so a guard would reject a default config.
-/// See that method's own doc for the full reasoning.
+/// which accepts the flag on every backend because `ConsumerOptions` defaults
+/// it to `true` — a guard there would reject a default, unmodified config. That
+/// leaves the flag a hard error via `consumer_group()` and silently inert via
+/// `consumer_supervisor()` on Kafka and NATS; see that method's own doc for the
+/// per-backend detail.
 #[cfg(any(feature = "kafka", feature = "nats", feature = "redis-streams"))]
 pub(crate) fn reject_fifo_concurrency(queue: &str) -> ShoveError {
     ShoveError::Topology(format!(
@@ -168,8 +170,10 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
     /// - `config` sets `concurrent_processing(true)`. Every backend whose
     ///   `ConsumerGroupConfig` carries that flag refuses it here rather than
     ///   discarding it; the error names what to drop. (InMemory has no such
-    ///   flag.) Concurrency for a FIFO topic comes from the shard fan-out,
-    ///   and on RabbitMQ additionally from `prefetch_count`.
+    ///   flag.) FIFO throughput scales by other means instead: the shard
+    ///   fan-out on Redis, NATS and RabbitMQ, partition assignment across
+    ///   instances on Kafka, and on RabbitMQ additionally `prefetch_count`,
+    ///   which bounds how many distinct sequence keys run at once.
     /// - Topology declaration fails (e.g. broker unreachable).
     ///
     /// [`register`]: Self::register

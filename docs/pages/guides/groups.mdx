@@ -137,7 +137,7 @@ Pick a drain timeout longer than your longest-expected handler. If handlers rout
 
 Each backend's consumer group config has backend-specific knobs beyond the shared set:
 
-> **Note:** `.with_concurrent_processing(true)` applies to `register` only. Every backend whose config carries the flag rejects it in `register_fifo`, returning a `ShoveError::Topology` at registration that names what to drop — it is never silently discarded. Concurrency for a sequenced topic comes from the shard fan-out instead (and on RabbitMQ additionally from `prefetch_count`, which bounds how many distinct sequence keys run at once). InMemory has no such flag.
+> **Note:** `.with_concurrent_processing(true)` applies to `register` only. Every backend whose config carries the flag rejects it in `register_fifo`, returning a `ShoveError::Topology` at registration that names what to drop — it is never silently discarded. (InMemory has no such flag.) FIFO throughput scales by other means instead: the shard fan-out on Redis, NATS and RabbitMQ, partition assignment across instances on Kafka, and on RabbitMQ additionally `prefetch_count`, which bounds how many distinct sequence keys run at once.
 
 **RabbitMQ (`rabbitmq::ConsumerGroupConfig`)** — adds `.with_concurrent_processing(bool)`. When `true`, each consumer processes up to `prefetch_count` messages concurrently. RabbitMQ's Single Active Consumer mode is enabled automatically for sequenced topics.
 
