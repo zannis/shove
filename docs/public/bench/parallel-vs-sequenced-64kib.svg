@@ -68,7 +68,7 @@ nats: 2 cells in this slice failed to run — absent, not zero; see failures[]
 redis: 6 cells in this slice failed to run — absent, not zero; see failures[]
 </text>
 <text x="24" y="614" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-Generated 2026-09-09T20:15:34Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
+Generated 2026-09-10T10:42:03Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
 </text>
 <text x="24" y="630" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
 Apple M4 Max — 16 cores — 64 GB RAM — macOS 26.6.2 — rustc 1.91.1 (ed61e7d7e 2025-11-07) — handler: zero (no-op)
@@ -185,26 +185,26 @@ n/s
 <text x="481" y="218" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 8.6k
 </text>
-<rect x="539" y="189" width="24" height="60" opacity="1" fill="#2A78D6" stroke="none"/>
-<rect x="543" y="185" width="16" height="5" opacity="1" fill="#2A78D6" stroke="none"/>
-<circle cx="543" cy="189" r="4" opacity="1" fill="#2A78D6" stroke="none" stroke-width="0"/>
-<circle cx="559" cy="189" r="4" opacity="1" fill="#2A78D6" stroke="none" stroke-width="0"/>
-<text x="551" y="182" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
-20k
+<rect x="539" y="191" width="24" height="58" opacity="1" fill="#2A78D6" stroke="none"/>
+<rect x="543" y="187" width="16" height="5" opacity="1" fill="#2A78D6" stroke="none"/>
+<circle cx="543" cy="191" r="4" opacity="1" fill="#2A78D6" stroke="none" stroke-width="0"/>
+<circle cx="559" cy="191" r="4" opacity="1" fill="#2A78D6" stroke="none" stroke-width="0"/>
+<text x="551" y="184" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+19k
 </text>
-<rect x="575" y="224" width="24" height="25" opacity="1" fill="#F3AB8E" stroke="none"/>
-<rect x="579" y="220" width="16" height="5" opacity="1" fill="#F3AB8E" stroke="none"/>
-<circle cx="579" cy="224" r="4" opacity="1" fill="#F3AB8E" stroke="none" stroke-width="0"/>
-<circle cx="595" cy="224" r="4" opacity="1" fill="#F3AB8E" stroke="none" stroke-width="0"/>
-<text x="587" y="217" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
-≥8.9k
+<rect x="575" y="228" width="24" height="21" opacity="1" fill="#F3AB8E" stroke="none"/>
+<rect x="579" y="224" width="16" height="5" opacity="1" fill="#F3AB8E" stroke="none"/>
+<circle cx="579" cy="228" r="4" opacity="1" fill="#F3AB8E" stroke="none" stroke-width="0"/>
+<circle cx="595" cy="228" r="4" opacity="1" fill="#F3AB8E" stroke="none" stroke-width="0"/>
+<text x="587" y="221" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+≥7.7k
 </text>
-<rect x="611" y="154" width="24" height="95" opacity="1" fill="#1BAF7A" stroke="none"/>
-<rect x="615" y="150" width="16" height="5" opacity="1" fill="#1BAF7A" stroke="none"/>
-<circle cx="615" cy="154" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
-<circle cx="631" cy="154" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
-<text x="623" y="147" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
-30k
+<rect x="611" y="163" width="24" height="86" opacity="1" fill="#1BAF7A" stroke="none"/>
+<rect x="615" y="159" width="16" height="5" opacity="1" fill="#1BAF7A" stroke="none"/>
+<circle cx="615" cy="163" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
+<circle cx="631" cy="163" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
+<text x="623" y="156" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+28k
 </text>
 <rect x="681" y="176" width="24" height="73" opacity="1" fill="#2A78D6" stroke="none"/>
 <rect x="685" y="172" width="16" height="5" opacity="1" fill="#2A78D6" stroke="none"/>
