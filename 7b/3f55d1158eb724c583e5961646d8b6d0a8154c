@@ -1,0 +1,29 @@
+docs/pages/backends/rabbitmq.mdx
+  s_b8e08bc78633be::t_ddb14004e89452 114-126
+scripts/bench.sh
+  s_b8e08bc78633be::t_90953fb3d5b15d 217-227
+benches/README.md
+  s_b8e08bc78633be::t_081e1317257135 181-192
+  s_b8e08bc78633be::t_ddb14004e89452 432-437
+  s_b8e08bc78633be::t_1163c47a75a791 230-235
+examples/rabbitmq/stress.rs
+  s_b8e08bc78633be::t_081e1317257135 53-60
+docs/pages/ops/performance.mdx
+  s_b8e08bc78633be::t_ddb14004e89452 65-73
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7b3f55d1158eb724c583e5961646d8b6d0a8154c",
+  "prompts": {},
+  "sessions": {
+    "s_b8e08bc78633be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e94058fc-68bc-4f6e-a55b-a6a4bcda1792",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
