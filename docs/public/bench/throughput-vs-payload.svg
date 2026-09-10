@@ -35,13 +35,13 @@ corpus differs by backend: inmemory, kafka, nats, rabbitmq, redis 49k / 3.1M / 6
 is a shorter window, not a different measurement
 </text>
 <text x="24" y="582" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-Generated 2026-09-10T10:42:03Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
+Generated 2026-09-10T17:24:39Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
 </text>
 <text x="24" y="598" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
 Apple M4 Max — 16 cores — 64 GB RAM — macOS 26.6.2 — rustc 1.91.1 (ed61e7d7e 2025-11-07) — handler: zero (no-op)
 </text>
 <text x="24" y="614" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-14 recorded failure(s) in the dataset — see failures[]
+12 recorded failure(s) in the dataset — see failures[]
 </text>
 <text x="16" y="245" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781" transform="rotate(270, 16, 245)">
 messages / second — log scale
@@ -64,7 +64,7 @@ messages / second — log scale
 <polyline fill="none" opacity="1" stroke="#C3C2B7" stroke-width="1" points="84,186 89,186 "/>
 <polyline fill="none" opacity="1" stroke="#2A78D6" stroke-width="2" points="189,102 474,103 "/>
 <polyline fill="none" opacity="1" stroke="#EB6834" stroke-width="2" points="189,180 474,195 "/>
-<polyline fill="none" opacity="1" stroke="#1BAF7A" stroke-width="2" points="189,194 474,200 759,288 "/>
+<polyline fill="none" opacity="1" stroke="#1BAF7A" stroke-width="2" points="189,194 474,202 759,286 "/>
 <polyline fill="none" opacity="1" stroke="#EDA100" stroke-width="2" points="189,269 474,257 759,261 "/>
 <polyline fill="none" opacity="1" stroke="#E87BA4" stroke-width="2" points="189,283 474,284 759,306 "/>
 <polyline fill="none" opacity="1" stroke="#008300" stroke-width="1" points="189,260 474,269 759,329 "/>
@@ -78,10 +78,10 @@ messages / second — log scale
 <circle cx="474" cy="195" r="4" opacity="1" fill="#EB6834" stroke="none" stroke-width="0"/>
 <circle cx="189" cy="194" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
 <circle cx="189" cy="194" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
-<circle cx="474" cy="200" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
-<circle cx="474" cy="200" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
-<circle cx="759" cy="288" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
-<circle cx="759" cy="288" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
+<circle cx="474" cy="202" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
+<circle cx="474" cy="202" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
+<circle cx="759" cy="286" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
+<circle cx="759" cy="286" r="4" opacity="1" fill="#1BAF7A" stroke="none" stroke-width="0"/>
 <circle cx="189" cy="269" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
 <circle cx="189" cy="269" r="4" opacity="1" fill="#EDA100" stroke="none" stroke-width="0"/>
 <circle cx="474" cy="257" r="6" opacity="1" fill="#FCFCFB" stroke="none" stroke-width="0"/>
@@ -107,8 +107,8 @@ kafka
 <text x="870" y="261" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 rabbitmq
 </text>
-<polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="765,288 867,288 "/>
-<text x="870" y="288" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
+<polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="765,286 867,286 "/>
+<text x="870" y="286" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#52514E">
 nats
 </text>
 <polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="765,306 867,306 "/>

@@ -44,13 +44,13 @@ rabbitmq: 1 cell in this slice failed to run — absent, not zero; see failures[
 redis: 2 cells in this slice failed to run — absent, not zero; see failures[]
 </text>
 <text x="24" y="582" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-Generated 2026-09-10T10:42:03Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
+Generated 2026-09-10T17:24:39Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
 </text>
 <text x="24" y="598" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
 Apple M4 Max — 16 cores — 64 GB RAM — macOS 26.6.2 — rustc 1.91.1 (ed61e7d7e 2025-11-07) — handler: zero (no-op)
 </text>
 <text x="24" y="614" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-14 recorded failure(s) in the dataset — see failures[]
+12 recorded failure(s) in the dataset — see failures[]
 </text>
 <text x="16" y="229" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781" transform="rotate(270, 16, 229)">
 messages / second — log scale
@@ -127,20 +127,20 @@ messages / second — log scale
 </text>
 <polyline fill="none" opacity="1" stroke="#383835" stroke-width="1" points="84,121 89,121 "/>
 <polyline fill="none" opacity="1" stroke="#D95926" stroke-width="2" points="370,119 "/>
-<polyline fill="none" opacity="1" stroke="#199E70" stroke-width="2" points="162,203 370,200 578,202 786,222 "/>
+<polyline fill="none" opacity="1" stroke="#199E70" stroke-width="2" points="162,200 370,205 578,201 786,204 "/>
 <polyline fill="none" opacity="1" stroke="#C98500" stroke-width="2" points="162,166 370,156 578,155 "/>
 <polyline fill="none" opacity="1" stroke="#D55181" stroke-width="2" points="162,227 370,200 578,172 786,152 "/>
 <polyline fill="none" opacity="1" stroke="#008300" stroke-width="1" points="162,280 370,258 578,242 786,241 "/>
 <circle cx="370" cy="119" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
 <circle cx="370" cy="119" r="4" opacity="1" fill="#D95926" stroke="none" stroke-width="0"/>
-<circle cx="162" cy="203" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
-<circle cx="162" cy="203" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
-<circle cx="370" cy="200" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
-<circle cx="370" cy="200" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
-<circle cx="578" cy="202" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
-<circle cx="578" cy="202" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
-<circle cx="786" cy="222" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
-<circle cx="786" cy="222" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
+<circle cx="162" cy="200" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="162" cy="200" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
+<circle cx="370" cy="205" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="370" cy="205" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
+<circle cx="578" cy="201" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="578" cy="201" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
+<circle cx="786" cy="204" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
+<circle cx="786" cy="204" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
 <circle cx="162" cy="166" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
 <circle cx="162" cy="166" r="4" opacity="1" fill="#C98500" stroke="none" stroke-width="0"/>
 <circle cx="370" cy="156" r="6" opacity="1" fill="#1A1A19" stroke="none" stroke-width="0"/>
@@ -169,8 +169,8 @@ rabbitmq
 <text x="870" y="152" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
 redis
 </text>
-<polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="792,222 867,222 "/>
-<text x="870" y="222" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+<polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="792,204 867,204 "/>
+<text x="870" y="204" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
 nats
 </text>
 <polyline fill="none" opacity="1" stroke="#898781" stroke-width="1" points="792,241 867,241 "/>
