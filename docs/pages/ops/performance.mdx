@@ -62,6 +62,15 @@ In order of impact:
 - **`concurrent_processing` flag**: `true` allows multiple handler invocations to run concurrently within a single worker, bounded by `prefetch_count`. `false` (default) processes one message at a time per worker.
 - **Transactional mode** (negative lever): the `rabbitmq-transactional` feature reduces throughput roughly 10–15× per channel compared to non-transactional. The trade-off is routing safety — every ack and publish land in the same AMQP transaction.
 
+**Batching and payload size.** `BatchConsumer` amortises one handler call over
+`max_batch_size` messages, and that pays when the per-message cost is the
+handler call itself. It does not pay for large payloads: on the in-process
+backend at 64 KiB, a 500-message batch (a 32 MB flush) drained at 55k msg/s,
+a 50-message batch at 80k, a 10-message batch at 79k, and the plain parallel
+consumer at about 356k. Below about 1 KiB the batch path leads; at 64 KiB it
+trails by 4x whatever the batch size, so the extra cost is per message, not
+per flush. Batch small messages; consume large ones one at a time.
+
 ## prefetch_count deep-dive
 
 `prefetch_count` tells the broker how many unacked messages it may deliver to a single consumer before waiting for acks. With `prefetch_count = 1`, the broker waits for an ack before sending the next message — every handler invocation pays a full network round-trip. With higher values, the consumer has a local buffer of pre-delivered messages and can begin processing the next one immediately after finishing the previous.
