@@ -114,17 +114,17 @@ published document measures all six backends, and a plotted series appears only
 for a backend the document actually contains. The SQS series measures LocalStack
 rather than the AWS service and runs a smaller, recorded corpus. See
 [Measurement methodology](https://shove.rs/ops/performance#measurement-methodology)
-for what is measured and what is still pending.
+for what is measured and how.
 
 ![Throughput vs consumer count, per backend](https://raw.githubusercontent.com/zannis/shove/main/docs/public/bench/throughput-vs-consumers-dark.svg)
 
 ![Framework overhead per flow, nanoseconds per message](https://raw.githubusercontent.com/zannis/shove/main/docs/public/bench/framework-overhead-dark.svg)
 
 Throughput vs payload size, the cost of sequenced ordering, and dispatch latency
-percentiles: [Performance](https://shove.rs/ops/performance). Reproduce with
-`cargo run --release --example <backend>_stress --features <flag>` using the
-feature flag from the table above; the exact published matrix and the chart
-regeneration command are in
+percentiles: [Performance](https://shove.rs/ops/performance). Every published row
+comes from one pinned matrix, so a run is reproduced with
+`scripts/bench.sh <backend>` rather than by invoking an example directly; that
+script and the chart regeneration are described under
 [Measurement methodology](https://shove.rs/ops/performance#measurement-methodology).
 
 **Batch consumption.** `BatchConsumer` hands the handler up to `max_batch_size`
