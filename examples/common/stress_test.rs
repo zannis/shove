@@ -3412,20 +3412,37 @@ where
 
 /// Wait until `processed` reaches `target` or the run is cancelled.
 ///
-/// No deadline: a scenario runs to completion however slow the backend is.
-/// A cell that never completes is a hang the operator interrupts, and the
-/// interruption is what gets recorded — never a clock the harness picked.
+/// No deadline on the whole wait: a scenario runs to completion however
+/// slow the backend is. The count has to keep moving, though: once it has
+/// stood still for [`DRAIN_STALL`] the cell is failed with where it stopped,
+/// the same rule the fills and drains apply. On 2026-09-10 the NATS 64 KiB
+/// broadcast cell at four subscribers lost part of its fan-out (ack policy
+/// none on an interest-retention stream: a dropped delivery is deleted
+/// server-side and never redelivered) and this loop idled for an hour with
+/// every thread parked, until the operator killed the pass.
 async fn await_completion(
     processed: &AtomicU64,
     target: u64,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
+    let mut last = processed.load(Ordering::Relaxed);
+    let mut last_progress = Instant::now();
     loop {
-        if processed.load(Ordering::Relaxed) >= target {
+        let count = processed.load(Ordering::Relaxed);
+        if count >= target {
             return Ok(());
         }
         if cancel.is_cancelled() {
             return Err("interrupted".to_string());
+        }
+        if count != last {
+            last = count;
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() >= DRAIN_STALL {
+            return Err(format!(
+                "completion stalled: {count} of {target} messages processed, no progress for {}s",
+                DRAIN_STALL.as_secs()
+            ));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -10778,6 +10795,44 @@ mod tests {
             backlog_capped: false,
             sustained: true,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_completion_fails_once_the_count_stops_moving() {
+        // A count that reaches its target returns; one that stands still for
+        // the stall window fails with where it stopped, so a cell whose
+        // fan-out was lost server-side (the NATS 64 KiB broadcast on
+        // 2026-09-10) is recorded instead of idling until someone kills the
+        // pass. Paused time: the stall window elapses without waiting it out.
+        let processed = AtomicU64::new(0);
+        let cancel = CancellationToken::new();
+        let done = await_completion(&processed, 0, &cancel).await;
+        assert_eq!(done, Ok(()), "a met target returns at once");
+
+        let processed = AtomicU64::new(3);
+        let err = await_completion(&processed, 10, &cancel)
+            .await
+            .expect_err("a count that never moves must fail");
+        assert!(
+            err.contains("completion stalled: 3 of 10"),
+            "the failure names where it stopped: {err}"
+        );
+
+        // A count that keeps moving inside the window is not a stall, however
+        // slow: advance it every half-window until it lands.
+        let processed = Arc::new(AtomicU64::new(0));
+        let ticker = {
+            let processed = Arc::clone(&processed);
+            tokio::spawn(async move {
+                for _ in 0..4 {
+                    tokio::time::sleep(DRAIN_STALL / 2).await;
+                    processed.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        let done = await_completion(&processed, 4, &cancel).await;
+        assert_eq!(done, Ok(()), "steady progress is not a stall");
+        ticker.await.expect("ticker");
     }
 
     #[test]
