@@ -48,15 +48,16 @@ const RABBITMQ_VERSION: &str = "3.8.22";
 /// thrashed once the broker was allowed 6.2 GB, so run this harness on a
 /// 16 GB VM.
 ///
-/// What the value does not set is the small-payload throughput. On the
-/// 2026-09-10 host, same-configuration runs of the 64 B consumer_group
-/// drain at one consumer were bimodal by time of day and indifferent to
-/// the limit: 176 to 181 s fills and 17.8k to 19.5k msg/s drains in one
-/// window, 244 to 283 s and 11.4k to 13.6k in another, across 9.6 GB, 6 GiB
-/// and 3.1 GB set at startup or changed mid-fill. The 2026-09-07 pass sits
-/// in the first mode and the 2026-09-09 pass in the second; the cause was
-/// not identified. Judge a pass by its first 64 B fill (cell 7) before
-/// letting it run.
+/// What the value does not set is the small-payload throughput. On
+/// 2026-09-10, same-configuration runs of the 64 B consumer_group drain at
+/// one consumer split by the host's power source and by nothing else: on
+/// mains, 176 to 181 s fills and 17.8k to 19.5k msg/s drains; on battery,
+/// 244 to 283 s and 11.4k to 13.6k, across 9.6 GB, 6 GiB and 3.1 GB set at
+/// startup or changed mid-fill. An Apple silicon host on battery runs the
+/// Docker VM at about 0.6x, publish cells included. The 2026-09-07 pass
+/// was measured on mains and the 2026-09-09 pass on battery, which is the
+/// whole of the difference between them. `scripts/bench.sh` refuses to
+/// start on battery for this reason.
 const RABBITMQ_MEMORY_HIGH_WATERMARK: &str = "6144MiB";
 
 #[tokio::main]
