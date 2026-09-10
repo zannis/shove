@@ -62,6 +62,10 @@ pub struct RedisConfig {
     /// Crate-private to mirror `response_timeout` — set via
     /// [`with_connection_timeout`](Self::with_connection_timeout).
     pub(crate) connection_timeout: Duration,
+    /// How often the maintenance sidecar trims acknowledged entries. `None`
+    /// derives it from the handler timeout, floored at 30 s. Set via
+    /// [`with_trim_interval`](Self::with_trim_interval).
+    pub(crate) trim_interval: Option<Duration>,
 }
 
 impl Default for RedisConfig {
@@ -82,6 +86,7 @@ impl Default for RedisConfig {
             group: None,
             response_timeout: DEFAULT_RESPONSE_TIMEOUT,
             connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
+            trim_interval: None,
         }
     }
 }
@@ -124,6 +129,28 @@ impl RedisConfig {
     pub fn with_connection_timeout(mut self, timeout: Duration) -> Self {
         assert!(!timeout.is_zero(), "connection_timeout must be positive");
         self.connection_timeout = timeout;
+        self
+    }
+
+    /// Set how often the maintenance sidecar trims acknowledged entries off
+    /// the stream.
+    ///
+    /// An `XACK` only clears the pending entry; the entry itself stays in the
+    /// stream until a sidecar sweep `XTRIM`s everything every group has
+    /// acknowledged. By default a sweep runs every handler timeout, floored at
+    /// 30 s, so at a high publish rate up to 30 s of already-consumed traffic
+    /// sits in memory. Lower this when the stream's memory has to track the
+    /// backlog closely; each sweep costs `XINFO GROUPS`, an `XPENDING` per
+    /// group and one `XTRIM`, so sub-second values buy memory with round
+    /// trips. Reclaim of stale pending entries is unaffected: it still gates
+    /// on the handler timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `interval` is zero.
+    pub fn with_trim_interval(mut self, interval: Duration) -> Self {
+        assert!(!interval.is_zero(), "trim_interval must be positive");
+        self.trim_interval = Some(interval);
         self
     }
 
@@ -208,6 +235,7 @@ pub struct RedisClient {
     pub(super) group: String,
     response_timeout: Duration,
     connection_timeout: Duration,
+    trim_interval: Option<Duration>,
 }
 
 impl RedisClient {
@@ -217,6 +245,7 @@ impl RedisClient {
         let group = config.resolved_group().to_owned();
         let response_timeout = config.response_timeout;
         let connection_timeout = config.connection_timeout;
+        let trim_interval = config.trim_interval;
 
         let inner = match config.mode {
             RedisMode::Standalone { url } => {
@@ -257,6 +286,7 @@ impl RedisClient {
             group,
             response_timeout,
             connection_timeout,
+            trim_interval,
         };
 
         let mut conn = client.multiplexed_conn().await?;
@@ -343,6 +373,12 @@ impl RedisClient {
     /// client share it; independently-connected clients (possibly to other
     /// servers) differ. Used by the maintenance registry to scope its
     /// per-`(client, stream, group)` deduplication.
+    /// The configured trim cadence override, if any
+    /// ([`RedisConfig::with_trim_interval`]).
+    pub(super) fn trim_interval(&self) -> Option<Duration> {
+        self.trim_interval
+    }
+
     pub(super) fn instance_id(&self) -> usize {
         Arc::as_ptr(&self.inner) as usize
     }
