@@ -2747,6 +2747,130 @@ impl Topic for SequentialTopic {
 }
 
 // ---------------------------------------------------------------------------
+// Trim cadence: `RedisConfig::with_trim_interval` sets how soon the sidecar
+// XTRIMs acknowledged entries off the stream. The default sweep is every
+// handler timeout floored at 30 s; a test cannot wait that out, so the
+// override is what makes the trim observable at all, and a stream that
+// empties within a few seconds of the last ack proves the knob reaches the
+// sidecar.
+// ---------------------------------------------------------------------------
+
+struct TrimTopic;
+impl Topic for TrimTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-trim-interval").build())
+    }
+}
+
+#[tokio::test]
+async fn a_trim_interval_override_removes_acked_entries_within_the_interval() {
+    let url = redis_url().await;
+    // Same bounded retry as `connect_with_retry`: the shared container can
+    // answer the port probe before Redis accepts connections.
+    let started = std::time::Instant::now();
+    let broker = loop {
+        match Broker::<Redis>::new(
+            RedisConfig::new(RedisMode::Standalone {
+                url: url.to_owned(),
+            })
+            .with_group("redis-int-trim-interval")
+            .with_trim_interval(Duration::from_millis(500)),
+        )
+        .await
+        {
+            Ok(b) => break b,
+            Err(e) if started.elapsed() < Duration::from_secs(30) => {
+                let _ = e;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => panic!("connect with trim interval: {e}"),
+        }
+    };
+    broker
+        .topology()
+        .declare::<TrimTopic>()
+        .await
+        .expect("declare");
+    let publisher = broker.publisher().await.expect("publisher");
+    let total: usize = 20;
+    for i in 0..total {
+        publisher
+            .publish::<TrimTopic>(&Order { id: i as u64 })
+            .await
+            .expect("publish");
+    }
+    let count = Arc::new(AtomicUsize::new(0));
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>);
+    impl MessageHandler<TrimTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+    let mut raw = redis::Client::open(url)
+        .expect("raw client")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw connection");
+    let stream = TrimTopic::topology().queue().to_owned();
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<TrimTopic, _>(H(Arc::clone(&count)), ConsumerOptions::<Redis>::new())
+        .expect("register");
+    let probe = count.clone();
+    let mut probe_conn = raw.clone();
+    let probe_stream = stream.clone();
+    // Consume everything, then hold the consumer (and with it the sidecar)
+    // alive until the stream has been trimmed down to its tail, or a bound
+    // well past a handful of 500 ms sweeps says it never will be. `XTRIM
+    // MINID` keeps the entry at the threshold, and with nothing pending the
+    // threshold is the group's last-delivered id, so one entry always stays.
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= total,
+            Duration::from_secs(10),
+        )
+        .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let len: i64 = redis::cmd("XLEN")
+                .arg(&probe_stream)
+                .query_async(&mut probe_conn)
+                .await
+                .expect("XLEN");
+            if len <= 1 || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        total,
+        "all messages consumed"
+    );
+    let len: i64 = redis::cmd("XLEN")
+        .arg(&stream)
+        .query_async(&mut raw)
+        .await
+        .expect("XLEN");
+    assert!(
+        len <= 1,
+        "all but the last acked entry should have been trimmed within a few 500 ms sweeps; \
+         {len} of {total} remain"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Concurrent-processing test, direct consumer: `RedisConsumer::run` (what the
 // supervisor drives) must honour `ConsumerOptions::with_concurrent_processing`
 // exactly as the group registry does. It used to take the sequential

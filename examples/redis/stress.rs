@@ -188,9 +188,21 @@ async fn main() {
                 harness::connect_with_retries("Redis", 10, Duration::from_secs(1), || {
                     let url = url.clone();
                     async move {
-                        <Redis as Backend>::connect(RedisConfig::new(RedisMode::Standalone { url }))
-                            .await
-                            .map_err(|e| e.to_string())
+                        // A sweep every second rather than every 30 s: the
+                        // 64 KiB ladder offers 1.6 GB/s, and Redis keeps every
+                        // acknowledged entry until the next sweep, so the
+                        // default cadence lets ~48 GB of consumed traffic
+                        // pile up against a 6 GB maxmemory while the
+                        // consumers keep pace. One second bounds that at
+                        // ~1.6 GB. Recorded here rather than in the matrix
+                        // because it is a broker-retention choice, not a
+                        // knob the other backends have.
+                        <Redis as Backend>::connect(
+                            RedisConfig::new(RedisMode::Standalone { url })
+                                .with_trim_interval(Duration::from_secs(1)),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())
                     }
                 })
                 .await

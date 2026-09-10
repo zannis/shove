@@ -143,7 +143,7 @@ impl Drop for MaintenanceGuard {
 }
 
 /// Derive the sidecar's sweep interval and XAUTOCLAIM idle threshold from a
-/// consumer's handler timeout.
+/// consumer's handler timeout and the client's trim-interval override.
 ///
 /// With a timeout, the idle threshold is the timeout itself (an entry must
 /// have been pending at least one handler-timeout before reclaim) and the
@@ -153,16 +153,26 @@ impl Drop for MaintenanceGuard {
 /// which an in-flight entry can be presumed dead, so reclaim is disabled
 /// (`None`) and the sidecar only trims, on the default 30 s cadence.
 ///
+/// [`RedisConfig::with_trim_interval`] replaces the sweep interval outright
+/// and leaves the reclaim threshold alone: how much acknowledged history sits
+/// in memory and how long an in-flight entry may stay pending are different
+/// decisions.
+///
 /// [`ConsumerOptions::without_handler_timeout`]: crate::ConsumerOptions::without_handler_timeout
-fn sidecar_timing(handler_timeout: Option<Duration>) -> (Duration, Option<u64>) {
-    match handler_timeout {
+/// [`RedisConfig::with_trim_interval`]: super::client::RedisConfig::with_trim_interval
+fn sidecar_timing(
+    handler_timeout: Option<Duration>,
+    trim_interval: Option<Duration>,
+) -> (Duration, Option<u64>) {
+    let (derived, min_idle_ms) = match handler_timeout {
         Some(timeout) => {
             let min_idle_ms = timeout.as_millis() as u64;
             let interval = Duration::from_millis(min_idle_ms.max(30_000));
             (interval, Some(min_idle_ms))
         }
         None => (DEFAULT_HANDLER_TIMEOUT, None),
-    }
+    };
+    (trim_interval.unwrap_or(derived), min_idle_ms)
 }
 
 /// This consumer's reclaim policy, given its handler timeout and whether it
@@ -219,8 +229,9 @@ pub(super) fn acquire(
     );
     let client = client.clone();
     let stream = stream.to_owned();
+    let trim_interval = client.trim_interval();
     let spawner: Spawner = Arc::new(move |shutdown, policy| {
-        let (interval, min_idle_ms) = sidecar_timing(policy);
+        let (interval, min_idle_ms) = sidecar_timing(policy, trim_interval);
         spawn_maintenance(
             client.clone(),
             vec![stream.clone()],
@@ -279,12 +290,12 @@ mod tests {
     #[test]
     fn timing_with_timeout_floors_interval_and_sets_min_idle() {
         assert_eq!(
-            sidecar_timing(Some(Duration::from_secs(5))),
+            sidecar_timing(Some(Duration::from_secs(5)), None),
             (Duration::from_secs(30), Some(5_000)),
             "short timeouts keep the 30s sweep floor but gate reclaim at the timeout"
         );
         assert_eq!(
-            sidecar_timing(Some(Duration::from_secs(45))),
+            sidecar_timing(Some(Duration::from_secs(45)), None),
             (Duration::from_secs(45), Some(45_000)),
             "long timeouts stretch the sweep interval to match"
         );
@@ -296,9 +307,31 @@ mod tests {
         // may run indefinitely — maintenance must never reclaim their
         // in-flight entries on a made-up deadline. Trim still runs.
         assert_eq!(
-            sidecar_timing(None),
+            sidecar_timing(None, None),
             (Duration::from_secs(30), None),
             "no handler deadline means no XAUTOCLAIM deadline"
+        );
+    }
+
+    #[test]
+    fn timing_trim_interval_override_replaces_the_sweep_and_keeps_reclaim() {
+        assert_eq!(
+            sidecar_timing(Some(Duration::from_secs(5)), Some(Duration::from_secs(1))),
+            (Duration::from_secs(1), Some(5_000)),
+            "the override sets the sweep; reclaim still gates on the handler timeout"
+        );
+        assert_eq!(
+            sidecar_timing(
+                Some(Duration::from_secs(45)),
+                Some(Duration::from_secs(120))
+            ),
+            (Duration::from_secs(120), Some(45_000)),
+            "an override above the derived interval is honoured too"
+        );
+        assert_eq!(
+            sidecar_timing(None, Some(Duration::from_millis(500))),
+            (Duration::from_millis(500), None),
+            "without a handler deadline the override still sets the sweep and reclaim stays off"
         );
     }
 
