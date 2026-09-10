@@ -50,14 +50,14 @@ const RABBITMQ_VERSION: &str = "3.8.22";
 ///
 /// What the value does not set is the small-payload throughput. On
 /// 2026-09-10, same-configuration runs of the 64 B consumer_group drain at
-/// one consumer split by the host's power source and by nothing else: on
-/// mains, 176 to 181 s fills and 17.8k to 19.5k msg/s drains; on battery,
-/// 244 to 283 s and 11.4k to 13.6k, across 9.6 GB, 6 GiB and 3.1 GB set at
-/// startup or changed mid-fill. An Apple silicon host on battery runs the
-/// Docker VM at about 0.6x, publish cells included. The 2026-09-07 pass
-/// was measured on mains and the 2026-09-09 pass on battery, which is the
-/// whole of the difference between them. `scripts/bench.sh` refuses to
-/// start on battery for this reason.
+/// one consumer split by whether macOS Low Power Mode was in effect and by
+/// nothing else: with it off, 176 to 181 s fills and 17.8k to 19.5k msg/s
+/// drains; with it on, 244 to 283 s and 11.4k to 13.6k, across 9.6 GB,
+/// 6 GiB and 3.1 GB set at startup or changed mid-fill. Low Power Mode caps
+/// the CPU and the Docker VM with it at about 0.6x, publish cells included,
+/// and this host enables it on battery. The 2026-09-09 pass was measured
+/// that way, which is the whole of its gap to the earlier pass.
+/// `scripts/bench.sh` refuses to start with the mode in effect.
 const RABBITMQ_MEMORY_HIGH_WATERMARK: &str = "6144MiB";
 
 #[tokio::main]

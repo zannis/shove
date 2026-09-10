@@ -214,14 +214,17 @@ if [ "$fresh" = 1 ] && [ -f "$RESULTS_FILE" ]; then
   echo "moved existing results document aside: $backup"
 fi
 
-# A laptop on battery runs the Docker VM at about 0.6x, publish cells and
-# drains alike (2026-09-10: the same 64 B drain filled in 180 s on mains and
-# 265 s on battery at every watermark tried), and the 2026-09-09 RabbitMQ
-# pass was measured that way. Refuse rather than merge such a pass into the
-# published document; BENCH_ALLOW_BATTERY=1 is for a run nobody will publish.
-if [ "$(uname -s)" = Darwin ] && [ -z "${BENCH_ALLOW_BATTERY:-}" ] \
-  && ! pmset -g batt | grep -q "AC Power"; then
-  die "host is on battery power: the Docker VM runs at about 0.6x there. Plug in, or set BENCH_ALLOW_BATTERY=1 for a run that will not be published"
+# macOS Low Power Mode caps the CPU and the Docker VM with it, at about 0.6x
+# on publish cells and drains alike (2026-09-10: the same 64 B drain filled
+# in 180 s with it off and 265 s with it on at every watermark tried). This
+# host enables it on battery (`pmset -g custom`: `powermode 1` under Battery
+# Power), which is how the 2026-09-09 RabbitMQ pass was measured. Check the
+# mode in effect, not the power source: it can be on while plugged in.
+# Refuse rather than merge such a pass into the published document;
+# BENCH_ALLOW_LOW_POWER=1 is for a run nobody will publish.
+if [ "$(uname -s)" = Darwin ] && [ -z "${BENCH_ALLOW_LOW_POWER:-}" ] \
+  && [ "$(pmset -g 2>/dev/null | awk '/^ *powermode/ {print $2}')" != 0 ]; then
+  die "host is in Low Power Mode (pmset -g: powermode != 0; on battery this host enables it). Plug in or turn it off, or set BENCH_ALLOW_LOW_POWER=1 for a run that will not be published"
 fi
 
 mkdir -p "$LOG_DIR" "$(dirname "$RESULTS_FILE")"

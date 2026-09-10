@@ -111,6 +111,19 @@ The autoscaler reads queue depth from the RabbitMQ management HTTP API and scale
 
 When `max_consumers > 50`, the group automatically pools AMQP connections — one per ~50 workers, rounded up. Lapin parses every inbound delivery on a connection through a single reader task, so a high-throughput group of 200 consumers on one connection bottlenecks on that task. The pool is transparent; all clones of the underlying `RabbitMqClient` share broker config and reconnect logic.
 
+### One queue is one process
+
+A classic queue is a single Erlang process, so its throughput is bounded by
+one core on the broker whatever the consumer count. On RabbitMQ 3.8.22 in the
+benchmark VM that ceiling is about 35k msg/s at 64 B in either direction:
+eight publishers fill a queue at 34k msg/s, the batch consumer drains it at
+32k to 35k at one, two, four and eight consumers alike, and a connection per
+consumer changes nothing (measured 2026-09-10: 35.7k on one shared connection,
+31.1k on four). Adding consumers to one queue spreads handler work; it does
+not add broker throughput. To scale past the ceiling, spread the topic over
+several queues: a sequenced topic with `routing_shards(N)` does exactly that
+on the broker side, at the cost of per-key ordering constraints.
+
 ### Stuck-retry eviction
 
 If a transient broker error kills the consumer mid-republish, a delivery can land in the per-consumer `AwaitingRetry` map and never escape. `ConsumerOptions::<RabbitMq>::new().with_hold_queue_timeout(Duration)` evicts any entry that has been waiting longer than the timeout and requeues it to the main queue. The eviction ticker fires at half the configured timeout, so a 30 s setting checks every 15 s. Default: no eviction — set it explicitly to enable.

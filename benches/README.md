@@ -178,16 +178,18 @@ same fraction on a 7.8 GB and then a 16 GB VM. 6 GiB is the floor the 64 KiB
 corpus needs (5.1 GiB resident) without tripping the alarm that #172 removed,
 so give the VM 16 GB.
 
-Run on mains power. An Apple silicon laptop on battery runs the Docker VM at
-about 0.6x, fills, drains and publish cells alike: on 2026-09-10 the same
-64 B drain filled in 176 to 181 s and drained at 17.8k to 19.5k msg/s on
-mains, and filled in 244 to 283 s and drained at 11.4k to 13.6k on battery,
-at every watermark tried. The 2026-09-09 RabbitMQ pass was measured on
-battery, which is why its multi-consumer 64 B and 1 KiB cells read 20 to 45 %
-under the 2026-09-07 pass. `scripts/bench.sh` checks `pmset -g batt` and
-refuses to start on battery; `BENCH_ALLOW_BATTERY=1` overrides the check for
-a run whose numbers will not be published. Check any pass at its first 64 B
-fill (cell 7) before letting it run for four and a half hours.
+Run with Low Power Mode off. macOS Low Power Mode caps the CPU and the
+Docker VM with it, at about 0.6x on fills, drains and publish cells alike: on
+2026-09-10 the same 64 B drain filled in 176 to 181 s and drained at 17.8k to
+19.5k msg/s with it off, and filled in 244 to 283 s and drained at 11.4k to
+13.6k with it on, at every watermark tried. This host enables it on battery
+(`pmset -g custom` shows `powermode 1` under Battery Power), which is how the
+2026-09-09 RabbitMQ pass and the later cells of the 2026-09-08 NATS pass were
+measured; that is the whole of their multi-consumer dips. `scripts/bench.sh`
+reads the mode in effect from `pmset -g` and refuses to start unless
+`powermode` is 0; `BENCH_ALLOW_LOW_POWER=1` overrides the check for a run
+whose numbers will not be published. Check any pass at its first 64 B fill
+(cell 7) before letting it run for the full two and a half hours.
 
 Every backend's stress binary wires the batch-consume driver, so
 `consume_batch` is measured wherever the backend implements
@@ -225,6 +227,12 @@ which the harness records as that cell's failure, instead of the process
 being killed and every later cell dying with it. Because `UNLINK` frees in
 the background and `maxmemory` counts what is not yet freed, the purge waits
 for `lazyfree_pending_objects` to reach zero before the next cell starts.
+The Redis stress binary also connects with
+`RedisConfig::with_trim_interval(1 s)` in place of the library's default
+sweep (every handler timeout, floored at 30 s), so at most about a second of
+acknowledged traffic is resident at once instead of up to 48 GB of it at the
+64 KiB rung. It is a retention choice for the container, recorded here rather
+than in the matrix because no other backend has the knob.
 
 ### The SQS corpus deviation
 
@@ -421,6 +429,12 @@ things to check before trusting a document:
   half the corpus, `duplicates` at zero on the backends that deliver once,
   and a window of several seconds. A cell that failed as consumed before
   assembly wants a larger `--drain-messages`, not a rerun.
+- Rows flat across consumer counts on RabbitMQ are the broker, not the
+  harness: one classic queue is one Erlang process, and at 64 B it moves
+  about 35k msg/s in this VM whether one or eight consumers drain it and
+  whether they share a connection or not (2026-09-10). The publish fill hits
+  the same ceiling. A cell 10 to 15 % under its neighbours is inside the
+  cell-to-cell noise seen on the same host.
 
 ## Related benchmarks
 
