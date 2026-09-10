@@ -176,12 +176,18 @@ The RabbitMQ binary pins the broker's memory high watermark to an absolute
 under does not move with the VM: the 2026-09-07 and 2026-09-09 passes ran the
 same fraction on a 7.8 GB and then a 16 GB VM. 6 GiB is the floor the 64 KiB
 corpus needs (5.1 GiB resident) without tripping the alarm that #172 removed,
-so give the VM 16 GB. The value does not set the small-payload throughput:
-on 2026-09-10 same-configuration 64 B drains were bimodal by time of day and
-indifferent to the limit (176 to 181 s fills and 17.8k to 19.5k msg/s in one
-window, 244 to 283 s and 11.4k to 13.6k in another; the 2026-09-07 pass is
-the first mode, 2026-09-09 the second, cause unidentified). Check a pass at
-its first 64 B fill before letting it run for the full four and a half hours.
+so give the VM 16 GB.
+
+Run on mains power. An Apple silicon laptop on battery runs the Docker VM at
+about 0.6x, fills, drains and publish cells alike: on 2026-09-10 the same
+64 B drain filled in 176 to 181 s and drained at 17.8k to 19.5k msg/s on
+mains, and filled in 244 to 283 s and drained at 11.4k to 13.6k on battery,
+at every watermark tried. The 2026-09-09 RabbitMQ pass was measured on
+battery, which is why its multi-consumer 64 B and 1 KiB cells read 20 to 45 %
+under the 2026-09-07 pass. `scripts/bench.sh` checks `pmset -g batt` and
+refuses to start on battery; `BENCH_ALLOW_BATTERY=1` overrides the check for
+a run whose numbers will not be published. Check any pass at its first 64 B
+fill (cell 7) before letting it run for four and a half hours.
 
 Every backend's stress binary wires the batch-consume driver, so
 `consume_batch` is measured wherever the backend implements
