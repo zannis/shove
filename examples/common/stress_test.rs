@@ -3545,6 +3545,22 @@ fn finish_window(
     let mut metrics = finish(scenario, duration, window.setup, resources, latencies);
     let secs = duration.as_secs_f64();
     if let (Some(outcome), Some(rung)) = (&window.load, scenario.load) {
+        // A window nothing completed inside measured no rate. It happens when
+        // the backlog cap fires before the first batch of a large-payload
+        // rung flushes; the document refuses a zero rate as a failed
+        // measurement wearing a row's clothes, so fail the rung here and let
+        // `failures[]` carry it with its reason.
+        if outcome.processed_at_window_end == 0 {
+            let how = if outcome.backlog_capped {
+                "the backlog cap stopped the rung"
+            } else {
+                "the window closed"
+            };
+            return Err(format!(
+                "no message completed inside the rung's {secs:.1}s window before {how}; a \
+                 zero rate is a failed measurement, not a row"
+            ));
+        }
         metrics.throughput = if secs > 0.0 {
             outcome.processed_at_window_end as f64 / secs
         } else {
@@ -5815,6 +5831,12 @@ fn validate_load(run: &BackendRun, r: &ScenarioResult, flow: Flow) -> Result<(),
             "claims an achieved publish rate of {:.1} msg/s where its counts derive {achieved:.1}",
             l.achieved_publish_msg_per_sec
         ));
+    }
+    if l.processed_at_window_end == 0 {
+        return refuse(
+            "processed nothing inside its window; the harness records that rung as a failure, \
+             not a row",
+        );
     }
     let throughput = l.processed_at_window_end as f64 / r.duration_secs;
     if !rate_matches(r.throughput_msg_per_sec, throughput) {
@@ -10759,6 +10781,31 @@ mod tests {
     }
 
     #[test]
+    fn validate_run_refuses_a_rung_that_processed_nothing() {
+        // The 2026-09-10 NATS pass: the 64 KiB rung at 25 000/s with eight
+        // batch workers hit the backlog cap at 1.5 s, before any 32 MB batch
+        // had flushed, and the harness stamped a row with a rate of zero that
+        // chartgen then refused. The document refuses it too, so a harness
+        // that let one through again could not merge it.
+        let mut run = sample_run("kafka");
+        let mut load = sustained_load(25_000, 15_132);
+        load.processed_at_window_end = 0;
+        load.lag_at_window_end = 15_132;
+        load.peak_lag = 15_132;
+        load.achieved_publish_msg_per_sec = 15_132.0 / 1.5;
+        load.backlog_capped = true;
+        load.sustained = false;
+        run.results[0].load = Some(load);
+        run.results[0].method = Some(Method::OfferedLoad.as_str().to_string());
+        run.results[0].drain = None;
+        run.results[0].messages = 15_132;
+        run.results[0].duration_secs = 1.5;
+        run.results[0].throughput_msg_per_sec = 0.0;
+        let err = validate_run(&run).unwrap_err();
+        assert!(err.contains("processed nothing"), "{err}");
+    }
+
+    #[test]
     fn validate_run_holds_a_load_account_to_its_own_numbers() {
         let mut run = sample_run("kafka");
         run.results[0].load = Some(sustained_load(10_000, 100_000));
@@ -10974,7 +11021,7 @@ mod tests {
         // rung is not sustained, and the ladder skips the rungs above.
         let rung = LoadRung {
             rate_msg_per_sec: 20_000,
-            window_secs: 5,
+            window_secs: 20,
             producers: 2,
         };
         let scenario = Scenario {
@@ -10992,11 +11039,14 @@ mod tests {
         };
         // A sleeping handler so one consumer cannot keep up with 20 000/s
         // even with a hundred in flight; the cap, not the handler, is under
-        // test. 500 messages of backlog at 64 B; the in-process queue holds
-        // far more, so the cap fires first. Small publish chunks so the drain
-        // after the stop is seconds of sleeping handler, not minutes.
+        // test. 4 000 messages of backlog at 64 B fire the cap about 0.2 s
+        // in, late enough for the first 50 ms sleeps to have returned (a
+        // window nothing completed inside is a failed rung, not a capped
+        // row), and the in-process queue holds far more, so the cap fires
+        // before anything else does. Small publish chunks so the drain after
+        // the stop is seconds of sleeping handler, not minutes.
         let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory")
-            .with_load_backlog_cap_bytes(64 * 500)
+            .with_load_backlog_cap_bytes(64 * 4_000)
             .with_publish_chunk_size(20);
         let cancel = CancellationToken::new();
         let started = Instant::now();
@@ -11022,15 +11072,19 @@ mod tests {
         let load = metrics.load.expect("a rung stamps its account");
         assert!(!load.sustained, "{load:?}");
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(10),
             "the rung must stop when the backlog reaches the cap, not run out its {}s window \
              (took {:?})",
             rung.window_secs,
             started.elapsed()
         );
         assert!(
-            load.peak_lag >= 500,
-            "the cap fires at 500 messages of backlog: {load:?}"
+            load.peak_lag >= 4_000,
+            "the cap fires at 4 000 messages of backlog: {load:?}"
+        );
+        assert!(
+            load.processed_at_window_end > 0,
+            "the window closed after the first handlers returned, so the row has a rate: {load:?}"
         );
         assert!(
             load.backlog_capped,
