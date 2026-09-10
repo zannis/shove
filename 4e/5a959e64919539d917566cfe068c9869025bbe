@@ -1,0 +1,21 @@
+examples/common/stress_test.rs
+  s_b8e08bc78633be::t_6e9d84bca0930d 11024,11042-11047,11049,11075,11082-11087
+  s_b8e08bc78633be::t_9636d777e776fc 3548-3563,5835-5840,10783-10805
+  s_b8e08bc78633be::t_48cfe11ad3103f 10806-10807
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4e5a959e64919539d917566cfe068c9869025bbe",
+  "prompts": {},
+  "sessions": {
+    "s_b8e08bc78633be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e94058fc-68bc-4f6e-a55b-a6a4bcda1792",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
