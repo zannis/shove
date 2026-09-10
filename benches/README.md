@@ -171,6 +171,18 @@ Run backends one after another, never in parallel. Two harnesses on one host
 contend for CPU and skew each other's windows, and two merges into the same
 document race.
 
+The RabbitMQ binary pins the broker's memory high watermark to an absolute
+6 GiB rather than the image's fraction of the VM. The watermark decides how
+much of a six-million-message backlog a 3.8 classic queue keeps in RAM, and
+that window sets the throughput of every small-payload consume cell: measured
+on the 64 B `consumer_group` drain, a 9.6 GB limit drained at 12.2k msg/s
+behind a 262 s fill where 3.1 GB to 6 GiB drained at 17.8k to 19.5k behind
+176 to 181 s fills. A fraction moves with the VM's size, which is how the
+2026-09-09 re-run came in 20 to 45 % under the 2026-09-07 pass on its
+multi-consumer 64 B and 1 KiB cells after the VM grew from 7.8 to 16 GB
+between them. 6 GiB is the floor the 64 KiB corpus needs (5.1 GiB resident)
+without tripping the alarm that #172 removed, so give the VM 16 GB.
+
 Every backend's stress binary wires the batch-consume driver, so
 `consume_batch` is measured wherever the backend implements
 `HasBatchConsumption` rather than recorded as a capability hole. SQS is the
