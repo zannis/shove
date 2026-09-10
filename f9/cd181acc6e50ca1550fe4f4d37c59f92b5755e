@@ -1,0 +1,61 @@
+docs/public/bench/dispatch-latency-dark.svg
+  s_b8e08bc78633be::t_05938032b00818 26,32,117-129
+docs/public/bench/dispatch-latency-64kib-dark.svg
+  s_b8e08bc78633be::t_05938032b00818 26,32,120-139
+docs/public/bench/parallel-vs-sequenced-64kib-dark.svg
+  s_b8e08bc78633be::t_05938032b00818 1-3,67-68,70,73-74,164-169,176-183
+docs/public/bench/throughput-vs-consumers-64kib-dark.svg
+  s_b8e08bc78633be::t_05938032b00818 47,53,130,136-143,172-173
+docs/public/bench/throughput-vs-consumers.svg
+  s_b8e08bc78633be::t_05938032b00818 32,38,141,161-168,197-198,201-206
+docs/public/bench/throughput-vs-payload-dark.svg
+  s_b8e08bc78633be::t_05938032b00818 38,44,67,81-84,110-111
+docs/public/bench/dispatch-latency.svg
+  s_b8e08bc78633be::t_05938032b00818 26,32,117-129
+docs/public/bench/dispatch-latency-64kib.svg
+  s_b8e08bc78633be::t_05938032b00818 26,32,120-139
+docs/public/bench/parallel-vs-sequenced-1kib-dark.svg
+  s_b8e08bc78633be::t_05938032b00818 56,62,142-147,156-161
+docs/public/bench/parallel-vs-sequenced-dark.svg
+  s_b8e08bc78633be::t_05938032b00818 56,62,132-137,143-148
+docs/public/bench/framework-overhead.svg
+  s_b8e08bc78633be::t_05938032b00818 38,44
+docs/public/bench/parallel-vs-sequenced-64kib.svg
+  s_b8e08bc78633be::t_05938032b00818 1-3,67-68,70,73-74,164-169,176-183
+docs/public/bench/throughput-vs-consumers-dark.svg
+  s_b8e08bc78633be::t_05938032b00818 32,38,141,161-168,197-198,201-206
+docs/public/bench/parallel-vs-sequenced.svg
+  s_b8e08bc78633be::t_05938032b00818 56,62,132-137,143-148
+docs/public/bench/throughput-vs-consumers-1kib-dark.svg
+  s_b8e08bc78633be::t_05938032b00818 32,38,141,161-168,197-198,201-202
+docs/public/bench/throughput-vs-consumers-1kib.svg
+  s_b8e08bc78633be::t_05938032b00818 32,38,141,161-168,197-198,201-202
+docs/public/bench/throughput-vs-payload.svg
+  s_b8e08bc78633be::t_05938032b00818 38,44,67,81-84,110-111
+docs/public/bench/throughput-vs-consumers-64kib.svg
+  s_b8e08bc78633be::t_05938032b00818 47,53,130,136-143,172-173
+docs/public/bench/dispatch-latency-1kib.svg
+  s_b8e08bc78633be::t_05938032b00818 26,32,38-41,47,50-51,54-55,58-59,62-67,70-74,77-81,84-88,91-95,98-102,105-109,112-130,133-137,140-144,147-151,154-158,161-165
+docs/public/bench/dispatch-latency-1kib-dark.svg
+  s_b8e08bc78633be::t_05938032b00818 26,32,38-41,47,50-51,54-55,58-59,62-67,70-74,77-81,84-88,91-95,98-102,105-109,112-130,133-137,140-144,147-151,154-158,161-165
+docs/public/bench/parallel-vs-sequenced-1kib.svg
+  s_b8e08bc78633be::t_05938032b00818 56,62,142-147,156-161
+docs/public/bench/framework-overhead-dark.svg
+  s_b8e08bc78633be::t_05938032b00818 38,44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f9cd181acc6e50ca1550fe4f4d37c59f92b5755e",
+  "prompts": {},
+  "sessions": {
+    "s_b8e08bc78633be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e94058fc-68bc-4f6e-a55b-a6a4bcda1792",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
