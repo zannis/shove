@@ -1,6 +1,6 @@
-<svg width="960" height="672" viewBox="0 0 960 672" xmlns="http://www.w3.org/2000/svg">
-<rect x="0" y="0" width="960" height="672" opacity="1" fill="#1A1A19" stroke="none"/>
-<rect x="0" y="0" width="959" height="671" opacity="0.1" fill="none" stroke="#FFFFFF"/>
+<svg width="960" height="656" viewBox="0 0 960 656" xmlns="http://www.w3.org/2000/svg">
+<rect x="0" y="0" width="960" height="656" opacity="1" fill="#1A1A19" stroke="none"/>
+<rect x="0" y="0" width="959" height="655" opacity="0.1" fill="none" stroke="#FFFFFF"/>
 <text x="24" y="18" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="20.967741935483872" opacity="1" fill="#FFFFFF">
 Parallel vs sequenced consume
 </text>
@@ -62,19 +62,16 @@ sqs: measured as supervisor — this backend&apos;s spelling of consume_parallel
 inmemory, rabbitmq: 1 cell in this slice failed to run — absent, not zero; see failures[]
 </text>
 <text x="24" y="582" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
-nats: 2 cells in this slice failed to run — absent, not zero; see failures[]
-</text>
-<text x="24" y="598" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
 redis: 6 cells in this slice failed to run — absent, not zero; see failures[]
 </text>
-<text x="24" y="614" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-Generated 2026-09-10T10:42:03Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
+<text x="24" y="598" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
+Generated 2026-09-10T17:24:39Z — shove 0.14.0 — Apple M4 Max (16c / 64 GB)
 </text>
-<text x="24" y="630" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
+<text x="24" y="614" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
 Apple M4 Max — 16 cores — 64 GB RAM — macOS 26.6.2 — rustc 1.91.1 (ed61e7d7e 2025-11-07) — handler: zero (no-op)
 </text>
-<text x="24" y="646" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
-14 recorded failure(s) in the dataset — see failures[]
+<text x="24" y="630" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#898781">
+12 recorded failure(s) in the dataset — see failures[]
 </text>
 <text x="16" y="173" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#898781" transform="rotate(270, 16, 173)">
 messages / second
@@ -164,26 +161,26 @@ n/s
 <text x="339" y="149" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
 30k
 </text>
-<rect x="397" y="229" width="24" height="20" opacity="1" fill="#3987E5" stroke="none"/>
-<rect x="401" y="225" width="16" height="5" opacity="1" fill="#3987E5" stroke="none"/>
-<circle cx="401" cy="229" r="4" opacity="1" fill="#3987E5" stroke="none" stroke-width="0"/>
-<circle cx="417" cy="229" r="4" opacity="1" fill="#3987E5" stroke="none" stroke-width="0"/>
-<text x="409" y="222" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
-7.6k
+<rect x="397" y="220" width="24" height="29" opacity="1" fill="#3987E5" stroke="none"/>
+<rect x="401" y="216" width="16" height="5" opacity="1" fill="#3987E5" stroke="none"/>
+<circle cx="401" cy="220" r="4" opacity="1" fill="#3987E5" stroke="none" stroke-width="0"/>
+<circle cx="417" cy="220" r="4" opacity="1" fill="#3987E5" stroke="none" stroke-width="0"/>
+<text x="409" y="213" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+10k
 </text>
 <rect x="433" y="233" width="24" height="16" opacity="1" fill="#833D20" stroke="none"/>
 <rect x="437" y="229" width="16" height="5" opacity="1" fill="#833D20" stroke="none"/>
 <circle cx="437" cy="233" r="4" opacity="1" fill="#833D20" stroke="none" stroke-width="0"/>
 <circle cx="453" cy="233" r="4" opacity="1" fill="#833D20" stroke="none" stroke-width="0"/>
 <text x="445" y="226" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
-≥6.4k
+≥6.3k
 </text>
-<rect x="469" y="225" width="24" height="24" opacity="1" fill="#199E70" stroke="none"/>
-<rect x="473" y="221" width="16" height="5" opacity="1" fill="#199E70" stroke="none"/>
-<circle cx="473" cy="225" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
-<circle cx="489" cy="225" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
-<text x="481" y="218" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
-8.6k
+<rect x="469" y="214" width="24" height="35" opacity="1" fill="#199E70" stroke="none"/>
+<rect x="473" y="210" width="16" height="5" opacity="1" fill="#199E70" stroke="none"/>
+<circle cx="473" cy="214" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
+<circle cx="489" cy="214" r="4" opacity="1" fill="#199E70" stroke="none" stroke-width="0"/>
+<text x="481" y="207" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="12.096774193548388" opacity="1" fill="#C3C2B7">
+12k
 </text>
 <rect x="539" y="191" width="24" height="58" opacity="1" fill="#3987E5" stroke="none"/>
 <rect x="543" y="187" width="16" height="5" opacity="1" fill="#3987E5" stroke="none"/>
