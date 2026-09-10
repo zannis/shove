@@ -29,15 +29,34 @@ use harness::{BatchConsumeFn, DlqDrainFn, HarnessConfig, StressTestTopic, run_al
 /// results provenance so a reader knows which server produced the numbers.
 const RABBITMQ_VERSION: &str = "3.8.22";
 
-/// Fraction of the container's memory the broker may hold before its memory
-/// alarm blocks publishers; see the `set_vm_memory_high_watermark` exec in
-/// `main` for why the image default (0.4) is too low for the 64 KiB corpus.
-/// 0.6 rather than higher: at 0.8 the broker was allowed to grow to about
-/// 6.2 GB of an 8 GB VM over a full pass of six-million-message fills, and
-/// on 2026-09-09 the VM thrashed and the broker stopped heartbeating at cell
-/// 34 of 168. 0.6 (about 4.7 GB) still clears the 3.2 GB corpus with its
-/// overhead and leaves the VM room to breathe.
-const RABBITMQ_MEMORY_HIGH_WATERMARK: &str = "0.6";
+/// Memory the broker may hold before its memory alarm blocks publishers,
+/// as an absolute amount (`MiB`: rabbitmqctl reads a bare `MB` as 10^6);
+/// see the `set_vm_memory_high_watermark` exec in `main` for why the image
+/// default is too low for the 64 KiB corpus.
+///
+/// Absolute rather than a fraction of the VM, because this number sets how
+/// much of a six-million-message backlog a 3.8 classic queue keeps in RAM,
+/// and that window sets the throughput of every small-payload consume cell.
+/// The broker pages on RSS at half the limit, and RSS runs two to three
+/// times Erlang's allocated bytes during a 64 B fill, so the window tracks
+/// the limit closely. Measured 2026-09-10 on the 64 B consumer_group drain
+/// at one consumer, everything else equal: a 9.6 GB limit (0.6 of a 16 GB
+/// VM) held a ~1M-message window, filled in 262 s and drained at 12.2k
+/// msg/s; 3.1 GB, 4.5 GB and 6 GiB held 240k to 580k, filled in 176 to
+/// 181 s and drained at 18.8k, 19.5k and 17.8k. The fraction form gave the
+/// 2026-09-09 re-run a limit three times the 2026-09-07 run's because the
+/// VM had grown from 7.8 to 16 GB between them, and its multi-consumer 64 B
+/// and 1 KiB cells read 20 to 45 % under the earlier pass for that reason
+/// alone.
+///
+/// The floor is the 64 KiB corpus: 49 152 resident messages put the
+/// broker's RSS at 5.1 GiB, so the 4.5 GB that 0.6 stood for on the 8 GB
+/// VM it was chosen on trips the alarm at the end of every 64 KiB fill
+/// (measured 2026-09-10, two of eight samples in alarm), while 6 GiB leaves
+/// about 1 GiB of headroom and saw none. The VM needs room above this for
+/// itself and the other containers; on 2026-09-09 an 8 GB VM thrashed once
+/// the broker was allowed 6.2 GB, so run this harness on a 16 GB VM.
+const RABBITMQ_MEMORY_HIGH_WATERMARK: &str = "6144MiB";
 
 #[tokio::main]
 async fn main() {
@@ -65,22 +84,25 @@ async fn main() {
     // blocks the connection that is also registering the consumers, so on
     // an eight-consumer cell the last workers register seconds late and
     // the barrier rightly refuses a window most of the corpus has already
-    // left. Raise the watermark so the corpus stays resident and unpaged;
-    // the alarm is protecting a broker nothing else shares. The exit-code
-    // condition is what makes the `expect` mean "the watermark was raised":
-    // without it a failing rabbitmqctl would leave the default in place and
-    // the run would proceed into the very alarm this guards against.
+    // left. Pin the watermark to an absolute value the corpus clears; the
+    // alarm is protecting a broker nothing else shares, and a fraction of
+    // the VM would move the small-payload numbers with the VM's size (see
+    // the constant). The exit-code condition is what makes the `expect`
+    // mean "the watermark was set": without it a failing rabbitmqctl would
+    // leave the default in place and the run would proceed into the very
+    // alarm this guards against.
     let mut exec = container
         .exec(
             ExecCommand::new([
                 "rabbitmqctl",
                 "set_vm_memory_high_watermark",
+                "absolute",
                 RABBITMQ_MEMORY_HIGH_WATERMARK,
             ])
             .with_cmd_ready_condition(CmdWaitFor::exit_code(0)),
         )
         .await
-        .expect("failed to raise the RabbitMQ memory high watermark");
+        .expect("failed to set the RabbitMQ memory high watermark");
     let _ = exec.stdout_to_vec().await;
     let _container = harness::ContainerGuard::new(container);
 
