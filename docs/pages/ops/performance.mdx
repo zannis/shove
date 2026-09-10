@@ -65,17 +65,18 @@ In order of impact:
 **Batching and payload size.** `BatchConsumer` amortises one handler call over
 `max_batch_size` messages, and that pays when the per-message cost is the
 handler call itself. It does not pay for large payloads. In the committed
-document, the in-process batch flow drains 3-10x faster than the plain parallel
-consumer at 64 B and 2-7x faster at 1 KiB, and 2-4x slower at 64 KiB — so what
-turns the comparison around is payload size. Those 64 KiB rows are read from
-the document rather than off the charts: every in-process 64 KiB drain in the
-published run finished under the harness's reliability floor, so the charts
-withhold all of them. Batch size is not the lever either — an off-matrix probe
-(the pinned matrix has no batch-size axis) varied the flush at 64 KiB and found
-the deficit flat: a 500-message batch (a 32 MB flush) at 55k msg/s, a
-50-message batch at 80k, a 10-message batch at 79k, against the document's
-about 356k for the single-consumer parallel drain. The extra cost is per
-message, not per flush. Batch small messages; consume large ones one at a time.
+document, the in-process batch flow drains 2.8-10.5x faster than the plain
+parallel consumer at 64 B and 2.0-6.9x faster at 1 KiB, and 2.0-3.7x slower at
+64 KiB — so what turns the comparison around is payload size. Those 64 KiB rows
+are read from the document rather than off the charts: every in-process 64 KiB
+drain in the published run finished under the harness's reliability floor, so
+the charts withhold all of them. Batch size is not the lever either — an
+off-matrix probe (the pinned matrix has no batch-size axis) varied the flush at
+64 KiB and found the deficit flat: a 500-message batch (a 32 MB flush) at
+55k msg/s, a 50-message batch at 80k, a 10-message batch at 79k, against the
+document's about 356k for the single-consumer parallel drain. The extra cost is
+per message, not per flush. Batch small messages; consume large ones one at a
+time.
 
 ## prefetch_count deep-dive
 
