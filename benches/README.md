@@ -172,16 +172,16 @@ contend for CPU and skew each other's windows, and two merges into the same
 document race.
 
 The RabbitMQ binary pins the broker's memory high watermark to an absolute
-6 GiB rather than the image's fraction of the VM. The watermark decides how
-much of a six-million-message backlog a 3.8 classic queue keeps in RAM, and
-that window sets the throughput of every small-payload consume cell: measured
-on the 64 B `consumer_group` drain, a 9.6 GB limit drained at 12.2k msg/s
-behind a 262 s fill where 3.1 GB to 6 GiB drained at 17.8k to 19.5k behind
-176 to 181 s fills. A fraction moves with the VM's size, which is how the
-2026-09-09 re-run came in 20 to 45 % under the 2026-09-07 pass on its
-multi-consumer 64 B and 1 KiB cells after the VM grew from 7.8 to 16 GB
-between them. 6 GiB is the floor the 64 KiB corpus needs (5.1 GiB resident)
-without tripping the alarm that #172 removed, so give the VM 16 GB.
+6 GiB rather than the image's fraction of the VM, so the limit a pass runs
+under does not move with the VM: the 2026-09-07 and 2026-09-09 passes ran the
+same fraction on a 7.8 GB and then a 16 GB VM. 6 GiB is the floor the 64 KiB
+corpus needs (5.1 GiB resident) without tripping the alarm that #172 removed,
+so give the VM 16 GB. The value does not set the small-payload throughput:
+on 2026-09-10 same-configuration 64 B drains were bimodal by time of day and
+indifferent to the limit (176 to 181 s fills and 17.8k to 19.5k msg/s in one
+window, 244 to 283 s and 11.4k to 13.6k in another; the 2026-09-07 pass is
+the first mode, 2026-09-09 the second, cause unidentified). Check a pass at
+its first 64 B fill before letting it run for the full four and a half hours.
 
 Every backend's stress binary wires the batch-consume driver, so
 `consume_batch` is measured wherever the backend implements

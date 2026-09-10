@@ -34,28 +34,29 @@ const RABBITMQ_VERSION: &str = "3.8.22";
 /// see the `set_vm_memory_high_watermark` exec in `main` for why the image
 /// default is too low for the 64 KiB corpus.
 ///
-/// Absolute rather than a fraction of the VM, because this number sets how
-/// much of a six-million-message backlog a 3.8 classic queue keeps in RAM,
-/// and that window sets the throughput of every small-payload consume cell.
-/// The broker pages on RSS at half the limit, and RSS runs two to three
-/// times Erlang's allocated bytes during a 64 B fill, so the window tracks
-/// the limit closely. Measured 2026-09-10 on the 64 B consumer_group drain
-/// at one consumer, everything else equal: a 9.6 GB limit (0.6 of a 16 GB
-/// VM) held a ~1M-message window, filled in 262 s and drained at 12.2k
-/// msg/s; 3.1 GB, 4.5 GB and 6 GiB held 240k to 580k, filled in 176 to
-/// 181 s and drained at 18.8k, 19.5k and 17.8k. The fraction form gave the
-/// 2026-09-09 re-run a limit three times the 2026-09-07 run's because the
-/// VM had grown from 7.8 to 16 GB between them, and its multi-consumer 64 B
-/// and 1 KiB cells read 20 to 45 % under the earlier pass for that reason
-/// alone.
+/// Absolute rather than a fraction of the VM so the limit a run measures
+/// under does not move with the VM: the 2026-09-07 and 2026-09-09 passes
+/// ran the same fraction on a 7.8 GB and then a 16 GB VM, which meant
+/// 3.1 GB and then 9.6 GB.
 ///
 /// The floor is the 64 KiB corpus: 49 152 resident messages put the
-/// broker's RSS at 5.1 GiB, so the 4.5 GB that 0.6 stood for on the 8 GB
-/// VM it was chosen on trips the alarm at the end of every 64 KiB fill
-/// (measured 2026-09-10, two of eight samples in alarm), while 6 GiB leaves
-/// about 1 GiB of headroom and saw none. The VM needs room above this for
-/// itself and the other containers; on 2026-09-09 an 8 GB VM thrashed once
-/// the broker was allowed 6.2 GB, so run this harness on a 16 GB VM.
+/// broker's RSS at 5.1 GiB, so a limit of 4.5 GB trips the alarm at the end
+/// of every 64 KiB fill (measured 2026-09-10) and blocks the connection
+/// that is registering the consumers, which is what #172 removed. 6 GiB
+/// leaves about 1 GiB of headroom and saw no alarm. The VM needs room above
+/// this for itself and the other containers; on 2026-09-09 an 8 GB VM
+/// thrashed once the broker was allowed 6.2 GB, so run this harness on a
+/// 16 GB VM.
+///
+/// What the value does not set is the small-payload throughput. On the
+/// 2026-09-10 host, same-configuration runs of the 64 B consumer_group
+/// drain at one consumer were bimodal by time of day and indifferent to
+/// the limit: 176 to 181 s fills and 17.8k to 19.5k msg/s drains in one
+/// window, 244 to 283 s and 11.4k to 13.6k in another, across 9.6 GB, 6 GiB
+/// and 3.1 GB set at startup or changed mid-fill. The 2026-09-07 pass sits
+/// in the first mode and the 2026-09-09 pass in the second; the cause was
+/// not identified. Judge a pass by its first 64 B fill (cell 7) before
+/// letting it run.
 const RABBITMQ_MEMORY_HIGH_WATERMARK: &str = "6144MiB";
 
 #[tokio::main]
