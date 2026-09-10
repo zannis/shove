@@ -328,31 +328,40 @@ container, so it is the one backend whose cap can rise without touching the VM.
 
 At 32 GiB the 64 KiB leg drains 524 288 messages, which puts the fastest cell
 (`consumer_group` at two consumers, 514 k msg/s) at about 0.9 s and the other
-ten at 1.0-5.0 s: the leg publishes instead of being withheld whole. Resident
-cost is ~34 GB. Clearing that last cell as well would need ~40 GiB, and
+ten at 1.0-5.0 s: the leg would publish instead of being withheld whole.
+Resident cost is ~34 GB. Clearing that last cell as well would need ~40 GiB, and
 `MIN_FRAMEWORK_CORPUS_MESSAGES`'s own doc declines to chase a window that
 hardware speed keeps moving — a cell landing under the floor is withheld and
 captioned exactly as before, which costs one bar rather than the pass.
 
 It moves the 1 KiB leg too, by design: at 3 GiB that leg is byte-bound at
-3 145 728, and 32 GiB puts it back on the pinned count of 6 000 000 where the
-64 B leg already sits. In-process then runs two of its three legs on the
-matrix's own corpus rather than one, and the single 1 KiB cell that drained in
-0.97 s clears the floor as well. It costs about forty seconds and 6 GiB rather
-than 3 GiB resident.
+3 145 728, and 32 GiB would put it back on the pinned count of 6 000 000 where
+the 64 B leg already sits. In-process would then run two of its three legs on
+the matrix's own corpus rather than one, and the single 1 KiB cell that drained
+in 0.97 s would clear the floor as well. It costs about forty seconds and 6 GiB
+rather than 3 GiB resident.
+
+**None of that is in the published document.** The cap landed after the
+committed in-process leg was measured, and a leg changes only by being
+re-measured — so `benches/results/bench-results.json` still carries in-process
+at the pinned 3 GiB: `drain.corpus` 49 152 at 64 KiB with all eleven rows
+`setup_bound` and withheld, and 3 145 728 at 1 KiB. That is what the chart
+captions name. The two paragraphs above are what the next in-process pass
+produces, not a description of what is plotted today.
 
 As with the SQS deviation it is recorded on the rows, not only here: every
 drain row carries `drain.corpus`, and where a slice's backends disagree the
-charts name them ("corpus differs by backend: inmemory 524k; …") rather than
-listing sizes unattributed.
+charts name them — today "corpus differs by backend: inmemory, kafka, nats,
+rabbitmq, redis 49k / 3.1M / 6.0M; sqs 49k / 60k" — rather than listing sizes
+unattributed.
 
-One thing it does **not** fix, so a rerun is not read as fixing it: of the four
-cells that failed "consumed before assembly" at 64 KiB with eight consumers,
-in-process was one and this clears it, but the other three are RabbitMQ, whose
-eight-consumer group assembly ran through 37 000-46 300 messages. Putting that
-well under half a corpus needs ~196 k messages, or 12 GiB inside an 8 GB VM.
-Those three are a group-assembly cost rather than a corpus size, and they are
-expected to fail again.
+One thing it does **not** fix, so a rerun is not read as fixing it: of the two
+cells in the published document that failed "consumed before assembly" at
+64 KiB with eight consumers, in-process is one and this clears it; the other is
+RabbitMQ, whose eight-consumer group assembly ran through 46 467 of 49 152
+messages. Putting that well under half a corpus needs ~196 k messages, or
+12 GiB inside an 8 GB VM. That one is a group-assembly cost rather than a
+corpus size, and it is expected to fail again.
 
 ## Results document and provenance
 
