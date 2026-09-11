@@ -91,6 +91,18 @@ from page cache with every fetch full, and no publisher competes for the
 host. It is the number to compare backends and versions by, not a
 prediction of what a live producer at that rate would see.
 
+One class of row on the current host is the opposite of that, and it is not
+comparable with anything: a **single-consumer** drain whose loop spends most
+of each cycle waiting on the Docker VM is measured at a reduced CPU clock, so
+that row is a floor rather than a ceiling. In the committed document it is
+Redis `consume_batch` at 64 B and 1 KiB with one consumer, published at
+0.457x and 0.439x their `consume_parallel` cells — where an unrelated busy
+process on the host takes the same cell *above* that comparator. Do not
+quote, chart or diff a 1c drain rate from this host as a backend or version
+result without reading **A lone consumer on the macOS host clocks down**
+below; on those flows the multi-consumer cells of the same row are the
+comparable ones.
+
 ## The offered-load ladder
 
 The ladder is the latency measurement. For each rate on it the harness
@@ -513,6 +525,19 @@ check before trusting a document:
   whether they share a connection or not (2026-09-10). The publish fill hits
   the same ceiling. A cell 10 to 15 % under its neighbours is inside the
   cell-to-cell noise seen on the same host.
+- A **1-consumer** cell far under its own 2-consumer per-consumer rate on the
+  macOS host is that host's clock management, not the backend and not the
+  flow: the published Redis `consume_batch` 64 B row draws 132k at one
+  consumer against 363k each at two, and repeated quiet-host runs of it draw
+  anywhere in 130-270k. Such a row is a floor, so it is not a rate to reason
+  from and not comparable across backends or versions — see **A lone consumer
+  on the macOS host clocks down**. The per-consumer rate at two consumers is
+  the test, and it isolates the affected rows across the whole document: it is
+  2.75x and 2.37x the 1c rate on those two Redis cells, and no higher than
+  1.07x on all twelve others, which fall from one to two consumers the way
+  contention makes them. A 1c row under parity with a *flat* 2c per-consumer
+  rate — in-process at 1 KiB and 64 KiB, Kafka at 64 B — is a real result and
+  not this effect.
 
 ## Related benchmarks
 
