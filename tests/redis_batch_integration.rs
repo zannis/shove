@@ -785,7 +785,11 @@ async fn a_full_batch_reads_the_next_one_while_the_flush_is_in_flight() {
 
     let mut raw = raw_conn(url).await;
     let mut pending = 0usize;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Generous against a slow CI box — the loop leaves as soon as the count
+    // arrives, so the budget only lengthens a failure. It still has to stay
+    // well under the `handler_timeout` above, because the handler is held for
+    // exactly this long.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
         pending = xpending_count(&mut raw, READ_AHEAD_QUEUE, group).await;
         if pending >= 10 {
