@@ -67,20 +67,18 @@ In order of impact:
 
 **Batching and payload size.** `BatchConsumer` amortises one handler call over
 `max_batch_size` messages, and that pays when the per-message cost is the
-handler call itself. It does not pay for large payloads. In the committed
-document, the in-process batch flow drains 2.7-10.5x faster than the plain
-parallel consumer at 64 B and 1.9-7.0x faster at 1 KiB, and 2.0-3.8x slower at
-64 KiB — so what turns the comparison around is payload size. Every bound is
-rounded outward, so no drain row falls outside a range stated here. Those 64 KiB
-rows are read from the document rather than off the charts: every in-process
-64 KiB drain in the published run finished under the harness's reliability
-floor, so the charts withhold all of them. Batch size is not the lever either — an
-off-matrix probe (the pinned matrix has no batch-size axis) varied the flush at
-64 KiB and found the deficit flat: a 500-message batch (a 32 MB flush) at
-55k msg/s, a 50-message batch at 80k, a 10-message batch at 79k, against the
-document's about 356k for the single-consumer parallel drain. The extra cost is
-per message, not per flush. Batch small messages; consume large ones one at a
-time.
+handler call itself. It stops paying as the payload grows. Comparing the
+in-process batch drain against the plain parallel drain at the same cell, the
+committed document has the batch flow at **3.6-9.7x** the parallel rate at 64 B,
+**0.9-3.1x** at 1 KiB and **0.5-1.2x** at 64 KiB — so what turns the comparison
+around is payload size, and by 64 KiB batching is a wash at best: only the
+eight-consumer cell is above parity there, and the single-consumer one runs at
+about half the parallel rate. Every bound is rounded outward, so no drain row
+falls outside a range stated here. One cell behind these ranges is in the
+document but not on the charts — the 64 B two-consumer batch drain finished
+under the harness's reliability floor and is withheld with an `n/s` marker;
+every 64 KiB drain row publishes. Batch small messages; consume large ones one
+at a time.
 
 ## prefetch_count deep-dive
 
