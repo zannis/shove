@@ -148,6 +148,24 @@ moving bytes.
 | Redis | 1.29M (8c), 2.1x | 770k (8c), 1.5x | 41k (4c), 1.0x |
 | SQS (LocalStack) | 3.2k (8c), 1.1x | 3.3k (8c), 2.5x | 1.9k (8c), 1.1x |
 
+**What batching costs.** A batch flushes when it fills or when `max_batch_age`
+expires, whichever comes first, so the rates above are bought with dispatch
+latency — and the batch flow is on no latency chart, because the
+dispatch-latency family plots the parallel flow only. Over the 120 paired
+offered-load rungs of the same document (`consume_batch` against the plain
+parallel consumer at the same backend, payload, consumer count and offered rate,
+both arms sustaining the rate), batch dispatch p99 runs 6.1-262 ms against
+0.14-340 ms for the comparator, and batch is the slower arm in 115 of them; the
+five exceptions are all in-process rungs where the parallel consumer was itself
+the slower one. What sets the cost is `max_batch_age`, not batching: at the
+5,000 msg/s rung a 500-message batch does not fill inside 250 ms, so p99 lands
+on the age bound in 60 of 60 rungs, 100-262 ms; by 100,000 msg/s the size bound
+fires first and batch p99 falls as low as 6.1 ms. Lower `max_batch_age` to buy
+the latency back, at the cost of the amortisation the table measures. SQS
+contributes no rung — its batch consumers never kept pace with the paced
+producer, so its percentiles there measure backlog rather than dispatch. Every
+bound is rounded outward, so no rung falls outside a range stated here.
+
 ## Learn more
 
 - [Getting Started](https://shove.rs/getting-started)
