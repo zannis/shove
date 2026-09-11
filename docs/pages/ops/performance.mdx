@@ -53,9 +53,10 @@ These bars are the plain parallel consumer. `BatchConsumer` is measured in the
 same document and deliberately absent here: its percentiles are set by
 `max_batch_age` rather than by the backend, and the rung this chart picks per
 backend — the least-parallel worker count that sustained a rung, at the highest
-rate it sustained — is the one where that effect is at its smallest, so a batch
-series drawn under this chart's own policy would understate the cost rather
-than publish it. The measured cost is stated as a number under
+rate it sustained — is a cell where a batch fills in 5 ms to 100 ms and so never
+waits out the age bound, which is where the effect is at its smallest. A batch
+series drawn under this chart's own policy would understate the cost rather than
+publish it. The measured cost is stated as a number under
 [The throughput levers](#the-throughput-levers) instead.
 
 ### Framework overhead
@@ -92,35 +93,48 @@ at a time.
 **What batching costs, and the knob that sets it.** Those ratios are throughput.
 A batch flushes when it reaches `max_batch_size` or when `max_batch_age`
 expires, whichever comes first, so a message can wait for the rest of its batch
-— and that wait is the price of the amortisation. Over the 120 paired
-offered-load rungs of the same document — `consume_batch` against the plain
-parallel consumer at the same backend, payload, consumer count and offered rate,
-both arms sustaining the rate, every batch row at the defaults
-(`max_batch_size` 500, `max_batch_age` 250 ms) — batch dispatch p99 runs
-**6.1-262 ms** against **0.14-340 ms** for the comparator, and batch is the
-slower arm in **115 of the 120**. The five exceptions are all in-process rungs
-where the parallel consumer was itself the slower one, its own p99 reaching
-340 ms at 64 KiB.
+— and that wait is the price of the amortisation. What it costs is decided by
+which of the two bounds fires, so the two regimes are worth reading separately
+rather than pooled.
 
-What matters here is not the ratio but which of the two bounds is binding. The
-cost is `max_batch_age`, not batching: at the 5,000 msg/s rung a consumer sees
-625-5,000 msg/s, so 500 messages take 100 ms to 800 ms to arrive, the age bound
-fires first, and p99 lands on it in **60 of those 60 rungs** at
-**100-262 ms** — 1.7x to 1744x the comparator, by backend **36x-1744x**
-in-process, **7.4x-22.2x** on Kafka, **1.7x-97.7x** on NATS,
-**2.7x-98.9x** on RabbitMQ and **13.6x-97x** on Redis, twelve rungs each. Raise
-the offered rate and the size bound takes over instead: at 100,000 msg/s a
-consumer fills 500 messages in 5 ms to 40 ms, and across those sixteen rungs
-batch p99 comes off the age bound entirely, down to **6.1-104 ms**. So the lever
-is `max_batch_age` — lower it to shorten the wait, and pay for it in smaller
-average batches and less amortisation. Every bound here is rounded outward too,
-so no rung falls outside a range stated; note that the largest measured p99 is
-261.85 ms, *above* the 250 ms age bound, so read 250 ms as the wait a message
-can accrue before a flush is triggered and not as a cap on the percentile. SQS
-contributes no rung: all
-twelve of its batch offered-load rows are `sustained: false`, so their
-percentiles are backlog residency and not dispatch, and the harness withholds
-them.
+The comparison throughout is a **paired offered-load rung**: one `consume_batch`
+row against the plain parallel consumer at the same backend, payload, consumer
+count and offered rate, both arms sustaining the rate, every batch row at the
+defaults (`max_batch_size` 500, `max_batch_age` 250 ms). The document has 120 of
+them, across five backends.
+
+**When the batch cannot fill, the age bound is the whole cost.** A consumer has
+to see 2,000 msg/s to collect 500 messages inside 250 ms. In the **30** rungs
+below that — 625 to 1,250 msg/s per consumer, six on every backend — batch
+dispatch p99 is **250-262 ms in all 30**, against **0.14-144 ms** for the
+comparator, and batch is the slower arm in **30 of 30**. By backend the ratio is
+**145x-1744x** in-process, **14.7x-22.2x** on Kafka, **1.7x-97.7x** on NATS,
+**4x-98.9x** on RabbitMQ and **66x-97x** on Redis, six rungs each. That spread
+is the comparator's, not the batch side's: batch p99 sits within 12 ms of the
+age bound in every one of the 30, while the parallel consumer ranges from
+0.14 ms in-process at 64 B to 143.74 ms on NATS at 64 KiB. Read the absolute
+number, not the multiple — if a consumer is not fed 2,000 msg/s, batching costs
+it about a quarter of a second at p99, whatever the backend.
+
+**When the batch can fill, the wait shrinks with the fill.** Across the other
+**90** rungs batch p99 runs **6.1-251 ms** and batch is the slower arm in
+**85 of 90**; at 100,000 msg/s, where a consumer fills 500 messages in 5 ms to
+40 ms, it is down to **6.1-104 ms** over sixteen rungs. The five rungs where
+batch is *not* slower are all in-process, and all of them are cases where the
+parallel consumer was itself the slower arm — its own p99 reaches 339.2 ms at
+64 KiB, against batch's 234.7 ms at the same cell. Pooled over all 120 rungs
+batch loses 115, but that pooled figure is the weakest way to read the trade: it
+mixes a regime where the cost is fixed at the age bound with one where it tracks
+the arrival rate.
+
+So the lever is `max_batch_age` — lower it to shorten the wait, and pay for it
+in smaller average batches and less amortisation. Every bound here is rounded
+outward, so no rung falls outside a range stated; note that the largest measured
+p99 is 261.85 ms, *above* the 250 ms age bound, so read 250 ms as the wait a
+message can accrue before a flush is triggered and not as a cap on the
+percentile. SQS contributes no rung: all twelve of its batch offered-load rows
+are `sustained: false`, so their percentiles are backlog residency and not
+dispatch, and the harness withholds them.
 
 ## prefetch_count deep-dive
 

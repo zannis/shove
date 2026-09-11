@@ -148,23 +148,29 @@ moving bytes.
 | Redis | 1.29M (8c), 2.1x | 770k (8c), 1.5x | 41k (4c), 1.0x |
 | SQS (LocalStack) | 3.2k (8c), 1.1x | 3.3k (8c), 2.5x | 1.9k (8c), 1.1x |
 
-**What batching costs.** A batch flushes when it fills or when `max_batch_age`
-expires, whichever comes first, so the rates above are bought with dispatch
-latency — and the batch flow is on no latency chart, because the
-dispatch-latency family plots the parallel flow only. Over the 120 paired
-offered-load rungs of the same document (`consume_batch` against the plain
+**What batching costs.** A batch flushes when it reaches `max_batch_size` or
+when `max_batch_age` expires, whichever comes first, so the rates above are
+bought with dispatch latency — and the batch flow is on no latency chart,
+because the dispatch-latency family plots the parallel flow only. What the wait
+costs depends on which of the two bounds fires. The comparison is the paired
+offered-load rungs of the same document: `consume_batch` against the plain
 parallel consumer at the same backend, payload, consumer count and offered rate,
-both arms sustaining the rate), batch dispatch p99 runs 6.1-262 ms against
-0.14-340 ms for the comparator, and batch is the slower arm in 115 of them; the
-five exceptions are all in-process rungs where the parallel consumer was itself
-the slower one. What sets the cost is `max_batch_age`, not batching: at the
-5,000 msg/s rung a 500-message batch does not fill inside 250 ms, so p99 lands
-on the age bound in 60 of 60 rungs, 100-262 ms; by 100,000 msg/s the size bound
-fires first and batch p99 falls as low as 6.1 ms. Lower `max_batch_age` to buy
-the latency back, at the cost of the amortisation the table measures. SQS
-contributes no rung — its batch consumers never kept pace with the paced
-producer, so its percentiles there measure backlog rather than dispatch. Every
-bound is rounded outward, so no rung falls outside a range stated here.
+both arms sustaining the rate, every batch row at the defaults
+(`max_batch_size` 500, `max_batch_age` 250 ms). In the **30** rungs where a
+consumer sees under 2,000 msg/s — so 500 messages cannot arrive within 250 ms
+and the age bound has to fire — batch dispatch p99 is **250-262 ms in all 30**
+against 0.14-144 ms for the comparator, and batch is the slower arm in **30 of
+30**, by 1.7x to 1744x. The ratio spans that much only because the comparator
+does: 0.14 ms in-process at 64 B, 143.74 ms on NATS at 64 KiB. The batch side
+does not move. Where the batch fills first the wait shrinks with it: across the
+other 90 rungs batch p99 runs 6.1-251 ms and is the slower arm in 85, the five
+exceptions all in-process rungs where the parallel consumer was itself the
+slower one. Pooled, batch loses 115 of the 120. So `max_batch_age` is
+the lever, not batching — lower it to shorten the wait, and pay for it in
+smaller batches and less of the amortisation the table measures. SQS contributes
+no rung: its batch consumers never kept pace with the paced producer, so its
+percentiles there measure backlog rather than dispatch. Every bound is rounded
+outward, so no rung falls outside a range stated here.
 
 ## Learn more
 
