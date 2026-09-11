@@ -43,7 +43,9 @@
       "nanoid@<3.3.16": ">=3.3.16",
       "@hono/node-server@<1.19.15": ">=1.19.15",
       "nanoid@<3.3.18": ">=3.3.18",
-      "postcss@<=8.5.17": ">=8.5.18"
+      "postcss@<=8.5.17": ">=8.5.18",
+      "toml@<4.2.0": ">=4.2.0",
+      "hono@<4.13.5": ">=4.13.5"
     }
   },
   "packageManager": "pnpm@10.33.2+sha512.a90faf6feeab71ad6c6e57f94e0fe1a12f5dcc22cd754db40ae9593eb6a3e0b6b12e3540218bb37ae083404b1f2ce6db2a4121e979829b4aff94b99f49da1cf8"
