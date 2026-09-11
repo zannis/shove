@@ -2358,6 +2358,16 @@ async fn read_ahead_batch(
 /// read-ahead, and the shutdown drain — so that none of them can arm the
 /// deadline differently from the others. The deadline means "age of the
 /// oldest message buffered", and it is never pushed back.
+///
+/// `read_at` is when these entries left the stream, and the deadline is armed
+/// `max_batch_age` from it rather than from the ingest. For the loop's own
+/// read the two are the same instant. For the read-ahead they are not: its
+/// reply waits in `prefetched` for as long as the flush that issued it runs,
+/// and `max_batch_age` bounds how long this loop may sit on an entry it has
+/// already taken out of the stream — the entry is in the PEL and counting
+/// against its own reclaim from the moment it is read, so the age clock may
+/// not restart just because the entry is parked in a local variable rather
+/// than in `batch`.
 #[allow(clippy::too_many_arguments)]
 async fn ingest_entries<T: Topic>(
     conn: &mut RedisConnection,
@@ -2371,6 +2381,7 @@ async fn ingest_entries<T: Topic>(
     batch: &mut RedisBatch<T>,
     deadline: &mut Option<Instant>,
     max_batch_age: Duration,
+    read_at: Instant,
 ) -> Result<()> {
     for (entry_id, fields_vec) in entries {
         ingest_batch_entry::<T>(
@@ -2393,7 +2404,7 @@ async fn ingest_entries<T: Topic>(
             // not above. An age too large for the clock to represent leaves
             // the deadline unarmed, which is what such an age means — no age
             // trigger, with the size trigger still bounding the batch.
-            *deadline = Instant::now().checked_add(max_batch_age);
+            *deadline = read_at.checked_add(max_batch_age);
         }
     }
     Ok(())
@@ -2761,7 +2772,8 @@ where
 /// (history reads never block) — raced `biased` against shutdown exactly
 /// like `run_stream_loop_arc`, including the `NOGROUP` → retryable mapping.
 /// Every returned entry is decoded via [`ingest_batch_entry`]; the age
-/// deadline arms on the first message pushed into an empty batch and is
+/// deadline arms on the first message pushed into an empty batch, measured
+/// from when that message left the stream (see [`ingest_entries`]), and is
 /// never pushed back. After ingesting, the deadline is re-checked and a
 /// flush fires if it has elapsed. `replay_cursor` advances via
 /// [`next_replay_cursor`] after every history read; an empty history reply
@@ -2786,12 +2798,19 @@ where
 /// are per consumer — N loops fill each other's gaps, one loop has nothing
 /// to fill its own with.
 ///
-/// Four properties keep it from changing what a handler sees:
+/// Five properties keep it from changing what a handler sees:
 ///
 /// - **No surplus, so `max_batch_size` still bounds a handler call.** The
 ///   read-ahead is armed only where a flush is about to empty the batch, so
 ///   its at-most-`max_batch_size` entries are always ingested into an empty
 ///   buffer.
+/// - **`max_batch_age` still bounds the wait, flush time included.** The
+///   deadline for a prefetched entry is armed from the instant its read was
+///   issued, not from the ingest that follows the flush, so parking a reply
+///   in `prefetched` cannot extend how long this loop sits on an entry it
+///   has already taken out of the stream. A flush that outlasts
+///   `max_batch_age` therefore hands its read-ahead to a handler as soon as
+///   the loop re-enters, rather than starting a fresh window.
 /// - **Never during a replay.** A live `>` read would interleave
 ///   never-delivered entries into a PEL drain.
 /// - **Dropped on `Redeliver`.** That settlement arms `replay_cursor = "0"`,
@@ -2910,10 +2929,12 @@ where
             let mut deadline: Option<Instant> = None;
             let mut redelivery_backoff = batch_redelivery_backoff();
             let mut replay_cursor: Option<String> = None;
-            // The read-ahead's reply, waiting to seed the next batch. Only
-            // ever `Some` between a size-triggered flush and the ingest that
-            // immediately follows it.
-            let mut prefetched: Option<BatchEntries> = None;
+            // The read-ahead's reply, waiting to seed the next batch, paired
+            // with the instant its read was issued. Only ever `Some` between
+            // a size-triggered flush and the ingest that immediately follows
+            // it. The instant rides along because the age deadline is armed
+            // from it, not from the ingest — see `ingest_entries`.
+            let mut prefetched: Option<(Instant, BatchEntries)> = None;
 
             loop {
                 if batch.len() >= max_batch_size {
@@ -2941,6 +2962,12 @@ where
                     // drain, and `next_replay_cursor` only describes the
                     // history read it advanced from.
                     let read_ahead_armed = replay_cursor.is_none();
+                    // Taken before the read is issued rather than when its
+                    // reply lands: the age bound this arms is an upper bound,
+                    // so the conservative end is the earlier instant, and the
+                    // reply can be delayed behind the flush's own `XACK` on
+                    // the shared socket.
+                    let read_at = Instant::now();
                     let (ahead, flushed) = tokio::join!(
                         async {
                             if read_ahead_armed {
@@ -2984,7 +3011,11 @@ where
                     // these entries as well — ingesting them here too would
                     // hand the same entries to the handler twice within one
                     // process.
-                    prefetched = if replay_cursor.is_some() { None } else { ahead };
+                    prefetched = if replay_cursor.is_some() {
+                        None
+                    } else {
+                        ahead.map(|entries| (read_at, entries))
+                    };
                     deadline = None;
                     continue;
                 }
@@ -2995,7 +3026,7 @@ where
                     // graceful stop flushes what this loop holds, and the
                     // read-ahead makes "holds" include entries fetched while
                     // the previous flush ran.
-                    if let Some(entries) = prefetched.take() {
+                    if let Some((read_at, entries)) = prefetched.take() {
                         ingest_entries::<T>(
                             &mut conn,
                             stream,
@@ -3008,6 +3039,7 @@ where
                             &mut batch,
                             &mut deadline,
                             max_batch_age,
+                            read_at,
                         )
                         .await?;
                     }
@@ -3037,7 +3069,7 @@ where
                 // entries into a buffer the flush that issued it emptied, so
                 // it needs no headroom recomputation and never touches
                 // `replay_cursor`.
-                if let Some(entries) = prefetched.take() {
+                if let Some((read_at, entries)) = prefetched.take() {
                     ingest_entries::<T>(
                         &mut conn,
                         stream,
@@ -3050,6 +3082,7 @@ where
                         &mut batch,
                         &mut deadline,
                         max_batch_age,
+                        read_at,
                     )
                     .await?;
                     continue;
@@ -3109,6 +3142,11 @@ where
                     }
                 };
 
+                // When these entries left the stream. Unlike the read-ahead's
+                // instant this is taken when the reply lands, not when the
+                // read was issued: this read `BLOCK`s, so the entries need
+                // not have existed when it went out.
+                let read_at = Instant::now();
                 let entries = parse_xreadgroup_reply(raw_reply, headroom);
 
                 if is_replay {
@@ -3127,6 +3165,7 @@ where
                     &mut batch,
                     &mut deadline,
                     max_batch_age,
+                    read_at,
                 )
                 .await?;
 

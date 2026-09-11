@@ -858,9 +858,8 @@ async fn a_full_batch_reads_the_next_one_while_the_flush_is_in_flight() {
 }
 
 /// A read-ahead that comes back **short** of `max_batch_size` still flushes on
-/// the age trigger, and its age window is the one this loop documents: it
-/// starts when the entry is ingested into the batch, i.e. after the flush that
-/// fetched it returns.
+/// the age trigger, and its age window runs from the **fetch**, not from the
+/// ingest that follows the flush.
 ///
 /// This is the partial case the full-batch test above cannot reach — there the
 /// read-ahead returns `max_batch_size` entries and the size trigger fires the
@@ -868,19 +867,27 @@ async fn a_full_batch_reads_the_next_one_while_the_flush_is_in_flight() {
 /// messages against `max_batch_size` 5 leave the read-ahead holding exactly
 /// one, and only the age trigger can retire it.
 ///
-/// The window deliberately does **not** run from the fetch. `max_batch_age` is
-/// documented as time "since the first message in the current batch", and a
-/// read-ahead entry is not in a batch until it is ingested; the entry is also
-/// not delayed by measuring it this way, because without the read-ahead the
-/// loop could not have fetched it before the flush returned either. The
-/// assertions below pin both halves: nothing is handed to the handler during
-/// the hold, and the sixth message follows within one age window of the
-/// release.
+/// `max_batch_age` bounds how long this loop may sit on a message it has taken
+/// out of the stream, so the clock starts where the entry left Redis — the
+/// read-ahead — and not where it happens to enter the `batch` buffer. The
+/// distinction is the whole point of the test, so the assertions are built to
+/// separate the two:
+///
+/// - `HOLD` is three age windows, so by the release a fetch-armed deadline has
+///   long elapsed and an ingest-armed one has not started.
+/// - The release-to-handler delay is therefore bounded **below one half of an
+///   age window**. A fetch-armed deadline flushes as soon as the loop re-enters
+///   (tens of ms); an ingest-armed deadline cannot beat `BATCH_AGE`, so it
+///   fails this bound by ~2x rather than passing a loose multiple of it.
+/// - The during-hold call count pins serialization only — no handler call
+///   overlaps the flush that fetched the entry. It holds under either arming
+///   choice and is not the discriminator; the bound above is.
 #[tokio::test]
-async fn a_partial_read_ahead_batch_flushes_on_its_own_age_window() {
-    const BATCH_AGE: Duration = Duration::from_millis(300);
-    // Long enough that a window started at the fetch would have expired many
-    // times over during the hold, so "did it flush early?" is unambiguous.
+async fn a_partial_read_ahead_batch_ages_from_its_fetch_not_its_ingest() {
+    // A full second, so the discriminating bound below (half a window) sits far
+    // above loop-reentry overhead and far below a window.
+    const BATCH_AGE: Duration = Duration::from_secs(1);
+    // Three age windows: a fetch-armed deadline expires well inside the hold.
     const HOLD: Duration = Duration::from_secs(3);
 
     let url = redis_url().await;
@@ -943,8 +950,10 @@ async fn a_partial_read_ahead_batch_flushes_on_its_own_age_window() {
          while it ran; {pending} means the loop waited for the flush before reading"
     );
 
-    // Hold well past `BATCH_AGE`. A window armed at the fetch would have fired
-    // inside this sleep; the handler call count proves it did not.
+    // Hold three age windows. This pins serialization, not the arming point:
+    // the loop cannot flush the prefetched entry while the flush that fetched
+    // it is still awaiting the handler, so one call is expected whether the
+    // deadline was armed at the fetch or at the ingest.
     tokio::time::sleep(HOLD).await;
     assert_eq!(
         handler.calls(),
@@ -957,8 +966,8 @@ async fn a_partial_read_ahead_batch_flushes_on_its_own_age_window() {
     handler.release();
     assert!(
         poll_until(|| handler.calls() >= 2, TIMEOUT).await,
-        "the prefetched entry should flush on its age window once the first \
-         flush returns, saw {:?}",
+        "the prefetched entry should flush as soon as the first flush returns, \
+         saw {:?}",
         handler.batches()
     );
     shutdown.cancel();
@@ -981,16 +990,19 @@ async fn a_partial_read_ahead_batch_flushes_on_its_own_age_window() {
         "the second call is the single read-ahead entry, retired by the age trigger"
     );
 
-    // The latency that matters, and the one a window armed at the fetch would
-    // have changed: measured from the flush returning, not from the fetch.
-    // Generously bounded because the release wakes a task that must still
-    // ingest and re-enter the loop, but far below `HOLD` — the point is that
-    // the window restarts here rather than having already elapsed.
+    // The discriminating assertion. The entry was fetched before the hold
+    // started, so at the release its fetch-armed deadline is two age windows
+    // past due and the only work left is waking the loop, ingesting, and
+    // re-blocking for the 1 ms floor — tens of milliseconds. A deadline armed
+    // at the ingest instead cannot deliver before `BATCH_AGE`, so it fails
+    // this bound by about 2x. The bound is half a window rather than a loose
+    // multiple of one precisely so the two outcomes cannot both pass.
     let delay = batches[1].0.saturating_duration_since(released_at);
     assert!(
-        delay < BATCH_AGE * 10,
-        "the prefetched entry should follow the release by about one age \
-         window, took {delay:?}"
+        delay < BATCH_AGE / 2,
+        "the prefetched entry's age window runs from its fetch, so it must \
+         flush promptly once the first flush returns rather than waiting a \
+         fresh {BATCH_AGE:?} window; took {delay:?}"
     );
 
     assert_eq!(
