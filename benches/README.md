@@ -533,11 +533,12 @@ check before trusting a document:
   from and not comparable across backends or versions — see **A lone consumer
   on the macOS host clocks down**. The per-consumer rate at two consumers is
   the test, and it isolates the affected rows across the whole document: it is
-  2.75x and 2.37x the 1c rate on those two Redis cells, and no higher than
-  1.07x on all twelve others, which fall from one to two consumers the way
-  contention makes them. A 1c row under parity with a *flat* 2c per-consumer
-  rate — in-process at 1 KiB and 64 KiB, Kafka at 64 B — is a real result and
-  not this effect.
+  2.75x and 2.37x the 1c rate on those two Redis cells, and **at most 1.08x**
+  on every one of the eleven other 1c cells that has a 2c batch row to compare
+  against (in-process at 64 B has none) — they fall from one to two consumers
+  the way contention makes them. So a 1c row under parity with a *flat* 2c
+  per-consumer rate — in-process at 1 KiB and 64 KiB, Kafka at 64 B — is a
+  real result and not this effect.
 
 ## Related benchmarks
 
