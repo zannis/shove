@@ -18,7 +18,7 @@ use lapin::{Connection, ConnectionProperties};
 use shove::batch_consumer::BatchConsumerOptions;
 use shove::rabbitmq as rmq;
 use shove::{Backend, Broker, RabbitMq, Topic};
-use testcontainers::core::ExecCommand;
+use testcontainers::core::{CmdWaitFor, ExecCommand};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::rabbitmq::RabbitMq as RabbitMqImage;
 
@@ -28,6 +28,37 @@ use harness::{BatchConsumeFn, DlqDrainFn, HarnessConfig, StressTestTopic, run_al
 /// default), recorded in the
 /// results provenance so a reader knows which server produced the numbers.
 const RABBITMQ_VERSION: &str = "3.8.22";
+
+/// Memory the broker may hold before its memory alarm blocks publishers,
+/// as an absolute amount (`MiB`: rabbitmqctl reads a bare `MB` as 10^6);
+/// see the `set_vm_memory_high_watermark` exec in `main` for why the image
+/// default is too low for the 64 KiB corpus.
+///
+/// Absolute rather than a fraction of the VM so the limit a run measures
+/// under does not move with the VM: the 2026-09-07 and 2026-09-09 passes
+/// ran the same fraction on a 7.8 GB and then a 16 GB VM, which meant
+/// 3.1 GB and then 9.6 GB.
+///
+/// The floor is the 64 KiB corpus: 49 152 resident messages put the
+/// broker's RSS at 5.1 GiB, so a limit of 4.5 GB trips the alarm at the end
+/// of every 64 KiB fill (measured 2026-09-10) and blocks the connection
+/// that is registering the consumers, which is what #172 removed. 6 GiB
+/// leaves about 1 GiB of headroom and saw no alarm. The VM needs room above
+/// this for itself and the other containers; on 2026-09-09 an 8 GB VM
+/// thrashed once the broker was allowed 6.2 GB, so run this harness on a
+/// 16 GB VM.
+///
+/// What the value does not set is the small-payload throughput. On
+/// 2026-09-10, same-configuration runs of the 64 B consumer_group drain at
+/// one consumer split by whether macOS Low Power Mode was in effect and by
+/// nothing else: with it off, 176 to 181 s fills and 17.8k to 19.5k msg/s
+/// drains; with it on, 244 to 283 s and 11.4k to 13.6k, across 9.6 GB,
+/// 6 GiB and 3.1 GB set at startup or changed mid-fill. Low Power Mode caps
+/// the CPU and the Docker VM with it at about 0.6x, publish cells included,
+/// and this host enables it on battery. The 2026-09-09 pass was measured
+/// that way, which is the whole of its gap to the earlier pass.
+/// `scripts/bench.sh` refuses to start with the mode in effect.
+const RABBITMQ_MEMORY_HIGH_WATERMARK: &str = "6144MiB";
 
 #[tokio::main]
 async fn main() {
@@ -48,6 +79,32 @@ async fn main() {
         ]))
         .await
         .expect("failed to enable consistent-hash plugin");
+    let _ = exec.stdout_to_vec().await;
+    // The 64 KiB drain corpus is 3.2 GB of queued messages, and the image's
+    // default high watermark (0.4 of the Docker VM's memory, about 3.4 GB
+    // on an 8 GB VM) sits right on top of it. Tripping the memory alarm
+    // blocks the connection that is also registering the consumers, so on
+    // an eight-consumer cell the last workers register seconds late and
+    // the barrier rightly refuses a window most of the corpus has already
+    // left. Pin the watermark to an absolute value the corpus clears; the
+    // alarm is protecting a broker nothing else shares, and a fraction of
+    // the VM would move the small-payload numbers with the VM's size (see
+    // the constant). The exit-code condition is what makes the `expect`
+    // mean "the watermark was set": without it a failing rabbitmqctl would
+    // leave the default in place and the run would proceed into the very
+    // alarm this guards against.
+    let mut exec = container
+        .exec(
+            ExecCommand::new([
+                "rabbitmqctl",
+                "set_vm_memory_high_watermark",
+                "absolute",
+                RABBITMQ_MEMORY_HIGH_WATERMARK,
+            ])
+            .with_cmd_ready_condition(CmdWaitFor::exit_code(0)),
+        )
+        .await
+        .expect("failed to set the RabbitMQ memory high watermark");
     let _ = exec.stdout_to_vec().await;
     let _container = harness::ContainerGuard::new(container);
 
@@ -179,9 +236,15 @@ async fn main() {
         || {
             let uri = uri.clone();
             async move {
-                <RabbitMq as Backend>::connect(rmq::RabbitMqConfig::new(&uri))
-                    .await
-                    .expect("connect RabbitMQ")
+                harness::connect_with_retries("RabbitMQ", 10, Duration::from_secs(1), || {
+                    let uri = uri.clone();
+                    async move {
+                        <RabbitMq as Backend>::connect(rmq::RabbitMqConfig::new(&uri))
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                })
+                .await
             }
         },
         |consumers, prefetch, concurrent| {

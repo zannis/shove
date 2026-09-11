@@ -21,10 +21,12 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+use crate::backend::batch_consumer::settling::{
+    PREALLOC_CAP, RejectSettlement, TerminalDiscard, batch_redelivery_backoff,
+    invoke_batch_handler, next_redelivery_delay, reject_settlement,
+};
 use crate::backend::batch_consumer::{
-    BatchConsumerOptionsInner, BatchSettlement, PREALLOC_CAP, RejectSettlement, TerminalDiscard,
-    batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay, reject_settlement,
-    settle_batch_outcome, validate_batch_topic,
+    BatchConsumerOptionsInner, BatchSettlement, settle_batch_outcome, validate_batch_topic,
 };
 use crate::backend::broadcast::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_broadcast_outcome};
 use crate::batch_consumer::BatchConsumerOptions as GenericBatchConsumerOptions;
@@ -2425,10 +2427,9 @@ async fn settle_dropped(
 /// The buffer is left empty on every path; the caller only has to disarm the
 /// deadline.
 ///
-/// The handler itself is invoked through
-/// [`invoke_batch_handler`](crate::backend::batch_consumer::invoke_batch_handler) —
-/// shared across every backend with a batch implementation now, not
-/// Kafka-specific — which supplies the panic containment, timeout and
+/// The handler itself is invoked through [`invoke_batch_handler`] —
+/// shared batching machinery, not Kafka-specific — which supplies the
+/// panic containment, timeout and
 /// instrumentation this flush relies on. See that function's doc for why the
 /// guard exists and why the handler future is built *inside* it.
 async fn flush_batch<T, H>(

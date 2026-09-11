@@ -125,9 +125,15 @@ async fn main() {
         || {
             let url = url.clone();
             async move {
-                <Nats as Backend>::connect(NatsConfig::new(&url))
-                    .await
-                    .expect("connect NATS")
+                harness::connect_with_retries("NATS", 10, Duration::from_secs(1), || {
+                    let url = url.clone();
+                    async move {
+                        <Nats as Backend>::connect(NatsConfig::new(&url))
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                })
+                .await
             }
         },
         |consumers, prefetch, concurrent| {

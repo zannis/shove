@@ -1,16 +1,22 @@
 # Performance Tuning
 
-Most `shove` performance questions resolve to four levers: prefetch count, worker count, the concurrent-processing flag, and (negatively) transactional mode. Knowing which lever to pull first — and which to ignore — is what this page is for. The charts below are generated from a committed results document covering all six backends, and each carries its own provenance (shove version, generation date, hardware) in the caption; always measure on your own hardware and workload.
+Most `shove` performance questions resolve to four levers: prefetch count, worker count, the concurrent-processing flag, and (negatively) transactional mode. Knowing which lever to pull first — and which to ignore — is what this page is for. The charts below are generated from a committed results document, and each carries its own provenance (shove version, generation date, hardware) in the caption; always measure on your own hardware and workload.
 
 ## Benchmarks
 
 Two conventions hold across every chart. A backend that cannot do a flow
 (`HasBroadcast` / `HasCoordinatedGroups` gate them at compile time) appears as
-an explicit "not supported" marker, never as a zero. And SQS is not measured
-in this document at all: it only runs against LocalStack (non-representative
-by design), which requires a LocalStack Pro auth token that was unavailable
-where these results were generated — the charts carry an explicit "not
-measured" note for it instead of a plotted series.
+an explicit "not supported" marker, never as a zero. And a backend the results
+document does not contain is never plotted, so absence from a chart means "not
+measured here", not "slow".
+
+The document these charts render from measures all six backends: **in-process**,
+**Kafka**, **NATS**, **RabbitMQ**, **Redis** and **SQS**. The SQS rows measure
+LocalStack, which is non-representative of the AWS service by design, and run a
+smaller corpus than the other backends; the rows and the charts record both
+(see the benchmark runbook's "The SQS corpus deviation"). Every run was measured
+on the same host: the harness refuses to merge runs from different hosts into
+one document.
 
 ### Throughput vs consumer count
 
@@ -55,6 +61,21 @@ In order of impact:
 - **Worker count** (linear scaling on handler-bound workloads): more concurrent handlers means more throughput when handlers are CPU- or I/O-bound. Scaling is close to linear until you hit a broker or partition limit.
 - **`concurrent_processing` flag**: `true` allows multiple handler invocations to run concurrently within a single worker, bounded by `prefetch_count`. `false` (default) processes one message at a time per worker.
 - **Transactional mode** (negative lever): the `rabbitmq-transactional` feature reduces throughput roughly 10–15× per channel compared to non-transactional. The trade-off is routing safety — every ack and publish land in the same AMQP transaction.
+
+**Batching and payload size.** `BatchConsumer` amortises one handler call over
+`max_batch_size` messages, and that pays when the per-message cost is the
+handler call itself. It does not pay for large payloads. In the committed
+document, the in-process batch flow drains 3-10x faster than the plain parallel
+consumer at 64 B and 2-7x faster at 1 KiB, and 2-4x slower at 64 KiB — so what
+turns the comparison around is payload size. Those 64 KiB rows are read from
+the document rather than off the charts: every in-process 64 KiB drain in the
+published run finished under the harness's reliability floor, so the charts
+withhold all of them. Batch size is not the lever either — an off-matrix probe
+(the pinned matrix has no batch-size axis) varied the flush at 64 KiB and found
+the deficit flat: a 500-message batch (a 32 MB flush) at 55k msg/s, a
+50-message batch at 80k, a 10-message batch at 79k, against the document's
+about 356k for the single-consumer parallel drain. The extra cost is per
+message, not per flush. Batch small messages; consume large ones one at a time.
 
 ## prefetch_count deep-dive
 

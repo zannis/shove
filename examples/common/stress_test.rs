@@ -130,6 +130,18 @@ pub const DEFAULT_LOAD_PRODUCERS: u16 = 4;
 /// 64 KiB corpus to a few tens of thousands of messages, which the in-process
 /// backend holds resident and Kafka writes to disk before every cell.
 pub const DEFAULT_DRAIN_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Default `--load-backlog-max-bytes`: the most backlog (`lag × payload_bytes`)
+/// an offered-load rung may build before its producers are stopped. Lower
+/// than the drain cap on purpose: a drain corpus sits on an idle broker before
+/// the consumers start, while a rung's backlog piles onto a broker that is
+/// also serving the consumers and still reclaiming the previous cell — Redis
+/// stopped answering under a 3.2 GB backlog on 2026-09-08 having drained a
+/// 3.2 GB corpus minutes earlier. A rung a gigabyte behind is unsustained by
+/// any definition, so nothing that passes is changed by stopping there.
+pub const DEFAULT_LOAD_BACKLOG_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+// The backlog cap protects a busier broker than the drain cap does, so it
+// must never default above it.
+const _: () = assert!(DEFAULT_LOAD_BACKLOG_MAX_BYTES < DEFAULT_DRAIN_MAX_BYTES);
 /// The share of a drain's corpus left out of the measured window at the end:
 /// the window closes at `corpus − corpus / DRAIN_TAIL_DIVISOR` unique
 /// completions. Partitions (or the shared queue) run dry at different
@@ -271,12 +283,32 @@ pub struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub drain_messages: Option<u64>,
 
+    /// Corpus per FIFO worker for the `consume-fifo` cell, in place of the
+    /// tier's per-consumer count and in the same unit: the cell's corpus is
+    /// this value times the workers the backend reports for FIFO (one per
+    /// shard on most backends, one in total on Kafka), exactly as the tier's
+    /// count is. FIFO holds no barrier and takes no drain, so this is the
+    /// only knob that sizes it; every other flow keeps the tier's count. It
+    /// exists for a backend whose FIFO path is slow enough that the tier's
+    /// corpus stops being a cell and becomes a day (SQS on LocalStack). The
+    /// row records the corpus it ran in `messages`.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub fifo_messages: Option<u64>,
+
     /// Cap on a drain corpus in bytes (`corpus × payload_bytes`), default
     /// 2 GiB. A cell whose cap admits no message at its payload is refused
     /// rather than clamped. Only meaningful with `--drain-messages`; refused
     /// without it.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub drain_max_bytes: Option<u64>,
+
+    /// Cap on an offered-load rung's backlog in bytes (`lag × payload_bytes`),
+    /// default 1 GiB. Past it the rung's producers stop and the rung is
+    /// recorded as not sustained with the window it actually ran; the ladder
+    /// skips the rungs above. Lower than the drain cap because the backlog
+    /// piles onto a broker that is also serving the consumers.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub load_backlog_max_bytes: Option<u64>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -1216,7 +1248,12 @@ fn flow_list(flows: &[Flow]) -> String {
         .join(", ")
 }
 
-fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scenario> {
+fn build_scenarios(
+    cli: &Cli,
+    default_flow: Flow,
+    fifo_workers: u16,
+    batch_size_cap: Option<NonZeroUsize>,
+) -> Vec<Scenario> {
     let handlers: Vec<HandlerProfile> = match cli.handler {
         HandlerArg::Zero => vec![HandlerProfile::Zero],
         HandlerArg::Fast => vec![HandlerProfile::Fast],
@@ -1241,9 +1278,15 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
 
     // CLI-invariant, so derived once here with the other CLI bindings: the
     // knobs every `consume_batch` scenario runs with (and stamps on its row).
+    // The backend's cap lands here, at the single point of construction, so
+    // the driver and the row are handed the same already-effective value —
+    // see [`HarnessConfig::batch_size_cap`] for why not in the closure.
     let defaults = BatchOptions::default();
     let batch_options = BatchOptions {
-        max_batch_size: cli.batch_max_size.unwrap_or(defaults.max_batch_size),
+        max_batch_size: cli
+            .batch_max_size
+            .unwrap_or(defaults.max_batch_size)
+            .min(batch_size_cap.unwrap_or(NonZeroUsize::MAX)),
         max_batch_age_ms: cli.batch_max_age_ms.unwrap_or(defaults.max_batch_age_ms),
     };
 
@@ -1306,19 +1349,31 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                     // width instead of holding it constant.
                     let tier_messages = match flow {
                         Flow::Broadcast => per_consumer,
+                        Flow::ConsumeFifo => cli
+                            .fifo_messages
+                            .unwrap_or(per_consumer)
+                            .saturating_mul(consumers as u64),
                         _ => per_consumer.saturating_mul(consumers as u64),
                     };
                     // Only the flow with a batch to size carries the knobs;
                     // stamping a default on any other row would claim options
                     // a run never had.
                     let batch_options = (flow == Flow::ConsumeBatch).then_some(batch_options);
+                    // FIFO concurrency does not come from this flag, so
+                    // `--concurrent` shapes every flow but this one. On the
+                    // consumer-group path every backend whose config carries
+                    // the flag now refuses it outright. On the supervisor path
+                    // (SQS) it is still accepted, so forcing it false here is
+                    // our choice to keep the row comparable -- it clamps
+                    // prefetch to 1 rather than tripping a guard.
+                    let concurrent = cli.concurrent && flow != Flow::ConsumeFifo;
                     for &payload_bytes in &cli.payload.0 {
                         // Inside the payload loop, because the floor is capped
                         // by bytes and so differs per tier.
                         let messages = tier_messages.max(framework_corpus_floor(
                             flow,
                             h,
-                            cli.concurrent,
+                            concurrent,
                             payload_bytes,
                         ));
                         let scenario = Scenario {
@@ -1326,7 +1381,7 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                             messages,
                             consumers,
                             handler: h,
-                            concurrent: cli.concurrent,
+                            concurrent,
                             prefetch: cli.prefetch,
                             flow,
                             payload_bytes,
@@ -1381,6 +1436,46 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
         }
     }
     scenarios
+}
+
+/// Connect to a broker, retrying a transient failure with doubling delays
+/// (capped at ten seconds) up to `attempts` times, and panic only when the
+/// broker stays down. A stress binary's per-scenario connect used to give
+/// up on the first failure, so a broker still recovering from a heavy cell
+/// (Redis after a 64 KiB rung, 2026-09-08) ended the whole pass instead of
+/// the one cell. The panic is the fail-fast the harness wants for a broker
+/// that is really gone; a retry is what it wants for one that is catching
+/// its breath.
+pub async fn connect_with_retries<C, F, Fut>(
+    label: &str,
+    attempts: u32,
+    first_delay: Duration,
+    connect: F,
+) -> C
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<C, String>>,
+{
+    let attempts = attempts.max(1);
+    let mut delay = first_delay;
+    let mut last = String::new();
+    for attempt in 1..=attempts {
+        match connect().await {
+            Ok(client) => return client,
+            Err(e) => {
+                last = e;
+                if attempt < attempts {
+                    eprintln!(
+                        "{label}: connect attempt {attempt}/{attempts} failed ({last}); retrying \
+                         in {delay:?}"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(Duration::from_secs(10));
+                }
+            }
+        }
+    }
+    panic!("{label}: could not connect after {attempts} attempts: {last}")
 }
 
 /// Panic if Docker is unreachable. Shared by all container-backed backends.
@@ -2107,6 +2202,25 @@ pub struct HarnessConfig<B: Backend> {
     pub backend_name: &'static str,
     /// Upper bound for computed default prefetch (e.g. SQS caps at 10).
     pub prefetch_cap: u16,
+    /// Upper bound on a `consume_batch` scenario's `max_batch_size`, where the
+    /// backend's batch primitive refuses anything larger. `None` for the
+    /// backends that accept the harness's cross-backend sizes as-is.
+    ///
+    /// Applied in [`build_scenarios`], not by the wrapper's own
+    /// `BatchConsumeFn`: the scenario's [`BatchOptions`] are what the driver
+    /// runs *and* what the result row records, so clamping at construction is
+    /// what keeps those two from claiming different batch sizes. Clamping in
+    /// the closure instead would run a 10-message batch under a row saying
+    /// 500 — a chart silently comparing unequal batches, which is the whole
+    /// thing this exists to prevent.
+    pub batch_size_cap: Option<NonZeroUsize>,
+    /// The most backlog, in bytes (`lag x payload_bytes`), an offered-load rung
+    /// may build before its producers are stopped and the rung recorded as
+    /// not sustained. An unsustained rung's backlog is resident on the broker:
+    /// at 64 KiB and 25 000/s a rung offers 1.6 GB/s, and Redis stopped
+    /// answering under it. `--load-backlog-max-bytes` overrides the default,
+    /// [`DEFAULT_LOAD_BACKLOG_MAX_BYTES`].
+    pub load_backlog_cap_bytes: u64,
     /// Maximum batch size for `publish_batch` (some backends have SDK limits).
     pub publish_chunk_size: usize,
     /// Drain the main queue between scenarios.
@@ -2150,6 +2264,8 @@ impl<B: Backend> HarnessConfig<B> {
         Self {
             backend_name,
             prefetch_cap: 100,
+            batch_size_cap: None,
+            load_backlog_cap_bytes: DEFAULT_LOAD_BACKLOG_MAX_BYTES,
             publish_chunk_size: 1000,
             purge: noop_purge(),
             broker: BrokerInfo {
@@ -2177,6 +2293,21 @@ impl<B: Backend> HarnessConfig<B> {
 
     pub fn with_prefetch_cap(mut self, cap: u16) -> Self {
         self.prefetch_cap = cap;
+        self
+    }
+
+    /// See [`HarnessConfig::batch_size_cap`]. A bench-harness-only accommodation:
+    /// the backend's own refusal stays exactly as shipped, and it is this
+    /// harness — whose scenario sizes are shared across six backends — that
+    /// has to fit itself to the smallest of them.
+    pub fn with_batch_size_cap(mut self, cap: NonZeroUsize) -> Self {
+        self.batch_size_cap = Some(cap);
+        self
+    }
+
+    /// See [`HarnessConfig::load_backlog_cap_bytes`].
+    pub fn with_load_backlog_cap_bytes(mut self, cap: u64) -> Self {
+        self.load_backlog_cap_bytes = cap;
         self
     }
 
@@ -2322,6 +2453,11 @@ pub const LOAD_SUSTAINED_MAX_LAG_RATIO: f64 = 0.05;
 const LOAD_DRAIN_GRACE: Duration = Duration::from_secs(60);
 /// How often the window's lag is sampled for `peak_lag`.
 const LOAD_LAG_SAMPLE: Duration = Duration::from_millis(50);
+/// How long a rung stopped by the backlog cap waits for the consumers to work
+/// off what was published before moving on. The cap bounds the backlog's
+/// bytes, not the time slow consumers take to clear it; what is left after
+/// this is the next cell's purge's business, and the measurement stands.
+const LOAD_CAPPED_DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// A paced producer's idle sleep while it is ahead of its credit line.
 const LOAD_PACE_SLEEP: Duration = Duration::from_millis(1);
 
@@ -2339,6 +2475,10 @@ struct LoadOutcome {
     published: u64,
     processed_at_window_end: u64,
     peak_lag: u64,
+    /// The backlog cap stopped the producers before the nominal window ran
+    /// out; the rung is not sustained by definition and its window is the
+    /// time it actually ran.
+    backlog_capped: bool,
     /// The window as measured, from `start` to the sample that closed it.
     window: Duration,
     /// Seconds from the window closing to the last published message being
@@ -2458,6 +2598,7 @@ async fn run_offered_load<B, T>(
     pool: ProducerPool<B>,
     rung: LoadRung,
     payload_bytes: usize,
+    backlog_cap_bytes: u64,
     epoch: Instant,
     start: Instant,
     processed: &AtomicU64,
@@ -2477,6 +2618,7 @@ where
         publishers,
         rung,
         payload_bytes,
+        backlog_cap_bytes,
         epoch,
         start,
         processed,
@@ -2498,6 +2640,7 @@ async fn run_offered_load_with<B, T>(
     publishers: Vec<shove::Publisher<B>>,
     rung: LoadRung,
     payload_bytes: usize,
+    backlog_cap_bytes: u64,
     epoch: Instant,
     start: Instant,
     processed: &AtomicU64,
@@ -2532,6 +2675,7 @@ where
     }
 
     let mut peak_lag = 0u64;
+    let mut backlog_capped = false;
     loop {
         let elapsed = start.elapsed();
         // Against what has been handed to the publisher: conservative by up
@@ -2539,7 +2683,25 @@ where
         // are already processing.
         let p = claimed.load(Ordering::Relaxed);
         let c = processed.load(Ordering::Relaxed);
-        peak_lag = peak_lag.max(p.saturating_sub(c));
+        let lag = p.saturating_sub(c);
+        peak_lag = peak_lag.max(lag);
+        // An unsustained rung's backlog sits on the broker. Past the byte cap
+        // the rung has already shown the consumers cannot keep up; letting
+        // the producers run out the window only buries the broker (Redis
+        // stopped answering under a 64 KiB rung at 25 000/s), and a broker
+        // that stops answering takes every later cell with it. Stop here;
+        // the lag makes the verdict "not sustained" and the ladder skips the
+        // rungs above.
+        if lag.saturating_mul(payload_bytes as u64) > backlog_cap_bytes {
+            producers.abort_all();
+            backlog_capped = true;
+            println!(
+                "     load: backlog of {lag} messages x {payload_bytes} B passed the {backlog_cap_bytes} B \
+                 cap at {:.1}s — producers stopped, rung not sustained",
+                elapsed.as_secs_f64()
+            );
+            break;
+        }
         if elapsed >= window {
             break;
         }
@@ -2599,6 +2761,9 @@ where
     // watched exactly as it was during the nominal window.
     let boundary = tokio::time::sleep(LOAD_DRAIN_GRACE);
     tokio::pin!(boundary);
+    // Producers stopped by the backlog cap were aborted, not asked to finish
+    // their chunk: reap them and go straight to the drain.
+    while backlog_capped && producers.join_next().await.is_some() {}
     loop {
         let driver_ended = async {
             match drivers.as_deref_mut() {
@@ -2649,8 +2814,19 @@ where
     let published_at_window_end = published;
     let processed_at_window_end = processed.load(Ordering::Relaxed);
     peak_lag = peak_lag.max(published_at_window_end.saturating_sub(processed_at_window_end));
+    // The samples measured lag against chunks *claimed* by the producers,
+    // conservative by up to a chunk each; a rung the cap stopped mid-chunk
+    // never published some of those, and a lag larger than everything
+    // published is not a lag the consumers ever faced (the document's
+    // validation refuses such a row, and with it the whole write).
+    peak_lag = peak_lag.min(published_at_window_end);
 
-    let grace = tokio::time::sleep(LOAD_DRAIN_GRACE);
+    let grace_for = if backlog_capped {
+        LOAD_CAPPED_DRAIN_GRACE
+    } else {
+        LOAD_DRAIN_GRACE
+    };
+    let grace = tokio::time::sleep(grace_for);
     tokio::pin!(grace);
     loop {
         let c = processed.load(Ordering::Relaxed);
@@ -2662,10 +2838,20 @@ where
         }
         tokio::select! {
             _ = &mut grace => {
+                if backlog_capped {
+                    // The measurement closed when the cap fired; the leftover
+                    // is cleanup, and the next cell's purge does it.
+                    println!(
+                        "     load: {c} of {published} published messages processed within {}s of \
+                         the cap; the rest is left to the next cell's purge",
+                        grace_for.as_secs()
+                    );
+                    break;
+                }
                 return Err(format!(
                     "consumers processed {c} of {published} published messages within {}s of \
                      the producer stopping",
-                    LOAD_DRAIN_GRACE.as_secs()
+                    grace_for.as_secs()
                 ));
             }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}
@@ -2677,6 +2863,7 @@ where
         published,
         processed_at_window_end,
         peak_lag,
+        backlog_capped,
         window: window_measured,
         drain_secs: window_closed.elapsed().as_secs_f64(),
     })
@@ -3225,20 +3412,37 @@ where
 
 /// Wait until `processed` reaches `target` or the run is cancelled.
 ///
-/// No deadline: a scenario runs to completion however slow the backend is.
-/// A cell that never completes is a hang the operator interrupts, and the
-/// interruption is what gets recorded — never a clock the harness picked.
+/// No deadline on the whole wait: a scenario runs to completion however
+/// slow the backend is. The count has to keep moving, though: once it has
+/// stood still for [`DRAIN_STALL`] the cell is failed with where it stopped,
+/// the same rule the fills and drains apply. On 2026-09-10 the NATS 64 KiB
+/// broadcast cell at four subscribers lost part of its fan-out (ack policy
+/// none on an interest-retention stream: a dropped delivery is deleted
+/// server-side and never redelivered) and this loop idled for an hour with
+/// every thread parked, until the operator killed the pass.
 async fn await_completion(
     processed: &AtomicU64,
     target: u64,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
+    let mut last = processed.load(Ordering::Relaxed);
+    let mut last_progress = Instant::now();
     loop {
-        if processed.load(Ordering::Relaxed) >= target {
+        let count = processed.load(Ordering::Relaxed);
+        if count >= target {
             return Ok(());
         }
         if cancel.is_cancelled() {
             return Err("interrupted".to_string());
+        }
+        if count != last {
+            last = count;
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() >= DRAIN_STALL {
+            return Err(format!(
+                "completion stalled: {count} of {target} messages processed, no progress for {}s",
+                DRAIN_STALL.as_secs()
+            ));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -3358,6 +3562,22 @@ fn finish_window(
     let mut metrics = finish(scenario, duration, window.setup, resources, latencies);
     let secs = duration.as_secs_f64();
     if let (Some(outcome), Some(rung)) = (&window.load, scenario.load) {
+        // A window nothing completed inside measured no rate. It happens when
+        // the backlog cap fires before the first batch of a large-payload
+        // rung flushes; the document refuses a zero rate as a failed
+        // measurement wearing a row's clothes, so fail the rung here and let
+        // `failures[]` carry it with its reason.
+        if outcome.processed_at_window_end == 0 {
+            let how = if outcome.backlog_capped {
+                "the backlog cap stopped the rung"
+            } else {
+                "the window closed"
+            };
+            return Err(format!(
+                "no message completed inside the rung's {secs:.1}s window before {how}; a \
+                 zero rate is a failed measurement, not a row"
+            ));
+        }
         metrics.throughput = if secs > 0.0 {
             outcome.processed_at_window_end as f64 / secs
         } else {
@@ -3479,9 +3699,19 @@ where
                 None => {
                     let round: Vec<StressTestMsg> =
                         (0..per_round).map(|_| sentinel(epoch)).collect();
-                    publisher
-                        .publish_batch::<T>(&round)
+                    // Bounded: the stall guard below only arms once a worker
+                    // has consumed something, so a sentinel publish that never
+                    // returns would otherwise hold the whole sweep, not just
+                    // this cell (the NATS publisher did exactly that before
+                    // its in-flight ack budget was driven concurrently).
+                    tokio::time::timeout(DRAIN_STALL, publisher.publish_batch::<T>(&round))
                         .await
+                        .map_err(|_| {
+                            format!(
+                                "publish readiness sentinels: no ack within {}s",
+                                DRAIN_STALL.as_secs()
+                            )
+                        })?
                         .map_err(|e| format!("publish readiness sentinels: {e}"))?;
                 }
             }
@@ -3937,6 +4167,7 @@ where
                     pool,
                     rung,
                     scenario.payload_bytes,
+                    hcfg.load_backlog_cap_bytes,
                     epoch,
                     start,
                     &processed,
@@ -4446,6 +4677,7 @@ where
                     pool,
                     rung,
                     scenario.payload_bytes,
+                    hcfg.load_backlog_cap_bytes,
                     epoch,
                     start,
                     &processed,
@@ -4669,6 +4901,7 @@ where
                     pool,
                     rung,
                     scenario.payload_bytes,
+                    hcfg.load_backlog_cap_bytes,
                     epoch,
                     start,
                     &processed,
@@ -4874,6 +5107,13 @@ struct LoadResult {
     /// while the consumers kept up with what it did publish: the producer was
     /// the limit, and the row says nothing about the consumers.
     producer_bound: bool,
+    /// The backlog cap stopped the producers early (see
+    /// [`HarnessConfig::load_backlog_cap_bytes`]). Such a rung is never
+    /// `sustained`, and its `duration_secs` is the window it actually ran
+    /// rather than the nominal one. Absent on rows written before the cap
+    /// existed, which never stopped early.
+    #[serde(default)]
+    backlog_capped: bool,
     /// The producer held the rate and the consumers kept up with it — see
     /// [`LOAD_SUSTAINED_MAX_LAG_RATIO`].
     sustained: bool,
@@ -4897,6 +5137,9 @@ impl LoadResult {
             lag,
             outcome.peak_lag,
         );
+        // A rung the cap stopped has shown the consumers cannot keep up,
+        // whatever the lag ratio at the moment it stopped says.
+        let sustained = sustained && !outcome.backlog_capped;
         Self {
             offered_msg_per_sec: rung.rate_msg_per_sec,
             window_secs: rung.window_secs,
@@ -4909,6 +5152,7 @@ impl LoadResult {
             peak_lag: outcome.peak_lag,
             drain_secs: outcome.drain_secs,
             producer_bound,
+            backlog_capped: outcome.backlog_capped,
             sustained,
         }
     }
@@ -5591,10 +5835,11 @@ fn validate_load(run: &BackendRun, r: &ScenarioResult, flow: Flow) -> Result<(),
     if !(r.duration_secs.is_finite() && r.duration_secs > 0.0) {
         return refuse("sits on a row with a non-positive window");
     }
-    if r.duration_secs < l.window_secs as f64 {
+    if r.duration_secs < l.window_secs as f64 && !l.backlog_capped {
         return refuse(
             "sits on a row whose measured window is shorter than the rung's nominal window, \
-             which closes only after the nominal window has elapsed",
+             which closes only after the nominal window has elapsed unless the backlog cap \
+             stopped it",
         );
     }
     let achieved = l.published_at_window_end as f64 / r.duration_secs;
@@ -5603,6 +5848,12 @@ fn validate_load(run: &BackendRun, r: &ScenarioResult, flow: Flow) -> Result<(),
             "claims an achieved publish rate of {:.1} msg/s where its counts derive {achieved:.1}",
             l.achieved_publish_msg_per_sec
         ));
+    }
+    if l.processed_at_window_end == 0 {
+        return refuse(
+            "processed nothing inside its window; the harness records that rung as a failure, \
+             not a row",
+        );
     }
     let throughput = l.processed_at_window_end as f64 / r.duration_secs;
     if !rate_matches(r.throughput_msg_per_sec, throughput) {
@@ -5621,6 +5872,7 @@ fn validate_load(run: &BackendRun, r: &ScenarioResult, flow: Flow) -> Result<(),
         l.lag_at_window_end,
         l.peak_lag,
     );
+    let sustained = sustained && !l.backlog_capped;
     if l.producer_bound != producer_bound || l.sustained != sustained {
         return refuse(&format!(
             "claims producer_bound={} sustained={} where its own numbers derive \
@@ -5971,8 +6223,8 @@ fn unsupported_for_group_backend<B: Backend>(hcfg: &HarnessConfig<B>) -> Vec<Uns
     if hcfg.batch_consume.is_none() {
         out.push(Unsupported {
             flow: Flow::ConsumeBatch.as_str().to_string(),
-            reason: "the stress harness wires a batch consume flow only for the Kafka \
-                     and InMemory backends; this reflects harness wiring, not which \
+            reason: "this backend's stress binary does not wire a batch consume \
+                     flow; that is harness wiring, not a statement about which \
                      backends implement the primitive (see `HasBatchConsumption`)"
                 .to_string(),
         });
@@ -6004,8 +6256,8 @@ fn unsupported_for_supervisor_backend<B: Backend>(hcfg: &HarnessConfig<B>) -> Ve
     if hcfg.batch_consume.is_none() {
         out.push(Unsupported {
             flow: Flow::ConsumeBatch.as_str().to_string(),
-            reason: "the stress harness wires a batch consume flow only for the Kafka \
-                     and InMemory backends; this reflects harness wiring, not which \
+            reason: "this backend's stress binary does not wire a batch consume \
+                     flow; that is harness wiring, not a statement about which \
                      backends implement the primitive (see `HasBatchConsumption`)"
                 .to_string(),
         });
@@ -6396,6 +6648,41 @@ fn refused_drain_capacity<B: Backend>(
         })
 }
 
+/// The operator-facing half of [`HarnessConfig::batch_size_cap`]: the sweep is
+/// about to run a smaller batch than the invocation asked for, so say the
+/// number and say who imposed it.
+///
+/// A note, not a refusal, and deliberately so — the cap is the harness fitting
+/// its cross-backend scenario sizes to the smallest backend, not the operator
+/// making a mistake. An unflagged run hits it too (shove's cross-backend
+/// default of 500 exceeds SQS's 10), so refusing would mean no SQS batch
+/// measurement at all, which is exactly the hole this wiring closes.
+///
+/// Silent when the flow will not run: `skip` being `Some` means the row it
+/// would describe is never written.
+fn clamped_batch_size_note(
+    cli: &Cli,
+    selected: &[Flow],
+    cap: Option<NonZeroUsize>,
+    skip: Option<&str>,
+) -> Option<String> {
+    let cap = cap?;
+    if !selected.contains(&Flow::ConsumeBatch) || skip.is_some() {
+        return None;
+    }
+    let requested = cli
+        .batch_max_size
+        .unwrap_or(BatchOptions::default().max_batch_size);
+    (requested > cap).then(|| {
+        format!(
+            "note: consume-batch runs at max_batch_size {cap}, not {requested} — this \
+             backend's batch primitive refuses anything larger, and the harness clamps \
+             rather than skip the flow. The result rows record {cap}, the size that ran; \
+             a chart comparing them against another backend is comparing unequal batches."
+        )
+    })
+}
+
 /// Build, capability-filter, and guard the scenario list — the one selection
 /// step every entry point goes through, so no runner can wire the flows in
 /// while forgetting the flag guards. `Err` is a refusal to run at all.
@@ -6417,7 +6704,7 @@ fn select_scenarios<B: Backend>(
     }
     let scenarios = filter_scenarios(
         hcfg,
-        build_scenarios(cli, default_flow, hcfg.fifo_workers),
+        build_scenarios(cli, default_flow, hcfg.fifo_workers, hcfg.batch_size_cap),
         supervisor_only,
     );
     if let Some(reason) = refused_drain_capacity(hcfg, &scenarios) {
@@ -6425,6 +6712,11 @@ fn select_scenarios<B: Backend>(
     }
     let skip = skip_reason(hcfg, Flow::ConsumeBatch, supervisor_only);
     if let Some(note) = inert_batch_flags_note(cli, &selected, skip.as_deref()) {
+        eprintln!("{note}");
+    }
+    if let Some(note) =
+        clamped_batch_size_note(cli, &selected, hcfg.batch_size_cap, skip.as_deref())
+    {
         eprintln!("{note}");
     }
     if let Some(path) = cli.results_file.as_deref()
@@ -6585,7 +6877,7 @@ impl LadderGate {
 /// and unreachable for SQS: the exclusion is a compile-time fact, not a
 /// runtime skip.
 pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
-    hcfg: HarnessConfig<B>,
+    mut hcfg: HarnessConfig<B>,
     connect: Connect,
     make_cfg: MkCfg,
 ) where
@@ -6597,6 +6889,9 @@ pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
     init_tracing();
 
     let cli = Cli::parse();
+    if let Some(cap) = cli.load_backlog_max_bytes {
+        hcfg.load_backlog_cap_bytes = cap;
+    }
     let cancel = spawn_ctrlc_watcher();
     let scenarios = select_scenarios_or_exit(&cli, &hcfg, Flow::ConsumerGroup, false);
 
@@ -6666,7 +6961,7 @@ pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
 /// Run every selected scenario against a supervisor-only backend (SQS). See
 /// [`run_all_scenarios`] for the closure contract.
 pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
-    hcfg: HarnessConfig<B>,
+    mut hcfg: HarnessConfig<B>,
     connect: Connect,
     make_opts: MkOpts,
 ) where
@@ -6678,6 +6973,9 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
     init_tracing();
 
     let cli = Cli::parse();
+    if let Some(cap) = cli.load_backlog_max_bytes {
+        hcfg.load_backlog_cap_bytes = cap;
+    }
     let cancel = spawn_ctrlc_watcher();
     // `Flow::Supervisor`, not `ConsumerGroup`: the group flow is unsupported
     // here and would be filtered out, leaving the default invocation running
@@ -6755,7 +7053,7 @@ mod tests {
     /// [`build_scenarios`] with the coordinated-group entry point's default
     /// flow, which is what every pre-existing test in this module assumed.
     fn build_scenarios_cg(cli: &Cli) -> Vec<Scenario> {
-        build_scenarios(cli, Flow::ConsumerGroup, SEQ_SHARDS)
+        build_scenarios(cli, Flow::ConsumerGroup, SEQ_SHARDS, None)
     }
 
     // ── Pre-existing scenario-sizing tests ──
@@ -7025,9 +7323,9 @@ mod tests {
         // The group entry point defaults to consumer_group, the supervisor
         // entry point to supervisor — each is what its harness measured
         // before flows were a dimension.
-        let group = build_scenarios(&c, Flow::ConsumerGroup, SEQ_SHARDS);
+        let group = build_scenarios(&c, Flow::ConsumerGroup, SEQ_SHARDS, None);
         assert!(group.iter().all(|s| s.flow == Flow::ConsumerGroup));
-        let sup = build_scenarios(&c, Flow::Supervisor, SEQ_SHARDS);
+        let sup = build_scenarios(&c, Flow::Supervisor, SEQ_SHARDS, None);
         assert!(sup.iter().all(|s| s.flow == Flow::Supervisor));
     }
 
@@ -7041,14 +7339,14 @@ mod tests {
 
         let group = filter_scenarios(
             &hcfg,
-            build_scenarios(&c, Flow::ConsumerGroup, SEQ_SHARDS),
+            build_scenarios(&c, Flow::ConsumerGroup, SEQ_SHARDS, None),
             false,
         );
         assert!(!group.is_empty(), "group default filtered to nothing");
 
         let sup = filter_scenarios(
             &hcfg,
-            build_scenarios(&c, Flow::Supervisor, SEQ_SHARDS),
+            build_scenarios(&c, Flow::Supervisor, SEQ_SHARDS, None),
             true,
         );
         assert!(!sup.is_empty(), "supervisor default filtered to nothing");
@@ -7176,10 +7474,134 @@ mod tests {
             ]),
             Flow::ConsumerGroup,
             1,
+            None,
         );
         assert_eq!(scenarios.len(), 1);
         assert_eq!(scenarios[0].consumers, 1);
         assert_eq!(scenarios[0].messages, 5_000);
+    }
+
+    #[test]
+    fn the_fifo_corpus_override_is_per_worker_like_the_tier() {
+        // Kafka's wrapper reports one FIFO worker, and the tier already sizes
+        // its corpus for that one worker (see the test above). The override
+        // replaces the tier's per-consumer count in the same unit, so it
+        // must not silently multiply by the shard count instead.
+        let scenarios = build_scenarios(
+            &cli_args(&[
+                "--tier",
+                "moderate",
+                "--handler",
+                "zero",
+                "--flow",
+                "consume-fifo",
+                "--consumers",
+                "8",
+                "--fifo-messages",
+                "100",
+            ]),
+            Flow::ConsumerGroup,
+            1,
+            None,
+        );
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(scenarios[0].consumers, 1);
+        assert_eq!(scenarios[0].messages, 100);
+    }
+
+    #[test]
+    fn the_fifo_corpus_can_be_deviated_per_worker() {
+        // SQS on LocalStack drains a FIFO shard at a few messages per second,
+        // so the tier's 5,000 per shard is a ten-hour cell three times over.
+        // The knob sizes the FIFO corpus per worker (one per shard here) and
+        // leaves every other flow on the tier's count, the same shape as the
+        // drain deviation.
+        let fifo = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consume-fifo",
+            "--consumers",
+            "8",
+            "--fifo-messages",
+            "100",
+        ]));
+        assert_eq!(fifo.len(), 1);
+        assert_eq!(fifo[0].messages, 100 * SEQ_SHARDS as u64);
+
+        // Compared against the same build without the knob rather than a
+        // literal: the parallel corpus is the tier's count raised to the
+        // framework floor, and this test is about the knob, not the floor.
+        let parallel_args = [
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consume-parallel",
+            "--consumers",
+            "8",
+        ];
+        let baseline: Vec<u64> = build_scenarios_cg(&cli_args(&parallel_args))
+            .iter()
+            .map(|s| s.messages)
+            .collect();
+        let mut with_knob = parallel_args.to_vec();
+        with_knob.extend(["--fifo-messages", "100"]);
+        let deviated: Vec<u64> = build_scenarios_cg(&cli_args(&with_knob))
+            .iter()
+            .map(|s| s.messages)
+            .collect();
+        assert_eq!(
+            deviated, baseline,
+            "--fifo-messages must not resize any other flow"
+        );
+    }
+
+    #[test]
+    fn fifo_scenarios_never_ask_for_concurrent_processing() {
+        // FIFO concurrency does not come from this flag. Redis's
+        // `register_fifo` refused it first, which is why `--concurrent` in the
+        // pinned matrix made every Redis FIFO cell fail at registration while
+        // the backends that still discarded it measured theirs. Every
+        // consumer-group `register_fifo` refuses it now, so a FIFO scenario
+        // must never ask for it -- including the supervisor rows, where no
+        // guard would catch the mistake: the flag is simply accepted there,
+        // and leaving it false is what clamps prefetch to 1.
+        let fifo = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consume-fifo",
+            "--consumers",
+            "8",
+            "--concurrent",
+        ]));
+        assert_eq!(fifo.len(), 1);
+        assert!(
+            !fifo[0].concurrent,
+            "a FIFO scenario must not carry --concurrent"
+        );
+
+        let parallel = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consume-parallel",
+            "--consumers",
+            "8",
+            "--concurrent",
+        ]));
+        assert!(
+            parallel.iter().all(|s| s.concurrent),
+            "--concurrent still shapes the other flows"
+        );
     }
 
     #[test]
@@ -10007,6 +10429,109 @@ mod tests {
     }
 
     #[test]
+    fn the_backends_batch_size_cap_reaches_the_row_that_records_it() {
+        // The whole point of capping at construction rather than inside the
+        // wrapper's closure: `run_scenario_batch` hands the driver
+        // `scenario.batch_options` and `push_result` stamps the row from the
+        // same field, so a capped scenario cannot run one size while claiming
+        // another. Asserted on the scenario, which is that single field.
+        let cli = cli_args(&[
+            "--flow",
+            "consume-batch",
+            "--batch-max-size",
+            "500",
+            "--batch-max-age-ms",
+            "125",
+        ]);
+        let cap = NonZeroUsize::new(10).expect("non-zero");
+
+        let capped = build_scenarios(&cli, Flow::Supervisor, SEQ_SHARDS, Some(cap));
+        let batch: Vec<_> = capped
+            .iter()
+            .filter(|s| s.flow == Flow::ConsumeBatch)
+            .collect();
+        assert!(!batch.is_empty(), "no consume-batch scenario was built");
+        for s in &batch {
+            let opts = s.batch_options.expect("a batch scenario carries options");
+            assert_eq!(opts.max_batch_size, cap);
+            // Only the size is capped — the age is a client-side flush timer
+            // with no broker limit behind it, so clamping it would be the
+            // harness inventing a constraint.
+            assert_eq!(opts.max_batch_age_ms.get(), 125);
+        }
+
+        // No cap → the requested size, unchanged. Without this the assertion
+        // above would also pass on a harness that capped every backend to 10.
+        let uncapped = build_scenarios(&cli, Flow::Supervisor, SEQ_SHARDS, None);
+        let opts = uncapped
+            .iter()
+            .find(|s| s.flow == Flow::ConsumeBatch)
+            .and_then(|s| s.batch_options)
+            .expect("a batch scenario carries options");
+        assert_eq!(opts.max_batch_size.get(), 500);
+
+        // A request already under the cap is left alone rather than raised to
+        // it: the cap is a ceiling, not a size.
+        let small = cli_args(&["--flow", "consume-batch", "--batch-max-size", "4"]);
+        let opts = build_scenarios(&small, Flow::Supervisor, SEQ_SHARDS, Some(cap))
+            .iter()
+            .find(|s| s.flow == Flow::ConsumeBatch)
+            .and_then(|s| s.batch_options)
+            .expect("a batch scenario carries options");
+        assert_eq!(opts.max_batch_size.get(), 4);
+    }
+
+    #[test]
+    fn a_capped_batch_size_is_announced_only_when_the_flow_will_run() {
+        let cap = NonZeroUsize::new(10).expect("non-zero");
+        let cli = cli_args(&["--flow", "consume-batch", "--batch-max-size", "500"]);
+        let selected = selected_flows(&cli, Flow::Supervisor);
+
+        // Capped, flow runs → the operator is told both numbers, so a row
+        // reading 10 under a `--batch-max-size 500` invocation is explained
+        // where it happens rather than in a results file read later.
+        let note = clamped_batch_size_note(&cli, &selected, Some(cap), None)
+            .expect("a bitten cap must be announced");
+        assert!(note.contains("10"), "{note}");
+        assert!(note.contains("500"), "{note}");
+
+        // Uncapped backend, or a cap the request never reaches → nothing to
+        // say. The clamp is silent precisely when it changed nothing.
+        assert_eq!(clamped_batch_size_note(&cli, &selected, None, None), None);
+        let big = NonZeroUsize::new(5_000).expect("non-zero");
+        assert_eq!(
+            clamped_batch_size_note(&cli, &selected, Some(big), None),
+            None
+        );
+
+        // Flow dropped on this backend → the note would describe a row that
+        // is never written; `inert_batch_flags_note` already covers that case.
+        assert_eq!(
+            clamped_batch_size_note(&cli, &selected, Some(cap), Some("unsupported: no closure")),
+            None
+        );
+
+        // Flow not selected at all.
+        let other = cli_args(&["--flow", "consumer-group"]);
+        let other_selected = selected_flows(&other, Flow::ConsumerGroup);
+        assert_eq!(
+            clamped_batch_size_note(&other, &other_selected, Some(cap), None),
+            None
+        );
+
+        // An unflagged invocation is capped too — shove's cross-backend
+        // default exceeds SQS's 10 — so the note fires with no flag passed.
+        let bare = cli_args(&["--flow", "consume-batch"]);
+        let bare_selected = selected_flows(&bare, Flow::Supervisor);
+        let note = clamped_batch_size_note(&bare, &bare_selected, Some(cap), None)
+            .expect("the default size is above the cap, so it is clamped too");
+        assert!(
+            note.contains(&BatchOptions::default().max_batch_size.to_string()),
+            "{note}"
+        );
+    }
+
+    #[test]
     fn select_scenarios_refuses_a_dead_batch_flag_on_both_entry_paths() {
         // The refusal lives inside the one selection step every entry point
         // calls, so a runner cannot wire the flows in while forgetting the
@@ -10266,8 +10791,73 @@ mod tests {
             peak_lag: 12,
             drain_secs: 0.01,
             producer_bound: false,
+
+            backlog_capped: false,
             sustained: true,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_completion_fails_once_the_count_stops_moving() {
+        // A count that reaches its target returns; one that stands still for
+        // the stall window fails with where it stopped, so a cell whose
+        // fan-out was lost server-side (the NATS 64 KiB broadcast on
+        // 2026-09-10) is recorded instead of idling until someone kills the
+        // pass. Paused time: the stall window elapses without waiting it out.
+        let processed = AtomicU64::new(0);
+        let cancel = CancellationToken::new();
+        let done = await_completion(&processed, 0, &cancel).await;
+        assert_eq!(done, Ok(()), "a met target returns at once");
+
+        let processed = AtomicU64::new(3);
+        let err = await_completion(&processed, 10, &cancel)
+            .await
+            .expect_err("a count that never moves must fail");
+        assert!(
+            err.contains("completion stalled: 3 of 10"),
+            "the failure names where it stopped: {err}"
+        );
+
+        // A count that keeps moving inside the window is not a stall, however
+        // slow: advance it every half-window until it lands.
+        let processed = Arc::new(AtomicU64::new(0));
+        let ticker = {
+            let processed = Arc::clone(&processed);
+            tokio::spawn(async move {
+                for _ in 0..4 {
+                    tokio::time::sleep(DRAIN_STALL / 2).await;
+                    processed.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        let done = await_completion(&processed, 4, &cancel).await;
+        assert_eq!(done, Ok(()), "steady progress is not a stall");
+        ticker.await.expect("ticker");
+    }
+
+    #[test]
+    fn validate_run_refuses_a_rung_that_processed_nothing() {
+        // The 2026-09-10 NATS pass: the 64 KiB rung at 25 000/s with eight
+        // batch workers hit the backlog cap at 1.5 s, before any 32 MB batch
+        // had flushed, and the harness stamped a row with a rate of zero that
+        // chartgen then refused. The document refuses it too, so a harness
+        // that let one through again could not merge it.
+        let mut run = sample_run("kafka");
+        let mut load = sustained_load(25_000, 15_132);
+        load.processed_at_window_end = 0;
+        load.lag_at_window_end = 15_132;
+        load.peak_lag = 15_132;
+        load.achieved_publish_msg_per_sec = 15_132.0 / 1.5;
+        load.backlog_capped = true;
+        load.sustained = false;
+        run.results[0].load = Some(load);
+        run.results[0].method = Some(Method::OfferedLoad.as_str().to_string());
+        run.results[0].drain = None;
+        run.results[0].messages = 15_132;
+        run.results[0].duration_secs = 1.5;
+        run.results[0].throughput_msg_per_sec = 0.0;
+        let err = validate_run(&run).unwrap_err();
+        assert!(err.contains("processed nothing"), "{err}");
     }
 
     #[test]
@@ -10475,6 +11065,141 @@ mod tests {
     /// each is closed after the rung, and the rung still measures — here the
     /// hook hands out clones of the driver's own in-process client, since a
     /// fresh InMemory client would be a second, empty broker.
+    #[tokio::test]
+    async fn a_rung_whose_backlog_reaches_the_byte_cap_is_stopped_early() {
+        // An unsustained rung's backlog is the broker's problem, not the
+        // consumers': at 64 KiB and 25 000/s the producer offers 1.6 GB/s to
+        // a container in an 8 GB VM, and Redis stopped answering under it
+        // (2026-09-08), taking the rest of the pass down with it. The byte
+        // cap that keeps a drain corpus resident keeps a rung's backlog
+        // resident too: once lag x payload passes it the producers stop, the
+        // rung is not sustained, and the ladder skips the rungs above.
+        let rung = LoadRung {
+            rate_msg_per_sec: 20_000,
+            window_secs: 20,
+            producers: 2,
+        };
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: rung.nominal_messages(),
+            consumers: 1,
+            handler: HandlerProfile::Slow,
+            concurrent: true,
+            prefetch: None,
+            flow: Flow::ConsumerGroup,
+            payload_bytes: 64,
+            batch_options: None,
+            load: Some(rung),
+            drain: None,
+        };
+        // A sleeping handler so one consumer cannot keep up with 20 000/s
+        // even with a hundred in flight; the cap, not the handler, is under
+        // test. 4 000 messages of backlog at 64 B fire the cap about 0.2 s
+        // in, late enough for the first 50 ms sleeps to have returned (a
+        // window nothing completed inside is a failed rung, not a capped
+        // row), and the in-process queue holds far more, so the cap fires
+        // before anything else does. Small publish chunks so the drain after
+        // the stop is seconds of sleeping handler, not minutes.
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory")
+            .with_load_backlog_cap_bytes(64 * 4_000)
+            .with_publish_chunk_size(20);
+        let cancel = CancellationToken::new();
+        let started = Instant::now();
+        let metrics = run_scenario_group(
+            &hcfg,
+            &scenario,
+            &cancel,
+            &|consumers, prefetch, _concurrent| {
+                InMemoryConsumerGroupConfig::new(consumers..=consumers)
+                    .with_prefetch_count(prefetch)
+            },
+            &|| async {
+                let capacity = NonZeroUsize::new(100_000).expect("non-zero");
+                <shove::InMemory as Backend>::connect(
+                    InMemoryConfig::default().with_default_capacity(capacity),
+                )
+                .await
+                .expect("connect InMemory")
+            },
+        )
+        .await
+        .expect("a capped rung is a measurement, not an error");
+        let load = metrics.load.expect("a rung stamps its account");
+        assert!(!load.sustained, "{load:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the rung must stop when the backlog reaches the cap, not run out its {}s window \
+             (took {:?})",
+            rung.window_secs,
+            started.elapsed()
+        );
+        assert!(
+            load.peak_lag >= 4_000,
+            "the cap fires at 4 000 messages of backlog: {load:?}"
+        );
+        assert!(
+            load.processed_at_window_end > 0,
+            "the window closed after the first handlers returned, so the row has a rate: {load:?}"
+        );
+        assert!(
+            load.backlog_capped,
+            "the account says the cap stopped it: {load:?}"
+        );
+        assert!(
+            load.peak_lag <= load.published_at_window_end,
+            "a stop mid-chunk must not record a lag above what was published: {load:?}"
+        );
+        // A capped rung is a measurement, so its row must survive the
+        // document's own validation, which otherwise refuses a window shorter
+        // than the rung's nominal one and re-derives the verdicts.
+        let mut run = sample_run("inmemory");
+        run.unsupported.clear();
+        run.results.clear();
+        push_metrics(&mut run.results, &scenario, metrics);
+        validate_run(&run).expect("a capped rung's row is a valid, recordable measurement");
+    }
+
+    #[test]
+    fn the_backlog_cap_has_its_own_flag_and_a_lower_default_than_the_drain_cap() {
+        // The two caps bound different things: a drain corpus sits on an idle
+        // broker, a rung's backlog piles onto one that is also serving the
+        // consumers. Redis survived a 3.2 GB drain corpus and died under a
+        // 3.2 GB backlog minutes later, so the backlog cap is its own knob
+        // with a default a third of the drain cap's.
+        let cli = cli_args(&["--load-backlog-max-bytes", "1024"]);
+        assert_eq!(cli.load_backlog_max_bytes, Some(1024));
+        assert!(Cli::try_parse_from(["stress", "--load-backlog-max-bytes", "0"]).is_err());
+        assert_eq!(
+            HarnessConfig::<shove::InMemory>::new("inmemory").load_backlog_cap_bytes,
+            DEFAULT_LOAD_BACKLOG_MAX_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_with_retries_survives_a_broker_that_answers_on_the_third_try() {
+        // A stress binary's per-scenario connect used to `expect` on the
+        // first failure, so a broker that was momentarily unreachable after
+        // a heavy cell ended the whole pass (Redis, 2026-09-08). Transient
+        // means retry; only a broker that stays down is a fail-fast.
+        let attempts = Arc::new(AtomicU64::new(0));
+        let a = attempts.clone();
+        let client: u32 =
+            connect_with_retries("test broker", 5, Duration::from_millis(1), move || {
+                let a = a.clone();
+                async move {
+                    let n = a.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n < 3 {
+                        Err(format!("attempt {n} refused"))
+                    } else {
+                        Ok(42u32)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(client, 42);
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
     #[tokio::test]
     async fn each_paced_producer_gets_its_own_client_and_every_client_is_closed() {
         let shared = <shove::InMemory as Backend>::connect(InMemoryConfig::default())

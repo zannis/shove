@@ -20,6 +20,7 @@ use crate::consumer::{
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, HandlerTimeoutConfig,
     resolve_handler_timeout,
 };
+use crate::consumer_group::reject_fifo_concurrency;
 use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally, SupervisorOutcome};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
@@ -718,12 +719,7 @@ impl RedisConsumerGroupRegistry {
         H: MessageHandler<T> + 'static,
     {
         if config.concurrent_processing() {
-            return Err(ShoveError::Topology(format!(
-                "topic '{}' is sequenced; `concurrent_processing` on a FIFO consumer would \
-                 break per-key ordering. Drop `with_concurrent_processing(true)` or use \
-                 `register` for unsequenced topics.",
-                T::topology().queue(),
-            )));
+            return Err(reject_fifo_concurrency(T::topology().queue()));
         }
 
         let mut config = config;
@@ -1232,6 +1228,92 @@ mod tests {
             // All handles, including the retired one, are now resolved.
             assert_eq!(group.active_consumers(), 0);
             assert!(group.retiring_is_empty());
+        }
+    }
+
+    // -- FIFO registration rejects `concurrent_processing(true)` --
+
+    mod fifo_concurrency_guard {
+        use super::*;
+        use crate::topology::{SequenceFailure, TopologyBuilder};
+        use crate::{MessageMetadata, Outcome, define_sequenced_topic};
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct GuardEntry {
+            account_id: String,
+        }
+
+        define_sequenced_topic!(
+            GuardLedger,
+            GuardEntry,
+            |msg| msg.account_id.clone(),
+            TopologyBuilder::new("redis-fifo-concurrency-guard")
+                .sequenced(SequenceFailure::FailAll)
+                .hold_queue(Duration::from_millis(50))
+                .dlq()
+                .build()
+        );
+
+        struct NoopHandler;
+        impl MessageHandler<GuardLedger> for NoopHandler {
+            type Context = ();
+            async fn handle(&self, _: GuardEntry, _: MessageMetadata, _: &()) -> Outcome {
+                Outcome::Ack
+            }
+        }
+
+        fn registry() -> RedisConsumerGroupRegistry {
+            RedisConsumerGroupRegistry::from_groups(std::collections::HashMap::new())
+        }
+
+        /// An explicitly-set `concurrent_processing(true)` must fail at
+        /// registration rather than be silently discarded. Redis's FIFO stream loop runs sequentially within a shard.
+        #[tokio::test]
+        async fn register_fifo_rejects_concurrent_processing() {
+            let config = RedisConsumerGroupConfig::new(1..=4).with_concurrent_processing(true);
+
+            let err = registry()
+                .register_fifo::<GuardLedger, _>(config, || NoopHandler, ())
+                .await
+                .expect_err("concurrent_processing(true) must be rejected on a FIFO consumer");
+
+            let ShoveError::Topology(msg) = err else {
+                panic!("expected ShoveError::Topology, got {err:?}");
+            };
+            assert!(
+                msg.contains("redis-fifo-concurrency-guard"),
+                "message must name the offending topic: {msg}"
+            );
+            assert!(
+                msg.contains("is sequenced")
+                    && msg.contains("break per-key ordering")
+                    && msg.contains("with_concurrent_processing(true)"),
+                "message must match the shared FIFO-concurrency wording: {msg}"
+            );
+        }
+
+        /// Negative control: the guard is conditional on the flag, not
+        /// unconditional on FIFO registration. With the flag off the call
+        /// runs past the guard and only then fails on the absent client —
+        /// so a passing reject test above cannot be an artefact of
+        /// `register_fifo` refusing everything.
+        #[tokio::test]
+        async fn register_fifo_admits_non_concurrent_config() {
+            let config = RedisConsumerGroupConfig::new(1..=4).with_concurrent_processing(false);
+
+            let err = registry()
+                .register_fifo::<GuardLedger, _>(config, || NoopHandler, ())
+                .await
+                .expect_err("a client-less registry cannot finish registering");
+
+            let ShoveError::Topology(msg) = err else {
+                panic!("expected ShoveError::Topology, got {err:?}");
+            };
+            assert!(
+                msg.contains("registry has no client"),
+                "expected to reach the client lookup past the guard, got: {msg}"
+            );
         }
     }
 }

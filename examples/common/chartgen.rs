@@ -554,6 +554,14 @@ pub struct LoadAccount {
     #[serde(default)]
     pub peak_lag: u64,
     pub producer_bound: bool,
+    /// The harness's backlog cap stopped the rung's producers before the
+    /// nominal window ran out (see the harness's `--load-backlog-max-bytes`).
+    /// Such a row's measured window is the time it actually ran, and its
+    /// verdict is not sustained whatever its lag ratio says; the harness
+    /// re-derives both the same way. Absent, hence false, on rows written
+    /// before the cap existed.
+    #[serde(default)]
+    pub backlog_capped: bool,
     pub sustained: bool,
 }
 
@@ -571,7 +579,7 @@ impl LoadAccount {
             self.lag_at_window_end as f64 <= max_lag && self.peak_lag as f64 <= max_lag;
         (
             !producer_held_rate && consumers_kept_up,
-            producer_held_rate && consumers_kept_up,
+            producer_held_rate && consumers_kept_up && !self.backlog_capped,
         )
     }
 }
@@ -641,6 +649,13 @@ impl ScenarioResult {
 /// that a bad results document cannot produce a clean-looking chart.
 #[derive(Debug)]
 pub enum ChartError {
+    /// A caption block that overran the canvas by a bounded number of lines
+    /// at the base [`HEIGHT`]. Never surfaced by the public render entry
+    /// points: they catch it and render again on a canvas grown by exactly
+    /// `extra_lines` caption lines (see [`MAX_CAPTION_GROWTH_LINES`]).
+    CaptionOverflow {
+        extra_lines: i32,
+    },
     /// Rule 1 — a document from a schema this generator does not understand.
     UnsupportedSchemaVersion {
         found: u32,
@@ -698,6 +713,11 @@ pub enum ChartError {
 impl fmt::Display for ChartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CaptionOverflow { extra_lines } => write!(
+                f,
+                "caption block overruns the base canvas by {extra_lines} line(s); the \
+                 renderer grows the canvas and renders again"
+            ),
             Self::UnsupportedSchemaVersion { found, expected } => write!(
                 f,
                 "unsupported schema_version {found}: this chartgen understands \
@@ -1082,10 +1102,11 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
                 if !(window_secs.is_finite() && window_secs > 0.0) {
                     return malformed("an offered-load row has no positive window");
                 }
-                if window_secs < load.window_secs as f64 {
+                if window_secs < load.window_secs as f64 && !load.backlog_capped {
                     return malformed(
                         "an offered-load row's measured window is shorter than the rung's \
-                         nominal window, which closes only after the nominal one has elapsed",
+                         nominal window, which closes only after the nominal one has elapsed \
+                         unless the harness's backlog cap stopped it",
                     );
                 }
                 let achieved = load.published_at_window_end as f64 / window_secs;
@@ -1408,11 +1429,21 @@ impl Chart {
 // ── Style: one render path, two selected themes ─────────────────────────────
 
 pub const WIDTH: u32 = 960;
-/// Tall enough that a full caption block — every backend's declared holes,
-/// the lower-bound and worker-count qualifiers, three provenance lines — still
-/// leaves the plot body [`MIN_PLOT_PX`] high. At 560 the committed ordering
-/// chart's nineteen caption lines squeezed the bars into ~50px.
+/// The base canvas height: tall enough that a full caption block — every
+/// backend's declared holes, the lower-bound and worker-count qualifiers,
+/// three provenance lines — still leaves the plot body [`MIN_PLOT_PX`] high.
+/// At 560 the committed ordering chart's nineteen caption lines squeezed the
+/// bars into ~50px. A caption that overruns this by up to
+/// [`MAX_CAPTION_GROWTH_LINES`] lines grows the canvas by exactly those lines
+/// instead of being refused: six backends' worth of qualifiers is a real
+/// document, not a pathology (the six-backend document's ordering chart
+/// carried 23 lines against a budget of 21).
 pub const HEIGHT: u32 = 640;
+/// The most caption lines the canvas may grow by past [`HEIGHT`]. Beyond it
+/// the caption is a defect in the document or the notes, and the chart is
+/// refused with the budget it went over rather than published as a footnote
+/// with a sliver of plot on top.
+pub const MAX_CAPTION_GROWTH_LINES: i32 = 8;
 /// The least plot-body height the frame will render. Below this the bars are
 /// slivers between the legend and the caption, and a chart that cannot be
 /// read is refused rather than published.
@@ -2057,12 +2088,16 @@ fn frame<'b>(
     // The surface: exactly one canvas-sized rect, in the mode's own surface
     // color, so the file is self-contained on any page it is embedded in.
     // The whitelist test counts on there being exactly one.
+    // The canvas may stand taller than `HEIGHT` on a retry (see
+    // `render_validated`), so every vertical anchor reads the area's own
+    // height rather than the constant.
+    let canvas_h = i32::try_from(root.dim_in_pixel().1).unwrap_or(HEIGHT as i32);
     root.fill(&theme.surface).map_err(render)?;
     // A hairline ring so the chart reads as a deliberate card where the page
     // plane is close to the surface color. Alpha serializes as an `opacity`
     // attribute, so the emitted hex stays the primary ink's.
     root.draw(&Rectangle::new(
-        [(0, 0), (WIDTH as i32 - 1, HEIGHT as i32 - 1)],
+        [(0, 0), (WIDTH as i32 - 1, canvas_h - 1)],
         ShapeStyle {
             color: theme.primary.mix(0.10),
             filled: false,
@@ -2116,7 +2151,7 @@ fn frame<'b>(
         footer.extend(wrap(&line, NOTE_WRAP).into_iter().map(|l| (l, true)));
     }
 
-    let bottom = HEIGHT as i32 - 26;
+    let bottom = canvas_h - 26;
     let lines = i32::try_from(footer.len()).unwrap_or(i32::MAX);
     let top_of_footer = bottom.saturating_sub(LINE.saturating_mul(lines.saturating_sub(1)));
     // The plot body runs from the chart area's top margin to the footer top
@@ -2133,8 +2168,29 @@ fn frame<'b>(
             + MIN_PLOT_PX
             + PLOT_BOTTOM_GAP
     {
+        // Name the chart and the budget it went over. The chart step runs
+        // after the whole measurement sequence, so this message is read hours
+        // from the decision that caused it; "the caption block is too tall"
+        // alone leaves the reader to work out which of eleven charts refused,
+        // and by how much, before they can trim anything.
+        let floor = PLOT_TOP
+            .saturating_add(legend_extra)
+            .saturating_add(subtitle_extra)
+            + MIN_PLOT_PX
+            + PLOT_BOTTOM_GAP;
+        let budget = (bottom - floor) / LINE + 1;
+        // A bounded overrun at the base height is not a refusal but a
+        // request for a taller canvas: `render_validated` renders again with
+        // exactly the missing lines added. Only a second overrun (the canvas
+        // already grown) or a runaway caption reaches the refusal below.
+        let deficit = floor.saturating_sub(top_of_footer);
+        let extra_lines = deficit.saturating_add(LINE - 1) / LINE;
+        if canvas_h == HEIGHT as i32 && extra_lines <= MAX_CAPTION_GROWTH_LINES {
+            return Err(ChartError::CaptionOverflow { extra_lines });
+        }
         return Err(ChartError::Render(format!(
-            "the caption block ({} lines) leaves no room for the chart body",
+            "`{title}`: the caption block ({} lines) leaves no room for the chart body \
+             — this chart's budget is {budget} lines",
             footer.len()
         )));
     }
@@ -2156,7 +2212,7 @@ fn frame<'b>(
         .map_err(render)?;
     }
 
-    let reserved = (HEIGHT as i32 - top_of_footer + 18).max(0) as u32;
+    let reserved = (canvas_h - top_of_footer + 18).max(0) as u32;
     Ok((
         root.margin(
             (70 + subtitle_extra + legend_extra).max(0) as u32,
@@ -2267,7 +2323,7 @@ fn failed_text() -> &'static str {
 fn short_window_text() -> String {
     format!(
         "measured, but every window under {MIN_PUBLISHABLE_WINDOW_SECS} s — too short \
-         for the throughput to be a rate, so none is published (not even as a lower bound)"
+         to publish as a rate, even a lower bound"
     )
 }
 
@@ -2319,22 +2375,44 @@ fn shape_only_note(run: &BackendRun) -> String {
 /// Caption lines for cells the harness ran and could not measure in a chart's
 /// slice. A failed cell is absent from `results[]`, and an unexplained
 /// absence reads as a smaller sweep — or, worse, as a capability hole.
+///
+/// One line per *count*, not one per backend. The sentence is the same for
+/// every backend that lost the same number of cells, and the slices a failure
+/// lands in are the ones already carrying the mode notes, the batch knobs and
+/// the drain account — the caption block has a fixed budget before the chart
+/// body has no room left, so restating the sentence per backend is what turns
+/// a second failed backend into a refusal. Backends sharing a count are named
+/// in document order; the lines run fewest failures first.
 fn failure_notes<P>(runs: &[BackendRun], in_slice: P) -> Vec<String>
 where
     P: Fn(&FailedRow) -> bool,
 {
-    let mut notes = Vec::new();
+    let mut by_count: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
     for run in runs {
         let failed = run.failures.iter().filter(|f| in_slice(f)).count();
         if failed > 0 {
-            notes.push(format!(
-                "{}: {failed} cell(s) in this slice failed to run — absent, \
-                 not zero; see failures[] in the results document",
-                run.backend
-            ));
+            by_count
+                .entry(failed)
+                .or_default()
+                .push(run.backend.as_str());
         }
     }
-    notes
+    by_count
+        .into_iter()
+        .map(|(failed, backends)| {
+            // Every word here is spent against a caption line the tightest
+            // family has one to spare of: naming the six backends and the
+            // count is what the reader cannot reconstruct, and "see
+            // failures[]" already says where — the provenance line under it
+            // names the document.
+            format!(
+                "{}: {failed} cell{} in this slice failed to run — absent, \
+                 not zero; see failures[]",
+                backends.join(", "),
+                if failed == 1 { "" } else { "s" },
+            )
+        })
+        .collect()
 }
 
 /// The best-observed row by throughput. First-wins on exact ties, which keeps
@@ -2825,28 +2903,39 @@ where
 /// points keep their own captions), what the window was, that no producer
 /// ran inside it, the corpus sizes, and any redeliveries the consumers saw.
 /// Empty when no in-slice row is a drain.
+///
+/// The corpus is stated **per backend as soon as the backends disagree**. A
+/// drain rate is a rate whatever the corpus size, but the corpus is what sets
+/// the window length, and a slice where one backend ran a deliberately
+/// smaller one is a documented deviation the reader has to be able to see. An
+/// unattributed set ("6M / 30k") names both sizes and tells nobody which bar
+/// is which, which is worse than either naming one or naming them all — so
+/// the flat sentence is kept only for the case it is actually true of, every
+/// backend on the same corpus. Attributed, the backends sharing a corpus are
+/// grouped onto one entry rather than one each: they disagree because one
+/// deviates, so an entry each spends caption lines restating the pinned size.
 fn drain_notes<P>(runs: &[BackendRun], in_slice: P) -> Vec<String>
 where
     P: Fn(&ScenarioResult) -> bool,
 {
     let mut drained: Vec<&str> = Vec::new();
-    let mut corpora: BTreeSet<u64> = BTreeSet::new();
+    let mut per_backend: Vec<(&str, BTreeSet<u64>)> = Vec::new();
     let mut flows: BTreeSet<&str> = BTreeSet::new();
     let mut duplicates: Vec<String> = Vec::new();
     for run in runs {
         let mut dups = 0u64;
-        let mut any = false;
+        let mut corpora: BTreeSet<u64> = BTreeSet::new();
         for r in run.results.iter().filter(|r| in_slice(r)) {
             let Some(d) = &r.drain else {
                 continue;
             };
-            any = true;
             corpora.insert(d.corpus);
             flows.insert(canonical_flow(&r.flow));
             dups = dups.saturating_add(d.duplicates);
         }
-        if any {
+        if !corpora.is_empty() {
             drained.push(run.backend.as_str());
+            per_backend.push((run.backend.as_str(), corpora));
             if dups > 0 {
                 duplicates.push(format!("{} saw {dups} redeliveries", run.backend));
             }
@@ -2854,15 +2943,59 @@ where
     }
     let mut notes = Vec::new();
     if !drained.is_empty() {
-        let corpora: Vec<String> = corpora.iter().map(|c| fmt_count(*c as f64)).collect();
+        // Every backend on one corpus reads as one number; the moment two
+        // disagree the sentence stops naming a size and a second line
+        // attributes them.
+        let uniform = per_backend
+            .iter()
+            .all(|(_, c)| *c == per_backend[0].1)
+            .then(|| fmt_counts(&per_backend[0].1));
+        let corpus_clause = match &uniform {
+            Some(sizes) => format!("a corpus of {sizes} messages"),
+            None => "its corpus".to_string(),
+        };
         notes.push(format!(
             "drain ({}): each {} point is the processing rate of the consumers from the moment \
-             every worker was assigned until 90 % of a corpus of {} messages, published before \
+             every worker was assigned until 90 % of {}, published before \
              they started, had been consumed; no producer ran in the window",
             drained.join(", "),
             flows.iter().copied().collect::<Vec<_>>().join(" / "),
-            corpora.join(" / "),
+            corpus_clause,
         ));
+        if uniform.is_none() {
+            // Attributed does not mean one entry per backend. The backends
+            // disagree because one of them deviates — the matrix pins a single
+            // corpus and SQS alone runs a smaller one — so an entry each
+            // repeats the same sizes five times to say one thing. This note
+            // shares the caption block with the mode, lower-bound and batch
+            // notes, and that block has a fixed budget before the chart body
+            // has no room left; the repetition is what spends the line.
+            // Backends on the same corpus are grouped and named in document
+            // order, as are the groups themselves — which puts the pinned
+            // corpus before the deviation that differs from it. Groups are
+            // separated by `;` so a group's backend list cannot be misread as
+            // running into the next group.
+            let mut groups: Vec<(&BTreeSet<u64>, Vec<&str>)> = Vec::new();
+            for (backend, corpora) in &per_backend {
+                match groups.iter_mut().find(|(c, _)| *c == corpora) {
+                    Some((_, sharing)) => sharing.push(backend),
+                    None => groups.push((corpora, vec![backend])),
+                }
+            }
+            notes.push(format!(
+                "corpus differs by backend: {} — a smaller corpus is a shorter window, not a \
+                 different measurement",
+                groups
+                    .iter()
+                    .map(|(corpora, sharing)| format!(
+                        "{} {}",
+                        sharing.join(", "),
+                        fmt_counts(corpora)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
         if !duplicates.is_empty() {
             notes.push(format!(
                 "redeliveries counted once: {}",
@@ -2871,6 +3004,16 @@ where
         }
     }
     notes
+}
+
+/// Corpus sizes as they read in a caption: one backend's slice can span
+/// payload legs whose byte cap sized them differently, so this is a set.
+fn fmt_counts(corpora: &BTreeSet<u64>) -> String {
+    corpora
+        .iter()
+        .map(|c| fmt_count(*c as f64))
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 /// One caption line per backend whose in-slice rows arrived under an alias:
@@ -3900,8 +4043,8 @@ fn render_parallel_vs_sequenced(
                             "lower bound (muted bar) — this window cannot separate setup \
                              from drain, so the true rate is at least the bar shown"
                         } else {
-                            "lower bound from a window that cannot separate setup from drain; \
-                             the bar is shape only, so its height is not the bound"
+                            "lower bound from a window mixing setup and drain; shape only, \
+                             so its height is not the bound"
                         };
                         qualifiers
                             .entry(text.to_string())
@@ -3976,8 +4119,17 @@ fn render_parallel_vs_sequenced(
     notes.extend(mode_notes(&qualifiers));
 
     // One note when every backend's batch bar ran the same knobs (the usual
-    // case), per-backend notes when they differ — never silence, because the
+    // case), attributed notes when they differ — never silence, because the
     // knobs are what the bar's number means.
+    //
+    // Attributed does not mean one line per backend. A backend differs from
+    // the rest only rarely — SQS clamps to `ReceiveMessage`'s 10 while the
+    // matrix pins 500 for everyone else — so a line per backend spends six
+    // lines saying two things. The caption block has a fixed budget before
+    // the chart body has no room left, and the same slice also carries a
+    // drain note, the mode notes and the provenance; six backends is over
+    // it. Backends that ran the same knobs share one line, named in document
+    // order; the lines themselves run smallest batch first.
     let configs: BTreeSet<(u64, u64)> = batch_knobs.iter().map(|(_, s, a)| (*s, *a)).collect();
     match configs.len() {
         0 => {}
@@ -3988,9 +4140,15 @@ fn render_parallel_vs_sequenced(
             ));
         }
         _ => {
-            for (backend, size, age) in &batch_knobs {
+            for (size, age) in &configs {
+                let sharing: Vec<&str> = batch_knobs
+                    .iter()
+                    .filter(|(_, s, a)| (s, a) == (size, age))
+                    .map(|(backend, _, _)| backend.as_str())
+                    .collect();
                 notes.push(format!(
-                    "{backend} / batch: up to {size} messages or {age} ms per batch"
+                    "{} / batch: up to {size} messages or {age} ms per batch",
+                    sharing.join(", "),
                 ));
             }
         }
@@ -4601,9 +4759,20 @@ pub fn render_chart_to_string(
 /// already validated — [`generate`] validates once for every variant rather
 /// than re-walking every row per chart.
 fn render_validated(doc: &Document, chart: Chart, mode: Mode) -> Result<String, ChartError> {
+    match render_at(doc, chart, mode, HEIGHT) {
+        Err(ChartError::CaptionOverflow { extra_lines }) => {
+            let grown =
+                HEIGHT.saturating_add(u32::try_from(extra_lines.saturating_mul(LINE)).unwrap_or(0));
+            render_at(doc, chart, mode, grown)
+        }
+        other => other,
+    }
+}
+
+fn render_at(doc: &Document, chart: Chart, mode: Mode, height: u32) -> Result<String, ChartError> {
     let mut buf = String::new();
     {
-        let root = SVGBackend::with_string(&mut buf, (WIDTH, HEIGHT)).into_drawing_area();
+        let root = SVGBackend::with_string(&mut buf, (WIDTH, height)).into_drawing_area();
         render_into(doc, chart, mode, &root)?;
         root.present()
             .map_err(|e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string()))?;

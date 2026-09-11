@@ -157,11 +157,9 @@ impl<B: HasBroadcast> Broker<B> {
     /// [`.broadcast()`](crate::topology::TopologyBuilder::broadcast) can be
     /// subscribed through it.
     ///
-    /// Gated on [`HasBroadcast`], which not every backend implements — see that
-    /// trait for the authoritative list. `Broker<Sqs>` is excluded permanently
-    /// (SQS has no subscription shove can create and destroy per process
-    /// without leaking a queue); the backends still awaiting an implementation
-    /// are excluded by the same gate until it lands.
+    /// Gated on [`HasBroadcast`] — see that trait for the authoritative
+    /// list. `Broker<Sqs>` is excluded permanently (SQS has no subscription
+    /// shove can create and destroy per process without leaking a queue).
     pub fn broadcast_subscriber(&self) -> BroadcastSubscriber<B> {
         BroadcastSubscriber::new(&self.client)
     }
@@ -173,8 +171,7 @@ impl<B: HasBatchConsumption> Broker<B> {
     /// instead of once per message.
     ///
     /// Gated on [`HasBatchConsumption`] — see that trait for the
-    /// authoritative per-backend list and the caps that apply to each
-    /// (SQS's is a hard 10 messages).
+    /// authoritative per-backend list and the caps that apply to each.
     pub fn batch_consumer(&self) -> BatchConsumer<B> {
         BatchConsumer::new(&self.client)
     }

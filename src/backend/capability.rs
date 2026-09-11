@@ -5,9 +5,9 @@
 //! - [`HasBroadcast`] gates `BroadcastSubscriber<B>` / `broadcast_subscriber()`.
 //! - [`HasBatchConsumption`] gates `BatchConsumer<B>` / `Broker::batch_consumer()`.
 //!
-//! SQS implements only [`HasBatchConsumption`] (with a hard 10-message
-//! receive cap — see that trait's doc); the other two entry points are
-//! compile errors on `Broker<Sqs>` rather than runtime surprises.
+//! SQS implements only [`HasBatchConsumption`] (its receive cap is
+//! documented on that trait); the other two entry points are compile
+//! errors on `Broker<Sqs>` rather than runtime surprises.
 
 use std::sync::Arc;
 
@@ -126,17 +126,13 @@ pub trait HasBroadcast: Backend {
 /// | **NATS** | **yes** |
 /// | **SQS** | **yes** — hard 10-message `ReceiveMessage`/`DeleteMessageBatch`/`ChangeMessageVisibilityBatch` cap; `max_batch_size > 10` (including the crate default of 500) is rejected at consumer startup, not silently clamped |
 ///
-/// Every backend implements this capability. Unlike [`HasBroadcast`], which
-/// excludes SQS permanently, no row here was ever excluded on principle: the
-/// table filled in backend by backend as each batch consumer was implemented,
-/// and `Broker::batch_consumer()` started compiling on each marker the moment
-/// it did.
-///
 /// Sealed via `Backend`.
-#[diagnostic::on_unimplemented(
-    message = "`{Self}` has no batch-consumption implementation yet, so `.batch_consumer()` is unavailable.",
-    note = "Every backend implements `HasBatchConsumption` today (SQS with a hard 10-message receive cap — see that trait's doc), so this diagnostic should be unreachable: the trait is sealed via `Backend`."
-)]
+// No `on_unimplemented` diagnostic here, unlike the two sibling traits:
+// every concrete marker implements this trait, so the bound can only fail
+// on an underconstrained generic parameter — where rustc's default
+// suggestion (add the bound) is the right guidance, and there is no
+// alternative API or permanent exclusion for a tailored message to point
+// at.
 #[allow(private_interfaces, private_bounds)]
 pub trait HasBatchConsumption: Backend {
     type BatchConsumerImpl: BatchConsumerImpl + Clone + Send + Sync + 'static;

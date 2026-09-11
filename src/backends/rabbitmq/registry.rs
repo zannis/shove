@@ -10,6 +10,7 @@ use crate::backends::rabbitmq::consumer_group::{
 };
 use crate::backends::rabbitmq::topology::RabbitMqTopologyDeclarer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
+use crate::consumer_group::reject_fifo_concurrency_prefetch_controlled;
 use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
@@ -109,6 +110,14 @@ impl ConsumerGroupRegistry {
     /// Declares the topology for `T` before creating the group.  The group is
     /// **not** started — call [`start_all`] separately.
     ///
+    /// Rejects configs with `concurrent_processing(true)`, which this path
+    /// never read. Note the reason differs from the serial-FIFO backends':
+    /// a RabbitMQ FIFO shard is already concurrent across sequence keys and
+    /// serialised within each one, so concurrency here is not an ordering
+    /// hazard — it is simply governed by `prefetch_count` rather than by this
+    /// flag. An explicitly set flag is refused rather than silently discarded,
+    /// and the error names `with_prefetch_count` as the knob that works.
+    ///
     /// [`start_all`]: Self::start_all
     pub async fn register_fifo<T, H>(
         &mut self,
@@ -120,6 +129,12 @@ impl ConsumerGroupRegistry {
         T: SequencedTopic + 'static,
         H: MessageHandler<T> + 'static,
     {
+        if config.concurrent_processing() {
+            return Err(reject_fifo_concurrency_prefetch_controlled(
+                T::topology().queue(),
+            ));
+        }
+
         let mut config = config;
         config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
             config.handler_timeout,

@@ -548,6 +548,58 @@ fn a_published_batch_bar_names_its_knobs() {
 }
 
 #[test]
+fn batch_knob_captions_group_the_backends_that_share_them() {
+    // The knobs are per backend only because one backend can differ. Once
+    // any two disagree the caption used to degenerate to a line per backend,
+    // so a six-backend document spent six lines saying two things — and the
+    // caption block has a fixed budget before the chart body has no room
+    // left. Backends that ran the same knobs share a line.
+    let batch = |backend: &str, size: u64| {
+        format!(
+            r#"{{
+              "backend": "{backend}", "representative": true,
+              "results": [{}], "failures": [], "unsupported": []
+            }}"#,
+            scenario("consume_batch", "batch", 64, 1, 80_000.0).replace(
+                r#""max_batch_size": 500"#,
+                &format!(r#""max_batch_size": {size}"#)
+            )
+        )
+    };
+    // Five backends on the pinned size, one clamped — the shape the published
+    // matrix produces, SQS capping `ReceiveMessage` at 10.
+    let runs = [
+        inmemory_run(true),
+        batch("kafka", 500),
+        batch("nats", 500),
+        batch("rabbitmq", 500),
+        batch("redis", 500),
+        batch("sqs", 10),
+    ]
+    .join(",");
+    let doc = parse(&document(&runs));
+
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("a six-backend document must still leave room for the chart body");
+
+    assert!(
+        svg.contains(
+            "kafka, nats, rabbitmq, redis / batch: up to 500 messages or 200 ms per batch"
+        ),
+        "backends sharing the knobs must share one caption line"
+    );
+    assert!(
+        svg.contains("sqs / batch: up to 10 messages or 200 ms per batch"),
+        "the backend that differs must still be named with its own knobs"
+    );
+    assert_eq!(
+        svg.matches("ms per batch").count(),
+        2,
+        "one line per distinct knob pair, not one per backend"
+    );
+}
+
+#[test]
 fn a_sleeping_handler_row_never_reaches_a_throughput_chart() {
     // A handler_bound row's throughput is the simulated sleep, not shove.
     // Its magnitude must not appear in any throughput family — not as a bar,
@@ -1342,12 +1394,146 @@ fn a_failed_cell_in_a_slice_is_named_in_the_caption() {
     let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
         .expect("chart should render");
     assert!(
-        svg.contains("kafka: 1 cell(s) in this slice failed to run"),
+        svg.contains("kafka: 1 cell in this slice failed to run"),
         "a failed cell must be named in the caption"
     );
     assert!(
         svg.contains("absent, not zero"),
         "the caption must say how to read the absence"
+    );
+}
+
+#[test]
+fn failure_captions_group_the_backends_that_lost_the_same_count() {
+    // The note names a backend and a count, and says the same sentence about
+    // both. A line per backend spends the caption budget restating it: the
+    // slice a failure is most likely to land in already carries the mode
+    // notes, the batch knobs, the drain account and the provenance, so on a
+    // six-backend document two failed backends are the difference between a
+    // chart and a refusal. Backends that lost the same number of cells share
+    // a line, named in document order.
+    let failing = |backend: &str, consumers: u32| {
+        format!(
+            r#"{{
+              "backend": "{backend}", "representative": true,
+              "results": [{}],
+              "failures": [{{
+                "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 64,
+                "tier": "moderate", "messages": 150000, "consumers": {consumers},
+                "handler": "zero (no-op)", "method": "drain", "error": "timeout after 60s"
+              }}],
+              "unsupported": []
+            }}"#,
+            scenario("consume_parallel", "parallel", 64, 1, 9_000.0)
+        )
+    };
+    let runs = [inmemory_run(true), failing("kafka", 4), failing("nats", 8)].join(",");
+    let doc = parse(&document(&runs));
+
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+
+    assert!(
+        svg.contains("kafka, nats: 1 cell in this slice failed to run"),
+        "backends that lost the same count share one caption line"
+    );
+    assert_eq!(
+        svg.matches("in this slice failed to run").count(),
+        1,
+        "the two backends share one line rather than taking one each"
+    );
+    assert!(
+        svg.contains("absent, not zero"),
+        "the grouped line must still say how to read the absence"
+    );
+}
+
+#[test]
+fn failure_captions_keep_backends_with_different_counts_apart() {
+    // Grouping is by what the line says. Two backends that lost different
+    // numbers of cells do not say the same thing, so they keep their own
+    // lines — ordered by count, so the ordering does not depend on which
+    // backend the harness happened to measure first.
+    let failed_cell = |consumers: u32| {
+        format!(
+            r#"{{
+              "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 64,
+              "tier": "moderate", "messages": 150000, "consumers": {consumers},
+              "handler": "zero (no-op)", "method": "drain", "error": "timeout after 60s"
+            }}"#
+        )
+    };
+    let run = |backend: &str, failures: &str| {
+        format!(
+            r#"{{
+              "backend": "{backend}", "representative": true,
+              "results": [{}], "failures": [{failures}], "unsupported": []
+            }}"#,
+            scenario("consume_parallel", "parallel", 64, 1, 9_000.0)
+        )
+    };
+    let runs = [
+        inmemory_run(true),
+        run("kafka", &format!("{},{}", failed_cell(4), failed_cell(8))),
+        run("nats", &failed_cell(4)),
+    ]
+    .join(",");
+    let doc = parse(&document(&runs));
+
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+
+    assert!(
+        svg.contains("nats: 1 cell in this slice failed to run"),
+        "a backend that lost one cell says one"
+    );
+    assert!(
+        svg.contains("kafka: 2 cells in this slice failed to run"),
+        "a backend that lost two says two"
+    );
+}
+
+#[test]
+fn the_grouped_failure_note_fits_one_caption_line_with_every_backend_named() {
+    // Grouping backends onto one line only saves that line if the grouped
+    // sentence itself fits: a caption line is NOTE_WRAP characters, and the
+    // wording wrapped onto a second line as soon as three backends were
+    // named. The worst case is the whole sealed backend set losing the same
+    // cell — which is the expected shape here, since the cell the published
+    // document already fails on ("consumed before assembly" at 64 KiB) fails
+    // harder the faster the backend, so a faster host loses it on more of
+    // them. That lands in `parallel-vs-sequenced`, the family with the least
+    // caption headroom, so a wrap here is the difference between a chart and
+    // a refusal.
+    let failing = |backend: &str| {
+        format!(
+            r#"{{
+              "backend": "{backend}", "representative": true,
+              "results": [{}],
+              "failures": [{{
+                "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 64,
+                "tier": "moderate", "messages": 150000, "consumers": 8,
+                "handler": "zero (no-op)", "method": "drain", "error": "timeout after 60s"
+              }}],
+              "unsupported": []
+            }}"#,
+            scenario("consume_parallel", "parallel", 64, 1, 9_000.0)
+        )
+    };
+    let runs = ["inmemory", "kafka", "nats", "rabbitmq", "redis", "sqs"]
+        .map(failing)
+        .join(",");
+    let doc = parse(&document(&runs));
+
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+
+    assert!(
+        svg.contains(
+            "inmemory, kafka, nats, rabbitmq, redis, sqs: 1 cell in this slice failed to run \
+             — absent, not zero; see failures[]"
+        ),
+        "the grouped note must stay on one line with every backend named"
     );
 }
 
@@ -1438,7 +1624,18 @@ fn a_pathological_caption_block_is_a_loud_error_not_a_garbage_chart() {
     )));
     match chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light) {
         Err(ChartError::Render(msg)) => {
-            assert!(msg.contains("leaves no room"), "wrong error: {msg}")
+            assert!(msg.contains("leaves no room"), "wrong error: {msg}");
+            // The chart step runs after the whole measurement sequence, so the
+            // refusal has to say which of eleven charts refused and what it had
+            // to spend — otherwise trimming the caption starts with a search.
+            assert!(
+                msg.contains("Parallel vs sequenced consume"),
+                "the refusal must name the chart: {msg}"
+            );
+            assert!(
+                msg.contains("budget is") && msg.contains("lines"),
+                "the refusal must name the budget it went over: {msg}"
+            );
         }
         Ok(_) => panic!("a caption block taller than the canvas rendered a chart"),
         other => panic!("expected a Render refusal, got {other:?}"),
@@ -1508,7 +1705,7 @@ fn an_empty_run_with_recorded_failures_is_not_silent() {
     let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
         .expect("chart should render");
     assert!(
-        svg.contains("kafka: 1 cell(s) in this slice failed to run"),
+        svg.contains("kafka: 1 cell in this slice failed to run"),
         "the failed cell must surface in the caption"
     );
 }
@@ -2311,6 +2508,86 @@ fn identical_explanations_across_modes_collapse_to_one_caption_line() {
         svg.contains("sqs / parallel, sequenced (fifo), batch:"),
         "the merged caption must name every mode it covers"
     );
+}
+
+#[test]
+fn a_caption_a_few_lines_over_budget_grows_the_canvas_instead_of_refusing() {
+    // Six backends' worth of qualifiers is a real document, not a pathology:
+    // the six-backend results document's ordering chart carried 23 caption
+    // lines against a budget of 21 and was refused. A bounded overflow grows
+    // the canvas by exactly the lines it needs and keeps the plot body at its
+    // minimum; only a runaway caption is still refused (the test below).
+    let filler = "x".repeat(120);
+    let runs: Vec<String> = (0..2)
+        .map(|i| {
+            format!(
+                r#"{{
+                  "backend": "backend{i}", "representative": true,
+                  "results": [{}], "failures": [],
+                  "unsupported": [
+                    {{ "flow": "consume_parallel", "reason": "{filler}-a{i}" }},
+                    {{ "flow": "consume_fifo", "reason": "{filler}-b{i}" }},
+                    {{ "flow": "consume_batch", "reason": "{filler}-c{i}" }}
+                  ]
+                }}"#,
+                scenario("publish_single", "parallel", 64, 1, 10_000.0)
+            )
+        })
+        .collect();
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        runs.join(",")
+    )));
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("a caption a few lines over budget grows the canvas rather than refusing");
+    let height = canvas_height(&svg);
+    assert!(
+        height > f64::from(chartgen::HEIGHT),
+        "the canvas must grow past {} to seat the caption, got {height}",
+        chartgen::HEIGHT
+    );
+    for (_, y, _, content) in texts(&svg) {
+        assert!(
+            (0.0..=height).contains(&y),
+            "text baseline y={y} is outside the grown canvas of {height}: {content:?}"
+        );
+    }
+    // The plot's actual vertical extent is the y axis itself: plotters draws
+    // it as a two-point polyline with one x, and it is the longest such line
+    // on the canvas. Tick labels stop short of the boundaries, so a
+    // tick-based span would let an undersized plot through.
+    let axis_span = vertical_axis_span(&svg).expect("the chart draws a y axis");
+    assert!(
+        axis_span >= f64::from(chartgen::MIN_PLOT_PX),
+        "the plot body spans only {axis_span:.0}px on the grown canvas, under the \
+         {}px minimum",
+        chartgen::MIN_PLOT_PX
+    );
+}
+
+/// The vertical span of the longest two-point vertical polyline in `svg`: the
+/// y axis, which bounds the plot body exactly.
+fn vertical_axis_span(svg: &str) -> Option<f64> {
+    svg.split("<polyline")
+        .skip(1)
+        .filter_map(|chunk| svg_attr(chunk, "points"))
+        .filter_map(|points| {
+            let pts: Vec<(f64, f64)> = points
+                .split_whitespace()
+                .filter_map(|p| {
+                    let (x, y) = p.split_once(',')?;
+                    Some((x.parse().ok()?, y.parse().ok()?))
+                })
+                .collect();
+            match pts.as_slice() {
+                [(x1, y1), (x2, y2)] if x1 == x2 => Some((y1 - y2).abs()),
+                _ => None,
+            }
+        })
+        .fold(None, |best: Option<f64>, span| {
+            Some(best.map_or(span, |b| b.max(span)))
+        })
 }
 
 #[test]
@@ -4174,6 +4451,157 @@ fn load_scenario(
     )
 }
 
+/// An offered-load row the harness's backlog cap stopped at 2.7 s of a 10 s
+/// window: 25 000/s offered and held, 67 500 published, 50 000 processed, so
+/// 17 500 of lag (26 %) and not sustained. `backlog_capped` is what makes
+/// the short window legitimate; without it the same row is malformed.
+fn capped_rung_row(backlog_capped: bool) -> String {
+    let flag = if backlog_capped {
+        r#""backlog_capped": true,"#
+    } else {
+        ""
+    };
+    format!(
+        r#"{{
+          "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 65536,
+          "tier": "moderate", "messages": 67500, "consumers": 1,
+          "handler": "zero (no-op)", "handler_cost": "framework", "setup_secs": 3.1,
+          "throughput_msg_per_sec": 18518.518518518518,
+          "dispatch_p50_ms": 400.0, "dispatch_p95_ms": 800.0, "dispatch_p99_ms": 1600.0,
+          "e2e_p50_ms": 400.0, "e2e_p95_ms": 800.0, "e2e_p99_ms": 1600.0,
+          "scaling_efficiency": 1.0, "peak_rss_mb": 1.0, "cpu_pct": 100.0,
+          "duration_secs": 2.7,
+          "method": "offered_load",
+          "load": {{
+            "offered_msg_per_sec": 25000, "window_secs": 10, "producers": 8,
+            "published": 67500, "published_at_window_end": 67500,
+            "processed_at_window_end": 50000,
+            "achieved_publish_msg_per_sec": 25000.0, "lag_at_window_end": 17500,
+            "peak_lag": 17500, "drain_secs": 5.0,
+            "producer_bound": false, {flag} "sustained": false
+          }}
+        }}"#
+    )
+}
+
+#[test]
+fn a_rung_the_backlog_cap_stopped_is_a_valid_row_with_its_shorter_window() {
+    // The harness stops a rung's producers once its backlog passes the byte
+    // cap and records the window it actually ran, flagged `backlog_capped`.
+    // Such a row is a measurement (not sustained, by definition), not a
+    // malformed one: the first six-backend document with a capped rung must
+    // render rather than be refused.
+    let doc = parse(&document(&kafka_ladder_run(&[
+        load_scenario(
+            "consume_parallel",
+            65536,
+            1,
+            5_000,
+            5_000.0,
+            50_000,
+            5_000.0,
+            1.0,
+        ),
+        capped_rung_row(true),
+    ])));
+    chartgen::render_to_string(&doc, Family::DispatchLatency, Mode::Light)
+        .expect("a capped rung's shorter window is legitimate");
+}
+
+#[test]
+fn a_short_window_without_the_cap_flag_is_still_malformed() {
+    // The flag is the only thing that licenses a short window; a row that
+    // simply stopped early is still a document defect.
+    let doc = parse(&document(&kafka_ladder_run(&[
+        load_scenario(
+            "consume_parallel",
+            65536,
+            1,
+            5_000,
+            5_000.0,
+            50_000,
+            5_000.0,
+            1.0,
+        ),
+        capped_rung_row(false),
+    ])));
+    let err = chartgen::render_to_string(&doc, Family::DispatchLatency, Mode::Light)
+        .expect_err("an unflagged short window is refused");
+    assert!(
+        err.to_string().contains("shorter than the rung"),
+        "wrong refusal: {err}"
+    );
+}
+
+/// A capped row whose consumers kept up: 67 500 published, 67 000 processed,
+/// 500 of lag (under the 5 % threshold) with the producer holding the rate.
+/// Only the cap makes it not sustained, so this row is what proves the
+/// verdict honours the flag.
+fn capped_rung_row_kept_up(claimed_sustained: bool) -> String {
+    format!(
+        r#"{{
+          "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 65536,
+          "tier": "moderate", "messages": 67500, "consumers": 1,
+          "handler": "zero (no-op)", "handler_cost": "framework", "setup_secs": 3.1,
+          "throughput_msg_per_sec": 24814.814814814815,
+          "dispatch_p50_ms": 40.0, "dispatch_p95_ms": 80.0, "dispatch_p99_ms": 160.0,
+          "e2e_p50_ms": 40.0, "e2e_p95_ms": 80.0, "e2e_p99_ms": 160.0,
+          "scaling_efficiency": 1.0, "peak_rss_mb": 1.0, "cpu_pct": 100.0,
+          "duration_secs": 2.7,
+          "method": "offered_load",
+          "load": {{
+            "offered_msg_per_sec": 25000, "window_secs": 10, "producers": 8,
+            "published": 67500, "published_at_window_end": 67500,
+            "processed_at_window_end": 67000,
+            "achieved_publish_msg_per_sec": 25000.0, "lag_at_window_end": 500,
+            "peak_lag": 500, "drain_secs": 0.1,
+            "producer_bound": false, "backlog_capped": true, "sustained": {claimed_sustained}
+          }}
+        }}"#
+    )
+}
+
+#[test]
+fn the_cap_makes_a_rung_not_sustained_even_when_its_consumers_kept_up() {
+    // With 500 of lag on 67 500 published the numbers alone would call the
+    // rung sustained; the cap says otherwise, as the harness derives it. A
+    // row that claims sustained anyway is refused as inconsistent.
+    let ok = parse(&document(&kafka_ladder_run(&[
+        load_scenario(
+            "consume_parallel",
+            65536,
+            1,
+            5_000,
+            5_000.0,
+            50_000,
+            5_000.0,
+            1.0,
+        ),
+        capped_rung_row_kept_up(false),
+    ])));
+    chartgen::render_to_string(&ok, Family::DispatchLatency, Mode::Light)
+        .expect("a capped rung that kept up is not sustained, and renders");
+    let inconsistent = parse(&document(&kafka_ladder_run(&[
+        load_scenario(
+            "consume_parallel",
+            65536,
+            1,
+            5_000,
+            5_000.0,
+            50_000,
+            5_000.0,
+            1.0,
+        ),
+        capped_rung_row_kept_up(true),
+    ])));
+    let err = chartgen::render_to_string(&inconsistent, Family::DispatchLatency, Mode::Light)
+        .expect_err("a capped rung claiming sustained contradicts its own account");
+    assert!(
+        err.to_string().contains("sustained"),
+        "wrong refusal: {err}"
+    );
+}
+
 fn kafka_ladder_run(rows: &[String]) -> String {
     format!(
         r#"{{
@@ -4350,9 +4778,14 @@ fn a_drain_document_publishes_drain_rows_and_withholds_rungs() {
         !svg.contains("100k"),
         "the sustained rung must not supply a point in a drain document"
     );
+    // The caption wraps at NOTE_WRAP, so the rule is asserted against the
+    // text nodes joined rather than the raw SVG: where the line happens to
+    // break is not part of the claim.
+    let caption = joined_text(&svg);
     assert!(
-        svg.contains("drain (inmemory, kafka)") && svg.contains("no producer ran in the window"),
-        "the caption must state the drain rule: {svg}"
+        caption.contains("drain (inmemory, kafka)")
+            && caption.contains("no producer ran in the window"),
+        "the caption must state the drain rule: {caption}"
     );
     assert!(
         svg.contains("consume_parallel point"),
@@ -4422,6 +4855,116 @@ fn the_drain_caption_covers_the_consume_bars_and_leaves_the_fifo_bar_its_own() {
     assert!(
         svg.contains("kafka saw 12 redeliveries"),
         "redeliveries are disclosed: {svg}"
+    );
+}
+
+/// Every text node of a chart in reading order. A caption sentence wraps
+/// across nodes at [`chartgen::NOTE_WRAP`], so a phrase is asserted against
+/// this rather than the raw SVG, which would make the assertion a claim
+/// about where the line happened to break.
+fn joined_text(svg: &str) -> String {
+    texts(svg)
+        .into_iter()
+        .map(|(_, _, _, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Consumer-axis drain rows for the second backend, all at one rate so the
+/// run has a single corpus: `rate` picks whether it matches the in-process
+/// run's cell on that axis (10k msg/s over the fixture's 2 s window) or
+/// deviates from it.
+fn consumer_axis_drains(rate: f64) -> Vec<String> {
+    [1u32, 2, 4]
+        .into_iter()
+        .map(|consumers| drain_scenario("consume_parallel", 64, consumers, rate, 2.0, 0))
+        .collect()
+}
+
+#[test]
+fn one_shared_corpus_is_stated_once_and_never_attributed() {
+    // Both backends drained the same corpus — what every published chart
+    // renders today, since one matrix pins one corpus. The caption names it
+    // once; per-backend attribution here would be noise.
+    let run = kafka_ladder_run(&consumer_axis_drains(10_000.0));
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+    let caption = joined_text(&svg);
+    assert!(
+        caption.contains("a corpus of 22k messages"),
+        "a shared corpus is stated in the drain sentence: {caption}"
+    );
+    assert!(
+        !caption.contains("corpus differs by backend"),
+        "backends that agree are not attributed: {caption}"
+    );
+}
+
+#[test]
+fn a_backend_that_drained_a_smaller_corpus_is_named_in_the_caption() {
+    // The deviation this exists for: a backend too slow to drain the pinned
+    // corpus in a sane wall clock runs a smaller one. A bare set
+    // ("22k / 2.2k") names both sizes and attributes neither, so the reader
+    // cannot tell which series had the shorter window — which is the whole
+    // difference between a documented deviation and a footnote nobody can
+    // apply.
+    let run = kafka_ladder_run(&consumer_axis_drains(1_000.0));
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+    let caption = joined_text(&svg);
+    assert!(
+        caption.contains("corpus differs by backend: inmemory 22k; kafka 2.2k"),
+        "each backend's corpus is named: {caption}"
+    );
+    assert!(
+        !caption.contains("a corpus of"),
+        "the flat sentence must not claim one corpus the backends did not share: {caption}"
+    );
+    assert!(
+        caption.contains("no producer ran in the window"),
+        "the drain rule itself still stands: {caption}"
+    );
+}
+
+#[test]
+fn backends_sharing_a_corpus_are_grouped_into_one_caption_entry() {
+    // The shape the six-backend rerun actually produces: one matrix pins a
+    // corpus for everyone and a single backend deviates because it is too
+    // slow to drain the pinned one in a sane wall clock. An entry per backend
+    // would restate the pinned size once per backend to say one thing, and
+    // the parallel-vs-sequenced slice this note shares a caption block with
+    // sits one line under its budget at six backends.
+    let shared = ["kafka", "nats", "rabbitmq", "redis"].map(|backend| {
+        format!(
+            r#"{{ "backend": "{backend}", "representative": true,
+                  "results": [{}], "failures": [], "unsupported": [] }}"#,
+            consumer_axis_drains(10_000.0).join(",")
+        )
+    });
+    let deviating = format!(
+        r#"{{ "backend": "sqs", "representative": true,
+              "results": [{}], "failures": [], "unsupported": [] }}"#,
+        consumer_axis_drains(1_000.0).join(",")
+    );
+    let runs = format!("{},{},{}", inmemory_run(true), shared.join(","), deviating);
+    let doc = parse(&document(&runs));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("chart should render");
+    let caption = joined_text(&svg);
+    assert!(
+        caption.contains(
+            "corpus differs by backend: inmemory, kafka, nats, rabbitmq, redis 22k; sqs 2.2k"
+        ),
+        "backends on one corpus share an entry, the deviation keeps its own: {caption}"
+    );
+    // The point of grouping is the line it buys back, so the sizes must be
+    // stated once each rather than once per backend.
+    assert_eq!(
+        caption.matches("22k").count(),
+        1,
+        "the shared corpus is stated once, not once per backend: {caption}"
     );
 }
 
@@ -4671,4 +5214,336 @@ fn a_cell_with_rungs_only_is_withheld_and_never_plotted() {
         "the cell is withheld by name: {svg}"
     );
     assert!(!svg.contains("offered-load ladder"), "{svg}");
+}
+
+// ── Caption line budget: notes that must not wrap ───────────────────────────
+
+#[test]
+fn the_shape_only_fifo_lower_bound_note_fits_one_caption_line() {
+    // `parallel-vs-sequenced` is the family with the least caption headroom,
+    // and on a six-backend document its 64 KiB slice ran at 20 of a 21-line
+    // budget — one redelivery anywhere in the slice adds `drain_notes`'
+    // "redeliveries counted once" line and takes it to 21/21, after which any
+    // further note makes `frame()` refuse and write *no* charts at all.
+    //
+    // This note and its representative twin state one concept in two entries
+    // because a shape-only bar's height is normalised, so it cannot carry the
+    // "at least the bar shown" bound. They stay separate on purpose — see
+    // `a_shape_only_bar_carries_no_value_and_no_absolute_bound`, which guards
+    // sqs against the absolute claim — so the line is bought by wording, not
+    // by merging them and walking the bound back in a trailing clause.
+    let run = format!(
+        r#"{{
+          "backend": "sqs", "representative": false,
+          "broker": {{ "name": "LocalStack", "version": "x", "deployment": "localstack" }},
+          "results": [{},{}], "failures": [],
+          "unsupported": [{{ "flow": "consume_batch", "reason": "no batch on sqs" }}]
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 900.0),
+        scenario("consume_fifo", "fifo", 64, 1, 400.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
+
+    assert!(
+        svg.contains(
+            "sqs / sequenced (fifo): lower bound from a window mixing setup and drain; \
+             shape only, so its height is not the bound"
+        ),
+        "the shape-only lower-bound note must stay on one caption line: {svg}"
+    );
+}
+
+#[test]
+fn the_short_window_note_fits_one_caption_line() {
+    // Same budget, same family. A backend whose every window in the slice is
+    // under the publishable floor is captioned rather than dropped, and that
+    // caption sits in the block that has the least room to spare.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{},{},{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario_with_window(
+            "consume_parallel",
+            "parallel",
+            64,
+            1,
+            9_000.0,
+            "setup_bound",
+            0.4
+        ),
+        scenario_with_window("consume_batch", "batch", 64, 1, 9_500.0, "setup_bound", 0.4),
+        scenario("consume_fifo", "fifo", 64, 1, 4_000.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
+
+    assert!(
+        svg.contains(
+            "measured, but every window under 1 s — too short to publish as a rate, \
+             even a lower bound"
+        ),
+        "the short-window note must stay on one caption line: {svg}"
+    );
+}
+
+// ── Caption line budget: the headroom itself ────────────────────────────────
+
+/// The x every caption line is drawn at (`GUTTER`) and the ceiling that
+/// separates the caption's font size from the title's and the subtitle's.
+///
+/// A hand-synced copy like [`Y_TICK_BAND_X`]: chartgen draws the caption at
+/// `GUTTER` in `FOOT_PX` and scales a declared px by 1/1.24 on the way into
+/// the SVG, so the caption lands at ~12.1 px against the subtitle's ~14.5 and
+/// the title's ~21. The title and subtitle share the gutter x, so the size is
+/// what separates them; no other text in the frame is drawn at this x.
+const CAPTION_X: f64 = 24.0;
+const CAPTION_PX_CEILING: f64 = 13.0;
+
+/// The number of lines `frame()` drew into the caption block.
+fn caption_lines(svg: &str) -> usize {
+    texts(svg)
+        .into_iter()
+        .filter(|(x, _, size, _)| *x == CAPTION_X && *size < CAPTION_PX_CEILING)
+        .count()
+}
+
+/// The canvas height `frame()` settled on, as the SVG root declares it.
+///
+/// Since `52e27b1` a caption up to [`chartgen::MAX_CAPTION_GROWTH_LINES`] over
+/// budget is not refused — the canvas grows by exactly the lines it needs. So
+/// a render returning `Ok` no longer says the caption fit the budget, and this
+/// is what distinguishes the two: a height past `HEIGHT` means the budget was
+/// already gone and the growth allowance paid for it.
+fn canvas_height(svg: &str) -> f64 {
+    let root = svg.split('>').next().unwrap_or_default();
+    svg_attr(root, "height")
+        .and_then(|v| v.parse().ok())
+        .expect("the svg root declares its height")
+}
+
+/// One row of the `parallel-vs-sequenced` 64 KiB slice.
+///
+/// Method-measured flows get a drain account deriving exactly `throughput`
+/// (`duplicates` redeliveries folded in); the barrier-less `consume_fifo`
+/// carries no method, as the harness emits it.
+#[allow(clippy::too_many_arguments)]
+fn slice_row(
+    flow: &str,
+    mode: &str,
+    throughput: f64,
+    duration_secs: f64,
+    duplicates: u64,
+    batch: Option<(u64, u64)>,
+    cost: &str,
+) -> String {
+    let batch_knobs = match batch {
+        Some((size, age)) => format!(r#""max_batch_size": {size}, "max_batch_age_ms": {age},"#),
+        None => String::new(),
+    };
+    let (messages, method_and_drain, duration_secs, setup_secs) = if METHOD_FLOWS.contains(&flow) {
+        let (corpus, account, secs) = drain_account_json(throughput, duration_secs, duplicates);
+        (corpus, account, secs, "0.4")
+    } else {
+        (5000, String::new(), duration_secs, "null")
+    };
+    format!(
+        r#"{{
+          "flow": "{flow}", "mode": "{mode}", "payload_bytes": 65536,
+          "tier": "moderate", "messages": {messages}, "consumers": 1,
+          "handler": "zero (no-op)", "handler_cost": "{cost}", "setup_secs": {setup_secs},
+          {batch_knobs}
+          {method_and_drain}
+          "throughput_msg_per_sec": {throughput},
+          "dispatch_p50_ms": 1.5, "dispatch_p95_ms": 4.0, "dispatch_p99_ms": 9.0,
+          "e2e_p50_ms": 1.5, "e2e_p95_ms": 4.0, "e2e_p99_ms": 9.0,
+          "scaling_efficiency": 1.0, "peak_rss_mb": 1.0, "cpu_pct": 100.0,
+          "duration_secs": {duration_secs:?}
+        }}"#
+    )
+}
+
+/// The six-backend shape CAF-889's rerun produces, at the payload the
+/// `parallel-vs-sequenced` family's tightest slice reads.
+///
+/// Every caption entry that slice carries in the real document is present:
+/// the grouped fifo lower bound and sqs's shape-only variant of it, the mode
+/// note, in-memory's unpublishable window, its declared batch hole, the two
+/// batch-knob groups (sqs clamps to `ReceiveMessage`'s 10), the drain rule,
+/// the per-backend corpus deviation, the supervisor alias, a recorded
+/// failure and the three provenance lines.
+///
+/// `duplicates` redeliveries on one backend add `drain_notes`' "redeliveries
+/// counted once" line — the ordinary outcome (RabbitMQ redelivering on an
+/// unacked channel, SQS re-driving past a visibility timeout) that this
+/// slice had no room for before `df0d954`.
+///
+/// `extra_note_rows` rows carry a flow this chart does not know. Such a row
+/// contributes no bar, no series and no legend row — it moves the caption's
+/// height and nothing else the budget is computed from — so it is how this
+/// test adds "two further notes" without perturbing the layout it is
+/// measuring.
+fn six_backend_slice(duplicates: u64, extra_note_rows: usize) -> String {
+    let mut runs = vec![format!(
+        r#"{{ "backend": "inmemory",
+              "broker": {{ "name": "in-process", "version": "n/a", "deployment": "in-process" }},
+              "representative": true, "results": [{},{}], "failures": [],
+              "unsupported": [{{ "flow": "consume_batch", "reason": "run_batch is Kafka-only" }}] }}"#,
+        slice_row(
+            "consume_parallel",
+            "parallel",
+            9_000.0,
+            0.4,
+            0,
+            None,
+            "setup_bound"
+        ),
+        slice_row("consume_fifo", "fifo", 4_000.0, 2.0, 0, None, "setup_bound"),
+    )];
+    for (i, backend) in ["kafka", "nats", "rabbitmq", "redis"].iter().enumerate() {
+        // One backend records the redeliveries; the drain note names it.
+        let duplicates = if i == 0 { duplicates } else { 0 };
+        runs.push(format!(
+            r#"{{ "backend": "{backend}", "representative": true,
+                  "results": [{},{},{}], "failures": [], "unsupported": [] }}"#,
+            slice_row(
+                "consume_parallel",
+                "parallel",
+                9_000.0,
+                2.0,
+                duplicates,
+                None,
+                "framework"
+            ),
+            slice_row(
+                "consume_batch",
+                "batch",
+                9_500.0,
+                2.0,
+                0,
+                Some((500, 200)),
+                "framework"
+            ),
+            slice_row("consume_fifo", "fifo", 4_000.0, 2.0, 0, None, "setup_bound"),
+        ));
+    }
+    let mut sqs_rows = vec![
+        slice_row("supervisor", "parallel", 900.0, 2.0, 0, None, "framework"),
+        slice_row(
+            "consume_batch",
+            "batch",
+            950.0,
+            2.0,
+            0,
+            Some((10, 200)),
+            "framework",
+        ),
+        slice_row("consume_fifo", "fifo", 400.0, 2.0, 0, None, "setup_bound"),
+    ];
+    for k in 0..extra_note_rows {
+        // Long enough that the note naming it wraps: one such row is the two
+        // further caption lines the acceptance criterion asks for, and the
+        // test asserts that growth rather than trusting this length.
+        let flow = format!("unknown_flow_{k}_{}", "x".repeat(96));
+        sqs_rows.push(slice_row(
+            &flow,
+            "parallel",
+            100.0,
+            2.0,
+            0,
+            None,
+            "setup_bound",
+        ));
+    }
+    runs.push(format!(
+        r#"{{ "backend": "sqs", "representative": false,
+              "broker": {{ "name": "LocalStack", "version": "x", "deployment": "localstack" }},
+              "results": [{}],
+              "failures": [{{ "flow": "consume_parallel", "mode": "parallel",
+                              "payload_bytes": 65536, "tier": "moderate", "messages": 1000,
+                              "consumers": 1, "handler": "zero (no-op)", "method": "drain",
+                              "error": "timeout after 60s" }}],
+              "unsupported": [] }}"#,
+        sqs_rows.join(",")
+    ));
+    document(&runs.join(","))
+}
+
+/// Renders the tightest slice, turning a refusal into a failure that names
+/// the arithmetic — `frame()`'s message carries both the lines used and the
+/// budget, which is the whole diagnosis.
+fn render_tightest_slice(doc: &Document) -> String {
+    let chart = chartgen::Chart {
+        family: Family::ParallelVsSequenced,
+        payload: 65536,
+    };
+    chartgen::render_chart_to_string(doc, chart, Mode::Light)
+        .unwrap_or_else(|e| panic!("the tightest slice must render: {e}"))
+}
+
+#[test]
+fn the_tightest_slice_keeps_two_caption_lines_spare_at_six_backends() {
+    // The budget itself, not a wording. `0e5f930`'s refusal arrives at the
+    // chart step — hours after the measurement run that caused it, at the end
+    // of a six-backend evening, with nothing published — so the margin has to
+    // be asserted while it still exists rather than discovered by a run that
+    // writes no charts.
+    //
+    // Asserting the margin rather than a sentence is deliberate: the two
+    // notes `df0d954` reworded onto one line each are guarded above by their
+    // text, which fails when someone rewords them. This fails when the budget
+    // is next *approached*, whatever spends it — a seventh backend, a new
+    // note, a wider corpus deviation — which is the failure the wording tests
+    // cannot see coming.
+    let doc = parse(&six_backend_slice(12, 0));
+    let svg = render_tightest_slice(&doc);
+    let used = caption_lines(&svg);
+
+    // The slice must fit the budget on the base canvas. `52e27b1` landed the
+    // growth allowance between this test's branch point and its merge, which
+    // silently dissolved the property the test was written to hold: with a
+    // caption up to `MAX_CAPTION_GROWTH_LINES` over budget absorbed by a
+    // taller canvas, "it still rendered" became true whether the headroom
+    // existed or not. Spending the allowance is the budget being gone, not
+    // headroom, so the height is asserted rather than the `Ok`.
+    assert_eq!(
+        canvas_height(&svg),
+        f64::from(chartgen::HEIGHT),
+        "the tightest slice must seat its caption within the budget, not by growing the canvas"
+    );
+
+    // The fixture is the tight case, not the comfortable one: a document
+    // whose backends all drained cleanly is a line shorter and would prove
+    // less than it appears to.
+    assert!(
+        joined_text(&svg).contains("redeliveries counted once"),
+        "the fixture must be the redelivery case this margin is measured against: {svg}"
+    );
+
+    // Two further notes still render. `render_tightest_slice` panics with
+    // `frame()`'s own "(N lines) … budget is B lines" if they do not.
+    let padded = parse(&six_backend_slice(12, 1));
+    let padded_svg = render_tightest_slice(&padded);
+
+    // The two lines of headroom the criterion asks for: the further notes seat
+    // inside the budget too, on the same base canvas. This is the assertion
+    // that fails when the budget is next approached — whatever spends it — and
+    // it fails while the margin still exists, which is the whole point of
+    // asserting the margin rather than a sentence.
+    assert_eq!(
+        canvas_height(&padded_svg),
+        f64::from(chartgen::HEIGHT),
+        "two further caption lines must fit the budget, leaving the growth allowance unspent"
+    );
+
+    // Without this the test would pass vacuously if the padding ever stopped
+    // adding lines — it would prove the same document renders twice.
+    assert_eq!(
+        caption_lines(&padded_svg),
+        used + 2,
+        "the padding must add exactly two caption lines for this to prove two lines of headroom"
+    );
 }
