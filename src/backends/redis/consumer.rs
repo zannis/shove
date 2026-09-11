@@ -2307,11 +2307,16 @@ type BatchEntries = Vec<(String, Vec<(String, String)>)>;
 ///
 /// `BLOCK` is deliberately absent, and that is a correctness requirement
 /// rather than a tuning choice: this read shares one socket with the flush's
-/// `XACK`, Redis does not serve a blocked client's subsequent commands until
-/// it unblocks, so a blocking read-ahead on an idle stream would hold the
+/// `XACK` (see [`run_batch_impl`] for why sharing is the measured choice),
+/// Redis does not serve a blocked client's subsequent commands until it
+/// unblocks, so a blocking read-ahead on an idle stream would hold the
 /// flush's ack hostage for up to [`BLOCK_MS`]. Without `BLOCK` an empty
 /// stream answers immediately with nil, which is `None` here and costs the
-/// flush nothing.
+/// flush nothing. A second reason survives even on a socket of its own: this
+/// future is joined with the flush, so a blocking read would keep the join
+/// pending after the flush had returned, delaying the loop and shutdown with
+/// it, where the loop's own read is the one that may wait — raced `biased`
+/// against the shutdown token.
 ///
 /// A failure is logged and swallowed rather than propagated: the loop's own
 /// read is the next thing to run, and it reports a dead connection with the
@@ -2845,12 +2850,54 @@ where
 /// loop's consumer-path requests (803 -> 403 per 200 000 messages at 1c —
 /// the next read travels with the flush's `XACK` instead of following it
 /// cold), and under the charged cost it buys 1.28x at 1c and 1.35x at 2c.
-/// With no such cost it buys nothing at 1c (0.99x) and 1.50x at 2c, which is
-/// what this host measures. The gain tracks how much cold idle there was to
-/// fill, and 1.28x is short of the 2.19x the published 1c row would need for
-/// parity — so this loop does not claim that row is fixed, only that it
-/// removes one of the two serialized cold round trips per cycle. Pricing the
-/// cold start on the affected host is one short pass on it.
+/// With no such cost it buys 1.07x at 1c and 1.48x at 2c, which is what this
+/// host measures. The gain tracks how much cold idle there was to fill, and
+/// 1.28x is short of the 2.19x the published 1c row would need for parity —
+/// so this loop does not claim that row is fixed, only that it removes one of
+/// the two serialized cold round trips per cycle. Pricing the cold start on
+/// the affected host is one short pass on it.
+///
+/// # What sharing the socket costs, and why it is still the choice
+///
+/// The read-ahead rides a clone of the loop's connection, so its reply and
+/// the flush's `XACK` reply are queued on one client in that order. Three
+/// structures were built and measured on the host above — no read-ahead; the
+/// clone; and the two split over two sockets (once with the read-ahead moved
+/// off, once with the settlement moved off, which is what
+/// `run_stream_loop_concurrent` does). 64 B, `--concurrent --handler zero`,
+/// 600 000-message drains, `max_batch_size` 500, every arm built from one
+/// `CARGO_TARGET_DIR`, medians of three reps (one for the second split):
+///
+/// | consumers | no read-ahead | shared socket | split socket |
+/// |---|---|---|---|
+/// | 1 | 99 458 | 106 806 (1.074x) | 99 313 (0.999x) |
+/// | 2 | 152 724 | 225 206 (1.475x) | 181 495 (1.188x) |
+/// | 8 | 335 868 | 319 046 (**0.950x**) | 361 746 (1.077x) |
+///
+/// No run of one arm overlaps another arm's range in any cell, so the
+/// crossover is not this host's noise, and it is the same either way round:
+/// moving the settlement off instead of the read-ahead lands within 4% of the
+/// column above (102 509 at 1c, 177 869 at 2c, 351 839 at 8c, n=1), so the
+/// cost is having two sockets at all rather than which half moves.
+///
+/// So the 8-consumer cell pays about 5% for what the 1- and 2-consumer cells
+/// gain 7% and 48% from, and a split that recovers the 5% gives back 28
+/// points at 2c. This loop keeps the shared socket and the cost is stated
+/// rather than hidden.
+///
+/// What the cost is **not**, measured off the broker rather than argued: the
+/// command mix is identical (1 209 vs 1 214 `XREADGROUP`s at ~495 entries
+/// each and 1 200 `XACK`s per 600 000 messages, so nothing is fragmented,
+/// clamped or double-read), time inside Redis commands is within 4%
+/// (2.163 vs 2.246 us/msg), the server is not command-saturated on either arm
+/// (command execution fills 71% and 66% of the drain window), socket events
+/// per cycle actually *fall* (2.0 -> 1.15 reads, 3.0 -> 2.1 writes: the
+/// pipelining works), and `connected_clients` is unchanged at 11, proving the
+/// clone opens no socket. What rises is Redis's non-command CPU per message,
+/// +10 to 18% — the event-loop cost of serving one client whose 32 KB read
+/// reply and whose ack reply are queued together, the ack's behind the
+/// read's. That is why the loss appears only where the broker is busy enough
+/// for the queueing to land on the critical path.
 ///
 /// Five properties keep it from changing what a handler sees:
 ///
@@ -2971,13 +3018,21 @@ where
 
         async move {
             let mut conn = client.dedicated_conn().await?;
-            // One clone per reconnect cycle, exactly as
-            // `run_stream_loop_concurrent` hoists its `outcome_conn`: a clone
-            // of a multiplexed connection shares the socket and the
-            // multiplexer task, so this opens nothing new and only exists so
-            // the read-ahead and the flush can hold separate handles at the
-            // same time. Re-cloned when this closure re-runs, off the
-            // freshly dialed `conn`.
+            // A clone rather than a second connection, and that is a
+            // **measured** choice rather than the convenience it looks like.
+            // A `MultiplexedConnection` clone shares the socket and the
+            // multiplexer task, so it opens nothing new — `connected_clients`
+            // does not move — and exists only so the read-ahead and the flush
+            // can hold separate handles at the same time. Sharing has two
+            // consequences and this loop wants the first: the read-ahead's
+            // `XREADGROUP` and the flush's `XACK` pipeline over one socket
+            // instead of taking turns on it, which is what buys the 1- and
+            // 2-consumer cells; and Redis writes the ack's reply behind the
+            // read's, which is what costs the 8-consumer one. Both halves are
+            // measured in `run_batch_impl`'s "Read-ahead across the flush",
+            // together with the two split-socket variants that were built and
+            // rejected. Re-cloned when this closure re-runs, off the freshly
+            // dialed `conn`.
             let mut read_conn = conn.clone();
             let mut batch: RedisBatch<T> = RedisBatch::new(max_batch_size);
             let mut deadline: Option<Instant> = None;
@@ -3010,7 +3065,9 @@ where
                     // connection: the read and the flush's `XACK` pipeline
                     // over one socket instead of taking turns on it. See
                     // [`read_ahead_batch`] for why that obliges the
-                    // read-ahead to omit `BLOCK`.
+                    // read-ahead to omit `BLOCK`, and this function's
+                    // "Read-ahead across the flush" for what sharing costs at
+                    // eight consumers and why a split socket costs more.
                     //
                     // A replay cycle takes no read-ahead: a live `>` read
                     // would interleave never-delivered entries into a PEL
