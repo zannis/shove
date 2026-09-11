@@ -132,10 +132,11 @@ messages per call, so whatever the handler costs per invocation is paid once per
 flush rather than once per message. The table reads the batch flow's drain
 ceiling off the same results document: the best cell the charts publish for
 each backend and payload, its consumer count, and the ratio to the plain
-parallel consumer at that same cell. Batches are up to 500 messages or 250 ms,
+parallel consumer at that same cell — on SQS, which has no `consume_parallel`
+rows, the comparator is `supervisor`. Batches are up to 500 messages or 250 ms,
 except on SQS, whose API caps a batch at 10. Batching leads most where messages
 are small and per-message framework work dominates; at 64 KiB the batch flow is
-at most 1.35x the parallel one on every backend, because the cost there is
+at most 1.5x the parallel one on every backend, because the cost there is
 moving bytes.
 
 | Backend | 64 B (msg/s) | 1 KiB (msg/s) | 64 KiB (msg/s) |
