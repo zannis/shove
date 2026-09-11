@@ -83,9 +83,10 @@ use serde::Deserialize;
 /// row without a `load` account was the live-publish corpus, and nothing on
 /// it says so, which is why v5 is refused rather than read as v6.
 ///
-/// v7 gave `consume_fifo` and `dlq_drain` readiness barriers of their own, so
-/// their rows may now carry a `setup_secs` and a `framework` marker where a v6
-/// row of those flows always carried `null` and `setup_bound`.
+/// v7 gave `dlq_drain` a readiness barrier of its own, so its rows may now
+/// carry a `setup_secs` and a `framework` marker where a v6 `dlq_drain` row
+/// always carried `null` and `setup_bound`. `consume_fifo` is unchanged and
+/// still carries `null` in a v7 document — see [`BARRIERLESS_FLOWS_V7`].
 pub const SCHEMA_VERSION: u32 = 7;
 
 /// Every `schema_version` this generator reads, newest last.
@@ -94,13 +95,12 @@ pub const SCHEMA_VERSION: u32 = 7;
 /// exists to bound. The usual rule — refuse anything but the current version —
 /// is there because a prior version's *published* numbers are not comparable
 /// with the current one's. The v6→v7 delta is not of that kind: it changed
-/// `duration_secs` only on `consume_fifo` and `dlq_drain`, and every v6 row of
-/// those two flows carries `setup_bound`, so every one of them is already
-/// withheld from an absolute axis by its own marker. Nothing a v6 document
-/// charts moved.
+/// `duration_secs` only on `dlq_drain`, and every v6 `dlq_drain` row carries
+/// `setup_bound`, so every one of them is already withheld from an absolute
+/// axis by its own marker. Nothing a v6 document charts moved.
 ///
-/// What is open is the *acceptance* rule, not the plotting rule: the two flows
-/// are held to the v6 shape in a v6 document and the v7 shape in a v7 one, so
+/// What is open is the *acceptance* rule, not the plotting rule: `dlq_drain`
+/// is held to the v6 shape in a v6 document and the v7 shape in a v7 one, so
 /// neither document can carry the other's. The reason both are readable at
 /// once is that the harness's barrier change and the six-backend re-measure
 /// that replaces the committed document do not land together — the
@@ -263,12 +263,17 @@ pub const NEGLIGIBLE_HANDLERS: &[&str] = &["zero (no-op)", "fast (1-5ms)"];
 /// The consume flows whose driver held no readiness barrier **through v6**.
 /// Without a barrier no window can be certified as a drain, so a `framework`
 /// row for one of these is unproducible in a v6 document.
-///
-/// Empty from [`SCHEMA_VERSION`] on: both flows gained barriers there, and the
-/// harness's `Flow::holds_readiness_barrier` is now true for every consume
-/// flow. [`barrierless_flows`] is what applies this per document, and the
-/// guards in [`validate`] go through it rather than this constant.
 pub const BARRIERLESS_FLOWS_THROUGH_V6: &[&str] = &["consume_fifo", "dlq_drain"];
+
+/// The same set from [`SCHEMA_VERSION`] on. `dlq_drain` gained a barrier in
+/// v7 and left; `consume_fifo` did not and cannot, because a sequenced drain
+/// is not measurable at all — a sentinel published once the consumers are up
+/// is delivered behind the prefilled corpus on its shard, so the barrier it
+/// feeds could only open after the drain it was meant to bracket. The harness
+/// keeps its `Flow::holds_readiness_barrier` false and publishes its corpus
+/// inside the measured window, which is why that window is never a drain and
+/// its negligible-handler rows stay `setup_bound`.
+pub const BARRIERLESS_FLOWS_V7: &[&str] = &["consume_fifo"];
 
 /// The barrierless consume flows of a document declaring `schema_version`.
 ///
@@ -279,7 +284,7 @@ pub fn barrierless_flows(schema_version: u32) -> &'static [&'static str] {
     if schema_version < SCHEMA_VERSION {
         BARRIERLESS_FLOWS_THROUGH_V6
     } else {
-        &[]
+        BARRIERLESS_FLOWS_V7
     }
 }
 
@@ -3603,11 +3608,10 @@ where
 /// `lower_bound` marks a setup-bound consume window: the recorded throughput
 /// can only under-state the drain rate (the window is only ever too long), so
 /// the bar is drawn at its value but muted, and the caption states the `≥`.
-/// That keeps a mode whose window is setup-bound on the chart as a bounded
-/// claim instead of either a false absolute or a silent omission. Through v6
-/// sequenced consume was always in that state — it held no readiness barrier
-/// to hang a probe on — and from v7 it reaches this arm only when its drain
-/// is under the publishable-window floor.
+/// That keeps the one mode that *cannot* separate setup (sequenced consume
+/// holds no readiness barrier in any version — its window contains the publish
+/// of its own corpus) on the chart as a bounded claim instead of either a
+/// false absolute or a silent omission.
 #[derive(Debug, Clone, Copy)]
 struct Bar {
     value: f64,
@@ -3965,11 +3969,10 @@ fn render_parallel_vs_sequenced(
 
     for run in &doc.runs {
         // Per mode: an absolute bar from the framework rows if any exist,
-        // else a lower-bound bar from the setup-bound rows. In a v6 document
-        // sequenced consume's zero/fast rows are *always* setup-bound (it held
-        // no readiness barrier), and in a v7 one they still can be on a short
-        // drain — without the lower-bound arm the ordering-cost chart would
-        // lose the sequenced bar it exists to show. Sleeping-handler
+        // else a lower-bound bar from the setup-bound rows. Sequenced consume
+        // holds no readiness barrier, so its zero/fast rows are *always*
+        // setup-bound — without the lower-bound arm the ordering-cost chart
+        // would lose the sequenced bar it exists to show. Sleeping-handler
         // rows (`handler_bound` / `handler_amortised`) never reach either arm:
         // their number is the simulated sleep, not shove.
         // One worker count per backend, shared by every mode it measured:

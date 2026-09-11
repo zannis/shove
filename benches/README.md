@@ -262,21 +262,15 @@ an SQS row changes — a rate is a rate — but a shorter window is a noisier
 estimate, which is why the size is on the chart and not just in the script.
 
 The FIFO cell deviates too, and separately, because the drain deviation never
-reaches it: `consume_fifo` takes no drain, so it publishes the tier's 5 000
-messages per shard from behind its readiness barrier and consumes them through
-the sequenced path. LocalStack serves that path at a few messages per second,
-which makes each of the three FIFO cells (one per payload) a ten-hour cell.
-SQS runs **100 per FIFO worker** instead (one worker per shard on this
-backend), set as `SQS_FIFO_MESSAGES` in `scripts/bench.sh` and passed as
-`--fifo-messages`, which replaces the tier's per-consumer count in the same
-unit; every other backend runs the tier's count. The row records the corpus it
-ran in `messages`.
-
-An explicit `--fifo-messages` also outranks the framework corpus floor, which
-`consume_fifo` entered when it gained its barrier. Without that precedence the
-floor would raise this cell back to 150 000 at 64 B and 32 768 at 1 KiB —
-replacing the deviation with the ten-hour cell it exists to avoid. Every other
-backend, which passes no `--fifo-messages`, gets the floor.
+reaches it: `consume_fifo` holds no barrier and takes no drain, so it publishes
+the tier's 5 000 messages per shard and consumes them through the sequenced
+path. LocalStack serves that path at a few messages per second, which makes
+each of the three FIFO cells (one per payload) a ten-hour cell. SQS runs
+**100 per FIFO worker** instead (one worker per shard on this backend), set
+as `SQS_FIFO_MESSAGES` in `scripts/bench.sh` and passed as `--fifo-messages`,
+which replaces the tier's per-consumer count in the same unit; every other
+backend runs the tier's count. The row records the corpus it ran in
+`messages`.
 
 Kafka is the reference backend for the batched-consume flow. Its batch and
 parallel scenarios declare one partition per consumer so every group member
@@ -438,10 +432,13 @@ check before trusting a document:
 - `handler_cost` on each row. `framework` means the window measured shove;
   `setup_bound` means the window was too short or unseparated from setup and
   the number is a stopwatch reading, not a rate.
-- `setup_secs` on the consume rows. Every consume driver now holds a readiness
-  barrier and records the interval it excluded, so a `None` there is a row from
-  a v6 document — the two are not comparable, which is why a v6 file is refused
-  at merge rather than written into.
+- `setup_secs` on the consume rows. Every consume driver but one holds a
+  readiness barrier and records the interval it excluded. `None` is expected on
+  `consume_fifo`, which cannot hold one — a sequenced drain is not measurable,
+  so that driver publishes its corpus inside the timed window and its
+  negligible-handler rows stay `setup_bound`. `None` on a `dlq_drain` row is a
+  row from a v6 document instead; the two are not comparable, which is why a v6
+  file is refused at merge rather than written into.
 - The `Offered-load rungs` table at the end of the log, one line per rung
   with its verdict. A cell whose first rung is already producer-bound is a
   host that cannot drive the ladder for that payload, not a backend result.
