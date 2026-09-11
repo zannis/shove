@@ -313,10 +313,11 @@ This is the mirror image of the SQS deviation. SQS drains a smaller corpus
 because it is the only backend slow enough that the pinned *count* means
 something else there; in-process is allowed a larger one because it is the only
 backend fast enough that the pinned *byte cap* does. At 3 GiB the 64 KiB leg is
-49 152 messages, and the 2026-09-08 run drained every one of the in-process
+49 152 messages, and the last pre-cap in-process leg drained every one of its
 64 KiB cells in 0.09-0.46 s — under the 1 s floor, so the harness marked all
 eleven rows `setup_bound` and the charts withheld all eleven. The fastest
-backend in the set published no 64 KiB consume rate at all.
+backend in the set published no 64 KiB consume rate at all. That is the hole
+the cap was added to close.
 
 Why only in-process gets it: 3 GiB is not a cautious number for the others, it
 is the containerised limit. Every other backend stages its corpus inside the
@@ -326,42 +327,44 @@ backlog has already taken Redis down mid-pass (see the backlog cap). In-process
 stages its corpus in the harness process on the 64 GB host and never starts a
 container, so it is the one backend whose cap can rise without touching the VM.
 
-At 32 GiB the 64 KiB leg drains 524 288 messages, which puts the fastest cell
-(`consumer_group` at two consumers, 514 k msg/s) at about 0.9 s and the other
-ten at 1.0-5.0 s: the leg would publish instead of being withheld whole.
-Resident cost is ~34 GB. Clearing that last cell as well would need ~40 GiB, and
-`MIN_FRAMEWORK_CORPUS_MESSAGES`'s own doc declines to chase a window that
-hardware speed keeps moving — a cell landing under the floor is withheld and
-captioned exactly as before, which costs one bar rather than the pass.
+The published in-process leg carries the cap, so the paragraphs below are
+measured rows rather than a forecast. At 32 GiB the 64 KiB leg drains 524 288
+messages — 32 GiB of payload staged in the harness process, which is the cap
+doing exactly what it says. All twelve 64 KiB drain rows land in 3.4-9.1 s,
+every one of them clears the floor as `framework`, and the leg publishes whole
+where it was withheld whole.
 
-It moves the 1 KiB leg too, by design: at 3 GiB that leg is byte-bound at
-3 145 728, and 32 GiB would put it back on the pinned count of 6 000 000 where
-the 64 B leg already sits. In-process would then run two of its three legs on
-the matrix's own corpus rather than one, and the single 1 KiB cell that drained
-in 0.97 s would clear the floor as well. It costs about forty seconds and 6 GiB
-rather than 3 GiB resident.
+Rates at that corpus are 52 k-139 k msg/s, well below the 95 k-514 k the same
+cells reported at 49 152. A rate measured over a 0.1 s window does not predict
+the rate over a 5 s one, so size the corpus from the window you want, not from
+the throughput a sub-floor cell happened to report. `MIN_FRAMEWORK_CORPUS_MESSAGES`'s
+own doc declines to chase a window that hardware speed keeps moving — a cell
+landing under the floor is withheld and captioned, which costs one bar rather
+than the pass.
 
-**None of that is in the published document.** The cap landed after the
-committed in-process leg was measured, and a leg changes only by being
-re-measured — so `benches/results/bench-results.json` still carries in-process
-at the pinned 3 GiB: `drain.corpus` 49 152 at 64 KiB with all eleven rows
-`setup_bound` and withheld, and 3 145 728 at 1 KiB. That is what the chart
-captions name. The two paragraphs above are what the next in-process pass
-produces, not a description of what is plotted today.
+It moves the 1 KiB leg too, by design: at 3 GiB that leg was byte-bound at
+3 145 728, and 32 GiB puts it back on the pinned count of 6 000 000 where the
+64 B leg already sits. In-process now runs two of its three legs on the matrix's
+own corpus rather than one, in 4.9-15.1 s per cell, and the 1 KiB cell that
+previously drained in 0.95 s clears the floor with the rest: the leg has no
+`setup_bound` drain row at either payload.
 
 As with the SQS deviation it is recorded on the rows, not only here: every
 drain row carries `drain.corpus`, and where a slice's backends disagree the
-charts name them — today "corpus differs by backend: inmemory, kafka, nats,
-rabbitmq, redis 49k / 3.1M / 6.0M; sqs 49k / 60k" — rather than listing sizes
-unattributed.
+charts name them — today "corpus differs by backend: inmemory 524k / 6.0M;
+kafka, nats, rabbitmq, redis 49k / 3.1M / 6.0M; sqs 49k / 60k" — rather than
+listing sizes unattributed.
 
-One thing it does **not** fix, so a rerun is not read as fixing it: of the two
-cells in the published document that failed "consumed before assembly" at
-64 KiB with eight consumers, in-process is one and this clears it; the other is
-RabbitMQ, whose eight-consumer group assembly ran through 46 467 of 49 152
-messages. Putting that well under half a corpus needs ~196 k messages, or
-12 GiB inside an 8 GB VM. That one is a group-assembly cost rather than a
-corpus size, and it is expected to fail again.
+One thing it does **not** fix, so the rerun is not read as fixing it: two cells
+failed "consumed before assembly" at 64 KiB with eight consumers, and the cap
+clears only one. In-process cleared — its batch drain assembled at 30 500 of
+524 288, comfortably inside the first half — and it has no failures left. The
+other is RabbitMQ, whose eight-consumer drain ran through 46 467 of 49 152
+messages before the last worker was assigned. That leg was not re-measured and
+the cap cannot reach it anyway: RabbitMQ stages inside the 8 GB VM at the pinned
+3 GiB, and putting the assembly well under half a corpus needs ~196 k messages,
+or 12 GiB inside that VM. That one is a worker-assembly cost rather than a
+corpus size, and it is still the document's one drain failure.
 
 ## Results document and provenance
 
@@ -420,8 +423,8 @@ ones. Keep them in a separate results file.
 
 ## Reading a run
 
-The harness prints a table per scenario and a summary at the end. Three
-things to check before trusting a document:
+The harness prints a table per scenario and a summary at the end. What to
+check before trusting a document:
 
 - `Failed scenarios:` at the end of the log. A failed scenario is recorded in
   `failures[]` and produces no row, so a chart drawn from it is missing a
