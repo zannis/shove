@@ -2804,8 +2804,31 @@ where
 /// publishes, one round trip each, at `dispatch_p50_ms` 0.071. Two round
 /// trips is therefore ~142 us of that row's 3 777 us per-batch cycle — under
 /// 4%, against a gap that needs 2.19x. The serialization is real and this
-/// removes it, but it is far too small to be that row's cause, and what is
-/// remains open. Do not re-derive the overlap as the explanation.
+/// removes it, but it is far too small to be that row's cause. Do not
+/// re-derive the overlap as the explanation.
+///
+/// What that row's cost IS bounded to, from the same document's own rows.
+/// Read its three 1c `consume_batch` drains as a payload sweep at a constant
+/// `max_batch_size` 500: 64 B / 1 KiB / 64 KiB cost 3 777 / 4 977 / 20 658 us
+/// per cycle, for 32 KB / 512 KB / 32 MB of reply. A 1 000x in bytes buys
+/// 5.5x in time, which fits a ~1.9 GB/s byte term over a **~3.7 ms per-cycle
+/// term that does not depend on payload** — some 50 of that host's own round
+/// trips. It is not a per-entry cost either: the same host at two consumers
+/// runs 726 872 msg/s, i.e. each consumer's 500-entry cycle in 1 377 us, and
+/// no per-entry or per-byte cost falls by 2.7x because a second connection
+/// appeared. So ~2.4 ms of every single-consumer cycle there is dead time
+/// that another concurrent flow removes — a wakeup/flush-latency shape, not a
+/// throughput one.
+///
+/// That shape is absent on an aarch64 Linux host against a native Docker
+/// Redis 7.0, which is why no local A/B can close it. A parse-free
+/// `XREADGROUP` probe there — one connection, reads back to back — fits
+/// 0.32 ms fixed + 2.1 us per entry across COUNT 100/500/2000, and the lone
+/// serial reader is the FASTEST arm: two concurrent readers cost ~1.5x more
+/// per read, not less. Whether the published host instead pays a large fixed
+/// per-read cost that any second busy flow hides is one short measurement on
+/// that host, and it is what this row's cause turns on. It cannot be settled
+/// from this code, and this loop does not claim it.
 ///
 /// Five properties keep it from changing what a handler sees:
 ///
