@@ -2796,16 +2796,22 @@ where
 /// 500-message cycle, of which the read phase alone is 57% and the process
 /// holds one core only half busy.
 ///
-/// What this does **not** explain is the sub-parity single-consumer batch row
+/// What this does **not** settle is the sub-parity single-consumer batch row
 /// in `benches/results/bench-results.json` — 64 B, one consumer, drain:
 /// 132 389 msg/s against `consume_parallel`'s 289 728 at the same cell. That
-/// document was measured on another host, and it dates that host's own Redis
-/// round trip: its `publish_single` 64 B row is 5 000 strictly serial awaited
-/// publishes, one round trip each, at `dispatch_p50_ms` 0.071. Two round
-/// trips is therefore ~142 us of that row's 3 777 us per-batch cycle — under
-/// 4%, against a gap that needs 2.19x. The serialization is real and this
-/// removes it, but it is far too small to be that row's cause. Do not
-/// re-derive the overlap as the explanation.
+/// document was measured on another host and nothing here was, so this loop
+/// does not claim the overlap as that row's established cause.
+///
+/// Nor is it excluded by magnitude, and an earlier revision of this comment
+/// had that wrong: it bounded the overlap by two of that host's
+/// `publish_single` round trips (2 x 71 us, under 4% of the cycle) and called
+/// the mechanism thirty times too small. A small-command round trip is not
+/// the quantity a read-ahead hides. What it hides is the whole read phase —
+/// the server building a 500-entry reply, its transfer, and the client's
+/// decode — which the parse-free probe below prices at 0.32 ms fixed plus
+/// 2.1 us per entry, about **1.4 ms** at COUNT 500. That is 6.7x the
+/// two-round-trip proxy on the one host where both were measured, so the
+/// proxy bounds nothing.
 ///
 /// What that row's cost IS bounded to, from the same document's own rows.
 /// Read its three 1c `consume_batch` drains as a payload sweep at a constant
@@ -2818,14 +2824,25 @@ where
 /// no per-entry or per-byte cost falls by 2.7x because a second connection
 /// appeared. So ~2.4 ms of every single-consumer cycle there is dead time
 /// that another concurrent flow removes — a wakeup/flush-latency shape, not a
-/// throughput one.
+/// throughput one. That also bounds what removing it could buy there: a 1c
+/// cycle with that dead time gone runs at the 2c per-consumer rate, 363 436
+/// msg/s, which clears the 289 728 parity bar. Being large enough to be the
+/// cause is not being it, and this loop claims only the former.
 ///
 /// That shape is absent on an aarch64 Linux host against a native Docker
 /// Redis 7.0, which is why no local A/B can close it. A parse-free
 /// `XREADGROUP` probe there — one connection, reads back to back — fits
 /// 0.32 ms fixed + 2.1 us per entry across COUNT 100/500/2000, and the lone
 /// serial reader is the FASTEST arm: two concurrent readers cost ~1.5x more
-/// per read, not less. Whether the published host instead pays a large fixed
+/// per read, not less. The drain says it in the published rows' own units,
+/// 3 interleaved reps per arm at the 64 B cell: without this read-ahead that
+/// host scales 1c -> 2c by **1.49x** (105 224 -> 156 247 msg/s) where the
+/// published host scales by **5.49x**, and its 1c batch row already runs
+/// 1.75x *above* its own `consume_parallel` (60 002 msg/s) where the
+/// published one runs at 0.457x. With the read-ahead the same cells move to
+/// 114 834 at 1c (+9%, inside this host's spread) and 205 137 at 2c (+31%,
+/// outside it) — the gain tracks how much idle there was to fill, and this
+/// host has little. Whether the published host instead pays a large fixed
 /// per-read cost that any second busy flow hides is one short measurement on
 /// that host, and it is what this row's cause turns on. It cannot be settled
 /// from this code, and this loop does not claim it.
