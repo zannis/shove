@@ -1,0 +1,57 @@
+# TEMPORARY calibration scaffolding for the bench-tier-a leg — deleted before
+# this branch is handed back for review; it never reaches main.
+#
+# Why it exists: the Tier A baseline is runner-pinned
+# (`provenance.runner: ubuntu-latest`), so the entries for the ids this branch
+# adds can only be earned from runs on that runner — never from a dev box.
+# But ci.yml triggers on `pull_request` and push-to-main only, and on this
+# flow the PR does not exist yet, so the leg that produces the numbers cannot
+# be made to run. This workflow gives every push to the working branch a run
+# on that same runner, which is how the committed baseline was earned in the
+# first place (see `ci: add temporary calibration scaffolding for the bench
+# leg`, reverted by `ci: remove the temporary calibration scaffolding`).
+name: bench-calibrate
+
+on:
+  push:
+    branches: [zannis/shove-2004]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench-tier-a-calibrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Same reason as the ci.yml leg: rust-cache keeps the directory tree but
+      # prunes the sample files, so criterion would compare against a phantom
+      # previous run. Start with no tree, exactly as the judging leg does.
+      - name: Drop the criterion tree the cache restored
+        run: rm -rf target/criterion
+      - name: Run the Tier A criterion suite
+        run: >
+          cargo bench --no-default-features --features inmemory
+          --bench pure_paths --bench inmemory_flows --bench consumer_overhead
+      # Before the new ids are in the baseline this is the calibration view and
+      # the unbaselined ids are reported `new (not in baseline)`; after they are
+      # spliced in it is the real comparison, so the leg-to-be is exercised
+      # against the committed baseline on this runner before any PR opens.
+      - name: Compare against the committed baseline
+        run: >
+          cargo run --no-default-features --example bench_compare --
+          --criterion-dir target/criterion
+          --baseline benches/baselines/tier-a-ubuntu-latest.json
+      # Per-run artifact name: upload-artifact refuses a duplicate name within
+      # a run, and these are harvested across runs, so the run id disambiguates.
+      - name: Upload criterion estimates
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tier-a-criterion-estimates-${{ github.run_id }}
+          path: target/criterion/**/new/estimates.json
