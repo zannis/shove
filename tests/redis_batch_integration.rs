@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -304,6 +305,74 @@ impl RecordingBatchHandler {
     }
 }
 
+/// Batch handler that holds its **first** batch inside `handle_batch` until
+/// the test releases it, so the test can observe what the consumer loop does
+/// while a flush is in flight. Later batches `Ack` at once, so the loop
+/// finishes the corpus without further help.
+#[derive(Clone)]
+struct GatedFirstBatchHandler {
+    /// Set once the first batch is inside the handler. An `AtomicBool` the
+    /// test polls, rather than a `Notify` the test could subscribe to too
+    /// late and miss.
+    entered: Arc<AtomicBool>,
+    /// `notify_one` stores a permit, so releasing before the handler awaits
+    /// cannot deadlock the test.
+    release: Arc<Notify>,
+    calls: Arc<AtomicUsize>,
+    seen: Arc<Mutex<Vec<u32>>>,
+}
+
+impl GatedFirstBatchHandler {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new(AtomicBool::new(false)),
+            release: Arc::new(Notify::new()),
+            calls: Arc::new(AtomicUsize::new(0)),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn entered(&self) -> bool {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+
+    fn seen(&self) -> Vec<u32> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl<T> BatchMessageHandler<T> for GatedFirstBatchHandler
+where
+    T: Topic<Message = BatchMessage>,
+{
+    type Context = ();
+
+    async fn handle_batch(
+        &self,
+        messages: Vec<(BatchMessage, MessageMetadata)>,
+        _: &(),
+    ) -> Outcome {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.seen
+            .lock()
+            .unwrap()
+            .extend(messages.iter().map(|(m, _)| m.seq));
+        if call == 0 {
+            self.entered.store(true, Ordering::SeqCst);
+            self.release.notified().await;
+        }
+        Outcome::Ack
+    }
+}
+
 fn sorted(batch: &[u32]) -> Vec<u32> {
     let mut v = batch.to_vec();
     v.sort_unstable();
@@ -335,6 +404,12 @@ define_topic!(
     CountPinTopic,
     BatchMessage,
     TopologyBuilder::new("redis-batch-count-pin").build()
+);
+const READ_AHEAD_QUEUE: &str = "redis-batch-read-ahead";
+define_topic!(
+    ReadAheadTopic,
+    BatchMessage,
+    TopologyBuilder::new(READ_AHEAD_QUEUE).build()
 );
 define_topic!(
     AgeTopic,
@@ -656,6 +731,104 @@ async fn batch_flushes_on_max_batch_size() {
     let mut seen = handler.seen();
     seen.sort_unstable();
     assert_eq!(seen, (0..10).collect::<Vec<_>>());
+}
+
+/// A full batch must have the **next** read already outstanding while its
+/// flush runs: a serialized read -> flush -> read cycle leaves the connection
+/// idle for the whole flush, which is the single-consumer throughput deficit
+/// this test pins shut.
+///
+/// Observable without a stopwatch. The group's PEL counts what Redis has
+/// delivered to this consumer: the loop reads `COUNT max_batch_size` (5), so
+/// exactly 5 entries are pending when the flush starts. While that flush is
+/// held inside the handler, only a read issued *concurrently with it* can
+/// raise the PEL to 10. A serial loop stays at 5 until the handler returns.
+#[tokio::test]
+async fn a_full_batch_reads_the_next_one_while_the_flush_is_in_flight() {
+    let url = redis_url().await;
+    let group = "batch-read-ahead-grp";
+    let broker = connect_with_retry(url, group, Duration::from_secs(30)).await;
+    broker.topology().declare::<ReadAheadTopic>().await.unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publish_seq::<ReadAheadTopic>(&publisher, 0..10).await;
+
+    let handler = GatedFirstBatchHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<ReadAheadTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(5)
+                        // Only the size trigger may fire: the age trigger
+                        // must not be what produces a second read.
+                        .with_max_batch_age(Duration::from_secs(30))
+                        // Stated rather than inherited: the gate below holds
+                        // the handler for at most a few seconds, and this is
+                        // the margin that makes that safe.
+                        .with_handler_timeout(Duration::from_secs(30))
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    assert!(
+        poll_until(|| handler.entered(), TIMEOUT).await,
+        "the first batch never reached the handler"
+    );
+
+    let mut raw = raw_conn(url).await;
+    let mut pending = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        pending = xpending_count(&mut raw, READ_AHEAD_QUEUE, group).await;
+        if pending >= 10 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The guard that makes the count above mean what the test says: the
+    // second five can only have been delivered by a read that overlapped the
+    // flush, because the flush has not returned yet.
+    assert_eq!(
+        handler.calls(),
+        1,
+        "the handler must still be holding the first batch while the PEL is read"
+    );
+    assert_eq!(
+        pending, 10,
+        "expected all 10 entries pending — 5 in the flush plus 5 read ahead \
+         while it ran; {pending} means the loop waited for the flush before reading"
+    );
+
+    handler.release();
+    assert!(
+        poll_until(|| handler.seen().len() >= 10, TIMEOUT).await,
+        "both batches should complete once the gate opens, saw {:?}",
+        handler.seen()
+    );
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let mut seen = handler.seen();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        (0..10).collect::<Vec<_>>(),
+        "every message delivered exactly once across the two batches"
+    );
+    assert_eq!(
+        xpending_count(&mut raw, READ_AHEAD_QUEUE, group).await,
+        0,
+        "both batches should be acked, leaving nothing pending"
+    );
 }
 
 /// The ticket's trap pin: the batch consumer must issue `XREADGROUP … COUNT

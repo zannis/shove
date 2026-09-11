@@ -2297,6 +2297,102 @@ fn batch_block_ms(deadline: Option<Instant>, now: Instant) -> u64 {
     }
 }
 
+/// One `XREADGROUP` reply's worth of entries, as
+/// [`parse_xreadgroup_reply`] hands them back: `(entry_id, fields)`.
+type BatchEntries = Vec<(String, Vec<(String, String)>)>;
+
+/// One **non-blocking** live (`>`) `XREADGROUP` for the *next* batch, issued
+/// to run concurrently with the current batch's flush (see
+/// [`run_batch_impl`]'s "Read-ahead across the flush").
+///
+/// `BLOCK` is deliberately absent, and that is a correctness requirement
+/// rather than a tuning choice: this read shares one socket with the flush's
+/// `XACK`, Redis does not serve a blocked client's subsequent commands until
+/// it unblocks, so a blocking read-ahead on an idle stream would hold the
+/// flush's ack hostage for up to [`BLOCK_MS`]. Without `BLOCK` an empty
+/// stream answers immediately with nil, which is `None` here and costs the
+/// flush nothing.
+///
+/// A failure is logged and swallowed rather than propagated: the loop's own
+/// read is the next thing to run, and it reports a dead connection with the
+/// error taxonomy `run_with_reconnect` expects. Entries this read delivered
+/// but whose reply never arrived stay pending, recovered exactly as a lost
+/// reply to the loop's own read already is — by the reaper, or by the next
+/// `Redeliver` replay.
+async fn read_ahead_batch(
+    conn: &mut RedisConnection,
+    stream: &str,
+    group: &str,
+    consumer: &str,
+    count: usize,
+) -> Option<BatchEntries> {
+    let mut cmd = redis::cmd("XREADGROUP");
+    cmd.arg("GROUP")
+        .arg(group)
+        .arg(consumer)
+        .arg("COUNT")
+        .arg(count)
+        .arg("STREAMS")
+        .arg(stream)
+        .arg(">");
+    match conn.query::<redis::Value>(&mut cmd).await {
+        Ok(value) => {
+            let entries = parse_xreadgroup_reply(value, count);
+            (!entries.is_empty()).then_some(entries)
+        }
+        Err(e) => {
+            tracing::debug!(
+                stream,
+                error = %e,
+                "batch read-ahead XREADGROUP failed; the loop's own read will report it"
+            );
+            None
+        }
+    }
+}
+
+/// Ingest one read's entries into `batch`, arming the age deadline on the
+/// first message to land in an empty buffer.
+///
+/// Shared by all three sites that ingest — the loop's own read, the
+/// read-ahead, and the shutdown drain — so that none of them can arm the
+/// deadline differently from the others. The deadline means "age of the
+/// oldest message buffered", and it is never pushed back.
+#[allow(clippy::too_many_arguments)]
+async fn ingest_entries<T: Topic>(
+    conn: &mut RedisConnection,
+    stream: &str,
+    group: &str,
+    consumer: &str,
+    entries: BatchEntries,
+    topic_name: &str,
+    consumer_group: Option<&str>,
+    max_message_size: Option<usize>,
+    batch: &mut RedisBatch<T>,
+    deadline: &mut Option<Instant>,
+    max_batch_age: Duration,
+) -> Result<()> {
+    for (entry_id, fields_vec) in entries {
+        ingest_batch_entry::<T>(
+            conn,
+            stream,
+            group,
+            consumer,
+            entry_id,
+            fields_vec,
+            topic_name,
+            consumer_group,
+            max_message_size,
+            batch,
+        )
+        .await?;
+        if deadline.is_none() && !batch.is_empty() {
+            *deadline = Some(Instant::now() + max_batch_age);
+        }
+    }
+    Ok(())
+}
+
 /// Advance a PEL-replay cursor after a non-blocking history read. History
 /// reads are exclusive of the start id, so the next read must begin just
 /// past the last entry actually returned; an empty reply means the PEL is
@@ -2671,6 +2767,37 @@ where
 /// returns as soon as ANY entry exists, so it cannot fill a batch, and it
 /// holds shutdown hostage for up to `max_batch_age`.
 ///
+/// # Read-ahead across the flush
+///
+/// A size-triggered flush issues the next read ([`read_ahead_batch`]) to run
+/// concurrently with itself, and the reply seeds the next batch. Without it
+/// the cycle is strictly serial — read, then handle and ack with nothing in
+/// flight, then read again — so one consumer spends the whole flush idle on
+/// its connection. Measured on this loop at 64 B / `max_batch_size` 500
+/// against a Docker Redis 7.0: 3.88 ms per 500-message cycle, of which the
+/// read phase alone is 57% and the process holds one core only half busy.
+/// That idle share is what makes a lone batch consumer slower than N of them
+/// are per consumer — N loops fill each other's gaps, one loop has nothing
+/// to fill its own with.
+///
+/// Three properties keep it from changing what a handler sees:
+///
+/// - **No surplus, so `max_batch_size` still bounds a handler call.** The
+///   read-ahead is armed only where a flush is about to empty the batch, so
+///   its at-most-`max_batch_size` entries are always ingested into an empty
+///   buffer.
+/// - **Never during a replay.** A live `>` read would interleave
+///   never-delivered entries into a PEL drain.
+/// - **Dropped on `Redeliver`.** That settlement arms `replay_cursor = "0"`,
+///   and the replay returns the read-ahead's entries too; ingesting them
+///   here as well would deliver them twice in one process.
+///
+/// The reclaim policy below still covers the widened buffering phase: a
+/// read-ahead entry waits out the flush that fetched it (bounded by
+/// `handler_timeout`) before its own batch's age window even starts, so its
+/// worst-case idle is `2 * handler_timeout + max_batch_age`, inside the
+/// `2 * (handler_timeout + max_batch_age)` threshold this loop registers.
+///
 /// The deadline is **disarmed** (`deadline = None`) on every flush — the
 /// size trigger, the age trigger, and the shutdown-triggered partial flush —
 /// so an elapsed deadline is never left armed over an empty buffer (which
@@ -2766,36 +2893,108 @@ where
             let mut deadline: Option<Instant> = None;
             let mut redelivery_backoff = batch_redelivery_backoff();
             let mut replay_cursor: Option<String> = None;
+            // The read-ahead's reply, waiting to seed the next batch. Only
+            // ever `Some` between a size-triggered flush and the ingest that
+            // immediately follows it.
+            let mut prefetched: Option<BatchEntries> = None;
 
             loop {
                 if batch.len() >= max_batch_size {
-                    match flush_redis_batch(
-                        &mut conn,
-                        topology,
-                        stream,
-                        &group,
-                        &consumer,
-                        handler.as_ref(),
-                        ctx.as_ref(),
-                        &mut batch,
-                        handler_timeout,
-                        handler_timeout_outcome.clone(),
-                        &topic_arc,
-                        group_arc.as_deref(),
-                        &mut redelivery_backoff,
-                        &mut replay_cursor,
-                        &shutdown,
-                    )
-                    .await?
-                    {
+                    // Keep the next read in flight for the duration of the
+                    // flush. Serialized read → flush → read leaves this
+                    // consumer idle on the socket for the whole flush, and
+                    // that idle window is the single-consumer deficit: one
+                    // loop has nothing to fill it with, where N loops fill
+                    // each other's.
+                    //
+                    // No surplus buffer is needed to make this safe: the
+                    // flush below empties `batch`, so a
+                    // `COUNT max_batch_size` reply can only ever be ingested
+                    // into an empty buffer and `max_batch_size` still bounds
+                    // what one handler call sees.
+                    //
+                    // A clone, not a second connection: clones of a
+                    // multiplexed connection share one socket and one
+                    // multiplexer task, so the read and the flush's `XACK`
+                    // pipeline over it instead of taking turns. See
+                    // [`read_ahead_batch`] for why that obliges the
+                    // read-ahead to omit `BLOCK`.
+                    let mut read_conn = conn.clone();
+                    // A replay cycle takes no read-ahead: a live `>` read
+                    // would interleave never-delivered entries into a PEL
+                    // drain, and `next_replay_cursor` only describes the
+                    // history read it advanced from.
+                    let read_ahead_armed = replay_cursor.is_none();
+                    let (ahead, flushed) = tokio::join!(
+                        async {
+                            if read_ahead_armed {
+                                read_ahead_batch(
+                                    &mut read_conn,
+                                    stream,
+                                    &group,
+                                    &consumer,
+                                    max_batch_size,
+                                )
+                                .await
+                            } else {
+                                None
+                            }
+                        },
+                        flush_redis_batch(
+                            &mut conn,
+                            topology,
+                            stream,
+                            &group,
+                            &consumer,
+                            handler.as_ref(),
+                            ctx.as_ref(),
+                            &mut batch,
+                            handler_timeout,
+                            handler_timeout_outcome.clone(),
+                            &topic_arc,
+                            group_arc.as_deref(),
+                            &mut redelivery_backoff,
+                            &mut replay_cursor,
+                            &shutdown,
+                        ),
+                    );
+                    match flushed? {
                         FlushOutcome::ShutdownDuringBackoff => return Ok(()),
                         FlushOutcome::Flushed => {}
                     }
+                    // Dropped rather than ingested when the flush armed a
+                    // replay: `Redeliver` leaves the whole batch pending and
+                    // sets the cursor to "0", so the replay read returns
+                    // these entries as well — ingesting them here too would
+                    // hand the same entries to the handler twice within one
+                    // process.
+                    prefetched = if replay_cursor.is_some() { None } else { ahead };
                     deadline = None;
                     continue;
                 }
 
                 if shutdown.is_cancelled() {
+                    // Settle what the read-ahead already took out of the
+                    // stream instead of leaving it pending for the reaper: a
+                    // graceful stop flushes what this loop holds, and the
+                    // read-ahead makes "holds" include entries fetched while
+                    // the previous flush ran.
+                    if let Some(entries) = prefetched.take() {
+                        ingest_entries::<T>(
+                            &mut conn,
+                            stream,
+                            &group,
+                            &consumer,
+                            entries,
+                            &topic_arc,
+                            group_arc.as_deref(),
+                            max_message_size,
+                            &mut batch,
+                            &mut deadline,
+                            max_batch_age,
+                        )
+                        .await?;
+                    }
                     let _ = flush_redis_batch(
                         &mut conn,
                         topology,
@@ -2815,6 +3014,29 @@ where
                     )
                     .await?;
                     return Ok(());
+                }
+
+                // The read-ahead's reply stands in for this iteration's read.
+                // Always a live (`>`) read of at most `max_batch_size`
+                // entries into a buffer the flush that issued it emptied, so
+                // it needs no headroom recomputation and never touches
+                // `replay_cursor`.
+                if let Some(entries) = prefetched.take() {
+                    ingest_entries::<T>(
+                        &mut conn,
+                        stream,
+                        &group,
+                        &consumer,
+                        entries,
+                        &topic_arc,
+                        group_arc.as_deref(),
+                        max_message_size,
+                        &mut batch,
+                        &mut deadline,
+                        max_batch_age,
+                    )
+                    .await?;
+                    continue;
                 }
 
                 let headroom = batch_headroom(max_batch_size, batch.len());
@@ -2877,24 +3099,20 @@ where
                     replay_cursor = next_replay_cursor(&entries);
                 }
 
-                for (entry_id, fields_vec) in entries {
-                    ingest_batch_entry::<T>(
-                        &mut conn,
-                        stream,
-                        &group,
-                        &consumer,
-                        entry_id,
-                        fields_vec,
-                        &topic_arc,
-                        group_arc.as_deref(),
-                        max_message_size,
-                        &mut batch,
-                    )
-                    .await?;
-                    if deadline.is_none() && !batch.is_empty() {
-                        deadline = Some(Instant::now() + max_batch_age);
-                    }
-                }
+                ingest_entries::<T>(
+                    &mut conn,
+                    stream,
+                    &group,
+                    &consumer,
+                    entries,
+                    &topic_arc,
+                    group_arc.as_deref(),
+                    max_message_size,
+                    &mut batch,
+                    &mut deadline,
+                    max_batch_age,
+                )
+                .await?;
 
                 if let Some(d) = deadline
                     && Instant::now() >= d
