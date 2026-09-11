@@ -505,9 +505,9 @@ pub fn render_report(cmp: &Comparison, annotate: bool) -> String {
         ));
     }
     // Say what the gate actually covers, so a fully green run cannot be read
-    // as "58 ids held to 50%": ids the fleet swings hard get thresholds that
-    // only catch catastrophic blowups, and that is a property of the runner
-    // pool, not of the code under test.
+    // as "every baseline id held to 50%": ids the fleet swings hard get
+    // thresholds that only catch catastrophic blowups, and that is a property
+    // of the runner pool, not of the code under test.
     let with_threshold: Vec<f64> = cmp.rows.iter().filter_map(|r| r.fail_above_pct).collect();
     let floor = with_threshold
         .iter()
@@ -542,6 +542,16 @@ pub fn render_report(cmp: &Comparison, annotate: bool) -> String {
                     row.id,
                     row.delta_pct
                         .map_or_else(String::new, |d| format!("{d:+.2}%")),
+                )),
+                // Not a failure — a bench must not fail the PR that introduces
+                // it, and the baseline is runner-pinned so the entry can only
+                // be earned from this leg's own `ubuntu-latest` runs. But it is
+                // the one verdict where the gate is watching nothing, so it has
+                // to say so on the PR instead of only in the log table.
+                Verdict::NewInRun => out.push_str(&format!(
+                    "::warning::bench {} is measured but has no baseline entry, so it is not \
+                     judged — add it to the baseline from this leg's estimates artifact\n",
+                    row.id,
                 )),
                 _ => {}
             }

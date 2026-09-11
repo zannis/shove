@@ -493,8 +493,13 @@ check before trusting a document:
 - `handler_cost` on each row. `framework` means the window measured shove;
   `setup_bound` means the window was too short or unseparated from setup and
   the number is a stopwatch reading, not a rate.
-- `setup_secs` on the consume rows. `None` means the driver could not
-  separate setup from the drain, which is expected for FIFO.
+- `setup_secs` on the consume rows. Every consume driver but one holds a
+  readiness barrier and records the interval it excluded. `None` is expected on
+  `consume_fifo`, which cannot hold one — a sequenced drain is not measurable,
+  so that driver publishes its corpus inside the timed window and its
+  negligible-handler rows stay `setup_bound`. `None` on a `dlq_drain` row is a
+  row from a v6 document instead; the two are not comparable, which is why a v6
+  file is refused at merge rather than written into.
 - The `Offered-load rungs` table at the end of the log, one line per rung
   with its verdict. A cell whose first rung is already producer-bound is a
   host that cannot drive the ladder for that payload, not a backend result.

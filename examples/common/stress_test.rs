@@ -115,7 +115,31 @@ use tokio_util::sync::CancellationToken;
 /// row without a `load` account was a live-publish corpus whose rate one
 /// sequential publisher bounded; a v6 row without one is a drain. Nothing on
 /// a v5 row says which method produced it, so the two are not merged.
-pub const RESULTS_SCHEMA_VERSION: u32 = 6;
+///
+/// v7 gave **`dlq_drain`** a readiness barrier, the one flow that could hold
+/// one and did not. Its measured phase has no publish path — a message
+/// published there lands in the main queue, not the DLQ — so the probe is the
+/// dead-letter backlog it is about to consume: the window opens on the first
+/// dead-lettered message to reach the handler, and what the drain got through
+/// before then leaves the numerator with it. On a v7 `dlq_drain` row
+/// `duration_secs` is therefore the measured window alone and `setup_secs` is
+/// the interval it excludes, where a v6 row carried `setup_secs: null` over a
+/// window that *contained* that interval — and on the `zero`/`fast` cells the
+/// interval was much of the number: Kafka reported 3.2 s at all three payload
+/// sizes, which is its group-join constant rather than a drain of 5 000
+/// messages. The two versions' `duration_secs` and `throughput_msg_per_sec`
+/// are not comparable on one axis — the same reason v4 gave, and why a v6
+/// document is refused in [`merge_results_file`] rather than merged into.
+///
+/// `dlq_drain` also entered [`framework_corpus_floor`] with its barrier,
+/// because that floor asks [`Flow::holds_readiness_barrier`]. So a v7
+/// `dlq_drain` row may record a larger `messages` than its tier would have
+/// sized, which is a second reason not to plot it against a v6 one.
+///
+/// `consume_fifo` is unchanged and still carries `setup_secs: null` in a v7
+/// document: it is the one consume flow that cannot hold a barrier at all,
+/// for the reason [`Flow::holds_readiness_barrier`] gives.
+pub const RESULTS_SCHEMA_VERSION: u32 = 7;
 
 /// Default `--load-window-secs`: long enough for a rate, short enough that a
 /// six-rung ladder over a full consumer sweep finishes in an hour per backend.
@@ -169,8 +193,12 @@ pub const PAYLOAD_SIZES: [usize; 3] = [64, 1024, 65536];
 /// key, so message ids spread evenly across shards.
 const SEQ_SHARDS: u16 = 8;
 
-/// Message id reserved for broadcast readiness sentinels. Corpus ids count up
-/// from zero, so no measured message can carry it.
+/// Message id reserved for readiness sentinels. Corpus ids count up from
+/// zero, so no measured message can carry it.
+///
+/// One id and not a band, because a band would only be wanted by a *sequenced*
+/// barrier — one id per routing key — and the sequenced flow holds no barrier.
+/// See [`Flow::holds_readiness_barrier`] for why it cannot.
 const SENTINEL_ID: u64 = u64::MAX;
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
@@ -592,14 +620,24 @@ impl Flow {
     ///
     /// The three answers, and why each one is where it is:
     ///
-    /// - **Yes** for the four barrier-holding drivers — `run_scenario_batch`,
-    ///   `run_scenario_supervisor` (non-FIFO), `run_scenario_group` (non-FIFO)
-    ///   and `run_scenario_broadcast`. Each waits until every worker has
-    ///   handled a sentinel before taking `start`.
-    /// - **No** for `consume_fifo` and `dlq_drain`: neither has anywhere to
-    ///   hang the probe — a sequenced sentinel routes to exactly one shard, and
-    ///   the DLQ drain's measured phase has no publish path at all — so both
-    ///   drivers emit `setup_secs: None` by construction.
+    /// - **Yes** for the five barrier-holding drivers — `run_scenario_batch`,
+    ///   `run_scenario_supervisor` (non-FIFO), `run_scenario_group` (non-FIFO),
+    ///   `run_scenario_broadcast`, and `dlq_drain`. The first four wait until
+    ///   every worker has handled a sentinel before taking `start`. The DLQ
+    ///   drain has no publish path in its measured phase — a message published
+    ///   there lands in the main queue, not the DLQ — so it uses the backlog it
+    ///   is about to drain as its own probe instead: the window opens on the
+    ///   first dead-lettered message to reach the handler, and what the drain
+    ///   got through before then leaves the numerator with it.
+    /// - **No** for `consume_fifo`, and the reason is the sequencing itself
+    ///   rather than a missing probe. A barrier is only worth holding if the
+    ///   window after it is a drain, and a drain prefills its corpus before any
+    ///   consumer starts — so a sentinel published once the consumers are up is
+    ///   delivered *behind* that corpus on its shard, and the barrier it feeds
+    ///   would open only after the drain it was meant to bracket had finished.
+    ///   The driver therefore publishes its corpus inside the measured window,
+    ///   as it always has, and reports `setup_secs: None` so that window is
+    ///   never mistaken for a consumer-only rate. See [`HandlerCost::of`].
     /// - **No** for the publish flows and the autoscaler, which construct no
     ///   consumer, so there is no worker for a barrier to wait on.
     ///
@@ -613,12 +651,11 @@ impl Flow {
             | Flow::ConsumeParallel
             | Flow::ConsumerGroup
             | Flow::Supervisor
-            | Flow::Broadcast => true,
-            Flow::ConsumeFifo
-            | Flow::DlqDrain
-            | Flow::PublishSingle
-            | Flow::PublishBatch
-            | Flow::Autoscaler => false,
+            | Flow::Broadcast
+            | Flow::DlqDrain => true,
+            Flow::ConsumeFifo | Flow::PublishSingle | Flow::PublishBatch | Flow::Autoscaler => {
+                false
+            }
         }
     }
 
@@ -1203,16 +1240,22 @@ fn framework_corpus_floor(
         HandlerProfile::Fast => concurrent || flow.mode() == Mode::Batch,
         HandlerProfile::Slow | HandlerProfile::Heavy => false,
     };
-    // Asked of the flow rather than re-listed here: FIFO, the DLQ drain and the
-    // publish flows are excluded because no corpus can make them `framework`,
-    // and that is the same fact [`Flow::holds_readiness_barrier`] already
-    // carries for [`HandlerCost::of`]. A second hand-maintained list of it
-    // would only drift from the first.
+    // Asked of the flow rather than re-listed here: FIFO, the publish flows
+    // and the autoscaler are excluded because no corpus can make them
+    // `framework`, and that is the same fact [`Flow::holds_readiness_barrier`]
+    // already carries for [`HandlerCost::of`]. A second hand-maintained list
+    // of it would only drift from the first.
     //
     // Broadcast is the one flow subtracted from that set, and not because of
     // its barrier — it holds one. Its corpus is the *per-subscriber* workload,
     // so flooring `messages` multiplies by the fan-out width and a
     // 16-subscriber cell would run 2.4M handler invocations.
+    //
+    // `dlq_drain` joined the set when it gained a barrier, and it needed the
+    // floor more than anything already in it: the windows the committed
+    // document records for it run 0.012-0.06 s on in-process and NATS, so
+    // without a larger corpus a separated setup would have bought it nothing
+    // but a different reason for the same `setup_bound`.
     let barrier_backed_drain = flow.holds_readiness_barrier() && flow != Flow::Broadcast;
     if !negligible_and_not_sleep_bound || !barrier_backed_drain {
         return 0;
@@ -1648,6 +1691,24 @@ impl LatencyRecorder {
         let _ = self.tx.send(record);
     }
 
+    /// Throw away everything recorded so far.
+    ///
+    /// Called by a driver at the moment its readiness barrier opens, for the
+    /// same reason `ResourceSampler` is *started* there rather than earlier:
+    /// a percentile computed across worker startup describes a different
+    /// interval than the window the row reports. `dlq_drain` is the one flow
+    /// that needs it — the others either record no latencies at all (a drain
+    /// keeps only the completion tracker) or have nothing in flight before
+    /// their barrier, because their corpus is published after it.
+    ///
+    /// Records still in flight in a handler when this runs are not caught,
+    /// which is inherent to a boundary between concurrent tasks and is the
+    /// same slack `unique_at_start` carries on a drain.
+    async fn discard_recorded(&self) {
+        let mut rx = self.rx.lock().await;
+        while rx.try_recv().is_ok() {}
+    }
+
     async fn compute_percentiles(&self) -> LatencyPercentiles {
         let mut rx = self.rx.lock().await;
         let mut records = Vec::new();
@@ -1842,10 +1903,10 @@ pub struct StressTestHandler {
     /// unmeasured fill phase of the DLQ-drain flow, which needs every message
     /// to land in the DLQ before the drain is timed.
     reject: bool,
-    /// When set, a message carrying [`SENTINEL_ID`] is a broadcast readiness
-    /// probe: it bumps this counter and is acked immediately — no simulated
-    /// work, no latency record, no `processed` increment — so warmup
-    /// deliveries can never leak into the measurement, even mid-flight.
+    /// When set, a message carrying [`SENTINEL_ID`] is a readiness probe: it
+    /// bumps this counter and is acked immediately — no simulated work, no
+    /// latency record, no `processed` increment — so warmup deliveries can
+    /// never leak into the measurement, even mid-flight.
     attach: Option<Arc<AtomicU64>>,
     /// Measure latency from this handler's own `epoch` instead of from the
     /// message's embedded `published_at_ns`. The DLQ drain needs this: its
@@ -3533,8 +3594,33 @@ fn finish(
     resources: ResourceSnapshot,
     latencies: LatencyPercentiles,
 ) -> ScenarioMetrics {
+    finish_measured(
+        scenario.expected_processed(),
+        duration,
+        setup,
+        resources,
+        latencies,
+    )
+}
+
+/// [`finish`] where the messages consumed inside the window are not the
+/// scenario's whole expected count.
+///
+/// `dlq_drain` is the caller: its barrier opens on the first dead-lettered
+/// message to reach the handler, so whatever the drain got through before the
+/// driver noticed sits *outside* the window and must come out of the
+/// numerator too. Dividing the whole corpus by a window that did not carry
+/// all of it is the overstatement this exists to prevent — the same
+/// correction `run_drain_window` makes with `unique_at_start`.
+fn finish_measured(
+    measured: u64,
+    duration: Duration,
+    setup: Option<Duration>,
+    resources: ResourceSnapshot,
+    latencies: LatencyPercentiles,
+) -> ScenarioMetrics {
     ScenarioMetrics {
-        throughput: scenario.expected_processed() as f64 / duration.as_secs_f64(),
+        throughput: measured as f64 / duration.as_secs_f64(),
         latencies,
         peak_rss_mb: resources.peak_rss_mb,
         cpu_pct: resources.cpu_pct,
@@ -3624,6 +3710,7 @@ async fn stop_sampler(sampler: Option<ResourceSampler>) -> ResourceSnapshot {
 /// round is not, so this is deliberately generous. Partitioned backends do not
 /// rely on this — see [`ReadinessProbeFn`].
 const READINESS_OVERSUPPLY: usize = 4;
+
 /// How long the barrier waits between sentinel rounds.
 const READINESS_ROUND: Duration = Duration::from_millis(200);
 /// How often the barrier checks the attach flags inside a round.
@@ -4079,7 +4166,7 @@ where
     // its real count, which is the loud outcome.
     //
     // FIFO takes no flags, for the reason spelled out in
-    // `run_scenario_supervisor`.
+    // `Flow::holds_readiness_barrier`.
     let attach_flags: Vec<Arc<AtomicU64>> = if fifo {
         Vec::new()
     } else {
@@ -4523,8 +4610,6 @@ where
     let epoch = Instant::now();
     let recorder = Arc::new(LatencyRecorder::new());
     let processed = Arc::new(AtomicU64::new(0));
-    let sampler = ResourceSampler::start();
-
     // `epoch_relative`: the DLQ'd messages carry `published_at_ns` stamped
     // against the *fill* phase's epoch, which shares no base with this
     // phase's clock — subtracting it would produce saturated-to-zero noise.
@@ -4533,13 +4618,47 @@ where
         StressTestHandler::new(epoch, processed.clone(), recorder.clone(), scenario.handler)
             .epoch_relative();
 
-    let start = Instant::now();
+    // Before the spawn, not after: `setup_secs` runs from the driver being
+    // brought up, and constructing the consumer is part of that — the same
+    // boundary every other driver takes.
+    let setup_started = Instant::now();
     let dlq_stop = CancellationToken::new();
     let mut drivers = tokio::task::JoinSet::new();
     drivers.spawn(drain(client.clone(), handler, dlq_stop.clone()));
 
-    let outcome =
-        await_completion_or_driver_error(&processed, scenario.messages, cancel, &mut drivers).await;
+    // The readiness barrier, and the reason this flow needed a different one:
+    // the measured phase drains a queue that is *already* full, so nothing it
+    // publishes can carry a sentinel — a message published here lands in the
+    // main queue, not the DLQ. The backlog itself is the probe instead. One
+    // driver runs the whole drain, and any message reaching the handler is
+    // proof that driver is assigned and polling, which is exactly what
+    // `note_attached` asserts for every other flow. What the barrier excludes
+    // is the consumer's own startup: on Kafka that is the group join the
+    // committed document records as this flow's entire 3.2 s window.
+    let barrier = await_dlq_readiness(&processed, cancel, &mut drivers).await;
+    let setup = setup_started.elapsed();
+    // Read in the same step that takes `start`, so the numerator and the clock
+    // share one boundary — `PendingDrain::open_window`'s contract, for the
+    // same reason. Whatever the drain got through before the driver noticed is
+    // outside the window and comes out of the numerator with it.
+    let consumed_at_start = processed.load(Ordering::Relaxed);
+    let start = Instant::now();
+    // Started at the barrier, not at the phase's top — see
+    // `run_scenario_supervisor`.
+    let sampler = ResourceSampler::start();
+    // Samples taken while the consumer was starting up describe the setup this
+    // window just excluded, so they are dropped here rather than folded into
+    // the row's percentiles — the same boundary the sampler above is started
+    // on. See `LatencyRecorder::discard_recorded`.
+    recorder.discard_recorded().await;
+
+    let outcome = match barrier {
+        Ok(()) => {
+            await_completion_or_driver_error(&processed, scenario.messages, cancel, &mut drivers)
+                .await
+        }
+        Err(e) => Err(e),
+    };
     let duration = start.elapsed();
     // Stopped with the window — see `run_scenario_batch`.
     let resources = sampler.stop().await;
@@ -4562,15 +4681,71 @@ where
     stop_drivers_with_grace(&mut drivers, "dlq").await;
     outcome?;
 
-    // `None`: this window is not separated from the drain consumer's own
-    // startup. The measured phase drains a queue that is *already* full, so
-    // there is no publish path left to carry a readiness sentinel through —
-    // any message this phase published would land in the main queue, not the
-    // DLQ being drained. Saying so demotes this flow's negligible-handler rows
-    // to `HandlerCost::SetupBound` instead of letting them keep a framework
-    // claim the window cannot support. Filed as a follow-up; it needs a
-    // different probe, not this one.
-    Ok(finish(scenario, duration, None, resources, latencies))
+    // A window that opened with most of the corpus already gone is not the
+    // steady state the row would claim, exactly as on a drain — so it is
+    // refused by the same bound rather than published as a rate over whatever
+    // slice was left. Checked after the teardown above so the driver is
+    // already stopped.
+    let measured = scenario.messages.saturating_sub(consumed_at_start);
+    if consumed_at_start >= DrainPlan::max_start(scenario.messages) {
+        return Err(format!(
+            "{consumed_at_start} of {} dead-lettered messages were already drained when the \
+             consumer's first delivery was noticed; the window left is not a steady state. \
+             Raise the corpus so the consumer comes up within the first half of it",
+            scenario.messages
+        ));
+    }
+    Ok(finish_measured(
+        measured,
+        duration,
+        Some(setup),
+        resources,
+        latencies,
+    ))
+}
+
+/// Hold until the DLQ drain's consumer has handled its first message.
+///
+/// The counterpart of [`await_worker_readiness`] for the one flow whose
+/// measured phase has no publish path: there are no sentinels to place, so
+/// the probe is the backlog and the flag is `processed`. Polled on
+/// [`READINESS_POLL`], not the coarser progress sample, because every
+/// millisecond between the first delivery and this loop noticing is corpus
+/// consumed outside the window — `consumed_at_start` accounts for it exactly,
+/// but a smaller number is a larger measured slice.
+///
+/// Keeps [`await_worker_readiness`]'s deliberate lack of a deadline: it waits
+/// for the actual event, and only the run's cancellation or the driver dying
+/// ends it early.
+async fn await_dlq_readiness(
+    processed: &AtomicU64,
+    cancel: &CancellationToken,
+    drivers: &mut tokio::task::JoinSet<Result<(), String>>,
+) -> Result<(), String> {
+    loop {
+        if processed.load(Ordering::Relaxed) > 0 {
+            return Ok(());
+        }
+        if cancel.is_cancelled() {
+            return Err("interrupted before the drain consumer's first delivery".to_string());
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(READINESS_POLL) => {}
+            Some(joined) = drivers.join_next() => match joined {
+                Ok(Err(e)) => return Err(format!("consumer driver failed: {e}")),
+                // A driver that exits before delivering anything drained
+                // nothing: without this the loop would spin on a counter
+                // nothing can advance.
+                Ok(Ok(())) => {
+                    return Err(
+                        "the dlq drain driver exited before its first delivery".to_string()
+                    );
+                }
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => return Err(format!("consumer driver panicked: {e}")),
+            },
+        }
+    }
 }
 
 /// Batch consume. Kafka-only: the closure exists nowhere else.
@@ -4814,13 +4989,13 @@ where
     let replicas = if fifo { 1 } else { scenario.consumers };
     let mut supervisor_handles = Vec::with_capacity(replicas as usize);
     // One attach flag per replica, for the readiness barrier below. FIFO gets
-    // none: its sentinel would route by `id % SEQ_SHARDS`, so one reserved id
-    // reaches exactly one shard and can never prove the rest are polling — and
-    // `register_fifo` takes a single handler for the whole shard set, so there
-    // is no per-worker flag to hang the probe on. That flow therefore keeps an
-    // unseparated window and reports `setup_secs: None`, which downgrades its
-    // negligible-handler rows to `HandlerCost::SetupBound` rather than letting
-    // them keep claiming to measure shove.
+    // none, and the reason is the flow rather than the plumbing: a barrier is
+    // only worth holding ahead of a drain, and a sequenced drain cannot be
+    // measured at all — see `Flow::holds_readiness_barrier`. That flow
+    // therefore keeps an unseparated window and reports `setup_secs: None`,
+    // which downgrades its negligible-handler rows to
+    // `HandlerCost::SetupBound` rather than letting them keep claiming to
+    // measure shove.
     let mut attach_flags: Vec<Arc<AtomicU64>> = Vec::with_capacity(replicas as usize);
     // A drain publishes its corpus before any replica exists to consume it.
     if fifo && scenario.drain.is_some() {
@@ -7209,15 +7384,15 @@ mod tests {
             }
         }
         // And the flows for which no corpus produces a `framework` row: the
-        // two that cannot separate their setup, the two with no drain at all,
-        // and broadcast, whose corpus is per-subscriber so a floor multiplies
-        // by the fan-out width.
+        // three that construct no consumer, broadcast, whose corpus is
+        // per-subscriber so a floor multiplies by the fan-out width, and
+        // `consume_fifo`, which holds no barrier.
         for flow in [
-            Flow::ConsumeFifo,
-            Flow::DlqDrain,
             Flow::PublishSingle,
             Flow::PublishBatch,
+            Flow::Autoscaler,
             Flow::Broadcast,
+            Flow::ConsumeFifo,
         ] {
             assert_eq!(
                 framework_corpus_floor(flow, HandlerProfile::Zero, true, 64),
@@ -7225,6 +7400,14 @@ mod tests {
                 "{flow}"
             );
         }
+        // And the one that joined the floored set with its barrier. It needed
+        // it most: the windows the committed document records for it run
+        // 0.012-0.06 s on in-process and NATS, so a separated setup alone
+        // would have left it `setup_bound` for a different reason.
+        assert_eq!(
+            framework_corpus_floor(Flow::DlqDrain, HandlerProfile::Zero, false, 64),
+            MIN_FRAMEWORK_CORPUS_MESSAGES,
+        );
     }
 
     // ── Payload ──
@@ -7453,6 +7636,9 @@ mod tests {
         assert_eq!(scenarios.len(), 1);
         let s = &scenarios[0];
         assert_eq!(s.consumers, SEQ_SHARDS);
+        // The tier's 5 000 per shard, unfloored: the corpus floor asks
+        // `Flow::holds_readiness_barrier`, and FIFO holds none — see
+        // `the_fifo_corpus_is_never_raised_by_the_framework_floor`.
         assert_eq!(s.messages, 5_000 * SEQ_SHARDS as u64);
     }
 
@@ -7478,6 +7664,7 @@ mod tests {
         );
         assert_eq!(scenarios.len(), 1);
         assert_eq!(scenarios[0].consumers, 1);
+        // One worker's corpus, unfloored — see the test above.
         assert_eq!(scenarios[0].messages, 5_000);
     }
 
@@ -8149,8 +8336,8 @@ mod tests {
         // The cells where the simulated work is negligible are the only ones
         // that measure shove itself, and they are comparable across flows —
         // which is what makes a batch-vs-parallel chart legitimate at all.
-        // "Every consume flow" would overstate it: the two flows that hold no
-        // barrier are covered by
+        // "Every consume flow" would overstate it: `consume_fifo`, which
+        // holds no barrier, is covered by
         // `a_flow_whose_driver_holds_no_barrier_can_never_be_framework`.
         for flow in BARRIER_FLOWS {
             for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
@@ -8183,18 +8370,19 @@ mod tests {
     /// under test which flows qualify cannot notice that code changing its
     /// mind. `a_flows_barrier_claim_matches_the_drivers_that_hold_one` pins the
     /// two against each other.
-    const BARRIER_FLOWS: [Flow; 5] = [
+    const BARRIER_FLOWS: [Flow; 6] = [
         Flow::ConsumeBatch,
         Flow::ConsumeParallel,
         Flow::ConsumerGroup,
         Flow::Supervisor,
         Flow::Broadcast,
+        Flow::DlqDrain,
     ];
 
-    /// The two consume flows that always report `setup_secs: null`, because
-    /// neither has anywhere to hang a readiness probe — see
-    /// `run_scenario_supervisor` (FIFO) and `run_scenario_dlq`.
-    const UNSEPARATED_CONSUME_FLOWS: [Flow; 2] = [Flow::ConsumeFifo, Flow::DlqDrain];
+    /// The consume flow that always reports `setup_secs: null`: `consume_fifo`
+    /// publishes its corpus inside the measured window, because a sequenced
+    /// drain cannot be measured at all — see `Flow::holds_readiness_barrier`.
+    const UNSEPARATED_CONSUME_FLOWS: [Flow; 1] = [Flow::ConsumeFifo];
 
     #[test]
     fn a_flows_barrier_claim_matches_the_drivers_that_hold_one() {
@@ -8220,10 +8408,10 @@ mod tests {
     #[test]
     fn a_flow_whose_driver_holds_no_barrier_can_never_be_framework() {
         // `setup_secs: Some(_)` is a row's claim that its driver held a
-        // readiness barrier and took `start` after it. Two flows can never make
-        // that claim: `consume_fifo` has no per-worker flag to hang a sentinel
-        // on, and `dlq_drain`'s measured phase drains an already-full queue,
-        // with no publish path to carry one. Both always emit `None`.
+        // readiness barrier and took `start` after it. `consume_fifo` can
+        // never make that claim: a sequenced drain is not measurable, so its
+        // driver publishes the corpus inside the window and always emits
+        // `None`.
         //
         // The derivation used to consult only the recorded `Option`, with no
         // per-flow knowledge of which flows can produce a `Some`. So a row
@@ -8250,6 +8438,128 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_dlq_drain_can_now_claim_framework() {
+        // The other direction of the change, and the point of it: a recorded
+        // setup window over a publishable drain is what this flow's driver now
+        // produces, so the derivation must stamp `framework` on it rather than
+        // the `setup_bound` that was correct while it had no barrier. Without
+        // this the barrier would be dead code — the rows would carry the same
+        // marker for a different reason.
+        for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
+            assert_eq!(
+                HandlerCost::of(
+                    Flow::DlqDrain,
+                    handler,
+                    WindowSplit {
+                        setup_secs: Some(3.2),
+                        duration_secs: 2.0,
+                    }
+                ),
+                HandlerCost::Framework,
+                "{handler}"
+            );
+            // And the window floor still binds: a separated setup does not
+            // make a 0.05 s drain a rate.
+            assert_eq!(
+                HandlerCost::of(
+                    Flow::DlqDrain,
+                    handler,
+                    WindowSplit {
+                        setup_secs: Some(3.2),
+                        duration_secs: 0.05,
+                    }
+                ),
+                HandlerCost::SetupBound,
+                "{handler} under the window floor"
+            );
+            // A driver that recorded nothing still cannot claim it.
+            assert_eq!(
+                HandlerCost::of(
+                    Flow::DlqDrain,
+                    handler,
+                    WindowSplit {
+                        setup_secs: None,
+                        duration_secs: 2.0,
+                    }
+                ),
+                HandlerCost::SetupBound,
+                "{handler} with no recorded setup"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fifo_window_is_never_framework_however_it_is_recorded() {
+        // `consume_fifo` did not come along with the DLQ drain, and the reason
+        // is worth a test of its own rather than an entry in a list: the flag
+        // that admits a flow to `framework` is "the driver held a barrier",
+        // but what the marker *asserts* is "the window is a drain". Those
+        // coincide on every other consume flow because a barrier is only ever
+        // held ahead of a prefilled corpus. On FIFO they would not: the
+        // driver publishes its whole corpus inside the timed window, so even
+        // a perfect barrier in front of it would leave `duration_secs` as
+        // publish-plus-drain and the row would publish `corpus / both` as a
+        // consumer rate.
+        //
+        // So the derivation refuses the marker for every window shape a FIFO
+        // row could carry, including one that passes every other gate — a
+        // recorded setup over a window far above the floor.
+        for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
+            for setup_secs in [None, Some(0.0), Some(3.2)] {
+                for duration_secs in [0.05, 2.0, 600.0] {
+                    assert_eq!(
+                        HandlerCost::of(
+                            Flow::ConsumeFifo,
+                            handler,
+                            WindowSplit {
+                                setup_secs,
+                                duration_secs,
+                            }
+                        ),
+                        HandlerCost::SetupBound,
+                        "{handler} / setup {setup_secs:?} / window {duration_secs}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_fifo_corpus_is_never_raised_by_the_framework_floor() {
+        // The floor exists to grow a drain long enough for its rate to mean
+        // something, and it asks `Flow::holds_readiness_barrier` so it cannot
+        // drift from the marker's own gate. FIFO fails that gate, so no corpus
+        // can make it `framework` and a floor would only lengthen a cell that
+        // publishes no publishable number — twenty minutes for a row chartgen
+        // withholds. Pinned because the coupling is one-directional and easy
+        // to miss: re-admitting the flow to the barrier set silently re-admits
+        // it here.
+        for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
+            for concurrent in [false, true] {
+                for payload_bytes in PAYLOAD_SIZES {
+                    assert_eq!(
+                        framework_corpus_floor(
+                            Flow::ConsumeFifo,
+                            handler,
+                            concurrent,
+                            payload_bytes
+                        ),
+                        0,
+                        "{handler} / concurrent {concurrent} / {payload_bytes} B"
+                    );
+                }
+            }
+        }
+        // The control: the flow that *did* gain a barrier is floored, so the
+        // assertion above is about FIFO and not about a floor that never
+        // fires.
+        assert!(
+            framework_corpus_floor(Flow::DlqDrain, HandlerProfile::Zero, false, 64) > 0,
+            "the dlq drain must be floored, or the FIFO assertion proves nothing"
+        );
     }
 
     #[test]
@@ -8626,6 +8936,37 @@ mod tests {
             <<StressTestTopic as Topic>::Codec as shove::Codec<StressTestMsg>>::decode(&seen[0].1)
                 .expect("the probe receives the topic's own encoding");
         assert_eq!(sentinel.id, SENTINEL_ID);
+    }
+
+    #[test]
+    fn a_fifo_handler_carries_no_attach_flag_so_the_reserved_id_is_corpus() {
+        // `consume_fifo` holds no barrier, so nothing hands its handler an
+        // attach flag — and `is_sentinel` is gated on carrying one precisely
+        // because outside a barrier there is nowhere to record a probe and
+        // dropping the message would understate the drain instead of
+        // measuring it. The reserved id is therefore ordinary corpus to a
+        // FIFO handler, which is the safe direction: a flow that published
+        // one would count it, never silently swallow it.
+        let bare = StressTestHandler::new(
+            Instant::now(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(LatencyRecorder::new()),
+            HandlerProfile::Zero,
+        );
+        assert!(
+            !bare.is_sentinel(SENTINEL_ID),
+            "no flag: the reserved id is corpus"
+        );
+
+        let barriered = bare
+            .clone()
+            .with_attach_counter(Arc::new(AtomicU64::new(0)));
+        assert!(barriered.is_sentinel(SENTINEL_ID));
+        assert!(
+            !barriered.is_sentinel(SENTINEL_ID - 1),
+            "one id is reserved, not a band"
+        );
+        assert!(!barriered.is_sentinel(0), "corpus ids count up from zero");
     }
 
     #[tokio::test]
@@ -9378,13 +9719,19 @@ mod tests {
         // publish flows carry zero, and the flows that hold no barrier carry
         // `None`. A `setup_bound` marker is honest about the number but must
         // not launder a field the flow's driver cannot have written.
+        //
+        // `dlq_drain` with a negative interval is the shape that flow gained
+        // when it gained a barrier: a missing window is now as unproducible
+        // for it as a fabricated one used to be. `consume_fifo` runs the
+        // other way — it holds no barrier, so any recorded interval is the
+        // fabricated one.
         let cases: [(Flow, Option<f64>); 7] = [
             (Flow::ConsumeBatch, None),
             (Flow::ConsumeParallel, Some(-0.5)),
             (Flow::ConsumerGroup, Some(f64::NAN)),
             (Flow::Broadcast, Some(f64::INFINITY)),
-            (Flow::ConsumeFifo, Some(1.0)),
-            (Flow::DlqDrain, Some(0.0)),
+            (Flow::ConsumeFifo, Some(0.0)),
+            (Flow::DlqDrain, Some(-1.0)),
             (Flow::PublishBatch, Some(1.5)),
         ];
         for (flow, setup_secs) in cases {
@@ -9444,35 +9791,76 @@ mod tests {
     }
 
     #[test]
-    fn a_framework_claim_from_a_flow_that_holds_no_barrier_is_refused() {
-        // The document-level half of
-        // `a_flow_whose_driver_holds_no_barrier_can_never_be_framework`: a row
-        // whose `setup_secs` could not have come from its own flow must be
-        // refused, not re-derived into agreement. This is the shape a
-        // hand-edited or mis-generated document takes — every real run of these
-        // two flows writes `null` — and `validate_run` is the check that exists
-        // to catch a marker its row cannot support.
-        for flow in UNSEPARATED_CONSUME_FLOWS {
-            let mut run = batch_run(flow, HandlerProfile::Zero);
-            run.results[0].setup_secs = Some(0.0);
-            run.results[0].duration_secs = 2.0;
-            run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
-
-            // The fabricated field is refused before the marker built on it
-            // is even compared.
-            let err = validate_run(&run)
-                .expect_err(&format!("{flow}: a fabricated setup_secs must be refused"));
-            assert!(err.contains("setup_secs"), "{flow}: {err}");
-
-            // Even with the honest marker, the field alone keeps the row out.
-            run.results[0].handler_cost = HandlerCost::SetupBound.as_str().to_string();
-            let err = validate_run(&run)
-                .expect_err(&format!("{flow}: setup_bound must not launder setup_secs"));
-            assert!(err.contains("setup_secs"), "{flow}: {err}");
-
-            // The row the driver really writes passes.
+    fn a_null_setup_window_on_the_late_barrier_flow_is_refused() {
+        // The v6 shape of a `dlq_drain` row, which is what the pre-barrier
+        // driver wrote: `setup_secs: null` over an unseparated window. Its
+        // driver now holds a barrier and records the interval, so `null` is a
+        // value no run of it produces any more — and a document mixing the
+        // two shapes would put an unseparated window and a drain on one axis
+        // under the same flow. `setup_bound` does not launder it: the marker
+        // is honest about the *number*, and the refusal is about the field.
+        //
+        // This refusal is precisely why `RESULTS_SCHEMA_VERSION` had to move.
+        // A v6 document reaches the version check in `merge_results_file`
+        // first and is refused there with the "move it aside" message,
+        // instead of arriving here as five backends' worth of invalid
+        // preserved runs.
+        for cost in [HandlerCost::SetupBound, HandlerCost::Framework] {
+            let mut run = batch_run(Flow::DlqDrain, HandlerProfile::Zero);
             run.results[0].setup_secs = None;
-            validate_run(&run).unwrap_or_else(|e| panic!("{flow}: honest row refused: {e}"));
+            run.results[0].duration_secs = 2.0;
+            run.results[0].handler_cost = cost.as_str().to_string();
+            let err = validate_run(&run).expect_err(&format!(
+                "dlq_drain/{}: a null setup window must be refused",
+                cost.as_str()
+            ));
+            assert!(err.contains("setup_secs"), "{err}");
+        }
+
+        // And the row the barrier-holding driver really writes passes.
+        let mut run = batch_run(Flow::DlqDrain, HandlerProfile::Zero);
+        run.results[0].setup_secs = Some(3.2);
+        run.results[0].duration_secs = 2.0;
+        run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
+        validate_run(&run).unwrap_or_else(|e| panic!("honest row refused: {e}"));
+    }
+
+    #[test]
+    fn a_fifo_row_is_refused_a_setup_window_and_a_framework_marker_together() {
+        // `consume_fifo` did not gain a barrier, so its v6 row shape is still
+        // the only one it writes: `setup_secs: null` over a window that
+        // contains its own corpus publish, marked `setup_bound`. Both halves
+        // are guarded, because either one alone would publish the window as a
+        // consumer rate.
+        let honest = |mut run: BackendRun| {
+            run.results[0].setup_secs = None;
+            run.results[0].duration_secs = 2.0;
+            run.results[0].handler_cost = HandlerCost::SetupBound.as_str().to_string();
+            run
+        };
+        let run = honest(batch_run(Flow::ConsumeFifo, HandlerProfile::Zero));
+        validate_run(&run).unwrap_or_else(|e| panic!("the honest fifo row was refused: {e}"));
+
+        // A recorded interval is a claim its driver never makes.
+        let mut run = honest(batch_run(Flow::ConsumeFifo, HandlerProfile::Zero));
+        run.results[0].setup_secs = Some(3.2);
+        let err = validate_run(&run).expect_err("a fifo row carrying a setup window");
+        assert!(err.contains("setup_secs"), "{err}");
+
+        // And the marker cannot be talked up on its own either, with or
+        // without a setup window under it. That promotion is the one that
+        // would actually mislead a reader: a `framework` fifo row reaches
+        // chartgen's absolute axis, and its window is publish-plus-drain.
+        for setup_secs in [None, Some(3.2)] {
+            let mut run = honest(batch_run(Flow::ConsumeFifo, HandlerProfile::Zero));
+            run.results[0].setup_secs = setup_secs;
+            run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
+            let err = validate_run(&run)
+                .expect_err(&format!("a framework fifo row / setup {setup_secs:?}"));
+            assert!(
+                err.contains("handler_cost") || err.contains("setup_secs"),
+                "{err}"
+            );
         }
     }
 
@@ -10895,8 +11283,6 @@ mod tests {
         // before the account is even read.
         let mut wrong = run.clone();
         wrong.results[0].flow = Flow::DlqDrain.as_str().to_string();
-        wrong.results[0].setup_secs = None;
-        wrong.results[0].handler_cost = HandlerCost::SetupBound.as_str().to_string();
         let err = validate_run(&wrong).unwrap_err();
         assert!(err.contains("method"), "{err}");
 
