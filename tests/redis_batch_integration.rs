@@ -305,6 +305,10 @@ impl RecordingBatchHandler {
     }
 }
 
+/// One `handle_batch` call: when the call was entered, and the seqs it was
+/// handed.
+type HandledBatch = (Instant, Vec<u32>);
+
 /// Batch handler that holds its **first** batch inside `handle_batch` until
 /// the test releases it, so the test can observe what the consumer loop does
 /// while a flush is in flight. Later batches `Ack` at once, so the loop
@@ -319,7 +323,10 @@ struct GatedFirstBatchHandler {
     /// cannot deadlock the test.
     release: Arc<Notify>,
     calls: Arc<AtomicUsize>,
-    seen: Arc<Mutex<Vec<u32>>>,
+    /// One entry per `handle_batch` call. Kept per call rather than as one
+    /// flat list so a test can assert the *shape* of the split (which messages
+    /// arrived together) and *when* a later call landed, not just the union.
+    batches: Arc<Mutex<Vec<HandledBatch>>>,
 }
 
 impl GatedFirstBatchHandler {
@@ -328,7 +335,7 @@ impl GatedFirstBatchHandler {
             entered: Arc::new(AtomicBool::new(false)),
             release: Arc::new(Notify::new()),
             calls: Arc::new(AtomicUsize::new(0)),
-            seen: Arc::new(Mutex::new(Vec::new())),
+            batches: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -344,8 +351,17 @@ impl GatedFirstBatchHandler {
         self.release.notify_one();
     }
 
+    fn batches(&self) -> Vec<HandledBatch> {
+        self.batches.lock().unwrap().clone()
+    }
+
     fn seen(&self) -> Vec<u32> {
-        self.seen.lock().unwrap().clone()
+        self.batches
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(_, seqs)| seqs.iter().copied())
+            .collect()
     }
 }
 
@@ -361,10 +377,10 @@ where
         _: &(),
     ) -> Outcome {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        self.seen
-            .lock()
-            .unwrap()
-            .extend(messages.iter().map(|(m, _)| m.seq));
+        self.batches.lock().unwrap().push((
+            Instant::now(),
+            messages.iter().map(|(m, _)| m.seq).collect(),
+        ));
         if call == 0 {
             self.entered.store(true, Ordering::SeqCst);
             self.release.notified().await;
@@ -410,6 +426,12 @@ define_topic!(
     ReadAheadTopic,
     BatchMessage,
     TopologyBuilder::new(READ_AHEAD_QUEUE).build()
+);
+const PARTIAL_READ_AHEAD_QUEUE: &str = "redis-batch-read-ahead-partial";
+define_topic!(
+    PartialReadAheadTopic,
+    BatchMessage,
+    TopologyBuilder::new(PARTIAL_READ_AHEAD_QUEUE).build()
 );
 define_topic!(
     AgeTopic,
@@ -832,6 +854,149 @@ async fn a_full_batch_reads_the_next_one_while_the_flush_is_in_flight() {
         xpending_count(&mut raw, READ_AHEAD_QUEUE, group).await,
         0,
         "both batches should be acked, leaving nothing pending"
+    );
+}
+
+/// A read-ahead that comes back **short** of `max_batch_size` still flushes on
+/// the age trigger, and its age window is the one this loop documents: it
+/// starts when the entry is ingested into the batch, i.e. after the flush that
+/// fetched it returns.
+///
+/// This is the partial case the full-batch test above cannot reach — there the
+/// read-ahead returns `max_batch_size` entries and the size trigger fires the
+/// moment they are ingested, so the age path is never exercised. Here six
+/// messages against `max_batch_size` 5 leave the read-ahead holding exactly
+/// one, and only the age trigger can retire it.
+///
+/// The window deliberately does **not** run from the fetch. `max_batch_age` is
+/// documented as time "since the first message in the current batch", and a
+/// read-ahead entry is not in a batch until it is ingested; the entry is also
+/// not delayed by measuring it this way, because without the read-ahead the
+/// loop could not have fetched it before the flush returned either. The
+/// assertions below pin both halves: nothing is handed to the handler during
+/// the hold, and the sixth message follows within one age window of the
+/// release.
+#[tokio::test]
+async fn a_partial_read_ahead_batch_flushes_on_its_own_age_window() {
+    const BATCH_AGE: Duration = Duration::from_millis(300);
+    // Long enough that a window started at the fetch would have expired many
+    // times over during the hold, so "did it flush early?" is unambiguous.
+    const HOLD: Duration = Duration::from_secs(3);
+
+    let url = redis_url().await;
+    let group = "batch-read-ahead-partial-grp";
+    let broker = connect_with_retry(url, group, Duration::from_secs(30)).await;
+    broker
+        .topology()
+        .declare::<PartialReadAheadTopic>()
+        .await
+        .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publish_seq::<PartialReadAheadTopic>(&publisher, 0..6).await;
+
+    let handler = GatedFirstBatchHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<PartialReadAheadTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(5)
+                        .with_max_batch_age(BATCH_AGE)
+                        // Comfortably past `HOLD`: the first handler call is
+                        // held for that long on purpose and must not be
+                        // abandoned as a timeout.
+                        .with_handler_timeout(Duration::from_secs(60))
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    assert!(
+        poll_until(|| handler.entered(), TIMEOUT).await,
+        "the first batch never reached the handler"
+    );
+
+    // The precondition that makes this the *partial* case: the read-ahead ran
+    // concurrently with the held flush and took the one remaining entry, so
+    // all six are delivered (5 in the flush + 1 read ahead) while the handler
+    // is still holding.
+    let mut raw = raw_conn(url).await;
+    let mut pending = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        pending = xpending_count(&mut raw, PARTIAL_READ_AHEAD_QUEUE, group).await;
+        if pending >= 6 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        pending, 6,
+        "expected all 6 entries pending — 5 in the flush plus the 1 read ahead \
+         while it ran; {pending} means the loop waited for the flush before reading"
+    );
+
+    // Hold well past `BATCH_AGE`. A window armed at the fetch would have fired
+    // inside this sleep; the handler call count proves it did not.
+    tokio::time::sleep(HOLD).await;
+    assert_eq!(
+        handler.calls(),
+        1,
+        "the prefetched entry must not reach a handler while the flush that \
+         fetched it is still running"
+    );
+
+    let released_at = Instant::now();
+    handler.release();
+    assert!(
+        poll_until(|| handler.calls() >= 2, TIMEOUT).await,
+        "the prefetched entry should flush on its age window once the first \
+         flush returns, saw {:?}",
+        handler.batches()
+    );
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let batches = handler.batches();
+    assert_eq!(
+        batches.len(),
+        2,
+        "expected exactly two handler calls, saw {batches:?}"
+    );
+    assert_eq!(
+        sorted(&batches[0].1),
+        (0..5).collect::<Vec<_>>(),
+        "the first call is the full size-triggered batch"
+    );
+    assert_eq!(
+        batches[1].1,
+        vec![5],
+        "the second call is the single read-ahead entry, retired by the age trigger"
+    );
+
+    // The latency that matters, and the one a window armed at the fetch would
+    // have changed: measured from the flush returning, not from the fetch.
+    // Generously bounded because the release wakes a task that must still
+    // ingest and re-enter the loop, but far below `HOLD` — the point is that
+    // the window restarts here rather than having already elapsed.
+    let delay = batches[1].0.saturating_duration_since(released_at);
+    assert!(
+        delay < BATCH_AGE * 10,
+        "the prefetched entry should follow the release by about one age \
+         window, took {delay:?}"
+    );
+
+    assert_eq!(
+        xpending_count(&mut raw, PARTIAL_READ_AHEAD_QUEUE, group).await,
+        0,
+        "both calls should be acked, leaving nothing pending"
     );
 }
 
