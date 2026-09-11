@@ -154,6 +154,17 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
     /// is ignored: broadcast has no retry chain, so the retry budget is pinned
     /// to `0` and the first `Retry` discards through the same no-DLQ path a
     /// `Reject` takes.
+    ///
+    /// [`ConsumerOptions::with_prefetch_count`](crate::ConsumerOptions::with_prefetch_count)
+    /// and
+    /// [`ConsumerOptions::with_concurrent_processing`](crate::ConsumerOptions::with_concurrent_processing)
+    /// are ignored too: a broadcast subscription is a single delivery loop by
+    /// contract, so the effective prefetch is pinned to `1`. A second
+    /// concurrent handler inside one subscription would reorder the fan-out
+    /// this instance is supposed to observe whole — the same surprise
+    /// [`reject_broadcast`] refuses from the outside — and NATS and Redis
+    /// already assume the single loop structurally, so honouring the option
+    /// here would make ordering backend-dependent.
     pub fn subscribe<T, H>(&mut self, handler: H, options: ConsumerOptions<B>) -> Result<()>
     where
         T: Topic,
@@ -186,6 +197,13 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
         // the first `Retry` land on the existing terminal (no-DLQ) arm instead
         // of introducing a second discard path.
         inner.max_retries = 0;
+        // A broadcast subscription is a single delivery loop by contract:
+        // NATS and Redis assume it structurally (inline delivery; neither
+        // reads the prefetch), so any backend that does honour prefetch —
+        // InMemory, Kafka, RabbitMQ — must be pinned here or ordering
+        // becomes backend-dependent. Pinned after `into_inner()` so
+        // `with_concurrent_processing(true)` cannot re-raise it either.
+        inner.prefetch_count = 1;
 
         self.tasks
             .spawn(async move { broadcast.run_broadcast::<T, H>(handler, ctx, inner).await });

@@ -57,18 +57,26 @@ pub(crate) trait BroadcastImpl: Send + Sync {
         H: MessageHandler<T>;
 }
 
-// Gated to the backends that actually call it, for two reasons. `routing` is
-// itself compiled only when some backend is, so an ungated body fails to
-// resolve `crate::routing` under `--no-default-features`. And InMemory and
-// RabbitMQ are deliberately *not* in the list: InMemory's broadcast path reuses
-// its own `route_outcome` over a private buffer, and RabbitMQ settles through
-// `router::route_reject` / `nack_requeue` because an AMQP delivery has to be
-// nacked on the channel it arrived on — the router already records the terminal
-// metric there, so going through this helper too would count it twice.
-// Including either would leave this re-export unused under that backend's
-// feature alone — which `-D warnings` rejects, and which CI's per-feature
-// clippy legs would catch.
-#[cfg(any(feature = "kafka", feature = "nats", feature = "redis-streams"))]
+// Gated to the backends that actually call into it, for two reasons.
+// `routing` is itself compiled only when some backend is, so an ungated body
+// fails to resolve `crate::routing` under `--no-default-features`. And neither
+// InMemory nor RabbitMQ calls `settle_broadcast_outcome`: InMemory's broadcast
+// path reuses its own `route_outcome` over a private buffer, and RabbitMQ
+// settles through `router::route_reject` / `nack_requeue` because an AMQP
+// delivery has to be nacked on the channel it arrived on — the router already
+// records the terminal metric there, so going through this helper too would
+// count it twice. InMemory *is* in the cfg list, but only for
+// `BROADCAST_DEFER_DELAY`: its in-place broadcast `Defer` paces on the same
+// constant, so the test substrate redelivers on the schedule production does.
+// The re-exports below are split to match — a name re-exported under a feature
+// that never uses it is an unused import, which `-D warnings` rejects and
+// CI's per-feature clippy legs would catch.
+#[cfg(any(
+    feature = "inmemory",
+    feature = "kafka",
+    feature = "nats",
+    feature = "redis-streams"
+))]
 mod settling {
     use std::time::Duration;
 
@@ -219,5 +227,12 @@ mod settling {
     }
 }
 
+#[cfg(any(
+    feature = "inmemory",
+    feature = "kafka",
+    feature = "nats",
+    feature = "redis-streams"
+))]
+pub(crate) use settling::BROADCAST_DEFER_DELAY;
 #[cfg(any(feature = "kafka", feature = "nats", feature = "redis-streams"))]
-pub(crate) use settling::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_broadcast_outcome};
+pub(crate) use settling::{BroadcastAction, settle_broadcast_outcome};
