@@ -2792,11 +2792,20 @@ where
 /// the cycle is strictly serial — read, then handle and ack with nothing in
 /// flight, then read again — so one consumer spends the whole flush idle on
 /// its connection. Measured on this loop at 64 B / `max_batch_size` 500
-/// against a Docker Redis 7.0: 3.88 ms per 500-message cycle, of which the
-/// read phase alone is 57% and the process holds one core only half busy.
-/// That idle share is what makes a lone batch consumer slower than N of them
-/// are per consumer — N loops fill each other's gaps, one loop has nothing
-/// to fill its own with.
+/// against a Docker Redis 7.0 on an aarch64 Linux host: 3.88 ms per
+/// 500-message cycle, of which the read phase alone is 57% and the process
+/// holds one core only half busy.
+///
+/// What this does **not** explain is the sub-parity single-consumer batch row
+/// in `benches/results/bench-results.json` — 64 B, one consumer, drain:
+/// 132 389 msg/s against `consume_parallel`'s 289 728 at the same cell. That
+/// document was measured on another host, and it dates that host's own Redis
+/// round trip: its `publish_single` 64 B row is 5 000 strictly serial awaited
+/// publishes, one round trip each, at `dispatch_p50_ms` 0.071. Two round
+/// trips is therefore ~142 us of that row's 3 777 us per-batch cycle — under
+/// 4%, against a gap that needs 2.19x. The serialization is real and this
+/// removes it, but it is far too small to be that row's cause, and what is
+/// remains open. Do not re-derive the overlap as the explanation.
 ///
 /// Five properties keep it from changing what a handler sees:
 ///
@@ -2940,10 +2949,11 @@ where
                 if batch.len() >= max_batch_size {
                     // Keep the next read in flight for the duration of the
                     // flush. Serialized read → flush → read leaves this
-                    // consumer idle on the socket for the whole flush, and
-                    // that idle window is the single-consumer deficit: one
-                    // loop has nothing to fill it with, where N loops fill
-                    // each other's.
+                    // consumer idle on the socket for the whole flush, with
+                    // nothing of its own to fill that window with. This is
+                    // not the published single-consumer deficit — see the
+                    // arithmetic in `run_batch_impl`'s doc comment — it is
+                    // just a gap worth not having.
                     //
                     // No surplus buffer is needed to make this safe: the
                     // flush below empties `batch`, so a
