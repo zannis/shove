@@ -1,0 +1,19 @@
+Cargo.lock
+  s_65007dc190c9aa::t_bb142d71c939d1 135,146,1034,1036,1707,2864,3042,3829,3903,4372,4662,4664,5222
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f9d5c62fba4f0c1bbcad2ceee731d3678f8f919f",
+  "prompts": {},
+  "sessions": {
+    "s_65007dc190c9aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c8781777-55d4-4045-aa93-3532d226d965",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
