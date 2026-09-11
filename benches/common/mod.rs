@@ -98,10 +98,10 @@ pub const TIER_A_COVERAGE: [FlowCoverage; 10] = [
     },
     FlowCoverage {
         flow: "consume_batch",
-        coverage: Coverage::NotApplicable(
-            "batch consume (`run_batch`) exists on InMemory too, but this \
-             bench harness has not wired a consume_batch flow for it yet",
-        ),
+        coverage: Coverage::Benched {
+            target: "inmemory_flows",
+            group: "inmemory_batch",
+        },
     },
     FlowCoverage {
         flow: "consumer_group",

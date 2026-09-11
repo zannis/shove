@@ -255,6 +255,20 @@ fn an_id_in_the_run_but_not_the_baseline_warns_only() {
     .expect("compare");
     assert_eq!(*verdict_of(&cmp, "g/new"), Verdict::NewInRun);
     assert!(!cmp.failed());
+
+    // ...but "not judged" must not mean "not surfaced". An unbaselined id is
+    // the one state the gate cannot catch a regression in, so it has to reach
+    // the PR as an annotation rather than sitting in the log table only —
+    // otherwise the calibration it is waiting on is silently forgettable.
+    let report = bench_compare::render_report(&cmp, true);
+    assert!(
+        report.contains("::warning::bench g/new"),
+        "a measured id with no baseline entry must annotate as a warning, got:\n{report}"
+    );
+    assert!(
+        !report.contains("::error"),
+        "a new id must not fail the leg it is introduced in, got:\n{report}"
+    );
 }
 
 #[test]
