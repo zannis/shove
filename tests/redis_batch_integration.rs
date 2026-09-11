@@ -427,6 +427,12 @@ define_topic!(
     BatchMessage,
     TopologyBuilder::new(READ_AHEAD_QUEUE).build()
 );
+const READ_AHEAD_CONN_QUEUE: &str = "redis-batch-read-ahead-conn";
+define_topic!(
+    ReadAheadConnTopic,
+    BatchMessage,
+    TopologyBuilder::new(READ_AHEAD_CONN_QUEUE).build()
+);
 const PARTIAL_READ_AHEAD_QUEUE: &str = "redis-batch-read-ahead-partial";
 define_topic!(
     PartialReadAheadTopic,
@@ -553,6 +559,7 @@ macro_rules! impl_recording_for {
 impl_recording_for!(
     SizeTopic,
     CountPinTopic,
+    ReadAheadConnTopic,
     AgeTopic,
     AgeUnderLoadTopic,
     AckTopic,
@@ -1077,6 +1084,136 @@ async fn xreadgroup_count_matches_max_batch_size_not_one() {
     assert!(
         found,
         "expected the first XREADGROUP for {stream_needle} to carry {expected}"
+    );
+}
+
+/// The read-ahead and the flush share one socket, and that is load-bearing.
+///
+/// Splitting them over two connections is the obvious-looking cleanup — it is
+/// what the concurrent single-message loop does with its `outcome_conn` — and
+/// it costs 28 points of the two-consumer gain and 7 of the one-consumer one.
+/// Both split variants were built and measured; the numbers, in both
+/// directions, are in the crate's `run_batch_impl` doc comment under
+/// "What sharing the socket costs, and why it is still the choice".
+///
+/// No functional test can see a throughput trade, so the structure gets
+/// pinned instead: every `XREADGROUP` and every `XACK` this loop issues for
+/// one stream must come from the **same** client. `MONITOR` reports the
+/// issuing client's `ip:port` per command, which is what makes a split
+/// visible at all. A future refactor that hands the read-ahead or the
+/// settlement its own connection fails here and has to read why first.
+#[tokio::test]
+async fn the_read_ahead_and_the_flush_share_one_socket() {
+    let url = redis_url().await;
+    let broker =
+        connect_with_retry(url, "batch-read-ahead-conn-grp", Duration::from_secs(30)).await;
+    broker
+        .topology()
+        .declare::<ReadAheadConnTopic>()
+        .await
+        .unwrap();
+
+    let monitor_client = redis::Client::open(url).expect("open monitor client");
+    let monitor = monitor_client
+        .get_async_monitor()
+        .await
+        .expect("MONITOR connection");
+    let mut lines = monitor.into_on_message::<String>();
+
+    let publisher = broker.publisher().await.unwrap();
+    // Two full batches at `max_batch_size` 5, so the first size-triggered
+    // flush arms a read-ahead: the trace then carries the loop's own read, the
+    // read-ahead's, and the ack between them — the three commands whose client
+    // addresses the pin compares.
+    publish_seq::<ReadAheadConnTopic>(&publisher, 0..10).await;
+
+    let handler = RecordingBatchHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<ReadAheadConnTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(5)
+                        .with_max_batch_age(Duration::from_millis(500))
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    /// `1758… [0 172.17.0.1:57134] "XREADGROUP" …` — the client address is the
+    /// second field inside the brackets.
+    fn client_addr(line: &str) -> Option<&str> {
+        let inside = line.split_once('[')?.1.split_once(']')?.0;
+        inside.split_once(' ').map(|(_, addr)| addr)
+    }
+
+    let stream_needle = format!("\"{READ_AHEAD_CONN_QUEUE}\"");
+    let mut read_addrs: Vec<String> = Vec::new();
+    let mut ack_addrs: Vec<String> = Vec::new();
+    let mut reads = 0usize;
+    let _ = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let Some(line) = lines.next().await else {
+                return;
+            };
+            if !line.contains(&stream_needle) {
+                continue;
+            }
+            let Some(addr) = client_addr(&line) else {
+                continue;
+            };
+            if line.contains("\"XREADGROUP\"") {
+                reads += 1;
+                if !read_addrs.iter().any(|a| a == addr) {
+                    read_addrs.push(addr.to_string());
+                }
+            } else if line.contains("\"XACK\"") {
+                if !ack_addrs.iter().any(|a| a == addr) {
+                    ack_addrs.push(addr.to_string());
+                }
+            } else {
+                continue;
+            }
+            // Leave once both halves of a cycle have been seen: two reads —
+            // the loop's own of the first five and the read-ahead's of the
+            // second five, which is what proves the read-ahead fired — and
+            // the ack the flush between them issued.
+            if reads >= 2 && !ack_addrs.is_empty() {
+                return;
+            }
+        }
+    })
+    .await;
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    assert!(
+        reads >= 2 && !ack_addrs.is_empty(),
+        "expected at least two XREADGROUPs and one XACK for {stream_needle} \
+         within {TIMEOUT:?} — saw {reads} reads from {read_addrs:?} and acks \
+         from {ack_addrs:?}"
+    );
+    assert_eq!(
+        read_addrs.len(),
+        1,
+        "the read-ahead must stay on the loop's own socket, but XREADGROUPs \
+         for {stream_needle} came from {read_addrs:?}"
+    );
+    assert_eq!(
+        ack_addrs, read_addrs,
+        "the flush must settle on the socket it reads on, but acks for \
+         {stream_needle} came from {ack_addrs:?} against reads from \
+         {read_addrs:?}. Splitting them recovers ~5% at eight consumers and \
+         gives back 28 points at two — see run_batch_impl's \"What sharing \
+         the socket costs, and why it is still the choice\""
     );
 }
 
