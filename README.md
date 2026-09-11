@@ -127,6 +127,26 @@ comes from one pinned matrix, so a run is reproduced with
 script and the chart regeneration are described under
 [Measurement methodology](https://shove.rs/ops/performance#measurement-methodology).
 
+**Batch consumption.** `BatchConsumer` hands the handler up to `max_batch_size`
+messages per call, so whatever the handler costs per invocation is paid once per
+flush rather than once per message. The table reads the batch flow's drain
+ceiling off the same results document: the best cell the charts publish for
+each backend and payload, its consumer count, and the ratio to the plain
+parallel consumer at that same cell. Batches are up to 500 messages or 250 ms,
+except on SQS, whose API caps a batch at 10. Batching leads most where messages
+are small and per-message framework work dominates; at 64 KiB the batch flow is
+at most 1.35x the parallel one on every backend, because the cost there is
+moving bytes.
+
+| Backend | 64 B (msg/s) | 1 KiB (msg/s) | 64 KiB (msg/s) |
+|---|---|---|---|
+| In-process | 4.33M (8c), 9.6x parallel | 1.09M (4c), 3.0x | 80k (8c), 1.1x |
+| Kafka | 963k (8c), 1.2x | 1.50M (8c), 2.9x | 42k (2c), 1.0x |
+| NATS | 101k (8c), 1.1x | 81k (2c), 1.0x | 12k (1c), 1.1x |
+| RabbitMQ | 35k (2c), 1.6x | 36k (4c), 1.2x | 31k (4c), 1.3x |
+| Redis | 1.29M (8c), 2.1x | 770k (8c), 1.5x | 41k (4c), 1.0x |
+| SQS (LocalStack) | 3.2k (8c), 1.1x | 3.3k (8c), 2.5x | 1.9k (8c), 1.1x |
+
 ## Learn more
 
 - [Getting Started](https://shove.rs/getting-started)
