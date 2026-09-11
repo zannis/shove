@@ -2387,7 +2387,13 @@ async fn ingest_entries<T: Topic>(
         )
         .await?;
         if deadline.is_none() && !batch.is_empty() {
-            *deadline = Some(Instant::now() + max_batch_age);
+            // `checked_add` rather than `+`: this loop's contract is no
+            // unchecked arithmetic on a runtime path, and
+            // `with_max_batch_age` bounds its argument below (non-zero) but
+            // not above. An age too large for the clock to represent leaves
+            // the deadline unarmed, which is what such an age means — no age
+            // trigger, with the size trigger still bounding the batch.
+            *deadline = Instant::now().checked_add(max_batch_age);
         }
     }
     Ok(())
