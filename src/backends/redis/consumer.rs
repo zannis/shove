@@ -2786,7 +2786,7 @@ where
 /// are per consumer — N loops fill each other's gaps, one loop has nothing
 /// to fill its own with.
 ///
-/// Three properties keep it from changing what a handler sees:
+/// Four properties keep it from changing what a handler sees:
 ///
 /// - **No surplus, so `max_batch_size` still bounds a handler call.** The
 ///   read-ahead is armed only where a flush is about to empty the batch, so
@@ -2797,6 +2797,9 @@ where
 /// - **Dropped on `Redeliver`.** That settlement arms `replay_cursor = "0"`,
 ///   and the replay returns the read-ahead's entries too; ingesting them
 ///   here as well would deliver them twice in one process.
+/// - **Settled on a graceful stop, not stranded.** The shutdown arm ingests
+///   a pending read-ahead before its final flush, so a clean stop still
+///   delivers what this loop fetched rather than leaving it for the reaper.
 ///
 /// The reclaim policy below still covers the widened buffering phase: a
 /// read-ahead entry waits out the flush that fetched it (bounded by
@@ -2895,6 +2898,14 @@ where
 
         async move {
             let mut conn = client.dedicated_conn().await?;
+            // One clone per reconnect cycle, exactly as
+            // `run_stream_loop_concurrent` hoists its `outcome_conn`: a clone
+            // of a multiplexed connection shares the socket and the
+            // multiplexer task, so this opens nothing new and only exists so
+            // the read-ahead and the flush can hold separate handles at the
+            // same time. Re-cloned when this closure re-runs, off the
+            // freshly dialed `conn`.
+            let mut read_conn = conn.clone();
             let mut batch: RedisBatch<T> = RedisBatch::new(max_batch_size);
             let mut deadline: Option<Instant> = None;
             let mut redelivery_backoff = batch_redelivery_backoff();
@@ -2919,13 +2930,12 @@ where
                     // into an empty buffer and `max_batch_size` still bounds
                     // what one handler call sees.
                     //
-                    // A clone, not a second connection: clones of a
-                    // multiplexed connection share one socket and one
-                    // multiplexer task, so the read and the flush's `XACK`
-                    // pipeline over it instead of taking turns. See
+                    // `read_conn` is a clone of `conn`, not a second
+                    // connection: the read and the flush's `XACK` pipeline
+                    // over one socket instead of taking turns on it. See
                     // [`read_ahead_batch`] for why that obliges the
                     // read-ahead to omit `BLOCK`.
-                    let mut read_conn = conn.clone();
+                    //
                     // A replay cycle takes no read-ahead: a live `>` read
                     // would interleave never-delivered entries into a PEL
                     // drain, and `next_replay_cursor` only describes the
