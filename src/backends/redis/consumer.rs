@@ -2796,56 +2796,61 @@ where
 /// 500-message cycle, of which the read phase alone is 57% and the process
 /// holds one core only half busy.
 ///
-/// What this does **not** settle is the sub-parity single-consumer batch row
-/// in `benches/results/bench-results.json` — 64 B, one consumer, drain:
-/// 132 389 msg/s against `consume_parallel`'s 289 728 at the same cell. That
-/// document was measured on another host and nothing here was, so this loop
-/// does not claim the overlap as that row's established cause.
+/// What this does **not** settle by itself is the sub-parity single-consumer
+/// batch row in `benches/results/bench-results.json` — 64 B, one consumer,
+/// drain: 132 389 msg/s against `consume_parallel`'s 289 728 at the same
+/// cell. That document was measured on another host (Apple M4 Max / macOS)
+/// and nothing in this loop was, so the read-ahead is not claimed as that
+/// row's established cause. The phase that row loses its time in is
+/// identified below; the size of it on that host is not.
 ///
-/// Nor is it excluded by magnitude, and an earlier revision of this comment
-/// had that wrong: it bounded the overlap by two of that host's
-/// `publish_single` round trips (2 x 71 us, under 4% of the cycle) and called
-/// the mechanism thirty times too small. A small-command round trip is not
-/// the quantity a read-ahead hides. What it hides is the whole read phase —
-/// the server building a 500-entry reply, its transfer, and the client's
-/// decode — which the parse-free probe below prices at 0.32 ms fixed plus
-/// 2.1 us per entry, about **1.4 ms** at COUNT 500. That is 6.7x the
-/// two-round-trip proxy on the one host where both were measured, so the
-/// proxy bounds nothing.
-///
-/// What that row's cost IS bounded to, from the same document's own rows.
-/// Read its three 1c `consume_batch` drains as a payload sweep at a constant
-/// `max_batch_size` 500: 64 B / 1 KiB / 64 KiB cost 3 777 / 4 977 / 20 658 us
-/// per cycle, for 32 KB / 512 KB / 32 MB of reply. A 1 000x in bytes buys
-/// 5.5x in time, which fits a ~1.9 GB/s byte term over a **~3.7 ms per-cycle
-/// term that does not depend on payload** — some 50 of that host's own round
-/// trips. It is not a per-entry cost either: the same host at two consumers
+/// **Bounded by the document's own rows.** Read its three 1c `consume_batch`
+/// drains as a payload sweep at a constant `max_batch_size` 500: 64 B /
+/// 1 KiB / 64 KiB cost 3 777 / 4 977 / 20 658 us per cycle, for 32 KB /
+/// 512 KB / 32 MB of reply. A 1 000x in bytes buys 5.5x in time, which fits
+/// a ~1.9 GB/s byte term over a **~3.7 ms per-cycle term that does not
+/// depend on payload**. Nor is it per entry: the same host at two consumers
 /// runs 726 872 msg/s, i.e. each consumer's 500-entry cycle in 1 377 us, and
 /// no per-entry or per-byte cost falls by 2.7x because a second connection
 /// appeared. So ~2.4 ms of every single-consumer cycle there is dead time
-/// that another concurrent flow removes — a wakeup/flush-latency shape, not a
-/// throughput one. That also bounds what removing it could buy there: a 1c
-/// cycle with that dead time gone runs at the 2c per-consumer rate, 363 436
-/// msg/s, which clears the 289 728 parity bar. Being large enough to be the
-/// cause is not being it, and this loop claims only the former.
+/// that another concurrent flow removes.
 ///
-/// That shape is absent on an aarch64 Linux host against a native Docker
-/// Redis 7.0, which is why no local A/B can close it. A parse-free
-/// `XREADGROUP` probe there — one connection, reads back to back — fits
-/// 0.32 ms fixed + 2.1 us per entry across COUNT 100/500/2000, and the lone
-/// serial reader is the FASTEST arm: two concurrent readers cost ~1.5x more
-/// per read, not less. The drain says it in the published rows' own units,
-/// 3 interleaved reps per arm at the 64 B cell: without this read-ahead that
-/// host scales 1c -> 2c by **1.49x** (105 224 -> 156 247 msg/s) where the
-/// published host scales by **5.49x**, and its 1c batch row already runs
-/// 1.75x *above* its own `consume_parallel` (60 002 msg/s) where the
-/// published one runs at 0.457x. With the read-ahead the same cells move to
-/// 114 834 at 1c (+9%, inside this host's spread) and 205 137 at 2c (+31%,
-/// outside it) — the gain tracks how much idle there was to fill, and this
-/// host has little. Whether the published host instead pays a large fixed
-/// per-read cost that any second busy flow hides is one short measurement on
-/// that host, and it is what this row's cause turns on. It cannot be settled
-/// from this code, and this loop does not claim it.
+/// **Three of the candidate phases are excluded by that same pass.**
+/// `consume_parallel` at the same cell runs 289 728 msg/s at `prefetch` 100,
+/// so it completes at least 2 897 serial `XREADGROUP` round trips a second —
+/// under 0.35 ms each — while acking every message individually. A cost
+/// charged per entry decoded, per message acked, or per round trip cannot
+/// then be the ~2.4 ms this loop's 500-entry cycle loses there; per round
+/// trip in particular it would charge the parallel flow ~5x more per message
+/// (COUNT 100 against 500), which is the wrong flow.
+///
+/// **What does reproduce the shape, measured on an aarch64 Linux host.**
+/// That host never shows the deficit — its 1c batch row runs 1.75x *above*
+/// its own `consume_parallel` where the published one runs at 0.457x — so
+/// no local A/B can close the row, and the cost has to be put into the path
+/// to study it. Behind a proxy that can charge a cost on this loop's
+/// `XREADGROUP` and `XACK` requests, 64 B, 200 000-message drains, 3 reps:
+/// 98.5% of this loop's consumer-path requests at 1c are issued after the
+/// path has been quiet for >= 0.3 ms (mean 1.6 ms), against 70.9% at 2c and
+/// 24.7% for `consume_parallel`. Charge 1.2 ms per such cold request and this loop
+/// falls to 0.54x. Then keep the path busy with a flow that delivers
+/// nothing — one connection pinging every 100 us, no corpus share, no
+/// second consumer — and it returns to 0.98x of the uncharged control, a
+/// 1.82x recovery. A cost paid only when a lone flow has let the path go
+/// quiet is therefore the one shape that behaves like the published rows:
+/// nothing charged per entry, per message or per round trip is removed by
+/// unrelated traffic.
+///
+/// **What the read-ahead is worth against that shape.** It halves this
+/// loop's consumer-path requests (803 -> 403 per 200 000 messages at 1c —
+/// the next read travels with the flush's `XACK` instead of following it
+/// cold), and under the charged cost it buys 1.28x at 1c and 1.35x at 2c.
+/// With no such cost it buys nothing at 1c (0.99x) and 1.50x at 2c, which is
+/// what this host measures. The gain tracks how much cold idle there was to
+/// fill, and 1.28x is short of the 2.19x the published 1c row would need for
+/// parity — so this loop does not claim that row is fixed, only that it
+/// removes one of the two serialized cold round trips per cycle. Pricing the
+/// cold start on the affected host is one short pass on it.
 ///
 /// Five properties keep it from changing what a handler sees:
 ///
