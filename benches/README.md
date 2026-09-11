@@ -534,11 +534,13 @@ check before trusting a document:
   on the macOS host clocks down**. The per-consumer rate at two consumers is
   the test, and it isolates the affected rows across the whole document: it is
   2.75x and 2.37x the 1c rate on those two Redis cells, and **at most 1.08x**
-  on every one of the eleven other 1c cells that has a 2c batch row to compare
-  against (in-process at 64 B has none) — they fall from one to two consumers
-  the way contention makes them. So a 1c row under parity with a *flat* 2c
-  per-consumer rate — in-process at 1 KiB and 64 KiB, Kafka at 64 B — is a
-  real result and not this effect.
+  on every other 1c `consume_batch` drain cell in the document — the highest of
+  them is Kafka at 1 KiB, 1.07x — which hold flat or fall from one to two
+  consumers the way contention makes them. Every 1c cell has a 2c row to
+  compare against; in-process at 64 B is the only one whose 2c row is
+  `setup_bound` rather than `framework`, and it reads 1.02x either way. So a 1c
+  row under parity with a *flat* 2c per-consumer rate — in-process at 1 KiB and
+  64 KiB, Kafka at 64 B — is a real result and not this effect.
 
 ## Related benchmarks
 
