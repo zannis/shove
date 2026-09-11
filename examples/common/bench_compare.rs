@@ -505,9 +505,9 @@ pub fn render_report(cmp: &Comparison, annotate: bool) -> String {
         ));
     }
     // Say what the gate actually covers, so a fully green run cannot be read
-    // as "58 ids held to 50%": ids the fleet swings hard get thresholds that
-    // only catch catastrophic blowups, and that is a property of the runner
-    // pool, not of the code under test.
+    // as "every baseline id held to 50%": ids the fleet swings hard get
+    // thresholds that only catch catastrophic blowups, and that is a property
+    // of the runner pool, not of the code under test.
     let with_threshold: Vec<f64> = cmp.rows.iter().filter_map(|r| r.fail_above_pct).collect();
     let floor = with_threshold
         .iter()

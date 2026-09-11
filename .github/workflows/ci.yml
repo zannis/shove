@@ -159,9 +159,10 @@ jobs:
   # Threshold rationale: six no-op calibration runs on separate ubuntu-latest
   # runners moved the median id ~57% and the worst 2.5x with no code change —
   # the fleet's hardware diversity, not sampling noise (per-run normalization
-  # does not collapse it), and the leg is a max over 58 ids. A single
-  # threshold tight enough to matter would therefore cry wolf weekly and be
-  # ignored within a week, which is worse than no leg. Instead every id fails
+  # does not collapse it), and the leg is a max over every id in the baseline.
+  # A single threshold tight enough to matter would therefore cry wolf weekly
+  # and be ignored within a week, which is worse than no leg. Instead every
+  # id fails
   # at max(50%, 5x its own measured no-op spread), recorded per id in the
   # baseline. Thresholds are earned, never asserted: an early 3-run
   # calibration was breached by its own fourth no-op run (heavy tails —
