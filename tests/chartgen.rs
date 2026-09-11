@@ -2305,6 +2305,157 @@ fn the_lockfile_carries_no_font_stack() {
     }
 }
 
+// ── The withholding marker ──────────────────────────────────────────────────
+
+/// `row` with a comparability marker stamped on it, asserting the stamp took:
+/// a fixture that silently failed to take would assert against the *unmarked*
+/// behaviour and pass for the wrong reason.
+fn host_bounded(row: &str, kind: &str) -> String {
+    let marked = row.replace(
+        r#""handler_cost": "framework","#,
+        &format!(r#""handler_cost": "framework", "comparability": "{kind}","#),
+    );
+    assert_ne!(marked, row, "the comparability stamp did not take");
+    marked
+}
+
+/// A one-backend run carrying a single 64 B batch drain — the shape
+/// `a_published_batch_bar_names_its_knobs` publishes.
+fn batch_run_json(backend: &str, row: String) -> String {
+    format!(
+        r#"{{
+          "backend": "{backend}", "representative": true,
+          "results": [{row}], "failures": [], "unsupported": []
+        }}"#
+    )
+}
+
+#[test]
+fn a_host_bounded_row_is_withheld_from_the_ordering_chart_and_said_to_be() {
+    // The A and B arms differ in one key. A marked row is measured, honest
+    // and internally consistent — every other guard passes it — but its rate
+    // is the measuring host's rather than the backend's, so no chart may
+    // publish it. Withholding it silently would be the worse failure: an
+    // absent bar reads as a gap, which says a measurement was never made.
+    let row = scenario("consume_batch", "batch", 64, 1, 80_000.0);
+    let published = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        batch_run_json("kafka", row.clone())
+    )));
+    let withheld = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        batch_run_json("kafka", host_bounded(&row, "host_clock_floor"))
+    )));
+
+    let svg_published =
+        chartgen::render_to_string(&published, Family::ParallelVsSequenced, Mode::Light)
+            .expect("the unmarked control should render");
+    let svg_withheld =
+        chartgen::render_to_string(&withheld, Family::ParallelVsSequenced, Mode::Light)
+            .expect("a marked row is a valid row, so the chart still renders");
+
+    // The knob caption is stated by a *published* batch bar and by nothing
+    // else, so it is the one string that tracks the bar itself.
+    assert!(
+        svg_published.contains("up to 500 messages or 200 ms per batch"),
+        "the control's batch bar must publish"
+    );
+    assert!(
+        !svg_withheld.contains("up to 500 messages or 200 ms per batch"),
+        "a host-bounded row must not reach the ordering chart's batch bar"
+    );
+    assert!(
+        svg_withheld.contains("the host rather than the backend bounded the rate"),
+        "the withheld cell must name its cause instead of reading as a gap"
+    );
+    // Other cells of this six-cell chart are legitimately gaps, so the test
+    // is that withholding this one added *no* gap: same gap count in both
+    // arms, with the withheld cell's own explanation on top.
+    let gaps = |svg: &str| svg.matches("a gap, not a").count();
+    assert_eq!(
+        gaps(&svg_withheld),
+        gaps(&svg_published),
+        "the withheld cell was captioned as a gap — it was measured"
+    );
+}
+
+#[test]
+fn a_comparability_marker_outside_the_closed_set_is_refused() {
+    // The failure mode this guards is silence: an unknown marker that fell
+    // through `is_comparable` would publish the number it was added to
+    // withhold, and the document would look like it had withheld it.
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        batch_run_json(
+            "kafka",
+            host_bounded(
+                &scenario("consume_batch", "batch", 64, 1, 80_000.0),
+                "clocked_down",
+            ),
+        )
+    )));
+    let err = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect_err("an unknown marker is refused");
+    assert!(
+        err.to_string().contains("not a comparability marker"),
+        "wrong refusal: {err}"
+    );
+}
+
+#[test]
+fn the_committed_document_withholds_exactly_the_rows_the_runbook_names() {
+    // The marker is hand-added against evidence, and the evidence names two
+    // cells. This is the staleness guard on that pairing: a re-measure drops
+    // the marker (the harness never writes it), and a marker that survived
+    // onto a row the runbook does not explain — or a third cell quietly
+    // acquiring one — fails here rather than in a reader's comparison.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let doc = chartgen::load(&path).expect("the committed results document should load");
+
+    let marked: Vec<(String, String, u64, u32, String)> = doc
+        .runs
+        .iter()
+        .flat_map(|run| {
+            run.results.iter().filter_map(move |r| {
+                r.comparability.as_ref().map(|kind| {
+                    (
+                        run.backend.clone(),
+                        r.flow.clone(),
+                        r.payload_bytes,
+                        r.consumers,
+                        kind.clone(),
+                    )
+                })
+            })
+        })
+        .collect();
+
+    assert_eq!(
+        marked,
+        vec![
+            (
+                "redis".to_string(),
+                "consume_batch".to_string(),
+                64,
+                1,
+                "host_clock_floor".to_string()
+            ),
+            (
+                "redis".to_string(),
+                "consume_batch".to_string(),
+                1024,
+                1,
+                "host_clock_floor".to_string()
+            ),
+        ],
+        "the marked cells are not the ones benches/README.md accounts for"
+    );
+}
+
 // ── The committed artifact renders ──────────────────────────────────────────
 
 #[test]

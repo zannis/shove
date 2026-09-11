@@ -141,6 +141,29 @@ use tokio_util::sync::CancellationToken;
 /// for the reason [`Flow::holds_readiness_barrier`] gives.
 pub const RESULTS_SCHEMA_VERSION: u32 = 7;
 
+/// The closed set the optional per-row `comparability` field draws from — the
+/// schema's **withholding** marker, mirrored by the chart generator.
+///
+/// It carries no version semantics and so appears in no paragraph above: it
+/// is additive, optional, and only ever *withholds* a row from publication,
+/// so a reader that does not know the field publishes exactly what it
+/// published before. A document of any version this harness can read may
+/// carry it. What it must never do is arrive misspelt and be ignored, which
+/// is why [`validate_run`] refuses a value outside this set rather than
+/// dropping it.
+pub const COMPARABILITY_KINDS: &[&str] = &[COMPARABILITY_HOST_CLOCK_FLOOR];
+
+/// The row's rate is bounded by the measuring host's CPU clock rather than by
+/// the backend: a single-threaded consumer that spends most of each cycle
+/// waiting on the broker never sustains the utilisation that keeps the host's
+/// cores clocked up, and every phase of its loop — client-side decode
+/// included — runs at the reduced clock. Such a row is a **floor** for its
+/// flow, is comparable with nothing (not another backend, another version, or
+/// the same cell at more consumers), and rises under unrelated load on the
+/// same host. The measurements establishing it are under *A lone consumer on
+/// the macOS host clocks down* in `benches/README.md`.
+pub const COMPARABILITY_HOST_CLOCK_FLOOR: &str = "host_clock_floor";
+
 /// Default `--load-window-secs`: long enough for a rate, short enough that a
 /// six-rung ladder over a full consumer sweep finishes in an hour per backend.
 pub const DEFAULT_LOAD_WINDOW_SECS: u64 = 10;
@@ -5252,6 +5275,22 @@ struct ScenarioResult {
     /// `messages` is `drain.corpus`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     drain: Option<DrainResult>,
+    /// Why this row's rate is not a result, when the *measuring host* rather
+    /// than the backend bounded it — one of [`COMPARABILITY_KINDS`], absent
+    /// on every row that publishes normally.
+    ///
+    /// This is the one field in the schema no measurement writes. The harness
+    /// cannot detect what it names (a property of the machine, established by
+    /// a separate investigation), so it is added to a published document by
+    /// hand against evidence recorded in `benches/README.md` — and everything
+    /// else here treats it as data: [`merge_results_file`] preserves it
+    /// across a single-backend merge, and [`validate_run`] holds it to the
+    /// closed set, so a typo cannot silently un-withhold the row. A fresh
+    /// measurement of the same cell writes a row without it, deliberately:
+    /// the marker is a claim about one number, and a new number has to earn
+    /// it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comparability: Option<String>,
 }
 
 /// What an offered-load rung measured, as stamped on its row. Every field a
@@ -5714,6 +5753,19 @@ fn validate_run(run: &BackendRun) -> Result<(), String> {
 
     for r in &run.results {
         let flow = check_row(&run.backend, "result", &r.flow, &r.mode, r.payload_bytes)?;
+        // The one field no run writes, so the one field a hand edit can get
+        // wrong. An unrecognised marker reads as no marker everywhere
+        // downstream — which publishes the number it was added to withhold —
+        // so it is refused here, on the way into a merged document.
+        if let Some(kind) = r.comparability.as_deref()
+            && !COMPARABILITY_KINDS.contains(&kind)
+        {
+            return Err(format!(
+                "run '{}' has a result for flow '{}' carrying comparability '{kind}', which is \
+                 not one of {COMPARABILITY_KINDS:?}",
+                run.backend, r.flow
+            ));
+        }
         // `handler_cost` says what `throughput_msg_per_sec` measures, and it is
         // fully determined by the row's own flow and handler — so it is
         // checkable, not merely present. Re-derive it: a `consume_batch` +
@@ -6581,6 +6633,8 @@ fn push_metrics(results: &mut Vec<ScenarioResult>, scenario: &Scenario, m: Scena
         load: m.load,
         method: scenario.method().map(|m| m.as_str().to_string()),
         drain: m.drain,
+        // Never written by a measurement — see the field's doc.
+        comparability: None,
     });
 }
 
@@ -9613,6 +9667,7 @@ mod tests {
                 load: None,
                 method: Some(Method::Drain.as_str().to_string()),
                 drain: Some(drain_account(100)),
+                comparability: None,
             }],
             failures: vec![],
             unsupported: vec![Unsupported {
@@ -9646,6 +9701,59 @@ mod tests {
         assert_eq!(doc.schema_version, RESULTS_SCHEMA_VERSION);
         assert_eq!(doc.shove_version, env!("CARGO_PKG_VERSION"));
         assert!(!doc.rust_version.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_comparability_marker_is_checked_preserved_and_never_inherited() {
+        // The one field no measurement writes. Three properties make it safe
+        // to carry a hand-added claim in a generated document, and each is
+        // load-bearing on its own.
+        let mut marked = sample_run("redis");
+        marked.results[0].comparability = Some("clocked_down".to_string());
+        let err = validate_run(&marked).unwrap_err();
+        assert!(err.contains("clocked_down"), "{err}");
+        assert!(err.contains(COMPARABILITY_HOST_CLOCK_FLOOR), "{err}");
+
+        marked.results[0].comparability = Some(COMPARABILITY_HOST_CLOCK_FLOOR.to_string());
+        validate_run(&marked).expect("the closed set's own value is a valid row");
+
+        let path = temp_path("comparability");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+        let read_marker = |backend: &str| -> Option<String> {
+            let doc: BenchResults =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
+                    .expect("parse");
+            doc.runs
+                .iter()
+                .find(|r| r.backend == backend)
+                .expect("run preserved")
+                .results[0]
+                .comparability
+                .clone()
+        };
+
+        merge_results_file(&p, marked, None).expect("write the marked run");
+        // Preserved through another backend's leg: a refresh of one backend
+        // rewrites the whole file, and dropping a withholding marker there
+        // would silently re-publish the row.
+        merge_results_file(&p, sample_run("nats"), None).expect("merge another backend");
+        assert_eq!(
+            read_marker("redis").as_deref(),
+            Some(COMPARABILITY_HOST_CLOCK_FLOOR)
+        );
+        assert_eq!(read_marker("nats"), None, "no run writes the marker");
+
+        // Not inherited by a re-measure of the marked backend: the marker is
+        // a claim about one number, so a new number earns it again.
+        merge_results_file(&p, sample_run("redis"), None).expect("re-measure the marked backend");
+        assert_eq!(
+            read_marker("redis"),
+            None,
+            "a re-measured row inherited a marker it never earned"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

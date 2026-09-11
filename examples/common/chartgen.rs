@@ -208,6 +208,42 @@ pub const COST_SETUP_BOUND: &str = "setup_bound";
 /// throughput and there is no setup window to separate.
 pub const COST_NO_HANDLER: &str = "no_handler";
 
+/// The closed `comparability` set — the schema's optional **withholding**
+/// marker, mirrored from the harness.
+///
+/// `handler_cost` says what a number measures; this says whether the *host*
+/// let that measurement be a result. A marked row is measured, honestly
+/// accounted and internally consistent — every other guard here still holds
+/// it — but its rate is an artifact of the measuring machine rather than of
+/// the backend, so nothing may publish it as one.
+///
+/// Three properties make this safe to carry on a document of any
+/// `schema_version` this generator reads, without a version bump:
+///
+/// - It is **additive and optional**: an absent marker is the status quo.
+/// - It only ever **withholds**. A reader that does not know the field
+///   publishes exactly what it published before, so the field can never turn
+///   a correct reading into a wrong one — only a wrong one into no reading.
+/// - It is **editorial, not measured**: no harness run writes it, and a
+///   re-measure of a marked cell drops it, so it must be re-earned against
+///   the new numbers rather than inherited by a row that no longer needs it.
+///
+/// An unknown value is refused rather than ignored, for the reason
+/// [`HANDLER_COSTS`] gives: a marker that silently falls out of every filter
+/// is indistinguishable from no marker, and here that failure publishes the
+/// number the marker exists to withhold.
+pub const COMPARABILITY_KINDS: &[&str] = &[COMPARABILITY_HOST_CLOCK_FLOOR];
+
+/// The row's rate is bounded by the measuring host's CPU clock rather than by
+/// the backend: a single-threaded consumer that spends most of each cycle
+/// waiting on the broker never sustains the utilisation that keeps the host's
+/// cores clocked up, so every phase of its loop — client-side decode included
+/// — runs slow. Such a row is a **floor** for its flow, is not comparable
+/// with any other cell, backend or version, and moves under unrelated load on
+/// the same host. See *A lone consumer on the macOS host clocks down* in
+/// `benches/README.md` for the measurements that establish it.
+pub const COMPARABILITY_HOST_CLOCK_FLOOR: &str = "host_clock_floor";
+
 /// The closed flow set from the schema contract — the nine flows the
 /// harness's merge validation resolves rows and `unsupported[]` entries
 /// through, i.e. the only flows a mergeable document can carry. (The
@@ -492,6 +528,12 @@ pub struct ScenarioResult {
     /// The drain account, on a `drain` row — see [`DrainAccount`].
     #[serde(default)]
     pub drain: Option<DrainAccount>,
+    /// Why this row's rate is not a result, when it is not — one of
+    /// [`COMPARABILITY_KINDS`], absent on every row that publishes normally.
+    /// Read for one rule, in [`ScenarioResult::is_comparable`]: a marked row
+    /// reaches no absolute axis, whatever its other markers certify.
+    #[serde(default)]
+    pub comparability: Option<String>,
 }
 
 /// What a drain measured — the harness's `DrainResult`. Observed counts
@@ -655,10 +697,19 @@ impl ScenarioResult {
         !LOAD_FLOWS.contains(&self.flow.as_str()) || self.method() == Some(Method::Drain)
     }
 
+    /// Whether the host let this row be a result at all — see
+    /// [`COMPARABILITY_KINDS`]. A marked row is withheld from every absolute
+    /// axis *before* any marker it carries is consulted: `handler_cost`
+    /// certifies what the number measures, and this says the number is the
+    /// measuring machine's rather than the backend's.
+    fn is_comparable(&self) -> bool {
+        self.comparability.is_none()
+    }
+
     /// [`Self::is_framework`] on a chartable method — the one predicate
     /// every absolute-throughput family plots by.
     fn is_publishable(&self) -> bool {
-        self.is_framework() && self.is_charted_method()
+        self.is_framework() && self.is_charted_method() && self.is_comparable()
     }
 
     /// An offered-load rung whose producer fell short of the offered rate.
@@ -920,6 +971,15 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
                 return malformed(&format!(
                     "handler `{}` is not one of the harness's profiles ({:?}, {:?})",
                     row.handler, NEGLIGIBLE_HANDLERS, SLEEPING_HANDLERS
+                ));
+            }
+            // A withholding marker outside the closed set would fall out of
+            // `is_comparable` and publish the row it was added to withhold.
+            if let Some(kind) = row.comparability.as_deref()
+                && !COMPARABILITY_KINDS.contains(&kind)
+            {
+                return malformed(&format!(
+                    "`{kind}` is not a comparability marker the schema knows ({COMPARABILITY_KINDS:?})"
                 ));
             }
             // No barrier, no setup window to record — through v6 only; see
@@ -1799,6 +1859,9 @@ enum WithheldKind {
     SetupBound,
     /// Only sleeping-handler rows: the number is the simulated sleep.
     HandlerBound,
+    /// Every row of the cell carries a [`COMPARABILITY_KINDS`] marker: the
+    /// measuring host bounded the rate, so it is not this backend's.
+    HostFloor,
     /// This cell's drain failed: its rungs, whatever they sustained, are not
     /// its ceiling.
     DrainFailed,
@@ -1821,6 +1884,10 @@ impl WithheldKind {
             Self::SetupBound => "setup-bound (window includes coordination cost)".to_string(),
             Self::HandlerBound => {
                 "sleeping-handler rows only (the number is the simulated sleep)".to_string()
+            }
+            Self::HostFloor => {
+                "host-bounded rows only (the measuring host's clock, not the backend's rate)"
+                    .to_string()
             }
             Self::DrainFailed => format!(
                 "{} (a failed drain; the cell's ladder rungs are not its ceiling)",
@@ -2366,6 +2433,16 @@ fn sleeping_handler_text() -> &'static str {
      shove, so it is not published"
 }
 
+/// The shared caption for a slice whose every row carries a
+/// [`COMPARABILITY_KINDS`] marker: measured, honestly accounted, and withheld
+/// because the number belongs to the measuring host rather than to the
+/// backend. Never a gap — the measurement exists and the document says why it
+/// is not a result.
+fn withheld_by_host_text() -> &'static str {
+    "measured, but the host rather than the backend bounded the rate (see the rows' \
+     comparability marker in the results document), so it is not published"
+}
+
 /// The shared caption for a cell the harness ran and could not measure.
 fn failed_text() -> &'static str {
     "failed to run — absent, not zero; see failures[] in the results document"
@@ -2905,6 +2982,13 @@ where
                         WithheldKind::DrainFailed
                     } else if rows.is_empty() && !all_rows.is_empty() {
                         WithheldKind::RungsOnly
+                    } else if !rows.is_empty() && rows.iter().all(|r| !r.is_comparable()) {
+                        // Before the marker arms below: a host-bounded row is
+                        // withheld whatever its `handler_cost` certifies, and
+                        // captioning it as a sleeping handler or a setup-bound
+                        // window would name a cause the document does not
+                        // claim.
+                        WithheldKind::HostFloor
                     } else if rows.iter().any(|r| r.is_setup_bound()) {
                         if rows
                             .iter()
@@ -3993,6 +4077,7 @@ fn render_parallel_vs_sequenced(
                             && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
                             && r.payload_bytes == payload
                             && r.is_charted_method()
+                            && r.is_comparable()
                             && (r.is_framework() || r.is_setup_bound())
                             && r.window_ok()
                     })
@@ -4013,11 +4098,17 @@ fn render_parallel_vs_sequenced(
             .map(|(mi, (mode, flow, _))| {
                 // Rungs are not candidates for either arm: their window
                 // contains the harness's own producer.
+                // A row the host rather than the backend bounded is out of
+                // the slice entirely, not merely out of the absolute arm:
+                // drawn as a lower bound it would still be this backend's
+                // bar for the mode, and it would set the shared worker count
+                // the other modes are then read at.
                 let in_mode = |r: &&ScenarioResult| {
                     r.mode == *mode
                         && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
                         && r.payload_bytes == payload
                         && r.is_charted_method()
+                        && r.is_comparable()
                 };
                 // Either arm publishes a number, so either arm is held to
                 // the window floor: a lower bound read off a 0.18 s window is
@@ -4124,6 +4215,17 @@ fn render_parallel_vs_sequenced(
                         .filter(in_mode)
                         .any(|r| r.is_framework() || r.is_setup_bound());
                     let measured_sleeping = run.results.iter().any(|r| in_mode(&r));
+                    // `in_mode` has already dropped these, so without their
+                    // own arm a mode measured only in the affected cells
+                    // would be captioned as a gap — the omission this file's
+                    // rule 3 exists to prevent, on rows that do exist.
+                    let withheld_by_host = run.results.iter().any(|r| {
+                        r.mode == *mode
+                            && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
+                            && r.payload_bytes == payload
+                            && r.is_charted_method()
+                            && !r.is_comparable()
+                    });
                     // A failed cell in this mode is an absence with a
                     // recorded cause — not a gap, and not unsupported.
                     let failed = run.failures.iter().any(|f| {
@@ -4135,6 +4237,8 @@ fn render_parallel_vs_sequenced(
                     });
                     let text = if measured_short {
                         short_window_text()
+                    } else if withheld_by_host {
+                        withheld_by_host_text().to_string()
                     } else if measured_sleeping {
                         sleeping_handler_text().to_string()
                     } else if failed {

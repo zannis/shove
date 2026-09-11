@@ -23017,7 +23017,8 @@
             "unique_final": 6000000,
             "deliveries": 6000000,
             "duplicates": 0
-          }
+          },
+          "comparability": "host_clock_floor"
         },
         {
           "flow": "consume_batch",
@@ -23173,7 +23174,8 @@
             "unique_final": 3145728,
             "deliveries": 3145728,
             "duplicates": 0
-          }
+          },
+          "comparability": "host_clock_floor"
         },
         {
           "flow": "consume_batch",

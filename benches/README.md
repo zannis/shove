@@ -101,7 +101,10 @@ process on the host takes the same cell *above* that comparator. Do not
 quote, chart or diff a 1c drain rate from this host as a backend or version
 result without reading **A lone consumer on the macOS host clocks down**
 below; on those flows the multi-consumer cells of the same row are the
-comparable ones.
+comparable ones. Those two rows say so in the document as well as here: each
+carries `comparability: "host_clock_floor"`, which is what keeps a reader
+that only parses the JSON from deriving 0.457 and 0.439 as results — see
+**`comparability`: the one field no run writes**.
 
 ## The offered-load ladder
 
@@ -273,6 +276,14 @@ Nothing in the harness compensates for it. A keep-awake companion would make
 every cell measure a host state the published rows do not have, so the choice
 here is to disclose the effect rather than paper over it; adding one is a
 methodology decision in its own right.
+
+The disclosure is machine-readable, not only prose: both affected rows carry
+`comparability: "host_clock_floor"` in `benches/results/bench-results.json`,
+the chart generator withholds a marked row from every absolute axis, and a
+value outside the closed set is refused rather than ignored at both ends. See
+**`comparability`: the one field no run writes**. The marker is what a reader
+comparing rows programmatically sees — it is the difference between a rate a
+tool will happily divide by another and a row that says it is a floor.
 
 ### The backlog cap on the ladder
 
@@ -464,6 +475,35 @@ Rerunning a single backend into the current document replaces only that
 backend's entry. That is the intended way to refresh one backend after a
 change to it, as long as the host and toolchain still match the document.
 
+### `comparability`: the one field no run writes
+
+Every other field on a row is a measurement. `comparability` is a claim
+*about* a measurement — that the machine it was taken on, rather than the
+backend, set the number — and the harness cannot detect that, so the field is
+added to a published row by hand against evidence recorded in this file. It
+takes one of a closed set of values; today that set is `host_clock_floor`
+(see **A lone consumer on the macOS host clocks down**), and the two rows
+carrying it are Redis `consume_batch` at 64 B and at 1 KiB with one consumer.
+
+What makes a hand-added field in a generated document safe to trust:
+
+- **It only ever withholds.** A reader that does not know the field publishes
+  exactly what it published before, so it can never turn a correct reading
+  into a wrong one — only a wrong one into no reading. That is also why it
+  needs no `schema_version` bump and carries no version semantics: any
+  document version this tooling reads may carry it.
+- **A typo cannot go quiet.** A value outside the closed set is refused by the
+  harness on the way into a merged document and by the chart generator on the
+  way out, rather than ignored — an unknown marker that read as "no marker"
+  would publish the number it was added to withhold.
+- **A merge preserves it; a re-measure drops it.** Refreshing another
+  backend's leg keeps it. Re-measuring the marked backend writes rows without
+  it, deliberately: the claim is about one number, and a new number has to
+  earn it again.
+- **Nothing publishes a marked row.** The chart generator withholds it from
+  every absolute axis whatever its `handler_cost` certifies, and captions that
+  cell with the cause rather than letting it read as a gap.
+
 ## Regenerating the charts
 
 ```sh
@@ -531,7 +571,8 @@ check before trusting a document:
   consumer against 363k each at two, and repeated quiet-host runs of it draw
   anywhere in 130-270k. Such a row is a floor, so it is not a rate to reason
   from and not comparable across backends or versions — see **A lone consumer
-  on the macOS host clocks down**. The per-consumer rate at two consumers is
+  on the macOS host clocks down**, and `comparability: "host_clock_floor"` on
+  the row itself, which is the same statement in the data. The per-consumer rate at two consumers is
   the test, and it isolates the affected rows across the whole document: it is
   2.75x and 2.37x the 1c rate on those two Redis cells, and **at most 1.08x**
   on every other 1c `consume_batch` drain cell in the document — the highest of
