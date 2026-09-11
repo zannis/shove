@@ -2801,61 +2801,34 @@ where
 /// 500-message cycle, of which the read phase alone is 57% and the process
 /// holds one core only half busy.
 ///
-/// What this does **not** settle by itself is the sub-parity single-consumer
-/// batch row in `benches/results/bench-results.json` — 64 B, one consumer,
-/// drain: 132 389 msg/s against `consume_parallel`'s 289 728 at the same
-/// cell. That document was measured on another host (Apple M4 Max / macOS)
-/// and nothing in this loop was, so the read-ahead is not claimed as that
-/// row's established cause. The phase that row loses its time in is
-/// identified below; the size of it on that host is not.
+/// What this does **not** settle is the sub-parity single-consumer batch row
+/// in `benches/results/bench-results.json` — 64 B, one consumer, drain:
+/// 132 389 msg/s against `consume_parallel`'s 289 728 at the same cell. That
+/// row's cause has since been measured on the host that produced it (Apple
+/// M4 Max / macOS), and it is outside this loop: a single consumer there
+/// spends most of each cycle waiting on the Docker VM, never sustains the
+/// utilisation that keeps the host's performance cores clocked up, and runs
+/// every phase of the cycle slow — the decode included, which is client-side
+/// CPU that nothing on the wire or inside the server can reach. Any
+/// unrelated busy process on that host removes the deficit, and so does a
+/// second consumer, which is why the multi-consumer rows are 1.3x-2.3x. The
+/// measurements, and how to read the affected rows, are under *A lone
+/// consumer on the macOS host clocks down* in `benches/README.md`. The
+/// read-ahead is neither that row's cause nor its fix, and is justified here
+/// only by what it measures where it was measured.
 ///
-/// **Bounded by the document's own rows.** Read its three 1c `consume_batch`
-/// drains as a payload sweep at a constant `max_batch_size` 500: 64 B /
-/// 1 KiB / 64 KiB cost 3 777 / 4 977 / 20 658 us per cycle, for 32 KB /
-/// 512 KB / 32 MB of reply. A 1 000x in bytes buys 5.5x in time, which fits
-/// a ~1.9 GB/s byte term over a **~3.7 ms per-cycle term that does not
-/// depend on payload**. Nor is it per entry: the same host at two consumers
-/// runs 726 872 msg/s, i.e. each consumer's 500-entry cycle in 1 377 us, and
-/// no per-entry or per-byte cost falls by 2.7x because a second connection
-/// appeared. So ~2.4 ms of every single-consumer cycle there is dead time
-/// that another concurrent flow removes.
-///
-/// **Three of the candidate phases are excluded by that same pass.**
-/// `consume_parallel` at the same cell runs 289 728 msg/s at `prefetch` 100,
-/// so it completes at least 2 897 serial `XREADGROUP` round trips a second —
-/// under 0.35 ms each — while acking every message individually. A cost
-/// charged per entry decoded, per message acked, or per round trip cannot
-/// then be the ~2.4 ms this loop's 500-entry cycle loses there; per round
-/// trip in particular it would charge the parallel flow ~5x more per message
-/// (COUNT 100 against 500), which is the wrong flow.
-///
-/// **What does reproduce the shape, measured on an aarch64 Linux host.**
-/// That host never shows the deficit — its 1c batch row runs 1.75x *above*
-/// its own `consume_parallel` where the published one runs at 0.457x — so
-/// no local A/B can close the row, and the cost has to be put into the path
-/// to study it. Behind a proxy that can charge a cost on this loop's
-/// `XREADGROUP` and `XACK` requests, 64 B, 200 000-message drains, 3 reps:
-/// 98.5% of this loop's consumer-path requests at 1c are issued after the
-/// path has been quiet for >= 0.3 ms (mean 1.6 ms), against 70.9% at 2c and
-/// 24.7% for `consume_parallel`. Charge 1.2 ms per such cold request and this loop
-/// falls to 0.54x. Then keep the path busy with a flow that delivers
-/// nothing — one connection pinging every 100 us, no corpus share, no
-/// second consumer — and it returns to 0.98x of the uncharged control, a
-/// 1.82x recovery. A cost paid only when a lone flow has let the path go
-/// quiet is therefore the one shape that behaves like the published rows:
-/// nothing charged per entry, per message or per round trip is removed by
-/// unrelated traffic.
-///
-/// **What the read-ahead is worth against that shape.** It halves this
-/// loop's consumer-path requests (803 -> 403 per 200 000 messages at 1c —
-/// the next read travels with the flush's `XACK` instead of following it
-/// cold), and under the charged cost it buys 1.28x at 1c and 1.35x at 2c.
-/// With no such cost it buys 1.07x at 1c and 1.48x at 2c, which is what this
-/// host measures. The gain tracks how much cold idle there was to fill, and
-/// 1.28x is short of the 2.19x the published 1c row would need for parity —
-/// so this loop does not claim that row is fixed, only that it removes one of
-/// the two serialized cold round trips per cycle. Pricing the cold start on
-/// the affected host is one short pass on it.
+/// **Where the gain comes from, and where it is largest.** The read-ahead
+/// halves the loop's consumer-path requests — 803 to 403 per 200 000
+/// messages at one consumer, because the next read travels with the flush's
+/// `XACK` instead of following it — and it removes the quiet those requests
+/// used to be issued into: on an aarch64 Linux host, 98.5% of the serial
+/// loop's 1c requests start after the path has been silent for >= 0.3 ms
+/// (mean 1.6 ms), against 70.9% at 2c and 24.7% for `consume_parallel`. The
+/// gain therefore scales with what one round trip costs. Behind a proxy
+/// charging 1.2 ms per such request (64 B, 200 000-message drains, 3 reps)
+/// it is 1.28x at 1c and 1.35x at 2c; against a loopback Docker broker,
+/// where a round trip is nearly free, it is the 1.07x and 1.48x measured
+/// below. A broker a network hop away is the deployment it helps most.
 ///
 /// # What sharing the socket costs, and why it is still the choice
 ///

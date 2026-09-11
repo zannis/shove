@@ -201,6 +201,67 @@ than clamping it, and the matrix's size exceeds that. The harness clamps to 10
 when it builds the scenario and the row records 10, so an SQS batch bar is a
 10-message batch and is not like-for-like against a backend that ran 500.
 
+### A lone consumer on the macOS host clocks down
+
+Low Power Mode is not the only power management on this host, and the second
+effect survives `pmset -g` reading `powermode 0`. A cell that runs **one**
+consumer whose loop spends most of each cycle waiting on the Docker VM is
+measured at a reduced clock, and the rate it publishes is a floor for that
+flow rather than its ceiling. Where the current document shows it is Redis
+`consume_batch` at 64 B and 1 KiB: one consumer draws 132 388 msg/s where
+`consume_parallel` at the same cell draws 289 728, while two consumers draw
+726 872 — 363k each, 2.7x the per-consumer rate at one. Measured 2026-09-11
+on the host this document was measured on, Low Power Mode off, one consumer,
+`--concurrent --handler zero`, the matrix's six-million-message drain.
+
+The clock is the cause rather than the loop, and each of the three
+measurements that say so excludes something else:
+
+- **An instrumented drain steps mid-run.** Per-cycle cost holds at ~0.9 ms
+  for the first second and then ~3.7 ms for the rest of the drain (read
+  0.53-0.67 -> 1.9-2.7 ms, ingest 0.17-0.22 -> 0.6-0.9 ms, flush 0.20-0.26 ->
+  0.8-1.1 ms; 137 783 msg/s overall, against the document's 132 388). **All
+  three phases scale by the same ~3.7x, ingest included** — and ingest is
+  client-side decode with no I/O in it, so no server-side or on-the-wire cost
+  can be what slowed it; only the thread running slower can. The fast first
+  second is the fill's producers having just left the cores clocked up, which
+  is also why a 600 000-message drain finishes inside that window and measures
+  521 753 msg/s.
+- **Any unrelated busy process removes it.** `yes > /dev/null` on the host —
+  touching neither Redis, the VM nor the harness — takes the same cell to
+  384 000 msg/s and holds it fast throughout; so does a 250 ms `INFO` sampler
+  (416-434k); so does a second consumer, which is the document's own 2c row.
+  A quiet control run immediately afterwards draws 148 000 again. Nothing
+  charged per entry, per message or per round trip is removed by traffic that
+  shares no work with the flow.
+- **The transport is not the bound.** A parse-free `XREADGROUP` probe on one
+  connection fits ~0.085 ms fixed + 0.74 us per entry — 0.469 ms at COUNT 500,
+  an implied 1 065 662 msg/s — and gets no faster with a second flow keeping
+  the socket busy (0.438 ms). A lone serial reader pays no large fixed
+  per-read cost here.
+
+Excluded by the same pass: `XREADGROUP`/`XACK` server time, tokio cross-worker
+handoff (`TOKIO_WORKER_THREADS=1` steps identically), thread QoS and
+efficiency-core placement (`QOS_CLASS_USER_INTERACTIVE` on every worker, and
+`taskpolicy -t 0 -l 0`, both step identically, while `taskpolicy -c background`
+is slow from the first cycle), the Redis reaper's 1 s `XTRIM MINID` (disabling
+it changes nothing once any companion process is present), and per-entry and
+per-byte costs.
+
+So read a single-consumer cell on this host as a lower bound and compare
+across the multi-consumer cells on the same row. Repeated quiet-host runs of
+that Redis cell draw from a 130-270k band, which is why the deficit is not a
+stable rate to reason from. The effect needs a loop that is both
+single-threaded and mostly idle: it is absent at 64 KiB, where 32 MB of reply
+per cycle keeps the core busy and that 1c row runs 1.17x its `consume_parallel`
+instead; absent on Kafka, whose per-cycle client work is heavier; and absent
+in-process, with no broker and no VM in the cycle.
+
+Nothing in the harness compensates for it. A keep-awake companion would make
+every cell measure a host state the published rows do not have, so the choice
+here is to disclose the effect rather than paper over it; adding one is a
+methodology decision in its own right.
+
 ### The backlog cap on the ladder
 
 An offered-load rung the consumers cannot sustain builds a backlog on the
