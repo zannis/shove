@@ -82,7 +82,34 @@ use serde::Deserialize;
 /// barrier to nine tenths consumed, with no producer in the window. A v5
 /// row without a `load` account was the live-publish corpus, and nothing on
 /// it says so, which is why v5 is refused rather than read as v6.
-pub const SCHEMA_VERSION: u32 = 6;
+///
+/// v7 gave `consume_fifo` and `dlq_drain` readiness barriers of their own, so
+/// their rows may now carry a `setup_secs` and a `framework` marker where a v6
+/// row of those flows always carried `null` and `setup_bound`.
+pub const SCHEMA_VERSION: u32 = 7;
+
+/// Every `schema_version` this generator reads, newest last.
+///
+/// Two are open rather than one, which is the exception the paragraph above
+/// exists to bound. The usual rule — refuse anything but the current version —
+/// is there because a prior version's *published* numbers are not comparable
+/// with the current one's. The v6→v7 delta is not of that kind: it changed
+/// `duration_secs` only on `consume_fifo` and `dlq_drain`, and every v6 row of
+/// those two flows carries `setup_bound`, so every one of them is already
+/// withheld from an absolute axis by its own marker. Nothing a v6 document
+/// charts moved.
+///
+/// What is open is the *acceptance* rule, not the plotting rule: the two flows
+/// are held to the v6 shape in a v6 document and the v7 shape in a v7 one, so
+/// neither document can carry the other's. The reason both are readable at
+/// once is that the harness's barrier change and the six-backend re-measure
+/// that replaces the committed document do not land together — the
+/// [`SCHEMA_VERSION`] bump is exactly what forces that re-measure to start
+/// from a fresh file — and a chartgen that could read only the newer of the
+/// two would refuse the document in the tree until it did.
+///
+/// Drop v6 from this list once no committed document declares it.
+pub const SCHEMA_VERSIONS: &[u32] = &[6, SCHEMA_VERSION];
 
 /// The flows whose driver measures by method — a drain or the offered-load
 /// ladder — the harness's `Flow::takes_offered_load`, mirrored. A `method`,
@@ -233,11 +260,28 @@ pub const FLOW_MODES: &[(&str, &str)] = &[
 /// means and is a contract change, not an additive row.
 pub const NEGLIGIBLE_HANDLERS: &[&str] = &["zero (no-op)", "fast (1-5ms)"];
 
-/// The consume flows whose driver holds no readiness barrier — the
-/// harness's `Flow::holds_readiness_barrier` false set, less the publish
-/// flows. Without a barrier no window can be certified as a drain, so a
-/// `framework` row for one of these is unproducible.
-pub const BARRIERLESS_FLOWS: &[&str] = &["consume_fifo", "dlq_drain"];
+/// The consume flows whose driver held no readiness barrier **through v6**.
+/// Without a barrier no window can be certified as a drain, so a `framework`
+/// row for one of these is unproducible in a v6 document.
+///
+/// Empty from [`SCHEMA_VERSION`] on: both flows gained barriers there, and the
+/// harness's `Flow::holds_readiness_barrier` is now true for every consume
+/// flow. [`barrierless_flows`] is what applies this per document, and the
+/// guards in [`validate`] go through it rather than this constant.
+pub const BARRIERLESS_FLOWS_THROUGH_V6: &[&str] = &["consume_fifo", "dlq_drain"];
+
+/// The barrierless consume flows of a document declaring `schema_version`.
+///
+/// A row's legal shape depends on which version wrote it, and this is the one
+/// place that mapping lives — so a guard cannot be left applying v6's rule to
+/// a v7 row, or the reverse.
+pub fn barrierless_flows(schema_version: u32) -> &'static [&'static str] {
+    if schema_version < SCHEMA_VERSION {
+        BARRIERLESS_FLOWS_THROUGH_V6
+    } else {
+        &[]
+    }
+}
 
 /// The payload sizes the harness runs — its `PAYLOAD_SIZES`, mirrored. The
 /// label formatter truncates to whole KiB, so a size outside this set could
@@ -721,8 +765,8 @@ impl fmt::Display for ChartError {
             Self::UnsupportedSchemaVersion { found, expected } => write!(
                 f,
                 "unsupported schema_version {found}: this chartgen understands \
-                 only version {expected}. Refusing to render rather than \
-                 silently mis-reading a newer document."
+                 {SCHEMA_VERSIONS:?} and writes charts for v{expected}. Refusing \
+                 to render rather than silently mis-reading a newer document."
             ),
             Self::SilentlyEmptyRun { backend, missing } => write!(
                 f,
@@ -804,12 +848,13 @@ impl From<serde_json::Error> for ChartError {
 /// Rules 1, 5 and 6 of the schema contract. Checked once, before any chart is
 /// drawn, so a bad document fails before it can write a single file.
 pub fn validate(doc: &Document) -> Result<(), ChartError> {
-    if doc.schema_version != SCHEMA_VERSION {
+    if !SCHEMA_VERSIONS.contains(&doc.schema_version) {
         return Err(ChartError::UnsupportedSchemaVersion {
             found: doc.schema_version,
             expected: SCHEMA_VERSION,
         });
     }
+    let barrierless = barrierless_flows(doc.schema_version);
 
     // Everything the provenance block prints as text. The numeric hardware
     // fields are not gated: the harness writes 0 where a host does not
@@ -872,16 +917,17 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
                     row.handler, NEGLIGIBLE_HANDLERS, SLEEPING_HANDLERS
                 ));
             }
-            // No barrier, no setup window to record: see BARRIERLESS_FLOWS.
-            if BARRIERLESS_FLOWS.contains(&row.flow.as_str()) && row.setup_secs.is_some() {
+            // No barrier, no setup window to record — through v6 only; see
+            // `barrierless_flows`.
+            if barrierless.contains(&row.flow.as_str()) && row.setup_secs.is_some() {
                 return malformed(&format!(
-                    "`{}` holds no readiness barrier, so its rows never record setup_secs",
-                    row.flow
+                    "`{}` holds no readiness barrier in a v{} document, so its rows never \
+                     record setup_secs",
+                    row.flow, doc.schema_version
                 ));
             }
-            // No barrier, no certified drain: see BARRIERLESS_FLOWS.
-            if row.handler_cost == COST_FRAMEWORK && BARRIERLESS_FLOWS.contains(&row.flow.as_str())
-            {
+            // No barrier, no certified drain — through v6 only.
+            if row.handler_cost == COST_FRAMEWORK && barrierless.contains(&row.flow.as_str()) {
                 return malformed(&format!(
                     "a `{COST_FRAMEWORK}` marker on `{}`, whose driver holds no readiness barrier \
                      and so can never separate setup from drain",
@@ -968,7 +1014,7 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
             // the harness certified as the rate.
             if row.handler_cost == COST_SETUP_BOUND
                 && !is_publish_flow
-                && !BARRIERLESS_FLOWS.contains(&row.flow.as_str())
+                && !barrierless.contains(&row.flow.as_str())
                 && row.setup_secs.is_some_and(|v| v.is_finite() && v >= 0.0)
                 && row.window_ok()
             {
@@ -1296,7 +1342,7 @@ pub fn parse_str(raw: &str) -> Result<Document, ChartError> {
         schema_version: u32,
     }
     let probe: VersionProbe = serde_json::from_str(raw)?;
-    if probe.schema_version != SCHEMA_VERSION {
+    if !SCHEMA_VERSIONS.contains(&probe.schema_version) {
         return Err(ChartError::UnsupportedSchemaVersion {
             found: probe.schema_version,
             expected: SCHEMA_VERSION,
@@ -3557,9 +3603,11 @@ where
 /// `lower_bound` marks a setup-bound consume window: the recorded throughput
 /// can only under-state the drain rate (the window is only ever too long), so
 /// the bar is drawn at its value but muted, and the caption states the `≥`.
-/// That keeps the one mode that *cannot* separate setup (sequenced consume has
-/// no readiness barrier to hang a probe on) on the chart as a bounded claim
-/// instead of either a false absolute or a silent omission.
+/// That keeps a mode whose window is setup-bound on the chart as a bounded
+/// claim instead of either a false absolute or a silent omission. Through v6
+/// sequenced consume was always in that state — it held no readiness barrier
+/// to hang a probe on — and from v7 it reaches this arm only when its drain
+/// is under the publishable-window floor.
 #[derive(Debug, Clone, Copy)]
 struct Bar {
     value: f64,
@@ -3917,10 +3965,11 @@ fn render_parallel_vs_sequenced(
 
     for run in &doc.runs {
         // Per mode: an absolute bar from the framework rows if any exist,
-        // else a lower-bound bar from the setup-bound rows. Sequenced consume
-        // holds no readiness barrier, so its zero/fast rows are *always*
-        // setup-bound — without the lower-bound arm the ordering-cost chart
-        // would lose the sequenced bar it exists to show. Sleeping-handler
+        // else a lower-bound bar from the setup-bound rows. In a v6 document
+        // sequenced consume's zero/fast rows are *always* setup-bound (it held
+        // no readiness barrier), and in a v7 one they still can be on a short
+        // drain — without the lower-bound arm the ordering-cost chart would
+        // lose the sequenced bar it exists to show. Sleeping-handler
         // rows (`handler_bound` / `handler_amortised`) never reach either arm:
         // their number is the simulated sleep, not shove.
         // One worker count per backend, shared by every mode it measured:

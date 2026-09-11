@@ -71,14 +71,19 @@ MATRIX=(
 # This is a per-backend corpus, not a second matrix: every other knob is
 # shared, so the flows and the axes stay comparable.
 SQS_DRAIN_MESSAGES=60000
-# The FIFO cell has no drain and no barrier, so the corpus deviation above
-# never reaches it: it publishes the tier's 5 000 messages per shard and
-# consumes them through the sequenced path, which LocalStack serves at a few
-# messages per second. That is a ten-hour cell three times over (one per
-# payload) for a number that measures LocalStack. 100 per FIFO worker (one
-# per shard on this backend), the tier's own unit, keeps the cell a few
-# minutes long and, as with the drain, the row records the corpus it ran
-# (`messages`).
+# The FIFO cell has no drain, so the corpus deviation above never reaches it:
+# it publishes the tier's 5 000 messages per shard and consumes them through
+# the sequenced path, which LocalStack serves at a few messages per second.
+# That is a ten-hour cell three times over (one per payload) for a number that
+# measures LocalStack. 100 per FIFO worker (one per shard on this backend), the
+# tier's own unit, keeps the cell a few minutes long and, as with the drain,
+# the row records the corpus it ran (`messages`).
+#
+# This knob also has to outrank the framework corpus floor, which the flow
+# entered when it gained a readiness barrier — and it does: an explicit
+# `--fifo-messages` replaces the tier's count instead of being floored. Without
+# that the floor would put 150 000 back at 64 B and 32 768 at 1 KiB, which is
+# the ten-hour cell again.
 SQS_FIFO_MESSAGES=100
 
 # The second deviation, and the mirror image of the first: SQS drains a

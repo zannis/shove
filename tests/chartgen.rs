@@ -359,8 +359,10 @@ fn unknown_schema_version_blocks_every_chart() {
     // The rule has to bite at the render entry point too, not only in a
     // validate() a caller might forget: a document from another schema must
     // not be able to produce a single chart.
+    // v8, not v7: v7 is an *open* version (see `SCHEMA_VERSIONS`), so using it
+    // here would assert the opposite of the acceptance rule.
     let raw =
-        document(&inmemory_run(true)).replace("\"schema_version\": 6", "\"schema_version\": 7");
+        document(&inmemory_run(true)).replace("\"schema_version\": 6", "\"schema_version\": 8");
     let doc = parse(&raw);
 
     for family in Family::ALL {
@@ -372,6 +374,73 @@ fn unknown_schema_version_blocks_every_chart() {
             "{family:?} rendered a chart from an unknown schema version"
         );
     }
+}
+
+#[test]
+fn both_open_schema_versions_are_accepted_and_the_row_rules_follow_the_version() {
+    // Two versions are readable at once during the readiness-barrier
+    // migration, and the point of the pair is that each document is held to
+    // *its own* row rules rather than to the union of both. A v6
+    // `consume_fifo` row records no setup window; a v7 one does, because that
+    // flow gained a barrier there.
+    let v6 = document(&inmemory_run(true));
+    chartgen::validate(&parse(&v6)).expect("a v6 document is still readable");
+
+    // The v7 shape of the same run: every barrierless row now carries the
+    // window its barrier excluded, and with one recorded over a 2 s drain the
+    // marker the harness derives is `framework`, not `setup_bound`. The
+    // marker/window pair is replaced together for that reason — patching only
+    // the window trips the cross-check below it, which is that guard doing
+    // its job. `setup_secs: null` appears only on this fixture's fifo rows.
+    let v6_fifo_row = "\"handler_cost\": \"setup_bound\",\n          \"setup_secs\": null,";
+    assert_eq!(v6.matches(v6_fifo_row).count(), 3);
+    let v7 = v6
+        .replace("\"schema_version\": 6", "\"schema_version\": 7")
+        .replace(
+            v6_fifo_row,
+            "\"handler_cost\": \"framework\",\n          \"setup_secs\": 0.4,",
+        );
+    chartgen::validate(&parse(&v7)).expect("a v7 document is readable");
+
+    // And the rules do not leak across the boundary: the v7 row shape in a v6
+    // document is the malformed row the v6 guard exists to catch.
+    let mislabelled = v6.replace("\"setup_secs\": null", "\"setup_secs\": 0.4");
+    match chartgen::validate(&parse(&mislabelled)) {
+        Err(ChartError::MalformedRow { flow, what, .. }) => {
+            assert_eq!(flow, "consume_fifo");
+            assert!(what.contains("setup_secs"), "{what}");
+        }
+        other => panic!("expected MalformedRow for a v6 fifo row with a setup window: {other:?}"),
+    }
+}
+
+#[test]
+fn a_framework_fifo_row_is_refused_in_v6_and_published_in_v7() {
+    // The marker half of the same boundary, and the one that decides whether
+    // a number reaches an absolute axis: through v6 a `framework`
+    // `consume_fifo` row was unproducible, so chartgen refused it outright;
+    // from v7 its driver holds a barrier and the row is exactly what the
+    // charts are for.
+    let row = scenario_with_cost("consume_fifo", "fifo", 64, 1, 4_000.0, "framework")
+        .replace("\"setup_secs\": null", "\"setup_secs\": 0.4");
+    let run = format!(
+        r#"{{
+          "backend": "inmemory",
+          "broker": {{ "name": "in-process", "version": "n/a", "deployment": "in-process" }},
+          "representative": true,
+          "results": [{row}],
+          "failures": [],
+          "unsupported": []
+        }}"#
+    );
+    let v6 = document(&run);
+    match chartgen::validate(&parse(&v6)) {
+        Err(ChartError::MalformedRow { flow, .. }) => assert_eq!(flow, "consume_fifo"),
+        other => panic!("expected MalformedRow for a v6 framework fifo row: {other:?}"),
+    }
+
+    let v7 = v6.replace("\"schema_version\": 6", "\"schema_version\": 7");
+    chartgen::validate(&parse(&v7)).expect("a v7 framework fifo row is publishable");
 }
 
 // ── Rule 6: an unclassifiable handler_cost is a hard error ──────────────────
@@ -504,10 +573,11 @@ fn a_setup_bound_row_never_plots_an_absolute_drain_rate() {
 
 #[test]
 fn the_sequenced_bar_is_a_labelled_lower_bound() {
-    // Sequenced consume holds no readiness barrier, so its rows are always
-    // setup-bound. The ordering-cost chart keeps the bar — losing it would
-    // gut the one chart that shows what ordering costs — but as a muted,
-    // caption-qualified lower bound rather than a false absolute.
+    // The fixture is a v6 document, where sequenced consume held no readiness
+    // barrier and its rows are therefore always setup-bound. The ordering-cost
+    // chart keeps the bar — losing it would gut the one chart that shows what
+    // ordering costs — but as a muted, caption-qualified lower bound rather
+    // than a false absolute.
     let svg = chartgen::render_to_string(
         &parse(&document(&inmemory_run(true))),
         Family::ParallelVsSequenced,
@@ -3188,9 +3258,12 @@ fn a_sleeping_handler_only_line_slice_is_not_labelled_setup_bound() {
 
 #[test]
 fn a_barrier_less_flow_cannot_carry_the_framework_marker() {
-    // `consume_fifo` and `dlq_drain` hold no readiness barrier, so the
-    // harness can never certify their window as a drain; a `framework` row
-    // for either would reach the ordering chart as an absolute bar.
+    // Through v6 `consume_fifo` and `dlq_drain` held no readiness barrier, so
+    // the harness could never certify their window as a drain; a `framework`
+    // row for either would reach the ordering chart as an absolute bar. The
+    // fixture is a v6 document, so that is the rule under test here —
+    // `a_framework_fifo_row_is_refused_in_v6_and_published_in_v7` covers the
+    // other side of the boundary.
     for (flow, mode) in [("consume_fifo", "fifo"), ("dlq_drain", "parallel")] {
         let run = format!(
             r#"{{
