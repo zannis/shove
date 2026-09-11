@@ -16,8 +16,7 @@
 //!
 //! The manifest in `common::TIER_A_COVERAGE` is printed before the first group
 //! and asserted complete, so a flow cannot go missing without failing the run.
-//! One flow is not wired here: batch consume (`run_batch`) exists on InMemory
-//! too, but this bench harness has no `consume_batch` flow for it yet.
+//! Every canonical flow shove exposes on the in-process backend is wired here.
 //!
 //! # Why the shapes differ per group
 //!
@@ -33,6 +32,12 @@
 //! - **Broadcast** is the exception: its contract is deliver-new, so a
 //!   subscriber must exist before the publish. Its timed region is therefore
 //!   publish *and* deliver, and is not comparable to `consume_parallel`.
+//! - **Batch consume** follows the consume-side shape exactly — same corpus,
+//!   same timed region, same `Throughput::Elements` — so its msg/s is
+//!   directly comparable to `consume_parallel` at the same payload. That
+//!   comparison is the point of the primitive: `run_batch` exists for handler
+//!   amortisation, so the group runs at two `max_batch_size` values and
+//!   measures the amortisation rather than asserting it.
 
 mod common;
 
@@ -49,9 +54,9 @@ use shove::inmemory::{
     InMemoryQueueStatsProvider,
 };
 use shove::{
-    Broker, ConsumerGroupConfig, ConsumerOptions, DeadMessageMetadata, InMemory, MessageHandler,
-    MessageMetadata, Outcome, Publisher, SequenceFailure, SequencedTopic, Topic, TopologyBuilder,
-    define_sequenced_topic, define_topic,
+    BatchConsumerOptions, BatchMessageHandler, Broker, ConsumerGroupConfig, ConsumerOptions,
+    DeadMessageMetadata, InMemory, MessageHandler, MessageMetadata, Outcome, Publisher,
+    SequenceFailure, SequencedTopic, Topic, TopologyBuilder, define_sequenced_topic, define_topic,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
@@ -71,6 +76,19 @@ const CONSUME_MESSAGES: u64 = 256;
 
 /// Messages per `publish_batch` call.
 const BATCH_SIZE: u64 = 64;
+
+/// `max_batch_size` values the `consume_batch` flow is measured at.
+///
+/// Both divide [`CONSUME_MESSAGES`], which is load-bearing: every flush is
+/// then reached by size, so the 250 ms `DEFAULT_MAX_BATCH_AGE` timer never
+/// fires inside a timed region. A size that left a partial tail batch would
+/// measure that timer instead of the dispatch path, and at 256 messages the
+/// timer would dominate the figure entirely.
+///
+/// The span is one flush versus eight for the same corpus, so whatever
+/// per-flush cost batching amortises shows up as the gap between the two ids
+/// at equal payload.
+const BATCH_CONSUME_SIZES: [usize; 2] = [32, 256];
 
 /// Live bytes a single publish chunk may hold before the broker is rebuilt.
 /// Bounds memory at every payload size without changing what is measured.
@@ -119,6 +137,16 @@ define_topic!(
     GroupTopic,
     BenchMsg,
     TopologyBuilder::new("bench-group").build()
+);
+
+// Its own topic rather than a reuse of `ConsumeTopic`: `BatchConsumer::run`
+// is bound by `NotSequenced` and re-checks the topology at runtime, so the
+// batch flow's topic is kept visibly plain — no sequencing, no DLQ — and a
+// later change to the single-message topic cannot silently retarget it.
+define_topic!(
+    BatchTopic,
+    BenchMsg,
+    TopologyBuilder::new("bench-batch").build()
 );
 
 define_topic!(
@@ -252,6 +280,28 @@ where
 
     async fn handle_dead(&self, _msg: BenchMsg, _meta: DeadMessageMetadata, _ctx: &()) {
         self.record();
+    }
+}
+
+/// The same counter, reached one flush at a time.
+///
+/// Counting per *message* rather than per flush is what keeps the batch
+/// figure comparable to the single-message groups: both complete after
+/// exactly [`CONSUME_MESSAGES`] deliveries, so both report over the same
+/// corpus and `Throughput::Elements` means the same thing in each. The
+/// handler still does no work, so the gap between them is dispatch and
+/// settlement cost, not handler cost.
+impl<T> BatchMessageHandler<T> for CountingHandler
+where
+    T: Topic<Message = BenchMsg>,
+{
+    type Context = ();
+
+    async fn handle_batch(&self, messages: Vec<(BenchMsg, MessageMetadata)>, _ctx: &()) -> Outcome {
+        for _ in &messages {
+            self.record();
+        }
+        self.outcome.clone()
     }
 }
 
@@ -503,6 +553,76 @@ fn bench_consume(c: &mut Criterion) {
                 elapsed
             });
         });
+    }
+
+    group.finish();
+}
+
+// ── consume_batch ───────────────────────────────────────────────────────────
+
+/// `BatchConsumer::run` — the same corpus as [`bench_consume`], settled one
+/// flush per `max_batch_size` messages instead of once per message.
+///
+/// Publishing happens outside the timer and the timed region ends on the
+/// [`CONSUME_MESSAGES`]th delivery, exactly as in `consume_parallel`, so the
+/// two are directly comparable at equal payload. [`CONSUME_MESSAGES`] is far
+/// below `DEFAULT_QUEUE_CAPACITY` (10 000), so the publish cannot park on a
+/// full queue and needs no [`chunk_len`] chunking — that constraint binds the
+/// publish groups, which are unbounded by design, not this one.
+fn bench_batch_consume(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("inmemory_batch");
+    group.throughput(Throughput::Elements(CONSUME_MESSAGES));
+    group.sampling_mode(SamplingMode::Flat);
+    group.sample_size(10);
+
+    for bytes in PAYLOAD_SIZES {
+        let msg = BenchMsg {
+            id: 0,
+            payload: payload(bytes),
+        };
+
+        for batch in BATCH_CONSUME_SIZES {
+            // The batch size rides in the function-name slot and the payload
+            // stays the numeric parameter, so these ids keep the
+            // `group/flow/bytes` shape every other id in the suite has and
+            // the baseline stays sorted by payload within a batch size.
+            group.bench_with_input(
+                BenchmarkId::new(format!("consume_batch_b{batch}"), bytes),
+                &msg,
+                |b, msg| {
+                    b.to_async(&rt).iter_custom(|iters| async move {
+                        let mut elapsed = Duration::ZERO;
+                        for _ in 0..iters {
+                            let (_client, broker) = fresh_broker::<BatchTopic>().await;
+                            let publisher = broker.publisher().await.expect("publisher");
+                            publish_n::<BatchTopic>(&publisher, msg, CONSUME_MESSAGES).await;
+
+                            let handler = CountingHandler::new(CONSUME_MESSAGES, Outcome::Ack);
+                            let signal = handler.clone();
+                            let shutdown = CancellationToken::new();
+                            let options = BatchConsumerOptions::<InMemory>::new()
+                                .with_shutdown(shutdown.clone())
+                                .with_max_batch_size(batch);
+                            let consumer = broker.batch_consumer();
+
+                            let start = Instant::now();
+                            let task = tokio::spawn(async move {
+                                consumer
+                                    .run::<BatchTopic, CountingHandler>(handler, (), options)
+                                    .await
+                            });
+                            signal.completed().await;
+                            elapsed = elapsed.saturating_add(start.elapsed());
+
+                            shutdown.cancel();
+                            let _ = task.await;
+                        }
+                        elapsed
+                    });
+                },
+            );
+        }
     }
 
     group.finish();
@@ -911,6 +1031,7 @@ criterion_group!(
     benches,
     bench_publish,
     bench_consume,
+    bench_batch_consume,
     bench_consumer_group,
     bench_supervisor,
     bench_broadcast,
