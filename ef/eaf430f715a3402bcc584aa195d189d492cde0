@@ -1,0 +1,19 @@
+README.md
+  s_a7b9e205694576::t_4c6e50f730d0bd 130-149
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "efeaf430f715a3402bcc584aa195d189d492cde0",
+  "prompts": {},
+  "sessions": {
+    "s_a7b9e205694576": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5584ed-4369-4cf8-818e-4dd0600e3a07",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
