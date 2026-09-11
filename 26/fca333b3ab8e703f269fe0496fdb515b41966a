@@ -1,0 +1,21 @@
+package.json
+  s_65007dc190c9aa::t_02aec4606f3470 46-48
+pnpm-lock.yaml
+  s_65007dc190c9aa::t_30f5bea945e6ff 33-34,366,2290-2291,3222-3224,3705,3707,5774,6874,7095,7285,7315,7349
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "26fca333b3ab8e703f269fe0496fdb515b41966a",
+  "prompts": {},
+  "sessions": {
+    "s_65007dc190c9aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c8781777-55d4-4045-aa93-3532d226d965",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
