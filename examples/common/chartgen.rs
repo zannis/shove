@@ -235,9 +235,12 @@ pub const COST_NO_HANDLER: &str = "no_handler";
 /// disclaimer does not withhold anything from a reader that ignores it.
 ///
 /// A `schema_version` bump is the usual way to make an old reader refuse, and
-/// it is not available to the committed document: that document's `dlq_drain`
-/// rows are v6-shaped on all six backends, so declaring it v7 would misstate
-/// their lineage and [`barrierless_flows`] would refuse it. Moving the cell
+/// it is the wrong instrument for the committed document: that document's
+/// `dlq_drain` rows are v6-shaped on all six backends, so declaring it v7
+/// would misstate their lineage — silently, because [`barrierless_flows`]
+/// only stops a *barrierless* flow from claiming a setup window, and from v7
+/// `dlq_drain` merely leaves that set, so its v6 shape stays legal and
+/// nothing here refuses the mislabelled file. Moving the cell
 /// out of `results[]` needs no version at all — a reader that does not know
 /// `withheld[]` finds no row for the cell, and cannot derive a ratio from a
 /// row it does not have. Old readers lose exactly the two numbers they must

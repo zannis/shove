@@ -509,12 +509,18 @@ not have. It loses exactly the two numbers it must not publish and keeps every
 number it may.
 
 A `schema_version` bump is the usual way to make an old reader refuse a
-document it can no longer read correctly, and it is not available here: this
-document's `dlq_drain` rows are v6-shaped on all six backends (`setup_secs:
-null`, `handler_cost: setup_bound`), so declaring it v7 would misstate their
-lineage, and the generator — which holds `dlq_drain` to the v7 shape in a v7
-document — would refuse the whole file. Withholding by placement needs no
-version at all.
+document it can no longer read correctly, and it is the wrong instrument here:
+this document's `dlq_drain` rows are v6-shaped on all six backends
+(`setup_secs: null`, `handler_cost: setup_bound`) because a pre-barrier driver
+measured them, so declaring it v7 would misstate the lineage of six backends'
+rows — and nothing would catch it. From v7 `dlq_drain` only *leaves* the
+barrierless set, which permits a recorded setup window without requiring one,
+so its v6 shape stays a legal row. The generator accepts the committed document
+verbatim under a v7 declaration — pinned by
+`a_v7_declaration_of_the_committed_document_is_not_refused` in
+`tests/chartgen.rs` — so the bump would buy an old reader's refusal at the price
+of an unchecked false statement about how those rows were measured. Withholding
+by placement needs no version at all.
 
 The rest of what makes a hand-added claim safe in a generated document:
 

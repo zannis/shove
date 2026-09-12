@@ -2678,6 +2678,37 @@ fn a_withheld_baseline_leaves_no_derived_scaling_value_behind() {
         .expect("the refusal must be specific to the disclaimed rows, not the whole document");
 }
 
+#[test]
+fn a_v7_declaration_of_the_committed_document_is_not_refused() {
+    // Why that refusal had to be bought on the field itself rather than with
+    // a `schema_version` bump. The committed document is v6 and its
+    // `dlq_drain` rows were measured by the pre-barrier driver, so declaring
+    // it v7 would misstate the lineage of six backends' rows — and nothing
+    // here would say so. `barrierless_flows` only stops a *barrierless* flow
+    // from claiming a setup window; from v7 `dlq_drain` merely leaves that
+    // set, which permits the barrier shape without requiring it, so
+    // `setup_secs: null` with `setup_bound` stays a legal row.
+    //
+    // Pinned because the runbook's reasoning rests on it: if a later rule
+    // does make a v7 document require the barrier shape on `dlq_drain`, this
+    // test fails and that paragraph has to be rewritten rather than silently
+    // becoming true for a different reason.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    assert!(
+        raw.contains("\"schema_version\": 6"),
+        "the committed document is no longer v6 — this test's premise, and the runbook \
+         paragraph it pins, both need revisiting"
+    );
+    let doc = parse(&raw.replacen("\"schema_version\": 6", "\"schema_version\": 7", 1));
+    assert_eq!(doc.schema_version, 7, "the bump did not take");
+    chartgen::validate(&doc).expect(
+        "a v7 declaration of the committed document is accepted — the misstated lineage is \
+         exactly the unchecked cost a version bump would carry here",
+    );
+}
+
 // ── The committed artifact renders ──────────────────────────────────────────
 
 #[test]
