@@ -1589,6 +1589,22 @@ async fn a_stalled_read_ahead_re_dial_does_not_delay_the_flush() {
     assert_eq!(killed, 1, "expected to kill exactly {}", addrs[1]);
 
     let batches_at_kill = handler.batches().len();
+    eprintln!("PROBE: addrs={addrs:?} batches_at_kill={batches_at_kill}");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<(u128, String)>::new()));
+    let t0 = std::time::Instant::now();
+    tokio::spawn({
+        let seen = Arc::clone(&seen);
+        let needle = stream_needle.clone();
+        async move {
+            while let Some(line) = lines.next().await {
+                if line.contains(&needle) && line.contains("\"XREADGROUP\"")
+                    && let Some(a) = monitor_client_addr(&line)
+                {
+                    seen.lock().unwrap().push((t0.elapsed().as_millis(), a.to_string()));
+                }
+            }
+        }
+    });
     // Supply for BATCHES_AFTER full batches, with slack for whatever the loop
     // had already buffered when the kill landed.
     let supply = (BATCHES_AFTER as u32 + 4) * BATCH as u32;
@@ -1600,6 +1616,17 @@ async fn a_stalled_read_ahead_re_dial_does_not_delay_the_flush() {
         .await;
     let elapsed = started.elapsed();
     let delivered = handler.batches().len() - batches_at_kill;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    {
+        let v = seen.lock().unwrap();
+        let mut per: std::collections::BTreeMap<String,(usize,u128,u128)> = Default::default();
+        for (ms, a) in v.iter() {
+            let e = per.entry(a.clone()).or_insert((0, *ms, *ms));
+            e.0 += 1; e.2 = *ms;
+        }
+        eprintln!("PROBE: post-kill XREADGROUP by addr (count, first_ms, last_ms): {per:?}");
+    }
+    eprintln!("PROBE: drained={drained} delivered={delivered} elapsed={elapsed:?}");
 
     shutdown.cancel();
     handle.await.unwrap().ok();
@@ -2528,4 +2555,37 @@ async fn reaper_reclaims_a_batch_left_pending_by_a_dead_consumer() {
         redelivered > 0,
         "the reaper did not redeliver the dead consumer's pending batch"
     );
+}
+
+#[tokio::test]
+async fn zzz_probe_blackholed_dial() {
+    let url = redis_url().await;
+    let (proxy_url, blackhole) = spawn_blackholing_proxy(url).await;
+    let broker = Broker::<Redis>::new(
+        RedisConfig::new(RedisMode::Standalone {
+            url: proxy_url.clone(),
+        })
+        .with_group("probe-grp")
+        .with_response_timeout(Duration::from_secs(3))
+        .with_connection_timeout(Duration::from_secs(3)),
+    )
+    .await
+    .expect("broker through proxy");
+    eprintln!("PROBE: broker built (proxy not armed)");
+    blackhole.store(true, Ordering::SeqCst);
+    let t = std::time::Instant::now();
+    let r = redis::Client::open(proxy_url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection_with_config(
+            &redis::AsyncConnectionConfig::new()
+                .set_response_timeout(Some(Duration::from_secs(3)))
+                .set_connection_timeout(Some(Duration::from_secs(3))),
+        )
+        .await;
+    eprintln!(
+        "PROBE: raw redis-rs dial through blackhole took {:?}, ok={}",
+        t.elapsed(),
+        r.is_ok()
+    );
+    drop(broker);
 }

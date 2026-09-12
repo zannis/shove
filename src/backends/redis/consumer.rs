@@ -2999,6 +2999,47 @@ where
 ///
 /// No `unwrap`/`expect`/indexing on runtime paths; all arithmetic here is
 /// `saturating`/`checked` — see [`batch_headroom`], [`batch_block_ms`].
+/// A spawned task that is aborted when its handle is dropped.
+///
+/// `tokio::task::JoinHandle` detaches on drop; [`run_batch_impl`]'s read-ahead
+/// dial wants the opposite, so a loop that exits — shutdown, or an error on its
+/// way to `run_with_reconnect` — does not leave a dial running against a broker
+/// it has stopped using.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    }
+
+    /// The finished task's output, without suspending the caller.
+    ///
+    /// Only call once [`is_finished`](Self::is_finished) is true: a finished
+    /// `JoinHandle` resolves on its first poll, so this `await` cannot yield —
+    /// which is what lets the caller collect a dial from a path that must
+    /// never wait on one. `None` if the task panicked or was aborted.
+    async fn join_now(mut self) -> Option<T> {
+        match self.0.take() {
+            Some(handle) => handle.await.ok(),
+            None => None,
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.as_ref() {
+            handle.abort();
+        }
+    }
+}
+
 pub(crate) async fn run_batch_impl<T, H>(
     client: RedisClient,
     handler: H,
@@ -3066,6 +3107,14 @@ where
             // on its own whenever a read-ahead fails on it — `None` means
             // "dial one before the next read-ahead", see [`read_ahead_batch`].
             let mut read_conn = Some(client.multiplexed_conn().await?);
+            // A re-dial in flight for `read_conn`, spawned rather than
+            // awaited. See the recovery comment in the size-triggered arm:
+            // the flush must never wait on a dial, so the dial runs off the
+            // loop and a later cycle collects it. Aborted on drop, so a loop
+            // that exits (shutdown, or an error into `run_with_reconnect`)
+            // does not leave a dial running against a broker it has stopped
+            // using.
+            let mut dialing: Option<AbortOnDrop<Result<RedisConnection>>> = None;
             let mut batch: RedisBatch<T> = RedisBatch::new(max_batch_size);
             let mut deadline: Option<Instant> = None;
             let mut redelivery_backoff = batch_redelivery_backoff();
@@ -3108,14 +3157,53 @@ where
                     let read_ahead_armed = replay_cursor.is_none();
                     if read_ahead_armed && read_conn.is_none() {
                         // A previous read-ahead failed on that socket and it
-                        // was dropped; dial a fresh one. Best effort, and the
-                        // `.ok()` is the whole policy: a dial failure leaves
-                        // the read-ahead off for this cycle and is retried at
-                        // the next one, because the loop's own read covers
-                        // every entry either way. This is the only place the
-                        // flush waits on anything but itself, and it is
-                        // reached only after a failure.
-                        read_conn = client.multiplexed_conn().await.ok();
+                        // was dropped; get a fresh one — **without the flush
+                        // ever waiting for it**.
+                        //
+                        // Awaiting the dial here instead is what this does
+                        // not do, and the difference is not a micro-
+                        // optimisation. A dial is bounded only by
+                        // `connection_timeout` (10 s by default), and it can
+                        // run to that bound while this loop's own connection
+                        // is perfectly healthy: a middlebox that accepts a
+                        // TCP connection and answers nothing stalls the
+                        // handshake, not the socket already established. An
+                        // awaited dial therefore parks a `max_batch_size`-
+                        // full, PEL-owned batch in memory for up to that
+                        // timeout before its handler sees it — and since a
+                        // failed dial leaves `read_conn` at `None`, the next
+                        // size-triggered cycle pays it again. That turns an
+                        // optional read-ahead into a per-batch stall and
+                        // breaks the size/age flush contract on precisely the
+                        // recovery path (`a_stalled_read_ahead_re_dial_does_
+                        // not_delay_the_flush` measures it: ~1 batch per
+                        // `connection_timeout` instead of the whole drain).
+                        //
+                        // So the dial runs as its own task and a later cycle
+                        // collects it. Polling `is_finished` rather than
+                        // awaiting is the whole point — this arm never yields
+                        // on the dial. One dial is in flight at a time, and
+                        // a failed one is simply re-spawned at the next
+                        // cycle; the loop's own read covers every entry while
+                        // the read-ahead is off, so there is nothing to
+                        // recover urgently and nothing to escalate to
+                        // `run_with_reconnect` (a transient read-ahead error
+                        // must not spend a `max_reconnect_attempts` budget
+                        // that exists for real broker loss).
+                        match dialing.take() {
+                            Some(handle) if handle.is_finished() => {
+                                read_conn = handle.join_now().await.and_then(Result::ok);
+                            }
+                            // Still dialling: leave it running, carry on
+                            // without a read-ahead this cycle.
+                            Some(handle) => dialing = Some(handle),
+                            None => {
+                                let client = client.clone();
+                                dialing = Some(AbortOnDrop::new(tokio::spawn(async move {
+                                    client.multiplexed_conn().await
+                                })));
+                            }
+                        }
                     }
                     // Taken before the read is issued rather than when its
                     // reply lands: the age bound this arms is an upper bound,
