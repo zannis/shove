@@ -2809,6 +2809,194 @@ fn the_committed_documents_only_v6_deviation_is_the_withheld_derivations() {
 }
 
 #[test]
+fn the_committed_document_declares_the_deviation_it_carries() {
+    // The extent test above bounds the deviation; this one is about whether
+    // the *artifact* says so. `schema_version: 6` is a producer interlock on
+    // this file and not a description of its field contract, which left the
+    // file's only self-description saying something untrue of it, with the
+    // correction living in `benches/README.md` — where a reader holding the
+    // JSON has no reason to look. `schema_deviations` is that correction moved
+    // into the document: separate from the version, so the interlock is
+    // untouched, and closed and checked, so it cannot be misspelt into
+    // silence.
+    //
+    // Expires with the deviation: a re-measure that withholds nothing nulls
+    // nothing, `validate` then refuses a declaration no row exhibits, and the
+    // key comes out with the nulls.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+
+    assert_eq!(
+        doc["schema_deviations"],
+        serde_json::json!(["nullable_scaling_efficiency"]),
+        "the committed document does not declare, in the document, how it departs from the \
+         field contract the version it advertises names"
+    );
+    // Declared next to the version it qualifies, not buried among the rows: a
+    // reader that refuses the file at the first null has to be able to find
+    // the reason in what it already parsed.
+    let head = raw
+        .split_once("\"generated_at\"")
+        .expect("the provenance block opens the document")
+        .0;
+    assert!(
+        head.contains("\"schema_version\"") && head.contains("\"schema_deviations\""),
+        "the deviation declaration must sit in the provenance head beside the version it \
+         qualifies"
+    );
+
+    // And it is held to the rows, on the real artifact, by the generator that
+    // reads it — not only by this test.
+    chartgen::load(&path).expect("the committed document must satisfy the declaration rule");
+}
+
+#[test]
+fn a_document_that_nulls_a_derivation_without_declaring_it_is_refused() {
+    // The half that makes the declaration worth reading. Strip the key from
+    // the real artifact, change nothing else, and the generator must refuse:
+    // an undeclared departure is the state this mechanism exists to end, and a
+    // check that only ran on documents already declaring correctly would
+    // enforce nothing.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    value
+        .as_object_mut()
+        .expect("document")
+        .remove("schema_deviations")
+        .expect("the committed document declares its deviation");
+
+    let doc = parse(&value.to_string());
+    let err = chartgen::validate(&doc)
+        .expect_err("a document that nulls a derivation and declares nothing must be refused");
+    assert!(
+        err.to_string()
+            .contains("the rows exhibit `nullable_scaling_efficiency`"),
+        "the refusal must name the undeclared deviation: {err}"
+    );
+
+    // The converse: fill the six nulls in and the *declaration* becomes the
+    // false half. A key left behind by a re-measure describes a document that
+    // no longer exists, and is refused with the same force.
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    let mut filled = 0usize;
+    for run in value["runs"].as_array_mut().expect("runs") {
+        for row in run["results"].as_array_mut().expect("results") {
+            if row["scaling_efficiency"].is_null() {
+                row["scaling_efficiency"] = serde_json::json!(1.0);
+                filled += 1;
+            }
+        }
+    }
+    assert_eq!(
+        filled, 6,
+        "the control must fill exactly the declared nulls"
+    );
+    let doc = parse(&value.to_string());
+    let err = chartgen::validate(&doc)
+        .expect_err("a declaration no row exhibits must be refused, not carried");
+    assert!(
+        err.to_string()
+            .contains("declares `nullable_scaling_efficiency` but no row exhibits it"),
+        "the refusal must name the stale declaration: {err}"
+    );
+}
+
+#[test]
+fn a_misspelt_schema_deviation_is_refused_rather_than_ignored() {
+    // The property `COMPARABILITY_KINDS` had to learn the hard way, applied to
+    // the declaration: a member that fell out of every check would be
+    // indistinguishable from no member, so a document would read as declaring
+    // nothing while appearing to declare something — which is worse than the
+    // undeclared state, because it looks handled.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+
+    for spelling in [
+        "nullable_scaling_efficency",
+        "NULLABLE_SCALING_EFFICIENCY",
+        "",
+    ] {
+        let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        value["schema_deviations"] = serde_json::json!([spelling]);
+        let doc = parse(&value.to_string());
+        let err = chartgen::validate(&doc)
+            .expect_err("a deviation outside the closed set must be refused, not dropped");
+        assert!(
+            err.to_string().contains("schema_deviations names"),
+            "`{spelling}` was refused for the wrong reason: {err}"
+        );
+    }
+
+    // A duplicate is refused on the same footing: it is not a second
+    // declaration, and accepting it would let the array carry a count that
+    // means nothing.
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    value["schema_deviations"] =
+        serde_json::json!(["nullable_scaling_efficiency", "nullable_scaling_efficiency"]);
+    let doc = parse(&value.to_string());
+    chartgen::validate(&doc).expect_err("a repeated deviation must be refused");
+}
+
+#[test]
+fn a_row_that_omits_the_derivation_entirely_exhibits_no_deviation() {
+    // The distinction the double option exists for. A row with no
+    // `scaling_efficiency` key is not a row that nulls it: absent is what
+    // every fixture predating the field looks like, and what a future
+    // contract that drops the field would look like. Collapsing the two would
+    // make every such document demand a declaration for a deviation it does
+    // not carry — and, worse, would let a real null hide behind the same
+    // reading.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&document(&inmemory_run(true))).expect("valid fixture JSON");
+    let mut stripped = 0usize;
+    for run in value["runs"].as_array_mut().expect("runs") {
+        for row in run["results"].as_array_mut().expect("results") {
+            if row
+                .as_object_mut()
+                .expect("row")
+                .remove("scaling_efficiency")
+                .is_some()
+            {
+                stripped += 1;
+            }
+        }
+    }
+    assert!(stripped > 0, "the fixture carried no key to strip");
+
+    let doc = parse(&value.to_string());
+    assert!(
+        doc.runs
+            .iter()
+            .flat_map(|r| r.results.iter())
+            .all(|r| r.scaling_efficiency.is_none()),
+        "an absent key must read as absent, not as an explicit null"
+    );
+    assert!(
+        doc.schema_deviations.is_empty(),
+        "the fixture is meant to declare nothing"
+    );
+    chartgen::validate(&doc)
+        .expect("a keyless document deviates from nothing and so declares nothing");
+
+    // The same document with one key present and null *does* exhibit it, so
+    // the two readings are genuinely distinguished rather than both landing
+    // on the permissive one.
+    value["runs"][0]["results"][0]["scaling_efficiency"] = serde_json::Value::Null;
+    let doc = parse(&value.to_string());
+    assert_eq!(
+        doc.runs[0].results[0].scaling_efficiency,
+        Some(None),
+        "an explicit null must be distinguishable from an absent key"
+    );
+    chartgen::validate(&doc).expect_err("one explicit null is a deviation and must be declared");
+}
+
+#[test]
 fn a_v6_document_reader_clears_the_version_gate_and_then_keeps_no_row_at_all() {
     // The runbook states the cost of buying the refusal on the field rather
     // than on the declaration: serde types a document, not a cell, so a reader

@@ -534,7 +534,7 @@ barrierless set, which permits a recorded setup window without requiring one.
 The reader has nothing to object to; the producer does. Withholding by
 placement needs no version at all.
 
-#### The read rule for the committed artifact
+#### `schema_deviations[]`: the departure, declared in the document
 
 What the paragraph above establishes is that the bump is unavailable. It does
 not make the declaration true, and stating only the first invites reading the
@@ -544,35 +544,69 @@ v6-shaped, which no v7 producer could have written; six of its `results[]` rows
 null `scaling_efficiency`, which no v6 producer could have written. The `6` it
 declares is the producer interlock described above — the thing that keeps those
 pre-barrier rows from merging into a barriered leg — and it is not, on this
-artifact, a description of the field contract. Anything reading this file
-directly is held to one rule the declaration does not give it:
+artifact, a description of the field contract.
 
-> `scaling_efficiency` is nullable on this document regardless of its declared
-> version. A `null` means the family's one-consumer baseline is in
-> `withheld[]`, so the quotient is disclaimed; it never means zero, and it is
-> never a number that went missing.
+That leaves a real gap, and for four revisions this section closed it with
+prose: a read rule, stated here, that a reader holding the JSON has no reason
+to look for. A departure from the declared contract that is written down
+somewhere else is still an undeclared departure. So the document declares it
+itself, in a key beside the version it qualifies:
 
-The deviation is bounded and pinned, not open-ended.
+```json
+{
+  "schema_version": 6,
+  "schema_deviations": ["nullable_scaling_efficiency"],
+```
+
+> **`nullable_scaling_efficiency`** — one or more `results[]` rows carry
+> `scaling_efficiency: null`, where the declared version's contract types that
+> field as a plain `f64`. A `null` means the family's one-consumer baseline is
+> in `withheld[]`, so the quotient is disclaimed; it never means zero, and it
+> is never a number that went missing.
+
+This is deliberately **not** a second version number and it gates no merge on
+its own. The two answer different questions — which contract the rows were
+produced under, and how the file departs from it — and collapsing them is what
+the interlock forbids. Keeping them apart is what lets the version stay `6`,
+doing the one job only it can do, while the file still states what it is.
+
+Neither is it the ignorable-disclaimer mistake this section elsewhere is the
+repair of. That mistake was to make an additive key carry the **retraction** —
+an old reader skips the key and republishes `5.4904…`, the withheld
+measurement in quotient form. Here the retraction is the `null`, which no
+reader can skip; the key carries only the *name* of the departure, for a
+reader that has already been stopped by it. An ignorable label beside an
+unignorable refusal costs nothing and tells the reader which contract moved,
+which the version it cleared on the way in could not.
+
+Because it is hand-added, it is checked rather than trusted, in both
+directions and by both readers. `validate_schema_deviations` in the harness
+(`examples/common/stress_test.rs`) refuses a member outside the closed set, a
+duplicate, rows that null a derivation under no declaration, and a declaration
+no row exhibits — and it runs **before** the version gate, since a document
+whose declared version does not describe it is precisely the document the
+array exists for. The chart generator enforces the same four rules in
+`validate`, which is what holds the committed artifact to them on every
+`cargo nextest run --no-default-features`. And the harness *derives* what it
+writes from the rows (`schema_deviations_of`), so no run can produce a nulled
+derivation without producing the statement of it, and the key leaves the
+document the moment the nulls do.
+
+The deviation is bounded and pinned as well as declared.
 `the_committed_documents_only_v6_deviation_is_the_withheld_derivations`
 (`tests/chartgen.rs`) asserts its exact extent against the real artifact: the
 document nulls that field on exactly six rows, all of them Redis
 `consume_batch` drains at 64 B and 1 KiB with two, four and eight consumers,
 each in a family whose one-consumer row is withheld — and on no other row, of
 any backend or flow. A seventh null cannot arrive quietly under the v6 label.
-The rule and the deviation both expire together: the next six-backend
-re-measure writes a genuine v7 document with no withheld cells and no nulls,
-at which point that test and
-`the_committed_document_is_one_no_v7_producer_could_have_written` both fail by
+`the_committed_document_declares_the_deviation_it_carries` pins the
+declaration itself, and
+`a_document_that_nulls_a_derivation_without_declaring_it_is_refused` pins both
+halves of the rule against that same artifact. All of it expires together: the
+next six-backend re-measure writes a genuine v7 document with no withheld
+cells, no nulls and no `schema_deviations` key, at which point those tests and
+`the_committed_document_is_one_no_v7_producer_could_have_written` fail by
 design and this section is rewritten with them.
-
-The alternative the shape of this problem keeps suggesting — leave the field a
-plain `f64` and carry the retraction as a new, additive, top-level provenance
-key — is the mistake this whole section is the repair of. An old reader ignores
-an unknown key and goes on publishing `5.4904…`, which is the withheld
-measurement in quotient form; a disclaimer a reader can ignore withholds
-nothing from a reader that ignores it. Between a retraction that cannot be
-enforced and a declared version that cannot be bumped, the enforceable one wins
-and the unenforceable half is written down here.
 
 The rest of what makes a hand-added claim safe in a generated document:
 
@@ -610,7 +644,10 @@ The rest of what makes a hand-added claim safe in a generated document:
   available for the interlock reason above. Nor would dropping the field
   instead of nulling it: absent and `null` are the same parse failure against
   a non-`default` `f64`. What the null buys over silence is that the failure
-  happens at all.
+  happens at all — and what `schema_deviations` buys on top of it is that the
+  operator reading `invalid type: null, expected f64` finds the departure
+  named in the same file, rather than having to reach this page to learn which
+  contract moved.
 
   That cost is asserted, not merely conceded.
   `a_v6_document_reader_clears_the_version_gate_and_then_keeps_no_row_at_all`

@@ -164,6 +164,42 @@ pub const COMPARABILITY_KINDS: &[&str] = &[COMPARABILITY_HOST_CLOCK_FLOOR];
 /// the macOS host clocks down* in `benches/README.md`.
 pub const COMPARABILITY_HOST_CLOCK_FLOOR: &str = "host_clock_floor";
 
+/// The closed set the document-level `schema_deviations` array draws from —
+/// where a document states, **in the artifact rather than in prose**, the ways
+/// it departs from the field contract its [`RESULTS_SCHEMA_VERSION`] names.
+///
+/// This exists because the two jobs a version number is normally asked to do
+/// come apart on a hand-annotated document. `schema_version` is a *producer
+/// interlock* here: [`merge_results_file`] refuses a document whose version is
+/// not this binary's, which is what keeps runs measured under one contract
+/// from merging into runs measured under another. A document that also
+/// deviates from its version's *field* contract — because a cell was withheld
+/// by hand after the run — cannot say so by moving the version, since moving
+/// it releases that interlock. It says so here instead, and the two
+/// declarations stay separate because they answer different questions: which
+/// contract the rows were produced under, and how the file departs from it.
+///
+/// The array is not a second version number and gates no merge on its own. It
+/// is a declaration whose extent is checked against the rows:
+/// [`validate_schema_deviations`] refuses a member outside this set, a
+/// duplicate, a deviation the rows exhibit and the document does not declare,
+/// and a deviation declared with nothing in the rows that exhibits it. So it
+/// can neither be misspelt into silence nor left behind once the document that
+/// needed it is re-measured.
+pub const SCHEMA_DEVIATIONS: &[&str] = &[DEVIATION_NULLABLE_SCALING_EFFICIENCY];
+
+/// One or more `results[]` rows carry `scaling_efficiency: null`, where the
+/// declared version's contract types that field as a plain `f64`.
+///
+/// A `null` means the family's one-consumer baseline is in
+/// [`BackendRun::withheld`], so the quotient is disclaimed; it never means
+/// zero, and it is never a number that went missing. A reader built against
+/// the `f64` contract refuses such a document at the field — that refusal is
+/// the point of nulling rather than omitting — and this declaration is what
+/// names the field it will refuse on, since the version it cleared on the way
+/// in could not.
+pub const DEVIATION_NULLABLE_SCALING_EFFICIENCY: &str = "nullable_scaling_efficiency";
+
 /// Default `--load-window-secs`: long enough for a rate, short enough that a
 /// six-rung ladder over a full consumer sweep finishes in an hour per backend.
 pub const DEFAULT_LOAD_WINDOW_SECS: u64 = 10;
@@ -5553,6 +5589,12 @@ struct Hardware {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BenchResults {
     schema_version: u32,
+    /// How this document departs from `schema_version`'s field contract, from
+    /// the closed [`SCHEMA_DEVIATIONS`] set. Absent on every document the
+    /// harness writes from a clean run, which is every document that deviates
+    /// from nothing — see [`schema_deviations_of`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    schema_deviations: Vec<String>,
     generated_at: String,
     shove_version: String,
     rust_version: String,
@@ -6273,6 +6315,60 @@ fn validate_load(run: &BackendRun, r: &ScenarioResult, flow: Flow) -> Result<(),
     Ok(())
 }
 
+/// The deviations `runs` actually exhibit, in [`SCHEMA_DEVIATIONS`] order.
+///
+/// Derived rather than carried, so the declaration cannot drift from the rows
+/// it describes: the harness writes what this returns on every merge, and a
+/// re-measure that publishes every baseline drops the key by returning empty.
+fn schema_deviations_of(runs: &[BackendRun]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if runs
+        .iter()
+        .flat_map(|r| r.results.iter())
+        .any(|r| r.scaling_efficiency.is_none())
+    {
+        out.push(DEVIATION_NULLABLE_SCALING_EFFICIENCY);
+    }
+    out
+}
+
+/// The document-level declaration's invariants: every member is in the closed
+/// set, no member appears twice, and the declaration matches the rows exactly
+/// in both directions.
+///
+/// Checked **before** the version gate in [`merge_results_file`], not after,
+/// because the whole point of the array is to describe a document whose
+/// declared version does not describe it. A deviation the reader is told
+/// about only once the version happens to match is not a declaration.
+fn validate_schema_deviations(runs: &[BackendRun], declared: &[String]) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for d in declared {
+        if !SCHEMA_DEVIATIONS.contains(&d.as_str()) {
+            return Err(format!(
+                "schema_deviations lists '{d}', which is not one of {SCHEMA_DEVIATIONS:?} — a \
+                 deviation nothing recognises declares nothing"
+            ));
+        }
+        if !seen.insert(d.as_str()) {
+            return Err(format!("schema_deviations lists '{d}' twice"));
+        }
+    }
+    let exhibited: BTreeSet<&str> = schema_deviations_of(runs).into_iter().collect();
+    if let Some(d) = exhibited.difference(&seen).next() {
+        return Err(format!(
+            "the rows exhibit '{d}' but schema_deviations does not declare it — the departure \
+             from the declared schema_version's field contract must be stated in the document"
+        ));
+    }
+    if let Some(d) = seen.difference(&exhibited).next() {
+        return Err(format!(
+            "schema_deviations declares '{d}' but no row exhibits it — a declaration left behind \
+             by a re-measure describes a document that no longer exists"
+        ));
+    }
+    Ok(())
+}
+
 fn merge_results_file(
     path: &str,
     run: BackendRun,
@@ -6289,6 +6385,13 @@ fn merge_results_file(
                 format!(
                     "{path} exists but is not a v{RESULTS_SCHEMA_VERSION} results document: {e}"
                 )
+            })?;
+            // Before the version gate on purpose: this array describes a
+            // document whose declared version does not describe it, so a
+            // check that only runs once the version matches would never see
+            // the documents it exists for.
+            validate_schema_deviations(&doc.runs, &doc.schema_deviations).map_err(|e| {
+                format!("{path} declares its deviations wrongly ({e}) — refusing to rewrite it")
             })?;
             // A future version's document is shape-compatible enough to
             // deserialize, so without this it would be silently rewritten
@@ -6371,6 +6474,10 @@ fn merge_results_file(
 
     let doc = BenchResults {
         schema_version: RESULTS_SCHEMA_VERSION,
+        schema_deviations: schema_deviations_of(&existing)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         generated_at: generated_at(),
         shove_version: shove.to_string(),
         rust_version: rust,
@@ -10173,6 +10280,118 @@ mod tests {
         run.results[0].duration_secs = 2.0;
         run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
         validate_run(&run).unwrap_or_else(|e| panic!("honest row refused: {e}"));
+    }
+
+    #[test]
+    fn a_deviation_from_the_declared_field_contract_is_declared_in_the_document() {
+        // `schema_version` on a results document is a producer interlock —
+        // `merge_results_file` refuses anything but this binary's, which is
+        // what keeps runs measured under one contract out of runs measured
+        // under another. That makes it unavailable as a *description*: a
+        // document that departs from its version's field contract, because a
+        // cell was withheld by hand after the run, cannot say so by moving the
+        // version without releasing the interlock. `schema_deviations` is the
+        // separate declaration that carries it, and this pins that it is
+        // derived from the rows rather than trusted, in both directions.
+
+        // The document that deviates: a withheld one-consumer baseline, and
+        // the family's surviving row nulling the quotient over it.
+        let mut deviating = sample_run("redis");
+        let mut baseline = deviating.results.remove(0);
+        baseline.comparability = Some(COMPARABILITY_HOST_CLOCK_FLOOR.to_string());
+        let mut two_consumers = baseline.clone();
+        two_consumers.comparability = None;
+        two_consumers.consumers = 2;
+        two_consumers.scaling_efficiency = None;
+        deviating.results.push(two_consumers);
+        deviating.withheld = vec![baseline];
+        validate_run(&deviating).expect("a nulled quotient over a withheld baseline is valid");
+
+        assert_eq!(
+            schema_deviations_of(std::slice::from_ref(&deviating)),
+            vec![DEVIATION_NULLABLE_SCALING_EFFICIENCY],
+            "a nulled derivation is the deviation the declaration names"
+        );
+        assert!(
+            schema_deviations_of(std::slice::from_ref(&sample_run("redis"))).is_empty(),
+            "a run that nulls nothing must not declare a deviation — a stale key describes a \
+             document that no longer exists"
+        );
+
+        // The harness writes the declaration it derives, so a document can
+        // never acquire the deviation without acquiring the statement of it.
+        let path = temp_path("schema-deviations");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+        merge_results_file(&p, deviating, None).expect("write the deviating run");
+        let raw = std::fs::read_to_string(&path).expect("read back");
+        let doc: BenchResults = serde_json::from_str(&raw).expect("parse");
+        assert_eq!(
+            doc.schema_deviations,
+            vec![DEVIATION_NULLABLE_SCALING_EFFICIENCY.to_string()],
+            "the harness wrote a nulled derivation without declaring it"
+        );
+        // Beside the version it qualifies, not appended after the rows: a
+        // reader that refuses the file at the first null must find the reason
+        // in what it already parsed.
+        assert!(
+            raw.find("\"schema_deviations\"") < raw.find("\"generated_at\""),
+            "the declaration must sit in the provenance head: {}",
+            &raw[..raw.len().min(200)]
+        );
+
+        // Stripped, the same file is refused on the way in — and refused for
+        // *that*, not for its version. The check runs before the version gate
+        // on purpose: a document whose declared version does not describe it
+        // is exactly the document the array exists for, so a check reached
+        // only once the version matches would never see one.
+        let stripped = raw.replace(
+            "\"schema_deviations\": [\n    \"nullable_scaling_efficiency\"\n  ],\n  ",
+            "",
+        );
+        assert!(
+            !stripped.contains("schema_deviations"),
+            "the fixture did not take"
+        );
+        let stale_version = stripped.replace(
+            &format!("\"schema_version\": {RESULTS_SCHEMA_VERSION}"),
+            "\"schema_version\": 6",
+        );
+        assert!(
+            stale_version.contains("\"schema_version\": 6"),
+            "the fixture did not take"
+        );
+        for (what, content) in [("current", &stripped), ("stale", &stale_version)] {
+            std::fs::write(&path, content).expect("write");
+            let err = merge_results_file(&p, sample_run("kafka"), None)
+                .expect_err("an undeclared deviation must be refused");
+            assert!(
+                err.contains("the rows exhibit"),
+                "{what}: refused for the wrong reason: {err}"
+            );
+        }
+
+        // And the two ways the declaration itself can be wrong.
+        let misspelt = raw.replace("nullable_scaling_efficiency", "nullable_scaling_efficency");
+        std::fs::write(&path, &misspelt).expect("write");
+        let err = merge_results_file(&p, sample_run("kafka"), None)
+            .expect_err("a misspelt deviation must be refused, not ignored");
+        assert!(err.contains("nullable_scaling_efficency"), "{err}");
+
+        let orphaned = raw.replace(
+            "\"scaling_efficiency\": null",
+            "\"scaling_efficiency\": 2.0",
+        );
+        assert!(
+            orphaned.contains("\"schema_deviations\"") && !orphaned.contains(": null,\n"),
+            "the fixture did not take"
+        );
+        std::fs::write(&path, &orphaned).expect("write");
+        let err = merge_results_file(&p, sample_run("kafka"), None)
+            .expect_err("a declaration no row exhibits must be refused");
+        assert!(err.contains("no row exhibits it"), "{err}");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

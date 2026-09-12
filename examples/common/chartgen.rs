@@ -277,6 +277,34 @@ pub const COMPARABILITY_KINDS: &[&str] = &[COMPARABILITY_HOST_CLOCK_FLOOR];
 /// `benches/README.md` for the measurements that establish it.
 pub const COMPARABILITY_HOST_CLOCK_FLOOR: &str = "host_clock_floor";
 
+/// The closed set the document-level `schema_deviations` array draws from,
+/// mirroring the harness's `SCHEMA_DEVIATIONS` — where a document states, in
+/// the artifact rather than in prose, how it departs from the field contract
+/// its [`SCHEMA_VERSION`] names.
+///
+/// It is a declaration, not a second version: this generator reads it to
+/// refuse a document whose declaration and rows disagree, never to change how
+/// a row is plotted. The reason the two cannot be one field is in the harness
+/// const's doc and in `benches/README.md` — the version is a producer
+/// interlock, so a document that deviates from its version's field contract
+/// cannot say so by moving the version without releasing the interlock.
+///
+/// Refused rather than ignored when unknown, for the reason
+/// [`COMPARABILITY_KINDS`] gives: a misspelt declaration that fell out of
+/// every check would be indistinguishable from no declaration, which is the
+/// exact state the array exists to end.
+pub const SCHEMA_DEVIATIONS: &[&str] = &[DEVIATION_NULLABLE_SCALING_EFFICIENCY];
+
+/// One or more `results[]` rows carry `scaling_efficiency: null`, where the
+/// declared version's contract types that field as a plain `f64`. A `null`
+/// means the family's one-consumer baseline is in `withheld[]`, so the
+/// quotient is disclaimed; it never means zero, and it is never a number that
+/// went missing.
+///
+/// This generator does not plot `scaling_efficiency` and would not otherwise
+/// deserialize it. It reads it solely to hold the declaration to the rows.
+pub const DEVIATION_NULLABLE_SCALING_EFFICIENCY: &str = "nullable_scaling_efficiency";
+
 /// The closed flow set from the schema contract — the nine flows the
 /// harness's merge validation resolves rows and `unsupported[]` entries
 /// through, i.e. the only flows a mergeable document can carry. (The
@@ -407,6 +435,12 @@ pub const ALIASED_FLOWS: &[(&str, &str)] = &[("supervisor", "consume_parallel")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Document {
     pub schema_version: u32,
+    /// How this document departs from [`Self::schema_version`]'s field
+    /// contract, from the closed [`SCHEMA_DEVIATIONS`] set. Absent on a
+    /// document that departs from nothing, which is every document a clean
+    /// six-backend run writes.
+    #[serde(default)]
+    pub schema_deviations: Vec<String>,
     pub generated_at: String,
     pub shove_version: String,
     #[serde(default)]
@@ -576,6 +610,28 @@ pub struct ScenarioResult {
     /// [`COMPARABILITY_KINDS`] records.
     #[serde(default)]
     pub comparability: Option<String>,
+    /// The family's throughput over its one-consumer row, or `null` when that
+    /// baseline is in [`BackendRun::withheld`]. Never plotted: read only so
+    /// [`validate`] can hold the document's `schema_deviations` declaration to
+    /// its rows — see [`DEVIATION_NULLABLE_SCALING_EFFICIENCY`].
+    ///
+    /// A **double** option, so absent and `null` stay distinguishable: `None`
+    /// is a row that does not carry the key at all (every fixture predating
+    /// the field, and any future contract that drops it), `Some(None)` is the
+    /// explicit null that constitutes the deviation. Collapsing the two would
+    /// make every keyless row demand the declaration.
+    #[serde(default, deserialize_with = "double_option")]
+    pub scaling_efficiency: Option<Option<f64>>,
+}
+
+/// Distinguishes an absent key from a present `null` for
+/// `Option<Option<T>>` — plain `#[serde(default)]` maps both to `None`.
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
 }
 
 /// What a drain measured — the harness's `DrainResult`. Observed counts
@@ -801,6 +857,18 @@ pub enum ChartError {
         found: u32,
         expected: u32,
     },
+    /// Rule 1b — the document's `schema_deviations` array names something
+    /// outside [`SCHEMA_DEVIATIONS`], or names it twice.
+    UnknownSchemaDeviation {
+        found: String,
+    },
+    /// Rule 1b — the declaration and the rows disagree: a deviation the rows
+    /// exhibit and the document does not declare (`declared: false`), or one
+    /// declared with nothing in the rows that exhibits it (`declared: true`).
+    SchemaDeviationMismatch {
+        deviation: &'static str,
+        declared: bool,
+    },
     /// Rule 5 — a backend measured nothing and did not declare why.
     SilentlyEmptyRun {
         backend: String,
@@ -863,6 +931,31 @@ impl fmt::Display for ChartError {
                 "unsupported schema_version {found}: this chartgen understands \
                  {SCHEMA_VERSIONS:?} and writes charts for v{expected}. Refusing \
                  to render rather than silently mis-reading a newer document."
+            ),
+            Self::UnknownSchemaDeviation { found } => write!(
+                f,
+                "schema_deviations names `{found}`, which is not one of \
+                 {SCHEMA_DEVIATIONS:?} (or names it twice). A declaration \
+                 nothing recognises declares nothing."
+            ),
+            Self::SchemaDeviationMismatch {
+                deviation,
+                declared: false,
+            } => write!(
+                f,
+                "the rows exhibit `{deviation}` but schema_deviations does not \
+                 declare it. How a document departs from its declared \
+                 schema_version's field contract is stated in the document, \
+                 not left for a reader to discover at the field."
+            ),
+            Self::SchemaDeviationMismatch {
+                deviation,
+                declared: true,
+            } => write!(
+                f,
+                "schema_deviations declares `{deviation}` but no row exhibits \
+                 it — a declaration left behind by a re-measure describes a \
+                 document that no longer exists."
             ),
             Self::SilentlyEmptyRun { backend, missing } => write!(
                 f,
@@ -941,8 +1034,43 @@ impl From<serde_json::Error> for ChartError {
 
 // ── Validation: the enforcement rules that gate every render ────────────────
 
-/// Rules 1, 5 and 6 of the schema contract. Checked once, before any chart is
-/// drawn, so a bad document fails before it can write a single file.
+/// Rule 1b: the document's `schema_deviations` declaration, held to its rows
+/// in both directions.
+///
+/// The declaration is what makes a departure from the declared version's field
+/// contract legible to a reader holding the file, rather than only to a reader
+/// who found `benches/README.md`. Enforcing it here rather than trusting it is
+/// the same rule [`COMPARABILITY_KINDS`] follows: a hand-added claim in a
+/// generated document is only worth the check that keeps it true.
+///
+/// A row that omits `scaling_efficiency` entirely exhibits nothing — the
+/// deviation is the explicit `null`. See
+/// [`ScenarioResult::scaling_efficiency`] for why the two are kept apart.
+fn validate_schema_deviations(doc: &Document) -> Result<(), ChartError> {
+    let mut declared: BTreeSet<&str> = BTreeSet::new();
+    for d in &doc.schema_deviations {
+        if !SCHEMA_DEVIATIONS.contains(&d.as_str()) || !declared.insert(d.as_str()) {
+            return Err(ChartError::UnknownSchemaDeviation { found: d.clone() });
+        }
+    }
+
+    let nulled = doc
+        .runs
+        .iter()
+        .flat_map(|run| run.results.iter())
+        .any(|r| r.scaling_efficiency == Some(None));
+    let exhibits = declared.contains(DEVIATION_NULLABLE_SCALING_EFFICIENCY);
+    if nulled != exhibits {
+        return Err(ChartError::SchemaDeviationMismatch {
+            deviation: DEVIATION_NULLABLE_SCALING_EFFICIENCY,
+            declared: exhibits,
+        });
+    }
+    Ok(())
+}
+
+/// Rules 1, 1b, 5 and 6 of the schema contract. Checked once, before any chart
+/// is drawn, so a bad document fails before it can write a single file.
 pub fn validate(doc: &Document) -> Result<(), ChartError> {
     if !SCHEMA_VERSIONS.contains(&doc.schema_version) {
         return Err(ChartError::UnsupportedSchemaVersion {
@@ -950,6 +1078,7 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
             expected: SCHEMA_VERSION,
         });
     }
+    validate_schema_deviations(doc)?;
     let barrierless = barrierless_flows(doc.schema_version);
 
     // Everything the provenance block prints as text. The numeric hardware
