@@ -2330,6 +2330,19 @@ fn batch_run_json(backend: &str, row: String) -> String {
     )
 }
 
+/// The same run with its one cell *withheld* rather than published: the cell
+/// leaves `results[]` entirely, which is what makes the withholding bind on a
+/// reader that has never heard of the marker.
+fn batch_run_withheld_json(backend: &str, row: String) -> String {
+    format!(
+        r#"{{
+          "backend": "{backend}", "representative": true,
+          "results": [], "failures": [], "unsupported": [],
+          "withheld": [{row}]
+        }}"#
+    )
+}
+
 #[test]
 fn a_host_bounded_row_is_withheld_from_the_ordering_chart_and_said_to_be() {
     // The A and B arms differ in one key. A marked row is measured, honest
@@ -2346,7 +2359,7 @@ fn a_host_bounded_row_is_withheld_from_the_ordering_chart_and_said_to_be() {
     let withheld = parse(&document(&format!(
         "{},{}",
         inmemory_run(true),
-        batch_run_json("kafka", host_bounded(&row, "host_clock_floor"))
+        batch_run_withheld_json("kafka", host_bounded(&row, "host_clock_floor"))
     )));
 
     let svg_published =
@@ -2389,7 +2402,7 @@ fn a_comparability_marker_outside_the_closed_set_is_refused() {
     let doc = parse(&document(&format!(
         "{},{}",
         inmemory_run(true),
-        batch_run_json(
+        batch_run_withheld_json(
             "kafka",
             host_bounded(
                 &scenario("consume_batch", "batch", 64, 1, 80_000.0),
@@ -2401,6 +2414,76 @@ fn a_comparability_marker_outside_the_closed_set_is_refused() {
         .expect_err("an unknown marker is refused");
     assert!(
         err.to_string().contains("not a comparability marker"),
+        "wrong refusal: {err}"
+    );
+}
+
+#[test]
+fn a_marker_on_a_published_row_is_refused_because_an_old_reader_ignores_it() {
+    // The defect this rule exists for, and the reason the marker alone was
+    // not enough. Neither this generator's `Document` nor the harness's
+    // results struct denies unknown fields, so a reader built before the
+    // marker existed parses a marked `results[]` row and publishes its rate
+    // exactly as it did before — the disclaimer is invisible to precisely the
+    // readers it needed to reach. A withheld cell therefore leaves
+    // `results[]`, and a marker left behind on a published row is refused
+    // rather than honoured.
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        batch_run_json(
+            "kafka",
+            host_bounded(
+                &scenario("consume_batch", "batch", 64, 1, 80_000.0),
+                "host_clock_floor",
+            ),
+        )
+    )));
+    let err = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect_err("a marked row in results[] is refused");
+    assert!(
+        err.to_string().contains("belongs in `withheld[]`"),
+        "wrong refusal: {err}"
+    );
+}
+
+#[test]
+fn a_cell_cannot_be_published_and_withheld_at_once() {
+    // The `results[]` copy charts, so the document would publish exactly the
+    // number its `withheld[]` copy disclaims — and caption the cell as
+    // withheld while its bar stood on the chart.
+    let row = scenario("consume_batch", "batch", 64, 1, 80_000.0);
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{row}], "failures": [], "unsupported": [],
+          "withheld": [{}]
+        }}"#,
+        host_bounded(&row, "host_clock_floor")
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let err = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect_err("a cell published and withheld at once is refused");
+    assert!(
+        err.to_string().contains("withheld and also published"),
+        "wrong refusal: {err}"
+    );
+}
+
+#[test]
+fn a_withheld_cell_without_a_cause_is_refused() {
+    // Withholding without saying why is the failure mode the closed set
+    // exists to prevent, one step earlier: the cell vanishes from every axis
+    // and the caption cannot name a reason for it.
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        batch_run_withheld_json("kafka", scenario("consume_batch", "batch", 64, 1, 80_000.0))
+    )));
+    let err = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect_err("a withheld cell with no marker is refused");
+    assert!(
+        err.to_string().contains("carries no comparability marker"),
         "wrong refusal: {err}"
     );
 }
@@ -2420,16 +2503,14 @@ fn the_committed_document_withholds_exactly_the_rows_the_runbook_names() {
         .runs
         .iter()
         .flat_map(|run| {
-            run.results.iter().filter_map(move |r| {
-                r.comparability.as_ref().map(|kind| {
-                    (
-                        run.backend.clone(),
-                        r.flow.clone(),
-                        r.payload_bytes,
-                        r.consumers,
-                        kind.clone(),
-                    )
-                })
+            run.withheld.iter().map(move |r| {
+                (
+                    run.backend.clone(),
+                    r.flow.clone(),
+                    r.payload_bytes,
+                    r.consumers,
+                    r.comparability.clone().unwrap_or_default(),
+                )
             })
         })
         .collect();
@@ -2453,6 +2534,67 @@ fn the_committed_document_withholds_exactly_the_rows_the_runbook_names() {
             ),
         ],
         "the marked cells are not the ones benches/README.md accounts for"
+    );
+}
+
+#[test]
+fn a_reader_that_knows_only_results_finds_no_row_for_a_withheld_cell() {
+    // The property the marker could not deliver, asserted against the real
+    // artifact rather than a fixture. A reader built before any of this —
+    // one that parses `results[]`, ignores fields it does not know, and
+    // derives a batch-vs-parallel ratio — must come away with *no* number for
+    // the two host-bounded cells, not with the disclaimed one. Modelled the
+    // way such a reader actually behaves: raw JSON, `results[]` only, no
+    // knowledge of `withheld[]` or `comparability`.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+
+    // The drain specifically: it is the throughput ceiling the charts publish
+    // and the row a batch-vs-parallel ratio is taken from. The same cell also
+    // carries offered-load rungs, whose rates are the harness's own producer
+    // and were never the disclaimed number.
+    let drain_rate =
+        |backend: &str, flow: &str, mode: &str, payload: u64, consumers: u64| -> Option<f64> {
+            doc["runs"]
+                .as_array()?
+                .iter()
+                .find(|r| r["backend"] == backend)?["results"]
+                .as_array()?
+                .iter()
+                .find(|r| {
+                    r["flow"] == flow
+                        && r["payload_bytes"] == payload
+                        && r["consumers"] == consumers
+                        && r["mode"] == mode
+                        && r["method"] == "drain"
+                })
+                .and_then(|r| r["throughput_msg_per_sec"].as_f64())
+        };
+
+    for payload in [64, 1024] {
+        assert_eq!(
+            drain_rate("redis", "consume_batch", "batch", payload, 1),
+            None,
+            "an old reader can still read the {payload} B single-consumer batch drain out of \
+             results[], so it will still derive the ratio the document disclaims"
+        );
+        // The denominator of that ratio is untouched — it is a real result.
+        // Asserting it stayed is what makes the assertion above specific:
+        // a document that lost both sides would pass a one-sided check while
+        // having deleted a published number.
+        assert!(
+            drain_rate("redis", "consume_parallel", "parallel", payload, 1).is_some(),
+            "the {payload} B single-consumer parallel drain is publishable and must remain"
+        );
+    }
+    // The control: withholding removed those two cells and nothing else. A
+    // reader that lost the whole flow would be a different bug wearing the
+    // same green.
+    assert!(
+        drain_rate("redis", "consume_batch", "batch", 64, 8).is_some(),
+        "the eight-consumer batch drain is publishable and must still be readable"
     );
 }
 

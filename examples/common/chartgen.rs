@@ -217,21 +217,43 @@ pub const COST_NO_HANDLER: &str = "no_handler";
 /// it — but its rate is an artifact of the measuring machine rather than of
 /// the backend, so nothing may publish it as one.
 ///
-/// Three properties make this safe to carry on a document of any
-/// `schema_version` this generator reads, without a version bump:
+/// The marker names the cause. What makes the withholding *bind* is where
+/// the row lives: a marked cell is carried in [`BackendRun::withheld`], not
+/// in `results[]`.
 ///
-/// - It is **additive and optional**: an absent marker is the status quo.
-/// - It only ever **withholds**. A reader that does not know the field
-///   publishes exactly what it published before, so the field can never turn
-///   a correct reading into a wrong one — only a wrong one into no reading.
+/// That placement is the whole mechanism, and an earlier design got it
+/// wrong. Carrying the marker as an optional field on an ordinary `results[]`
+/// row was justified on the grounds that it "only ever withholds" — that a
+/// reader which does not know the field publishes exactly what it published
+/// before, so the field could never turn a correct reading into a wrong one.
+/// The premise is true and the conclusion does not follow: the reading such a
+/// reader published *before* is the one this marker exists to retract. Since
+/// neither this generator's [`Document`] nor the harness's own results struct
+/// denies unknown fields, every reader built before the marker existed parsed
+/// the marked rows and went on deriving the ratios they disclaim — silently,
+/// and with no signal that its interpretation was obsolete. An ignorable
+/// disclaimer does not withhold anything from a reader that ignores it.
+///
+/// A `schema_version` bump is the usual way to make an old reader refuse, and
+/// it is not available to the committed document: that document's `dlq_drain`
+/// rows are v6-shaped on all six backends, so declaring it v7 would misstate
+/// their lineage and [`barrierless_flows`] would refuse it. Moving the cell
+/// out of `results[]` needs no version at all — a reader that does not know
+/// `withheld[]` finds no row for the cell, and cannot derive a ratio from a
+/// row it does not have. Old readers lose exactly the two numbers they must
+/// not publish and keep every number they may.
+///
+/// Two further properties survive from that earlier design and are still
+/// load-bearing:
+///
 /// - It is **editorial, not measured**: no harness run writes it, and a
 ///   re-measure of a marked cell drops it, so it must be re-earned against
 ///   the new numbers rather than inherited by a row that no longer needs it.
-///
-/// An unknown value is refused rather than ignored, for the reason
-/// [`HANDLER_COSTS`] gives: a marker that silently falls out of every filter
-/// is indistinguishable from no marker, and here that failure publishes the
-/// number the marker exists to withhold.
+/// - An unknown value is **refused rather than ignored**, for the reason
+///   [`HANDLER_COSTS`] gives: a marker that silently fell out of every filter
+///   would be indistinguishable from no marker. A `withheld[]` entry must
+///   carry a cause from this set, and a `results[]` row must carry none —
+///   the marker is refused in the one place it would not bind.
 pub const COMPARABILITY_KINDS: &[&str] = &[COMPARABILITY_HOST_CLOCK_FLOOR];
 
 /// The row's rate is bounded by the measuring host's CPU clock rather than by
@@ -411,6 +433,13 @@ pub struct BackendRun {
     pub failures: Vec<FailedRow>,
     #[serde(default)]
     pub unsupported: Vec<Unsupported>,
+    /// Cells the harness measured and the document declines to publish,
+    /// because the measuring host rather than the backend set the number —
+    /// see [`COMPARABILITY_KINDS`] for why they live here rather than as a
+    /// marked row in `results[]`. Every entry carries its cause. Read for
+    /// captions only: a withheld cell is never a gap, and never a point.
+    #[serde(default)]
+    pub withheld: Vec<ScenarioResult>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -528,10 +557,12 @@ pub struct ScenarioResult {
     /// The drain account, on a `drain` row — see [`DrainAccount`].
     #[serde(default)]
     pub drain: Option<DrainAccount>,
-    /// Why this row's rate is not a result, when it is not — one of
-    /// [`COMPARABILITY_KINDS`], absent on every row that publishes normally.
-    /// Read for one rule, in [`ScenarioResult::is_comparable`]: a marked row
-    /// reaches no absolute axis, whatever its other markers certify.
+    /// Why this cell's rate is not a result — one of
+    /// [`COMPARABILITY_KINDS`], required on every entry of
+    /// [`BackendRun::withheld`] and refused on every row of `results[]`.
+    /// It names the cause of a withholding the entry's *placement* already
+    /// enforces; it is not itself the enforcement, which is the correction
+    /// [`COMPARABILITY_KINDS`] records.
     #[serde(default)]
     pub comparability: Option<String>,
 }
@@ -697,19 +728,17 @@ impl ScenarioResult {
         !LOAD_FLOWS.contains(&self.flow.as_str()) || self.method() == Some(Method::Drain)
     }
 
-    /// Whether the host let this row be a result at all — see
-    /// [`COMPARABILITY_KINDS`]. A marked row is withheld from every absolute
-    /// axis *before* any marker it carries is consulted: `handler_cost`
-    /// certifies what the number measures, and this says the number is the
-    /// measuring machine's rather than the backend's.
-    fn is_comparable(&self) -> bool {
-        self.comparability.is_none()
-    }
-
     /// [`Self::is_framework`] on a chartable method — the one predicate
     /// every absolute-throughput family plots by.
+    ///
+    /// Host-bounded cells need no term here: they are not in `results[]` at
+    /// all but in [`BackendRun::withheld`], which nothing plots from. That is
+    /// deliberate — a predicate every plotting site had to remember to call
+    /// is one a new plotting site can forget, and forgetting it publishes the
+    /// number the document withheld. [`validate`] refuses a `results[]` row
+    /// carrying a marker, so the structure is the guarantee.
     fn is_publishable(&self) -> bool {
-        self.is_framework() && self.is_charted_method() && self.is_comparable()
+        self.is_framework() && self.is_charted_method()
     }
 
     /// An offered-load rung whose producer fell short of the offered rate.
@@ -938,7 +967,16 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
     }
 
     for run in &doc.runs {
-        for row in &run.results {
+        // Every shape rule below holds a withheld cell to exactly the row it
+        // would have been: withholding a number is a claim about a real
+        // measurement, so an entry that could not have been a valid row is a
+        // document inventing one it never took.
+        for (row, is_withheld) in run
+            .results
+            .iter()
+            .map(|r| (r, false))
+            .chain(run.withheld.iter().map(|r| (r, true)))
+        {
             if !HANDLER_COSTS.contains(&row.handler_cost.as_str()) {
                 return Err(ChartError::UnknownHandlerCost {
                     backend: run.backend.clone(),
@@ -973,14 +1011,32 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
                     row.handler, NEGLIGIBLE_HANDLERS, SLEEPING_HANDLERS
                 ));
             }
-            // A withholding marker outside the closed set would fall out of
-            // `is_comparable` and publish the row it was added to withhold.
-            if let Some(kind) = row.comparability.as_deref()
-                && !COMPARABILITY_KINDS.contains(&kind)
-            {
-                return malformed(&format!(
-                    "`{kind}` is not a comparability marker the schema knows ({COMPARABILITY_KINDS:?})"
-                ));
+            // The marker is refused in the one place it would not bind. A
+            // reader that does not know the field ignores it, so a marked row
+            // sitting in `results[]` publishes the number it was added to
+            // withhold — the exact failure `withheld[]` exists to make
+            // structurally impossible. See [`COMPARABILITY_KINDS`].
+            match (is_withheld, row.comparability.as_deref()) {
+                (false, Some(kind)) => {
+                    return malformed(&format!(
+                        "a `results[]` row carries comparability `{kind}`, where a reader that \
+                         does not know the field would publish it anyway — a withheld cell \
+                         belongs in `withheld[]`"
+                    ));
+                }
+                (true, None) => {
+                    return malformed(
+                        "a `withheld[]` entry carries no comparability marker, so the document \
+                         withholds the cell without saying why",
+                    );
+                }
+                (true, Some(kind)) if !COMPARABILITY_KINDS.contains(&kind) => {
+                    return malformed(&format!(
+                        "`{kind}` is not a comparability marker the schema knows \
+                         ({COMPARABILITY_KINDS:?})"
+                    ));
+                }
+                _ => {}
             }
             // No barrier, no setup window to record — through v6 only; see
             // `barrierless_flows`.
@@ -1257,6 +1313,40 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
                 }
             }
         }
+        // A cell cannot be both published and withheld. The duplicate would
+        // not merely be untidy: the `results[]` copy plots, so the document
+        // would publish exactly the number its `withheld[]` copy disclaims,
+        // and the caption would call the cell withheld while its bar stood
+        // on the chart.
+        // `method` and the rung's offered rate are part of the key, not
+        // decoration: one cell carries a drain row *and* a rung per offered
+        // rate, all sharing flow/mode/payload/consumers/handler. Without them
+        // withholding the drain would read as a duplicate of its own rungs.
+        let cell_of = |r: &ScenarioResult| {
+            (
+                r.flow.clone(),
+                r.mode.clone(),
+                r.payload_bytes,
+                r.consumers,
+                r.handler.clone(),
+                r.method.clone(),
+                r.load.as_ref().map(|l| l.offered_msg_per_sec),
+            )
+        };
+        let published: BTreeSet<_> = run.results.iter().map(cell_of).collect();
+        for w in &run.withheld {
+            if published.contains(&cell_of(w)) {
+                return Err(ChartError::MalformedRow {
+                    backend: run.backend.clone(),
+                    flow: w.flow.clone(),
+                    what: format!(
+                        "is withheld and also published in `results[]` at {} B / {} consumer(s) \
+                         — the published copy would chart the number the withheld copy disclaims",
+                        w.payload_bytes, w.consumers
+                    ),
+                });
+            }
+        }
         // The unsupported[] invariants the writer also enforces: a blank
         // reason renders an unexplained absence, and a flow both measured
         // and declared unsupported is a document contradicting itself — the
@@ -1375,6 +1465,14 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
         // slice captions surface them. Rule 5 targets the run with neither
         // numbers nor an account.
         if !run.failures.is_empty() {
+            continue;
+        }
+        // A withheld cell is an account of the same kind, and a louder one: it
+        // says the run measured this cell and names why the number is not
+        // published. Rule 5 would otherwise read a fully-withheld run as a
+        // benchmark that silently failed, which inverts what the document
+        // says about it.
+        if !run.withheld.is_empty() {
             continue;
         }
         let declared: BTreeSet<&str> = run.unsupported.iter().map(|u| u.flow.as_str()).collect();
@@ -2978,17 +3076,21 @@ where
                             && failed_key_of(f) == *k
                             && f.method() == Some(Method::Drain)
                     });
+                    // A host-bounded cell is not in `results[]`, so without
+                    // this the slice would read as a gap — "never measured" —
+                    // which is the one thing the document knows is false.
+                    let host_bounded = run.withheld.iter().any(|r| in_slice(r) && key_of(r) == *k);
                     let kind = if rows.is_empty() && failed_drain {
                         WithheldKind::DrainFailed
+                    } else if rows.is_empty() && host_bounded {
+                        // Ahead of the rungs-only arm: a cell whose drain was
+                        // withheld and whose rungs ran is withheld, not
+                        // rungs-only. Captioning it as a sleeping handler or
+                        // a setup-bound window would name a cause the
+                        // document does not claim.
+                        WithheldKind::HostFloor
                     } else if rows.is_empty() && !all_rows.is_empty() {
                         WithheldKind::RungsOnly
-                    } else if !rows.is_empty() && rows.iter().all(|r| !r.is_comparable()) {
-                        // Before the marker arms below: a host-bounded row is
-                        // withheld whatever its `handler_cost` certifies, and
-                        // captioning it as a sleeping handler or a setup-bound
-                        // window would name a cause the document does not
-                        // claim.
-                        WithheldKind::HostFloor
                     } else if rows.iter().any(|r| r.is_setup_bound()) {
                         if rows
                             .iter()
@@ -4077,7 +4179,6 @@ fn render_parallel_vs_sequenced(
                             && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
                             && r.payload_bytes == payload
                             && r.is_charted_method()
-                            && r.is_comparable()
                             && (r.is_framework() || r.is_setup_bound())
                             && r.window_ok()
                     })
@@ -4098,17 +4199,17 @@ fn render_parallel_vs_sequenced(
             .map(|(mi, (mode, flow, _))| {
                 // Rungs are not candidates for either arm: their window
                 // contains the harness's own producer.
-                // A row the host rather than the backend bounded is out of
-                // the slice entirely, not merely out of the absolute arm:
-                // drawn as a lower bound it would still be this backend's
-                // bar for the mode, and it would set the shared worker count
-                // the other modes are then read at.
+                // A cell the host rather than the backend bounded is out of
+                // this slice for free — it is in `withheld[]`, not in
+                // `results[]`, and both arms read `results[]`. Were it a
+                // marked row here instead, drawing it as a lower bound would
+                // still make it this backend's bar for the mode, and it would
+                // set the shared worker count the other modes are read at.
                 let in_mode = |r: &&ScenarioResult| {
                     r.mode == *mode
                         && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
                         && r.payload_bytes == payload
                         && r.is_charted_method()
-                        && r.is_comparable()
                 };
                 // Either arm publishes a number, so either arm is held to
                 // the window floor: a lower bound read off a 0.18 s window is
@@ -4215,16 +4316,15 @@ fn render_parallel_vs_sequenced(
                         .filter(in_mode)
                         .any(|r| r.is_framework() || r.is_setup_bound());
                     let measured_sleeping = run.results.iter().any(|r| in_mode(&r));
-                    // `in_mode` has already dropped these, so without their
+                    // `results[]` does not hold these at all, so without their
                     // own arm a mode measured only in the affected cells
                     // would be captioned as a gap — the omission this file's
-                    // rule 3 exists to prevent, on rows that do exist.
-                    let withheld_by_host = run.results.iter().any(|r| {
+                    // rule 3 exists to prevent, on cells that were measured.
+                    let withheld_by_host = run.withheld.iter().any(|r| {
                         r.mode == *mode
                             && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
                             && r.payload_bytes == payload
                             && r.is_charted_method()
-                            && !r.is_comparable()
                     });
                     // A failed cell in this mode is an absence with a
                     // recorded cause — not a gap, and not unsupported.

@@ -32,7 +32,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -5275,9 +5275,10 @@ struct ScenarioResult {
     /// `messages` is `drain.corpus`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     drain: Option<DrainResult>,
-    /// Why this row's rate is not a result, when the *measuring host* rather
-    /// than the backend bounded it — one of [`COMPARABILITY_KINDS`], absent
-    /// on every row that publishes normally.
+    /// Why this cell's rate is not a result, when the *measuring host* rather
+    /// than the backend bounded it — one of [`COMPARABILITY_KINDS`], required
+    /// on every entry of `BackendRun::withheld` and refused on every row of
+    /// `results[]`.
     ///
     /// This is the one field in the schema no measurement writes. The harness
     /// cannot detect what it names (a property of the machine, established by
@@ -5285,10 +5286,16 @@ struct ScenarioResult {
     /// hand against evidence recorded in `benches/README.md` — and everything
     /// else here treats it as data: [`merge_results_file`] preserves it
     /// across a single-backend merge, and [`validate_run`] holds it to the
-    /// closed set, so a typo cannot silently un-withhold the row. A fresh
-    /// measurement of the same cell writes a row without it, deliberately:
-    /// the marker is a claim about one number, and a new number has to earn
-    /// it again.
+    /// closed set, so a typo cannot silently un-withhold the cell. A fresh
+    /// measurement writes the cell as an ordinary row, deliberately: the
+    /// marker is a claim about one number, and a new number has to earn it
+    /// again.
+    ///
+    /// The field names the cause; it does not do the withholding. A marked
+    /// row left in `results[]` would be published as usual by any reader that
+    /// does not know the field — neither this struct nor chartgen's denies
+    /// unknown fields — which is why the *placement* is the mechanism and
+    /// this is refused outside `withheld[]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     comparability: Option<String>,
 }
@@ -5489,6 +5496,22 @@ struct BackendRun {
     results: Vec<ScenarioResult>,
     failures: Vec<FailedResult>,
     unsupported: Vec<Unsupported>,
+    /// Cells measured on this backend that the document declines to publish,
+    /// because the measuring host rather than the backend set the number.
+    /// Each entry is the row it would have been, plus the required
+    /// `comparability` cause — see that field for why a withheld cell lives
+    /// here rather than as a marked row in `results[]`.
+    ///
+    /// No run of this harness writes an entry: a withholding is a claim about
+    /// the machine, which the harness cannot detect, so entries are
+    /// hand-added against evidence recorded in `benches/README.md`. What the
+    /// harness does is keep them honest — [`validate_run`] holds an entry to
+    /// the same shape as a row and to the closed cause set, a single-backend
+    /// merge preserves another backend's entries, and a re-measure of this
+    /// one drops its own (a freshly built run carries none, so the drop needs
+    /// no code).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    withheld: Vec<ScenarioResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5751,20 +5774,48 @@ fn validate_run(run: &BackendRun) -> Result<(), String> {
         Ok(*known)
     }
 
-    for r in &run.results {
-        let flow = check_row(&run.backend, "result", &r.flow, &r.mode, r.payload_bytes)?;
+    // A withheld cell is held to every rule a published row is held to: it is
+    // a real measurement the document declines to publish, so an entry that
+    // could not have been a valid row is one the harness never took.
+    for (r, is_withheld) in run
+        .results
+        .iter()
+        .map(|r| (r, false))
+        .chain(run.withheld.iter().map(|r| (r, true)))
+    {
+        let kind_label = if is_withheld { "withheld" } else { "result" };
+        let flow = check_row(&run.backend, kind_label, &r.flow, &r.mode, r.payload_bytes)?;
         // The one field no run writes, so the one field a hand edit can get
-        // wrong. An unrecognised marker reads as no marker everywhere
-        // downstream — which publishes the number it was added to withhold —
-        // so it is refused here, on the way into a merged document.
-        if let Some(kind) = r.comparability.as_deref()
-            && !COMPARABILITY_KINDS.contains(&kind)
-        {
-            return Err(format!(
-                "run '{}' has a result for flow '{}' carrying comparability '{kind}', which is \
-                 not one of {COMPARABILITY_KINDS:?}",
-                run.backend, r.flow
-            ));
+        // wrong — in two ways, both of which publish the number the edit
+        // meant to withhold. An unrecognised marker reads as no marker
+        // everywhere downstream; and a marker on a `results[]` row is ignored
+        // outright by any reader that does not know the field, which is every
+        // reader built before it existed. Both are refused here, on the way
+        // into a merged document.
+        match (is_withheld, r.comparability.as_deref()) {
+            (false, Some(kind)) => {
+                return Err(format!(
+                    "run '{}' has a result for flow '{}' carrying comparability '{kind}'. A \
+                     reader that does not know the field publishes that row anyway — move the \
+                     cell to withheld[] instead",
+                    run.backend, r.flow
+                ));
+            }
+            (true, None) => {
+                return Err(format!(
+                    "run '{}' withholds a cell for flow '{}' without a comparability marker, so \
+                     the document does not say why it is withheld",
+                    run.backend, r.flow
+                ));
+            }
+            (true, Some(kind)) if !COMPARABILITY_KINDS.contains(&kind) => {
+                return Err(format!(
+                    "run '{}' has a withheld cell for flow '{}' carrying comparability '{kind}', \
+                     which is not one of {COMPARABILITY_KINDS:?}",
+                    run.backend, r.flow
+                ));
+            }
+            _ => {}
         }
         // `handler_cost` says what `throughput_msg_per_sec` measures, and it is
         // fully determined by the row's own flow and handler — so it is
@@ -5906,10 +5957,45 @@ fn validate_run(run: &BackendRun) -> Result<(), String> {
                 run.backend, u.flow
             ));
         }
-        if run.results.iter().any(|r| r.flow == u.flow) {
+        // A withheld cell was measured too — the document declines to publish
+        // its number, which is not the same as the backend being unable to
+        // run the flow.
+        if run
+            .results
+            .iter()
+            .chain(run.withheld.iter())
+            .any(|r| r.flow == u.flow)
+        {
             return Err(format!(
                 "run '{}' lists flow '{}' as both measured and unsupported",
                 run.backend, u.flow
+            ));
+        }
+    }
+    // A cell is published or withheld, never both. The `results[]` copy would
+    // chart, so the document would publish exactly the number its `withheld[]`
+    // copy disclaims.
+    // `method` and the rung's offered rate belong to the key: one cell
+    // carries a drain row *and* a rung per offered rate, all sharing
+    // flow/mode/payload/consumers/handler, so without them withholding the
+    // drain would read as a duplicate of its own rungs.
+    let cell_of = |r: &ScenarioResult| {
+        (
+            r.flow.clone(),
+            r.mode.clone(),
+            r.payload_bytes,
+            r.consumers,
+            r.handler.clone(),
+            r.method.clone(),
+            r.load.as_ref().map(|l| l.offered_msg_per_sec),
+        )
+    };
+    let published: BTreeSet<_> = run.results.iter().map(cell_of).collect();
+    for w in &run.withheld {
+        if published.contains(&cell_of(w)) {
+            return Err(format!(
+                "run '{}' both publishes and withholds flow '{}' at {} B / {} consumer(s)",
+                run.backend, w.flow, w.payload_bytes, w.consumers
             ));
         }
     }
@@ -6521,6 +6607,12 @@ fn finalize_report<B: Backend>(
             results: results.clone(),
             failures: failures.clone(),
             unsupported,
+            // Never written by a run: a withholding is a claim about the
+            // machine, hand-added against evidence. A re-measure of this
+            // backend therefore drops whatever the document withheld for it,
+            // which is the intended semantics — the new numbers earn it again
+            // or they do not need it.
+            withheld: Vec::new(),
         };
         match merge_results_file(path, run, cli.hardware_label.as_deref()) {
             Ok(()) => eprintln!("wrote results to {path}"),
@@ -9674,6 +9766,7 @@ mod tests {
                 flow: Flow::ConsumeBatch.as_str().to_string(),
                 reason: "the stress harness only wires run_batch for Kafka".to_string(),
             }],
+            withheld: vec![],
         }
     }
 
@@ -9707,17 +9800,48 @@ mod tests {
 
     #[test]
     fn a_comparability_marker_is_checked_preserved_and_never_inherited() {
-        // The one field no measurement writes. Three properties make it safe
-        // to carry a hand-added claim in a generated document, and each is
-        // load-bearing on its own.
+        // The one field no measurement writes. What makes a hand-added claim
+        // safe in a generated document is *where* it sits, plus two
+        // properties of the field itself; each is load-bearing on its own.
+
+        // 1. A marker on a published row is refused outright. This is the
+        //    correction: an optional field on a `results[]` row is ignored by
+        //    every reader that does not know it — neither this struct nor
+        //    chartgen's denies unknown fields — so such a row publishes the
+        //    number the marker was added to withhold.
         let mut marked = sample_run("redis");
-        marked.results[0].comparability = Some("clocked_down".to_string());
+        marked.results[0].comparability = Some(COMPARABILITY_HOST_CLOCK_FLOOR.to_string());
+        let err = validate_run(&marked).unwrap_err();
+        assert!(err.contains("withheld[]"), "{err}");
+
+        // 2. Moved to `withheld[]`, the same cell is valid — and the closed
+        //    set still binds there, because an unrecognised marker reads as
+        //    no marker everywhere downstream.
+        let mut marked = sample_run("redis");
+        let mut cell = marked.results.remove(0);
+        cell.comparability = Some("clocked_down".to_string());
+        marked.withheld = vec![cell];
         let err = validate_run(&marked).unwrap_err();
         assert!(err.contains("clocked_down"), "{err}");
         assert!(err.contains(COMPARABILITY_HOST_CLOCK_FLOOR), "{err}");
 
-        marked.results[0].comparability = Some(COMPARABILITY_HOST_CLOCK_FLOOR.to_string());
-        validate_run(&marked).expect("the closed set's own value is a valid row");
+        marked.withheld[0].comparability = Some(COMPARABILITY_HOST_CLOCK_FLOOR.to_string());
+        validate_run(&marked).expect("the closed set's own value is a valid withheld cell");
+
+        // 3. A withheld cell without a cause withholds without saying why.
+        let mut causeless = marked.clone();
+        causeless.withheld[0].comparability = None;
+        let err = validate_run(&causeless).unwrap_err();
+        assert!(err.contains("without a comparability marker"), "{err}");
+
+        // 4. Published and withheld at once is a contradiction: the
+        //    `results[]` copy charts, so the document would publish exactly
+        //    the number the withheld copy disclaims.
+        let mut both = marked.clone();
+        both.results.push(both.withheld[0].clone());
+        both.results[both.results.len() - 1].comparability = None;
+        let err = validate_run(&both).unwrap_err();
+        assert!(err.contains("both publishes and withholds"), "{err}");
 
         let path = temp_path("comparability");
         let _ = std::fs::remove_file(&path);
@@ -9730,15 +9854,16 @@ mod tests {
                 .iter()
                 .find(|r| r.backend == backend)
                 .expect("run preserved")
-                .results[0]
-                .comparability
-                .clone()
+                .withheld
+                .first()
+                .and_then(|w| w.comparability.clone())
         };
 
         merge_results_file(&p, marked, None).expect("write the marked run");
         // Preserved through another backend's leg: a refresh of one backend
-        // rewrites the whole file, and dropping a withholding marker there
-        // would silently re-publish the row.
+        // rewrites the whole file, and dropping a withheld cell there would
+        // silently re-publish nothing — but it would lose the record of a
+        // measurement the document deliberately does not chart.
         merge_results_file(&p, sample_run("nats"), None).expect("merge another backend");
         assert_eq!(
             read_marker("redis").as_deref(),

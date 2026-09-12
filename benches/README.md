@@ -101,10 +101,11 @@ process on the host takes the same cell *above* that comparator. Do not
 quote, chart or diff a 1c drain rate from this host as a backend or version
 result without reading **A lone consumer on the macOS host clocks down**
 below; on those flows the multi-consumer cells of the same row are the
-comparable ones. Those two rows say so in the document as well as here: each
-carries `comparability: "host_clock_floor"`, which is what keeps a reader
-that only parses the JSON from deriving 0.457 and 0.439 as results — see
-**`comparability`: the one field no run writes**.
+comparable ones. The document says so as well as this file: those two cells
+are not in `results[]` at all but in `withheld[]`, carrying
+`comparability: "host_clock_floor"`, so a reader that only parses the JSON
+finds no row to derive 0.457 and 0.439 from — see **`withheld[]`: the cells
+the document declines to publish**.
 
 ## The offered-load ladder
 
@@ -277,13 +278,14 @@ every cell measure a host state the published rows do not have, so the choice
 here is to disclose the effect rather than paper over it; adding one is a
 methodology decision in its own right.
 
-The disclosure is machine-readable, not only prose: both affected rows carry
-`comparability: "host_clock_floor"` in `benches/results/bench-results.json`,
-the chart generator withholds a marked row from every absolute axis, and a
-value outside the closed set is refused rather than ignored at both ends. See
-**`comparability`: the one field no run writes**. The marker is what a reader
-comparing rows programmatically sees — it is the difference between a rate a
-tool will happily divide by another and a row that says it is a floor.
+The disclosure is machine-readable, not only prose: in
+`benches/results/bench-results.json` both affected cells are held in
+`withheld[]` rather than `results[]`, carrying
+`comparability: "host_clock_floor"`, and a value outside the closed set is
+refused rather than ignored at both ends. See **`withheld[]`: the cells the
+document declines to publish**. Placement rather than a marker is what reaches
+a reader comparing rows programmatically — it is the difference between a rate
+a tool will happily divide by another and no rate for the tool to divide.
 
 ### The backlog cap on the ladder
 
@@ -475,34 +477,63 @@ Rerunning a single backend into the current document replaces only that
 backend's entry. That is the intended way to refresh one backend after a
 change to it, as long as the host and toolchain still match the document.
 
-### `comparability`: the one field no run writes
+### `withheld[]`: the cells the document declines to publish
 
-Every other field on a row is a measurement. `comparability` is a claim
-*about* a measurement — that the machine it was taken on, rather than the
-backend, set the number — and the harness cannot detect that, so the field is
-added to a published row by hand against evidence recorded in this file. It
-takes one of a closed set of values; today that set is `host_clock_floor`
-(see **A lone consumer on the macOS host clocks down**), and the two rows
-carrying it are Redis `consume_batch` at 64 B and at 1 KiB with one consumer.
+Every field on a row is a measurement. `comparability` is a claim *about* a
+measurement — that the machine it was taken on, rather than the backend, set
+the number — and the harness cannot detect that, so it is added by hand
+against evidence recorded in this file. It takes one of a closed set of
+values; today that set is `host_clock_floor` (see **A lone consumer on the
+macOS host clocks down**), and the two cells carrying it are Redis
+`consume_batch` at 64 B and at 1 KiB with one consumer.
 
-What makes a hand-added field in a generated document safe to trust:
+**A withheld cell does not sit in `results[]`.** It lives in a sibling
+`withheld[]` array on the backend's run, carrying the row it would have been
+plus the required cause. That placement *is* the withholding, and it is the
+part an earlier version of this section got wrong. The marker was first
+carried as an optional field on an ordinary `results[]` row, justified on the
+grounds that it "only ever withholds" — that a reader which does not know the
+field publishes exactly what it published before, so it could never turn a
+correct reading into a wrong one. The premise is true and the conclusion does
+not follow: what such a reader published *before* is the reading the marker
+exists to retract. Neither the harness's results struct nor the chart
+generator's denies unknown fields, so every reader built before the marker
+existed went on parsing those rows and deriving 0.457 and 0.439 as results,
+with no signal that its interpretation was obsolete. A disclaimer a reader can
+ignore withholds nothing from a reader that ignores it.
 
-- **It only ever withholds.** A reader that does not know the field publishes
-  exactly what it published before, so it can never turn a correct reading
-  into a wrong one — only a wrong one into no reading. That is also why it
-  needs no `schema_version` bump and carries no version semantics: any
-  document version this tooling reads may carry it.
+Moving the cell fixes that for every reader at once, including ones this
+repository does not contain: a reader that has never heard of `withheld[]`
+finds *no row* for those cells and cannot derive a ratio from a row it does
+not have. It loses exactly the two numbers it must not publish and keeps every
+number it may.
+
+A `schema_version` bump is the usual way to make an old reader refuse a
+document it can no longer read correctly, and it is not available here: this
+document's `dlq_drain` rows are v6-shaped on all six backends (`setup_secs:
+null`, `handler_cost: setup_bound`), so declaring it v7 would misstate their
+lineage, and the generator — which holds `dlq_drain` to the v7 shape in a v7
+document — would refuse the whole file. Withholding by placement needs no
+version at all.
+
+The rest of what makes a hand-added claim safe in a generated document:
+
 - **A typo cannot go quiet.** A value outside the closed set is refused by the
   harness on the way into a merged document and by the chart generator on the
   way out, rather than ignored — an unknown marker that read as "no marker"
-  would publish the number it was added to withhold.
+  would leave the cell withheld with no stated cause. A `withheld[]` entry
+  without a marker is refused for the same reason, and a marker left behind on
+  a `results[]` row is refused because there it would not bind.
+- **A cell is published or withheld, never both.** A `results[]` copy would
+  chart, so the document would publish exactly the number its `withheld[]`
+  copy disclaims.
 - **A merge preserves it; a re-measure drops it.** Refreshing another
-  backend's leg keeps it. Re-measuring the marked backend writes rows without
-  it, deliberately: the claim is about one number, and a new number has to
-  earn it again.
-- **Nothing publishes a marked row.** The chart generator withholds it from
-  every absolute axis whatever its `handler_cost` certifies, and captions that
-  cell with the cause rather than letting it read as a gap.
+  backend's leg keeps that backend's entries. Re-measuring the withheld
+  backend writes ordinary rows and no entries, deliberately: the claim is
+  about one number, and a new number has to earn it again.
+- **A withheld cell is never a gap.** The chart generator captions it with its
+  cause rather than letting the absence read as a measurement never taken, and
+  a run whose cells are all withheld is not a silently-failed run.
 
 ## Regenerating the charts
 
@@ -571,8 +602,9 @@ check before trusting a document:
   consumer against 363k each at two, and repeated quiet-host runs of it draw
   anywhere in 130-270k. Such a row is a floor, so it is not a rate to reason
   from and not comparable across backends or versions — see **A lone consumer
-  on the macOS host clocks down**, and `comparability: "host_clock_floor"` on
-  the row itself, which is the same statement in the data. The per-consumer rate at two consumers is
+  on the macOS host clocks down**, and the cell's place in `withheld[]` under
+  `comparability: "host_clock_floor"`, which is the same statement in the
+  data. The per-consumer rate at two consumers is
   the test, and it isolates the affected rows across the whole document: it is
   2.75x and 2.37x the 1c rate on those two Redis cells, and **at most 1.08x**
   on every other 1c `consume_batch` drain cell in the document — the highest of
