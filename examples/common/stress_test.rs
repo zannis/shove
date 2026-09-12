@@ -204,6 +204,17 @@ pub const SCHEMA_DEVIATIONS: &[&str] = &[DEVIATION_NULLABLE_SCALING_EFFICIENCY];
 /// departure names only ever offers a reader names it may happen not to
 /// recognise. It still gates no merge *by itself*: what the merge refuses is
 /// the mismatch between version, expansion and rows.
+///
+/// **A departure's name is its identity, so no two versions may name the same
+/// set.** The producer never carries an input document's declaration forward;
+/// [`document_contract_for`] re-derives it from the departures the merged rows
+/// exhibit, which is what keeps a declaration from outliving the rows it
+/// describes. That derivation can only be unambiguous if the set determines
+/// the version, so a contract that changes what a departure *means*, or how it
+/// is *represented*, arrives as a new [`SCHEMA_DEVIATIONS`] name rather than as
+/// a second version over the same vocabulary — and then old readers refuse it
+/// twice over, at the contract version and at the name. Two entries naming one
+/// set are refused by [`contract_naming`] rather than resolved by table order.
 pub const DOCUMENT_CONTRACTS: &[(u32, &[&str])] = &[(1, &[DEVIATION_NULLABLE_SCALING_EFFICIENCY])];
 
 /// One or more `results[]` rows carry `scaling_efficiency: null`, where the
@@ -6380,19 +6391,51 @@ fn schema_deviations_of(runs: &[BackendRun]) -> Vec<&'static str> {
 /// no accurate way to declare the file it just wrote.
 fn document_contract_for(runs: &[BackendRun]) -> Result<Option<DocumentContract>, String> {
     let exhibited: BTreeSet<&str> = schema_deviations_of(runs).into_iter().collect();
+    contract_naming(DOCUMENT_CONTRACTS, &exhibited)
+}
+
+/// The `table` entry naming exactly `exhibited`, or `None` when the rows
+/// deviate from nothing.
+///
+/// Takes the table rather than reading [`DOCUMENT_CONTRACTS`] so the ambiguity
+/// refusal below is reachable from a test without a second entry existing yet.
+///
+/// Two errors, and neither is a property of the document: the table names no
+/// such set, or it names it twice. **Twice is refused rather than resolved by
+/// table order.** Selecting the first match would keep serializing version 1
+/// after a version 2 that redefines the same departure landed, and selecting
+/// the last would re-sign preserved version 1 rows as version 2 without
+/// converting them — the merge recomputes this declaration from the names
+/// alone, so either choice hands an old reader bytes under a contract they do
+/// not conform to. The way out is not a tie-break here but the naming rule on
+/// [`DOCUMENT_CONTRACTS`]: a redefined departure gets a new name, which makes
+/// the set that selects it a different set.
+fn contract_naming(
+    table: &[(u32, &[&str])],
+    exhibited: &BTreeSet<&str>,
+) -> Result<Option<DocumentContract>, String> {
     if exhibited.is_empty() {
         return Ok(None);
     }
-    let (version, names) = DOCUMENT_CONTRACTS
+    let mut naming = table
         .iter()
-        .find(|(_, names)| names.iter().copied().collect::<BTreeSet<&str>>() == exhibited)
-        .ok_or_else(|| {
-            format!(
-                "no document contract names {exhibited:?} — a deviation the rows can exhibit \
-                 must arrive with the DOCUMENT_CONTRACTS version that names it, or a document \
-                 carrying it cannot declare what it conforms to"
-            )
-        })?;
+        .filter(|(_, names)| names.iter().copied().collect::<BTreeSet<&str>>() == *exhibited);
+    let (version, names) = naming.next().ok_or_else(|| {
+        format!(
+            "no document contract names {exhibited:?} — a deviation the rows can exhibit \
+             must arrive with the DOCUMENT_CONTRACTS version that names it, or a document \
+             carrying it cannot declare what it conforms to"
+        )
+    })?;
+    if let Some((also, _)) = naming.next() {
+        return Err(format!(
+            "document contracts {version} and {also} both name {exhibited:?} — the declaration \
+             is derived from the departures the rows exhibit, so two versions over one \
+             vocabulary are indistinguishable to the producer and a merge would re-sign rows \
+             under whichever the table happens to list first. A contract that changes what a \
+             departure means, or how it is represented, names it differently"
+        ));
+    }
     Ok(Some(DocumentContract {
         version: *version,
         deviations: names.iter().map(|d| (*d).to_string()).collect(),
@@ -6407,6 +6450,11 @@ fn document_contract_for(runs: &[BackendRun]) -> Result<Option<DocumentContract>
 /// because the whole point of the declaration is to describe a document whose
 /// `schema_version` does not describe it. A departure the reader is told about
 /// only once that version happens to match is not a declaration.
+///
+/// Its unrecognised-version branch is a backstop rather than the gate: that
+/// refusal has to happen before any field is read, which is earlier than this
+/// function can run — see [`declared_versions`]. This one still fires for a
+/// caller holding rows it parsed itself.
 fn validate_document_contract(
     runs: &[BackendRun],
     declared: Option<&DocumentContract>,
@@ -6464,6 +6512,53 @@ fn validate_document_contract(
     Ok(())
 }
 
+/// The two version declarations a results document carries — `schema_version`,
+/// and `document_contract.version` when it has one — read **without** the typed
+/// parse.
+///
+/// Both readers of a results document need this and for the same reason, so
+/// this mirrors `chartgen::parse_str`'s probe. A document produced under a
+/// contract this binary does not know may re-type any field it already names —
+/// that is precisely the evolution `document_contract.version` exists to let a
+/// reader refuse — so a reader that types the whole file first fails on
+/// whichever re-typed field serde reaches and reports a generic data error,
+/// never reaching the declaration that explains it. The declarations are
+/// readable without knowing the field contract, so they are read first.
+///
+/// Nothing but the versions is modelled here: unknown fields are ignored by
+/// default, `runs` is not named at all, and everything else the merge checks
+/// needs the typed rows and is checked there.
+fn declared_versions(raw: &str) -> Result<(u32, Option<u32>), serde_json::Error> {
+    #[derive(Deserialize)]
+    struct VersionProbe {
+        #[serde(default)]
+        schema_version: u32,
+        #[serde(default)]
+        document_contract: Option<ContractProbe>,
+    }
+    #[derive(Deserialize)]
+    struct ContractProbe {
+        version: u32,
+    }
+    let probe: VersionProbe = serde_json::from_str(raw)?;
+    Ok((
+        probe.schema_version,
+        probe.document_contract.map(|c| c.version),
+    ))
+}
+
+/// Whether `version` is a contract this binary can write — the predicate both
+/// version refusals gate on, so the preflight cannot come to a different answer
+/// than the merge it is predicting.
+fn known_document_contract(version: u32) -> bool {
+    DOCUMENT_CONTRACTS.iter().any(|(v, _)| *v == version)
+}
+
+/// The contract versions this binary knows, for a refusal to name.
+fn known_document_contracts() -> Vec<u32> {
+    DOCUMENT_CONTRACTS.iter().map(|(v, _)| *v).collect()
+}
+
 fn merge_results_file(
     path: &str,
     run: BackendRun,
@@ -6476,10 +6571,36 @@ fn merge_results_file(
     let mut existing_label: Option<String> = None;
     let mut existing: Vec<BackendRun> = match std::fs::read_to_string(path) {
         Ok(content) => {
+            // Both version declarations before the typed parse, not after: a
+            // document produced under a contract this binary does not know may
+            // re-type a field this binary does know, and the parse error that
+            // would surface is not the refusal its declaration earns. See
+            // `declared_versions`.
+            let (declared_schema, declared_contract) = declared_versions(&content)
+                .map_err(|e| format!("{path} exists but is not a results document: {e}"))?;
+            if let Some(v) = declared_contract.filter(|v| !known_document_contract(*v)) {
+                return Err(format!(
+                    "{path} declares document_contract.version {v}, which is not one of {:?} — \
+                     it states that its field contract is neither its schema_version's nor one \
+                     this harness knows, so nothing here can read its rows. Move it aside first.",
+                    known_document_contracts()
+                ));
+            }
             let doc = serde_json::from_str::<BenchResults>(&content).map_err(|e| {
-                format!(
-                    "{path} exists but is not a v{RESULTS_SCHEMA_VERSION} results document: {e}"
-                )
+                // A document whose declared version is not this binary's is
+                // refused for the version below when it happens to stay
+                // shape-compatible; when it does not, the version is still the
+                // reason, and saying so beats a field-level serde error.
+                if declared_schema != RESULTS_SCHEMA_VERSION {
+                    format!(
+                        "{path} is a v{declared_schema} results document this harness cannot \
+                         read ({e}); it writes v{RESULTS_SCHEMA_VERSION} — move it aside first."
+                    )
+                } else {
+                    format!(
+                        "{path} exists but is not a v{RESULTS_SCHEMA_VERSION} results document: {e}"
+                    )
+                }
             })?;
             // Before the version gate on purpose: this declaration describes a
             // document whose declared version does not describe it, so a
@@ -6569,6 +6690,14 @@ fn merge_results_file(
 
     let doc = BenchResults {
         schema_version: RESULTS_SCHEMA_VERSION,
+        // Re-derived from the merged rows rather than carried over from the
+        // input, so a declaration cannot outlive the rows it describes. That
+        // is not a re-signing of the preserved rows: `validate_document_contract`
+        // has already held the input's declaration to the set its rows exhibit,
+        // and one set names at most one version, so for the preserved rows this
+        // recomputes the declaration they arrived with. It moves only when the
+        // incoming run brings a departure they did not have — which is a fact
+        // about the merged document, and the merged document is what it declares.
         document_contract: document_contract_for(&existing)?,
         generated_at: generated_at(),
         shove_version: shove.to_string(),
@@ -7342,26 +7471,29 @@ fn select_scenarios<B: Backend>(
 /// everything.
 fn refused_results_file_version(path: &str) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
-    let doc: BenchResults = serde_json::from_str(&content).ok()?;
-    if doc.schema_version != RESULTS_SCHEMA_VERSION {
+    // The probe rather than the typed parse, for the reason
+    // `declared_versions` gives — a contract this harness does not know may
+    // re-type a field, and swallowing that parse failure here would let the
+    // sweep run for hours before the merge refused the document anyway. A file
+    // this harness cannot even probe is still not refused here: the merge
+    // stays the authority for everything that is not a version.
+    let (schema_version, declared_contract) = declared_versions(&content).ok()?;
+    // Contract first, matching the order the merge refuses in, so a document
+    // failing both gets the same reason from the fast-fail as from the merge.
+    if let Some(declared) = declared_contract.filter(|v| !known_document_contract(*v)) {
         return Some(format!(
-            "{path} is a v{} results document; this harness writes \
-             v{RESULTS_SCHEMA_VERSION} and would refuse the merge after the sweep — \
-             move it aside first.",
-            doc.schema_version
+            "{path} declares document_contract.version {declared}, which this harness does not \
+             know ({:?}) — it states that its field contract is neither its schema_version's \
+             nor one this binary can write, and the merge would refuse it after the sweep. \
+             Move it aside first.",
+            known_document_contracts()
         ));
     }
-    let declared = doc.document_contract.as_ref()?.version;
-    (!DOCUMENT_CONTRACTS.iter().any(|(v, _)| *v == declared)).then(|| {
+    (schema_version != RESULTS_SCHEMA_VERSION).then(|| {
         format!(
-            "{path} declares document contract {declared}, which this harness does not know \
-             ({:?}) — it states that its field contract is neither its schema_version's nor \
-             one this binary can write, and the merge would refuse it after the sweep. \
-             Move it aside first.",
-            DOCUMENT_CONTRACTS
-                .iter()
-                .map(|(v, _)| *v)
-                .collect::<Vec<_>>()
+            "{path} is a v{schema_version} results document; this harness writes \
+             v{RESULTS_SCHEMA_VERSION} and would refuse the merge after the sweep — \
+             move it aside first."
         )
     })
 }
@@ -10557,7 +10689,7 @@ mod tests {
         let before_sweep =
             refused_results_file_version(&p).expect("an unknown contract must fast-fail");
         assert!(
-            before_sweep.contains("document contract 2"),
+            before_sweep.contains("document_contract.version 2"),
             "the fast-fail must name the contract, not the schema version: {before_sweep}"
         );
         let err = merge_results_file(&p, sample_run("kafka"), None)
@@ -10566,6 +10698,11 @@ mod tests {
             err.contains("document_contract.version 2"),
             "the merge must refuse for the contract: {err}"
         );
+
+        // This fixture leaves every field v1-compatible, so it says nothing
+        // about *when* the declaration is read;
+        // `an_unknown_contract_is_refused_before_its_fields_are_read` carries
+        // the re-typing case that does.
 
         // And the half that keeps the two statements from drifting: a known
         // version whose expansion beside it says something else. Neither half
@@ -10588,6 +10725,153 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unknown_contract_is_refused_before_its_fields_are_read() {
+        // The case the version exists for, and the only one in which it earns
+        // its keep: a later contract that *re-types a field this vocabulary
+        // already names*. `nullable_scaling_efficiency` still describes it, so
+        // a reader offered only the departure names sees nothing new; the
+        // shape on the wire is one this binary cannot parse.
+        //
+        // A refusal derived from a typed parse of the whole file therefore
+        // never reaches such a document — the parse fails first, and the
+        // failure is a serde data error naming a field, not a refusal naming
+        // the contract. That is not a version gate, it is a version gate that
+        // happens to be reachable only for the documents that did not need
+        // one. Both raises must come off the declaration alone.
+        let path = temp_path("unparseable-future-contract");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        let mut deviating = sample_run("redis");
+        let mut baseline = deviating.results.remove(0);
+        baseline.comparability = Some(COMPARABILITY_HOST_CLOCK_FLOOR.to_string());
+        let mut two_consumers = baseline.clone();
+        two_consumers.comparability = None;
+        two_consumers.consumers = 2;
+        two_consumers.scaling_efficiency = None;
+        deviating.results.push(two_consumers);
+        deviating.withheld = vec![baseline];
+        merge_results_file(&p, deviating, None).expect("write the deviating run");
+        let raw = std::fs::read_to_string(&path).expect("read back");
+
+        // Contract 2 as it would really arrive: the version moves *and* the
+        // field it re-types moves with it, from `null` to a string.
+        let future = raw.replace("\"version\": 1", "\"version\": 2").replace(
+            "\"scaling_efficiency\": null",
+            "\"scaling_efficiency\": \"withheld\"",
+        );
+        assert!(
+            !DOCUMENT_CONTRACTS.iter().any(|(v, _)| *v == 2),
+            "contract 2 now exists — this test's premise needs revisiting"
+        );
+        assert!(
+            future.contains("\"version\": 2")
+                && future.contains("\"scaling_efficiency\": \"withheld\""),
+            "the fixture did not take"
+        );
+        assert!(
+            serde_json::from_str::<BenchResults>(&future).is_err(),
+            "the premise of this test is that the body no longer parses under this binary's \
+             field contract — if it does, the fixture is not a re-typing"
+        );
+        std::fs::write(&path, &future).expect("write");
+
+        // Before the sweep: hours of broker time ride on this, and a `None`
+        // here spends them on a merge that was doomed at the declaration.
+        let before_sweep = refused_results_file_version(&p)
+            .expect("an unknown contract must fast-fail even when the body is unparseable");
+        assert!(
+            before_sweep.contains("document_contract.version 2"),
+            "the fast-fail must name the contract, not the field serde tripped on: {before_sweep}"
+        );
+
+        // And in the merge, which is the authority: the refusal is the
+        // contract's, not a generic data error that leaves the reader to guess
+        // whether the file is corrupt or merely newer.
+        let err = merge_results_file(&p, sample_run("kafka"), None)
+            .expect_err("an unknown contract must be refused by the merge too");
+        assert!(
+            err.contains("document_contract.version 2"),
+            "the merge must refuse at the declaration, not at the field: {err}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_deviation_set_names_one_contract_so_the_producer_can_select_it() {
+        // What makes a *derived* declaration safe to version.
+        //
+        // The merge never carries an input document's declaration forward; it
+        // re-derives it from the departures the merged rows exhibit, which is
+        // what keeps a declaration from outliving the rows it describes. That
+        // only holds together if a deviation set picks out one version. Were
+        // two versions to name the same set, the producer could not tell them
+        // apart: taking the first would keep writing version 1 after a
+        // version 2 that redefines that departure landed, and taking the last
+        // would re-sign preserved version 1 rows as version 2 without
+        // converting them. Both hand an old reader bytes under a contract they
+        // do not conform to, which is the one thing the declaration exists to
+        // prevent.
+        //
+        // So the table is one-to-one, and the evolution path for a departure
+        // whose meaning or representation changes is a new name — which makes
+        // the set that selects it a different set, and is refused twice over
+        // by an old reader (at the contract version, and at the name).
+        let mut seen: BTreeSet<BTreeSet<&str>> = BTreeSet::new();
+        for (version, names) in DOCUMENT_CONTRACTS {
+            let set: BTreeSet<&str> = names.iter().copied().collect();
+            assert_eq!(
+                set.len(),
+                names.len(),
+                "contract {version} names a deviation twice"
+            );
+            assert!(
+                seen.insert(set),
+                "contract {version} names a deviation set an earlier contract already names — \
+                 a redefined departure gets a new SCHEMA_DEVIATIONS name, not a second version \
+                 over the same vocabulary"
+            );
+        }
+
+        // And the refusal that says so, rather than a silent tie-break, if one
+        // ever does. Exercised against a table of its own: the invariant above
+        // is what keeps the real one from reaching it.
+        let ambiguous: &[(u32, &[&str])] = &[
+            (1, &[DEVIATION_NULLABLE_SCALING_EFFICIENCY]),
+            (2, &[DEVIATION_NULLABLE_SCALING_EFFICIENCY]),
+        ];
+        let exhibited: BTreeSet<&str> = [DEVIATION_NULLABLE_SCALING_EFFICIENCY].into();
+        let err = contract_naming(ambiguous, &exhibited)
+            .expect_err("two contracts over one vocabulary must be refused, not ordered");
+        assert!(
+            err.contains("contracts 1 and 2 both name"),
+            "the refusal must name both versions: {err}"
+        );
+
+        // The unambiguous halves either side of it still resolve: the set the
+        // table names, and a set it does not.
+        assert_eq!(
+            contract_naming(DOCUMENT_CONTRACTS, &exhibited)
+                .expect("the real table names this set once")
+                .map(|c| c.version),
+            Some(1)
+        );
+        let unnamed: BTreeSet<&str> = ["a_departure_no_contract_names"].into();
+        assert!(
+            contract_naming(DOCUMENT_CONTRACTS, &unnamed)
+                .expect_err("a set no contract names is a gap in the table")
+                .contains("no document contract names"),
+        );
+        assert!(
+            contract_naming(DOCUMENT_CONTRACTS, &BTreeSet::new())
+                .expect("no deviations")
+                .is_none(),
+            "a document that deviates from nothing declares no contract"
+        );
     }
 
     #[test]
