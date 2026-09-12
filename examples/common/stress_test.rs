@@ -164,9 +164,21 @@ pub const COMPARABILITY_KINDS: &[&str] = &[COMPARABILITY_HOST_CLOCK_FLOOR];
 /// the macOS host clocks down* in `benches/README.md`.
 pub const COMPARABILITY_HOST_CLOCK_FLOOR: &str = "host_clock_floor";
 
-/// The closed set the document-level `schema_deviations` array draws from —
-/// where a document states, **in the artifact rather than in prose**, the ways
-/// it departs from the field contract its [`RESULTS_SCHEMA_VERSION`] names.
+/// The closed vocabulary a [`DOCUMENT_CONTRACTS`] expansion is written in —
+/// the ways a document may depart from the field contract its
+/// [`RESULTS_SCHEMA_VERSION`] names, stated **in the artifact rather than in
+/// prose**.
+///
+/// Closed and checked in both directions by [`validate_document_contract`]: a
+/// member outside this set is refused, so is a duplicate, so is a deviation
+/// the rows exhibit and the document does not declare, and so is one declared
+/// with nothing in the rows that exhibits it. A departure can therefore
+/// neither be misspelt into silence nor left behind once the document that
+/// needed it is re-measured.
+pub const SCHEMA_DEVIATIONS: &[&str] = &[DEVIATION_NULLABLE_SCALING_EFFICIENCY];
+
+/// Every document contract this harness knows, newest last: the version, and
+/// the exact [`SCHEMA_DEVIATIONS`] set it names.
 ///
 /// This exists because the two jobs a version number is normally asked to do
 /// come apart on a hand-annotated document. `schema_version` is a *producer
@@ -174,19 +186,25 @@ pub const COMPARABILITY_HOST_CLOCK_FLOOR: &str = "host_clock_floor";
 /// not this binary's, which is what keeps runs measured under one contract
 /// from merging into runs measured under another. A document that also
 /// deviates from its version's *field* contract — because a cell was withheld
-/// by hand after the run — cannot say so by moving the version, since moving
-/// it releases that interlock. It says so here instead, and the two
-/// declarations stay separate because they answer different questions: which
-/// contract the rows were produced under, and how the file departs from it.
+/// by hand after the run, so the derivations off its baseline are nulled —
+/// cannot say so by moving the version, since moving it releases that
+/// interlock.
 ///
-/// The array is not a second version number and gates no merge on its own. It
-/// is a declaration whose extent is checked against the rows:
-/// [`validate_schema_deviations`] refuses a member outside this set, a
-/// duplicate, a deviation the rows exhibit and the document does not declare,
-/// and a deviation declared with nothing in the rows that exhibits it. So it
-/// can neither be misspelt into silence nor left behind once the document that
-/// needed it is re-measured.
-pub const SCHEMA_DEVIATIONS: &[&str] = &[DEVIATION_NULLABLE_SCALING_EFFICIENCY];
+/// So it carries a second, independently versioned declaration instead, and
+/// the two answer the two different questions: `schema_version` says which
+/// contract the rows were **produced** under, `document_contract.version` says
+/// which contract these bytes actually **conform to**. A document that
+/// conforms to its `schema_version`'s field contract carries no
+/// `document_contract` key at all.
+///
+/// Being a version rather than a bare list is what lets a reader refuse: an
+/// unrecognised contract is a refusal at the declaration — the harness raises
+/// it in [`refused_results_file_version`] before the sweep and again in
+/// [`merge_results_file`] before a row is read — where an unordered list of
+/// departure names only ever offers a reader names it may happen not to
+/// recognise. It still gates no merge *by itself*: what the merge refuses is
+/// the mismatch between version, expansion and rows.
+pub const DOCUMENT_CONTRACTS: &[(u32, &[&str])] = &[(1, &[DEVIATION_NULLABLE_SCALING_EFFICIENCY])];
 
 /// One or more `results[]` rows carry `scaling_efficiency: null`, where the
 /// declared version's contract types that field as a plain `f64`.
@@ -5589,17 +5607,37 @@ struct Hardware {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BenchResults {
     schema_version: u32,
-    /// How this document departs from `schema_version`'s field contract, from
-    /// the closed [`SCHEMA_DEVIATIONS`] set. Absent on every document the
-    /// harness writes from a clean run, which is every document that deviates
-    /// from nothing — see [`schema_deviations_of`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    schema_deviations: Vec<String>,
+    /// The field contract these bytes conform to, from the closed
+    /// [`DOCUMENT_CONTRACTS`] table, when that is not `schema_version`'s.
+    /// Absent on every document the harness writes from a clean run, which is
+    /// every document that deviates from nothing — see
+    /// [`document_contract_for`].
+    ///
+    /// `#[serde(default)]` grants nothing: [`validate_document_contract`]
+    /// derives the departures the rows exhibit and requires the key present
+    /// exactly when they exhibit any, so an omission is caught against the
+    /// rows rather than accepted by the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    document_contract: Option<DocumentContract>,
     generated_at: String,
     shove_version: String,
     rust_version: String,
     hardware: Hardware,
     runs: Vec<BackendRun>,
+}
+
+/// A document's own field contract, versioned independently of
+/// `schema_version` — see [`DOCUMENT_CONTRACTS`].
+///
+/// The two fields state one fact twice, deliberately: `version` is what a
+/// reader keys on and what the refusals gate, `deviations` is what a person
+/// reading the artifact sees without this table to hand.
+/// [`validate_document_contract`] holds each to the other and both to the
+/// rows, so the pair cannot drift.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DocumentContract {
+    version: u32,
+    deviations: Vec<String>,
 }
 
 // ── Provenance ──────────────────────────────────────────────────────────────
@@ -6332,37 +6370,94 @@ fn schema_deviations_of(runs: &[BackendRun]) -> Vec<&'static str> {
     out
 }
 
-/// The document-level declaration's invariants: every member is in the closed
-/// set, no member appears twice, and the declaration matches the rows exactly
-/// in both directions.
+/// The document contract this harness would write for `runs`: `None` when the
+/// rows conform to [`RESULTS_SCHEMA_VERSION`]'s field contract, otherwise the
+/// [`DOCUMENT_CONTRACTS`] entry naming exactly the departures they exhibit.
+///
+/// Errs when the rows exhibit a set no contract names — which is a gap in the
+/// table, not in the document: a new member of [`SCHEMA_DEVIATIONS`] must
+/// arrive with the contract version that names it, or the harness would have
+/// no accurate way to declare the file it just wrote.
+fn document_contract_for(runs: &[BackendRun]) -> Result<Option<DocumentContract>, String> {
+    let exhibited: BTreeSet<&str> = schema_deviations_of(runs).into_iter().collect();
+    if exhibited.is_empty() {
+        return Ok(None);
+    }
+    let (version, names) = DOCUMENT_CONTRACTS
+        .iter()
+        .find(|(_, names)| names.iter().copied().collect::<BTreeSet<&str>>() == exhibited)
+        .ok_or_else(|| {
+            format!(
+                "no document contract names {exhibited:?} — a deviation the rows can exhibit \
+                 must arrive with the DOCUMENT_CONTRACTS version that names it, or a document \
+                 carrying it cannot declare what it conforms to"
+            )
+        })?;
+    Ok(Some(DocumentContract {
+        version: *version,
+        deviations: names.iter().map(|d| (*d).to_string()).collect(),
+    }))
+}
+
+/// The document-level declaration's invariants: the version is one this
+/// harness knows, the expansion beside it is the closed, duplicate-free set
+/// that version names, and the rows are what that version describes.
 ///
 /// Checked **before** the version gate in [`merge_results_file`], not after,
-/// because the whole point of the array is to describe a document whose
-/// declared version does not describe it. A deviation the reader is told
-/// about only once the version happens to match is not a declaration.
-fn validate_schema_deviations(runs: &[BackendRun], declared: &[String]) -> Result<(), String> {
+/// because the whole point of the declaration is to describe a document whose
+/// `schema_version` does not describe it. A departure the reader is told about
+/// only once that version happens to match is not a declaration.
+fn validate_document_contract(
+    runs: &[BackendRun],
+    declared: Option<&DocumentContract>,
+) -> Result<(), String> {
     let mut seen = BTreeSet::new();
-    for d in declared {
-        if !SCHEMA_DEVIATIONS.contains(&d.as_str()) {
-            return Err(format!(
-                "schema_deviations lists '{d}', which is not one of {SCHEMA_DEVIATIONS:?} — a \
-                 deviation nothing recognises declares nothing"
-            ));
+    if let Some(contract) = declared {
+        for d in &contract.deviations {
+            if !SCHEMA_DEVIATIONS.contains(&d.as_str()) {
+                return Err(format!(
+                    "document_contract.deviations lists '{d}', which is not one of \
+                     {SCHEMA_DEVIATIONS:?} — a deviation nothing recognises declares nothing"
+                ));
+            }
+            if !seen.insert(d.as_str()) {
+                return Err(format!("document_contract.deviations lists '{d}' twice"));
+            }
         }
-        if !seen.insert(d.as_str()) {
-            return Err(format!("schema_deviations lists '{d}' twice"));
+        let names = DOCUMENT_CONTRACTS
+            .iter()
+            .find(|(v, _)| *v == contract.version)
+            .map(|(_, names)| *names)
+            .ok_or_else(|| {
+                format!(
+                    "document_contract.version {} is not one of {:?} — the document states that \
+                     its field contract is not its schema_version's, and not one this harness \
+                     knows either",
+                    contract.version,
+                    DOCUMENT_CONTRACTS
+                        .iter()
+                        .map(|(v, _)| *v)
+                        .collect::<Vec<_>>()
+                )
+            })?;
+        if seen != names.iter().copied().collect::<BTreeSet<&str>>() {
+            return Err(format!(
+                "document_contract.version {} names {names:?} but the expansion beside it lists \
+                 {:?} — one of the two is stale and the document cannot say which",
+                contract.version, contract.deviations
+            ));
         }
     }
     let exhibited: BTreeSet<&str> = schema_deviations_of(runs).into_iter().collect();
     if let Some(d) = exhibited.difference(&seen).next() {
         return Err(format!(
-            "the rows exhibit '{d}' but schema_deviations does not declare it — the departure \
+            "the rows exhibit '{d}' but no document_contract declares it — the departure \
              from the declared schema_version's field contract must be stated in the document"
         ));
     }
     if let Some(d) = seen.difference(&exhibited).next() {
         return Err(format!(
-            "schema_deviations declares '{d}' but no row exhibits it — a declaration left behind \
+            "document_contract declares '{d}' but no row exhibits it — a declaration left behind \
              by a re-measure describes a document that no longer exists"
         ));
     }
@@ -6386,12 +6481,12 @@ fn merge_results_file(
                     "{path} exists but is not a v{RESULTS_SCHEMA_VERSION} results document: {e}"
                 )
             })?;
-            // Before the version gate on purpose: this array describes a
+            // Before the version gate on purpose: this declaration describes a
             // document whose declared version does not describe it, so a
             // check that only runs once the version matches would never see
             // the documents it exists for.
-            validate_schema_deviations(&doc.runs, &doc.schema_deviations).map_err(|e| {
-                format!("{path} declares its deviations wrongly ({e}) — refusing to rewrite it")
+            validate_document_contract(&doc.runs, doc.document_contract.as_ref()).map_err(|e| {
+                format!("{path} declares its contract wrongly ({e}) — refusing to rewrite it")
             })?;
             // A future version's document is shape-compatible enough to
             // deserialize, so without this it would be silently rewritten
@@ -6474,10 +6569,7 @@ fn merge_results_file(
 
     let doc = BenchResults {
         schema_version: RESULTS_SCHEMA_VERSION,
-        schema_deviations: schema_deviations_of(&existing)
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        document_contract: document_contract_for(&existing)?,
         generated_at: generated_at(),
         shove_version: shove.to_string(),
         rust_version: rust,
@@ -7240,21 +7332,36 @@ fn select_scenarios<B: Backend>(
     Ok(scenarios)
 }
 
-/// Fast-fail the schema-version refusal `merge_results_file` would otherwise
-/// raise only *after* the whole sweep has run — hours of broker time spent on
-/// a merge that was doomed before the first scenario. Version only: the merge
-/// remains the authority for every other document invariant (provenance,
-/// per-row validation), which cannot go stale here because both compare
-/// against the same constants and the merge still re-checks everything.
+/// Fast-fail the version refusals `merge_results_file` would otherwise raise
+/// only *after* the whole sweep has run — hours of broker time spent on a
+/// merge that was doomed before the first scenario. Versions only, both of
+/// them: the merge remains the authority for every other document invariant
+/// (provenance, per-row validation, and whether the declared contract matches
+/// its expansion and the rows), which cannot go stale here because both
+/// compare against the same constants and the merge still re-checks
+/// everything.
 fn refused_results_file_version(path: &str) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     let doc: BenchResults = serde_json::from_str(&content).ok()?;
-    (doc.schema_version != RESULTS_SCHEMA_VERSION).then(|| {
-        format!(
+    if doc.schema_version != RESULTS_SCHEMA_VERSION {
+        return Some(format!(
             "{path} is a v{} results document; this harness writes \
              v{RESULTS_SCHEMA_VERSION} and would refuse the merge after the sweep — \
              move it aside first.",
             doc.schema_version
+        ));
+    }
+    let declared = doc.document_contract.as_ref()?.version;
+    (!DOCUMENT_CONTRACTS.iter().any(|(v, _)| *v == declared)).then(|| {
+        format!(
+            "{path} declares document contract {declared}, which this harness does not know \
+             ({:?}) — it states that its field contract is neither its schema_version's nor \
+             one this binary can write, and the merge would refuse it after the sweep. \
+             Move it aside first.",
+            DOCUMENT_CONTRACTS
+                .iter()
+                .map(|(v, _)| *v)
+                .collect::<Vec<_>>()
         )
     })
 }
@@ -10290,9 +10397,10 @@ mod tests {
         // under another. That makes it unavailable as a *description*: a
         // document that departs from its version's field contract, because a
         // cell was withheld by hand after the run, cannot say so by moving the
-        // version without releasing the interlock. `schema_deviations` is the
-        // separate declaration that carries it, and this pins that it is
-        // derived from the rows rather than trusted, in both directions.
+        // version without releasing the interlock. `document_contract` is the
+        // separate, independently versioned declaration that carries it, and
+        // this pins that it is derived from the rows rather than trusted, in
+        // both directions.
 
         // The document that deviates: a withheld one-consumer baseline, and
         // the family's surviving row nulling the quotient over it.
@@ -10320,22 +10428,29 @@ mod tests {
 
         // The harness writes the declaration it derives, so a document can
         // never acquire the deviation without acquiring the statement of it.
-        let path = temp_path("schema-deviations");
+        let path = temp_path("document-contract");
         let _ = std::fs::remove_file(&path);
         let p = path.to_string_lossy().to_string();
         merge_results_file(&p, deviating, None).expect("write the deviating run");
         let raw = std::fs::read_to_string(&path).expect("read back");
         let doc: BenchResults = serde_json::from_str(&raw).expect("parse");
+        let contract = doc
+            .document_contract
+            .as_ref()
+            .expect("the harness wrote a nulled derivation without declaring a contract");
         assert_eq!(
-            doc.schema_deviations,
-            vec![DEVIATION_NULLABLE_SCALING_EFFICIENCY.to_string()],
-            "the harness wrote a nulled derivation without declaring it"
+            (contract.version, contract.deviations.as_slice()),
+            (
+                1,
+                [DEVIATION_NULLABLE_SCALING_EFFICIENCY.to_string()].as_slice()
+            ),
+            "the declared contract is not the one DOCUMENT_CONTRACTS names for these rows"
         );
         // Beside the version it qualifies, not appended after the rows: a
         // reader that refuses the file at the first null must find the reason
         // in what it already parsed.
         assert!(
-            raw.find("\"schema_deviations\"") < raw.find("\"generated_at\""),
+            raw.find("\"document_contract\"") < raw.find("\"generated_at\""),
             "the declaration must sit in the provenance head: {}",
             &raw[..raw.len().min(200)]
         );
@@ -10343,14 +10458,17 @@ mod tests {
         // Stripped, the same file is refused on the way in — and refused for
         // *that*, not for its version. The check runs before the version gate
         // on purpose: a document whose declared version does not describe it
-        // is exactly the document the array exists for, so a check reached
-        // only once the version matches would never see one.
-        let stripped = raw.replace(
-            "\"schema_deviations\": [\n    \"nullable_scaling_efficiency\"\n  ],\n  ",
-            "",
+        // is exactly the document the declaration exists for, so a check
+        // reached only once the version matches would never see one.
+        let stripped = format!(
+            "{}{}",
+            &raw[..raw
+                .find("\"document_contract\"")
+                .expect("declared in the head")],
+            &raw[raw.find("\"generated_at\"").expect("provenance follows it")..]
         );
         assert!(
-            !stripped.contains("schema_deviations"),
+            !stripped.contains("document_contract"),
             "the fixture did not take"
         );
         let stale_version = stripped.replace(
@@ -10383,13 +10501,91 @@ mod tests {
             "\"scaling_efficiency\": 2.0",
         );
         assert!(
-            orphaned.contains("\"schema_deviations\"") && !orphaned.contains(": null,\n"),
+            orphaned.contains("\"document_contract\"") && !orphaned.contains(": null,\n"),
             "the fixture did not take"
         );
         std::fs::write(&path, &orphaned).expect("write");
         let err = merge_results_file(&p, sample_run("kafka"), None)
             .expect_err("a declaration no row exhibits must be refused");
         assert!(err.contains("no row exhibits it"), "{err}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_document_contract_this_harness_does_not_know_is_refused_at_the_declaration() {
+        // What makes the declaration a *contract* and not a list of names.
+        //
+        // A reader meeting a file produced under a later contract has to be
+        // able to refuse it whole. An unordered set of departure names cannot
+        // offer that — it can only surface names the reader happens not to
+        // recognise, and a contract that re-types a field it already names
+        // surfaces nothing. A version can, and this pins both places the
+        // harness raises it: before the sweep, where the cost of finding out
+        // late is hours of broker time, and in the merge, which is the
+        // authority.
+        let path = temp_path("unknown-document-contract");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        let mut deviating = sample_run("redis");
+        let mut baseline = deviating.results.remove(0);
+        baseline.comparability = Some(COMPARABILITY_HOST_CLOCK_FLOOR.to_string());
+        let mut two_consumers = baseline.clone();
+        two_consumers.comparability = None;
+        two_consumers.consumers = 2;
+        two_consumers.scaling_efficiency = None;
+        deviating.results.push(two_consumers);
+        deviating.withheld = vec![baseline];
+        merge_results_file(&p, deviating, None).expect("write the deviating run");
+        let raw = std::fs::read_to_string(&path).expect("read back");
+
+        // A contract from the future. Nothing else about the file changes —
+        // it still declares this binary's `schema_version`, so the version
+        // gate that catches an old document is not what refuses this one.
+        let future = raw.replace("\"version\": 1", "\"version\": 2");
+        assert!(
+            future.contains("\"version\": 2") && !future.contains("\"version\": 1"),
+            "the fixture did not take"
+        );
+        std::fs::write(&path, &future).expect("write");
+        assert!(
+            !DOCUMENT_CONTRACTS.iter().any(|(v, _)| *v == 2),
+            "contract 2 now exists — this test's premise needs revisiting"
+        );
+
+        let before_sweep =
+            refused_results_file_version(&p).expect("an unknown contract must fast-fail");
+        assert!(
+            before_sweep.contains("document contract 2"),
+            "the fast-fail must name the contract, not the schema version: {before_sweep}"
+        );
+        let err = merge_results_file(&p, sample_run("kafka"), None)
+            .expect_err("an unknown contract must be refused by the merge too");
+        assert!(
+            err.contains("document_contract.version 2"),
+            "the merge must refuse for the contract: {err}"
+        );
+
+        // And the half that keeps the two statements from drifting: a known
+        // version whose expansion beside it says something else. Neither half
+        // can be taken as the truth, so the document is refused rather than
+        // read under whichever one the reader happens to consult.
+        let disagreeing = raw.replace(
+            &format!("\"{DEVIATION_NULLABLE_SCALING_EFFICIENCY}\"\n    ]"),
+            "]",
+        );
+        assert!(
+            disagreeing.contains("\"version\": 1") && disagreeing.contains("\"deviations\": [\n"),
+            "the fixture did not take"
+        );
+        std::fs::write(&path, &disagreeing).expect("write");
+        let err = merge_results_file(&p, sample_run("kafka"), None)
+            .expect_err("a version and an expansion that disagree must be refused");
+        assert!(
+            err.contains("document_contract.version 1 names"),
+            "the refusal must name the contract the expansion contradicts: {err}"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

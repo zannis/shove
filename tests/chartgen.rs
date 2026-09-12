@@ -2815,10 +2815,10 @@ fn the_committed_document_declares_the_deviation_it_carries() {
     // this file and not a description of its field contract, which left the
     // file's only self-description saying something untrue of it, with the
     // correction living in `benches/README.md` — where a reader holding the
-    // JSON has no reason to look. `schema_deviations` is that correction moved
-    // into the document: separate from the version, so the interlock is
-    // untouched, and closed and checked, so it cannot be misspelt into
-    // silence.
+    // JSON has no reason to look. `document_contract` is that correction moved
+    // into the document: a contract of its own, versioned separately so the
+    // interlock is untouched, and closed and checked so it cannot be misspelt
+    // into silence.
     //
     // Expires with the deviation: a re-measure that withholds nothing nulls
     // nothing, `validate` then refuses a declaration no row exhibits, and the
@@ -2829,10 +2829,13 @@ fn the_committed_document_declares_the_deviation_it_carries() {
     let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
 
     assert_eq!(
-        doc["schema_deviations"],
-        serde_json::json!(["nullable_scaling_efficiency"]),
-        "the committed document does not declare, in the document, how it departs from the \
-         field contract the version it advertises names"
+        doc["document_contract"],
+        serde_json::json!({
+            "version": 1,
+            "deviations": ["nullable_scaling_efficiency"],
+        }),
+        "the committed document does not declare, in the document, the contract it conforms \
+         to where the version it advertises does not describe it"
     );
     // Declared next to the version it qualifies, not buried among the rows: a
     // reader that refuses the file at the first null has to be able to find
@@ -2842,8 +2845,8 @@ fn the_committed_document_declares_the_deviation_it_carries() {
         .expect("the provenance block opens the document")
         .0;
     assert!(
-        head.contains("\"schema_version\"") && head.contains("\"schema_deviations\""),
-        "the deviation declaration must sit in the provenance head beside the version it \
+        head.contains("\"schema_version\"") && head.contains("\"document_contract\""),
+        "the contract declaration must sit in the provenance head beside the version it \
          qualifies"
     );
 
@@ -2866,8 +2869,8 @@ fn a_document_that_nulls_a_derivation_without_declaring_it_is_refused() {
     value
         .as_object_mut()
         .expect("document")
-        .remove("schema_deviations")
-        .expect("the committed document declares its deviation");
+        .remove("document_contract")
+        .expect("the committed document declares its contract");
 
     let doc = parse(&value.to_string());
     let err = chartgen::validate(&doc)
@@ -2906,6 +2909,94 @@ fn a_document_that_nulls_a_derivation_without_declaring_it_is_refused() {
 }
 
 #[test]
+fn an_unknown_document_contract_is_refused_at_the_version_not_at_a_field() {
+    // What the deviation *array* alone could never buy. A list of departure
+    // names is unordered: a reader meeting a document produced under a later
+    // contract has nothing to refuse at — it can only notice names it happens
+    // not to recognise, and a contract that changes a field's meaning without
+    // needing a new name leaves it nothing to notice at all.
+    //
+    // `document_contract.version` is the thing that can say *this file's field
+    // contract is not one you know*, and it is checked where `schema_version`
+    // is checked: in the probe, before the typed deserialisation. So the
+    // refusal names the contract rather than whichever field serde trips on
+    // first — which is the distinction between a version-gated rejection and a
+    // data error.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    value["document_contract"]["version"] = serde_json::json!(2);
+
+    let err = chartgen::parse_str(&value.to_string())
+        .expect_err("a contract this generator does not know must be refused");
+    assert!(
+        err.to_string()
+            .contains("unknown document_contract version 2"),
+        "the refusal must name the contract, not a field: {err}"
+    );
+
+    // And it fires *before* the rows are typed: the same document with its
+    // `runs` replaced by something that could never deserialise still refuses
+    // for the contract. A check that ran after the typed parse would report
+    // the wrong problem on every document it exists for.
+    value["runs"] = serde_json::json!("not a run array");
+    let err = chartgen::parse_str(&value.to_string())
+        .expect_err("an unknown contract must refuse whatever else is wrong");
+    assert!(
+        err.to_string()
+            .contains("unknown document_contract version 2"),
+        "the contract gate must precede the typed deserialisation: {err}"
+    );
+}
+
+#[test]
+fn a_document_contract_that_disagrees_with_its_own_expansion_is_refused() {
+    // The version and the deviation list say the same thing twice, on purpose:
+    // the integer is what a reader keys on, the list is what a human reading
+    // the artifact sees. Two statements of one fact are only worth carrying if
+    // nothing can drift them apart, so the validator holds each to the other
+    // and both to the rows.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+
+    // An expansion emptied out while the version stays: the file would claim a
+    // contract it no longer describes. (A *misspelt* or duplicated member is
+    // refused one rule earlier, by the closed-set check the test below covers.)
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    value["document_contract"]["deviations"] = serde_json::json!([]);
+    let doc = parse(&value.to_string());
+    let err = chartgen::validate(&doc)
+        .expect_err("an expansion that contradicts its version must be refused, not carried")
+        .to_string();
+    assert!(
+        err.contains("document_contract version 1 names"),
+        "the refusal must name the contract the expansion contradicts: {err}"
+    );
+
+    // And the other direction: the rows stop exhibiting what the contract
+    // names. Filling the six nulls in leaves version and expansion agreeing
+    // with each other and both wrong about the document.
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    for run in value["runs"].as_array_mut().expect("runs") {
+        for row in run["results"].as_array_mut().expect("results") {
+            if row["scaling_efficiency"].is_null() {
+                row["scaling_efficiency"] = serde_json::json!(1.0);
+            }
+        }
+    }
+    let doc = parse(&value.to_string());
+    let err = chartgen::validate(&doc)
+        .expect_err("a contract no row exhibits must be refused, not carried")
+        .to_string();
+    assert!(
+        err.contains("declares `nullable_scaling_efficiency` but no row exhibits it"),
+        "the refusal must name the departure the rows no longer take: {err}"
+    );
+}
+
+#[test]
 fn a_misspelt_schema_deviation_is_refused_rather_than_ignored() {
     // The property `COMPARABILITY_KINDS` had to learn the hard way, applied to
     // the declaration: a member that fell out of every check would be
@@ -2922,12 +3013,13 @@ fn a_misspelt_schema_deviation_is_refused_rather_than_ignored() {
         "",
     ] {
         let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
-        value["schema_deviations"] = serde_json::json!([spelling]);
+        value["document_contract"]["deviations"] = serde_json::json!([spelling]);
         let doc = parse(&value.to_string());
         let err = chartgen::validate(&doc)
             .expect_err("a deviation outside the closed set must be refused, not dropped");
         assert!(
-            err.to_string().contains("schema_deviations names"),
+            err.to_string()
+                .contains("document_contract.deviations names"),
             "`{spelling}` was refused for the wrong reason: {err}"
         );
     }
@@ -2936,7 +3028,7 @@ fn a_misspelt_schema_deviation_is_refused_rather_than_ignored() {
     // declaration, and accepting it would let the array carry a count that
     // means nothing.
     let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
-    value["schema_deviations"] =
+    value["document_contract"]["deviations"] =
         serde_json::json!(["nullable_scaling_efficiency", "nullable_scaling_efficiency"]);
     let doc = parse(&value.to_string());
     chartgen::validate(&doc).expect_err("a repeated deviation must be refused");
@@ -2977,7 +3069,7 @@ fn a_row_that_omits_the_derivation_entirely_exhibits_no_deviation() {
         "an absent key must read as absent, not as an explicit null"
     );
     assert!(
-        doc.schema_deviations.is_empty(),
+        doc.document_contract.is_none(),
         "the fixture is meant to declare nothing"
     );
     chartgen::validate(&doc)

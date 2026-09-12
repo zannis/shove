@@ -534,7 +534,7 @@ barrierless set, which permits a recorded setup window without requiring one.
 The reader has nothing to object to; the producer does. Withholding by
 placement needs no version at all.
 
-#### `schema_deviations[]`: the departure, declared in the document
+#### `document_contract`: the contract these bytes conform to, versioned in the file
 
 What the paragraph above establishes is that the bump is unavailable. It does
 not make the declaration true, and stating only the first invites reading the
@@ -546,51 +546,88 @@ declares is the producer interlock described above — the thing that keeps thos
 pre-barrier rows from merging into a barriered leg — and it is not, on this
 artifact, a description of the field contract.
 
-That leaves a real gap, and for four revisions this section closed it with
-prose: a read rule, stated here, that a reader holding the JSON has no reason
-to look for. A departure from the declared contract that is written down
-somewhere else is still an undeclared departure. So the document declares it
-itself, in a key beside the version it qualifies:
+That leaves a real gap, and this section closed it twice without closing it:
+first with prose — a read rule stated here, that a reader holding the JSON has
+no reason to look for — and then with a bare list of departure names in the
+document. The second is better than the first and is still not a contract. A
+reader meeting a file whose field contract is not the one its `schema_version`
+names has to be able to say *this is not a contract I know* and stop, and an
+unordered list cannot give it that: it surfaces only the names a reader happens
+not to recognise, and a later contract that re-types a field already in the
+list surfaces nothing at all.
+
+So the document carries a contract of its own, versioned independently of
+`schema_version`, in a key beside it:
 
 ```json
 {
   "schema_version": 6,
-  "schema_deviations": ["nullable_scaling_efficiency"],
+  "document_contract": {
+    "version": 1,
+    "deviations": ["nullable_scaling_efficiency"]
+  },
 ```
 
+Two version numbers, because there are two questions and the interlock forbids
+answering them with one field. `schema_version: 6` says which contract the rows
+were **produced** under, and is the producer interlock described above.
+`document_contract.version: 1` says which field contract these bytes actually
+**conform to**, and is what a reader keys on. A document that conforms to its
+`schema_version`'s field contract carries no `document_contract` key at all —
+which is every document a clean six-backend run writes.
+
+Contract 1 is defined in one place per reader — `DOCUMENT_CONTRACTS` in
+`examples/common/stress_test.rs`, mirrored in `examples/common/chartgen.rs` —
+as exactly this set:
+
 > **`nullable_scaling_efficiency`** — one or more `results[]` rows carry
-> `scaling_efficiency: null`, where the declared version's contract types that
-> field as a plain `f64`. A `null` means the family's one-consumer baseline is
-> in `withheld[]`, so the quotient is disclaimed; it never means zero, and it
-> is never a number that went missing.
+> `scaling_efficiency: null`, where the declared `schema_version`'s contract
+> types that field as a plain `f64`. A `null` means the family's one-consumer
+> baseline is in `withheld[]`, so the quotient is disclaimed; it never means
+> zero, and it is never a number that went missing.
 
-This is deliberately **not** a second version number and it gates no merge on
-its own. The two answer different questions — which contract the rows were
-produced under, and how the file departs from it — and collapsing them is what
-the interlock forbids. Keeping them apart is what lets the version stay `6`,
-doing the one job only it can do, while the file still states what it is.
+The `deviations` array beside the version restates what the version already
+names. That is deliberate: the integer is what a reader keys on and what the
+refusals gate, the array is what a person reading the artifact sees without the
+table to hand. Two statements of one fact are only worth carrying if nothing
+can drift them apart — so the readers refuse a version whose expansion says
+something else, in either direction.
 
-Neither is it the ignorable-disclaimer mistake this section elsewhere is the
-repair of. That mistake was to make an additive key carry the **retraction** —
-an old reader skips the key and republishes `5.4904…`, the withheld
-measurement in quotient form. Here the retraction is the `null`, which no
-reader can skip; the key carries only the *name* of the departure, for a
-reader that has already been stopped by it. An ignorable label beside an
-unignorable refusal costs nothing and tells the reader which contract moved,
-which the version it cleared on the way in could not.
+An **unknown** contract version is a refusal at the declaration, and that is
+what the bare list could not buy. `chartgen::parse_str` checks it in the
+version probe, *before* the typed deserialisation and in the same place an
+unknown `schema_version` is checked, so a document written under a later
+contract is refused for the contract rather than for whichever field that
+contract re-typed. The harness raises the same refusal twice: in
+`refused_results_file_version`, before a sweep starts, where finding out late
+costs hours of broker time, and in `merge_results_file`, which is the
+authority. What no key here can do is reach a reader that predates it; that
+reader is stopped by the `null` itself, which is why the retraction lives on
+the field rather than in this declaration — see *Withholding a row withholds
+what was derived from it* below.
 
-Because it is hand-added, it is checked rather than trusted, in both
-directions and by both readers. `validate_schema_deviations` in the harness
-(`examples/common/stress_test.rs`) refuses a member outside the closed set, a
-duplicate, rows that null a derivation under no declaration, and a declaration
-no row exhibits — and it runs **before** the version gate, since a document
-whose declared version does not describe it is precisely the document the
-array exists for. The chart generator enforces the same four rules in
-`validate`, which is what holds the committed artifact to them on every
-`cargo nextest run --no-default-features`. And the harness *derives* what it
-writes from the rows (`schema_deviations_of`), so no run can produce a nulled
-derivation without producing the statement of it, and the key leaves the
-document the moment the nulls do.
+That distinction is the whole difference between this and the
+ignorable-disclaimer mistake this section elsewhere is the repair of. That
+mistake was to make an additive key carry the **retraction** — an old reader
+skips the key and republishes `5.4904…`, the withheld measurement in quotient
+form. Here the retraction is the `null`, which no reader can skip; the contract
+states which contract moved, for a reader that has already been stopped by it,
+or refuses one that knows the key and not the version.
+
+Because it is hand-added, the declaration is checked rather than trusted, in
+every direction and by both readers. `validate_document_contract` in the
+harness (`examples/common/stress_test.rs`) refuses a member outside the closed
+vocabulary, a duplicate, a version outside `DOCUMENT_CONTRACTS`, an expansion
+that is not the one its version names, rows that null a derivation under no
+declaration, and a declaration no row exhibits — and it runs **before** the
+version gate, since a document whose declared version does not describe it is
+precisely the document the key exists for. The chart generator enforces the
+same rules in `validate`, which is what holds the committed artifact to them on
+every `cargo nextest run --no-default-features`. And the harness *derives* what
+it writes from the rows (`document_contract_for`), so no run can produce a
+nulled derivation without producing the statement of it, the key leaves the
+document the moment the nulls do, and a future deviation with no contract
+naming it stops the merge rather than being written undeclared.
 
 The deviation is bounded and pinned as well as declared.
 `the_committed_documents_only_v6_deviation_is_the_withheld_derivations`
@@ -602,9 +639,17 @@ any backend or flow. A seventh null cannot arrive quietly under the v6 label.
 `the_committed_document_declares_the_deviation_it_carries` pins the
 declaration itself, and
 `a_document_that_nulls_a_derivation_without_declaring_it_is_refused` pins both
-halves of the rule against that same artifact. All of it expires together: the
-next six-backend re-measure writes a genuine v7 document with no withheld
-cells, no nulls and no `schema_deviations` key, at which point those tests and
+halves of the rule against that same artifact. The contract's own two
+properties are pinned beside them:
+`an_unknown_document_contract_is_refused_at_the_version_not_at_a_field`
+(`tests/chartgen.rs`) puts a contract from the future on the real document and
+asserts the refusal names the contract even when the rows could not
+deserialise at all, and
+`a_document_contract_this_harness_does_not_know_is_refused_at_the_declaration`
+(the harness's own tests) asserts the same on both of the harness's refusal
+points, plus the version-against-expansion check. All of it expires together:
+the next six-backend re-measure writes a genuine v7 document with no withheld
+cells, no nulls and no `document_contract` key, at which point those tests and
 `the_committed_document_is_one_no_v7_producer_could_have_written` fail by
 design and this section is rewritten with them.
 
@@ -644,10 +689,10 @@ The rest of what makes a hand-added claim safe in a generated document:
   available for the interlock reason above. Nor would dropping the field
   instead of nulling it: absent and `null` are the same parse failure against
   a non-`default` `f64`. What the null buys over silence is that the failure
-  happens at all — and what `schema_deviations` buys on top of it is that the
-  operator reading `invalid type: null, expected f64` finds the departure
-  named in the same file, rather than having to reach this page to learn which
-  contract moved.
+  happens at all — and what `document_contract` buys on top of it is that the
+  operator reading `invalid type: null, expected f64` finds the contract the
+  file conforms to named in the same file, rather than having to reach this
+  page to learn which contract moved.
 
   That cost is asserted, not merely conceded.
   `a_v6_document_reader_clears_the_version_gate_and_then_keeps_no_row_at_all`

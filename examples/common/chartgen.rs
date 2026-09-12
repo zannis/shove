@@ -277,23 +277,38 @@ pub const COMPARABILITY_KINDS: &[&str] = &[COMPARABILITY_HOST_CLOCK_FLOOR];
 /// `benches/README.md` for the measurements that establish it.
 pub const COMPARABILITY_HOST_CLOCK_FLOOR: &str = "host_clock_floor";
 
-/// The closed set the document-level `schema_deviations` array draws from,
-/// mirroring the harness's `SCHEMA_DEVIATIONS` — where a document states, in
-/// the artifact rather than in prose, how it departs from the field contract
-/// its [`SCHEMA_VERSION`] names.
-///
-/// It is a declaration, not a second version: this generator reads it to
-/// refuse a document whose declaration and rows disagree, never to change how
-/// a row is plotted. The reason the two cannot be one field is in the harness
-/// const's doc and in `benches/README.md` — the version is a producer
-/// interlock, so a document that deviates from its version's field contract
-/// cannot say so by moving the version without releasing the interlock.
+/// The closed vocabulary a [`DOCUMENT_CONTRACTS`] expansion is written in,
+/// mirroring the harness's `SCHEMA_DEVIATIONS` — the ways a document is
+/// allowed to depart from the field contract its [`SCHEMA_VERSION`] names,
+/// stated in the artifact rather than in prose.
 ///
 /// Refused rather than ignored when unknown, for the reason
 /// [`COMPARABILITY_KINDS`] gives: a misspelt declaration that fell out of
 /// every check would be indistinguishable from no declaration, which is the
-/// exact state the array exists to end.
+/// exact state the declaration exists to end.
 pub const SCHEMA_DEVIATIONS: &[&str] = &[DEVIATION_NULLABLE_SCALING_EFFICIENCY];
+
+/// Every document contract this generator understands, newest last, mirroring
+/// the harness's table of the same name: the version, and the exact set of
+/// [`SCHEMA_DEVIATIONS`] it names.
+///
+/// A document whose bytes conform to [`Document::schema_version`]'s field
+/// contract carries no `document_contract` key at all. One that has been
+/// hand-annotated after the run — a cell withheld, so the derivations off its
+/// baseline are nulled — conforms to no `schema_version`'s field contract, and
+/// cannot say so by moving that version: on a results document the version is
+/// a *producer interlock* (see the harness const's doc and
+/// `benches/README.md`), so moving it releases the one job only it does. The
+/// contract such a document does conform to is versioned here instead.
+///
+/// The version is what a reader keys on and what [`parse_str`] gates: a
+/// contract outside this table is refused at the probe, before a field is
+/// typed, exactly as an unknown [`SCHEMA_VERSIONS`] member is. That is what
+/// the bare deviation list this replaces could not buy — a list is unordered,
+/// so a reader meeting a later contract can only notice names it happens not
+/// to recognise, and a contract that re-types a field it already names gives
+/// it nothing to notice.
+pub const DOCUMENT_CONTRACTS: &[(u32, &[&str])] = &[(1, &[DEVIATION_NULLABLE_SCALING_EFFICIENCY])];
 
 /// One or more `results[]` rows carry `scaling_efficiency: null`, where the
 /// declared version's contract types that field as a plain `f64`. A `null`
@@ -435,18 +450,36 @@ pub const ALIASED_FLOWS: &[(&str, &str)] = &[("supervisor", "consume_parallel")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Document {
     pub schema_version: u32,
-    /// How this document departs from [`Self::schema_version`]'s field
-    /// contract, from the closed [`SCHEMA_DEVIATIONS`] set. Absent on a
-    /// document that departs from nothing, which is every document a clean
-    /// six-backend run writes.
+    /// The field contract these bytes conform to, from the closed
+    /// [`DOCUMENT_CONTRACTS`] table, when that is not
+    /// [`Self::schema_version`]'s — absent on a document that departs from
+    /// nothing, which is every document a clean six-backend run writes.
+    ///
+    /// `#[serde(default)]` is not an accept path here: [`validate`] derives
+    /// the departures the rows exhibit and requires the key to be present
+    /// exactly when they exhibit any, so an omission is caught by the rows
+    /// rather than granted by the default.
     #[serde(default)]
-    pub schema_deviations: Vec<String>,
+    pub document_contract: Option<DocumentContract>,
     pub generated_at: String,
     pub shove_version: String,
     #[serde(default)]
     pub rust_version: String,
     pub hardware: Hardware,
     pub runs: Vec<BackendRun>,
+}
+
+/// A document's own field contract, versioned independently of
+/// `schema_version` — see [`DOCUMENT_CONTRACTS`].
+///
+/// The two fields state one fact twice, deliberately: [`Self::version`] is
+/// what a reader keys on and what the probe gates, [`Self::deviations`] is
+/// what a human reading the artifact sees without a table to hand. [`validate`]
+/// holds each to the other and both to the rows, so the pair cannot drift.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DocumentContract {
+    pub version: u32,
+    pub deviations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -612,7 +645,7 @@ pub struct ScenarioResult {
     pub comparability: Option<String>,
     /// The family's throughput over its one-consumer row, or `null` when that
     /// baseline is in [`BackendRun::withheld`]. Never plotted: read only so
-    /// [`validate`] can hold the document's `schema_deviations` declaration to
+    /// [`validate`] can hold the document's `document_contract` declaration to
     /// its rows — see [`DEVIATION_NULLABLE_SCALING_EFFICIENCY`].
     ///
     /// A **double** option, so absent and `null` stay distinguishable: `None`
@@ -857,10 +890,25 @@ pub enum ChartError {
         found: u32,
         expected: u32,
     },
-    /// Rule 1b — the document's `schema_deviations` array names something
-    /// outside [`SCHEMA_DEVIATIONS`], or names it twice.
+    /// Rule 1b — a `document_contract.version` outside [`DOCUMENT_CONTRACTS`].
+    /// Raised by [`parse_str`] before the typed deserialisation, so a document
+    /// written under a contract this generator has never seen is refused for
+    /// the contract rather than for whichever field it happens to re-type.
+    UnknownDocumentContract {
+        found: u32,
+    },
+    /// Rule 1b — the document's `document_contract.deviations` array names
+    /// something outside [`SCHEMA_DEVIATIONS`], or names it twice.
     UnknownSchemaDeviation {
         found: String,
+    },
+    /// Rule 1b — the declared contract version and the expansion beside it
+    /// name different sets. One of the two is stale, and which is not knowable
+    /// from the document.
+    DocumentContractMismatch {
+        version: u32,
+        names: &'static [&'static str],
+        listed: Vec<String>,
     },
     /// Rule 1b — the declaration and the rows disagree: a deviation the rows
     /// exhibit and the document does not declare (`declared: false`), or one
@@ -932,28 +980,50 @@ impl fmt::Display for ChartError {
                  {SCHEMA_VERSIONS:?} and writes charts for v{expected}. Refusing \
                  to render rather than silently mis-reading a newer document."
             ),
+            Self::UnknownDocumentContract { found } => write!(
+                f,
+                "unknown document_contract version {found}: this chartgen \
+                 understands {:?}. The document states that its field contract \
+                 is not the one its schema_version names, and not one this \
+                 reader knows either — refusing to read it as though it were.",
+                DOCUMENT_CONTRACTS
+                    .iter()
+                    .map(|(v, _)| *v)
+                    .collect::<Vec<_>>()
+            ),
             Self::UnknownSchemaDeviation { found } => write!(
                 f,
-                "schema_deviations names `{found}`, which is not one of \
-                 {SCHEMA_DEVIATIONS:?} (or names it twice). A declaration \
+                "document_contract.deviations names `{found}`, which is not one \
+                 of {SCHEMA_DEVIATIONS:?} (or names it twice). A declaration \
                  nothing recognises declares nothing."
+            ),
+            Self::DocumentContractMismatch {
+                version,
+                names,
+                listed,
+            } => write!(
+                f,
+                "document_contract version {version} names {names:?}, but the \
+                 expansion beside it lists {listed:?}. The version is what a \
+                 reader keys on and the list is what a person reads; one of \
+                 them is stale and the document cannot say which."
             ),
             Self::SchemaDeviationMismatch {
                 deviation,
                 declared: false,
             } => write!(
                 f,
-                "the rows exhibit `{deviation}` but schema_deviations does not \
-                 declare it. How a document departs from its declared \
-                 schema_version's field contract is stated in the document, \
-                 not left for a reader to discover at the field."
+                "the rows exhibit `{deviation}` but the document declares no \
+                 document_contract that names it. How a document departs from \
+                 its declared schema_version's field contract is stated in the \
+                 document, not left for a reader to discover at the field."
             ),
             Self::SchemaDeviationMismatch {
                 deviation,
                 declared: true,
             } => write!(
                 f,
-                "schema_deviations declares `{deviation}` but no row exhibits \
+                "document_contract declares `{deviation}` but no row exhibits \
                  it — a declaration left behind by a re-measure describes a \
                  document that no longer exists."
             ),
@@ -1034,8 +1104,8 @@ impl From<serde_json::Error> for ChartError {
 
 // ── Validation: the enforcement rules that gate every render ────────────────
 
-/// Rule 1b: the document's `schema_deviations` declaration, held to its rows
-/// in both directions.
+/// Rule 1b: the document's `document_contract` declaration, held to its
+/// expansion and to its rows, in every direction.
 ///
 /// The declaration is what makes a departure from the declared version's field
 /// contract legible to a reader holding the file, rather than only to a reader
@@ -1043,14 +1113,31 @@ impl From<serde_json::Error> for ChartError {
 /// the same rule [`COMPARABILITY_KINDS`] follows: a hand-added claim in a
 /// generated document is only worth the check that keeps it true.
 ///
+/// Three checks, in this order, because each one's refusal is only legible
+/// once the ones before it hold: the expansion is written in the closed
+/// vocabulary, the expansion is the one its version names, and the rows are
+/// what that version describes.
+///
 /// A row that omits `scaling_efficiency` entirely exhibits nothing — the
 /// deviation is the explicit `null`. See
 /// [`ScenarioResult::scaling_efficiency`] for why the two are kept apart.
-fn validate_schema_deviations(doc: &Document) -> Result<(), ChartError> {
+fn validate_document_contract(doc: &Document) -> Result<(), ChartError> {
     let mut declared: BTreeSet<&str> = BTreeSet::new();
-    for d in &doc.schema_deviations {
-        if !SCHEMA_DEVIATIONS.contains(&d.as_str()) || !declared.insert(d.as_str()) {
-            return Err(ChartError::UnknownSchemaDeviation { found: d.clone() });
+    if let Some(contract) = &doc.document_contract {
+        for d in &contract.deviations {
+            if !SCHEMA_DEVIATIONS.contains(&d.as_str()) || !declared.insert(d.as_str()) {
+                return Err(ChartError::UnknownSchemaDeviation { found: d.clone() });
+            }
+        }
+        // `parse_str` refuses an unknown version before a field is typed; a
+        // `Document` built any other way reaches it here.
+        let names = named_document_contract(contract.version)?;
+        if declared != names.iter().copied().collect::<BTreeSet<&str>>() {
+            return Err(ChartError::DocumentContractMismatch {
+                version: contract.version,
+                names,
+                listed: contract.deviations.clone(),
+            });
         }
     }
 
@@ -1069,6 +1156,16 @@ fn validate_schema_deviations(doc: &Document) -> Result<(), ChartError> {
     Ok(())
 }
 
+/// The deviation set a [`DOCUMENT_CONTRACTS`] version names, or the refusal
+/// for a contract this generator does not know.
+fn named_document_contract(version: u32) -> Result<&'static [&'static str], ChartError> {
+    DOCUMENT_CONTRACTS
+        .iter()
+        .find(|(v, _)| *v == version)
+        .map(|(_, names)| *names)
+        .ok_or(ChartError::UnknownDocumentContract { found: version })
+}
+
 /// Rules 1, 1b, 5 and 6 of the schema contract. Checked once, before any chart
 /// is drawn, so a bad document fails before it can write a single file.
 pub fn validate(doc: &Document) -> Result<(), ChartError> {
@@ -1078,7 +1175,7 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
             expected: SCHEMA_VERSION,
         });
     }
-    validate_schema_deviations(doc)?;
+    validate_document_contract(doc)?;
     let barrierless = barrierless_flows(doc.schema_version);
 
     // Everything the provenance block prints as text. The numeric hardware
@@ -1643,6 +1740,12 @@ pub fn parse_str(raw: &str) -> Result<Document, ChartError> {
     struct VersionProbe {
         #[serde(default)]
         schema_version: u32,
+        #[serde(default)]
+        document_contract: Option<ContractProbe>,
+    }
+    #[derive(Deserialize)]
+    struct ContractProbe {
+        version: u32,
     }
     let probe: VersionProbe = serde_json::from_str(raw)?;
     if !SCHEMA_VERSIONS.contains(&probe.schema_version) {
@@ -1650,6 +1753,13 @@ pub fn parse_str(raw: &str) -> Result<Document, ChartError> {
             found: probe.schema_version,
             expected: SCHEMA_VERSION,
         });
+    }
+    // The same gate, for the same reason, on the other version this document
+    // can carry: a document produced under a contract this generator does not
+    // know may re-type any field, so the refusal has to name the contract
+    // rather than whichever re-typed field serde reaches first.
+    if let Some(contract) = &probe.document_contract {
+        named_document_contract(contract.version)?;
     }
     let doc: Document = serde_json::from_str(raw)?;
     validate(&doc)?;
