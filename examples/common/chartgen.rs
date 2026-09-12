@@ -99,9 +99,14 @@ pub const SCHEMA_VERSION: u32 = 7;
 /// `setup_bound`, so every one of them is already withheld from an absolute
 /// axis by its own marker. Nothing a v6 document charts moved.
 ///
-/// What is open is the *acceptance* rule, not the plotting rule: `dlq_drain`
-/// is held to the v6 shape in a v6 document and the v7 shape in a v7 one, so
-/// neither document can carry the other's. The reason both are readable at
+/// What is open is the *acceptance* rule, not the plotting rule: a v6
+/// document is held to the v6 `dlq_drain` shape, so it cannot carry a v7 row.
+/// The converse is the producer's to enforce, not this generator's — from v7
+/// `dlq_drain` merely *leaves* [`BARRIERLESS_FLOWS_THROUGH_V6`], and leaving
+/// permits a recorded setup window without requiring one, so a v6-shaped row
+/// stays acceptable here in a v7 document. The harness refuses it
+/// (`validate_run`), which is where that half binds; do not read this list as
+/// the generator rejecting a mislabelled file. The reason both are readable at
 /// once is that the harness's barrier change and the six-backend re-measure
 /// that replaces the committed document do not land together — the
 /// [`SCHEMA_VERSION`] bump is exactly what forces that re-measure to start
@@ -235,12 +240,15 @@ pub const COST_NO_HANDLER: &str = "no_handler";
 /// disclaimer does not withhold anything from a reader that ignores it.
 ///
 /// A `schema_version` bump is the usual way to make an old reader refuse, and
-/// it is the wrong instrument for the committed document: that document's
-/// `dlq_drain` rows are v6-shaped on all six backends, so declaring it v7
-/// would misstate their lineage — silently, because [`barrierless_flows`]
-/// only stops a *barrierless* flow from claiming a setup window, and from v7
-/// `dlq_drain` merely leaves that set, so its v6 shape stays legal and
-/// nothing here refuses the mislabelled file. Moving the cell
+/// it is the wrong instrument for the committed document: the version it
+/// declares is a live interlock on the *producer* side, where a v6-shaped
+/// `dlq_drain` row is refused outright, and re-declaring the file v7 opens
+/// the merge gate that refusal currently sits behind. It would not be caught
+/// *here*: [`barrierless_flows`] only stops a barrierless flow from claiming
+/// a setup window, and from v7 `dlq_drain` merely leaves that set, so its v6
+/// shape stays legal to this generator. See the `schema_version` paragraph
+/// under *A withheld cell does not sit in `results[]`* in `benches/README.md`
+/// for the whole argument and the tests pinning both halves. Moving the cell
 /// out of `results[]` needs no version at all — a reader that does not know
 /// `withheld[]` finds no row for the cell, and cannot derive a ratio from a
 /// row it does not have. Old readers lose exactly the two numbers they must

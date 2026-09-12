@@ -2680,14 +2680,21 @@ fn a_withheld_baseline_leaves_no_derived_scaling_value_behind() {
 
 #[test]
 fn a_v7_declaration_of_the_committed_document_is_not_refused() {
-    // Why that refusal had to be bought on the field itself rather than with
-    // a `schema_version` bump. The committed document is v6 and its
-    // `dlq_drain` rows were measured by the pre-barrier driver, so declaring
-    // it v7 would misstate the lineage of six backends' rows — and nothing
-    // here would say so. `barrierless_flows` only stops a *barrierless* flow
-    // from claiming a setup window; from v7 `dlq_drain` merely leaves that
-    // set, which permits the barrier shape without requiring it, so
-    // `setup_secs: null` with `setup_bound` stays a legal row.
+    // One half of why that refusal had to be bought on the field itself
+    // rather than with a `schema_version` bump — the half that binds *here*,
+    // in the reader. The committed document is v6 and its `dlq_drain` rows
+    // were measured by the pre-barrier driver, and this generator would not
+    // object to them under a v7 declaration: `barrierless_flows` only stops a
+    // *barrierless* flow from claiming a setup window, and from v7
+    // `dlq_drain` merely leaves that set, which permits the barrier shape
+    // without requiring it, so `setup_secs: null` with `setup_bound` stays a
+    // legal row to read.
+    //
+    // The producer half — that the same bytes declared v7 are refused per row
+    // by the harness's `validate_run`, so the version field is an interlock
+    // rather than a label — is pinned by
+    // `the_committed_document_is_one_no_v7_producer_could_have_written` in
+    // `examples/common/stress_test.rs` (run by `tests/bench_harness.rs`).
     //
     // Pinned because the runbook's reasoning rests on it: if a later rule
     // does make a v7 document require the barrier shape on `dlq_drain`, this

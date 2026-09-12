@@ -5250,6 +5250,14 @@ struct ScenarioResult {
     /// field whose meaning actually changed — and it costs no reader anything
     /// on a document that withholds nothing, where every row still carries a
     /// number.
+    ///
+    /// The bump itself is not available on the committed document, and not as
+    /// a matter of taste: its declared version is an interlock this file
+    /// enforces, not a label — see
+    /// `the_committed_document_is_one_no_v7_producer_could_have_written` and
+    /// the `schema_version` paragraph in `benches/README.md`. Absent would
+    /// buy nothing over `null` either: against a non-`default` `f64` they are
+    /// the same parse failure.
     scaling_efficiency: Option<f64>,
     peak_rss_mb: f64,
     cpu_pct: f64,
@@ -10165,6 +10173,58 @@ mod tests {
         run.results[0].duration_secs = 2.0;
         run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
         validate_run(&run).unwrap_or_else(|e| panic!("honest row refused: {e}"));
+    }
+
+    #[test]
+    fn the_committed_document_is_one_no_v7_producer_could_have_written() {
+        // The declared `schema_version` on the committed document is an
+        // interlock, not a label — which is what makes a bump the wrong
+        // instrument for buying an old reader's refusal there.
+        //
+        // Every one of its `dlq_drain` rows carries the pre-barrier shape
+        // (`setup_secs: null`), which the test above shows this harness
+        // refuses outright, at every marker and at every version: the shape
+        // left the contract when the barrier landed. Today that never
+        // surfaces, because [`merge_results_file`] reaches the version gate
+        // first and refuses a v6 file with one legible "move it aside"
+        // message — and `refused_results_file_version` raises the same
+        // refusal before the sweep rather than after it.
+        //
+        // Re-declare the same bytes v7 and the gate opens: the file reaches
+        // the preserved-run check below and is refused per row as an invalid
+        // v7 document. So the bump does not restate how those rows were
+        // measured, it releases the interlock that currently keeps a
+        // barriered leg from merging into five pre-barrier ones.
+        //
+        // When the six-backend re-measure lands, the fresh document is v7 and
+        // every row here becomes valid: this test then fails, and the
+        // `benches/README.md` paragraph it pins is rewritten with it rather
+        // than left standing on a premise that has expired.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("benches/results/bench-results.json");
+        let raw = std::fs::read_to_string(&path).expect("the committed results document reads");
+        let doc: BenchResults =
+            serde_json::from_str(&raw).expect("the committed document parses as a results file");
+        assert_eq!(
+            doc.schema_version, 6,
+            "the committed document is no longer v6 — this test's premise, and the runbook \
+             paragraph it pins, both need revisiting"
+        );
+        assert_eq!(doc.runs.len(), 6, "the document publishes six backends");
+        for preserved in &doc.runs {
+            let err = match validate_run(preserved) {
+                Ok(()) => panic!(
+                    "{}: a v{RESULTS_SCHEMA_VERSION} harness now accepts the committed run",
+                    preserved.backend
+                ),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("setup_secs") && err.contains(Flow::DlqDrain.as_str()),
+                "{}: refused for something other than a pre-barrier `dlq_drain` window: {err}",
+                preserved.backend
+            );
+        }
     }
 
     #[test]

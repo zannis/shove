@@ -509,18 +509,30 @@ not have. It loses exactly the two numbers it must not publish and keeps every
 number it may.
 
 A `schema_version` bump is the usual way to make an old reader refuse a
-document it can no longer read correctly, and it is the wrong instrument here:
-this document's `dlq_drain` rows are v6-shaped on all six backends
-(`setup_secs: null`, `handler_cost: setup_bound`) because a pre-barrier driver
-measured them, so declaring it v7 would misstate the lineage of six backends'
-rows — and nothing would catch it. From v7 `dlq_drain` only *leaves* the
-barrierless set, which permits a recorded setup window without requiring one,
-so its v6 shape stays a legal row. The generator accepts the committed document
-verbatim under a v7 declaration — pinned by
-`a_v7_declaration_of_the_committed_document_is_not_refused` in
-`tests/chartgen.rs` — so the bump would buy an old reader's refusal at the price
-of an unchecked false statement about how those rows were measured. Withholding
-by placement needs no version at all.
+document it can no longer read correctly, and it is the wrong instrument here —
+not because the declaration would merely read oddly, but because on this
+document the version field is a **live interlock**. Its `dlq_drain` rows are
+v6-shaped on all six backends (`setup_secs: null`, `handler_cost:
+setup_bound`), the shape that left the contract when that flow gained its
+readiness barrier: `validate_run` refuses it outright, under either marker,
+at any version. What keeps that from ever surfacing is the v6 declaration
+itself — `merge_results_file` reaches the version gate first and refuses the
+file with one legible *move it aside* message, and the harness raises the same
+refusal before the sweep rather than after hours of broker time. Re-declare the
+same bytes v7 and that gate opens: the file clears it, reaches the
+preserved-run check, and is refused there per row instead. So the bump does not
+relabel how those rows were measured — it releases the interlock that today
+keeps a barriered leg from merging into five pre-barrier ones.
+
+Both halves of that are pinned, because they sit in different crates' readers.
+`the_committed_document_is_one_no_v7_producer_could_have_written` (the
+harness's own tests, run by `tests/bench_harness.rs`) asserts the per-row
+refusal against the committed artifact. `a_v7_declaration_of_the_committed_document_is_not_refused`
+(`tests/chartgen.rs`) records the other side: the **chart generator** does not
+refuse the mislabelled file, because from v7 `dlq_drain` only *leaves* the
+barrierless set, which permits a recorded setup window without requiring one.
+The reader has nothing to object to; the producer does. Withholding by
+placement needs no version at all.
 
 The rest of what makes a hand-added claim safe in a generated document:
 
@@ -549,6 +561,16 @@ The rest of what makes a hand-added claim safe in a generated document:
   a `schema_version` bump would normally buy, on the one field whose meaning
   actually changed, and at no cost to a document that withholds nothing, where
   every row still carries a number.
+
+  The cost that *is* paid is stated rather than hidden: serde types a
+  document, not a cell, so such a reader loses the whole file rather than the
+  six rows, and its error names a field rather than a version. Neither is
+  avoidable here. A bump would not soften the first — an old reader refuses a
+  bumped document *entirely*, which is the point of bumping — and it is not
+  available for the interlock reason above. Nor would dropping the field
+  instead of nulling it: absent and `null` are the same parse failure against
+  a non-`default` `f64`. What the null buys over silence is that the failure
+  happens at all.
 - **A merge preserves it; a re-measure drops it.** Refreshing another
   backend's leg keeps that backend's entries. Re-measuring the withheld
   backend writes ordinary rows and no entries, deliberately: the claim is
