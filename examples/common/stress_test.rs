@@ -32,7 +32,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -140,6 +140,94 @@ use tokio_util::sync::CancellationToken;
 /// document: it is the one consume flow that cannot hold a barrier at all,
 /// for the reason [`Flow::holds_readiness_barrier`] gives.
 pub const RESULTS_SCHEMA_VERSION: u32 = 7;
+
+/// The closed set the optional per-row `comparability` field draws from — the
+/// schema's **withholding** marker, mirrored by the chart generator.
+///
+/// It carries no version semantics and so appears in no paragraph above: it
+/// is additive, optional, and only ever *withholds* a row from publication,
+/// so a reader that does not know the field publishes exactly what it
+/// published before. A document of any version this harness can read may
+/// carry it. What it must never do is arrive misspelt and be ignored, which
+/// is why [`validate_run`] refuses a value outside this set rather than
+/// dropping it.
+pub const COMPARABILITY_KINDS: &[&str] = &[COMPARABILITY_HOST_CLOCK_FLOOR];
+
+/// The row's rate is bounded by the measuring host's CPU clock rather than by
+/// the backend: a single-threaded consumer that spends most of each cycle
+/// waiting on the broker never sustains the utilisation that keeps the host's
+/// cores clocked up, and every phase of its loop — client-side decode
+/// included — runs at the reduced clock. Such a row is a **floor** for its
+/// flow, is comparable with nothing (not another backend, another version, or
+/// the same cell at more consumers), and rises under unrelated load on the
+/// same host. The measurements establishing it are under *A lone consumer on
+/// the macOS host clocks down* in `benches/README.md`.
+pub const COMPARABILITY_HOST_CLOCK_FLOOR: &str = "host_clock_floor";
+
+/// The closed vocabulary a [`DOCUMENT_CONTRACTS`] expansion is written in —
+/// the ways a document may depart from the field contract its
+/// [`RESULTS_SCHEMA_VERSION`] names, stated **in the artifact rather than in
+/// prose**.
+///
+/// Closed and checked in both directions by [`validate_document_contract`]: a
+/// member outside this set is refused, so is a duplicate, so is a deviation
+/// the rows exhibit and the document does not declare, and so is one declared
+/// with nothing in the rows that exhibits it. A departure can therefore
+/// neither be misspelt into silence nor left behind once the document that
+/// needed it is re-measured.
+pub const SCHEMA_DEVIATIONS: &[&str] = &[DEVIATION_NULLABLE_SCALING_EFFICIENCY];
+
+/// Every document contract this harness knows, newest last: the version, and
+/// the exact [`SCHEMA_DEVIATIONS`] set it names.
+///
+/// This exists because the two jobs a version number is normally asked to do
+/// come apart on a hand-annotated document. `schema_version` is a *producer
+/// interlock* here: [`merge_results_file`] refuses a document whose version is
+/// not this binary's, which is what keeps runs measured under one contract
+/// from merging into runs measured under another. A document that also
+/// deviates from its version's *field* contract — because a cell was withheld
+/// by hand after the run, so the derivations off its baseline are nulled —
+/// cannot say so by moving the version, since moving it releases that
+/// interlock.
+///
+/// So it carries a second, independently versioned declaration instead, and
+/// the two answer the two different questions: `schema_version` says which
+/// contract the rows were **produced** under, `document_contract.version` says
+/// which contract these bytes actually **conform to**. A document that
+/// conforms to its `schema_version`'s field contract carries no
+/// `document_contract` key at all.
+///
+/// Being a version rather than a bare list is what lets a reader refuse: an
+/// unrecognised contract is a refusal at the declaration — the harness raises
+/// it in [`refused_results_file_version`] before the sweep and again in
+/// [`merge_results_file`] before a row is read — where an unordered list of
+/// departure names only ever offers a reader names it may happen not to
+/// recognise. It still gates no merge *by itself*: what the merge refuses is
+/// the mismatch between version, expansion and rows.
+///
+/// **A departure's name is its identity, so no two versions may name the same
+/// set.** The producer never carries an input document's declaration forward;
+/// [`document_contract_for`] re-derives it from the departures the merged rows
+/// exhibit, which is what keeps a declaration from outliving the rows it
+/// describes. That derivation can only be unambiguous if the set determines
+/// the version, so a contract that changes what a departure *means*, or how it
+/// is *represented*, arrives as a new [`SCHEMA_DEVIATIONS`] name rather than as
+/// a second version over the same vocabulary — and then old readers refuse it
+/// twice over, at the contract version and at the name. Two entries naming one
+/// set are refused by [`contract_naming`] rather than resolved by table order.
+pub const DOCUMENT_CONTRACTS: &[(u32, &[&str])] = &[(1, &[DEVIATION_NULLABLE_SCALING_EFFICIENCY])];
+
+/// One or more `results[]` rows carry `scaling_efficiency: null`, where the
+/// declared version's contract types that field as a plain `f64`.
+///
+/// A `null` means the family's one-consumer baseline is in
+/// [`BackendRun::withheld`], so the quotient is disclaimed; it never means
+/// zero, and it is never a number that went missing. A reader built against
+/// the `f64` contract refuses such a document at the field — that refusal is
+/// the point of nulling rather than omitting — and this declaration is what
+/// names the field it will refuse on, since the version it cleared on the way
+/// in could not.
+pub const DEVIATION_NULLABLE_SCALING_EFFICIENCY: &str = "nullable_scaling_efficiency";
 
 /// Default `--load-window-secs`: long enough for a rate, short enough that a
 /// six-rung ladder over a full consumer sweep finishes in an hour per backend.
@@ -5208,7 +5296,34 @@ struct ScenarioResult {
     e2e_p50_ms: f64,
     e2e_p95_ms: f64,
     e2e_p99_ms: f64,
-    scaling_efficiency: f64,
+    /// This row's throughput over its family's **one-consumer** throughput —
+    /// see [`ScalingKey`] for what makes two rows one family.
+    ///
+    /// `null` when that baseline is not published: a withheld cell
+    /// (`BackendRun::withheld`) is a measurement the document declines to
+    /// stand behind, and a quotient of a disclaimed number is disclaimed too.
+    /// Relocating the source row while still publishing `5.4904…` — which is
+    /// exactly `726,872 / 132,388` — would let a reader present a conclusion
+    /// computed from the number it was denied, which is the same failure as
+    /// publishing the number. [`validate_run`] enforces both directions: null
+    /// iff the family's baseline is withheld.
+    ///
+    /// Nullable rather than absent, and deliberately **not** `default`: a
+    /// reader built against the `f64` this used to be refuses a document that
+    /// nulls it, instead of silently republishing a stale derivation. That is
+    /// the refusal a `schema_version` bump would normally buy, on the one
+    /// field whose meaning actually changed — and it costs no reader anything
+    /// on a document that withholds nothing, where every row still carries a
+    /// number.
+    ///
+    /// The bump itself is not available on the committed document, and not as
+    /// a matter of taste: its declared version is an interlock this file
+    /// enforces, not a label — see
+    /// `the_committed_document_is_one_no_v7_producer_could_have_written` and
+    /// the `schema_version` paragraph in `benches/README.md`. Absent would
+    /// buy nothing over `null` either: against a non-`default` `f64` they are
+    /// the same parse failure.
+    scaling_efficiency: Option<f64>,
     peak_rss_mb: f64,
     cpu_pct: f64,
     /// The measured window. On every consume flow that holds a readiness
@@ -5252,6 +5367,29 @@ struct ScenarioResult {
     /// `messages` is `drain.corpus`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     drain: Option<DrainResult>,
+    /// Why this cell's rate is not a result, when the *measuring host* rather
+    /// than the backend bounded it — one of [`COMPARABILITY_KINDS`], required
+    /// on every entry of `BackendRun::withheld` and refused on every row of
+    /// `results[]`.
+    ///
+    /// This is the one field in the schema no measurement writes. The harness
+    /// cannot detect what it names (a property of the machine, established by
+    /// a separate investigation), so it is added to a published document by
+    /// hand against evidence recorded in `benches/README.md` — and everything
+    /// else here treats it as data: [`merge_results_file`] preserves it
+    /// across a single-backend merge, and [`validate_run`] holds it to the
+    /// closed set, so a typo cannot silently un-withhold the cell. A fresh
+    /// measurement writes the cell as an ordinary row, deliberately: the
+    /// marker is a claim about one number, and a new number has to earn it
+    /// again.
+    ///
+    /// The field names the cause; it does not do the withholding. A marked
+    /// row left in `results[]` would be published as usual by any reader that
+    /// does not know the field — neither this struct nor chartgen's denies
+    /// unknown fields — which is why the *placement* is the mechanism and
+    /// this is refused outside `withheld[]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comparability: Option<String>,
 }
 
 /// What an offered-load rung measured, as stamped on its row. Every field a
@@ -5450,6 +5588,22 @@ struct BackendRun {
     results: Vec<ScenarioResult>,
     failures: Vec<FailedResult>,
     unsupported: Vec<Unsupported>,
+    /// Cells measured on this backend that the document declines to publish,
+    /// because the measuring host rather than the backend set the number.
+    /// Each entry is the row it would have been, plus the required
+    /// `comparability` cause — see that field for why a withheld cell lives
+    /// here rather than as a marked row in `results[]`.
+    ///
+    /// No run of this harness writes an entry: a withholding is a claim about
+    /// the machine, which the harness cannot detect, so entries are
+    /// hand-added against evidence recorded in `benches/README.md`. What the
+    /// harness does is keep them honest — [`validate_run`] holds an entry to
+    /// the same shape as a row and to the closed cause set, a single-backend
+    /// merge preserves another backend's entries, and a re-measure of this
+    /// one drops its own (a freshly built run carries none, so the drop needs
+    /// no code).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    withheld: Vec<ScenarioResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5464,11 +5618,37 @@ struct Hardware {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BenchResults {
     schema_version: u32,
+    /// The field contract these bytes conform to, from the closed
+    /// [`DOCUMENT_CONTRACTS`] table, when that is not `schema_version`'s.
+    /// Absent on every document the harness writes from a clean run, which is
+    /// every document that deviates from nothing — see
+    /// [`document_contract_for`].
+    ///
+    /// `#[serde(default)]` grants nothing: [`validate_document_contract`]
+    /// derives the departures the rows exhibit and requires the key present
+    /// exactly when they exhibit any, so an omission is caught against the
+    /// rows rather than accepted by the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    document_contract: Option<DocumentContract>,
     generated_at: String,
     shove_version: String,
     rust_version: String,
     hardware: Hardware,
     runs: Vec<BackendRun>,
+}
+
+/// A document's own field contract, versioned independently of
+/// `schema_version` — see [`DOCUMENT_CONTRACTS`].
+///
+/// The two fields state one fact twice, deliberately: `version` is what a
+/// reader keys on and what the refusals gate, `deviations` is what a person
+/// reading the artifact sees without this table to hand.
+/// [`validate_document_contract`] holds each to the other and both to the
+/// rows, so the pair cannot drift.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DocumentContract {
+    version: u32,
+    deviations: Vec<String>,
 }
 
 // ── Provenance ──────────────────────────────────────────────────────────────
@@ -5712,8 +5892,49 @@ fn validate_run(run: &BackendRun) -> Result<(), String> {
         Ok(*known)
     }
 
-    for r in &run.results {
-        let flow = check_row(&run.backend, "result", &r.flow, &r.mode, r.payload_bytes)?;
+    // A withheld cell is held to every rule a published row is held to: it is
+    // a real measurement the document declines to publish, so an entry that
+    // could not have been a valid row is one the harness never took.
+    for (r, is_withheld) in run
+        .results
+        .iter()
+        .map(|r| (r, false))
+        .chain(run.withheld.iter().map(|r| (r, true)))
+    {
+        let kind_label = if is_withheld { "withheld" } else { "result" };
+        let flow = check_row(&run.backend, kind_label, &r.flow, &r.mode, r.payload_bytes)?;
+        // The one field no run writes, so the one field a hand edit can get
+        // wrong — in two ways, both of which publish the number the edit
+        // meant to withhold. An unrecognised marker reads as no marker
+        // everywhere downstream; and a marker on a `results[]` row is ignored
+        // outright by any reader that does not know the field, which is every
+        // reader built before it existed. Both are refused here, on the way
+        // into a merged document.
+        match (is_withheld, r.comparability.as_deref()) {
+            (false, Some(kind)) => {
+                return Err(format!(
+                    "run '{}' has a result for flow '{}' carrying comparability '{kind}'. A \
+                     reader that does not know the field publishes that row anyway — move the \
+                     cell to withheld[] instead",
+                    run.backend, r.flow
+                ));
+            }
+            (true, None) => {
+                return Err(format!(
+                    "run '{}' withholds a cell for flow '{}' without a comparability marker, so \
+                     the document does not say why it is withheld",
+                    run.backend, r.flow
+                ));
+            }
+            (true, Some(kind)) if !COMPARABILITY_KINDS.contains(&kind) => {
+                return Err(format!(
+                    "run '{}' has a withheld cell for flow '{}' carrying comparability '{kind}', \
+                     which is not one of {COMPARABILITY_KINDS:?}",
+                    run.backend, r.flow
+                ));
+            }
+            _ => {}
+        }
         // `handler_cost` says what `throughput_msg_per_sec` measures, and it is
         // fully determined by the row's own flow and handler — so it is
         // checkable, not merely present. Re-derive it: a `consume_batch` +
@@ -5854,11 +6075,96 @@ fn validate_run(run: &BackendRun) -> Result<(), String> {
                 run.backend, u.flow
             ));
         }
-        if run.results.iter().any(|r| r.flow == u.flow) {
+        // A withheld cell was measured too — the document declines to publish
+        // its number, which is not the same as the backend being unable to
+        // run the flow.
+        if run
+            .results
+            .iter()
+            .chain(run.withheld.iter())
+            .any(|r| r.flow == u.flow)
+        {
             return Err(format!(
                 "run '{}' lists flow '{}' as both measured and unsupported",
                 run.backend, u.flow
             ));
+        }
+    }
+    // A cell is published or withheld, never both. The `results[]` copy would
+    // chart, so the document would publish exactly the number its `withheld[]`
+    // copy disclaims.
+    // `method` and the rung's offered rate belong to the key: one cell
+    // carries a drain row *and* a rung per offered rate, all sharing
+    // flow/mode/payload/consumers/handler, so without them withholding the
+    // drain would read as a duplicate of its own rungs.
+    let cell_of = |r: &ScenarioResult| {
+        (
+            r.flow.clone(),
+            r.mode.clone(),
+            r.payload_bytes,
+            r.consumers,
+            r.handler.clone(),
+            r.method.clone(),
+            r.load.as_ref().map(|l| l.offered_msg_per_sec),
+        )
+    };
+    let published: BTreeSet<_> = run.results.iter().map(cell_of).collect();
+    for w in &run.withheld {
+        if published.contains(&cell_of(w)) {
+            return Err(format!(
+                "run '{}' both publishes and withholds flow '{}' at {} B / {} consumer(s)",
+                run.backend, w.flow, w.payload_bytes, w.consumers
+            ));
+        }
+    }
+    // Withholding a row withholds what was derived from it. `scaling_efficiency`
+    // is each family's throughput over its lowest-consumer row, so withholding
+    // that row and leaving the quotient published hands a reader the disclaimed
+    // number back in derived form — 64 B / 2c publishing 5.4904… is exactly
+    // 726,872 / 132,388, the withheld 1c measurement. Moving a row out of
+    // `results[]` is therefore only half of withholding it; the other half is
+    // this.
+    //
+    // Enforced in both directions so neither mistake is silent: a family whose
+    // baseline is withheld must publish no quotient, and a family whose
+    // baseline is published must publish one (a stray `null` would read as a
+    // withholding the document never declared).
+    let mut baseline_consumers: BTreeMap<ScalingKey, (u16, bool)> = BTreeMap::new();
+    for (r, is_withheld) in run
+        .results
+        .iter()
+        .map(|r| (r, false))
+        .chain(run.withheld.iter().map(|r| (r, true)))
+    {
+        let entry = baseline_consumers
+            .entry(ScalingKey::of(r))
+            .or_insert((r.consumers, is_withheld));
+        if r.consumers < entry.0 {
+            *entry = (r.consumers, is_withheld);
+        }
+    }
+    for r in &run.results {
+        let baseline_withheld = baseline_consumers
+            .get(&ScalingKey::of(r))
+            .is_some_and(|&(_, withheld)| withheld);
+        match (baseline_withheld, r.scaling_efficiency) {
+            (true, Some(value)) => {
+                return Err(format!(
+                    "run '{}' publishes scaling_efficiency {value} for flow '{}' at {} B / {} \
+                     consumer(s), but that family's one-consumer baseline is withheld — the \
+                     quotient of a withheld measurement is withheld too",
+                    run.backend, r.flow, r.payload_bytes, r.consumers
+                ));
+            }
+            (false, None) => {
+                return Err(format!(
+                    "run '{}' nulls scaling_efficiency for flow '{}' at {} B / {} consumer(s) \
+                     while that family's baseline is published — null means withheld, and \
+                     nothing withholds this one",
+                    run.backend, r.flow, r.payload_bytes, r.consumers
+                ));
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -6058,6 +6364,201 @@ fn validate_load(run: &BackendRun, r: &ScenarioResult, flow: Flow) -> Result<(),
     Ok(())
 }
 
+/// The deviations `runs` actually exhibit, in [`SCHEMA_DEVIATIONS`] order.
+///
+/// Derived rather than carried, so the declaration cannot drift from the rows
+/// it describes: the harness writes what this returns on every merge, and a
+/// re-measure that publishes every baseline drops the key by returning empty.
+fn schema_deviations_of(runs: &[BackendRun]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if runs
+        .iter()
+        .flat_map(|r| r.results.iter())
+        .any(|r| r.scaling_efficiency.is_none())
+    {
+        out.push(DEVIATION_NULLABLE_SCALING_EFFICIENCY);
+    }
+    out
+}
+
+/// The document contract this harness would write for `runs`: `None` when the
+/// rows conform to [`RESULTS_SCHEMA_VERSION`]'s field contract, otherwise the
+/// [`DOCUMENT_CONTRACTS`] entry naming exactly the departures they exhibit.
+///
+/// Errs when the rows exhibit a set no contract names — which is a gap in the
+/// table, not in the document: a new member of [`SCHEMA_DEVIATIONS`] must
+/// arrive with the contract version that names it, or the harness would have
+/// no accurate way to declare the file it just wrote.
+fn document_contract_for(runs: &[BackendRun]) -> Result<Option<DocumentContract>, String> {
+    let exhibited: BTreeSet<&str> = schema_deviations_of(runs).into_iter().collect();
+    contract_naming(DOCUMENT_CONTRACTS, &exhibited)
+}
+
+/// The `table` entry naming exactly `exhibited`, or `None` when the rows
+/// deviate from nothing.
+///
+/// Takes the table rather than reading [`DOCUMENT_CONTRACTS`] so the ambiguity
+/// refusal below is reachable from a test without a second entry existing yet.
+///
+/// Two errors, and neither is a property of the document: the table names no
+/// such set, or it names it twice. **Twice is refused rather than resolved by
+/// table order.** Selecting the first match would keep serializing version 1
+/// after a version 2 that redefines the same departure landed, and selecting
+/// the last would re-sign preserved version 1 rows as version 2 without
+/// converting them — the merge recomputes this declaration from the names
+/// alone, so either choice hands an old reader bytes under a contract they do
+/// not conform to. The way out is not a tie-break here but the naming rule on
+/// [`DOCUMENT_CONTRACTS`]: a redefined departure gets a new name, which makes
+/// the set that selects it a different set.
+fn contract_naming(
+    table: &[(u32, &[&str])],
+    exhibited: &BTreeSet<&str>,
+) -> Result<Option<DocumentContract>, String> {
+    if exhibited.is_empty() {
+        return Ok(None);
+    }
+    let mut naming = table
+        .iter()
+        .filter(|(_, names)| names.iter().copied().collect::<BTreeSet<&str>>() == *exhibited);
+    let (version, names) = naming.next().ok_or_else(|| {
+        format!(
+            "no document contract names {exhibited:?} — a deviation the rows can exhibit \
+             must arrive with the DOCUMENT_CONTRACTS version that names it, or a document \
+             carrying it cannot declare what it conforms to"
+        )
+    })?;
+    if let Some((also, _)) = naming.next() {
+        return Err(format!(
+            "document contracts {version} and {also} both name {exhibited:?} — the declaration \
+             is derived from the departures the rows exhibit, so two versions over one \
+             vocabulary are indistinguishable to the producer and a merge would re-sign rows \
+             under whichever the table happens to list first. A contract that changes what a \
+             departure means, or how it is represented, names it differently"
+        ));
+    }
+    Ok(Some(DocumentContract {
+        version: *version,
+        deviations: names.iter().map(|d| (*d).to_string()).collect(),
+    }))
+}
+
+/// The document-level declaration's invariants: the version is one this
+/// harness knows, the expansion beside it is the closed, duplicate-free set
+/// that version names, and the rows are what that version describes.
+///
+/// Checked **before** the version gate in [`merge_results_file`], not after,
+/// because the whole point of the declaration is to describe a document whose
+/// `schema_version` does not describe it. A departure the reader is told about
+/// only once that version happens to match is not a declaration.
+///
+/// Its unrecognised-version branch is a backstop rather than the gate: that
+/// refusal has to happen before any field is read, which is earlier than this
+/// function can run — see [`declared_versions`]. This one still fires for a
+/// caller holding rows it parsed itself.
+fn validate_document_contract(
+    runs: &[BackendRun],
+    declared: Option<&DocumentContract>,
+) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    if let Some(contract) = declared {
+        for d in &contract.deviations {
+            if !SCHEMA_DEVIATIONS.contains(&d.as_str()) {
+                return Err(format!(
+                    "document_contract.deviations lists '{d}', which is not one of \
+                     {SCHEMA_DEVIATIONS:?} — a deviation nothing recognises declares nothing"
+                ));
+            }
+            if !seen.insert(d.as_str()) {
+                return Err(format!("document_contract.deviations lists '{d}' twice"));
+            }
+        }
+        let names = DOCUMENT_CONTRACTS
+            .iter()
+            .find(|(v, _)| *v == contract.version)
+            .map(|(_, names)| *names)
+            .ok_or_else(|| {
+                format!(
+                    "document_contract.version {} is not one of {:?} — the document states that \
+                     its field contract is not its schema_version's, and not one this harness \
+                     knows either",
+                    contract.version,
+                    DOCUMENT_CONTRACTS
+                        .iter()
+                        .map(|(v, _)| *v)
+                        .collect::<Vec<_>>()
+                )
+            })?;
+        if seen != names.iter().copied().collect::<BTreeSet<&str>>() {
+            return Err(format!(
+                "document_contract.version {} names {names:?} but the expansion beside it lists \
+                 {:?} — one of the two is stale and the document cannot say which",
+                contract.version, contract.deviations
+            ));
+        }
+    }
+    let exhibited: BTreeSet<&str> = schema_deviations_of(runs).into_iter().collect();
+    if let Some(d) = exhibited.difference(&seen).next() {
+        return Err(format!(
+            "the rows exhibit '{d}' but no document_contract declares it — the departure \
+             from the declared schema_version's field contract must be stated in the document"
+        ));
+    }
+    if let Some(d) = seen.difference(&exhibited).next() {
+        return Err(format!(
+            "document_contract declares '{d}' but no row exhibits it — a declaration left behind \
+             by a re-measure describes a document that no longer exists"
+        ));
+    }
+    Ok(())
+}
+
+/// The two version declarations a results document carries — `schema_version`,
+/// and `document_contract.version` when it has one — read **without** the typed
+/// parse.
+///
+/// Both readers of a results document need this and for the same reason, so
+/// this mirrors `chartgen::parse_str`'s probe. A document produced under a
+/// contract this binary does not know may re-type any field it already names —
+/// that is precisely the evolution `document_contract.version` exists to let a
+/// reader refuse — so a reader that types the whole file first fails on
+/// whichever re-typed field serde reaches and reports a generic data error,
+/// never reaching the declaration that explains it. The declarations are
+/// readable without knowing the field contract, so they are read first.
+///
+/// Nothing but the versions is modelled here: unknown fields are ignored by
+/// default, `runs` is not named at all, and everything else the merge checks
+/// needs the typed rows and is checked there.
+fn declared_versions(raw: &str) -> Result<(u32, Option<u32>), serde_json::Error> {
+    #[derive(Deserialize)]
+    struct VersionProbe {
+        #[serde(default)]
+        schema_version: u32,
+        #[serde(default)]
+        document_contract: Option<ContractProbe>,
+    }
+    #[derive(Deserialize)]
+    struct ContractProbe {
+        version: u32,
+    }
+    let probe: VersionProbe = serde_json::from_str(raw)?;
+    Ok((
+        probe.schema_version,
+        probe.document_contract.map(|c| c.version),
+    ))
+}
+
+/// Whether `version` is a contract this binary can write — the predicate both
+/// version refusals gate on, so the preflight cannot come to a different answer
+/// than the merge it is predicting.
+fn known_document_contract(version: u32) -> bool {
+    DOCUMENT_CONTRACTS.iter().any(|(v, _)| *v == version)
+}
+
+/// The contract versions this binary knows, for a refusal to name.
+fn known_document_contracts() -> Vec<u32> {
+    DOCUMENT_CONTRACTS.iter().map(|(v, _)| *v).collect()
+}
+
 fn merge_results_file(
     path: &str,
     run: BackendRun,
@@ -6070,10 +6571,43 @@ fn merge_results_file(
     let mut existing_label: Option<String> = None;
     let mut existing: Vec<BackendRun> = match std::fs::read_to_string(path) {
         Ok(content) => {
+            // Both version declarations before the typed parse, not after: a
+            // document produced under a contract this binary does not know may
+            // re-type a field this binary does know, and the parse error that
+            // would surface is not the refusal its declaration earns. See
+            // `declared_versions`.
+            let (declared_schema, declared_contract) = declared_versions(&content)
+                .map_err(|e| format!("{path} exists but is not a results document: {e}"))?;
+            if let Some(v) = declared_contract.filter(|v| !known_document_contract(*v)) {
+                return Err(format!(
+                    "{path} declares document_contract.version {v}, which is not one of {:?} — \
+                     it states that its field contract is neither its schema_version's nor one \
+                     this harness knows, so nothing here can read its rows. Move it aside first.",
+                    known_document_contracts()
+                ));
+            }
             let doc = serde_json::from_str::<BenchResults>(&content).map_err(|e| {
-                format!(
-                    "{path} exists but is not a v{RESULTS_SCHEMA_VERSION} results document: {e}"
-                )
+                // A document whose declared version is not this binary's is
+                // refused for the version below when it happens to stay
+                // shape-compatible; when it does not, the version is still the
+                // reason, and saying so beats a field-level serde error.
+                if declared_schema != RESULTS_SCHEMA_VERSION {
+                    format!(
+                        "{path} is a v{declared_schema} results document this harness cannot \
+                         read ({e}); it writes v{RESULTS_SCHEMA_VERSION} — move it aside first."
+                    )
+                } else {
+                    format!(
+                        "{path} exists but is not a v{RESULTS_SCHEMA_VERSION} results document: {e}"
+                    )
+                }
+            })?;
+            // Before the version gate on purpose: this declaration describes a
+            // document whose declared version does not describe it, so a
+            // check that only runs once the version matches would never see
+            // the documents it exists for.
+            validate_document_contract(&doc.runs, doc.document_contract.as_ref()).map_err(|e| {
+                format!("{path} declares its contract wrongly ({e}) — refusing to rewrite it")
             })?;
             // A future version's document is shape-compatible enough to
             // deserialize, so without this it would be silently rewritten
@@ -6156,6 +6690,15 @@ fn merge_results_file(
 
     let doc = BenchResults {
         schema_version: RESULTS_SCHEMA_VERSION,
+        // Re-derived from the merged rows rather than carried over from the
+        // input, so a declaration cannot outlive the rows it describes. That
+        // is not a re-signing of the preserved rows: `validate_document_contract`
+        // has already held the input's declaration to the set its rows exhibit,
+        // and one set names at most one version, so for the preserved rows this
+        // recomputes the declaration they arrived with. It moves only when the
+        // incoming run brings a departure they did not have — which is a fact
+        // about the merged document, and the merged document is what it declares.
+        document_contract: document_contract_for(&existing)?,
         generated_at: generated_at(),
         shove_version: shove.to_string(),
         rust_version: rust,
@@ -6217,7 +6760,11 @@ fn compute_scaling(results: &mut [ScenarioResult]) {
         if let Some(&(_, baseline)) = baselines.get(&ScalingKey::of(r))
             && baseline > 0.0
         {
-            r.scaling_efficiency = r.throughput_msg_per_sec / baseline;
+            // Always `Some` here: a run computes this over its own complete
+            // sweep, which always contains its own baseline. `None` is only
+            // ever reached by withholding that baseline afterwards, which no
+            // run does — see `BackendRun::withheld`.
+            r.scaling_efficiency = Some(r.throughput_msg_per_sec / baseline);
         }
     }
 }
@@ -6247,7 +6794,7 @@ fn print_table(report: &Report) {
     println!("{}", "-".repeat(170));
     for r in &report.results {
         println!(
-            "{:<16} {:>7} {:<10} {:>8} {:>5} {:>8} {:>8.0}  {:>8.1}ms {:>8.1}ms {:>8.1}ms  {:>8.1}ms {:>8.1}ms {:>8.1}ms  {:>5.1}x {:>7.1} {:>4.0}%",
+            "{:<16} {:>7} {:<10} {:>8} {:>5} {:>8} {:>8.0}  {:>8.1}ms {:>8.1}ms {:>8.1}ms  {:>8.1}ms {:>8.1}ms {:>8.1}ms  {:>6} {:>7.1} {:>4.0}%",
             r.flow,
             r.payload_bytes,
             r.tier,
@@ -6261,7 +6808,10 @@ fn print_table(report: &Report) {
             r.e2e_p50_ms,
             r.e2e_p95_ms,
             r.e2e_p99_ms,
-            r.scaling_efficiency,
+            // `-` where the family's baseline is withheld: a quotient of a
+            // withheld measurement is not a number this table may print.
+            r.scaling_efficiency
+                .map_or_else(|| "     -".to_string(), |s| format!("{s:>5.1}x")),
             r.peak_rss_mb,
             r.cpu_pct,
         );
@@ -6469,6 +7019,12 @@ fn finalize_report<B: Backend>(
             results: results.clone(),
             failures: failures.clone(),
             unsupported,
+            // Never written by a run: a withholding is a claim about the
+            // machine, hand-added against evidence. A re-measure of this
+            // backend therefore drops whatever the document withheld for it,
+            // which is the intended semantics — the new numbers earn it again
+            // or they do not need it.
+            withheld: Vec::new(),
         };
         match merge_results_file(path, run, cli.hardware_label.as_deref()) {
             Ok(()) => eprintln!("wrote results to {path}"),
@@ -6573,7 +7129,8 @@ fn push_metrics(results: &mut Vec<ScenarioResult>, scenario: &Scenario, m: Scena
         e2e_p50_ms: m.latencies.e2e_p50,
         e2e_p95_ms: m.latencies.e2e_p95,
         e2e_p99_ms: m.latencies.e2e_p99,
-        scaling_efficiency: 0.0,
+        // Filled in by `compute_scaling` once the whole sweep is in hand.
+        scaling_efficiency: Some(0.0),
         peak_rss_mb: m.peak_rss_mb,
         cpu_pct: m.cpu_pct,
         duration_secs: m.duration_secs,
@@ -6581,6 +7138,8 @@ fn push_metrics(results: &mut Vec<ScenarioResult>, scenario: &Scenario, m: Scena
         load: m.load,
         method: scenario.method().map(|m| m.as_str().to_string()),
         drain: m.drain,
+        // Never written by a measurement — see the field's doc.
+        comparability: None,
     });
 }
 
@@ -6902,21 +7461,39 @@ fn select_scenarios<B: Backend>(
     Ok(scenarios)
 }
 
-/// Fast-fail the schema-version refusal `merge_results_file` would otherwise
-/// raise only *after* the whole sweep has run — hours of broker time spent on
-/// a merge that was doomed before the first scenario. Version only: the merge
-/// remains the authority for every other document invariant (provenance,
-/// per-row validation), which cannot go stale here because both compare
-/// against the same constants and the merge still re-checks everything.
+/// Fast-fail the version refusals `merge_results_file` would otherwise raise
+/// only *after* the whole sweep has run — hours of broker time spent on a
+/// merge that was doomed before the first scenario. Versions only, both of
+/// them: the merge remains the authority for every other document invariant
+/// (provenance, per-row validation, and whether the declared contract matches
+/// its expansion and the rows), which cannot go stale here because both
+/// compare against the same constants and the merge still re-checks
+/// everything.
 fn refused_results_file_version(path: &str) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
-    let doc: BenchResults = serde_json::from_str(&content).ok()?;
-    (doc.schema_version != RESULTS_SCHEMA_VERSION).then(|| {
+    // The probe rather than the typed parse, for the reason
+    // `declared_versions` gives — a contract this harness does not know may
+    // re-type a field, and swallowing that parse failure here would let the
+    // sweep run for hours before the merge refused the document anyway. A file
+    // this harness cannot even probe is still not refused here: the merge
+    // stays the authority for everything that is not a version.
+    let (schema_version, declared_contract) = declared_versions(&content).ok()?;
+    // Contract first, matching the order the merge refuses in, so a document
+    // failing both gets the same reason from the fast-fail as from the merge.
+    if let Some(declared) = declared_contract.filter(|v| !known_document_contract(*v)) {
+        return Some(format!(
+            "{path} declares document_contract.version {declared}, which this harness does not \
+             know ({:?}) — it states that its field contract is neither its schema_version's \
+             nor one this binary can write, and the merge would refuse it after the sweep. \
+             Move it aside first.",
+            known_document_contracts()
+        ));
+    }
+    (schema_version != RESULTS_SCHEMA_VERSION).then(|| {
         format!(
-            "{path} is a v{} results document; this harness writes \
+            "{path} is a v{schema_version} results document; this harness writes \
              v{RESULTS_SCHEMA_VERSION} and would refuse the merge after the sweep — \
-             move it aside first.",
-            doc.schema_version
+             move it aside first."
         )
     })
 }
@@ -9605,7 +10182,7 @@ mod tests {
                 e2e_p50_ms: 0.0,
                 e2e_p95_ms: 0.0,
                 e2e_p99_ms: 0.0,
-                scaling_efficiency: 1.0,
+                scaling_efficiency: Some(1.0),
                 peak_rss_mb: 0.0,
                 cpu_pct: 0.0,
                 duration_secs: drain_bound().duration_secs,
@@ -9613,12 +10190,14 @@ mod tests {
                 load: None,
                 method: Some(Method::Drain.as_str().to_string()),
                 drain: Some(drain_account(100)),
+                comparability: None,
             }],
             failures: vec![],
             unsupported: vec![Unsupported {
                 flow: Flow::ConsumeBatch.as_str().to_string(),
                 reason: "the stress harness only wires run_batch for Kafka".to_string(),
             }],
+            withheld: vec![],
         }
     }
 
@@ -9646,6 +10225,123 @@ mod tests {
         assert_eq!(doc.schema_version, RESULTS_SCHEMA_VERSION);
         assert_eq!(doc.shove_version, env!("CARGO_PKG_VERSION"));
         assert!(!doc.rust_version.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_comparability_marker_is_checked_preserved_and_never_inherited() {
+        // The one field no measurement writes. What makes a hand-added claim
+        // safe in a generated document is *where* it sits, plus two
+        // properties of the field itself; each is load-bearing on its own.
+
+        // 1. A marker on a published row is refused outright. This is the
+        //    correction: an optional field on a `results[]` row is ignored by
+        //    every reader that does not know it — neither this struct nor
+        //    chartgen's denies unknown fields — so such a row publishes the
+        //    number the marker was added to withhold.
+        let mut marked = sample_run("redis");
+        marked.results[0].comparability = Some(COMPARABILITY_HOST_CLOCK_FLOOR.to_string());
+        let err = validate_run(&marked).unwrap_err();
+        assert!(err.contains("withheld[]"), "{err}");
+
+        // 2. Moved to `withheld[]`, the same cell is valid — and the closed
+        //    set still binds there, because an unrecognised marker reads as
+        //    no marker everywhere downstream.
+        let mut marked = sample_run("redis");
+        let mut cell = marked.results.remove(0);
+        cell.comparability = Some("clocked_down".to_string());
+        marked.withheld = vec![cell];
+        let err = validate_run(&marked).unwrap_err();
+        assert!(err.contains("clocked_down"), "{err}");
+        assert!(err.contains(COMPARABILITY_HOST_CLOCK_FLOOR), "{err}");
+
+        marked.withheld[0].comparability = Some(COMPARABILITY_HOST_CLOCK_FLOOR.to_string());
+        validate_run(&marked).expect("the closed set's own value is a valid withheld cell");
+
+        // 3. A withheld cell without a cause withholds without saying why.
+        let mut causeless = marked.clone();
+        causeless.withheld[0].comparability = None;
+        let err = validate_run(&causeless).unwrap_err();
+        assert!(err.contains("without a comparability marker"), "{err}");
+
+        // 4. Published and withheld at once is a contradiction: the
+        //    `results[]` copy charts, so the document would publish exactly
+        //    the number the withheld copy disclaims.
+        let mut both = marked.clone();
+        // Built before the push rather than indexed after it: `v[v.len()-1]`
+        // borrows `v` mutably and immutably at once (E0502).
+        let mut republished = both.withheld[0].clone();
+        republished.comparability = None;
+        both.results.push(republished);
+        let err = validate_run(&both).unwrap_err();
+        assert!(err.contains("both publishes and withholds"), "{err}");
+
+        // 5. Withholding a row withholds what was derived from it. Moving the
+        //    one-consumer row out of `results[]` is only half the job: every
+        //    surviving row of that family carries `scaling_efficiency`, which
+        //    is its throughput over exactly the row that left — so a published
+        //    quotient hands the disclaimed number back in derived form.
+        let mut derived = marked.clone();
+        let mut two_consumers = derived.withheld[0].clone();
+        two_consumers.comparability = None;
+        // Throughput left alone: the drain account derives it, and a row
+        // that disagrees with its own account is refused a rule earlier.
+        two_consumers.consumers = 2;
+        two_consumers.scaling_efficiency = Some(2.0);
+        derived.results.push(two_consumers);
+        let err = validate_run(&derived).unwrap_err();
+        assert!(err.contains("one-consumer baseline is withheld"), "{err}");
+
+        //    Nulled, the same document is valid.
+        let last = derived.results.len() - 1;
+        derived.results[last].scaling_efficiency = None;
+        validate_run(&derived).expect("a nulled quotient over a withheld baseline is valid");
+
+        //    And the converse, so neither mistake is silent: a null where the
+        //    baseline *is* published claims a withholding the document never
+        //    declared.
+        let mut stray = sample_run("redis");
+        stray.results[0].scaling_efficiency = None;
+        let err = validate_run(&stray).unwrap_err();
+        assert!(err.contains("nothing withholds this one"), "{err}");
+
+        let path = temp_path("comparability");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+        let read_marker = |backend: &str| -> Option<String> {
+            let doc: BenchResults =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
+                    .expect("parse");
+            doc.runs
+                .iter()
+                .find(|r| r.backend == backend)
+                .expect("run preserved")
+                .withheld
+                .first()
+                .and_then(|w| w.comparability.clone())
+        };
+
+        merge_results_file(&p, marked, None).expect("write the marked run");
+        // Preserved through another backend's leg: a refresh of one backend
+        // rewrites the whole file, and dropping a withheld cell there would
+        // silently re-publish nothing — but it would lose the record of a
+        // measurement the document deliberately does not chart.
+        merge_results_file(&p, sample_run("nats"), None).expect("merge another backend");
+        assert_eq!(
+            read_marker("redis").as_deref(),
+            Some(COMPARABILITY_HOST_CLOCK_FLOOR)
+        );
+        assert_eq!(read_marker("nats"), None, "no run writes the marker");
+
+        // Not inherited by a re-measure of the marked backend: the marker is
+        // a claim about one number, so a new number earns it again.
+        merge_results_file(&p, sample_run("redis"), None).expect("re-measure the marked backend");
+        assert_eq!(
+            read_marker("redis"),
+            None,
+            "a re-measured row inherited a marker it never earned"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -9823,6 +10519,411 @@ mod tests {
         run.results[0].duration_secs = 2.0;
         run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
         validate_run(&run).unwrap_or_else(|e| panic!("honest row refused: {e}"));
+    }
+
+    #[test]
+    fn a_deviation_from_the_declared_field_contract_is_declared_in_the_document() {
+        // `schema_version` on a results document is a producer interlock —
+        // `merge_results_file` refuses anything but this binary's, which is
+        // what keeps runs measured under one contract out of runs measured
+        // under another. That makes it unavailable as a *description*: a
+        // document that departs from its version's field contract, because a
+        // cell was withheld by hand after the run, cannot say so by moving the
+        // version without releasing the interlock. `document_contract` is the
+        // separate, independently versioned declaration that carries it, and
+        // this pins that it is derived from the rows rather than trusted, in
+        // both directions.
+
+        // The document that deviates: a withheld one-consumer baseline, and
+        // the family's surviving row nulling the quotient over it.
+        let mut deviating = sample_run("redis");
+        let mut baseline = deviating.results.remove(0);
+        baseline.comparability = Some(COMPARABILITY_HOST_CLOCK_FLOOR.to_string());
+        let mut two_consumers = baseline.clone();
+        two_consumers.comparability = None;
+        two_consumers.consumers = 2;
+        two_consumers.scaling_efficiency = None;
+        deviating.results.push(two_consumers);
+        deviating.withheld = vec![baseline];
+        validate_run(&deviating).expect("a nulled quotient over a withheld baseline is valid");
+
+        assert_eq!(
+            schema_deviations_of(std::slice::from_ref(&deviating)),
+            vec![DEVIATION_NULLABLE_SCALING_EFFICIENCY],
+            "a nulled derivation is the deviation the declaration names"
+        );
+        assert!(
+            schema_deviations_of(std::slice::from_ref(&sample_run("redis"))).is_empty(),
+            "a run that nulls nothing must not declare a deviation — a stale key describes a \
+             document that no longer exists"
+        );
+
+        // The harness writes the declaration it derives, so a document can
+        // never acquire the deviation without acquiring the statement of it.
+        let path = temp_path("document-contract");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+        merge_results_file(&p, deviating, None).expect("write the deviating run");
+        let raw = std::fs::read_to_string(&path).expect("read back");
+        let doc: BenchResults = serde_json::from_str(&raw).expect("parse");
+        let contract = doc
+            .document_contract
+            .as_ref()
+            .expect("the harness wrote a nulled derivation without declaring a contract");
+        assert_eq!(
+            (contract.version, contract.deviations.as_slice()),
+            (
+                1,
+                [DEVIATION_NULLABLE_SCALING_EFFICIENCY.to_string()].as_slice()
+            ),
+            "the declared contract is not the one DOCUMENT_CONTRACTS names for these rows"
+        );
+        // Beside the version it qualifies, not appended after the rows: a
+        // reader that refuses the file at the first null must find the reason
+        // in what it already parsed.
+        assert!(
+            raw.find("\"document_contract\"") < raw.find("\"generated_at\""),
+            "the declaration must sit in the provenance head: {}",
+            &raw[..raw.len().min(200)]
+        );
+
+        // Stripped, the same file is refused on the way in — and refused for
+        // *that*, not for its version. The check runs before the version gate
+        // on purpose: a document whose declared version does not describe it
+        // is exactly the document the declaration exists for, so a check
+        // reached only once the version matches would never see one.
+        let stripped = format!(
+            "{}{}",
+            &raw[..raw
+                .find("\"document_contract\"")
+                .expect("declared in the head")],
+            &raw[raw.find("\"generated_at\"").expect("provenance follows it")..]
+        );
+        assert!(
+            !stripped.contains("document_contract"),
+            "the fixture did not take"
+        );
+        let stale_version = stripped.replace(
+            &format!("\"schema_version\": {RESULTS_SCHEMA_VERSION}"),
+            "\"schema_version\": 6",
+        );
+        assert!(
+            stale_version.contains("\"schema_version\": 6"),
+            "the fixture did not take"
+        );
+        for (what, content) in [("current", &stripped), ("stale", &stale_version)] {
+            std::fs::write(&path, content).expect("write");
+            let err = merge_results_file(&p, sample_run("kafka"), None)
+                .expect_err("an undeclared deviation must be refused");
+            assert!(
+                err.contains("the rows exhibit"),
+                "{what}: refused for the wrong reason: {err}"
+            );
+        }
+
+        // And the two ways the declaration itself can be wrong.
+        let misspelt = raw.replace("nullable_scaling_efficiency", "nullable_scaling_efficency");
+        std::fs::write(&path, &misspelt).expect("write");
+        let err = merge_results_file(&p, sample_run("kafka"), None)
+            .expect_err("a misspelt deviation must be refused, not ignored");
+        assert!(err.contains("nullable_scaling_efficency"), "{err}");
+
+        let orphaned = raw.replace(
+            "\"scaling_efficiency\": null",
+            "\"scaling_efficiency\": 2.0",
+        );
+        assert!(
+            orphaned.contains("\"document_contract\"") && !orphaned.contains(": null,\n"),
+            "the fixture did not take"
+        );
+        std::fs::write(&path, &orphaned).expect("write");
+        let err = merge_results_file(&p, sample_run("kafka"), None)
+            .expect_err("a declaration no row exhibits must be refused");
+        assert!(err.contains("no row exhibits it"), "{err}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_document_contract_this_harness_does_not_know_is_refused_at_the_declaration() {
+        // What makes the declaration a *contract* and not a list of names.
+        //
+        // A reader meeting a file produced under a later contract has to be
+        // able to refuse it whole. An unordered set of departure names cannot
+        // offer that — it can only surface names the reader happens not to
+        // recognise, and a contract that re-types a field it already names
+        // surfaces nothing. A version can, and this pins both places the
+        // harness raises it: before the sweep, where the cost of finding out
+        // late is hours of broker time, and in the merge, which is the
+        // authority.
+        let path = temp_path("unknown-document-contract");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        let mut deviating = sample_run("redis");
+        let mut baseline = deviating.results.remove(0);
+        baseline.comparability = Some(COMPARABILITY_HOST_CLOCK_FLOOR.to_string());
+        let mut two_consumers = baseline.clone();
+        two_consumers.comparability = None;
+        two_consumers.consumers = 2;
+        two_consumers.scaling_efficiency = None;
+        deviating.results.push(two_consumers);
+        deviating.withheld = vec![baseline];
+        merge_results_file(&p, deviating, None).expect("write the deviating run");
+        let raw = std::fs::read_to_string(&path).expect("read back");
+
+        // A contract from the future. Nothing else about the file changes —
+        // it still declares this binary's `schema_version`, so the version
+        // gate that catches an old document is not what refuses this one.
+        let future = raw.replace("\"version\": 1", "\"version\": 2");
+        assert!(
+            future.contains("\"version\": 2") && !future.contains("\"version\": 1"),
+            "the fixture did not take"
+        );
+        std::fs::write(&path, &future).expect("write");
+        assert!(
+            !DOCUMENT_CONTRACTS.iter().any(|(v, _)| *v == 2),
+            "contract 2 now exists — this test's premise needs revisiting"
+        );
+
+        let before_sweep =
+            refused_results_file_version(&p).expect("an unknown contract must fast-fail");
+        assert!(
+            before_sweep.contains("document_contract.version 2"),
+            "the fast-fail must name the contract, not the schema version: {before_sweep}"
+        );
+        let err = merge_results_file(&p, sample_run("kafka"), None)
+            .expect_err("an unknown contract must be refused by the merge too");
+        assert!(
+            err.contains("document_contract.version 2"),
+            "the merge must refuse for the contract: {err}"
+        );
+
+        // This fixture leaves every field v1-compatible, so it says nothing
+        // about *when* the declaration is read;
+        // `an_unknown_contract_is_refused_before_its_fields_are_read` carries
+        // the re-typing case that does.
+
+        // And the half that keeps the two statements from drifting: a known
+        // version whose expansion beside it says something else. Neither half
+        // can be taken as the truth, so the document is refused rather than
+        // read under whichever one the reader happens to consult.
+        let disagreeing = raw.replace(
+            &format!("\"{DEVIATION_NULLABLE_SCALING_EFFICIENCY}\"\n    ]"),
+            "]",
+        );
+        assert!(
+            disagreeing.contains("\"version\": 1") && disagreeing.contains("\"deviations\": [\n"),
+            "the fixture did not take"
+        );
+        std::fs::write(&path, &disagreeing).expect("write");
+        let err = merge_results_file(&p, sample_run("kafka"), None)
+            .expect_err("a version and an expansion that disagree must be refused");
+        assert!(
+            err.contains("document_contract.version 1 names"),
+            "the refusal must name the contract the expansion contradicts: {err}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unknown_contract_is_refused_before_its_fields_are_read() {
+        // The case the version exists for, and the only one in which it earns
+        // its keep: a later contract that *re-types a field this vocabulary
+        // already names*. `nullable_scaling_efficiency` still describes it, so
+        // a reader offered only the departure names sees nothing new; the
+        // shape on the wire is one this binary cannot parse.
+        //
+        // A refusal derived from a typed parse of the whole file therefore
+        // never reaches such a document — the parse fails first, and the
+        // failure is a serde data error naming a field, not a refusal naming
+        // the contract. That is not a version gate, it is a version gate that
+        // happens to be reachable only for the documents that did not need
+        // one. Both raises must come off the declaration alone.
+        let path = temp_path("unparseable-future-contract");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        let mut deviating = sample_run("redis");
+        let mut baseline = deviating.results.remove(0);
+        baseline.comparability = Some(COMPARABILITY_HOST_CLOCK_FLOOR.to_string());
+        let mut two_consumers = baseline.clone();
+        two_consumers.comparability = None;
+        two_consumers.consumers = 2;
+        two_consumers.scaling_efficiency = None;
+        deviating.results.push(two_consumers);
+        deviating.withheld = vec![baseline];
+        merge_results_file(&p, deviating, None).expect("write the deviating run");
+        let raw = std::fs::read_to_string(&path).expect("read back");
+
+        // Contract 2 as it would really arrive: the version moves *and* the
+        // field it re-types moves with it, from `null` to a string.
+        let future = raw.replace("\"version\": 1", "\"version\": 2").replace(
+            "\"scaling_efficiency\": null",
+            "\"scaling_efficiency\": \"withheld\"",
+        );
+        assert!(
+            !DOCUMENT_CONTRACTS.iter().any(|(v, _)| *v == 2),
+            "contract 2 now exists — this test's premise needs revisiting"
+        );
+        assert!(
+            future.contains("\"version\": 2")
+                && future.contains("\"scaling_efficiency\": \"withheld\""),
+            "the fixture did not take"
+        );
+        assert!(
+            serde_json::from_str::<BenchResults>(&future).is_err(),
+            "the premise of this test is that the body no longer parses under this binary's \
+             field contract — if it does, the fixture is not a re-typing"
+        );
+        std::fs::write(&path, &future).expect("write");
+
+        // Before the sweep: hours of broker time ride on this, and a `None`
+        // here spends them on a merge that was doomed at the declaration.
+        let before_sweep = refused_results_file_version(&p)
+            .expect("an unknown contract must fast-fail even when the body is unparseable");
+        assert!(
+            before_sweep.contains("document_contract.version 2"),
+            "the fast-fail must name the contract, not the field serde tripped on: {before_sweep}"
+        );
+
+        // And in the merge, which is the authority: the refusal is the
+        // contract's, not a generic data error that leaves the reader to guess
+        // whether the file is corrupt or merely newer.
+        let err = merge_results_file(&p, sample_run("kafka"), None)
+            .expect_err("an unknown contract must be refused by the merge too");
+        assert!(
+            err.contains("document_contract.version 2"),
+            "the merge must refuse at the declaration, not at the field: {err}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_deviation_set_names_one_contract_so_the_producer_can_select_it() {
+        // What makes a *derived* declaration safe to version.
+        //
+        // The merge never carries an input document's declaration forward; it
+        // re-derives it from the departures the merged rows exhibit, which is
+        // what keeps a declaration from outliving the rows it describes. That
+        // only holds together if a deviation set picks out one version. Were
+        // two versions to name the same set, the producer could not tell them
+        // apart: taking the first would keep writing version 1 after a
+        // version 2 that redefines that departure landed, and taking the last
+        // would re-sign preserved version 1 rows as version 2 without
+        // converting them. Both hand an old reader bytes under a contract they
+        // do not conform to, which is the one thing the declaration exists to
+        // prevent.
+        //
+        // So the table is one-to-one, and the evolution path for a departure
+        // whose meaning or representation changes is a new name — which makes
+        // the set that selects it a different set, and is refused twice over
+        // by an old reader (at the contract version, and at the name).
+        let mut seen: BTreeSet<BTreeSet<&str>> = BTreeSet::new();
+        for (version, names) in DOCUMENT_CONTRACTS {
+            let set: BTreeSet<&str> = names.iter().copied().collect();
+            assert_eq!(
+                set.len(),
+                names.len(),
+                "contract {version} names a deviation twice"
+            );
+            assert!(
+                seen.insert(set),
+                "contract {version} names a deviation set an earlier contract already names — \
+                 a redefined departure gets a new SCHEMA_DEVIATIONS name, not a second version \
+                 over the same vocabulary"
+            );
+        }
+
+        // And the refusal that says so, rather than a silent tie-break, if one
+        // ever does. Exercised against a table of its own: the invariant above
+        // is what keeps the real one from reaching it.
+        let ambiguous: &[(u32, &[&str])] = &[
+            (1, &[DEVIATION_NULLABLE_SCALING_EFFICIENCY]),
+            (2, &[DEVIATION_NULLABLE_SCALING_EFFICIENCY]),
+        ];
+        let exhibited: BTreeSet<&str> = [DEVIATION_NULLABLE_SCALING_EFFICIENCY].into();
+        let err = contract_naming(ambiguous, &exhibited)
+            .expect_err("two contracts over one vocabulary must be refused, not ordered");
+        assert!(
+            err.contains("contracts 1 and 2 both name"),
+            "the refusal must name both versions: {err}"
+        );
+
+        // The unambiguous halves either side of it still resolve: the set the
+        // table names, and a set it does not.
+        assert_eq!(
+            contract_naming(DOCUMENT_CONTRACTS, &exhibited)
+                .expect("the real table names this set once")
+                .map(|c| c.version),
+            Some(1)
+        );
+        let unnamed: BTreeSet<&str> = ["a_departure_no_contract_names"].into();
+        assert!(
+            contract_naming(DOCUMENT_CONTRACTS, &unnamed)
+                .expect_err("a set no contract names is a gap in the table")
+                .contains("no document contract names"),
+        );
+        assert!(
+            contract_naming(DOCUMENT_CONTRACTS, &BTreeSet::new())
+                .expect("no deviations")
+                .is_none(),
+            "a document that deviates from nothing declares no contract"
+        );
+    }
+
+    #[test]
+    fn the_committed_document_is_one_no_v7_producer_could_have_written() {
+        // The declared `schema_version` on the committed document is an
+        // interlock, not a label — which is what makes a bump the wrong
+        // instrument for buying an old reader's refusal there.
+        //
+        // Every one of its `dlq_drain` rows carries the pre-barrier shape
+        // (`setup_secs: null`), which the test above shows this harness
+        // refuses outright, at every marker and at every version: the shape
+        // left the contract when the barrier landed. Today that never
+        // surfaces, because [`merge_results_file`] reaches the version gate
+        // first and refuses a v6 file with one legible "move it aside"
+        // message — and `refused_results_file_version` raises the same
+        // refusal before the sweep rather than after it.
+        //
+        // Re-declare the same bytes v7 and the gate opens: the file reaches
+        // the preserved-run check below and is refused per row as an invalid
+        // v7 document. So the bump does not restate how those rows were
+        // measured, it releases the interlock that currently keeps a
+        // barriered leg from merging into five pre-barrier ones.
+        //
+        // When the six-backend re-measure lands, the fresh document is v7 and
+        // every row here becomes valid: this test then fails, and the
+        // `benches/README.md` paragraph it pins is rewritten with it rather
+        // than left standing on a premise that has expired.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("benches/results/bench-results.json");
+        let raw = std::fs::read_to_string(&path).expect("the committed results document reads");
+        let doc: BenchResults =
+            serde_json::from_str(&raw).expect("the committed document parses as a results file");
+        assert_eq!(
+            doc.schema_version, 6,
+            "the committed document is no longer v6 — this test's premise, and the runbook \
+             paragraph it pins, both need revisiting"
+        );
+        assert_eq!(doc.runs.len(), 6, "the document publishes six backends");
+        for preserved in &doc.runs {
+            let err = match validate_run(preserved) {
+                Ok(()) => panic!(
+                    "{}: a v{RESULTS_SCHEMA_VERSION} harness now accepts the committed run",
+                    preserved.backend
+                ),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("setup_secs") && err.contains(Flow::DlqDrain.as_str()),
+                "{}: refused for something other than a pre-barrier `dlq_drain` window: {err}",
+                preserved.backend
+            );
+        }
     }
 
     #[test]
@@ -10427,9 +11528,9 @@ mod tests {
             },
         ];
         compute_scaling(&mut rows);
-        assert_eq!(rows[0].scaling_efficiency, 1.0);
-        assert_eq!(rows[1].scaling_efficiency, 4.0);
-        assert_eq!(rows[2].scaling_efficiency, 1.0);
+        assert_eq!(rows[0].scaling_efficiency, Some(1.0));
+        assert_eq!(rows[1].scaling_efficiency, Some(4.0));
+        assert_eq!(rows[2].scaling_efficiency, Some(1.0));
     }
 
     // ── batch options: CLI → scenario → driver → row → validation ──
@@ -11327,7 +12428,7 @@ mod tests {
         compute_scaling(&mut rows);
         // The 4-consumer 50k rung is compared with the 1-consumer 50k rung,
         // not with the 5k rung that happens to share flow, payload and tier.
-        assert_eq!(rows[2].scaling_efficiency, 1.0);
+        assert_eq!(rows[2].scaling_efficiency, Some(1.0));
     }
 
     #[test]

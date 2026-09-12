@@ -2297,6 +2297,153 @@ fn batch_block_ms(deadline: Option<Instant>, now: Instant) -> u64 {
     }
 }
 
+/// One `XREADGROUP` reply's worth of entries, as
+/// [`parse_xreadgroup_reply`] hands them back: `(entry_id, fields)`.
+type BatchEntries = Vec<(String, Vec<(String, String)>)>;
+
+/// What one read-ahead came back with. `Nothing` covers both "not armed this
+/// cycle" and "the stream had nothing to give", which the loop treats
+/// identically; `Failed` is distinct because it is the only one that says
+/// something about the *connection* — see [`read_ahead_batch`].
+enum ReadAhead {
+    Entries(BatchEntries),
+    Nothing,
+    Failed,
+}
+
+/// One **non-blocking** live (`>`) `XREADGROUP` for the *next* batch, issued
+/// to run concurrently with the current batch's flush (see
+/// [`run_batch_impl`]'s "Read-ahead across the flush").
+///
+/// `BLOCK` is deliberately absent, and that is a correctness requirement
+/// rather than a tuning choice: this future is joined with the flush, so a
+/// blocking read on an idle stream would keep the join pending for up to
+/// [`BLOCK_MS`] after the flush had returned, delaying the loop and shutdown
+/// with it — where the loop's own read is the one that may wait, raced
+/// `biased` against the shutdown token. Without `BLOCK` an empty stream
+/// answers immediately with nil, which is `None` here and costs the flush
+/// nothing.
+///
+/// A second reason applied while this read rode a clone of the loop's socket
+/// (Redis does not serve a blocked client's subsequent commands until it
+/// unblocks, so a blocking read-ahead would have held the flush's `XACK`
+/// hostage) and no longer does: the read-ahead has a connection of its own —
+/// see [`run_batch_impl`] for what that costs and why it is still the choice.
+/// The join reason above is sufficient on its own.
+///
+/// A failure is **reported to the caller** rather than propagated out of the
+/// loop, and the distinction is load-bearing now that this read has a socket
+/// of its own. While it rode a clone of the loop's connection, swallowing the
+/// error was enough: the same dead socket made the loop's own next read fail,
+/// which reported it with the error taxonomy `run_with_reconnect` expects. On
+/// a separate connection nothing else ever touches this socket, so a swallowed
+/// error would leave the read-ahead silently dead for the rest of the
+/// reconnect cycle while the loop ran on, degraded and quiet. `run_batch_impl`
+/// therefore drops the connection on `Err` and re-dials it at the next arming
+/// — best effort, because the loop's own read covers every entry either way.
+/// Failing the whole cycle instead was rejected: a transient read-ahead error
+/// would then spend a `max_reconnect_attempts` budget that exists for real
+/// broker loss.
+///
+/// Entries this read delivered but whose reply never arrived stay pending,
+/// recovered exactly as a lost reply to the loop's own read already is — by
+/// the reaper, or by the next `Redeliver` replay.
+async fn read_ahead_batch(
+    conn: &mut RedisConnection,
+    stream: &str,
+    group: &str,
+    consumer: &str,
+    count: usize,
+) -> ReadAhead {
+    let mut cmd = redis::cmd("XREADGROUP");
+    cmd.arg("GROUP")
+        .arg(group)
+        .arg(consumer)
+        .arg("COUNT")
+        .arg(count)
+        .arg("STREAMS")
+        .arg(stream)
+        .arg(">");
+    match conn.query::<redis::Value>(&mut cmd).await {
+        Ok(value) => {
+            let entries = parse_xreadgroup_reply(value, count);
+            if entries.is_empty() {
+                ReadAhead::Nothing
+            } else {
+                ReadAhead::Entries(entries)
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                stream,
+                error = %e,
+                "batch read-ahead XREADGROUP failed; its connection is dropped \
+                 and re-dialed at the next flush"
+            );
+            ReadAhead::Failed
+        }
+    }
+}
+
+/// Ingest one read's entries into `batch`, arming the age deadline on the
+/// first message to land in an empty buffer.
+///
+/// Shared by all three sites that ingest — the loop's own read, the
+/// read-ahead, and the shutdown drain — so that none of them can arm the
+/// deadline differently from the others. The deadline means "age of the
+/// oldest message buffered", and it is never pushed back.
+///
+/// `read_at` is when these entries left the stream, and the deadline is armed
+/// `max_batch_age` from it rather than from the ingest. For the loop's own
+/// read the two are the same instant. For the read-ahead they are not: its
+/// reply waits in `prefetched` for as long as the flush that issued it runs,
+/// and `max_batch_age` bounds how long this loop may sit on an entry it has
+/// already taken out of the stream — the entry is in the PEL and counting
+/// against its own reclaim from the moment it is read, so the age clock may
+/// not restart just because the entry is parked in a local variable rather
+/// than in `batch`.
+#[allow(clippy::too_many_arguments)]
+async fn ingest_entries<T: Topic>(
+    conn: &mut RedisConnection,
+    stream: &str,
+    group: &str,
+    consumer: &str,
+    entries: BatchEntries,
+    topic_name: &str,
+    consumer_group: Option<&str>,
+    max_message_size: Option<usize>,
+    batch: &mut RedisBatch<T>,
+    deadline: &mut Option<Instant>,
+    max_batch_age: Duration,
+    read_at: Instant,
+) -> Result<()> {
+    for (entry_id, fields_vec) in entries {
+        ingest_batch_entry::<T>(
+            conn,
+            stream,
+            group,
+            consumer,
+            entry_id,
+            fields_vec,
+            topic_name,
+            consumer_group,
+            max_message_size,
+            batch,
+        )
+        .await?;
+        if deadline.is_none() && !batch.is_empty() {
+            // `checked_add` rather than `+`: this loop's contract is no
+            // unchecked arithmetic on a runtime path, and
+            // `with_max_batch_age` bounds its argument below (non-zero) but
+            // not above. An age too large for the clock to represent leaves
+            // the deadline unarmed, which is what such an age means — no age
+            // trigger, with the size trigger still bounding the batch.
+            *deadline = read_at.checked_add(max_batch_age);
+        }
+    }
+    Ok(())
+}
+
 /// Advance a PEL-replay cursor after a non-blocking history read. History
 /// reads are exclusive of the start id, so the next read must begin just
 /// past the last entry actually returned; an empty reply means the PEL is
@@ -2645,6 +2792,47 @@ where
     }
 }
 
+/// A spawned task that is aborted when its handle is dropped.
+///
+/// `tokio::task::JoinHandle` detaches on drop; [`run_batch_impl`]'s read-ahead
+/// dial wants the opposite, so a loop that exits — shutdown, or an error on its
+/// way to `run_with_reconnect` — does not leave a dial running against a broker
+/// it has stopped using.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    }
+
+    /// The finished task's output, without suspending the caller.
+    ///
+    /// Only call once [`is_finished`](Self::is_finished) is true: a finished
+    /// `JoinHandle` resolves on its first poll, so this `await` cannot yield —
+    /// which is what lets the caller collect a dial from a path that must
+    /// never wait on one. `None` if the task panicked or was aborted.
+    async fn join_now(mut self) -> Option<T> {
+        match self.0.take() {
+            Some(handle) => handle.await.ok(),
+            None => None,
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.as_ref() {
+            handle.abort();
+        }
+    }
+}
+
 /// [`BatchConsumerImpl::run_batch`](crate::backend::BatchConsumerImpl) for
 /// Redis. See the module doc above for the no-lease design and PEL-replay
 /// metadata notes this loop depends on.
@@ -2659,7 +2847,8 @@ where
 /// (history reads never block) — raced `biased` against shutdown exactly
 /// like `run_stream_loop_arc`, including the `NOGROUP` → retryable mapping.
 /// Every returned entry is decoded via [`ingest_batch_entry`]; the age
-/// deadline arms on the first message pushed into an empty batch and is
+/// deadline arms on the first message pushed into an empty batch, measured
+/// from when that message left the stream (see [`ingest_entries`]), and is
 /// never pushed back. After ingesting, the deadline is re-checked and a
 /// flush fires if it has elapsed. `replay_cursor` advances via
 /// [`next_replay_cursor`] after every history read; an empty history reply
@@ -2670,6 +2859,142 @@ where
 /// A single `XREADGROUP COUNT max BLOCK max_age` per batch was rejected: it
 /// returns as soon as ANY entry exists, so it cannot fill a batch, and it
 /// holds shutdown hostage for up to `max_batch_age`.
+///
+/// # Read-ahead across the flush
+///
+/// A size-triggered flush issues the next read ([`read_ahead_batch`]) to run
+/// concurrently with itself, and the reply seeds the next batch. Without it
+/// the cycle is strictly serial — read, then handle and ack with nothing in
+/// flight, then read again — so one consumer spends the whole flush idle on
+/// its connection. Measured on this loop at 64 B / `max_batch_size` 500
+/// against a Docker Redis 7.0 on an aarch64 Linux host: 3.88 ms per
+/// 500-message cycle, of which the read phase alone is 57% and the process
+/// holds one core only half busy.
+///
+/// What this does **not** settle is the sub-parity single-consumer batch row
+/// in `benches/results/bench-results.json` — 64 B, one consumer, drain:
+/// 132 389 msg/s against `consume_parallel`'s 289 728 at the same cell. That
+/// row's cause has since been measured on the host that produced it (Apple
+/// M4 Max / macOS), and it is outside this loop: a single consumer there
+/// spends most of each cycle waiting on the Docker VM, never sustains the
+/// utilisation that keeps the host's performance cores clocked up, and runs
+/// every phase of the cycle slow — the decode included, which is client-side
+/// CPU that nothing on the wire or inside the server can reach. Any
+/// unrelated busy process on that host removes the deficit, and so does a
+/// second consumer, which is why the multi-consumer rows are 1.3x-2.3x. The
+/// measurements, and how to read the affected rows, are under *A lone
+/// consumer on the macOS host clocks down* in `benches/README.md`. The
+/// read-ahead is neither that row's cause nor its fix, and is justified here
+/// only by what it measures where it was measured.
+///
+/// **Where the gain comes from, and where it is largest.** On a socket of its
+/// own the read-ahead does not make the loop's round trips *fewer* — a
+/// transparent proxy in front of the broker counts 803 consumer-path requests
+/// per 200 000 messages at one consumer with or without it — it stops them
+/// being *serial*: the next read travels on `read_conn` while the flush's
+/// `XACK` travels on `conn`, where the serial loop issues each into the
+/// silence the previous one left. The proxy's own accounting is the sharpest
+/// form of that: it charges 800 of the split's 803 requests against 790 of
+/// the serial loop's 803, so the faster arm is the one paying *more* charges,
+/// concurrently.
+///
+/// The gain therefore scales with what one round trip costs. Behind that
+/// proxy charging 1.2 ms on any consumer-path request issued after >= 0.3 ms
+/// of quiet (64 B, 200 000-message drains, 3 reps, medians, arms interleaved)
+/// it is **1.37x at one consumer** and 1.16x at two; with the same proxy in
+/// measure-only mode — no charge, but its own hop still in the path — 1.15x
+/// and 1.20x; and against a loopback Docker broker, where a round trip is
+/// nearly free, it is the 0.96x and 1.11x measured below. A broker a network
+/// hop away is the deployment this helps most, and a loopback broker at one
+/// consumer is the one it costs.
+///
+/// # What a socket of its own costs, and why it is still the choice
+///
+/// The read-ahead reads on its own connection. The loop's own read and the
+/// flush's `XACK` stay on `conn`, so no two replies this loop waits for are
+/// queued behind each other on one client. The cheaper-looking structure is a
+/// `conn.clone()`: a `MultiplexedConnection` clone shares the socket and the
+/// multiplexer task, so it opens nothing (`connected_clients` does not move)
+/// and the read-ahead's `XREADGROUP` pipelines with the flush's `XACK`
+/// instead of taking turns with it. Three structures were built and measured
+/// on the host above — no read-ahead; the clone; the split. 64 B,
+/// `--concurrent --handler zero`, 600 000-message drains, `max_batch_size`
+/// 500, every arm built from one `CARGO_TARGET_DIR`, medians of three reps
+/// (four at eight consumers) with the arm order **rotated per rep** so no arm
+/// is systematically measured into the host state another arm left behind:
+///
+/// | consumers | no read-ahead | shared socket | own socket (shipped) |
+/// |---|---|---|---|
+/// | 1 | 108 515 | 116 516 (1.074x) | 104 392 (**0.962x**) |
+/// | 2 | 171 074 | 247 154 (1.445x) | 189 490 (1.108x) |
+/// | 8 | 370 189 | 349 741 (**0.945x**) | 376 923 (1.018x) |
+///
+/// Read the crossover rather than any one column. The clone is worth more
+/// wherever the server has idle to fill (+7% at one consumer, +45% at two)
+/// and *regresses* the eight-consumer cell against no read-ahead at all,
+/// where the split gives part of that gain back (+11% at two) and leaves the
+/// eight-consumer cell alone. The split's own one-consumer cell is ~4%
+/// **below** the serial loop here — small, but its runs do not overlap the
+/// baseline's, so it is a cost rather than noise. This loop takes the
+/// structure that regresses nothing at eight consumers: a multi-consumer
+/// regression is what the published rows cannot afford, and the
+/// single-consumer gain given up is the gain this host has least of (a
+/// loopback round trip is nearly free — the paragraph above prices the same
+/// read-ahead behind a proxy that charges for one).
+///
+/// The crossover is stable across campaigns rather than an artefact of one
+/// hour: an earlier pass on this host with a fixed (unrotated) arm order put
+/// the same three arms at 1.074x / 1.475x / 0.950x for the clone and
+/// 0.999x / 1.188x / 1.077x for the split, and it also measured the mirror
+/// split — settlement moved off instead of the read-ahead, which is what
+/// `run_stream_loop_concurrent` does — within 4% of the split column (n=1).
+/// The cost is having two sockets at all, not which half moves.
+///
+/// What the clone's eight-consumer cost is **not**, measured off the broker
+/// rather than argued: the
+/// command mix is identical (1 209 vs 1 214 `XREADGROUP`s at ~495 entries
+/// each and 1 200 `XACK`s per 600 000 messages, so nothing is fragmented,
+/// clamped or double-read), time inside Redis commands is within 4%
+/// (2.163 vs 2.246 us/msg), the server is not command-saturated on either arm
+/// (command execution fills 71% and 66% of the drain window), socket events
+/// per cycle actually *fall* (2.0 -> 1.15 reads, 3.0 -> 2.1 writes: the
+/// pipelining works), and `connected_clients` is unchanged at 11, proving the
+/// clone opens no socket. What rises is Redis's non-command CPU per message,
+/// +10 to 18% — the event-loop cost of serving one client whose 32 KB read
+/// reply and whose ack reply are queued together, the ack's behind the
+/// read's. Redis writes a client's replies in arrival order, so the flush
+/// cannot finish until the read it was hiding has been drained: at eight
+/// consumers that lands on the critical path, at one or two it does not.
+/// Splitting the sockets is what removes it, and a second socket per consumer
+/// is what that costs.
+///
+/// Five properties keep it from changing what a handler sees:
+///
+/// - **No surplus, so `max_batch_size` still bounds a handler call.** The
+///   read-ahead is armed only where a flush is about to empty the batch, so
+///   its at-most-`max_batch_size` entries are always ingested into an empty
+///   buffer.
+/// - **`max_batch_age` still bounds the wait, flush time included.** The
+///   deadline for a prefetched entry is armed from the instant its read was
+///   issued, not from the ingest that follows the flush, so parking a reply
+///   in `prefetched` cannot extend how long this loop sits on an entry it
+///   has already taken out of the stream. A flush that outlasts
+///   `max_batch_age` therefore hands its read-ahead to a handler as soon as
+///   the loop re-enters, rather than starting a fresh window.
+/// - **Never during a replay.** A live `>` read would interleave
+///   never-delivered entries into a PEL drain.
+/// - **Dropped on `Redeliver`.** That settlement arms `replay_cursor = "0"`,
+///   and the replay returns the read-ahead's entries too; ingesting them
+///   here as well would deliver them twice in one process.
+/// - **Settled on a graceful stop, not stranded.** The shutdown arm ingests
+///   a pending read-ahead before its final flush, so a clean stop still
+///   delivers what this loop fetched rather than leaving it for the reaper.
+///
+/// The reclaim policy below still covers the widened buffering phase: a
+/// read-ahead entry waits out the flush that fetched it (bounded by
+/// `handler_timeout`) before its own batch's age window even starts, so its
+/// worst-case idle is `2 * handler_timeout + max_batch_age`, inside the
+/// `2 * (handler_timeout + max_batch_age)` threshold this loop registers.
 ///
 /// The deadline is **disarmed** (`deadline = None`) on every flush — the
 /// size trigger, the age trigger, and the shutdown-triggered partial flush —
@@ -2762,40 +3087,214 @@ where
 
         async move {
             let mut conn = client.dedicated_conn().await?;
+            // A second connection rather than a `conn.clone()`, and that is a
+            // **measured** choice rather than the tidier-looking one. A
+            // `MultiplexedConnection` clone shares the socket and the
+            // multiplexer task, so the read-ahead's `XREADGROUP` and the
+            // flush's `XACK` would pipeline over one socket instead of taking
+            // turns on it — which buys the 1- and 2-consumer cells, and costs
+            // the 8-consumer one, because Redis writes a client's replies in
+            // arrival order and the ack's then waits behind a 32 KB read reply.
+            // This loop takes the structure that regresses no multi-consumer
+            // cell and pays about 4% at one consumer for it; both halves of the
+            // trade, in both directions, are in `run_batch_impl`'s "What a
+            // socket of its own costs, and why it is still the choice".
+            // `multiplexed_conn` rather than
+            // `dedicated_conn` because the read-ahead never blocks (see
+            // [`read_ahead_batch`]), the same call
+            // `run_stream_loop_concurrent` makes for its `outcome_conn`.
+            // Re-dialed when this closure re-runs, alongside `conn`, and also
+            // on its own whenever a read-ahead fails on it — `None` means
+            // "dial one before the next read-ahead", see [`read_ahead_batch`].
+            let mut read_conn = Some(client.multiplexed_conn().await?);
+            // A re-dial in flight for `read_conn`, spawned rather than
+            // awaited. See the recovery comment in the size-triggered arm:
+            // the flush must never wait on a dial, so the dial runs off the
+            // loop and a later cycle collects it. Aborted on drop, so a loop
+            // that exits (shutdown, or an error into `run_with_reconnect`)
+            // does not leave a dial running against a broker it has stopped
+            // using.
+            let mut dialing: Option<AbortOnDrop<Result<RedisConnection>>> = None;
             let mut batch: RedisBatch<T> = RedisBatch::new(max_batch_size);
             let mut deadline: Option<Instant> = None;
             let mut redelivery_backoff = batch_redelivery_backoff();
             let mut replay_cursor: Option<String> = None;
+            // The read-ahead's reply, waiting to seed the next batch, paired
+            // with the instant its read was issued. Only ever `Some` between
+            // a size-triggered flush and the ingest that immediately follows
+            // it. The instant rides along because the age deadline is armed
+            // from it, not from the ingest — see `ingest_entries`.
+            let mut prefetched: Option<(Instant, BatchEntries)> = None;
 
             loop {
                 if batch.len() >= max_batch_size {
-                    match flush_redis_batch(
-                        &mut conn,
-                        topology,
-                        stream,
-                        &group,
-                        &consumer,
-                        handler.as_ref(),
-                        ctx.as_ref(),
-                        &mut batch,
-                        handler_timeout,
-                        handler_timeout_outcome.clone(),
-                        &topic_arc,
-                        group_arc.as_deref(),
-                        &mut redelivery_backoff,
-                        &mut replay_cursor,
-                        &shutdown,
-                    )
-                    .await?
-                    {
+                    // Keep the next read in flight for the duration of the
+                    // flush. Serialized read → flush → read leaves this
+                    // consumer idle on the socket for the whole flush, with
+                    // nothing of its own to fill that window with. This is
+                    // not the published single-consumer deficit — see the
+                    // arithmetic in `run_batch_impl`'s doc comment — it is
+                    // just a gap worth not having.
+                    //
+                    // No surplus buffer is needed to make this safe: the
+                    // flush below empties `batch`, so a
+                    // `COUNT max_batch_size` reply can only ever be ingested
+                    // into an empty buffer and `max_batch_size` still bounds
+                    // what one handler call sees.
+                    //
+                    // `read_conn` is a connection of its own, not a clone of
+                    // `conn`: this read and the flush's `XACK` do not queue
+                    // their replies on one client, which is what keeps the
+                    // eight-consumer cell from regressing. See this function's
+                    // "What a socket of its own costs, and why it is still the
+                    // choice" for the whole trade, and [`read_ahead_batch`] for
+                    // why the read-ahead omits `BLOCK` either way.
+                    //
+                    // A replay cycle takes no read-ahead: a live `>` read
+                    // would interleave never-delivered entries into a PEL
+                    // drain, and `next_replay_cursor` only describes the
+                    // history read it advanced from.
+                    let read_ahead_armed = replay_cursor.is_none();
+                    if read_ahead_armed && read_conn.is_none() {
+                        // A previous read-ahead failed on that socket and it
+                        // was dropped; get a fresh one — **without the flush
+                        // ever waiting for it**.
+                        //
+                        // Awaiting the dial here instead is what this does
+                        // not do, and the difference is not a micro-
+                        // optimisation. A dial is bounded only by
+                        // `connection_timeout` (10 s by default), and it can
+                        // run to that bound while this loop's own connection
+                        // is perfectly healthy: a middlebox that accepts a
+                        // TCP connection and answers nothing stalls the
+                        // handshake, not the socket already established. An
+                        // awaited dial therefore parks a `max_batch_size`-
+                        // full, PEL-owned batch in memory for up to that
+                        // timeout before its handler sees it — and since a
+                        // failed dial leaves `read_conn` at `None`, the next
+                        // size-triggered cycle pays it again. That turns an
+                        // optional read-ahead into a per-batch stall and
+                        // breaks the size/age flush contract on precisely the
+                        // recovery path (`a_stalled_read_ahead_re_dial_does_
+                        // not_delay_the_flush` measures it: ~1 batch per
+                        // `connection_timeout` instead of the whole drain).
+                        //
+                        // So the dial runs as its own task and a later cycle
+                        // collects it. Polling `is_finished` rather than
+                        // awaiting is the whole point — this arm never yields
+                        // on the dial. One dial is in flight at a time, and
+                        // a failed one is simply re-spawned at the next
+                        // cycle; the loop's own read covers every entry while
+                        // the read-ahead is off, so there is nothing to
+                        // recover urgently and nothing to escalate to
+                        // `run_with_reconnect` (a transient read-ahead error
+                        // must not spend a `max_reconnect_attempts` budget
+                        // that exists for real broker loss).
+                        match dialing.take() {
+                            Some(handle) if handle.is_finished() => {
+                                read_conn = handle.join_now().await.and_then(Result::ok);
+                            }
+                            // Still dialling: leave it running, carry on
+                            // without a read-ahead this cycle.
+                            Some(handle) => dialing = Some(handle),
+                            None => {
+                                let client = client.clone();
+                                dialing = Some(AbortOnDrop::new(tokio::spawn(async move {
+                                    client.multiplexed_conn().await
+                                })));
+                            }
+                        }
+                    }
+                    // Taken before the read is issued rather than when its
+                    // reply lands: the age bound this arms is an upper bound,
+                    // so the conservative end is the earlier instant, and the
+                    // reply is parked in `prefetched` for however long the
+                    // flush it travels with runs.
+                    let read_at = Instant::now();
+                    let (ahead, flushed) = tokio::join!(
+                        async {
+                            match read_conn.as_mut() {
+                                Some(read_conn) if read_ahead_armed => {
+                                    read_ahead_batch(
+                                        read_conn,
+                                        stream,
+                                        &group,
+                                        &consumer,
+                                        max_batch_size,
+                                    )
+                                    .await
+                                }
+                                _ => ReadAhead::Nothing,
+                            }
+                        },
+                        flush_redis_batch(
+                            &mut conn,
+                            topology,
+                            stream,
+                            &group,
+                            &consumer,
+                            handler.as_ref(),
+                            ctx.as_ref(),
+                            &mut batch,
+                            handler_timeout,
+                            handler_timeout_outcome.clone(),
+                            &topic_arc,
+                            group_arc.as_deref(),
+                            &mut redelivery_backoff,
+                            &mut replay_cursor,
+                            &shutdown,
+                        ),
+                    );
+                    match flushed? {
                         FlushOutcome::ShutdownDuringBackoff => return Ok(()),
                         FlushOutcome::Flushed => {}
                     }
+                    // A failed read-ahead takes its connection with it: nothing
+                    // else uses that socket, so a dead one would otherwise
+                    // leave this loop quietly un-pipelined for the rest of the
+                    // reconnect cycle. The next arming dials a fresh one.
+                    if matches!(ahead, ReadAhead::Failed) {
+                        read_conn = None;
+                    }
+                    // Entries are dropped rather than ingested when the flush
+                    // armed a replay: `Redeliver` leaves the whole batch
+                    // pending and sets the cursor to "0", so the replay read
+                    // returns these entries as well — ingesting them here too
+                    // would hand the same entries to the handler twice within
+                    // one process.
+                    prefetched = match ahead {
+                        ReadAhead::Entries(entries) if replay_cursor.is_none() => {
+                            Some((read_at, entries))
+                        }
+                        _ => None,
+                    };
                     deadline = None;
                     continue;
                 }
 
                 if shutdown.is_cancelled() {
+                    // Settle what the read-ahead already took out of the
+                    // stream instead of leaving it pending for the reaper: a
+                    // graceful stop flushes what this loop holds, and the
+                    // read-ahead makes "holds" include entries fetched while
+                    // the previous flush ran.
+                    if let Some((read_at, entries)) = prefetched.take() {
+                        ingest_entries::<T>(
+                            &mut conn,
+                            stream,
+                            &group,
+                            &consumer,
+                            entries,
+                            &topic_arc,
+                            group_arc.as_deref(),
+                            max_message_size,
+                            &mut batch,
+                            &mut deadline,
+                            max_batch_age,
+                            read_at,
+                        )
+                        .await?;
+                    }
                     let _ = flush_redis_batch(
                         &mut conn,
                         topology,
@@ -2815,6 +3314,30 @@ where
                     )
                     .await?;
                     return Ok(());
+                }
+
+                // The read-ahead's reply stands in for this iteration's read.
+                // Always a live (`>`) read of at most `max_batch_size`
+                // entries into a buffer the flush that issued it emptied, so
+                // it needs no headroom recomputation and never touches
+                // `replay_cursor`.
+                if let Some((read_at, entries)) = prefetched.take() {
+                    ingest_entries::<T>(
+                        &mut conn,
+                        stream,
+                        &group,
+                        &consumer,
+                        entries,
+                        &topic_arc,
+                        group_arc.as_deref(),
+                        max_message_size,
+                        &mut batch,
+                        &mut deadline,
+                        max_batch_age,
+                        read_at,
+                    )
+                    .await?;
+                    continue;
                 }
 
                 let headroom = batch_headroom(max_batch_size, batch.len());
@@ -2871,30 +3394,32 @@ where
                     }
                 };
 
+                // When these entries left the stream. Unlike the read-ahead's
+                // instant this is taken when the reply lands, not when the
+                // read was issued: this read `BLOCK`s, so the entries need
+                // not have existed when it went out.
+                let read_at = Instant::now();
                 let entries = parse_xreadgroup_reply(raw_reply, headroom);
 
                 if is_replay {
                     replay_cursor = next_replay_cursor(&entries);
                 }
 
-                for (entry_id, fields_vec) in entries {
-                    ingest_batch_entry::<T>(
-                        &mut conn,
-                        stream,
-                        &group,
-                        &consumer,
-                        entry_id,
-                        fields_vec,
-                        &topic_arc,
-                        group_arc.as_deref(),
-                        max_message_size,
-                        &mut batch,
-                    )
-                    .await?;
-                    if deadline.is_none() && !batch.is_empty() {
-                        deadline = Some(Instant::now() + max_batch_age);
-                    }
-                }
+                ingest_entries::<T>(
+                    &mut conn,
+                    stream,
+                    &group,
+                    &consumer,
+                    entries,
+                    &topic_arc,
+                    group_arc.as_deref(),
+                    max_message_size,
+                    &mut batch,
+                    &mut deadline,
+                    max_batch_age,
+                    read_at,
+                )
+                .await?;
 
                 if let Some(d) = deadline
                     && Instant::now() >= d

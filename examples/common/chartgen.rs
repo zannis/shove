@@ -99,9 +99,14 @@ pub const SCHEMA_VERSION: u32 = 7;
 /// `setup_bound`, so every one of them is already withheld from an absolute
 /// axis by its own marker. Nothing a v6 document charts moved.
 ///
-/// What is open is the *acceptance* rule, not the plotting rule: `dlq_drain`
-/// is held to the v6 shape in a v6 document and the v7 shape in a v7 one, so
-/// neither document can carry the other's. The reason both are readable at
+/// What is open is the *acceptance* rule, not the plotting rule: a v6
+/// document is held to the v6 `dlq_drain` shape, so it cannot carry a v7 row.
+/// The converse is the producer's to enforce, not this generator's — from v7
+/// `dlq_drain` merely *leaves* [`BARRIERLESS_FLOWS_THROUGH_V6`], and leaving
+/// permits a recorded setup window without requiring one, so a v6-shaped row
+/// stays acceptable here in a v7 document. The harness refuses it
+/// (`validate_run`), which is where that half binds; do not read this list as
+/// the generator rejecting a mislabelled file. The reason both are readable at
 /// once is that the harness's barrier change and the six-backend re-measure
 /// that replaces the committed document do not land together — the
 /// [`SCHEMA_VERSION`] bump is exactly what forces that re-measure to start
@@ -207,6 +212,113 @@ pub const COST_SETUP_BOUND: &str = "setup_bound";
 /// A publish-only row: no consumer is constructed, so the number is publish
 /// throughput and there is no setup window to separate.
 pub const COST_NO_HANDLER: &str = "no_handler";
+
+/// The closed `comparability` set — the schema's optional **withholding**
+/// marker, mirrored from the harness.
+///
+/// `handler_cost` says what a number measures; this says whether the *host*
+/// let that measurement be a result. A marked row is measured, honestly
+/// accounted and internally consistent — every other guard here still holds
+/// it — but its rate is an artifact of the measuring machine rather than of
+/// the backend, so nothing may publish it as one.
+///
+/// The marker names the cause. What makes the withholding *bind* is where
+/// the row lives: a marked cell is carried in [`BackendRun::withheld`], not
+/// in `results[]`.
+///
+/// That placement is the whole mechanism, and an earlier design got it
+/// wrong. Carrying the marker as an optional field on an ordinary `results[]`
+/// row was justified on the grounds that it "only ever withholds" — that a
+/// reader which does not know the field publishes exactly what it published
+/// before, so the field could never turn a correct reading into a wrong one.
+/// The premise is true and the conclusion does not follow: the reading such a
+/// reader published *before* is the one this marker exists to retract. Since
+/// neither this generator's [`Document`] nor the harness's own results struct
+/// denies unknown fields, every reader built before the marker existed parsed
+/// the marked rows and went on deriving the ratios they disclaim — silently,
+/// and with no signal that its interpretation was obsolete. An ignorable
+/// disclaimer does not withhold anything from a reader that ignores it.
+///
+/// A `schema_version` bump is the usual way to make an old reader refuse, and
+/// it is the wrong instrument for the committed document: the version it
+/// declares is a live interlock on the *producer* side, where a v6-shaped
+/// `dlq_drain` row is refused outright, and re-declaring the file v7 opens
+/// the merge gate that refusal currently sits behind. It would not be caught
+/// *here*: [`barrierless_flows`] only stops a barrierless flow from claiming
+/// a setup window, and from v7 `dlq_drain` merely leaves that set, so its v6
+/// shape stays legal to this generator. See the `schema_version` paragraph
+/// under *A withheld cell does not sit in `results[]`* in `benches/README.md`
+/// for the whole argument and the tests pinning both halves. Moving the cell
+/// out of `results[]` needs no version at all — a reader that does not know
+/// `withheld[]` finds no row for the cell, and cannot derive a ratio from a
+/// row it does not have. Old readers lose exactly the two numbers they must
+/// not publish and keep every number they may.
+///
+/// Two further properties survive from that earlier design and are still
+/// load-bearing:
+///
+/// - It is **editorial, not measured**: no harness run writes it, and a
+///   re-measure of a marked cell drops it, so it must be re-earned against
+///   the new numbers rather than inherited by a row that no longer needs it.
+/// - An unknown value is **refused rather than ignored**, for the reason
+///   [`HANDLER_COSTS`] gives: a marker that silently fell out of every filter
+///   would be indistinguishable from no marker. A `withheld[]` entry must
+///   carry a cause from this set, and a `results[]` row must carry none —
+///   the marker is refused in the one place it would not bind.
+pub const COMPARABILITY_KINDS: &[&str] = &[COMPARABILITY_HOST_CLOCK_FLOOR];
+
+/// The row's rate is bounded by the measuring host's CPU clock rather than by
+/// the backend: a single-threaded consumer that spends most of each cycle
+/// waiting on the broker never sustains the utilisation that keeps the host's
+/// cores clocked up, so every phase of its loop — client-side decode included
+/// — runs slow. Such a row is a **floor** for its flow, is not comparable
+/// with any other cell, backend or version, and moves under unrelated load on
+/// the same host. See *A lone consumer on the macOS host clocks down* in
+/// `benches/README.md` for the measurements that establish it.
+pub const COMPARABILITY_HOST_CLOCK_FLOOR: &str = "host_clock_floor";
+
+/// The closed vocabulary a [`DOCUMENT_CONTRACTS`] expansion is written in,
+/// mirroring the harness's `SCHEMA_DEVIATIONS` — the ways a document is
+/// allowed to depart from the field contract its [`SCHEMA_VERSION`] names,
+/// stated in the artifact rather than in prose.
+///
+/// Refused rather than ignored when unknown, for the reason
+/// [`COMPARABILITY_KINDS`] gives: a misspelt declaration that fell out of
+/// every check would be indistinguishable from no declaration, which is the
+/// exact state the declaration exists to end.
+pub const SCHEMA_DEVIATIONS: &[&str] = &[DEVIATION_NULLABLE_SCALING_EFFICIENCY];
+
+/// Every document contract this generator understands, newest last, mirroring
+/// the harness's table of the same name: the version, and the exact set of
+/// [`SCHEMA_DEVIATIONS`] it names.
+///
+/// A document whose bytes conform to [`Document::schema_version`]'s field
+/// contract carries no `document_contract` key at all. One that has been
+/// hand-annotated after the run — a cell withheld, so the derivations off its
+/// baseline are nulled — conforms to no `schema_version`'s field contract, and
+/// cannot say so by moving that version: on a results document the version is
+/// a *producer interlock* (see the harness const's doc and
+/// `benches/README.md`), so moving it releases the one job only it does. The
+/// contract such a document does conform to is versioned here instead.
+///
+/// The version is what a reader keys on and what [`parse_str`] gates: a
+/// contract outside this table is refused at the probe, before a field is
+/// typed, exactly as an unknown [`SCHEMA_VERSIONS`] member is. That is what
+/// the bare deviation list this replaces could not buy — a list is unordered,
+/// so a reader meeting a later contract can only notice names it happens not
+/// to recognise, and a contract that re-types a field it already names gives
+/// it nothing to notice.
+pub const DOCUMENT_CONTRACTS: &[(u32, &[&str])] = &[(1, &[DEVIATION_NULLABLE_SCALING_EFFICIENCY])];
+
+/// One or more `results[]` rows carry `scaling_efficiency: null`, where the
+/// declared version's contract types that field as a plain `f64`. A `null`
+/// means the family's one-consumer baseline is in `withheld[]`, so the
+/// quotient is disclaimed; it never means zero, and it is never a number that
+/// went missing.
+///
+/// This generator does not plot `scaling_efficiency` and would not otherwise
+/// deserialize it. It reads it solely to hold the declaration to the rows.
+pub const DEVIATION_NULLABLE_SCALING_EFFICIENCY: &str = "nullable_scaling_efficiency";
 
 /// The closed flow set from the schema contract — the nine flows the
 /// harness's merge validation resolves rows and `unsupported[]` entries
@@ -338,12 +450,36 @@ pub const ALIASED_FLOWS: &[(&str, &str)] = &[("supervisor", "consume_parallel")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Document {
     pub schema_version: u32,
+    /// The field contract these bytes conform to, from the closed
+    /// [`DOCUMENT_CONTRACTS`] table, when that is not
+    /// [`Self::schema_version`]'s — absent on a document that departs from
+    /// nothing, which is every document a clean six-backend run writes.
+    ///
+    /// `#[serde(default)]` is not an accept path here: [`validate`] derives
+    /// the departures the rows exhibit and requires the key to be present
+    /// exactly when they exhibit any, so an omission is caught by the rows
+    /// rather than granted by the default.
+    #[serde(default)]
+    pub document_contract: Option<DocumentContract>,
     pub generated_at: String,
     pub shove_version: String,
     #[serde(default)]
     pub rust_version: String,
     pub hardware: Hardware,
     pub runs: Vec<BackendRun>,
+}
+
+/// A document's own field contract, versioned independently of
+/// `schema_version` — see [`DOCUMENT_CONTRACTS`].
+///
+/// The two fields state one fact twice, deliberately: [`Self::version`] is
+/// what a reader keys on and what the probe gates, [`Self::deviations`] is
+/// what a human reading the artifact sees without a table to hand. [`validate`]
+/// holds each to the other and both to the rows, so the pair cannot drift.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DocumentContract {
+    pub version: u32,
+    pub deviations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -375,6 +511,13 @@ pub struct BackendRun {
     pub failures: Vec<FailedRow>,
     #[serde(default)]
     pub unsupported: Vec<Unsupported>,
+    /// Cells the harness measured and the document declines to publish,
+    /// because the measuring host rather than the backend set the number —
+    /// see [`COMPARABILITY_KINDS`] for why they live here rather than as a
+    /// marked row in `results[]`. Every entry carries its cause. Read for
+    /// captions only: a withheld cell is never a gap, and never a point.
+    #[serde(default)]
+    pub withheld: Vec<ScenarioResult>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -492,6 +635,36 @@ pub struct ScenarioResult {
     /// The drain account, on a `drain` row — see [`DrainAccount`].
     #[serde(default)]
     pub drain: Option<DrainAccount>,
+    /// Why this cell's rate is not a result — one of
+    /// [`COMPARABILITY_KINDS`], required on every entry of
+    /// [`BackendRun::withheld`] and refused on every row of `results[]`.
+    /// It names the cause of a withholding the entry's *placement* already
+    /// enforces; it is not itself the enforcement, which is the correction
+    /// [`COMPARABILITY_KINDS`] records.
+    #[serde(default)]
+    pub comparability: Option<String>,
+    /// The family's throughput over its one-consumer row, or `null` when that
+    /// baseline is in [`BackendRun::withheld`]. Never plotted: read only so
+    /// [`validate`] can hold the document's `document_contract` declaration to
+    /// its rows — see [`DEVIATION_NULLABLE_SCALING_EFFICIENCY`].
+    ///
+    /// A **double** option, so absent and `null` stay distinguishable: `None`
+    /// is a row that does not carry the key at all (every fixture predating
+    /// the field, and any future contract that drops it), `Some(None)` is the
+    /// explicit null that constitutes the deviation. Collapsing the two would
+    /// make every keyless row demand the declaration.
+    #[serde(default, deserialize_with = "double_option")]
+    pub scaling_efficiency: Option<Option<f64>>,
+}
+
+/// Distinguishes an absent key from a present `null` for
+/// `Option<Option<T>>` — plain `#[serde(default)]` maps both to `None`.
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
 }
 
 /// What a drain measured — the harness's `DrainResult`. Observed counts
@@ -657,6 +830,13 @@ impl ScenarioResult {
 
     /// [`Self::is_framework`] on a chartable method — the one predicate
     /// every absolute-throughput family plots by.
+    ///
+    /// Host-bounded cells need no term here: they are not in `results[]` at
+    /// all but in [`BackendRun::withheld`], which nothing plots from. That is
+    /// deliberate — a predicate every plotting site had to remember to call
+    /// is one a new plotting site can forget, and forgetting it publishes the
+    /// number the document withheld. [`validate`] refuses a `results[]` row
+    /// carrying a marker, so the structure is the guarantee.
     fn is_publishable(&self) -> bool {
         self.is_framework() && self.is_charted_method()
     }
@@ -709,6 +889,33 @@ pub enum ChartError {
     UnsupportedSchemaVersion {
         found: u32,
         expected: u32,
+    },
+    /// Rule 1b — a `document_contract.version` outside [`DOCUMENT_CONTRACTS`].
+    /// Raised by [`parse_str`] before the typed deserialisation, so a document
+    /// written under a contract this generator has never seen is refused for
+    /// the contract rather than for whichever field it happens to re-type.
+    UnknownDocumentContract {
+        found: u32,
+    },
+    /// Rule 1b — the document's `document_contract.deviations` array names
+    /// something outside [`SCHEMA_DEVIATIONS`], or names it twice.
+    UnknownSchemaDeviation {
+        found: String,
+    },
+    /// Rule 1b — the declared contract version and the expansion beside it
+    /// name different sets. One of the two is stale, and which is not knowable
+    /// from the document.
+    DocumentContractMismatch {
+        version: u32,
+        names: &'static [&'static str],
+        listed: Vec<String>,
+    },
+    /// Rule 1b — the declaration and the rows disagree: a deviation the rows
+    /// exhibit and the document does not declare (`declared: false`), or one
+    /// declared with nothing in the rows that exhibits it (`declared: true`).
+    SchemaDeviationMismatch {
+        deviation: &'static str,
+        declared: bool,
     },
     /// Rule 5 — a backend measured nothing and did not declare why.
     SilentlyEmptyRun {
@@ -772,6 +979,53 @@ impl fmt::Display for ChartError {
                 "unsupported schema_version {found}: this chartgen understands \
                  {SCHEMA_VERSIONS:?} and writes charts for v{expected}. Refusing \
                  to render rather than silently mis-reading a newer document."
+            ),
+            Self::UnknownDocumentContract { found } => write!(
+                f,
+                "unknown document_contract version {found}: this chartgen \
+                 understands {:?}. The document states that its field contract \
+                 is not the one its schema_version names, and not one this \
+                 reader knows either — refusing to read it as though it were.",
+                DOCUMENT_CONTRACTS
+                    .iter()
+                    .map(|(v, _)| *v)
+                    .collect::<Vec<_>>()
+            ),
+            Self::UnknownSchemaDeviation { found } => write!(
+                f,
+                "document_contract.deviations names `{found}`, which is not one \
+                 of {SCHEMA_DEVIATIONS:?} (or names it twice). A declaration \
+                 nothing recognises declares nothing."
+            ),
+            Self::DocumentContractMismatch {
+                version,
+                names,
+                listed,
+            } => write!(
+                f,
+                "document_contract version {version} names {names:?}, but the \
+                 expansion beside it lists {listed:?}. The version is what a \
+                 reader keys on and the list is what a person reads; one of \
+                 them is stale and the document cannot say which."
+            ),
+            Self::SchemaDeviationMismatch {
+                deviation,
+                declared: false,
+            } => write!(
+                f,
+                "the rows exhibit `{deviation}` but the document declares no \
+                 document_contract that names it. How a document departs from \
+                 its declared schema_version's field contract is stated in the \
+                 document, not left for a reader to discover at the field."
+            ),
+            Self::SchemaDeviationMismatch {
+                deviation,
+                declared: true,
+            } => write!(
+                f,
+                "document_contract declares `{deviation}` but no row exhibits \
+                 it — a declaration left behind by a re-measure describes a \
+                 document that no longer exists."
             ),
             Self::SilentlyEmptyRun { backend, missing } => write!(
                 f,
@@ -850,8 +1104,70 @@ impl From<serde_json::Error> for ChartError {
 
 // ── Validation: the enforcement rules that gate every render ────────────────
 
-/// Rules 1, 5 and 6 of the schema contract. Checked once, before any chart is
-/// drawn, so a bad document fails before it can write a single file.
+/// Rule 1b: the document's `document_contract` declaration, held to its
+/// expansion and to its rows, in every direction.
+///
+/// The declaration is what makes a departure from the declared version's field
+/// contract legible to a reader holding the file, rather than only to a reader
+/// who found `benches/README.md`. Enforcing it here rather than trusting it is
+/// the same rule [`COMPARABILITY_KINDS`] follows: a hand-added claim in a
+/// generated document is only worth the check that keeps it true.
+///
+/// Three checks, in this order, because each one's refusal is only legible
+/// once the ones before it hold: the expansion is written in the closed
+/// vocabulary, the expansion is the one its version names, and the rows are
+/// what that version describes.
+///
+/// A row that omits `scaling_efficiency` entirely exhibits nothing — the
+/// deviation is the explicit `null`. See
+/// [`ScenarioResult::scaling_efficiency`] for why the two are kept apart.
+fn validate_document_contract(doc: &Document) -> Result<(), ChartError> {
+    let mut declared: BTreeSet<&str> = BTreeSet::new();
+    if let Some(contract) = &doc.document_contract {
+        for d in &contract.deviations {
+            if !SCHEMA_DEVIATIONS.contains(&d.as_str()) || !declared.insert(d.as_str()) {
+                return Err(ChartError::UnknownSchemaDeviation { found: d.clone() });
+            }
+        }
+        // `parse_str` refuses an unknown version before a field is typed; a
+        // `Document` built any other way reaches it here.
+        let names = named_document_contract(contract.version)?;
+        if declared != names.iter().copied().collect::<BTreeSet<&str>>() {
+            return Err(ChartError::DocumentContractMismatch {
+                version: contract.version,
+                names,
+                listed: contract.deviations.clone(),
+            });
+        }
+    }
+
+    let nulled = doc
+        .runs
+        .iter()
+        .flat_map(|run| run.results.iter())
+        .any(|r| r.scaling_efficiency == Some(None));
+    let exhibits = declared.contains(DEVIATION_NULLABLE_SCALING_EFFICIENCY);
+    if nulled != exhibits {
+        return Err(ChartError::SchemaDeviationMismatch {
+            deviation: DEVIATION_NULLABLE_SCALING_EFFICIENCY,
+            declared: exhibits,
+        });
+    }
+    Ok(())
+}
+
+/// The deviation set a [`DOCUMENT_CONTRACTS`] version names, or the refusal
+/// for a contract this generator does not know.
+fn named_document_contract(version: u32) -> Result<&'static [&'static str], ChartError> {
+    DOCUMENT_CONTRACTS
+        .iter()
+        .find(|(v, _)| *v == version)
+        .map(|(_, names)| *names)
+        .ok_or(ChartError::UnknownDocumentContract { found: version })
+}
+
+/// Rules 1, 1b, 5 and 6 of the schema contract. Checked once, before any chart
+/// is drawn, so a bad document fails before it can write a single file.
 pub fn validate(doc: &Document) -> Result<(), ChartError> {
     if !SCHEMA_VERSIONS.contains(&doc.schema_version) {
         return Err(ChartError::UnsupportedSchemaVersion {
@@ -859,6 +1175,7 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
             expected: SCHEMA_VERSION,
         });
     }
+    validate_document_contract(doc)?;
     let barrierless = barrierless_flows(doc.schema_version);
 
     // Everything the provenance block prints as text. The numeric hardware
@@ -887,7 +1204,16 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
     }
 
     for run in &doc.runs {
-        for row in &run.results {
+        // Every shape rule below holds a withheld cell to exactly the row it
+        // would have been: withholding a number is a claim about a real
+        // measurement, so an entry that could not have been a valid row is a
+        // document inventing one it never took.
+        for (row, is_withheld) in run
+            .results
+            .iter()
+            .map(|r| (r, false))
+            .chain(run.withheld.iter().map(|r| (r, true)))
+        {
             if !HANDLER_COSTS.contains(&row.handler_cost.as_str()) {
                 return Err(ChartError::UnknownHandlerCost {
                     backend: run.backend.clone(),
@@ -921,6 +1247,33 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
                     "handler `{}` is not one of the harness's profiles ({:?}, {:?})",
                     row.handler, NEGLIGIBLE_HANDLERS, SLEEPING_HANDLERS
                 ));
+            }
+            // The marker is refused in the one place it would not bind. A
+            // reader that does not know the field ignores it, so a marked row
+            // sitting in `results[]` publishes the number it was added to
+            // withhold — the exact failure `withheld[]` exists to make
+            // structurally impossible. See [`COMPARABILITY_KINDS`].
+            match (is_withheld, row.comparability.as_deref()) {
+                (false, Some(kind)) => {
+                    return malformed(&format!(
+                        "a `results[]` row carries comparability `{kind}`, where a reader that \
+                         does not know the field would publish it anyway — a withheld cell \
+                         belongs in `withheld[]`"
+                    ));
+                }
+                (true, None) => {
+                    return malformed(
+                        "a `withheld[]` entry carries no comparability marker, so the document \
+                         withholds the cell without saying why",
+                    );
+                }
+                (true, Some(kind)) if !COMPARABILITY_KINDS.contains(&kind) => {
+                    return malformed(&format!(
+                        "`{kind}` is not a comparability marker the schema knows \
+                         ({COMPARABILITY_KINDS:?})"
+                    ));
+                }
+                _ => {}
             }
             // No barrier, no setup window to record — through v6 only; see
             // `barrierless_flows`.
@@ -1197,6 +1550,40 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
                 }
             }
         }
+        // A cell cannot be both published and withheld. The duplicate would
+        // not merely be untidy: the `results[]` copy plots, so the document
+        // would publish exactly the number its `withheld[]` copy disclaims,
+        // and the caption would call the cell withheld while its bar stood
+        // on the chart.
+        // `method` and the rung's offered rate are part of the key, not
+        // decoration: one cell carries a drain row *and* a rung per offered
+        // rate, all sharing flow/mode/payload/consumers/handler. Without them
+        // withholding the drain would read as a duplicate of its own rungs.
+        let cell_of = |r: &ScenarioResult| {
+            (
+                r.flow.clone(),
+                r.mode.clone(),
+                r.payload_bytes,
+                r.consumers,
+                r.handler.clone(),
+                r.method.clone(),
+                r.load.as_ref().map(|l| l.offered_msg_per_sec),
+            )
+        };
+        let published: BTreeSet<_> = run.results.iter().map(cell_of).collect();
+        for w in &run.withheld {
+            if published.contains(&cell_of(w)) {
+                return Err(ChartError::MalformedRow {
+                    backend: run.backend.clone(),
+                    flow: w.flow.clone(),
+                    what: format!(
+                        "is withheld and also published in `results[]` at {} B / {} consumer(s) \
+                         — the published copy would chart the number the withheld copy disclaims",
+                        w.payload_bytes, w.consumers
+                    ),
+                });
+            }
+        }
         // The unsupported[] invariants the writer also enforces: a blank
         // reason renders an unexplained absence, and a flow both measured
         // and declared unsupported is a document contradicting itself — the
@@ -1317,6 +1704,14 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
         if !run.failures.is_empty() {
             continue;
         }
+        // A withheld cell is an account of the same kind, and a louder one: it
+        // says the run measured this cell and names why the number is not
+        // published. Rule 5 would otherwise read a fully-withheld run as a
+        // benchmark that silently failed, which inverts what the document
+        // says about it.
+        if !run.withheld.is_empty() {
+            continue;
+        }
         let declared: BTreeSet<&str> = run.unsupported.iter().map(|u| u.flow.as_str()).collect();
         let missing: Vec<String> = KNOWN_FLOWS
             .iter()
@@ -1345,6 +1740,12 @@ pub fn parse_str(raw: &str) -> Result<Document, ChartError> {
     struct VersionProbe {
         #[serde(default)]
         schema_version: u32,
+        #[serde(default)]
+        document_contract: Option<ContractProbe>,
+    }
+    #[derive(Deserialize)]
+    struct ContractProbe {
+        version: u32,
     }
     let probe: VersionProbe = serde_json::from_str(raw)?;
     if !SCHEMA_VERSIONS.contains(&probe.schema_version) {
@@ -1352,6 +1753,13 @@ pub fn parse_str(raw: &str) -> Result<Document, ChartError> {
             found: probe.schema_version,
             expected: SCHEMA_VERSION,
         });
+    }
+    // The same gate, for the same reason, on the other version this document
+    // can carry: a document produced under a contract this generator does not
+    // know may re-type any field, so the refusal has to name the contract
+    // rather than whichever re-typed field serde reaches first.
+    if let Some(contract) = &probe.document_contract {
+        named_document_contract(contract.version)?;
     }
     let doc: Document = serde_json::from_str(raw)?;
     validate(&doc)?;
@@ -1799,6 +2207,9 @@ enum WithheldKind {
     SetupBound,
     /// Only sleeping-handler rows: the number is the simulated sleep.
     HandlerBound,
+    /// Every row of the cell carries a [`COMPARABILITY_KINDS`] marker: the
+    /// measuring host bounded the rate, so it is not this backend's.
+    HostFloor,
     /// This cell's drain failed: its rungs, whatever they sustained, are not
     /// its ceiling.
     DrainFailed,
@@ -1821,6 +2232,10 @@ impl WithheldKind {
             Self::SetupBound => "setup-bound (window includes coordination cost)".to_string(),
             Self::HandlerBound => {
                 "sleeping-handler rows only (the number is the simulated sleep)".to_string()
+            }
+            Self::HostFloor => {
+                "host-bounded rows only (the measuring host's clock, not the backend's rate)"
+                    .to_string()
             }
             Self::DrainFailed => format!(
                 "{} (a failed drain; the cell's ladder rungs are not its ceiling)",
@@ -2366,6 +2781,16 @@ fn sleeping_handler_text() -> &'static str {
      shove, so it is not published"
 }
 
+/// The shared caption for a slice whose every row carries a
+/// [`COMPARABILITY_KINDS`] marker: measured, honestly accounted, and withheld
+/// because the number belongs to the measuring host rather than to the
+/// backend. Never a gap — the measurement exists and the document says why it
+/// is not a result.
+fn withheld_by_host_text() -> &'static str {
+    "measured, but the host rather than the backend bounded the rate (see the rows' \
+     comparability marker in the results document), so it is not published"
+}
+
 /// The shared caption for a cell the harness ran and could not measure.
 fn failed_text() -> &'static str {
     "failed to run — absent, not zero; see failures[] in the results document"
@@ -2901,8 +3326,19 @@ where
                             && failed_key_of(f) == *k
                             && f.method() == Some(Method::Drain)
                     });
+                    // A host-bounded cell is not in `results[]`, so without
+                    // this the slice would read as a gap — "never measured" —
+                    // which is the one thing the document knows is false.
+                    let host_bounded = run.withheld.iter().any(|r| in_slice(r) && key_of(r) == *k);
                     let kind = if rows.is_empty() && failed_drain {
                         WithheldKind::DrainFailed
+                    } else if rows.is_empty() && host_bounded {
+                        // Ahead of the rungs-only arm: a cell whose drain was
+                        // withheld and whose rungs ran is withheld, not
+                        // rungs-only. Captioning it as a sleeping handler or
+                        // a setup-bound window would name a cause the
+                        // document does not claim.
+                        WithheldKind::HostFloor
                     } else if rows.is_empty() && !all_rows.is_empty() {
                         WithheldKind::RungsOnly
                     } else if rows.iter().any(|r| r.is_setup_bound()) {
@@ -4013,6 +4449,12 @@ fn render_parallel_vs_sequenced(
             .map(|(mi, (mode, flow, _))| {
                 // Rungs are not candidates for either arm: their window
                 // contains the harness's own producer.
+                // A cell the host rather than the backend bounded is out of
+                // this slice for free — it is in `withheld[]`, not in
+                // `results[]`, and both arms read `results[]`. Were it a
+                // marked row here instead, drawing it as a lower bound would
+                // still make it this backend's bar for the mode, and it would
+                // set the shared worker count the other modes are read at.
                 let in_mode = |r: &&ScenarioResult| {
                     r.mode == *mode
                         && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
@@ -4124,6 +4566,16 @@ fn render_parallel_vs_sequenced(
                         .filter(in_mode)
                         .any(|r| r.is_framework() || r.is_setup_bound());
                     let measured_sleeping = run.results.iter().any(|r| in_mode(&r));
+                    // `results[]` does not hold these at all, so without their
+                    // own arm a mode measured only in the affected cells
+                    // would be captioned as a gap — the omission this file's
+                    // rule 3 exists to prevent, on cells that were measured.
+                    let withheld_by_host = run.withheld.iter().any(|r| {
+                        r.mode == *mode
+                            && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
+                            && r.payload_bytes == payload
+                            && r.is_charted_method()
+                    });
                     // A failed cell in this mode is an absence with a
                     // recorded cause — not a gap, and not unsupported.
                     let failed = run.failures.iter().any(|f| {
@@ -4135,6 +4587,8 @@ fn render_parallel_vs_sequenced(
                     });
                     let text = if measured_short {
                         short_window_text()
+                    } else if withheld_by_host {
+                        withheld_by_host_text().to_string()
                     } else if measured_sleeping {
                         sleeping_handler_text().to_string()
                     } else if failed {

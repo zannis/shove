@@ -91,6 +91,22 @@ from page cache with every fetch full, and no publisher competes for the
 host. It is the number to compare backends and versions by, not a
 prediction of what a live producer at that rate would see.
 
+One class of row on the current host is the opposite of that, and it is not
+comparable with anything: a **single-consumer** drain whose loop spends most
+of each cycle waiting on the Docker VM is measured at a reduced CPU clock, so
+that row is a floor rather than a ceiling. In the committed document it is
+Redis `consume_batch` at 64 B and 1 KiB with one consumer, published at
+0.457x and 0.439x their `consume_parallel` cells — where an unrelated busy
+process on the host takes the same cell *above* that comparator. Do not
+quote, chart or diff a 1c drain rate from this host as a backend or version
+result without reading **A lone consumer on the macOS host clocks down**
+below; on those flows the multi-consumer cells of the same row are the
+comparable ones. The document says so as well as this file: those two cells
+are not in `results[]` at all but in `withheld[]`, carrying
+`comparability: "host_clock_floor"`, so a reader that only parses the JSON
+finds no row to derive 0.457 and 0.439 from — see **`withheld[]`: the cells
+the document declines to publish**.
+
 ## The offered-load ladder
 
 The ladder is the latency measurement. For each rate on it the harness
@@ -200,6 +216,76 @@ shove's SQS batch consumer rejects a larger `max_batch_size` at startup rather
 than clamping it, and the matrix's size exceeds that. The harness clamps to 10
 when it builds the scenario and the row records 10, so an SQS batch bar is a
 10-message batch and is not like-for-like against a backend that ran 500.
+
+### A lone consumer on the macOS host clocks down
+
+Low Power Mode is not the only power management on this host, and the second
+effect survives `pmset -g` reading `powermode 0`. A cell that runs **one**
+consumer whose loop spends most of each cycle waiting on the Docker VM is
+measured at a reduced clock, and the rate it publishes is a floor for that
+flow rather than its ceiling. Where the current document shows it is Redis
+`consume_batch` at 64 B and 1 KiB: one consumer draws 132 388 msg/s where
+`consume_parallel` at the same cell draws 289 728, while two consumers draw
+726 872 — 363k each, 2.7x the per-consumer rate at one. Measured 2026-09-11
+on the host this document was measured on, Low Power Mode off, one consumer,
+`--concurrent --handler zero`, the matrix's six-million-message drain.
+
+The clock is the cause rather than the loop, and each of the three
+measurements that say so excludes something else:
+
+- **An instrumented drain steps mid-run.** Per-cycle cost holds at ~0.9 ms
+  for the first second and then ~3.7 ms for the rest of the drain (read
+  0.53-0.67 -> 1.9-2.7 ms, ingest 0.17-0.22 -> 0.6-0.9 ms, flush 0.20-0.26 ->
+  0.8-1.1 ms; 137 783 msg/s overall, against the document's 132 388). **All
+  three phases scale by the same ~3.7x, ingest included** — and ingest is
+  client-side decode with no I/O in it, so no server-side or on-the-wire cost
+  can be what slowed it; only the thread running slower can. The fast first
+  second is the fill's producers having just left the cores clocked up, which
+  is also why a 600 000-message drain finishes inside that window and measures
+  521 753 msg/s.
+- **Any unrelated busy process removes it.** `yes > /dev/null` on the host —
+  touching neither Redis, the VM nor the harness — takes the same cell to
+  384 000 msg/s and holds it fast throughout; so does a 250 ms `INFO` sampler
+  (416-434k); so does a second consumer, which is the document's own 2c row.
+  A quiet control run immediately afterwards draws 148 000 again. Nothing
+  charged per entry, per message or per round trip is removed by traffic that
+  shares no work with the flow.
+- **The transport is not the bound.** A parse-free `XREADGROUP` probe on one
+  connection fits ~0.085 ms fixed + 0.74 us per entry — 0.469 ms at COUNT 500,
+  an implied 1 065 662 msg/s — and gets no faster with a second flow keeping
+  the socket busy (0.438 ms). A lone serial reader pays no large fixed
+  per-read cost here.
+
+Excluded by the same pass: `XREADGROUP`/`XACK` server time, tokio cross-worker
+handoff (`TOKIO_WORKER_THREADS=1` steps identically), thread QoS and
+efficiency-core placement (`QOS_CLASS_USER_INTERACTIVE` on every worker, and
+`taskpolicy -t 0 -l 0`, both step identically, while `taskpolicy -c background`
+is slow from the first cycle), the Redis reaper's 1 s `XTRIM MINID` (disabling
+it changes nothing once any companion process is present), and per-entry and
+per-byte costs.
+
+So read a single-consumer cell on this host as a lower bound and compare
+across the multi-consumer cells on the same row. Repeated quiet-host runs of
+that Redis cell draw from a 130-270k band, which is why the deficit is not a
+stable rate to reason from. The effect needs a loop that is both
+single-threaded and mostly idle: it is absent at 64 KiB, where 32 MB of reply
+per cycle keeps the core busy and that 1c row runs 1.17x its `consume_parallel`
+instead; absent on Kafka, whose per-cycle client work is heavier; and absent
+in-process, with no broker and no VM in the cycle.
+
+Nothing in the harness compensates for it. A keep-awake companion would make
+every cell measure a host state the published rows do not have, so the choice
+here is to disclose the effect rather than paper over it; adding one is a
+methodology decision in its own right.
+
+The disclosure is machine-readable, not only prose: in
+`benches/results/bench-results.json` both affected cells are held in
+`withheld[]` rather than `results[]`, carrying
+`comparability: "host_clock_floor"`, and a value outside the closed set is
+refused rather than ignored at both ends. See **`withheld[]`: the cells the
+document declines to publish**. Placement rather than a marker is what reaches
+a reader comparing rows programmatically — it is the difference between a rate
+a tool will happily divide by another and no rate for the tool to divide.
 
 ### The backlog cap on the ladder
 
@@ -391,6 +477,246 @@ Rerunning a single backend into the current document replaces only that
 backend's entry. That is the intended way to refresh one backend after a
 change to it, as long as the host and toolchain still match the document.
 
+### `withheld[]`: the cells the document declines to publish
+
+Every field on a row is a measurement. `comparability` is a claim *about* a
+measurement — that the machine it was taken on, rather than the backend, set
+the number — and the harness cannot detect that, so it is added by hand
+against evidence recorded in this file. It takes one of a closed set of
+values; today that set is `host_clock_floor` (see **A lone consumer on the
+macOS host clocks down**), and the two cells carrying it are Redis
+`consume_batch` at 64 B and at 1 KiB with one consumer.
+
+**A withheld cell does not sit in `results[]`.** It lives in a sibling
+`withheld[]` array on the backend's run, carrying the row it would have been
+plus the required cause. That placement *is* the withholding, and it is the
+part an earlier version of this section got wrong. The marker was first
+carried as an optional field on an ordinary `results[]` row, justified on the
+grounds that it "only ever withholds" — that a reader which does not know the
+field publishes exactly what it published before, so it could never turn a
+correct reading into a wrong one. The premise is true and the conclusion does
+not follow: what such a reader published *before* is the reading the marker
+exists to retract. Neither the harness's results struct nor the chart
+generator's denies unknown fields, so every reader built before the marker
+existed went on parsing those rows and deriving 0.457 and 0.439 as results,
+with no signal that its interpretation was obsolete. A disclaimer a reader can
+ignore withholds nothing from a reader that ignores it.
+
+Moving the cell fixes that for every reader at once, including ones this
+repository does not contain: a reader that has never heard of `withheld[]`
+finds *no row* for those cells and cannot derive a ratio from a row it does
+not have. It loses exactly the two numbers it must not publish and keeps every
+number it may.
+
+A `schema_version` bump is the usual way to make an old reader refuse a
+document it can no longer read correctly, and it is the wrong instrument here —
+not because the declaration would merely read oddly, but because on this
+document the version field is a **live interlock**. Its `dlq_drain` rows are
+v6-shaped on all six backends (`setup_secs: null`, `handler_cost:
+setup_bound`), the shape that left the contract when that flow gained its
+readiness barrier: `validate_run` refuses it outright, under either marker,
+at any version. What keeps that from ever surfacing is the v6 declaration
+itself — `merge_results_file` reaches the version gate first and refuses the
+file with one legible *move it aside* message, and the harness raises the same
+refusal before the sweep rather than after hours of broker time. Re-declare the
+same bytes v7 and that gate opens: the file clears it, reaches the
+preserved-run check, and is refused there per row instead. So the bump does not
+relabel how those rows were measured — it releases the interlock that today
+keeps a barriered leg from merging into five pre-barrier ones.
+
+Both halves of that are pinned, because they sit in different crates' readers.
+`the_committed_document_is_one_no_v7_producer_could_have_written` (the
+harness's own tests, run by `tests/bench_harness.rs`) asserts the per-row
+refusal against the committed artifact. `a_v7_declaration_of_the_committed_document_is_not_refused`
+(`tests/chartgen.rs`) records the other side: the **chart generator** does not
+refuse the mislabelled file, because from v7 `dlq_drain` only *leaves* the
+barrierless set, which permits a recorded setup window without requiring one.
+The reader has nothing to object to; the producer does. Withholding by
+placement needs no version at all.
+
+#### `document_contract`: the contract these bytes conform to, versioned in the file
+
+What the paragraph above establishes is that the bump is unavailable. It does
+not make the declaration true, and stating only the first invites reading the
+second. So, plainly: **no schema version describes
+`benches/results/bench-results.json` as it stands.** Its `dlq_drain` rows are
+v6-shaped, which no v7 producer could have written; six of its `results[]` rows
+null `scaling_efficiency`, which no v6 producer could have written. The `6` it
+declares is the producer interlock described above — the thing that keeps those
+pre-barrier rows from merging into a barriered leg — and it is not, on this
+artifact, a description of the field contract.
+
+That leaves a real gap, and this section closed it twice without closing it:
+first with prose — a read rule stated here, that a reader holding the JSON has
+no reason to look for — and then with a bare list of departure names in the
+document. The second is better than the first and is still not a contract. A
+reader meeting a file whose field contract is not the one its `schema_version`
+names has to be able to say *this is not a contract I know* and stop, and an
+unordered list cannot give it that: it surfaces only the names a reader happens
+not to recognise, and a later contract that re-types a field already in the
+list surfaces nothing at all.
+
+So the document carries a contract of its own, versioned independently of
+`schema_version`, in a key beside it:
+
+```json
+{
+  "schema_version": 6,
+  "document_contract": {
+    "version": 1,
+    "deviations": ["nullable_scaling_efficiency"]
+  },
+```
+
+Two version numbers, because there are two questions and the interlock forbids
+answering them with one field. `schema_version: 6` says which contract the rows
+were **produced** under, and is the producer interlock described above.
+`document_contract.version: 1` says which field contract these bytes actually
+**conform to**, and is what a reader keys on. A document that conforms to its
+`schema_version`'s field contract carries no `document_contract` key at all —
+which is every document a clean six-backend run writes.
+
+Contract 1 is defined in one place per reader — `DOCUMENT_CONTRACTS` in
+`examples/common/stress_test.rs`, mirrored in `examples/common/chartgen.rs` —
+as exactly this set:
+
+> **`nullable_scaling_efficiency`** — one or more `results[]` rows carry
+> `scaling_efficiency: null`, where the declared `schema_version`'s contract
+> types that field as a plain `f64`. A `null` means the family's one-consumer
+> baseline is in `withheld[]`, so the quotient is disclaimed; it never means
+> zero, and it is never a number that went missing.
+
+The `deviations` array beside the version restates what the version already
+names. That is deliberate: the integer is what a reader keys on and what the
+refusals gate, the array is what a person reading the artifact sees without the
+table to hand. Two statements of one fact are only worth carrying if nothing
+can drift them apart — so the readers refuse a version whose expansion says
+something else, in either direction.
+
+An **unknown** contract version is a refusal at the declaration, and that is
+what the bare list could not buy. `chartgen::parse_str` checks it in the
+version probe, *before* the typed deserialisation and in the same place an
+unknown `schema_version` is checked, so a document written under a later
+contract is refused for the contract rather than for whichever field that
+contract re-typed. The harness raises the same refusal twice: in
+`refused_results_file_version`, before a sweep starts, where finding out late
+costs hours of broker time, and in `merge_results_file`, which is the
+authority. What no key here can do is reach a reader that predates it; that
+reader is stopped by the `null` itself, which is why the retraction lives on
+the field rather than in this declaration — see *Withholding a row withholds
+what was derived from it* below.
+
+That distinction is the whole difference between this and the
+ignorable-disclaimer mistake this section elsewhere is the repair of. That
+mistake was to make an additive key carry the **retraction** — an old reader
+skips the key and republishes `5.4904…`, the withheld measurement in quotient
+form. Here the retraction is the `null`, which no reader can skip; the contract
+states which contract moved, for a reader that has already been stopped by it,
+or refuses one that knows the key and not the version.
+
+Because it is hand-added, the declaration is checked rather than trusted, in
+every direction and by both readers. `validate_document_contract` in the
+harness (`examples/common/stress_test.rs`) refuses a member outside the closed
+vocabulary, a duplicate, a version outside `DOCUMENT_CONTRACTS`, an expansion
+that is not the one its version names, rows that null a derivation under no
+declaration, and a declaration no row exhibits — and it runs **before** the
+version gate, since a document whose declared version does not describe it is
+precisely the document the key exists for. The chart generator enforces the
+same rules in `validate`, which is what holds the committed artifact to them on
+every `cargo nextest run --no-default-features`. And the harness *derives* what
+it writes from the rows (`document_contract_for`), so no run can produce a
+nulled derivation without producing the statement of it, the key leaves the
+document the moment the nulls do, and a future deviation with no contract
+naming it stops the merge rather than being written undeclared.
+
+The deviation is bounded and pinned as well as declared.
+`the_committed_documents_only_v6_deviation_is_the_withheld_derivations`
+(`tests/chartgen.rs`) asserts its exact extent against the real artifact: the
+document nulls that field on exactly six rows, all of them Redis
+`consume_batch` drains at 64 B and 1 KiB with two, four and eight consumers,
+each in a family whose one-consumer row is withheld — and on no other row, of
+any backend or flow. A seventh null cannot arrive quietly under the v6 label.
+`the_committed_document_declares_the_deviation_it_carries` pins the
+declaration itself, and
+`a_document_that_nulls_a_derivation_without_declaring_it_is_refused` pins both
+halves of the rule against that same artifact. The contract's own two
+properties are pinned beside them:
+`an_unknown_document_contract_is_refused_at_the_version_not_at_a_field`
+(`tests/chartgen.rs`) puts a contract from the future on the real document and
+asserts the refusal names the contract even when the rows could not
+deserialise at all, and
+`a_document_contract_this_harness_does_not_know_is_refused_at_the_declaration`
+(the harness's own tests) asserts the same on both of the harness's refusal
+points, plus the version-against-expansion check. All of it expires together:
+the next six-backend re-measure writes a genuine v7 document with no withheld
+cells, no nulls and no `document_contract` key, at which point those tests and
+`the_committed_document_is_one_no_v7_producer_could_have_written` fail by
+design and this section is rewritten with them.
+
+The rest of what makes a hand-added claim safe in a generated document:
+
+- **A typo cannot go quiet.** A value outside the closed set is refused by the
+  harness on the way into a merged document and by the chart generator on the
+  way out, rather than ignored — an unknown marker that read as "no marker"
+  would leave the cell withheld with no stated cause. A `withheld[]` entry
+  without a marker is refused for the same reason, and a marker left behind on
+  a `results[]` row is refused because there it would not bind.
+- **A cell is published or withheld, never both.** A `results[]` copy would
+  chart, so the document would publish exactly the number its `withheld[]`
+  copy disclaims.
+- **Withholding a row withholds what was derived from it.** Moving the row is
+  only half the job. `scaling_efficiency` is each family's throughput over its
+  *one-consumer* row, so withholding that row while leaving the quotient
+  published hands a reader the disclaimed number back in derived form: Redis
+  `consume_batch` at 64 B / 2c published `5.490446860977596`, which is exactly
+  `726,872 / 132,388` — the withheld measurement. Those rows now publish
+  `scaling_efficiency: null`, and the harness refuses both mistakes: a
+  quotient over a withheld baseline, and a `null` where the baseline *is*
+  published (which would claim a withholding the document never declared).
+
+  This is also where an old reader is made to **refuse**. `scaling_efficiency`
+  was a plain `f64`, so a reader built against that contract fails to parse a
+  nulled row instead of quietly republishing a stale derivation — the refusal
+  a `schema_version` bump would normally buy, on the one field whose meaning
+  actually changed, and at no cost to a document that withholds nothing, where
+  every row still carries a number.
+
+  The cost that *is* paid is stated rather than hidden: serde types a
+  document, not a cell, so such a reader loses the whole file rather than the
+  six rows, and its error names a field rather than a version. Neither is
+  avoidable here. A bump would not soften the first — an old reader refuses a
+  bumped document *entirely*, which is the point of bumping — and it is not
+  available for the interlock reason above. Nor would dropping the field
+  instead of nulling it: absent and `null` are the same parse failure against
+  a non-`default` `f64`. What the null buys over silence is that the failure
+  happens at all — and what `document_contract` buys on top of it is that the
+  operator reading `invalid type: null, expected f64` finds the contract the
+  file conforms to named in the same file, rather than having to reach this
+  page to learn which contract moved.
+
+  That cost is asserted, not merely conceded.
+  `a_v6_document_reader_clears_the_version_gate_and_then_keeps_no_row_at_all`
+  (`tests/chartgen.rs`) runs the most permissive v6 reader there can be — the
+  changed field typed `f64`, every other key ignored, nothing denied — over
+  the real artifact: it clears the version gate the document still advertises,
+  then refuses the file with `invalid type: null, expected f64`, keeping no
+  row of any backend. Its control fills in exactly those six cells, touches
+  nothing else, and the same reader then takes every published row. So the
+  nullability is the whole of what a v6 reader cannot take from this file, and
+  the `dlq_drain` rows the version field interlocks against are no part of it
+  — which is the other reason relabelling these bytes v7 repairs nothing. The
+  one softening that argument leaves open, dropping the field rather than
+  nulling it, is caught there too: against a reader carrying
+  `#[serde(default)]` it would read as `0.0` for the withheld families, and
+  the test fails on the error the document no longer produces.
+- **A merge preserves it; a re-measure drops it.** Refreshing another
+  backend's leg keeps that backend's entries. Re-measuring the withheld
+  backend writes ordinary rows and no entries, deliberately: the claim is
+  about one number, and a new number has to earn it again.
+- **A withheld cell is never a gap.** The chart generator captions it with its
+  cause rather than letting the absence read as a measurement never taken, and
+  a run whose cells are all withheld is not a silently-failed run.
+
 ## Regenerating the charts
 
 ```sh
@@ -452,6 +778,24 @@ check before trusting a document:
   whether they share a connection or not (2026-09-10). The publish fill hits
   the same ceiling. A cell 10 to 15 % under its neighbours is inside the
   cell-to-cell noise seen on the same host.
+- A **1-consumer** cell far under its own 2-consumer per-consumer rate on the
+  macOS host is that host's clock management, not the backend and not the
+  flow: the published Redis `consume_batch` 64 B row draws 132k at one
+  consumer against 363k each at two, and repeated quiet-host runs of it draw
+  anywhere in 130-270k. Such a row is a floor, so it is not a rate to reason
+  from and not comparable across backends or versions — see **A lone consumer
+  on the macOS host clocks down**, and the cell's place in `withheld[]` under
+  `comparability: "host_clock_floor"`, which is the same statement in the
+  data. The per-consumer rate at two consumers is
+  the test, and it isolates the affected rows across the whole document: it is
+  2.75x and 2.37x the 1c rate on those two Redis cells, and **at most 1.08x**
+  on every other 1c `consume_batch` drain cell in the document — the highest of
+  them is Kafka at 1 KiB, 1.07x — which hold flat or fall from one to two
+  consumers the way contention makes them. Every 1c cell has a 2c row to
+  compare against; in-process at 64 B is the only one whose 2c row is
+  `setup_bound` rather than `framework`, and it reads 1.02x either way. So a 1c
+  row under parity with a *flat* 2c per-consumer rate — in-process at 1 KiB and
+  64 KiB, Kafka at 64 B — is a real result and not this effect.
 
 ## Related benchmarks
 

@@ -2305,6 +2305,938 @@ fn the_lockfile_carries_no_font_stack() {
     }
 }
 
+// ── The withholding marker ──────────────────────────────────────────────────
+
+/// `row` with a comparability marker stamped on it, asserting the stamp took:
+/// a fixture that silently failed to take would assert against the *unmarked*
+/// behaviour and pass for the wrong reason.
+fn host_bounded(row: &str, kind: &str) -> String {
+    let marked = row.replace(
+        r#""handler_cost": "framework","#,
+        &format!(r#""handler_cost": "framework", "comparability": "{kind}","#),
+    );
+    assert_ne!(marked, row, "the comparability stamp did not take");
+    marked
+}
+
+/// A one-backend run carrying a single 64 B batch drain — the shape
+/// `a_published_batch_bar_names_its_knobs` publishes.
+fn batch_run_json(backend: &str, row: String) -> String {
+    format!(
+        r#"{{
+          "backend": "{backend}", "representative": true,
+          "results": [{row}], "failures": [], "unsupported": []
+        }}"#
+    )
+}
+
+/// The same run with its one cell *withheld* rather than published: the cell
+/// leaves `results[]` entirely, which is what makes the withholding bind on a
+/// reader that has never heard of the marker.
+fn batch_run_withheld_json(backend: &str, row: String) -> String {
+    format!(
+        r#"{{
+          "backend": "{backend}", "representative": true,
+          "results": [], "failures": [], "unsupported": [],
+          "withheld": [{row}]
+        }}"#
+    )
+}
+
+#[test]
+fn a_host_bounded_row_is_withheld_from_the_ordering_chart_and_said_to_be() {
+    // The A and B arms differ in one key. A marked row is measured, honest
+    // and internally consistent — every other guard passes it — but its rate
+    // is the measuring host's rather than the backend's, so no chart may
+    // publish it. Withholding it silently would be the worse failure: an
+    // absent bar reads as a gap, which says a measurement was never made.
+    let row = scenario("consume_batch", "batch", 64, 1, 80_000.0);
+    let published = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        batch_run_json("kafka", row.clone())
+    )));
+    let withheld = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        batch_run_withheld_json("kafka", host_bounded(&row, "host_clock_floor"))
+    )));
+
+    let svg_published =
+        chartgen::render_to_string(&published, Family::ParallelVsSequenced, Mode::Light)
+            .expect("the unmarked control should render");
+    let svg_withheld =
+        chartgen::render_to_string(&withheld, Family::ParallelVsSequenced, Mode::Light)
+            .expect("a marked row is a valid row, so the chart still renders");
+
+    // The knob caption is stated by a *published* batch bar and by nothing
+    // else, so it is the one string that tracks the bar itself.
+    assert!(
+        svg_published.contains("up to 500 messages or 200 ms per batch"),
+        "the control's batch bar must publish"
+    );
+    assert!(
+        !svg_withheld.contains("up to 500 messages or 200 ms per batch"),
+        "a host-bounded row must not reach the ordering chart's batch bar"
+    );
+    assert!(
+        svg_withheld.contains("the host rather than the backend bounded the rate"),
+        "the withheld cell must name its cause instead of reading as a gap"
+    );
+    // Other cells of this six-cell chart are legitimately gaps, so the test
+    // is that withholding this one added *no* gap: same gap count in both
+    // arms, with the withheld cell's own explanation on top.
+    let gaps = |svg: &str| svg.matches("a gap, not a").count();
+    assert_eq!(
+        gaps(&svg_withheld),
+        gaps(&svg_published),
+        "the withheld cell was captioned as a gap — it was measured"
+    );
+}
+
+#[test]
+fn a_comparability_marker_outside_the_closed_set_is_refused() {
+    // The failure mode this guards is silence: an unknown marker that fell
+    // through `is_comparable` would publish the number it was added to
+    // withhold, and the document would look like it had withheld it.
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        batch_run_withheld_json(
+            "kafka",
+            host_bounded(
+                &scenario("consume_batch", "batch", 64, 1, 80_000.0),
+                "clocked_down",
+            ),
+        )
+    )));
+    let err = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect_err("an unknown marker is refused");
+    assert!(
+        err.to_string().contains("not a comparability marker"),
+        "wrong refusal: {err}"
+    );
+}
+
+#[test]
+fn a_marker_on_a_published_row_is_refused_because_an_old_reader_ignores_it() {
+    // The defect this rule exists for, and the reason the marker alone was
+    // not enough. Neither this generator's `Document` nor the harness's
+    // results struct denies unknown fields, so a reader built before the
+    // marker existed parses a marked `results[]` row and publishes its rate
+    // exactly as it did before — the disclaimer is invisible to precisely the
+    // readers it needed to reach. A withheld cell therefore leaves
+    // `results[]`, and a marker left behind on a published row is refused
+    // rather than honoured.
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        batch_run_json(
+            "kafka",
+            host_bounded(
+                &scenario("consume_batch", "batch", 64, 1, 80_000.0),
+                "host_clock_floor",
+            ),
+        )
+    )));
+    let err = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect_err("a marked row in results[] is refused");
+    assert!(
+        err.to_string().contains("belongs in `withheld[]`"),
+        "wrong refusal: {err}"
+    );
+}
+
+#[test]
+fn a_cell_cannot_be_published_and_withheld_at_once() {
+    // The `results[]` copy charts, so the document would publish exactly the
+    // number its `withheld[]` copy disclaims — and caption the cell as
+    // withheld while its bar stood on the chart.
+    let row = scenario("consume_batch", "batch", 64, 1, 80_000.0);
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{row}], "failures": [], "unsupported": [],
+          "withheld": [{}]
+        }}"#,
+        host_bounded(&row, "host_clock_floor")
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let err = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect_err("a cell published and withheld at once is refused");
+    assert!(
+        err.to_string().contains("withheld and also published"),
+        "wrong refusal: {err}"
+    );
+}
+
+#[test]
+fn a_withheld_cell_without_a_cause_is_refused() {
+    // Withholding without saying why is the failure mode the closed set
+    // exists to prevent, one step earlier: the cell vanishes from every axis
+    // and the caption cannot name a reason for it.
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        batch_run_withheld_json("kafka", scenario("consume_batch", "batch", 64, 1, 80_000.0))
+    )));
+    let err = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect_err("a withheld cell with no marker is refused");
+    assert!(
+        err.to_string().contains("carries no comparability marker"),
+        "wrong refusal: {err}"
+    );
+}
+
+#[test]
+fn the_committed_document_withholds_exactly_the_rows_the_runbook_names() {
+    // The marker is hand-added against evidence, and the evidence names two
+    // cells. This is the staleness guard on that pairing: a re-measure drops
+    // the marker (the harness never writes it), and a marker that survived
+    // onto a row the runbook does not explain — or a third cell quietly
+    // acquiring one — fails here rather than in a reader's comparison.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let doc = chartgen::load(&path).expect("the committed results document should load");
+
+    let marked: Vec<(String, String, u64, u32, String)> = doc
+        .runs
+        .iter()
+        .flat_map(|run| {
+            run.withheld.iter().map(move |r| {
+                (
+                    run.backend.clone(),
+                    r.flow.clone(),
+                    r.payload_bytes,
+                    r.consumers,
+                    r.comparability.clone().unwrap_or_default(),
+                )
+            })
+        })
+        .collect();
+
+    assert_eq!(
+        marked,
+        vec![
+            (
+                "redis".to_string(),
+                "consume_batch".to_string(),
+                64,
+                1,
+                "host_clock_floor".to_string()
+            ),
+            (
+                "redis".to_string(),
+                "consume_batch".to_string(),
+                1024,
+                1,
+                "host_clock_floor".to_string()
+            ),
+        ],
+        "the marked cells are not the ones benches/README.md accounts for"
+    );
+}
+
+#[test]
+fn a_reader_that_knows_only_results_finds_no_row_for_a_withheld_cell() {
+    // The property the marker could not deliver, asserted against the real
+    // artifact rather than a fixture. A reader built before any of this —
+    // one that parses `results[]`, ignores fields it does not know, and
+    // derives a batch-vs-parallel ratio — must come away with *no* number for
+    // the two host-bounded cells, not with the disclaimed one. Modelled the
+    // way such a reader actually behaves: raw JSON, `results[]` only, no
+    // knowledge of `withheld[]` or `comparability`.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+
+    // The drain specifically: it is the throughput ceiling the charts publish
+    // and the row a batch-vs-parallel ratio is taken from. The same cell also
+    // carries offered-load rungs, whose rates are the harness's own producer
+    // and were never the disclaimed number.
+    let drain_rate =
+        |backend: &str, flow: &str, mode: &str, payload: u64, consumers: u64| -> Option<f64> {
+            doc["runs"]
+                .as_array()?
+                .iter()
+                .find(|r| r["backend"] == backend)?["results"]
+                .as_array()?
+                .iter()
+                .find(|r| {
+                    r["flow"] == flow
+                        && r["payload_bytes"] == payload
+                        && r["consumers"] == consumers
+                        && r["mode"] == mode
+                        && r["method"] == "drain"
+                })
+                .and_then(|r| r["throughput_msg_per_sec"].as_f64())
+        };
+
+    for payload in [64, 1024] {
+        assert_eq!(
+            drain_rate("redis", "consume_batch", "batch", payload, 1),
+            None,
+            "an old reader can still read the {payload} B single-consumer batch drain out of \
+             results[], so it will still derive the ratio the document disclaims"
+        );
+        // The denominator of that ratio is untouched — it is a real result.
+        // Asserting it stayed is what makes the assertion above specific:
+        // a document that lost both sides would pass a one-sided check while
+        // having deleted a published number.
+        assert!(
+            drain_rate("redis", "consume_parallel", "parallel", payload, 1).is_some(),
+            "the {payload} B single-consumer parallel drain is publishable and must remain"
+        );
+    }
+    // The control: withholding removed those two cells and nothing else. A
+    // reader that lost the whole flow would be a different bug wearing the
+    // same green.
+    assert!(
+        drain_rate("redis", "consume_batch", "batch", 64, 8).is_some(),
+        "the eight-consumer batch drain is publishable and must still be readable"
+    );
+}
+
+#[test]
+fn a_withheld_baseline_leaves_no_derived_scaling_value_behind() {
+    // Relocating a row withholds the measurement. It does not, by itself,
+    // withhold what was *computed* from it — and `scaling_efficiency` is
+    // computed from exactly the row that moved: each family's throughput over
+    // its one-consumer row. The 64 B / 2c row published 5.490446860977596,
+    // which is 726,872 / 132,388 — the withheld number in quotient form. A
+    // reader that correctly finds no 1c row could still present a conclusion
+    // derived from the 1c row, which is the same failure as publishing it.
+    //
+    // Asserted against the real artifact, in the three ways it can go wrong.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+
+    let rows = |backend: &str, flow: &str| -> Vec<serde_json::Value> {
+        doc["runs"]
+            .as_array()
+            .expect("runs")
+            .iter()
+            .find(|r| r["backend"] == backend)
+            .expect("the backend is in the document")["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .filter(|r| r["flow"] == flow && r["method"] == "drain")
+            .cloned()
+            .collect()
+    };
+
+    // 1. Every row whose baseline is withheld publishes `null`, not a number.
+    for row in rows("redis", "consume_batch") {
+        let payload = row["payload_bytes"].as_u64().expect("payload_bytes");
+        if payload != 64 && payload != 1024 {
+            continue;
+        }
+        assert!(
+            row["scaling_efficiency"].is_null(),
+            "redis consume_batch at {payload} B / {} consumer(s) still publishes a scaling \
+             value derived from the withheld one-consumer drain: {}",
+            row["consumers"],
+            row["scaling_efficiency"]
+        );
+    }
+
+    // 2. The control. Withholding removed the derivations of two families and
+    //    nothing else — a document that nulled the field everywhere would pass
+    //    a one-sided check while having deleted publishable conclusions.
+    let parallel = rows("redis", "consume_parallel");
+    assert!(
+        !parallel.is_empty() && parallel.iter().all(|r| r["scaling_efficiency"].is_number()),
+        "redis consume_parallel baselines are published, so every row of it must still carry \
+         its scaling value"
+    );
+
+    // 3. And the refusal. A reader built against the `f64` this field used to
+    //    be does not quietly default the nulled rows — it fails to parse them,
+    //    which is the signal that its interpretation is obsolete. This is the
+    //    property an ignorable additive field could not deliver.
+    #[derive(Debug, serde::Deserialize)]
+    struct OldReaderRow {
+        #[allow(dead_code)]
+        scaling_efficiency: f64,
+    }
+    let withheld_baseline_row = rows("redis", "consume_batch")
+        .into_iter()
+        .find(|r| r["payload_bytes"] == 64 && r["consumers"] == 2)
+        .expect("the 64 B / 2c batch drain is in the document");
+    serde_json::from_value::<OldReaderRow>(withheld_baseline_row)
+        .expect_err("a reader typed against the old f64 contract must refuse a nulled row");
+    // The same reader still parses a row the document does not disclaim.
+    let publishable_row = rows("redis", "consume_parallel")
+        .into_iter()
+        .find(|r| r["payload_bytes"] == 64 && r["consumers"] == 2)
+        .expect("the 64 B / 2c parallel drain is in the document");
+    serde_json::from_value::<OldReaderRow>(publishable_row)
+        .expect("the refusal must be specific to the disclaimed rows, not the whole document");
+}
+
+#[test]
+fn the_committed_documents_only_v6_deviation_is_the_withheld_derivations() {
+    // The committed document declares v6 and is not a v6 document: the v6
+    // contract typed `scaling_efficiency` `f64`, and six of its rows null it.
+    // The declaration is kept because on this artifact the version field is a
+    // producer interlock rather than a description — see the `schema_version`
+    // paragraph in `benches/README.md` and, for the interlock itself,
+    // `the_committed_document_is_one_no_v7_producer_could_have_written`.
+    //
+    // What a declaration cannot describe has to be bounded instead, which is
+    // what this pins: the deviation's *extent*, against the real artifact. A
+    // seventh null — a later withholding, a bug in `compute_scaling`, a hand
+    // edit — would otherwise arrive under a label that gives a reader no
+    // reason to expect it. The read rule the runbook states is only worth
+    // stating if it stays true of every row, so it is asserted over the whole
+    // document rather than over the one backend that motivated it.
+    //
+    // Expires with the deviation: the six-backend re-measure withholds
+    // nothing, so every row carries a number again, this fails, and the
+    // runbook section it pins is rewritten with it.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    assert_eq!(
+        doc["schema_version"], 6,
+        "the committed document is no longer v6 — this test's premise, and the runbook \
+         section it pins, both need revisiting"
+    );
+
+    // Every row the document publishes, in one list, so the assertion below is
+    // document-wide and not scoped to the backend that motivated it.
+    let runs = doc["runs"].as_array().expect("runs");
+    let mut nulled: Vec<(String, &serde_json::Value)> = Vec::new();
+    let mut numbered = 0usize;
+    for run in runs {
+        let backend = run["backend"].as_str().expect("backend").to_string();
+        for row in run["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .chain(run["withheld"].as_array().into_iter().flatten())
+        {
+            match &row["scaling_efficiency"] {
+                serde_json::Value::Null => nulled.push((backend.clone(), row)),
+                serde_json::Value::Number(_) => numbered += 1,
+                other => {
+                    panic!("{backend}: scaling_efficiency is neither null nor a number: {other}")
+                }
+            }
+        }
+    }
+    assert!(
+        numbered > 0,
+        "a document that published no scaling value anywhere would pass every check below \
+         while having deleted the conclusions this field exists for"
+    );
+
+    // The deviation, cell by cell: Redis `consume_batch` drains at the two
+    // payloads whose one-consumer drain the host clocked down, at every
+    // consumer count above one. Nowhere else, on no other backend or flow.
+    let expected: Vec<(u64, u64)> = [64u64, 1024]
+        .into_iter()
+        .flat_map(|payload| [2u64, 4, 8].into_iter().map(move |c| (payload, c)))
+        .collect();
+    let mut found: Vec<(u64, u64)> = Vec::new();
+    for (backend, row) in &nulled {
+        assert_eq!(
+            (backend.as_str(), &row["flow"], &row["method"]),
+            (
+                "redis",
+                &serde_json::json!("consume_batch"),
+                &serde_json::json!("drain")
+            ),
+            "a null scaling value outside the withheld Redis batch drains: {row}"
+        );
+        found.push((
+            row["payload_bytes"].as_u64().expect("payload_bytes"),
+            row["consumers"].as_u64().expect("consumers"),
+        ));
+    }
+    found.sort_unstable();
+    let mut want = expected.clone();
+    want.sort_unstable();
+    assert_eq!(
+        found, want,
+        "the set of rows nulling `scaling_efficiency` moved; the runbook's read rule names \
+         exactly these cells"
+    );
+
+    // And each one is null *because* its baseline is withheld — the rule the
+    // runbook states, not merely the count. The one-consumer row of each
+    // family is absent from `results[]` and present in `withheld[]` under its
+    // stated cause; `validate_run` enforces the same pairing on the way in,
+    // and this asserts it held on the way out.
+    let redis = runs
+        .iter()
+        .find(|r| r["backend"] == "redis")
+        .expect("the redis run is in the document");
+    for (payload, _) in &expected {
+        let baseline = |key: &str| {
+            redis[key]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|r| {
+                            r["flow"] == "consume_batch"
+                                && r["method"] == "drain"
+                                && r["consumers"] == 1
+                                && r["payload_bytes"] == *payload
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            baseline("results"),
+            0,
+            "the {payload} B one-consumer batch drain is published, so nulling its family's \
+             derivations claims a withholding the document never declared"
+        );
+        assert_eq!(
+            baseline("withheld"),
+            1,
+            "the {payload} B one-consumer batch drain is not in `withheld[]`, so nothing \
+             explains why its family's derivations are null"
+        );
+    }
+}
+
+#[test]
+fn the_committed_document_declares_the_deviation_it_carries() {
+    // The extent test above bounds the deviation; this one is about whether
+    // the *artifact* says so. `schema_version: 6` is a producer interlock on
+    // this file and not a description of its field contract, which left the
+    // file's only self-description saying something untrue of it, with the
+    // correction living in `benches/README.md` — where a reader holding the
+    // JSON has no reason to look. `document_contract` is that correction moved
+    // into the document: a contract of its own, versioned separately so the
+    // interlock is untouched, and closed and checked so it cannot be misspelt
+    // into silence.
+    //
+    // Expires with the deviation: a re-measure that withholds nothing nulls
+    // nothing, `validate` then refuses a declaration no row exhibits, and the
+    // key comes out with the nulls.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+
+    assert_eq!(
+        doc["document_contract"],
+        serde_json::json!({
+            "version": 1,
+            "deviations": ["nullable_scaling_efficiency"],
+        }),
+        "the committed document does not declare, in the document, the contract it conforms \
+         to where the version it advertises does not describe it"
+    );
+    // Declared next to the version it qualifies, not buried among the rows: a
+    // reader that refuses the file at the first null has to be able to find
+    // the reason in what it already parsed.
+    let head = raw
+        .split_once("\"generated_at\"")
+        .expect("the provenance block opens the document")
+        .0;
+    assert!(
+        head.contains("\"schema_version\"") && head.contains("\"document_contract\""),
+        "the contract declaration must sit in the provenance head beside the version it \
+         qualifies"
+    );
+
+    // And it is held to the rows, on the real artifact, by the generator that
+    // reads it — not only by this test.
+    chartgen::load(&path).expect("the committed document must satisfy the declaration rule");
+}
+
+#[test]
+fn a_document_that_nulls_a_derivation_without_declaring_it_is_refused() {
+    // The half that makes the declaration worth reading. Strip the key from
+    // the real artifact, change nothing else, and the generator must refuse:
+    // an undeclared departure is the state this mechanism exists to end, and a
+    // check that only ran on documents already declaring correctly would
+    // enforce nothing.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    value
+        .as_object_mut()
+        .expect("document")
+        .remove("document_contract")
+        .expect("the committed document declares its contract");
+
+    let doc = parse(&value.to_string());
+    let err = chartgen::validate(&doc)
+        .expect_err("a document that nulls a derivation and declares nothing must be refused");
+    assert!(
+        err.to_string()
+            .contains("the rows exhibit `nullable_scaling_efficiency`"),
+        "the refusal must name the undeclared deviation: {err}"
+    );
+
+    // The converse: fill the six nulls in and the *declaration* becomes the
+    // false half. A key left behind by a re-measure describes a document that
+    // no longer exists, and is refused with the same force.
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    let mut filled = 0usize;
+    for run in value["runs"].as_array_mut().expect("runs") {
+        for row in run["results"].as_array_mut().expect("results") {
+            if row["scaling_efficiency"].is_null() {
+                row["scaling_efficiency"] = serde_json::json!(1.0);
+                filled += 1;
+            }
+        }
+    }
+    assert_eq!(
+        filled, 6,
+        "the control must fill exactly the declared nulls"
+    );
+    let doc = parse(&value.to_string());
+    let err = chartgen::validate(&doc)
+        .expect_err("a declaration no row exhibits must be refused, not carried");
+    assert!(
+        err.to_string()
+            .contains("declares `nullable_scaling_efficiency` but no row exhibits it"),
+        "the refusal must name the stale declaration: {err}"
+    );
+}
+
+#[test]
+fn an_unknown_document_contract_is_refused_at_the_version_not_at_a_field() {
+    // What the deviation *array* alone could never buy. A list of departure
+    // names is unordered: a reader meeting a document produced under a later
+    // contract has nothing to refuse at — it can only notice names it happens
+    // not to recognise, and a contract that changes a field's meaning without
+    // needing a new name leaves it nothing to notice at all.
+    //
+    // `document_contract.version` is the thing that can say *this file's field
+    // contract is not one you know*, and it is checked where `schema_version`
+    // is checked: in the probe, before the typed deserialisation. So the
+    // refusal names the contract rather than whichever field serde trips on
+    // first — which is the distinction between a version-gated rejection and a
+    // data error.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    value["document_contract"]["version"] = serde_json::json!(2);
+
+    let err = chartgen::parse_str(&value.to_string())
+        .expect_err("a contract this generator does not know must be refused");
+    assert!(
+        err.to_string()
+            .contains("unknown document_contract version 2"),
+        "the refusal must name the contract, not a field: {err}"
+    );
+
+    // And it fires *before* the rows are typed: the same document with its
+    // `runs` replaced by something that could never deserialise still refuses
+    // for the contract. A check that ran after the typed parse would report
+    // the wrong problem on every document it exists for.
+    value["runs"] = serde_json::json!("not a run array");
+    let err = chartgen::parse_str(&value.to_string())
+        .expect_err("an unknown contract must refuse whatever else is wrong");
+    assert!(
+        err.to_string()
+            .contains("unknown document_contract version 2"),
+        "the contract gate must precede the typed deserialisation: {err}"
+    );
+}
+
+#[test]
+fn a_document_contract_that_disagrees_with_its_own_expansion_is_refused() {
+    // The version and the deviation list say the same thing twice, on purpose:
+    // the integer is what a reader keys on, the list is what a human reading
+    // the artifact sees. Two statements of one fact are only worth carrying if
+    // nothing can drift them apart, so the validator holds each to the other
+    // and both to the rows.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+
+    // An expansion emptied out while the version stays: the file would claim a
+    // contract it no longer describes. (A *misspelt* or duplicated member is
+    // refused one rule earlier, by the closed-set check the test below covers.)
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    value["document_contract"]["deviations"] = serde_json::json!([]);
+    let doc = parse(&value.to_string());
+    let err = chartgen::validate(&doc)
+        .expect_err("an expansion that contradicts its version must be refused, not carried")
+        .to_string();
+    assert!(
+        err.contains("document_contract version 1 names"),
+        "the refusal must name the contract the expansion contradicts: {err}"
+    );
+
+    // And the other direction: the rows stop exhibiting what the contract
+    // names. Filling the six nulls in leaves version and expansion agreeing
+    // with each other and both wrong about the document.
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    for run in value["runs"].as_array_mut().expect("runs") {
+        for row in run["results"].as_array_mut().expect("results") {
+            if row["scaling_efficiency"].is_null() {
+                row["scaling_efficiency"] = serde_json::json!(1.0);
+            }
+        }
+    }
+    let doc = parse(&value.to_string());
+    let err = chartgen::validate(&doc)
+        .expect_err("a contract no row exhibits must be refused, not carried")
+        .to_string();
+    assert!(
+        err.contains("declares `nullable_scaling_efficiency` but no row exhibits it"),
+        "the refusal must name the departure the rows no longer take: {err}"
+    );
+}
+
+#[test]
+fn a_misspelt_schema_deviation_is_refused_rather_than_ignored() {
+    // The property `COMPARABILITY_KINDS` had to learn the hard way, applied to
+    // the declaration: a member that fell out of every check would be
+    // indistinguishable from no member, so a document would read as declaring
+    // nothing while appearing to declare something — which is worse than the
+    // undeclared state, because it looks handled.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+
+    for spelling in [
+        "nullable_scaling_efficency",
+        "NULLABLE_SCALING_EFFICIENCY",
+        "",
+    ] {
+        let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        value["document_contract"]["deviations"] = serde_json::json!([spelling]);
+        let doc = parse(&value.to_string());
+        let err = chartgen::validate(&doc)
+            .expect_err("a deviation outside the closed set must be refused, not dropped");
+        assert!(
+            err.to_string()
+                .contains("document_contract.deviations names"),
+            "`{spelling}` was refused for the wrong reason: {err}"
+        );
+    }
+
+    // A duplicate is refused on the same footing: it is not a second
+    // declaration, and accepting it would let the array carry a count that
+    // means nothing.
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    value["document_contract"]["deviations"] =
+        serde_json::json!(["nullable_scaling_efficiency", "nullable_scaling_efficiency"]);
+    let doc = parse(&value.to_string());
+    chartgen::validate(&doc).expect_err("a repeated deviation must be refused");
+}
+
+#[test]
+fn a_row_that_omits_the_derivation_entirely_exhibits_no_deviation() {
+    // The distinction the double option exists for. A row with no
+    // `scaling_efficiency` key is not a row that nulls it: absent is what
+    // every fixture predating the field looks like, and what a future
+    // contract that drops the field would look like. Collapsing the two would
+    // make every such document demand a declaration for a deviation it does
+    // not carry — and, worse, would let a real null hide behind the same
+    // reading.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&document(&inmemory_run(true))).expect("valid fixture JSON");
+    let mut stripped = 0usize;
+    for run in value["runs"].as_array_mut().expect("runs") {
+        for row in run["results"].as_array_mut().expect("results") {
+            if row
+                .as_object_mut()
+                .expect("row")
+                .remove("scaling_efficiency")
+                .is_some()
+            {
+                stripped += 1;
+            }
+        }
+    }
+    assert!(stripped > 0, "the fixture carried no key to strip");
+
+    let doc = parse(&value.to_string());
+    assert!(
+        doc.runs
+            .iter()
+            .flat_map(|r| r.results.iter())
+            .all(|r| r.scaling_efficiency.is_none()),
+        "an absent key must read as absent, not as an explicit null"
+    );
+    assert!(
+        doc.document_contract.is_none(),
+        "the fixture is meant to declare nothing"
+    );
+    chartgen::validate(&doc)
+        .expect("a keyless document deviates from nothing and so declares nothing");
+
+    // The same document with one key present and null *does* exhibit it, so
+    // the two readings are genuinely distinguished rather than both landing
+    // on the permissive one.
+    value["runs"][0]["results"][0]["scaling_efficiency"] = serde_json::Value::Null;
+    let doc = parse(&value.to_string());
+    assert_eq!(
+        doc.runs[0].results[0].scaling_efficiency,
+        Some(None),
+        "an explicit null must be distinguishable from an absent key"
+    );
+    chartgen::validate(&doc).expect_err("one explicit null is a deviation and must be declared");
+}
+
+#[test]
+fn a_v6_document_reader_clears_the_version_gate_and_then_keeps_no_row_at_all() {
+    // The runbook states the cost of buying the refusal on the field rather
+    // than on the declaration: serde types a document, not a cell, so a reader
+    // built against the v6 `f64` contract clears the version gate this file
+    // still advertises and then loses the whole file rather than the six rows
+    // it must not read. That is a concession about an unversioned change, and
+    // it was prose. Prose is the wrong place for it — it is the *consequence*
+    // of the deviation, and the one thing a later edit could quietly soften
+    // (drop the field instead of nulling it, and a v6 reader carrying
+    // `#[serde(default)]` takes the file and publishes `0.0` for the withheld
+    // families). So it is pinned against the real artifact instead.
+    //
+    // The reader modelled here is the *most permissive* v6 reader there can
+    // be: it names only the field whose contract changed, ignores every other
+    // key, and denies nothing. If even that one refuses, every real v6 reader
+    // refuses, because each has at least this field typed `f64`.
+    //
+    // Both directions are asserted, because only the pair is discriminating.
+    // The refusal alone could come from unrelated shape drift; the control
+    // fills in exactly those six nulls, touches nothing else, and shows the
+    // same reader then takes the entire document — every row of all six
+    // backends, `dlq_drain` rows included. Nullability is therefore the whole
+    // of what a v6 reader cannot take from this file, which is also why
+    // relabelling these bytes v7 was never the repair: the rows the version
+    // field interlocks against parse fine, and the one that does not is not a
+    // versioning problem the declaration could describe.
+    //
+    // Expires with the deviation, like the two tests above it: a re-measure
+    // that withholds nothing leaves no null to refuse and this fails.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    let mut doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+
+    #[derive(serde::Deserialize)]
+    struct V6Doc {
+        schema_version: u32,
+        runs: Vec<V6Run>,
+    }
+    #[derive(serde::Deserialize)]
+    struct V6Run {
+        results: Vec<V6Row>,
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct V6Row {
+        scaling_efficiency: f64,
+    }
+
+    // The gate such a reader checks first does not stop it: the document still
+    // declares the version it was built for. Whatever protection it gets, it
+    // does not get from the declaration.
+    assert_eq!(
+        doc["schema_version"], 6,
+        "the committed document no longer advertises v6 — the premise of this test, and the \
+         runbook's read rule, both need revisiting"
+    );
+
+    use serde_json::error::Category;
+    let err = serde_json::from_str::<V6Doc>(&raw)
+        .err()
+        .expect("a reader typed against the v6 `f64` contract must refuse this document outright");
+    assert_eq!(
+        err.classify(),
+        Category::Data,
+        "the refusal must be a type error on the changed field, not a syntax or io failure: {err}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("invalid type: null, expected f64"),
+        "the refusal must name the nullability as its cause, so the reader's operator can see \
+         which contract moved: {err}"
+    );
+
+    // The control. Fill in exactly the nulled cells, leave every other byte of
+    // the document alone, and the same reader takes all of it.
+    let mut filled_in = 0usize;
+    let mut published = 0usize;
+    for run in doc["runs"].as_array_mut().expect("runs") {
+        for row in run["results"].as_array_mut().expect("results") {
+            published += 1;
+            if row["scaling_efficiency"].is_null() {
+                row["scaling_efficiency"] = serde_json::json!(1.0);
+                filled_in += 1;
+            }
+        }
+    }
+    assert_eq!(
+        filled_in, 6,
+        "the control only means something against the six nulls the runbook's read rule names"
+    );
+
+    let repaired = serde_json::from_str::<V6Doc>(&doc.to_string())
+        .expect("with the six nulls filled in, a v6 reader must take the whole document");
+    assert_eq!(
+        repaired.schema_version, 6,
+        "the control must not have moved the declaration it is holding fixed"
+    );
+    assert_eq!(
+        repaired
+            .runs
+            .iter()
+            .map(|run| run.results.len())
+            .sum::<usize>(),
+        published,
+        "the v6 reader must recover every published row, or the refusal above was not caused \
+         by the nullability alone"
+    );
+}
+
+#[test]
+fn a_v7_declaration_of_the_committed_document_is_not_refused() {
+    // One half of why that refusal had to be bought on the field itself
+    // rather than with a `schema_version` bump — the half that binds *here*,
+    // in the reader. The committed document is v6 and its `dlq_drain` rows
+    // were measured by the pre-barrier driver, and this generator would not
+    // object to them under a v7 declaration: `barrierless_flows` only stops a
+    // *barrierless* flow from claiming a setup window, and from v7
+    // `dlq_drain` merely leaves that set, which permits the barrier shape
+    // without requiring it, so `setup_secs: null` with `setup_bound` stays a
+    // legal row to read.
+    //
+    // The producer half — that the same bytes declared v7 are refused per row
+    // by the harness's `validate_run`, so the version field is an interlock
+    // rather than a label — is pinned by
+    // `the_committed_document_is_one_no_v7_producer_could_have_written` in
+    // `examples/common/stress_test.rs` (run by `tests/bench_harness.rs`).
+    //
+    // Pinned because the runbook's reasoning rests on it: if a later rule
+    // does make a v7 document require the barrier shape on `dlq_drain`, this
+    // test fails and that paragraph has to be rewritten rather than silently
+    // becoming true for a different reason.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    assert!(
+        raw.contains("\"schema_version\": 6"),
+        "the committed document is no longer v6 — this test's premise, and the runbook \
+         paragraph it pins, both need revisiting"
+    );
+    let doc = parse(&raw.replacen("\"schema_version\": 6", "\"schema_version\": 7", 1));
+    assert_eq!(doc.schema_version, 7, "the bump did not take");
+    chartgen::validate(&doc).expect(
+        "a v7 declaration of the committed document is accepted — the misstated lineage is \
+         exactly the unchecked cost a version bump would carry here",
+    );
+}
+
 // ── The committed artifact renders ──────────────────────────────────────────
 
 #[test]

@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -28,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -304,6 +306,90 @@ impl RecordingBatchHandler {
     }
 }
 
+/// One `handle_batch` call: when the call was entered, and the seqs it was
+/// handed.
+type HandledBatch = (Instant, Vec<u32>);
+
+/// Batch handler that holds its **first** batch inside `handle_batch` until
+/// the test releases it, so the test can observe what the consumer loop does
+/// while a flush is in flight. Later batches `Ack` at once, so the loop
+/// finishes the corpus without further help.
+#[derive(Clone)]
+struct GatedFirstBatchHandler {
+    /// Set once the first batch is inside the handler. An `AtomicBool` the
+    /// test polls, rather than a `Notify` the test could subscribe to too
+    /// late and miss.
+    entered: Arc<AtomicBool>,
+    /// `notify_one` stores a permit, so releasing before the handler awaits
+    /// cannot deadlock the test.
+    release: Arc<Notify>,
+    calls: Arc<AtomicUsize>,
+    /// One entry per `handle_batch` call. Kept per call rather than as one
+    /// flat list so a test can assert the *shape* of the split (which messages
+    /// arrived together) and *when* a later call landed, not just the union.
+    batches: Arc<Mutex<Vec<HandledBatch>>>,
+}
+
+impl GatedFirstBatchHandler {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new(AtomicBool::new(false)),
+            release: Arc::new(Notify::new()),
+            calls: Arc::new(AtomicUsize::new(0)),
+            batches: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn entered(&self) -> bool {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+
+    fn batches(&self) -> Vec<HandledBatch> {
+        self.batches.lock().unwrap().clone()
+    }
+
+    fn seen(&self) -> Vec<u32> {
+        self.batches
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(_, seqs)| seqs.iter().copied())
+            .collect()
+    }
+}
+
+impl<T> BatchMessageHandler<T> for GatedFirstBatchHandler
+where
+    T: Topic<Message = BatchMessage>,
+{
+    type Context = ();
+
+    async fn handle_batch(
+        &self,
+        messages: Vec<(BatchMessage, MessageMetadata)>,
+        _: &(),
+    ) -> Outcome {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.batches.lock().unwrap().push((
+            Instant::now(),
+            messages.iter().map(|(m, _)| m.seq).collect(),
+        ));
+        if call == 0 {
+            self.entered.store(true, Ordering::SeqCst);
+            self.release.notified().await;
+        }
+        Outcome::Ack
+    }
+}
+
 fn sorted(batch: &[u32]) -> Vec<u32> {
     let mut v = batch.to_vec();
     v.sort_unstable();
@@ -335,6 +421,36 @@ define_topic!(
     CountPinTopic,
     BatchMessage,
     TopologyBuilder::new("redis-batch-count-pin").build()
+);
+const READ_AHEAD_QUEUE: &str = "redis-batch-read-ahead";
+define_topic!(
+    ReadAheadTopic,
+    BatchMessage,
+    TopologyBuilder::new(READ_AHEAD_QUEUE).build()
+);
+const READ_AHEAD_CONN_QUEUE: &str = "redis-batch-read-ahead-conn";
+define_topic!(
+    ReadAheadConnTopic,
+    BatchMessage,
+    TopologyBuilder::new(READ_AHEAD_CONN_QUEUE).build()
+);
+const READ_AHEAD_REDIAL_QUEUE: &str = "redis-batch-read-ahead-redial";
+define_topic!(
+    ReadAheadRedialTopic,
+    BatchMessage,
+    TopologyBuilder::new(READ_AHEAD_REDIAL_QUEUE).build()
+);
+const READ_AHEAD_STALL_QUEUE: &str = "redis-batch-read-ahead-stall";
+define_topic!(
+    ReadAheadStallTopic,
+    BatchMessage,
+    TopologyBuilder::new(READ_AHEAD_STALL_QUEUE).build()
+);
+const PARTIAL_READ_AHEAD_QUEUE: &str = "redis-batch-read-ahead-partial";
+define_topic!(
+    PartialReadAheadTopic,
+    BatchMessage,
+    TopologyBuilder::new(PARTIAL_READ_AHEAD_QUEUE).build()
 );
 define_topic!(
     AgeTopic,
@@ -456,6 +572,9 @@ macro_rules! impl_recording_for {
 impl_recording_for!(
     SizeTopic,
     CountPinTopic,
+    ReadAheadConnTopic,
+    ReadAheadRedialTopic,
+    ReadAheadStallTopic,
     AgeTopic,
     AgeUnderLoadTopic,
     AckTopic,
@@ -658,6 +777,263 @@ async fn batch_flushes_on_max_batch_size() {
     assert_eq!(seen, (0..10).collect::<Vec<_>>());
 }
 
+/// A full batch must have the **next** read already outstanding while its
+/// flush runs: a serialized read -> flush -> read cycle leaves the connection
+/// idle for the whole flush, which is the single-consumer throughput deficit
+/// this test pins shut.
+///
+/// Observable without a stopwatch. The group's PEL counts what Redis has
+/// delivered to this consumer: the loop reads `COUNT max_batch_size` (5), so
+/// exactly 5 entries are pending when the flush starts. While that flush is
+/// held inside the handler, only a read issued *concurrently with it* can
+/// raise the PEL to 10. A serial loop stays at 5 until the handler returns.
+#[tokio::test]
+async fn a_full_batch_reads_the_next_one_while_the_flush_is_in_flight() {
+    let url = redis_url().await;
+    let group = "batch-read-ahead-grp";
+    let broker = connect_with_retry(url, group, Duration::from_secs(30)).await;
+    broker.topology().declare::<ReadAheadTopic>().await.unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publish_seq::<ReadAheadTopic>(&publisher, 0..10).await;
+
+    let handler = GatedFirstBatchHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<ReadAheadTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(5)
+                        // Only the size trigger may fire: the age trigger
+                        // must not be what produces a second read.
+                        .with_max_batch_age(Duration::from_secs(30))
+                        // Stated rather than inherited: the gate below holds
+                        // the handler for at most a few seconds, and this is
+                        // the margin that makes that safe.
+                        .with_handler_timeout(Duration::from_secs(30))
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    assert!(
+        poll_until(|| handler.entered(), TIMEOUT).await,
+        "the first batch never reached the handler"
+    );
+
+    let mut raw = raw_conn(url).await;
+    let mut pending = 0usize;
+    // Generous against a slow CI box — the loop leaves as soon as the count
+    // arrives, so the budget only lengthens a failure. It still has to stay
+    // well under the `handler_timeout` above, because the handler is held for
+    // exactly this long.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        pending = xpending_count(&mut raw, READ_AHEAD_QUEUE, group).await;
+        if pending >= 10 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The guard that makes the count above mean what the test says: the
+    // second five can only have been delivered by a read that overlapped the
+    // flush, because the flush has not returned yet.
+    assert_eq!(
+        handler.calls(),
+        1,
+        "the handler must still be holding the first batch while the PEL is read"
+    );
+    assert_eq!(
+        pending, 10,
+        "expected all 10 entries pending — 5 in the flush plus 5 read ahead \
+         while it ran; {pending} means the loop waited for the flush before reading"
+    );
+
+    handler.release();
+    assert!(
+        poll_until(|| handler.seen().len() >= 10, TIMEOUT).await,
+        "both batches should complete once the gate opens, saw {:?}",
+        handler.seen()
+    );
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let mut seen = handler.seen();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        (0..10).collect::<Vec<_>>(),
+        "every message delivered exactly once across the two batches"
+    );
+    assert_eq!(
+        xpending_count(&mut raw, READ_AHEAD_QUEUE, group).await,
+        0,
+        "both batches should be acked, leaving nothing pending"
+    );
+}
+
+/// A read-ahead that comes back **short** of `max_batch_size` still flushes on
+/// the age trigger, and its age window runs from the **fetch**, not from the
+/// ingest that follows the flush.
+///
+/// This is the partial case the full-batch test above cannot reach — there the
+/// read-ahead returns `max_batch_size` entries and the size trigger fires the
+/// moment they are ingested, so the age path is never exercised. Here six
+/// messages against `max_batch_size` 5 leave the read-ahead holding exactly
+/// one, and only the age trigger can retire it.
+///
+/// `max_batch_age` bounds how long this loop may sit on a message it has taken
+/// out of the stream, so the clock starts where the entry left Redis — the
+/// read-ahead — and not where it happens to enter the `batch` buffer. The
+/// distinction is the whole point of the test, so the assertions are built to
+/// separate the two:
+///
+/// - `HOLD` is three age windows, so by the release a fetch-armed deadline has
+///   long elapsed and an ingest-armed one has not started.
+/// - The release-to-handler delay is therefore bounded **below one half of an
+///   age window**. A fetch-armed deadline flushes as soon as the loop re-enters
+///   (tens of ms); an ingest-armed deadline cannot beat `BATCH_AGE`, so it
+///   fails this bound by ~2x rather than passing a loose multiple of it.
+/// - The during-hold call count pins serialization only — no handler call
+///   overlaps the flush that fetched the entry. It holds under either arming
+///   choice and is not the discriminator; the bound above is.
+#[tokio::test]
+async fn a_partial_read_ahead_batch_ages_from_its_fetch_not_its_ingest() {
+    // A full second, so the discriminating bound below (half a window) sits far
+    // above loop-reentry overhead and far below a window.
+    const BATCH_AGE: Duration = Duration::from_secs(1);
+    // Three age windows: a fetch-armed deadline expires well inside the hold.
+    const HOLD: Duration = Duration::from_secs(3);
+
+    let url = redis_url().await;
+    let group = "batch-read-ahead-partial-grp";
+    let broker = connect_with_retry(url, group, Duration::from_secs(30)).await;
+    broker
+        .topology()
+        .declare::<PartialReadAheadTopic>()
+        .await
+        .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publish_seq::<PartialReadAheadTopic>(&publisher, 0..6).await;
+
+    let handler = GatedFirstBatchHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<PartialReadAheadTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(5)
+                        .with_max_batch_age(BATCH_AGE)
+                        // Comfortably past `HOLD`: the first handler call is
+                        // held for that long on purpose and must not be
+                        // abandoned as a timeout.
+                        .with_handler_timeout(Duration::from_secs(60))
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    assert!(
+        poll_until(|| handler.entered(), TIMEOUT).await,
+        "the first batch never reached the handler"
+    );
+
+    // The precondition that makes this the *partial* case: the read-ahead ran
+    // concurrently with the held flush and took the one remaining entry, so
+    // all six are delivered (5 in the flush + 1 read ahead) while the handler
+    // is still holding.
+    let mut raw = raw_conn(url).await;
+    let mut pending = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        pending = xpending_count(&mut raw, PARTIAL_READ_AHEAD_QUEUE, group).await;
+        if pending >= 6 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        pending, 6,
+        "expected all 6 entries pending — 5 in the flush plus the 1 read ahead \
+         while it ran; {pending} means the loop waited for the flush before reading"
+    );
+
+    // Hold three age windows. This pins serialization, not the arming point:
+    // the loop cannot flush the prefetched entry while the flush that fetched
+    // it is still awaiting the handler, so one call is expected whether the
+    // deadline was armed at the fetch or at the ingest.
+    tokio::time::sleep(HOLD).await;
+    assert_eq!(
+        handler.calls(),
+        1,
+        "the prefetched entry must not reach a handler while the flush that \
+         fetched it is still running"
+    );
+
+    let released_at = Instant::now();
+    handler.release();
+    assert!(
+        poll_until(|| handler.calls() >= 2, TIMEOUT).await,
+        "the prefetched entry should flush as soon as the first flush returns, \
+         saw {:?}",
+        handler.batches()
+    );
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let batches = handler.batches();
+    assert_eq!(
+        batches.len(),
+        2,
+        "expected exactly two handler calls, saw {batches:?}"
+    );
+    assert_eq!(
+        sorted(&batches[0].1),
+        (0..5).collect::<Vec<_>>(),
+        "the first call is the full size-triggered batch"
+    );
+    assert_eq!(
+        batches[1].1,
+        vec![5],
+        "the second call is the single read-ahead entry, retired by the age trigger"
+    );
+
+    // The discriminating assertion. The entry was fetched before the hold
+    // started, so at the release its fetch-armed deadline is two age windows
+    // past due and the only work left is waking the loop, ingesting, and
+    // re-blocking for the 1 ms floor — tens of milliseconds. A deadline armed
+    // at the ingest instead cannot deliver before `BATCH_AGE`, so it fails
+    // this bound by about 2x. The bound is half a window rather than a loose
+    // multiple of one precisely so the two outcomes cannot both pass.
+    let delay = batches[1].0.saturating_duration_since(released_at);
+    assert!(
+        delay < BATCH_AGE / 2,
+        "the prefetched entry's age window runs from its fetch, so it must \
+         flush promptly once the first flush returns rather than waiting a \
+         fresh {BATCH_AGE:?} window; took {delay:?}"
+    );
+
+    assert_eq!(
+        xpending_count(&mut raw, PARTIAL_READ_AHEAD_QUEUE, group).await,
+        0,
+        "both calls should be acked, leaving nothing pending"
+    );
+}
+
 /// The ticket's trap pin: the batch consumer must issue `XREADGROUP … COUNT
 /// {max_batch_size}`, never the non-concurrent single-message path's `COUNT
 /// 1` clamp. Captured via a raw `MONITOR` connection established before the
@@ -723,6 +1099,519 @@ async fn xreadgroup_count_matches_max_batch_size_not_one() {
     assert!(
         found,
         "expected the first XREADGROUP for {stream_needle} to carry {expected}"
+    );
+}
+
+/// `1758… [0 172.17.0.1:57134] "XREADGROUP" …` — a `MONITOR` line's client
+/// address is the second field inside the brackets. Shared by the two tests
+/// that pin the batch loop's connection structure, so neither can parse it
+/// differently from the other.
+/// A TCP proxy in front of Redis whose *new* connections can be blackholed.
+///
+/// Returns the `redis://` URL to point a client at, and the switch. While the
+/// switch is set, a connection the proxy accepts is held open and forwarded
+/// nowhere — the client's TCP connect succeeds and its handshake is answered by
+/// nothing, which is what a blackholing middlebox looks like from the dialling
+/// side and is the only way to make a dial hang without also breaking the
+/// connections that already exist. Connections established before the switch
+/// was set keep forwarding normally, which is the whole point: it separates
+/// "this loop cannot open a new socket" from "this loop's socket is dead".
+async fn spawn_blackholing_proxy(upstream_url: &str) -> (String, Arc<AtomicBool>) {
+    let upstream = upstream_url
+        .trim_start_matches("redis://")
+        .trim_end_matches('/')
+        .to_owned();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy listener");
+    let addr = listener.local_addr().expect("proxy local addr");
+    let blackhole = Arc::new(AtomicBool::new(false));
+    tokio::spawn({
+        let blackhole = Arc::clone(&blackhole);
+        async move {
+            loop {
+                let Ok((down, _)) = listener.accept().await else {
+                    return;
+                };
+                if blackhole.load(Ordering::SeqCst) {
+                    tokio::spawn(async move {
+                        let _held = down;
+                        std::future::pending::<()>().await;
+                    });
+                    continue;
+                }
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    let Ok(up) = tokio::net::TcpStream::connect(&upstream).await else {
+                        return;
+                    };
+                    let (mut down_read, mut down_write) = down.into_split();
+                    let (mut up_read, mut up_write) = up.into_split();
+                    tokio::join!(
+                        async {
+                            let _ = tokio::io::copy(&mut down_read, &mut up_write).await;
+                            let _ = up_write.shutdown().await;
+                        },
+                        async {
+                            let _ = tokio::io::copy(&mut up_read, &mut down_write).await;
+                            let _ = down_write.shutdown().await;
+                        },
+                    );
+                });
+            }
+        }
+    });
+    (format!("redis://{addr}/"), blackhole)
+}
+
+fn monitor_client_addr(line: &str) -> Option<&str> {
+    let inside = line.split_once('[')?.1.split_once(']')?.0;
+    inside.split_once(' ').map(|(_, addr)| addr)
+}
+
+/// The read-ahead reads on a socket of its own, and that is load-bearing.
+///
+/// Riding a clone of the loop's connection is the cheaper-looking structure —
+/// it pipelines the read-ahead's `XREADGROUP` with the flush's `XACK` over one
+/// socket, which is worth 1.45x at two consumers against this structure's
+/// 1.11x — but Redis writes a client's replies in arrival order, so the ack
+/// cannot land until the read's 32 KB reply ahead of it has been drained, and
+/// at eight consumers that costs 5.5% against no read-ahead at all.
+/// Both structures were built and measured in both directions; the numbers are
+/// in the crate's `run_batch_impl` doc comment under "What a socket of its own
+/// costs, and why it is still the choice".
+///
+/// No functional test can see a throughput trade, so the structure gets
+/// pinned instead: the read-ahead's `XREADGROUP` must come from a **different**
+/// client than the loop's own read, and the flush's `XACK` must come from the
+/// loop's own. `MONITOR` reports the issuing client's `ip:port` per command,
+/// which is what makes the split visible at all. A future refactor that
+/// collapses the two connections back into a clone — or that moves the
+/// settlement onto the new socket instead of the read-ahead — fails here and
+/// has to read why first.
+#[tokio::test]
+async fn the_read_ahead_reads_on_a_socket_of_its_own() {
+    let url = redis_url().await;
+    let broker =
+        connect_with_retry(url, "batch-read-ahead-conn-grp", Duration::from_secs(30)).await;
+    broker
+        .topology()
+        .declare::<ReadAheadConnTopic>()
+        .await
+        .unwrap();
+
+    let monitor_client = redis::Client::open(url).expect("open monitor client");
+    let monitor = monitor_client
+        .get_async_monitor()
+        .await
+        .expect("MONITOR connection");
+    let mut lines = monitor.into_on_message::<String>();
+
+    let publisher = broker.publisher().await.unwrap();
+    // Two full batches at `max_batch_size` 5, so the first size-triggered
+    // flush arms a read-ahead: the trace then carries the loop's own read, the
+    // read-ahead's, and the ack between them — the three commands whose client
+    // addresses the pin compares.
+    publish_seq::<ReadAheadConnTopic>(&publisher, 0..10).await;
+
+    let handler = RecordingBatchHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<ReadAheadConnTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(5)
+                        .with_max_batch_age(Duration::from_millis(500))
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    let stream_needle = format!("\"{READ_AHEAD_CONN_QUEUE}\"");
+    let mut read_addrs: Vec<String> = Vec::new();
+    let mut ack_addrs: Vec<String> = Vec::new();
+    let mut reads = 0usize;
+    let _ = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let Some(line) = lines.next().await else {
+                return;
+            };
+            if !line.contains(&stream_needle) {
+                continue;
+            }
+            let Some(addr) = monitor_client_addr(&line) else {
+                continue;
+            };
+            if line.contains("\"XREADGROUP\"") {
+                reads += 1;
+                if !read_addrs.iter().any(|a| a == addr) {
+                    read_addrs.push(addr.to_string());
+                }
+            } else if line.contains("\"XACK\"") {
+                if !ack_addrs.iter().any(|a| a == addr) {
+                    ack_addrs.push(addr.to_string());
+                }
+            } else {
+                continue;
+            }
+            // Leave once both halves of a cycle have been seen: two reads from
+            // two clients — the loop's own of the first five and the
+            // read-ahead's of the second five, which is what proves both that
+            // the read-ahead fired and that it has its own socket — and the ack
+            // the flush between them issued.
+            if read_addrs.len() >= 2 && !ack_addrs.is_empty() {
+                return;
+            }
+        }
+    })
+    .await;
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    assert!(
+        reads >= 2 && !ack_addrs.is_empty(),
+        "expected at least two XREADGROUPs and one XACK for {stream_needle} \
+         within {TIMEOUT:?} — saw {reads} reads from {read_addrs:?} and acks \
+         from {ack_addrs:?}"
+    );
+    assert_eq!(
+        read_addrs.len(),
+        2,
+        "the read-ahead must read on a connection of its own, so the loop's \
+         own read and the read-ahead's must come from two clients, but \
+         XREADGROUPs for {stream_needle} came from {read_addrs:?}. Collapsing \
+         them back onto one socket costs 5.5% at eight consumers — see \
+         run_batch_impl's \"What a socket of its own costs, and why it is \
+         still the choice\""
+    );
+    // The first distinct address is the loop's own read: the read-ahead is
+    // only ever issued by a size-triggered flush, which the loop's own read
+    // has to fill the batch for first. So this pins *which* half moved, not
+    // just that two sockets exist — the mirror structure (settlement moved
+    // off, reads shared) measures 4% away and is not what ships.
+    let loop_addr = read_addrs.first().cloned().unwrap_or_default();
+    assert_eq!(
+        ack_addrs,
+        vec![loop_addr],
+        "the flush must settle on the socket the loop reads on, but acks for \
+         {stream_needle} came from {ack_addrs:?} against reads from \
+         {read_addrs:?}"
+    );
+}
+
+/// A read-ahead whose own socket dies gets a fresh one, rather than leaving
+/// the loop silently un-pipelined.
+///
+/// This is the failure mode the socket of its own *introduced*. While the
+/// read-ahead rode a clone of the loop's connection, a dead socket failed the
+/// loop's own next read too, so `run_with_reconnect` re-dialed everything and
+/// the read-ahead came back with it. Nothing else uses this socket, so the same
+/// error now has to be handled here or not at all: swallowing it would leave
+/// the loop correct (its own read covers every entry) and permanently
+/// un-pipelined, with nothing logged at a level anyone watches.
+///
+/// `MONITOR` makes the re-dial observable: kill the client the read-ahead
+/// issues from, keep publishing, and a *third* client address has to appear on
+/// this stream's `XREADGROUP`s. Failing the cycle instead of re-dialing is the
+/// other way to pass this, which is why the loop's comment says why it does
+/// not (a transient read-ahead error would spend a `max_reconnect_attempts`
+/// budget that exists for real broker loss).
+#[tokio::test]
+async fn a_dead_read_ahead_connection_is_re_dialed() {
+    let url = redis_url().await;
+    let broker =
+        connect_with_retry(url, "batch-read-ahead-redial-grp", Duration::from_secs(30)).await;
+    broker
+        .topology()
+        .declare::<ReadAheadRedialTopic>()
+        .await
+        .unwrap();
+
+    let monitor_client = redis::Client::open(url).expect("open monitor client");
+    let monitor = monitor_client
+        .get_async_monitor()
+        .await
+        .expect("MONITOR connection");
+    let mut lines = monitor.into_on_message::<String>();
+    let mut admin = monitor_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("admin connection");
+
+    let publisher = broker.publisher().await.unwrap();
+    publish_seq::<ReadAheadRedialTopic>(&publisher, 0..10).await;
+
+    let handler = RecordingBatchHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<ReadAheadRedialTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(5)
+                        .with_max_batch_age(Duration::from_millis(500))
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    let stream_needle = format!("\"{READ_AHEAD_REDIAL_QUEUE}\"");
+    let mut addrs: Vec<String> = Vec::new();
+    let collect_addrs = |line: &str, addrs: &mut Vec<String>| {
+        if !line.contains(&stream_needle) || !line.contains("\"XREADGROUP\"") {
+            return;
+        }
+        if let Some(addr) = monitor_client_addr(line)
+            && !addrs.iter().any(|a| a == addr)
+        {
+            addrs.push(addr.to_string());
+        }
+    };
+
+    // The loop's own read comes first and the read-ahead's second — the
+    // read-ahead is only ever issued by a size-triggered flush, which that
+    // first read has to fill the batch for.
+    let _ = tokio::time::timeout(TIMEOUT, async {
+        while addrs.len() < 2 {
+            let Some(line) = lines.next().await else {
+                return;
+            };
+            collect_addrs(&line, &mut addrs);
+        }
+    })
+    .await;
+    assert_eq!(
+        addrs.len(),
+        2,
+        "expected the loop's own read and the read-ahead's on two clients \
+         before the kill, saw {addrs:?}"
+    );
+    let read_ahead_addr = addrs[1].clone();
+
+    let killed: i64 = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("ADDR")
+        .arg(&read_ahead_addr)
+        .query_async(&mut admin)
+        .await
+        .expect("CLIENT KILL should be accepted");
+    assert_eq!(killed, 1, "expected to kill exactly {read_ahead_addr}");
+
+    let batches_at_kill = handler.batches().len();
+    // Enough cycles after the kill that the first read-ahead to fail and the
+    // arming that re-dials are both inside the window.
+    publish_seq::<ReadAheadRedialTopic>(&publisher, 10..60).await;
+
+    let re_dialed = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let Some(line) = lines.next().await else {
+                return false;
+            };
+            collect_addrs(&line, &mut addrs);
+            if addrs.len() >= 3 {
+                return true;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    let progressed = handler.wait_for_batches(batches_at_kill + 2, TIMEOUT).await;
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    assert!(
+        re_dialed,
+        "a read-ahead whose socket was killed must re-dial: expected a third \
+         client address on {stream_needle}'s XREADGROUPs within {TIMEOUT:?}, \
+         saw {addrs:?}"
+    );
+    assert!(
+        progressed,
+        "the loop must keep delivering across the kill — batches went from \
+         {batches_at_kill} to {}",
+        handler.batches().len()
+    );
+}
+
+/// A read-ahead re-dial that cannot complete must not hold a full batch away
+/// from its handler.
+///
+/// The recovery the test above proves has a cost the flush must never pay.
+/// While the read-ahead has no socket, every size-triggered cycle wants to dial
+/// a new one — and a dial is the one thing in this loop that can hang without
+/// anything being wrong with the loop's *own* connection: a proxy or a
+/// half-open network can accept a TCP connection and then answer nothing, so
+/// the dial runs to `connection_timeout` while the main socket stays healthy
+/// and a `max_batch_size`-full, PEL-owned batch sits in memory waiting for it.
+/// Awaiting the dial before the flush puts that timeout between a full batch
+/// and its handler, and because a failed dial leaves the read-ahead off, the
+/// next cycle pays it again — a per-batch stall on exactly the recovery path.
+///
+/// The fixture separates the two sockets deliberately. The consumer reaches
+/// Redis through an in-process TCP proxy that can be told to accept new
+/// connections and forward nothing, while the publisher talks to Redis
+/// directly — so the blackhole reaches only the connections the consumer opens
+/// *after* it is armed, and a stalled drain cannot be confused with a publisher
+/// that stopped supplying. Killing the read-ahead's own client (as above, via
+/// `MONITOR` + `CLIENT KILL`) is what empties `read_conn`; the blackhole is
+/// armed first so the re-dial cannot win a race against it.
+///
+/// `connection_timeout` is pinned well below the assertion budget so a
+/// regression fails in seconds rather than at the default ten.
+#[tokio::test]
+async fn a_stalled_read_ahead_re_dial_does_not_delay_the_flush() {
+    const BATCH: usize = 5;
+    /// Batches the drain must deliver after the blackhole is armed.
+    const BATCHES_AFTER: usize = 10;
+    /// One stalled dial alone (3 s) fits in this; ten do not. A loop that
+    /// dials in the flush's path cannot fit ten cycles into it, and a loop
+    /// that keeps the dial off that path needs milliseconds.
+    const BUDGET: Duration = Duration::from_secs(8);
+    const DIAL_TIMEOUT: Duration = Duration::from_secs(3);
+
+    let url = redis_url().await;
+    // Publisher and topology on a direct connection: the blackhole below must
+    // reach the consumer's sockets only.
+    let direct =
+        connect_with_retry(url, "batch-read-ahead-stall-grp", Duration::from_secs(30)).await;
+    direct
+        .topology()
+        .declare::<ReadAheadStallTopic>()
+        .await
+        .unwrap();
+    let publisher = direct.publisher().await.unwrap();
+
+    let (proxy_url, blackhole) = spawn_blackholing_proxy(url).await;
+    let consumer_broker = Broker::<Redis>::new(
+        RedisConfig::new(RedisMode::Standalone { url: proxy_url })
+            .with_group("batch-read-ahead-stall-grp")
+            // Must stay above BLOCK_MS (2 s); the dial is what this test stalls.
+            .with_response_timeout(Duration::from_secs(3))
+            .with_connection_timeout(DIAL_TIMEOUT),
+    )
+    .await
+    .expect("consumer broker through the proxy");
+
+    let monitor_client = redis::Client::open(url).expect("open monitor client");
+    let monitor = monitor_client
+        .get_async_monitor()
+        .await
+        .expect("MONITOR connection");
+    let mut lines = monitor.into_on_message::<String>();
+    let mut admin = monitor_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("admin connection");
+
+    // Enough to arm the read-ahead (a size-triggered flush is its only
+    // trigger) and keep the loop busy while the kill is set up.
+    publish_seq::<ReadAheadStallTopic>(&publisher, 0..40).await;
+
+    let handler = RecordingBatchHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = consumer_broker.batch_consumer();
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<ReadAheadStallTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(BATCH)
+                        // Long enough that only size triggers a flush in this
+                        // window — the dial is on the size-triggered path.
+                        .with_max_batch_age(Duration::from_secs(30))
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    let stream_needle = format!("\"{READ_AHEAD_STALL_QUEUE}\"");
+    let mut addrs: Vec<String> = Vec::new();
+    let collect_addrs = |line: &str, addrs: &mut Vec<String>| {
+        if !line.contains(&stream_needle) || !line.contains("\"XREADGROUP\"") {
+            return;
+        }
+        if let Some(addr) = monitor_client_addr(line)
+            && !addrs.iter().any(|a| a == addr)
+        {
+            addrs.push(addr.to_string());
+        }
+    };
+
+    // The loop's own read first, the read-ahead's second — as in the re-dial
+    // test above.
+    let _ = tokio::time::timeout(TIMEOUT, async {
+        while addrs.len() < 2 {
+            let Some(line) = lines.next().await else {
+                return;
+            };
+            collect_addrs(&line, &mut addrs);
+        }
+    })
+    .await;
+    assert_eq!(
+        addrs.len(),
+        2,
+        "expected the loop's own read and the read-ahead's on two clients \
+         before the blackhole, saw {addrs:?}"
+    );
+
+    // Arm the blackhole BEFORE the kill: a re-dial issued in between would
+    // succeed and the stall would never be reached.
+    blackhole.store(true, Ordering::SeqCst);
+    let killed: i64 = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("ADDR")
+        .arg(&addrs[1])
+        .query_async(&mut admin)
+        .await
+        .expect("CLIENT KILL should be accepted");
+    assert_eq!(killed, 1, "expected to kill exactly {}", addrs[1]);
+
+    let batches_at_kill = handler.batches().len();
+    // Supply for BATCHES_AFTER full batches, with slack for whatever the loop
+    // had already buffered when the kill landed.
+    let supply = (BATCHES_AFTER as u32 + 4) * BATCH as u32;
+    publish_seq::<ReadAheadStallTopic>(&publisher, 40..40 + supply).await;
+
+    let started = std::time::Instant::now();
+    let drained = handler
+        .wait_for_batches(batches_at_kill + BATCHES_AFTER, BUDGET)
+        .await;
+    let elapsed = started.elapsed();
+    let delivered = handler.batches().len() - batches_at_kill;
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    blackhole.store(false, Ordering::SeqCst);
+
+    assert!(
+        drained,
+        "a read-ahead re-dial that cannot complete must not delay the flush: \
+         expected {BATCHES_AFTER} more batches within {BUDGET:?} of the \
+         blackhole, saw {delivered} (from {batches_at_kill}) in {elapsed:?}. A \
+         loop that awaits the dial before the flush pays {DIAL_TIMEOUT:?} per \
+         size-triggered cycle here."
     );
 }
 
