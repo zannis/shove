@@ -534,6 +534,46 @@ barrierless set, which permits a recorded setup window without requiring one.
 The reader has nothing to object to; the producer does. Withholding by
 placement needs no version at all.
 
+#### The read rule for the committed artifact
+
+What the paragraph above establishes is that the bump is unavailable. It does
+not make the declaration true, and stating only the first invites reading the
+second. So, plainly: **no schema version describes
+`benches/results/bench-results.json` as it stands.** Its `dlq_drain` rows are
+v6-shaped, which no v7 producer could have written; six of its `results[]` rows
+null `scaling_efficiency`, which no v6 producer could have written. The `6` it
+declares is the producer interlock described above — the thing that keeps those
+pre-barrier rows from merging into a barriered leg — and it is not, on this
+artifact, a description of the field contract. Anything reading this file
+directly is held to one rule the declaration does not give it:
+
+> `scaling_efficiency` is nullable on this document regardless of its declared
+> version. A `null` means the family's one-consumer baseline is in
+> `withheld[]`, so the quotient is disclaimed; it never means zero, and it is
+> never a number that went missing.
+
+The deviation is bounded and pinned, not open-ended.
+`the_committed_documents_only_v6_deviation_is_the_withheld_derivations`
+(`tests/chartgen.rs`) asserts its exact extent against the real artifact: the
+document nulls that field on exactly six rows, all of them Redis
+`consume_batch` drains at 64 B and 1 KiB with two, four and eight consumers,
+each in a family whose one-consumer row is withheld — and on no other row, of
+any backend or flow. A seventh null cannot arrive quietly under the v6 label.
+The rule and the deviation both expire together: the next six-backend
+re-measure writes a genuine v7 document with no withheld cells and no nulls,
+at which point that test and
+`the_committed_document_is_one_no_v7_producer_could_have_written` both fail by
+design and this section is rewritten with them.
+
+The alternative the shape of this problem keeps suggesting — leave the field a
+plain `f64` and carry the retraction as a new, additive, top-level provenance
+key — is the mistake this whole section is the repair of. An old reader ignores
+an unknown key and goes on publishing `5.4904…`, which is the withheld
+measurement in quotient form; a disclaimer a reader can ignore withholds
+nothing from a reader that ignores it. Between a retraction that cannot be
+enforced and a declared version that cannot be bumped, the enforceable one wins
+and the unenforceable half is written down here.
+
 The rest of what makes a hand-added claim safe in a generated document:
 
 - **A typo cannot go quiet.** A value outside the closed set is refused by the

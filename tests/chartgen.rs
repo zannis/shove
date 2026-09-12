@@ -2679,6 +2679,136 @@ fn a_withheld_baseline_leaves_no_derived_scaling_value_behind() {
 }
 
 #[test]
+fn the_committed_documents_only_v6_deviation_is_the_withheld_derivations() {
+    // The committed document declares v6 and is not a v6 document: the v6
+    // contract typed `scaling_efficiency` `f64`, and six of its rows null it.
+    // The declaration is kept because on this artifact the version field is a
+    // producer interlock rather than a description — see the `schema_version`
+    // paragraph in `benches/README.md` and, for the interlock itself,
+    // `the_committed_document_is_one_no_v7_producer_could_have_written`.
+    //
+    // What a declaration cannot describe has to be bounded instead, which is
+    // what this pins: the deviation's *extent*, against the real artifact. A
+    // seventh null — a later withholding, a bug in `compute_scaling`, a hand
+    // edit — would otherwise arrive under a label that gives a reader no
+    // reason to expect it. The read rule the runbook states is only worth
+    // stating if it stays true of every row, so it is asserted over the whole
+    // document rather than over the one backend that motivated it.
+    //
+    // Expires with the deviation: the six-backend re-measure withholds
+    // nothing, so every row carries a number again, this fails, and the
+    // runbook section it pins is rewritten with it.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    assert_eq!(
+        doc["schema_version"], 6,
+        "the committed document is no longer v6 — this test's premise, and the runbook \
+         section it pins, both need revisiting"
+    );
+
+    // Every row the document publishes, in one list, so the assertion below is
+    // document-wide and not scoped to the backend that motivated it.
+    let runs = doc["runs"].as_array().expect("runs");
+    let mut nulled: Vec<(String, &serde_json::Value)> = Vec::new();
+    let mut numbered = 0usize;
+    for run in runs {
+        let backend = run["backend"].as_str().expect("backend").to_string();
+        for row in run["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .chain(run["withheld"].as_array().into_iter().flatten())
+        {
+            match &row["scaling_efficiency"] {
+                serde_json::Value::Null => nulled.push((backend.clone(), row)),
+                serde_json::Value::Number(_) => numbered += 1,
+                other => {
+                    panic!("{backend}: scaling_efficiency is neither null nor a number: {other}")
+                }
+            }
+        }
+    }
+    assert!(
+        numbered > 0,
+        "a document that published no scaling value anywhere would pass every check below \
+         while having deleted the conclusions this field exists for"
+    );
+
+    // The deviation, cell by cell: Redis `consume_batch` drains at the two
+    // payloads whose one-consumer drain the host clocked down, at every
+    // consumer count above one. Nowhere else, on no other backend or flow.
+    let expected: Vec<(u64, u64)> = [64u64, 1024]
+        .into_iter()
+        .flat_map(|payload| [2u64, 4, 8].into_iter().map(move |c| (payload, c)))
+        .collect();
+    let mut found: Vec<(u64, u64)> = Vec::new();
+    for (backend, row) in &nulled {
+        assert_eq!(
+            (backend.as_str(), &row["flow"], &row["method"]),
+            (
+                "redis",
+                &serde_json::json!("consume_batch"),
+                &serde_json::json!("drain")
+            ),
+            "a null scaling value outside the withheld Redis batch drains: {row}"
+        );
+        found.push((
+            row["payload_bytes"].as_u64().expect("payload_bytes"),
+            row["consumers"].as_u64().expect("consumers"),
+        ));
+    }
+    found.sort_unstable();
+    let mut want = expected.clone();
+    want.sort_unstable();
+    assert_eq!(
+        found, want,
+        "the set of rows nulling `scaling_efficiency` moved; the runbook's read rule names \
+         exactly these cells"
+    );
+
+    // And each one is null *because* its baseline is withheld — the rule the
+    // runbook states, not merely the count. The one-consumer row of each
+    // family is absent from `results[]` and present in `withheld[]` under its
+    // stated cause; `validate_run` enforces the same pairing on the way in,
+    // and this asserts it held on the way out.
+    let redis = runs
+        .iter()
+        .find(|r| r["backend"] == "redis")
+        .expect("the redis run is in the document");
+    for (payload, _) in &expected {
+        let baseline = |key: &str| {
+            redis[key]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|r| {
+                            r["flow"] == "consume_batch"
+                                && r["method"] == "drain"
+                                && r["consumers"] == 1
+                                && r["payload_bytes"] == *payload
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            baseline("results"),
+            0,
+            "the {payload} B one-consumer batch drain is published, so nulling its family's \
+             derivations claims a withholding the document never declared"
+        );
+        assert_eq!(
+            baseline("withheld"),
+            1,
+            "the {payload} B one-consumer batch drain is not in `withheld[]`, so nothing \
+             explains why its family's derivations are null"
+        );
+    }
+}
+
+#[test]
 fn a_v7_declaration_of_the_committed_document_is_not_refused() {
     // One half of why that refusal had to be bought on the field itself
     // rather than with a `schema_version` bump — the half that binds *here*,
