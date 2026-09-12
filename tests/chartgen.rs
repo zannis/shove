@@ -2809,6 +2809,117 @@ fn the_committed_documents_only_v6_deviation_is_the_withheld_derivations() {
 }
 
 #[test]
+fn a_v6_document_reader_clears_the_version_gate_and_then_keeps_no_row_at_all() {
+    // The runbook states the cost of buying the refusal on the field rather
+    // than on the declaration: serde types a document, not a cell, so a reader
+    // built against the v6 `f64` contract clears the version gate this file
+    // still advertises and then loses the whole file rather than the six rows
+    // it must not read. That is a concession about an unversioned change, and
+    // it was prose. Prose is the wrong place for it — it is the *consequence*
+    // of the deviation, and the one thing a later edit could quietly soften
+    // (drop the field instead of nulling it, and a v6 reader carrying
+    // `#[serde(default)]` takes the file and publishes `0.0` for the withheld
+    // families). So it is pinned against the real artifact instead.
+    //
+    // The reader modelled here is the *most permissive* v6 reader there can
+    // be: it names only the field whose contract changed, ignores every other
+    // key, and denies nothing. If even that one refuses, every real v6 reader
+    // refuses, because each has at least this field typed `f64`.
+    //
+    // Both directions are asserted, because only the pair is discriminating.
+    // The refusal alone could come from unrelated shape drift; the control
+    // fills in exactly those six nulls, touches nothing else, and shows the
+    // same reader then takes the entire document — every row of all six
+    // backends, `dlq_drain` rows included. Nullability is therefore the whole
+    // of what a v6 reader cannot take from this file, which is also why
+    // relabelling these bytes v7 was never the repair: the rows the version
+    // field interlocks against parse fine, and the one that does not is not a
+    // versioning problem the declaration could describe.
+    //
+    // Expires with the deviation, like the two tests above it: a re-measure
+    // that withholds nothing leaves no null to refuse and this fails.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    let mut doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+
+    #[derive(serde::Deserialize)]
+    struct V6Doc {
+        schema_version: u32,
+        runs: Vec<V6Run>,
+    }
+    #[derive(serde::Deserialize)]
+    struct V6Run {
+        results: Vec<V6Row>,
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct V6Row {
+        scaling_efficiency: f64,
+    }
+
+    // The gate such a reader checks first does not stop it: the document still
+    // declares the version it was built for. Whatever protection it gets, it
+    // does not get from the declaration.
+    assert_eq!(
+        doc["schema_version"], 6,
+        "the committed document no longer advertises v6 — the premise of this test, and the \
+         runbook's read rule, both need revisiting"
+    );
+
+    use serde_json::error::Category;
+    let err = serde_json::from_str::<V6Doc>(&raw)
+        .err()
+        .expect("a reader typed against the v6 `f64` contract must refuse this document outright");
+    assert_eq!(
+        err.classify(),
+        Category::Data,
+        "the refusal must be a type error on the changed field, not a syntax or io failure: {err}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("invalid type: null, expected f64"),
+        "the refusal must name the nullability as its cause, so the reader's operator can see \
+         which contract moved: {err}"
+    );
+
+    // The control. Fill in exactly the nulled cells, leave every other byte of
+    // the document alone, and the same reader takes all of it.
+    let mut filled_in = 0usize;
+    let mut published = 0usize;
+    for run in doc["runs"].as_array_mut().expect("runs") {
+        for row in run["results"].as_array_mut().expect("results") {
+            published += 1;
+            if row["scaling_efficiency"].is_null() {
+                row["scaling_efficiency"] = serde_json::json!(1.0);
+                filled_in += 1;
+            }
+        }
+    }
+    assert_eq!(
+        filled_in, 6,
+        "the control only means something against the six nulls the runbook's read rule names"
+    );
+
+    let repaired = serde_json::from_str::<V6Doc>(&doc.to_string())
+        .expect("with the six nulls filled in, a v6 reader must take the whole document");
+    assert_eq!(
+        repaired.schema_version, 6,
+        "the control must not have moved the declaration it is holding fixed"
+    );
+    assert_eq!(
+        repaired
+            .runs
+            .iter()
+            .map(|run| run.results.len())
+            .sum::<usize>(),
+        published,
+        "the v6 reader must recover every published row, or the refusal above was not caused \
+         by the nullability alone"
+    );
+}
+
+#[test]
 fn a_v7_declaration_of_the_committed_document_is_not_refused() {
     // One half of why that refusal had to be bought on the field itself
     // rather than with a `schema_version` bump — the half that binds *here*,

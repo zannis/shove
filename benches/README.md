@@ -611,6 +611,22 @@ The rest of what makes a hand-added claim safe in a generated document:
   instead of nulling it: absent and `null` are the same parse failure against
   a non-`default` `f64`. What the null buys over silence is that the failure
   happens at all.
+
+  That cost is asserted, not merely conceded.
+  `a_v6_document_reader_clears_the_version_gate_and_then_keeps_no_row_at_all`
+  (`tests/chartgen.rs`) runs the most permissive v6 reader there can be — the
+  changed field typed `f64`, every other key ignored, nothing denied — over
+  the real artifact: it clears the version gate the document still advertises,
+  then refuses the file with `invalid type: null, expected f64`, keeping no
+  row of any backend. Its control fills in exactly those six cells, touches
+  nothing else, and the same reader then takes every published row. So the
+  nullability is the whole of what a v6 reader cannot take from this file, and
+  the `dlq_drain` rows the version field interlocks against are no part of it
+  — which is the other reason relabelling these bytes v7 repairs nothing. The
+  one softening that argument leaves open, dropping the field rather than
+  nulling it, is caught there too: against a reader carrying
+  `#[serde(default)]` it would read as `0.0` for the withheld families, and
+  the test fails on the error the document no longer produces.
 - **A merge preserves it; a re-measure drops it.** Refreshing another
   backend's leg keeps that backend's entries. Re-measuring the withheld
   backend writes ordinary rows and no entries, deliberately: the claim is
