@@ -2792,6 +2792,47 @@ where
     }
 }
 
+/// A spawned task that is aborted when its handle is dropped.
+///
+/// `tokio::task::JoinHandle` detaches on drop; [`run_batch_impl`]'s read-ahead
+/// dial wants the opposite, so a loop that exits — shutdown, or an error on its
+/// way to `run_with_reconnect` — does not leave a dial running against a broker
+/// it has stopped using.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    }
+
+    /// The finished task's output, without suspending the caller.
+    ///
+    /// Only call once [`is_finished`](Self::is_finished) is true: a finished
+    /// `JoinHandle` resolves on its first poll, so this `await` cannot yield —
+    /// which is what lets the caller collect a dial from a path that must
+    /// never wait on one. `None` if the task panicked or was aborted.
+    async fn join_now(mut self) -> Option<T> {
+        match self.0.take() {
+            Some(handle) => handle.await.ok(),
+            None => None,
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.as_ref() {
+            handle.abort();
+        }
+    }
+}
+
 /// [`BatchConsumerImpl::run_batch`](crate::backend::BatchConsumerImpl) for
 /// Redis. See the module doc above for the no-lease design and PEL-replay
 /// metadata notes this loop depends on.
@@ -2999,47 +3040,6 @@ where
 ///
 /// No `unwrap`/`expect`/indexing on runtime paths; all arithmetic here is
 /// `saturating`/`checked` — see [`batch_headroom`], [`batch_block_ms`].
-/// A spawned task that is aborted when its handle is dropped.
-///
-/// `tokio::task::JoinHandle` detaches on drop; [`run_batch_impl`]'s read-ahead
-/// dial wants the opposite, so a loop that exits — shutdown, or an error on its
-/// way to `run_with_reconnect` — does not leave a dial running against a broker
-/// it has stopped using.
-struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
-
-impl<T> AbortOnDrop<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
-        Self(Some(handle))
-    }
-
-    fn is_finished(&self) -> bool {
-        self.0
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
-    }
-
-    /// The finished task's output, without suspending the caller.
-    ///
-    /// Only call once [`is_finished`](Self::is_finished) is true: a finished
-    /// `JoinHandle` resolves on its first poll, so this `await` cannot yield —
-    /// which is what lets the caller collect a dial from a path that must
-    /// never wait on one. `None` if the task panicked or was aborted.
-    async fn join_now(mut self) -> Option<T> {
-        match self.0.take() {
-            Some(handle) => handle.await.ok(),
-            None => None,
-        }
-    }
-}
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        if let Some(handle) = self.0.as_ref() {
-            handle.abort();
-        }
-    }
-}
-
 pub(crate) async fn run_batch_impl<T, H>(
     client: RedisClient,
     handler: H,
