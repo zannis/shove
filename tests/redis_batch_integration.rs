@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -439,6 +440,12 @@ define_topic!(
     BatchMessage,
     TopologyBuilder::new(READ_AHEAD_REDIAL_QUEUE).build()
 );
+const READ_AHEAD_STALL_QUEUE: &str = "redis-batch-read-ahead-stall";
+define_topic!(
+    ReadAheadStallTopic,
+    BatchMessage,
+    TopologyBuilder::new(READ_AHEAD_STALL_QUEUE).build()
+);
 const PARTIAL_READ_AHEAD_QUEUE: &str = "redis-batch-read-ahead-partial";
 define_topic!(
     PartialReadAheadTopic,
@@ -567,6 +574,7 @@ impl_recording_for!(
     CountPinTopic,
     ReadAheadConnTopic,
     ReadAheadRedialTopic,
+    ReadAheadStallTopic,
     AgeTopic,
     AgeUnderLoadTopic,
     AckTopic,
@@ -1098,6 +1106,64 @@ async fn xreadgroup_count_matches_max_batch_size_not_one() {
 /// address is the second field inside the brackets. Shared by the two tests
 /// that pin the batch loop's connection structure, so neither can parse it
 /// differently from the other.
+/// A TCP proxy in front of Redis whose *new* connections can be blackholed.
+///
+/// Returns the `redis://` URL to point a client at, and the switch. While the
+/// switch is set, a connection the proxy accepts is held open and forwarded
+/// nowhere — the client's TCP connect succeeds and its handshake is answered by
+/// nothing, which is what a blackholing middlebox looks like from the dialling
+/// side and is the only way to make a dial hang without also breaking the
+/// connections that already exist. Connections established before the switch
+/// was set keep forwarding normally, which is the whole point: it separates
+/// "this loop cannot open a new socket" from "this loop's socket is dead".
+async fn spawn_blackholing_proxy(upstream_url: &str) -> (String, Arc<AtomicBool>) {
+    let upstream = upstream_url
+        .trim_start_matches("redis://")
+        .trim_end_matches('/')
+        .to_owned();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy listener");
+    let addr = listener.local_addr().expect("proxy local addr");
+    let blackhole = Arc::new(AtomicBool::new(false));
+    tokio::spawn({
+        let blackhole = Arc::clone(&blackhole);
+        async move {
+            loop {
+                let Ok((down, _)) = listener.accept().await else {
+                    return;
+                };
+                if blackhole.load(Ordering::SeqCst) {
+                    tokio::spawn(async move {
+                        let _held = down;
+                        std::future::pending::<()>().await;
+                    });
+                    continue;
+                }
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    let Ok(up) = tokio::net::TcpStream::connect(&upstream).await else {
+                        return;
+                    };
+                    let (mut down_read, mut down_write) = down.into_split();
+                    let (mut up_read, mut up_write) = up.into_split();
+                    tokio::join!(
+                        async {
+                            let _ = tokio::io::copy(&mut down_read, &mut up_write).await;
+                            let _ = up_write.shutdown().await;
+                        },
+                        async {
+                            let _ = tokio::io::copy(&mut up_read, &mut down_write).await;
+                            let _ = down_write.shutdown().await;
+                        },
+                    );
+                });
+            }
+        }
+    });
+    (format!("redis://{addr}/"), blackhole)
+}
+
 fn monitor_client_addr(line: &str) -> Option<&str> {
     let inside = line.split_once('[')?.1.split_once(']')?.0;
     inside.split_once(' ').map(|(_, addr)| addr)
@@ -1380,6 +1446,172 @@ async fn a_dead_read_ahead_connection_is_re_dialed() {
         "the loop must keep delivering across the kill — batches went from \
          {batches_at_kill} to {}",
         handler.batches().len()
+    );
+}
+
+/// A read-ahead re-dial that cannot complete must not hold a full batch away
+/// from its handler.
+///
+/// The recovery the test above proves has a cost the flush must never pay.
+/// While the read-ahead has no socket, every size-triggered cycle wants to dial
+/// a new one — and a dial is the one thing in this loop that can hang without
+/// anything being wrong with the loop's *own* connection: a proxy or a
+/// half-open network can accept a TCP connection and then answer nothing, so
+/// the dial runs to `connection_timeout` while the main socket stays healthy
+/// and a `max_batch_size`-full, PEL-owned batch sits in memory waiting for it.
+/// Awaiting the dial before the flush puts that timeout between a full batch
+/// and its handler, and because a failed dial leaves the read-ahead off, the
+/// next cycle pays it again — a per-batch stall on exactly the recovery path.
+///
+/// The fixture separates the two sockets deliberately. The consumer reaches
+/// Redis through an in-process TCP proxy that can be told to accept new
+/// connections and forward nothing, while the publisher talks to Redis
+/// directly — so the blackhole reaches only the connections the consumer opens
+/// *after* it is armed, and a stalled drain cannot be confused with a publisher
+/// that stopped supplying. Killing the read-ahead's own client (as above, via
+/// `MONITOR` + `CLIENT KILL`) is what empties `read_conn`; the blackhole is
+/// armed first so the re-dial cannot win a race against it.
+///
+/// `connection_timeout` is pinned well below the assertion budget so a
+/// regression fails in seconds rather than at the default ten.
+#[tokio::test]
+async fn a_stalled_read_ahead_re_dial_does_not_delay_the_flush() {
+    const BATCH: usize = 5;
+    /// Batches the drain must deliver after the blackhole is armed.
+    const BATCHES_AFTER: usize = 10;
+    /// One stalled dial alone (3 s) fits in this; ten do not. A loop that
+    /// dials in the flush's path cannot fit ten cycles into it, and a loop
+    /// that keeps the dial off that path needs milliseconds.
+    const BUDGET: Duration = Duration::from_secs(8);
+    const DIAL_TIMEOUT: Duration = Duration::from_secs(3);
+
+    let url = redis_url().await;
+    // Publisher and topology on a direct connection: the blackhole below must
+    // reach the consumer's sockets only.
+    let direct =
+        connect_with_retry(url, "batch-read-ahead-stall-grp", Duration::from_secs(30)).await;
+    direct
+        .topology()
+        .declare::<ReadAheadStallTopic>()
+        .await
+        .unwrap();
+    let publisher = direct.publisher().await.unwrap();
+
+    let (proxy_url, blackhole) = spawn_blackholing_proxy(url).await;
+    let consumer_broker = Broker::<Redis>::new(
+        RedisConfig::new(RedisMode::Standalone { url: proxy_url })
+            .with_group("batch-read-ahead-stall-grp")
+            // Must stay above BLOCK_MS (2 s); the dial is what this test stalls.
+            .with_response_timeout(Duration::from_secs(3))
+            .with_connection_timeout(DIAL_TIMEOUT),
+    )
+    .await
+    .expect("consumer broker through the proxy");
+
+    let monitor_client = redis::Client::open(url).expect("open monitor client");
+    let monitor = monitor_client
+        .get_async_monitor()
+        .await
+        .expect("MONITOR connection");
+    let mut lines = monitor.into_on_message::<String>();
+    let mut admin = monitor_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("admin connection");
+
+    // Enough to arm the read-ahead (a size-triggered flush is its only
+    // trigger) and keep the loop busy while the kill is set up.
+    publish_seq::<ReadAheadStallTopic>(&publisher, 0..40).await;
+
+    let handler = RecordingBatchHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = consumer_broker.batch_consumer();
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<ReadAheadStallTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(BATCH)
+                        // Long enough that only size triggers a flush in this
+                        // window — the dial is on the size-triggered path.
+                        .with_max_batch_age(Duration::from_secs(30))
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    let stream_needle = format!("\"{READ_AHEAD_STALL_QUEUE}\"");
+    let mut addrs: Vec<String> = Vec::new();
+    let collect_addrs = |line: &str, addrs: &mut Vec<String>| {
+        if !line.contains(&stream_needle) || !line.contains("\"XREADGROUP\"") {
+            return;
+        }
+        if let Some(addr) = monitor_client_addr(line)
+            && !addrs.iter().any(|a| a == addr)
+        {
+            addrs.push(addr.to_string());
+        }
+    };
+
+    // The loop's own read first, the read-ahead's second — as in the re-dial
+    // test above.
+    let _ = tokio::time::timeout(TIMEOUT, async {
+        while addrs.len() < 2 {
+            let Some(line) = lines.next().await else {
+                return;
+            };
+            collect_addrs(&line, &mut addrs);
+        }
+    })
+    .await;
+    assert_eq!(
+        addrs.len(),
+        2,
+        "expected the loop's own read and the read-ahead's on two clients \
+         before the blackhole, saw {addrs:?}"
+    );
+
+    // Arm the blackhole BEFORE the kill: a re-dial issued in between would
+    // succeed and the stall would never be reached.
+    blackhole.store(true, Ordering::SeqCst);
+    let killed: i64 = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("ADDR")
+        .arg(&addrs[1])
+        .query_async(&mut admin)
+        .await
+        .expect("CLIENT KILL should be accepted");
+    assert_eq!(killed, 1, "expected to kill exactly {}", addrs[1]);
+
+    let batches_at_kill = handler.batches().len();
+    // Supply for BATCHES_AFTER full batches, with slack for whatever the loop
+    // had already buffered when the kill landed.
+    let supply = (BATCHES_AFTER as u32 + 4) * BATCH as u32;
+    publish_seq::<ReadAheadStallTopic>(&publisher, 40..40 + supply).await;
+
+    let started = std::time::Instant::now();
+    let drained = handler
+        .wait_for_batches(batches_at_kill + BATCHES_AFTER, BUDGET)
+        .await;
+    let elapsed = started.elapsed();
+    let delivered = handler.batches().len() - batches_at_kill;
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    blackhole.store(false, Ordering::SeqCst);
+
+    assert!(
+        drained,
+        "a read-ahead re-dial that cannot complete must not delay the flush: \
+         expected {BATCHES_AFTER} more batches within {BUDGET:?} of the \
+         blackhole, saw {delivered} (from {batches_at_kill}) in {elapsed:?}. A \
+         loop that awaits the dial before the flush pays {DIAL_TIMEOUT:?} per \
+         size-triggered cycle here."
     );
 }
 
