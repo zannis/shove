@@ -433,6 +433,12 @@ define_topic!(
     BatchMessage,
     TopologyBuilder::new(READ_AHEAD_CONN_QUEUE).build()
 );
+const READ_AHEAD_REDIAL_QUEUE: &str = "redis-batch-read-ahead-redial";
+define_topic!(
+    ReadAheadRedialTopic,
+    BatchMessage,
+    TopologyBuilder::new(READ_AHEAD_REDIAL_QUEUE).build()
+);
 const PARTIAL_READ_AHEAD_QUEUE: &str = "redis-batch-read-ahead-partial";
 define_topic!(
     PartialReadAheadTopic,
@@ -560,6 +566,7 @@ impl_recording_for!(
     SizeTopic,
     CountPinTopic,
     ReadAheadConnTopic,
+    ReadAheadRedialTopic,
     AgeTopic,
     AgeUnderLoadTopic,
     AckTopic,
@@ -1087,23 +1094,37 @@ async fn xreadgroup_count_matches_max_batch_size_not_one() {
     );
 }
 
-/// The read-ahead and the flush share one socket, and that is load-bearing.
+/// `1758… [0 172.17.0.1:57134] "XREADGROUP" …` — a `MONITOR` line's client
+/// address is the second field inside the brackets. Shared by the two tests
+/// that pin the batch loop's connection structure, so neither can parse it
+/// differently from the other.
+fn monitor_client_addr(line: &str) -> Option<&str> {
+    let inside = line.split_once('[')?.1.split_once(']')?.0;
+    inside.split_once(' ').map(|(_, addr)| addr)
+}
+
+/// The read-ahead reads on a socket of its own, and that is load-bearing.
 ///
-/// Splitting them over two connections is the obvious-looking cleanup — it is
-/// what the concurrent single-message loop does with its `outcome_conn` — and
-/// it costs 28 points of the two-consumer gain and 7 of the one-consumer one.
-/// Both split variants were built and measured; the numbers, in both
-/// directions, are in the crate's `run_batch_impl` doc comment under
-/// "What sharing the socket costs, and why it is still the choice".
+/// Riding a clone of the loop's connection is the cheaper-looking structure —
+/// it pipelines the read-ahead's `XREADGROUP` with the flush's `XACK` over one
+/// socket, which is worth 1.45x at two consumers against this structure's
+/// 1.11x — but Redis writes a client's replies in arrival order, so the ack
+/// cannot land until the read's 32 KB reply ahead of it has been drained, and
+/// at eight consumers that costs 5.5% against no read-ahead at all.
+/// Both structures were built and measured in both directions; the numbers are
+/// in the crate's `run_batch_impl` doc comment under "What a socket of its own
+/// costs, and why it is still the choice".
 ///
 /// No functional test can see a throughput trade, so the structure gets
-/// pinned instead: every `XREADGROUP` and every `XACK` this loop issues for
-/// one stream must come from the **same** client. `MONITOR` reports the
-/// issuing client's `ip:port` per command, which is what makes a split
-/// visible at all. A future refactor that hands the read-ahead or the
-/// settlement its own connection fails here and has to read why first.
+/// pinned instead: the read-ahead's `XREADGROUP` must come from a **different**
+/// client than the loop's own read, and the flush's `XACK` must come from the
+/// loop's own. `MONITOR` reports the issuing client's `ip:port` per command,
+/// which is what makes the split visible at all. A future refactor that
+/// collapses the two connections back into a clone — or that moves the
+/// settlement onto the new socket instead of the read-ahead — fails here and
+/// has to read why first.
 #[tokio::test]
-async fn the_read_ahead_and_the_flush_share_one_socket() {
+async fn the_read_ahead_reads_on_a_socket_of_its_own() {
     let url = redis_url().await;
     let broker =
         connect_with_retry(url, "batch-read-ahead-conn-grp", Duration::from_secs(30)).await;
@@ -1147,13 +1168,6 @@ async fn the_read_ahead_and_the_flush_share_one_socket() {
         }
     });
 
-    /// `1758… [0 172.17.0.1:57134] "XREADGROUP" …` — the client address is the
-    /// second field inside the brackets.
-    fn client_addr(line: &str) -> Option<&str> {
-        let inside = line.split_once('[')?.1.split_once(']')?.0;
-        inside.split_once(' ').map(|(_, addr)| addr)
-    }
-
     let stream_needle = format!("\"{READ_AHEAD_CONN_QUEUE}\"");
     let mut read_addrs: Vec<String> = Vec::new();
     let mut ack_addrs: Vec<String> = Vec::new();
@@ -1166,7 +1180,7 @@ async fn the_read_ahead_and_the_flush_share_one_socket() {
             if !line.contains(&stream_needle) {
                 continue;
             }
-            let Some(addr) = client_addr(&line) else {
+            let Some(addr) = monitor_client_addr(&line) else {
                 continue;
             };
             if line.contains("\"XREADGROUP\"") {
@@ -1181,11 +1195,12 @@ async fn the_read_ahead_and_the_flush_share_one_socket() {
             } else {
                 continue;
             }
-            // Leave once both halves of a cycle have been seen: two reads —
-            // the loop's own of the first five and the read-ahead's of the
-            // second five, which is what proves the read-ahead fired — and
-            // the ack the flush between them issued.
-            if reads >= 2 && !ack_addrs.is_empty() {
+            // Leave once both halves of a cycle have been seen: two reads from
+            // two clients — the loop's own of the first five and the
+            // read-ahead's of the second five, which is what proves both that
+            // the read-ahead fired and that it has its own socket — and the ack
+            // the flush between them issued.
+            if read_addrs.len() >= 2 && !ack_addrs.is_empty() {
                 return;
             }
         }
@@ -1203,17 +1218,168 @@ async fn the_read_ahead_and_the_flush_share_one_socket() {
     );
     assert_eq!(
         read_addrs.len(),
-        1,
-        "the read-ahead must stay on the loop's own socket, but XREADGROUPs \
-         for {stream_needle} came from {read_addrs:?}"
+        2,
+        "the read-ahead must read on a connection of its own, so the loop's \
+         own read and the read-ahead's must come from two clients, but \
+         XREADGROUPs for {stream_needle} came from {read_addrs:?}. Collapsing \
+         them back onto one socket costs 5.5% at eight consumers — see \
+         run_batch_impl's \"What a socket of its own costs, and why it is \
+         still the choice\""
     );
+    // The first distinct address is the loop's own read: the read-ahead is
+    // only ever issued by a size-triggered flush, which the loop's own read
+    // has to fill the batch for first. So this pins *which* half moved, not
+    // just that two sockets exist — the mirror structure (settlement moved
+    // off, reads shared) measures 4% away and is not what ships.
+    let loop_addr = read_addrs.first().cloned().unwrap_or_default();
     assert_eq!(
-        ack_addrs, read_addrs,
-        "the flush must settle on the socket it reads on, but acks for \
+        ack_addrs,
+        vec![loop_addr],
+        "the flush must settle on the socket the loop reads on, but acks for \
          {stream_needle} came from {ack_addrs:?} against reads from \
-         {read_addrs:?}. Splitting them recovers ~5% at eight consumers and \
-         gives back 28 points at two — see run_batch_impl's \"What sharing \
-         the socket costs, and why it is still the choice\""
+         {read_addrs:?}"
+    );
+}
+
+/// A read-ahead whose own socket dies gets a fresh one, rather than leaving
+/// the loop silently un-pipelined.
+///
+/// This is the failure mode the socket of its own *introduced*. While the
+/// read-ahead rode a clone of the loop's connection, a dead socket failed the
+/// loop's own next read too, so `run_with_reconnect` re-dialed everything and
+/// the read-ahead came back with it. Nothing else uses this socket, so the same
+/// error now has to be handled here or not at all: swallowing it would leave
+/// the loop correct (its own read covers every entry) and permanently
+/// un-pipelined, with nothing logged at a level anyone watches.
+///
+/// `MONITOR` makes the re-dial observable: kill the client the read-ahead
+/// issues from, keep publishing, and a *third* client address has to appear on
+/// this stream's `XREADGROUP`s. Failing the cycle instead of re-dialing is the
+/// other way to pass this, which is why the loop's comment says why it does
+/// not (a transient read-ahead error would spend a `max_reconnect_attempts`
+/// budget that exists for real broker loss).
+#[tokio::test]
+async fn a_dead_read_ahead_connection_is_re_dialed() {
+    let url = redis_url().await;
+    let broker =
+        connect_with_retry(url, "batch-read-ahead-redial-grp", Duration::from_secs(30)).await;
+    broker
+        .topology()
+        .declare::<ReadAheadRedialTopic>()
+        .await
+        .unwrap();
+
+    let monitor_client = redis::Client::open(url).expect("open monitor client");
+    let monitor = monitor_client
+        .get_async_monitor()
+        .await
+        .expect("MONITOR connection");
+    let mut lines = monitor.into_on_message::<String>();
+    let mut admin = monitor_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("admin connection");
+
+    let publisher = broker.publisher().await.unwrap();
+    publish_seq::<ReadAheadRedialTopic>(&publisher, 0..10).await;
+
+    let handler = RecordingBatchHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<ReadAheadRedialTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(5)
+                        .with_max_batch_age(Duration::from_millis(500))
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    let stream_needle = format!("\"{READ_AHEAD_REDIAL_QUEUE}\"");
+    let mut addrs: Vec<String> = Vec::new();
+    let collect_addrs = |line: &str, addrs: &mut Vec<String>| {
+        if !line.contains(&stream_needle) || !line.contains("\"XREADGROUP\"") {
+            return;
+        }
+        if let Some(addr) = monitor_client_addr(line)
+            && !addrs.iter().any(|a| a == addr)
+        {
+            addrs.push(addr.to_string());
+        }
+    };
+
+    // The loop's own read comes first and the read-ahead's second — the
+    // read-ahead is only ever issued by a size-triggered flush, which that
+    // first read has to fill the batch for.
+    let _ = tokio::time::timeout(TIMEOUT, async {
+        while addrs.len() < 2 {
+            let Some(line) = lines.next().await else {
+                return;
+            };
+            collect_addrs(&line, &mut addrs);
+        }
+    })
+    .await;
+    assert_eq!(
+        addrs.len(),
+        2,
+        "expected the loop's own read and the read-ahead's on two clients \
+         before the kill, saw {addrs:?}"
+    );
+    let read_ahead_addr = addrs[1].clone();
+
+    let killed: i64 = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("ADDR")
+        .arg(&read_ahead_addr)
+        .query_async(&mut admin)
+        .await
+        .expect("CLIENT KILL should be accepted");
+    assert_eq!(killed, 1, "expected to kill exactly {read_ahead_addr}");
+
+    let batches_at_kill = handler.batches().len();
+    // Enough cycles after the kill that the first read-ahead to fail and the
+    // arming that re-dials are both inside the window.
+    publish_seq::<ReadAheadRedialTopic>(&publisher, 10..60).await;
+
+    let re_dialed = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let Some(line) = lines.next().await else {
+                return false;
+            };
+            collect_addrs(&line, &mut addrs);
+            if addrs.len() >= 3 {
+                return true;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    let progressed = handler.wait_for_batches(batches_at_kill + 2, TIMEOUT).await;
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    assert!(
+        re_dialed,
+        "a read-ahead whose socket was killed must re-dial: expected a third \
+         client address on {stream_needle}'s XREADGROUPs within {TIMEOUT:?}, \
+         saw {addrs:?}"
+    );
+    assert!(
+        progressed,
+        "the loop must keep delivering across the kill — batches went from \
+         {batches_at_kill} to {}",
+        handler.batches().len()
     );
 }
 

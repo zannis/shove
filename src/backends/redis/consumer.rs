@@ -2301,36 +2301,60 @@ fn batch_block_ms(deadline: Option<Instant>, now: Instant) -> u64 {
 /// [`parse_xreadgroup_reply`] hands them back: `(entry_id, fields)`.
 type BatchEntries = Vec<(String, Vec<(String, String)>)>;
 
+/// What one read-ahead came back with. `Nothing` covers both "not armed this
+/// cycle" and "the stream had nothing to give", which the loop treats
+/// identically; `Failed` is distinct because it is the only one that says
+/// something about the *connection* — see [`read_ahead_batch`].
+enum ReadAhead {
+    Entries(BatchEntries),
+    Nothing,
+    Failed,
+}
+
 /// One **non-blocking** live (`>`) `XREADGROUP` for the *next* batch, issued
 /// to run concurrently with the current batch's flush (see
 /// [`run_batch_impl`]'s "Read-ahead across the flush").
 ///
 /// `BLOCK` is deliberately absent, and that is a correctness requirement
-/// rather than a tuning choice: this read shares one socket with the flush's
-/// `XACK` (see [`run_batch_impl`] for why sharing is the measured choice),
-/// Redis does not serve a blocked client's subsequent commands until it
-/// unblocks, so a blocking read-ahead on an idle stream would hold the
-/// flush's ack hostage for up to [`BLOCK_MS`]. Without `BLOCK` an empty
-/// stream answers immediately with nil, which is `None` here and costs the
-/// flush nothing. A second reason survives even on a socket of its own: this
-/// future is joined with the flush, so a blocking read would keep the join
-/// pending after the flush had returned, delaying the loop and shutdown with
-/// it, where the loop's own read is the one that may wait — raced `biased`
-/// against the shutdown token.
+/// rather than a tuning choice: this future is joined with the flush, so a
+/// blocking read on an idle stream would keep the join pending for up to
+/// [`BLOCK_MS`] after the flush had returned, delaying the loop and shutdown
+/// with it — where the loop's own read is the one that may wait, raced
+/// `biased` against the shutdown token. Without `BLOCK` an empty stream
+/// answers immediately with nil, which is `None` here and costs the flush
+/// nothing.
 ///
-/// A failure is logged and swallowed rather than propagated: the loop's own
-/// read is the next thing to run, and it reports a dead connection with the
-/// error taxonomy `run_with_reconnect` expects. Entries this read delivered
-/// but whose reply never arrived stay pending, recovered exactly as a lost
-/// reply to the loop's own read already is — by the reaper, or by the next
-/// `Redeliver` replay.
+/// A second reason applied while this read rode a clone of the loop's socket
+/// (Redis does not serve a blocked client's subsequent commands until it
+/// unblocks, so a blocking read-ahead would have held the flush's `XACK`
+/// hostage) and no longer does: the read-ahead has a connection of its own —
+/// see [`run_batch_impl`] for what that costs and why it is still the choice.
+/// The join reason above is sufficient on its own.
+///
+/// A failure is **reported to the caller** rather than propagated out of the
+/// loop, and the distinction is load-bearing now that this read has a socket
+/// of its own. While it rode a clone of the loop's connection, swallowing the
+/// error was enough: the same dead socket made the loop's own next read fail,
+/// which reported it with the error taxonomy `run_with_reconnect` expects. On
+/// a separate connection nothing else ever touches this socket, so a swallowed
+/// error would leave the read-ahead silently dead for the rest of the
+/// reconnect cycle while the loop ran on, degraded and quiet. `run_batch_impl`
+/// therefore drops the connection on `Err` and re-dials it at the next arming
+/// — best effort, because the loop's own read covers every entry either way.
+/// Failing the whole cycle instead was rejected: a transient read-ahead error
+/// would then spend a `max_reconnect_attempts` budget that exists for real
+/// broker loss.
+///
+/// Entries this read delivered but whose reply never arrived stay pending,
+/// recovered exactly as a lost reply to the loop's own read already is — by
+/// the reaper, or by the next `Redeliver` replay.
 async fn read_ahead_batch(
     conn: &mut RedisConnection,
     stream: &str,
     group: &str,
     consumer: &str,
     count: usize,
-) -> Option<BatchEntries> {
+) -> ReadAhead {
     let mut cmd = redis::cmd("XREADGROUP");
     cmd.arg("GROUP")
         .arg(group)
@@ -2343,15 +2367,20 @@ async fn read_ahead_batch(
     match conn.query::<redis::Value>(&mut cmd).await {
         Ok(value) => {
             let entries = parse_xreadgroup_reply(value, count);
-            (!entries.is_empty()).then_some(entries)
+            if entries.is_empty() {
+                ReadAhead::Nothing
+            } else {
+                ReadAhead::Entries(entries)
+            }
         }
         Err(e) => {
             tracing::debug!(
                 stream,
                 error = %e,
-                "batch read-ahead XREADGROUP failed; the loop's own read will report it"
+                "batch read-ahead XREADGROUP failed; its connection is dropped \
+                 and re-dialed at the next flush"
             );
-            None
+            ReadAhead::Failed
         }
     }
 }
@@ -2817,48 +2846,71 @@ where
 /// read-ahead is neither that row's cause nor its fix, and is justified here
 /// only by what it measures where it was measured.
 ///
-/// **Where the gain comes from, and where it is largest.** The read-ahead
-/// halves the loop's consumer-path requests — 803 to 403 per 200 000
-/// messages at one consumer, because the next read travels with the flush's
-/// `XACK` instead of following it — and it removes the quiet those requests
-/// used to be issued into: on an aarch64 Linux host, 98.5% of the serial
-/// loop's 1c requests start after the path has been silent for >= 0.3 ms
-/// (mean 1.6 ms), against 70.9% at 2c and 24.7% for `consume_parallel`. The
-/// gain therefore scales with what one round trip costs. Behind a proxy
-/// charging 1.2 ms per such request (64 B, 200 000-message drains, 3 reps)
-/// it is 1.28x at 1c and 1.35x at 2c; against a loopback Docker broker,
-/// where a round trip is nearly free, it is the 1.07x and 1.48x measured
-/// below. A broker a network hop away is the deployment it helps most.
+/// **Where the gain comes from, and where it is largest.** On a socket of its
+/// own the read-ahead does not make the loop's round trips *fewer* — a
+/// transparent proxy in front of the broker counts 803 consumer-path requests
+/// per 200 000 messages at one consumer with or without it — it stops them
+/// being *serial*: the next read travels on `read_conn` while the flush's
+/// `XACK` travels on `conn`, where the serial loop issues each into the
+/// silence the previous one left. The proxy's own accounting is the sharpest
+/// form of that: it charges 800 of the split's 803 requests against 790 of
+/// the serial loop's 803, so the faster arm is the one paying *more* charges,
+/// concurrently.
 ///
-/// # What sharing the socket costs, and why it is still the choice
+/// The gain therefore scales with what one round trip costs. Behind that
+/// proxy charging 1.2 ms on any consumer-path request issued after >= 0.3 ms
+/// of quiet (64 B, 200 000-message drains, 3 reps, medians, arms interleaved)
+/// it is **1.37x at one consumer** and 1.16x at two; with the same proxy in
+/// measure-only mode — no charge, but its own hop still in the path — 1.15x
+/// and 1.20x; and against a loopback Docker broker, where a round trip is
+/// nearly free, it is the 0.96x and 1.11x measured below. A broker a network
+/// hop away is the deployment this helps most, and a loopback broker at one
+/// consumer is the one it costs.
 ///
-/// The read-ahead rides a clone of the loop's connection, so its reply and
-/// the flush's `XACK` reply are queued on one client in that order. Three
-/// structures were built and measured on the host above — no read-ahead; the
-/// clone; and the two split over two sockets (once with the read-ahead moved
-/// off, once with the settlement moved off, which is what
-/// `run_stream_loop_concurrent` does). 64 B, `--concurrent --handler zero`,
-/// 600 000-message drains, `max_batch_size` 500, every arm built from one
-/// `CARGO_TARGET_DIR`, medians of three reps (one for the second split):
+/// # What a socket of its own costs, and why it is still the choice
 ///
-/// | consumers | no read-ahead | shared socket | split socket |
+/// The read-ahead reads on its own connection. The loop's own read and the
+/// flush's `XACK` stay on `conn`, so no two replies this loop waits for are
+/// queued behind each other on one client. The cheaper-looking structure is a
+/// `conn.clone()`: a `MultiplexedConnection` clone shares the socket and the
+/// multiplexer task, so it opens nothing (`connected_clients` does not move)
+/// and the read-ahead's `XREADGROUP` pipelines with the flush's `XACK`
+/// instead of taking turns with it. Three structures were built and measured
+/// on the host above — no read-ahead; the clone; the split. 64 B,
+/// `--concurrent --handler zero`, 600 000-message drains, `max_batch_size`
+/// 500, every arm built from one `CARGO_TARGET_DIR`, medians of three reps
+/// (four at eight consumers) with the arm order **rotated per rep** so no arm
+/// is systematically measured into the host state another arm left behind:
+///
+/// | consumers | no read-ahead | shared socket | own socket (shipped) |
 /// |---|---|---|---|
-/// | 1 | 99 458 | 106 806 (1.074x) | 99 313 (0.999x) |
-/// | 2 | 152 724 | 225 206 (1.475x) | 181 495 (1.188x) |
-/// | 8 | 335 868 | 319 046 (**0.950x**) | 361 746 (1.077x) |
+/// | 1 | 108 515 | 116 516 (1.074x) | 104 392 (**0.962x**) |
+/// | 2 | 171 074 | 247 154 (1.445x) | 189 490 (1.108x) |
+/// | 8 | 370 189 | 349 741 (**0.945x**) | 376 923 (1.018x) |
 ///
-/// No run of one arm overlaps another arm's range in any cell, so the
-/// crossover is not this host's noise, and it is the same either way round:
-/// moving the settlement off instead of the read-ahead lands within 4% of the
-/// column above (102 509 at 1c, 177 869 at 2c, 351 839 at 8c, n=1), so the
-/// cost is having two sockets at all rather than which half moves.
+/// Read the crossover rather than any one column. The clone is worth more
+/// wherever the server has idle to fill (+7% at one consumer, +45% at two)
+/// and *regresses* the eight-consumer cell against no read-ahead at all,
+/// where the split gives part of that gain back (+11% at two) and leaves the
+/// eight-consumer cell alone. The split's own one-consumer cell is ~4%
+/// **below** the serial loop here — small, but its runs do not overlap the
+/// baseline's, so it is a cost rather than noise. This loop takes the
+/// structure that regresses nothing at eight consumers: a multi-consumer
+/// regression is what the published rows cannot afford, and the
+/// single-consumer gain given up is the gain this host has least of (a
+/// loopback round trip is nearly free — the paragraph above prices the same
+/// read-ahead behind a proxy that charges for one).
 ///
-/// So the 8-consumer cell pays about 5% for what the 1- and 2-consumer cells
-/// gain 7% and 48% from, and a split that recovers the 5% gives back 28
-/// points at 2c. This loop keeps the shared socket and the cost is stated
-/// rather than hidden.
+/// The crossover is stable across campaigns rather than an artefact of one
+/// hour: an earlier pass on this host with a fixed (unrotated) arm order put
+/// the same three arms at 1.074x / 1.475x / 0.950x for the clone and
+/// 0.999x / 1.188x / 1.077x for the split, and it also measured the mirror
+/// split — settlement moved off instead of the read-ahead, which is what
+/// `run_stream_loop_concurrent` does — within 4% of the split column (n=1).
+/// The cost is having two sockets at all, not which half moves.
 ///
-/// What the cost is **not**, measured off the broker rather than argued: the
+/// What the clone's eight-consumer cost is **not**, measured off the broker
+/// rather than argued: the
 /// command mix is identical (1 209 vs 1 214 `XREADGROUP`s at ~495 entries
 /// each and 1 200 `XACK`s per 600 000 messages, so nothing is fragmented,
 /// clamped or double-read), time inside Redis commands is within 4%
@@ -2869,8 +2921,11 @@ where
 /// clone opens no socket. What rises is Redis's non-command CPU per message,
 /// +10 to 18% — the event-loop cost of serving one client whose 32 KB read
 /// reply and whose ack reply are queued together, the ack's behind the
-/// read's. That is why the loss appears only where the broker is busy enough
-/// for the queueing to land on the critical path.
+/// read's. Redis writes a client's replies in arrival order, so the flush
+/// cannot finish until the read it was hiding has been drained: at eight
+/// consumers that lands on the critical path, at one or two it does not.
+/// Splitting the sockets is what removes it, and a second socket per consumer
+/// is what that costs.
 ///
 /// Five properties keep it from changing what a handler sees:
 ///
@@ -2991,22 +3046,26 @@ where
 
         async move {
             let mut conn = client.dedicated_conn().await?;
-            // A clone rather than a second connection, and that is a
-            // **measured** choice rather than the convenience it looks like.
-            // A `MultiplexedConnection` clone shares the socket and the
-            // multiplexer task, so it opens nothing new — `connected_clients`
-            // does not move — and exists only so the read-ahead and the flush
-            // can hold separate handles at the same time. Sharing has two
-            // consequences and this loop wants the first: the read-ahead's
-            // `XREADGROUP` and the flush's `XACK` pipeline over one socket
-            // instead of taking turns on it, which is what buys the 1- and
-            // 2-consumer cells; and Redis writes the ack's reply behind the
-            // read's, which is what costs the 8-consumer one. Both halves are
-            // measured in `run_batch_impl`'s "Read-ahead across the flush",
-            // together with the two split-socket variants that were built and
-            // rejected. Re-cloned when this closure re-runs, off the freshly
-            // dialed `conn`.
-            let mut read_conn = conn.clone();
+            // A second connection rather than a `conn.clone()`, and that is a
+            // **measured** choice rather than the tidier-looking one. A
+            // `MultiplexedConnection` clone shares the socket and the
+            // multiplexer task, so the read-ahead's `XREADGROUP` and the
+            // flush's `XACK` would pipeline over one socket instead of taking
+            // turns on it — which buys the 1- and 2-consumer cells, and costs
+            // the 8-consumer one, because Redis writes a client's replies in
+            // arrival order and the ack's then waits behind a 32 KB read reply.
+            // This loop takes the structure that regresses no multi-consumer
+            // cell and pays about 4% at one consumer for it; both halves of the
+            // trade, in both directions, are in `run_batch_impl`'s "What a
+            // socket of its own costs, and why it is still the choice".
+            // `multiplexed_conn` rather than
+            // `dedicated_conn` because the read-ahead never blocks (see
+            // [`read_ahead_batch`]), the same call
+            // `run_stream_loop_concurrent` makes for its `outcome_conn`.
+            // Re-dialed when this closure re-runs, alongside `conn`, and also
+            // on its own whenever a read-ahead fails on it — `None` means
+            // "dial one before the next read-ahead", see [`read_ahead_batch`].
+            let mut read_conn = Some(client.multiplexed_conn().await?);
             let mut batch: RedisBatch<T> = RedisBatch::new(max_batch_size);
             let mut deadline: Option<Instant> = None;
             let mut redelivery_backoff = batch_redelivery_backoff();
@@ -3034,38 +3093,50 @@ where
                     // into an empty buffer and `max_batch_size` still bounds
                     // what one handler call sees.
                     //
-                    // `read_conn` is a clone of `conn`, not a second
-                    // connection: the read and the flush's `XACK` pipeline
-                    // over one socket instead of taking turns on it. See
-                    // [`read_ahead_batch`] for why that obliges the
-                    // read-ahead to omit `BLOCK`, and this function's
-                    // "Read-ahead across the flush" for what sharing costs at
-                    // eight consumers and why a split socket costs more.
+                    // `read_conn` is a connection of its own, not a clone of
+                    // `conn`: this read and the flush's `XACK` do not queue
+                    // their replies on one client, which is what keeps the
+                    // eight-consumer cell from regressing. See this function's
+                    // "What a socket of its own costs, and why it is still the
+                    // choice" for the whole trade, and [`read_ahead_batch`] for
+                    // why the read-ahead omits `BLOCK` either way.
                     //
                     // A replay cycle takes no read-ahead: a live `>` read
                     // would interleave never-delivered entries into a PEL
                     // drain, and `next_replay_cursor` only describes the
                     // history read it advanced from.
                     let read_ahead_armed = replay_cursor.is_none();
+                    if read_ahead_armed && read_conn.is_none() {
+                        // A previous read-ahead failed on that socket and it
+                        // was dropped; dial a fresh one. Best effort, and the
+                        // `.ok()` is the whole policy: a dial failure leaves
+                        // the read-ahead off for this cycle and is retried at
+                        // the next one, because the loop's own read covers
+                        // every entry either way. This is the only place the
+                        // flush waits on anything but itself, and it is
+                        // reached only after a failure.
+                        read_conn = client.multiplexed_conn().await.ok();
+                    }
                     // Taken before the read is issued rather than when its
                     // reply lands: the age bound this arms is an upper bound,
                     // so the conservative end is the earlier instant, and the
-                    // reply can be delayed behind the flush's own `XACK` on
-                    // the shared socket.
+                    // reply is parked in `prefetched` for however long the
+                    // flush it travels with runs.
                     let read_at = Instant::now();
                     let (ahead, flushed) = tokio::join!(
                         async {
-                            if read_ahead_armed {
-                                read_ahead_batch(
-                                    &mut read_conn,
-                                    stream,
-                                    &group,
-                                    &consumer,
-                                    max_batch_size,
-                                )
-                                .await
-                            } else {
-                                None
+                            match read_conn.as_mut() {
+                                Some(read_conn) if read_ahead_armed => {
+                                    read_ahead_batch(
+                                        read_conn,
+                                        stream,
+                                        &group,
+                                        &consumer,
+                                        max_batch_size,
+                                    )
+                                    .await
+                                }
+                                _ => ReadAhead::Nothing,
                             }
                         },
                         flush_redis_batch(
@@ -3090,16 +3161,24 @@ where
                         FlushOutcome::ShutdownDuringBackoff => return Ok(()),
                         FlushOutcome::Flushed => {}
                     }
-                    // Dropped rather than ingested when the flush armed a
-                    // replay: `Redeliver` leaves the whole batch pending and
-                    // sets the cursor to "0", so the replay read returns
-                    // these entries as well — ingesting them here too would
-                    // hand the same entries to the handler twice within one
-                    // process.
-                    prefetched = if replay_cursor.is_some() {
-                        None
-                    } else {
-                        ahead.map(|entries| (read_at, entries))
+                    // A failed read-ahead takes its connection with it: nothing
+                    // else uses that socket, so a dead one would otherwise
+                    // leave this loop quietly un-pipelined for the rest of the
+                    // reconnect cycle. The next arming dials a fresh one.
+                    if matches!(ahead, ReadAhead::Failed) {
+                        read_conn = None;
+                    }
+                    // Entries are dropped rather than ingested when the flush
+                    // armed a replay: `Redeliver` leaves the whole batch
+                    // pending and sets the cursor to "0", so the replay read
+                    // returns these entries as well — ingesting them here too
+                    // would hand the same entries to the handler twice within
+                    // one process.
+                    prefetched = match ahead {
+                        ReadAhead::Entries(entries) if replay_cursor.is_none() => {
+                            Some((read_at, entries))
+                        }
+                        _ => None,
                     };
                     deadline = None;
                     continue;
