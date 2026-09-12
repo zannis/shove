@@ -5231,7 +5231,26 @@ struct ScenarioResult {
     e2e_p50_ms: f64,
     e2e_p95_ms: f64,
     e2e_p99_ms: f64,
-    scaling_efficiency: f64,
+    /// This row's throughput over its family's **one-consumer** throughput —
+    /// see [`ScalingKey`] for what makes two rows one family.
+    ///
+    /// `null` when that baseline is not published: a withheld cell
+    /// (`BackendRun::withheld`) is a measurement the document declines to
+    /// stand behind, and a quotient of a disclaimed number is disclaimed too.
+    /// Relocating the source row while still publishing `5.4904…` — which is
+    /// exactly `726,872 / 132,388` — would let a reader present a conclusion
+    /// computed from the number it was denied, which is the same failure as
+    /// publishing the number. [`validate_run`] enforces both directions: null
+    /// iff the family's baseline is withheld.
+    ///
+    /// Nullable rather than absent, and deliberately **not** `default`: a
+    /// reader built against the `f64` this used to be refuses a document that
+    /// nulls it, instead of silently republishing a stale derivation. That is
+    /// the refusal a `schema_version` bump would normally buy, on the one
+    /// field whose meaning actually changed — and it costs no reader anything
+    /// on a document that withholds nothing, where every row still carries a
+    /// number.
+    scaling_efficiency: Option<f64>,
     peak_rss_mb: f64,
     cpu_pct: f64,
     /// The measured window. On every consume flow that holds a readiness
@@ -5999,6 +6018,56 @@ fn validate_run(run: &BackendRun) -> Result<(), String> {
             ));
         }
     }
+    // Withholding a row withholds what was derived from it. `scaling_efficiency`
+    // is each family's throughput over its lowest-consumer row, so withholding
+    // that row and leaving the quotient published hands a reader the disclaimed
+    // number back in derived form — 64 B / 2c publishing 5.4904… is exactly
+    // 726,872 / 132,388, the withheld 1c measurement. Moving a row out of
+    // `results[]` is therefore only half of withholding it; the other half is
+    // this.
+    //
+    // Enforced in both directions so neither mistake is silent: a family whose
+    // baseline is withheld must publish no quotient, and a family whose
+    // baseline is published must publish one (a stray `null` would read as a
+    // withholding the document never declared).
+    let mut baseline_consumers: BTreeMap<ScalingKey, (u16, bool)> = BTreeMap::new();
+    for (r, is_withheld) in run
+        .results
+        .iter()
+        .map(|r| (r, false))
+        .chain(run.withheld.iter().map(|r| (r, true)))
+    {
+        let entry = baseline_consumers
+            .entry(ScalingKey::of(r))
+            .or_insert((r.consumers, is_withheld));
+        if r.consumers < entry.0 {
+            *entry = (r.consumers, is_withheld);
+        }
+    }
+    for r in &run.results {
+        let baseline_withheld = baseline_consumers
+            .get(&ScalingKey::of(r))
+            .is_some_and(|&(_, withheld)| withheld);
+        match (baseline_withheld, r.scaling_efficiency) {
+            (true, Some(value)) => {
+                return Err(format!(
+                    "run '{}' publishes scaling_efficiency {value} for flow '{}' at {} B / {} \
+                     consumer(s), but that family's one-consumer baseline is withheld — the \
+                     quotient of a withheld measurement is withheld too",
+                    run.backend, r.flow, r.payload_bytes, r.consumers
+                ));
+            }
+            (false, None) => {
+                return Err(format!(
+                    "run '{}' nulls scaling_efficiency for flow '{}' at {} B / {} consumer(s) \
+                     while that family's baseline is published — null means withheld, and \
+                     nothing withholds this one",
+                    run.backend, r.flow, r.payload_bytes, r.consumers
+                ));
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 
@@ -6355,7 +6424,11 @@ fn compute_scaling(results: &mut [ScenarioResult]) {
         if let Some(&(_, baseline)) = baselines.get(&ScalingKey::of(r))
             && baseline > 0.0
         {
-            r.scaling_efficiency = r.throughput_msg_per_sec / baseline;
+            // Always `Some` here: a run computes this over its own complete
+            // sweep, which always contains its own baseline. `None` is only
+            // ever reached by withholding that baseline afterwards, which no
+            // run does — see `BackendRun::withheld`.
+            r.scaling_efficiency = Some(r.throughput_msg_per_sec / baseline);
         }
     }
 }
@@ -6385,7 +6458,7 @@ fn print_table(report: &Report) {
     println!("{}", "-".repeat(170));
     for r in &report.results {
         println!(
-            "{:<16} {:>7} {:<10} {:>8} {:>5} {:>8} {:>8.0}  {:>8.1}ms {:>8.1}ms {:>8.1}ms  {:>8.1}ms {:>8.1}ms {:>8.1}ms  {:>5.1}x {:>7.1} {:>4.0}%",
+            "{:<16} {:>7} {:<10} {:>8} {:>5} {:>8} {:>8.0}  {:>8.1}ms {:>8.1}ms {:>8.1}ms  {:>8.1}ms {:>8.1}ms {:>8.1}ms  {:>6} {:>7.1} {:>4.0}%",
             r.flow,
             r.payload_bytes,
             r.tier,
@@ -6399,7 +6472,10 @@ fn print_table(report: &Report) {
             r.e2e_p50_ms,
             r.e2e_p95_ms,
             r.e2e_p99_ms,
-            r.scaling_efficiency,
+            // `-` where the family's baseline is withheld: a quotient of a
+            // withheld measurement is not a number this table may print.
+            r.scaling_efficiency
+                .map_or_else(|| "     -".to_string(), |s| format!("{s:>5.1}x")),
             r.peak_rss_mb,
             r.cpu_pct,
         );
@@ -6717,7 +6793,8 @@ fn push_metrics(results: &mut Vec<ScenarioResult>, scenario: &Scenario, m: Scena
         e2e_p50_ms: m.latencies.e2e_p50,
         e2e_p95_ms: m.latencies.e2e_p95,
         e2e_p99_ms: m.latencies.e2e_p99,
-        scaling_efficiency: 0.0,
+        // Filled in by `compute_scaling` once the whole sweep is in hand.
+        scaling_efficiency: Some(0.0),
         peak_rss_mb: m.peak_rss_mb,
         cpu_pct: m.cpu_pct,
         duration_secs: m.duration_secs,
@@ -9751,7 +9828,7 @@ mod tests {
                 e2e_p50_ms: 0.0,
                 e2e_p95_ms: 0.0,
                 e2e_p99_ms: 0.0,
-                scaling_efficiency: 1.0,
+                scaling_efficiency: Some(1.0),
                 peak_rss_mb: 0.0,
                 cpu_pct: 0.0,
                 duration_secs: drain_bound().duration_secs,
@@ -9838,10 +9915,42 @@ mod tests {
         //    `results[]` copy charts, so the document would publish exactly
         //    the number the withheld copy disclaims.
         let mut both = marked.clone();
-        both.results.push(both.withheld[0].clone());
-        both.results[both.results.len() - 1].comparability = None;
+        // Built before the push rather than indexed after it: `v[v.len()-1]`
+        // borrows `v` mutably and immutably at once (E0502).
+        let mut republished = both.withheld[0].clone();
+        republished.comparability = None;
+        both.results.push(republished);
         let err = validate_run(&both).unwrap_err();
         assert!(err.contains("both publishes and withholds"), "{err}");
+
+        // 5. Withholding a row withholds what was derived from it. Moving the
+        //    one-consumer row out of `results[]` is only half the job: every
+        //    surviving row of that family carries `scaling_efficiency`, which
+        //    is its throughput over exactly the row that left — so a published
+        //    quotient hands the disclaimed number back in derived form.
+        let mut derived = marked.clone();
+        let mut two_consumers = derived.withheld[0].clone();
+        two_consumers.comparability = None;
+        // Throughput left alone: the drain account derives it, and a row
+        // that disagrees with its own account is refused a rule earlier.
+        two_consumers.consumers = 2;
+        two_consumers.scaling_efficiency = Some(2.0);
+        derived.results.push(two_consumers);
+        let err = validate_run(&derived).unwrap_err();
+        assert!(err.contains("one-consumer baseline is withheld"), "{err}");
+
+        //    Nulled, the same document is valid.
+        let last = derived.results.len() - 1;
+        derived.results[last].scaling_efficiency = None;
+        validate_run(&derived).expect("a nulled quotient over a withheld baseline is valid");
+
+        //    And the converse, so neither mistake is silent: a null where the
+        //    baseline *is* published claims a withholding the document never
+        //    declared.
+        let mut stray = sample_run("redis");
+        stray.results[0].scaling_efficiency = None;
+        let err = validate_run(&stray).unwrap_err();
+        assert!(err.contains("nothing withholds this one"), "{err}");
 
         let path = temp_path("comparability");
         let _ = std::fs::remove_file(&path);
@@ -10660,9 +10769,9 @@ mod tests {
             },
         ];
         compute_scaling(&mut rows);
-        assert_eq!(rows[0].scaling_efficiency, 1.0);
-        assert_eq!(rows[1].scaling_efficiency, 4.0);
-        assert_eq!(rows[2].scaling_efficiency, 1.0);
+        assert_eq!(rows[0].scaling_efficiency, Some(1.0));
+        assert_eq!(rows[1].scaling_efficiency, Some(4.0));
+        assert_eq!(rows[2].scaling_efficiency, Some(1.0));
     }
 
     // ── batch options: CLI → scenario → driver → row → validation ──
@@ -11560,7 +11669,7 @@ mod tests {
         compute_scaling(&mut rows);
         // The 4-consumer 50k rung is compared with the 1-consumer 50k rung,
         // not with the 5k rung that happens to share flow, payload and tier.
-        assert_eq!(rows[2].scaling_efficiency, 1.0);
+        assert_eq!(rows[2].scaling_efficiency, Some(1.0));
     }
 
     #[test]

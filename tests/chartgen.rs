@@ -2598,6 +2598,86 @@ fn a_reader_that_knows_only_results_finds_no_row_for_a_withheld_cell() {
     );
 }
 
+#[test]
+fn a_withheld_baseline_leaves_no_derived_scaling_value_behind() {
+    // Relocating a row withholds the measurement. It does not, by itself,
+    // withhold what was *computed* from it — and `scaling_efficiency` is
+    // computed from exactly the row that moved: each family's throughput over
+    // its one-consumer row. The 64 B / 2c row published 5.490446860977596,
+    // which is 726,872 / 132,388 — the withheld number in quotient form. A
+    // reader that correctly finds no 1c row could still present a conclusion
+    // derived from the 1c row, which is the same failure as publishing it.
+    //
+    // Asserted against the real artifact, in the three ways it can go wrong.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results/bench-results.json");
+    let raw = std::fs::read_to_string(&path).expect("the committed results document should read");
+    let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+
+    let rows = |backend: &str, flow: &str| -> Vec<serde_json::Value> {
+        doc["runs"]
+            .as_array()
+            .expect("runs")
+            .iter()
+            .find(|r| r["backend"] == backend)
+            .expect("the backend is in the document")["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .filter(|r| r["flow"] == flow && r["method"] == "drain")
+            .cloned()
+            .collect()
+    };
+
+    // 1. Every row whose baseline is withheld publishes `null`, not a number.
+    for row in rows("redis", "consume_batch") {
+        let payload = row["payload_bytes"].as_u64().expect("payload_bytes");
+        if payload != 64 && payload != 1024 {
+            continue;
+        }
+        assert!(
+            row["scaling_efficiency"].is_null(),
+            "redis consume_batch at {payload} B / {} consumer(s) still publishes a scaling \
+             value derived from the withheld one-consumer drain: {}",
+            row["consumers"],
+            row["scaling_efficiency"]
+        );
+    }
+
+    // 2. The control. Withholding removed the derivations of two families and
+    //    nothing else — a document that nulled the field everywhere would pass
+    //    a one-sided check while having deleted publishable conclusions.
+    let parallel = rows("redis", "consume_parallel");
+    assert!(
+        !parallel.is_empty() && parallel.iter().all(|r| r["scaling_efficiency"].is_number()),
+        "redis consume_parallel baselines are published, so every row of it must still carry \
+         its scaling value"
+    );
+
+    // 3. And the refusal. A reader built against the `f64` this field used to
+    //    be does not quietly default the nulled rows — it fails to parse them,
+    //    which is the signal that its interpretation is obsolete. This is the
+    //    property an ignorable additive field could not deliver.
+    #[derive(Debug, serde::Deserialize)]
+    struct OldReaderRow {
+        #[allow(dead_code)]
+        scaling_efficiency: f64,
+    }
+    let withheld_baseline_row = rows("redis", "consume_batch")
+        .into_iter()
+        .find(|r| r["payload_bytes"] == 64 && r["consumers"] == 2)
+        .expect("the 64 B / 2c batch drain is in the document");
+    serde_json::from_value::<OldReaderRow>(withheld_baseline_row)
+        .expect_err("a reader typed against the old f64 contract must refuse a nulled row");
+    // The same reader still parses a row the document does not disclaim.
+    let publishable_row = rows("redis", "consume_parallel")
+        .into_iter()
+        .find(|r| r["payload_bytes"] == 64 && r["consumers"] == 2)
+        .expect("the 64 B / 2c parallel drain is in the document");
+    serde_json::from_value::<OldReaderRow>(publishable_row)
+        .expect("the refusal must be specific to the disclaimed rows, not the whole document");
+}
+
 // ── The committed artifact renders ──────────────────────────────────────────
 
 #[test]

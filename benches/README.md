@@ -527,6 +527,22 @@ The rest of what makes a hand-added claim safe in a generated document:
 - **A cell is published or withheld, never both.** A `results[]` copy would
   chart, so the document would publish exactly the number its `withheld[]`
   copy disclaims.
+- **Withholding a row withholds what was derived from it.** Moving the row is
+  only half the job. `scaling_efficiency` is each family's throughput over its
+  *one-consumer* row, so withholding that row while leaving the quotient
+  published hands a reader the disclaimed number back in derived form: Redis
+  `consume_batch` at 64 B / 2c published `5.490446860977596`, which is exactly
+  `726,872 / 132,388` — the withheld measurement. Those rows now publish
+  `scaling_efficiency: null`, and the harness refuses both mistakes: a
+  quotient over a withheld baseline, and a `null` where the baseline *is*
+  published (which would claim a withholding the document never declared).
+
+  This is also where an old reader is made to **refuse**. `scaling_efficiency`
+  was a plain `f64`, so a reader built against that contract fails to parse a
+  nulled row instead of quietly republishing a stale derivation — the refusal
+  a `schema_version` bump would normally buy, on the one field whose meaning
+  actually changed, and at no cost to a document that withholds nothing, where
+  every row still carries a number.
 - **A merge preserves it; a re-measure drops it.** Refreshing another
   backend's leg keeps that backend's entries. Re-measuring the withheld
   backend writes ordinary rows and no entries, deliberately: the claim is
