@@ -2547,6 +2547,10 @@ fn metadata_from(env: &Envelope) -> MessageMetadata {
         delivery_id,
         redelivered: retry_count > 0,
         delivery_count: Some(env.delivery_count),
+        // The in-process broker models a queue, not a partitioned log.
+        partition: None,
+        offset: None,
+        timestamp_ms: None,
         headers: Arc::new(env.headers.clone()),
     }
 }

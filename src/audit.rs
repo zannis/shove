@@ -312,6 +312,9 @@ mod tests {
             delivery_id: "d-1".into(),
             redelivered: false,
             delivery_count: Some(1),
+            partition: None,
+            offset: None,
+            timestamp_ms: None,
             headers: Arc::new(HashMap::new()),
         }
     }
@@ -461,6 +464,9 @@ mod tests {
             delivery_id: "d-1".into(),
             redelivered: false,
             delivery_count: Some(1),
+            partition: None,
+            offset: None,
+            timestamp_ms: None,
             headers: Arc::new(HashMap::new()),
         };
 

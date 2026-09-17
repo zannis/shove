@@ -139,6 +139,11 @@ pub(super) fn extract_message_metadata(msg: &Message) -> MessageMetadata {
         delivery_id,
         redelivered,
         delivery_count,
+        // A JetStream sequence is not a partition and an offset; see the
+        // field docs on `MessageMetadata::partition`.
+        partition: None,
+        offset: None,
+        timestamp_ms: None,
         headers: Arc::new(headers),
     }
 }

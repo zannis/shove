@@ -110,6 +110,42 @@ pub struct MessageMetadata {
     /// thresholds, not for exact accounting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_count: Option<u32>,
+    /// The partition the record was read from, or `None` where the backend
+    /// has no partitions.
+    ///
+    /// With [`offset`](Self::offset) this names the record's position in the
+    /// log, which is what an audit trail or a replay request needs. It is a
+    /// position, not an attempt: the same record redelivered after a
+    /// rebalance carries the same coordinates, and a `Retry` republishes a
+    /// new record with new ones.
+    ///
+    /// ## Per-backend availability
+    ///
+    /// | Backend | `partition` | `offset` | `timestamp_ms` |
+    /// |---|---|---|---|
+    /// | Apache Kafka | `Some(p)` | `Some(o)` | `Some(ms)` when the record carries a broker timestamp, `None` otherwise |
+    /// | RabbitMQ | `None` | `None` | `None` |
+    /// | AWS SQS | `None` | `None` | `None` |
+    /// | NATS JetStream | `None` | `None` | `None` |
+    /// | Redis Streams | `None` | `None` | `None` |
+    /// | In-process | `None` | `None` | `None` |
+    ///
+    /// NATS and Redis do have a stream sequence and an entry id, but neither
+    /// is a partition and an offset, so they are not squeezed into these
+    /// fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<i32>,
+    /// The record's offset inside its partition, or `None` where the backend
+    /// has no log offset. See [`partition`](Self::partition) for the
+    /// per-backend availability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<i64>,
+    /// The record's broker timestamp in milliseconds since the Unix epoch:
+    /// `LogAppendTime` or `CreateTime`, as the topic is configured. `None`
+    /// where the backend has no such timestamp or the record carries none.
+    /// See [`partition`](Self::partition) for the per-backend availability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<i64>,
     /// String-valued headers attached to the delivery (e.g. `x-trace-id`).
     ///
     /// ## Deduplication (`x-message-id`, RabbitMQ)
@@ -169,9 +205,9 @@ pub struct DeadMessageMetadata {
 impl MessageMetadata {
     /// Starts building a [`MessageMetadata`].
     ///
-    /// Every field defaults to its empty value — no retries, no headers, an
-    /// empty `delivery_id`, and an unknown `delivery_count` — so you only set
-    /// what your test actually asserts on.
+    /// Every field defaults to its empty value, so you only set what your
+    /// test actually asserts on: no retries, no headers, an empty
+    /// `delivery_id`, an unknown `delivery_count` and no record coordinates.
     ///
     /// ```
     /// use shove::MessageMetadata;
@@ -196,6 +232,9 @@ pub struct MessageMetadataBuilder {
     delivery_id: String,
     redelivered: bool,
     delivery_count: Option<u32>,
+    partition: Option<i32>,
+    offset: Option<i64>,
+    timestamp_ms: Option<i64>,
     headers: HashMap<String, String>,
 }
 
@@ -225,6 +264,27 @@ impl MessageMetadataBuilder {
         self
     }
 
+    /// Sets [`MessageMetadata::partition`]. Defaults to `None`, which means
+    /// "the backend has no partitions".
+    pub fn partition(mut self, partition: impl Into<Option<i32>>) -> Self {
+        self.partition = partition.into();
+        self
+    }
+
+    /// Sets [`MessageMetadata::offset`]. Defaults to `None`, which means "the
+    /// backend has no log offset".
+    pub fn offset(mut self, offset: impl Into<Option<i64>>) -> Self {
+        self.offset = offset.into();
+        self
+    }
+
+    /// Sets [`MessageMetadata::timestamp_ms`]. Defaults to `None`, which means
+    /// "no broker timestamp".
+    pub fn timestamp_ms(mut self, timestamp_ms: impl Into<Option<i64>>) -> Self {
+        self.timestamp_ms = timestamp_ms.into();
+        self
+    }
+
     /// Adds a single header, overwriting any previous value for `key`.
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(key.into(), value.into());
@@ -244,6 +304,9 @@ impl MessageMetadataBuilder {
             delivery_id: self.delivery_id,
             redelivered: self.redelivered,
             delivery_count: self.delivery_count,
+            partition: self.partition,
+            offset: self.offset,
+            timestamp_ms: self.timestamp_ms,
             headers: Arc::new(self.headers),
         }
     }
@@ -324,6 +387,11 @@ mod tests {
         assert!(!metadata.redelivered);
         // `None` means "unknown", never zero — see the field docs.
         assert_eq!(metadata.delivery_count, None);
+        // No partitions, no log offset, no broker timestamp: the shape every
+        // backend but Kafka reports.
+        assert_eq!(metadata.partition, None);
+        assert_eq!(metadata.offset, None);
+        assert_eq!(metadata.timestamp_ms, None);
         assert!(metadata.headers.is_empty());
     }
 
@@ -334,6 +402,9 @@ mod tests {
             .delivery_id("amqp-tag-7")
             .redelivered(true)
             .delivery_count(5)
+            .partition(2)
+            .offset(4_711)
+            .timestamp_ms(1_700_000_000_000)
             .header("x-trace-id", "abc123")
             .build();
 
@@ -341,6 +412,9 @@ mod tests {
         assert_eq!(metadata.delivery_id, "amqp-tag-7");
         assert!(metadata.redelivered);
         assert_eq!(metadata.delivery_count, Some(5));
+        assert_eq!(metadata.partition, Some(2));
+        assert_eq!(metadata.offset, Some(4_711));
+        assert_eq!(metadata.timestamp_ms, Some(1_700_000_000_000));
         assert_eq!(
             metadata.headers.get("x-trace-id").map(String::as_str),
             Some("abc123")
@@ -370,6 +444,18 @@ mod tests {
                 .delivery_count,
             None
         );
+    }
+
+    #[test]
+    fn record_coordinates_accept_both_bare_values_and_options() {
+        let metadata = MessageMetadata::builder()
+            .partition(Some(1))
+            .offset(None)
+            .timestamp_ms(7)
+            .build();
+        assert_eq!(metadata.partition, Some(1));
+        assert_eq!(metadata.offset, None);
+        assert_eq!(metadata.timestamp_ms, Some(7));
     }
 
     #[test]
@@ -422,6 +508,9 @@ mod tests {
             .retry_count(1)
             .delivery_id("d-9")
             .delivery_count(4)
+            .partition(3)
+            .offset(99)
+            .timestamp_ms(1_700_000_000_123)
             .header("h", "v")
             .build();
 
@@ -431,6 +520,27 @@ mod tests {
         assert_eq!(back.retry_count, 1);
         assert_eq!(back.delivery_id, "d-9");
         assert_eq!(back.delivery_count, Some(4));
+        assert_eq!(back.partition, Some(3));
+        assert_eq!(back.offset, Some(99));
+        assert_eq!(back.timestamp_ms, Some(1_700_000_000_123));
         assert_eq!(back.headers.get("h").map(String::as_str), Some("v"));
+    }
+
+    /// Metadata serialized before the record coordinates existed, or by a
+    /// backend that has none, deserializes with the three fields `None`; and
+    /// `None` is not written out, so such a document stays byte-compatible.
+    #[test]
+    fn metadata_without_record_coordinates_deserializes() {
+        let json = r#"{"retry_count":0,"delivery_id":"d-1","redelivered":false,"headers":{}}"#;
+        let back: MessageMetadata = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(back.partition, None);
+        assert_eq!(back.offset, None);
+        assert_eq!(back.timestamp_ms, None);
+
+        let out = serde_json::to_string(&MessageMetadata::builder().delivery_id("d-1").build())
+            .expect("serialize");
+        assert!(!out.contains("partition"), "{out}");
+        assert!(!out.contains("offset"), "{out}");
+        assert!(!out.contains("timestamp_ms"), "{out}");
     }
 }

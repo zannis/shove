@@ -85,14 +85,24 @@ define_topic!(
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// The record coordinates a delivery carried: partition, offset and broker
+/// timestamp, each `None` where the backend has none.
+type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
+
 #[derive(Clone, Default)]
 struct Recorder {
     seen: Arc<Mutex<Vec<String>>>,
+    /// The record coordinates each delivery carried, in delivery order.
+    coordinates: Arc<Mutex<Vec<Coordinates>>>,
 }
 
 impl Recorder {
     async fn keys(&self) -> Vec<String> {
         self.seen.lock().await.clone()
+    }
+
+    async fn coordinates(&self) -> Vec<Coordinates> {
+        self.coordinates.lock().await.clone()
     }
 
     async fn wait_for(&self, target: usize, timeout: Duration) {
@@ -107,8 +117,12 @@ macro_rules! recorder_for {
     ($($topic:ty),+ $(,)?) => {$(
         impl MessageHandler<$topic> for Recorder {
             type Context = ();
-            async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _: &()) -> Outcome {
+            async fn handle(&self, msg: Invalidate, meta: MessageMetadata, _: &()) -> Outcome {
                 self.seen.lock().await.push(msg.key);
+                self.coordinates
+                    .lock()
+                    .await
+                    .push((meta.partition, meta.offset, meta.timestamp_ms));
                 Outcome::Ack
             }
         }
@@ -618,6 +632,15 @@ async fn broadcast_fans_out_to_every_instance_from_the_tail() {
             "subscriber {i} saw the wrong set — a fan-out delivers every message to \
              every instance, and replays nothing from before it subscribed"
         );
+        // The groupless path builds its metadata off the same record, so it
+        // reports the same coordinates a group consumer would.
+        for (partition, offset, timestamp_ms) in recorder.coordinates().await {
+            assert!(
+                partition.is_some() && offset.is_some() && timestamp_ms.is_some(),
+                "subscriber {i} saw a delivery without record coordinates: \
+                 {partition:?} {offset:?} {timestamp_ms:?}"
+            );
+        }
     }
 
     for (broker, sub) in running {

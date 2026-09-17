@@ -244,9 +244,15 @@ async fn drain_raw_within(
 /// Records the `seq` of every message in every batch it is handed, and
 /// returns outcomes from a scripted queue (defaulting to `Ack` once the
 /// script is exhausted).
+/// The record coordinates a delivery carried: partition, offset and broker
+/// timestamp, each `None` where the backend has none.
+type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
+
 #[derive(Clone)]
 struct RecordingBatchHandler {
     batches: Arc<Mutex<Vec<Vec<u32>>>>,
+    /// The record coordinates of every message in every batch, flattened.
+    coordinates: Arc<Mutex<Vec<Coordinates>>>,
     scripted: Arc<Mutex<VecDeque<Outcome>>>,
     signal: Arc<Notify>,
 }
@@ -255,6 +261,7 @@ impl RecordingBatchHandler {
     fn new() -> Self {
         Self {
             batches: Arc::new(Mutex::new(Vec::new())),
+            coordinates: Arc::new(Mutex::new(Vec::new())),
             scripted: Arc::new(Mutex::new(VecDeque::new())),
             signal: Arc::new(Notify::new()),
         }
@@ -271,6 +278,11 @@ impl RecordingBatchHandler {
             .lock()
             .unwrap()
             .push(batch.iter().map(|(m, _)| m.seq).collect());
+        self.coordinates.lock().unwrap().extend(
+            batch
+                .iter()
+                .map(|(_, meta)| (meta.partition, meta.offset, meta.timestamp_ms)),
+        );
         let outcome = self
             .scripted
             .lock()
@@ -283,6 +295,10 @@ impl RecordingBatchHandler {
 
     fn batches(&self) -> Vec<Vec<u32>> {
         self.batches.lock().unwrap().clone()
+    }
+
+    fn coordinates(&self) -> Vec<Coordinates> {
+        self.coordinates.lock().unwrap().clone()
     }
 
     /// All `seq` values seen across every batch, flattened.
@@ -517,6 +533,16 @@ async fn batch_flushes_on_max_batch_size() {
     seen.sort_unstable();
     seen.dedup();
     assert_eq!(seen, (0..10).collect::<Vec<_>>());
+    // The batch path builds each message's metadata off its own record, so
+    // every entry carries the record coordinates.
+    let coordinates = handler.coordinates();
+    assert_eq!(coordinates.len(), 10);
+    assert!(
+        coordinates
+            .iter()
+            .all(|(p, o, t)| p.is_some() && o.is_some() && t.is_some()),
+        "a batched delivery without record coordinates: {coordinates:?}"
+    );
     broker.close().await;
 }
 

@@ -906,6 +906,11 @@ where
                         // XREADGROUP does not return the counter — surfacing it
                         // would cost an XPENDING round-trip per message.
                         delivery_count: None,
+                        // A stream entry id is not a partition and an offset; see the
+                        // field docs on `MessageMetadata::partition`.
+                        partition: None,
+                        offset: None,
+                        timestamp_ms: None,
                         headers: Arc::clone(&user_headers),
                     };
 
@@ -1340,6 +1345,9 @@ where
                         // XREADGROUP does not return the counter — surfacing it
                         // would cost an XPENDING round-trip per message.
                         delivery_count: None,
+                        partition: None,
+                        offset: None,
+                        timestamp_ms: None,
                         headers: Arc::clone(&user_headers),
                     };
 
@@ -2594,6 +2602,9 @@ async fn ingest_batch_entry<T: Topic>(
         delivery_id,
         redelivered: retry_count > 0,
         delivery_count: None,
+        partition: None,
+        offset: None,
+        timestamp_ms: None,
         headers: Arc::clone(&user_headers),
     };
 
