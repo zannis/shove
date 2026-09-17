@@ -59,6 +59,10 @@ One caution: because `Defer` never increments the retry counter, a handler that 
 
 If no hold queues are configured on the topic, `Defer` falls back to broker nack-with-requeue and logs a warning.
 
+On a Kafka topic bound with `kafka_external_topic()` neither `Retry` nor `Defer` republishes anything.
+The handler's task waits the same delay in place and is handed the same record again, with the retry count kept in memory.
+See [Bind to an infra-owned topic](/backends/kafka#bind-to-an-infra-owned-topic).
+
 `Defer` is not supported on sequenced consumers. If a handler returns `Defer` in that context it is treated as `Retry` and a warning is logged, because deferral would violate ordering guarantees.
 
 ## Handler timeouts and deserialization failures

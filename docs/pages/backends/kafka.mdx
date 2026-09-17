@@ -126,6 +126,27 @@ The group is `{queue}-consumer` unless `for_consumer_group` or `with_group_id` n
 A publisher additionally needs `Write` on the topic.
 A declared DLQ needs `Create`, `Describe` and `Write` on the DLQ topic, so that shove can create it and route to it.
 
+An external topic is read-only for shove.
+`Ack` and `Reject` behave as everywhere else, because a `Reject` publishes to the shove-owned DLQ and not into the topic.
+The two outcomes that republish into a shove-owned topic wait in place instead:
+
+| Outcome | Shove-owned topic | External topic |
+|---|---|---|
+| `Ack` | commits the offset | the same |
+| `Reject` | publishes to the DLQ when one is declared, then commits | the same, the DLQ is shove's own topic |
+| `Retry` | republishes into the topic after the tier's delay, with the retry count in a header | waits the tier's delay inside the handler's task, holding its prefetch slot, then hands the same record back with the retry count kept in memory; an exhausted budget goes to the DLQ as usual, with the in-memory count written to the dead letter's `Shove-Retry-Count` header |
+| `Defer` | republishes into the topic after the first tier's delay | waits the first tier's delay in place, then hands the same record back |
+
+The redelivered `MessageMetadata` carries `redelivered: true` and the in-memory retry count.
+While every prefetch slot is held and at least one holder is a waiting handler, the consumer pauses its assignment and keeps polling.
+A long wait therefore does not evict the member from its group.
+Slots held only by running handlers do not pause the assignment, because a pause purges the fetch queue and refetches on resume.
+A partition the group assigns to the member during a pause is paused too.
+A record it delivers first is handed back to the broker and arrives again, in order, once a slot frees.
+A shutdown during a wait completes nothing: the record stays uncommitted and is redelivered on restart.
+A waiting handler holds its slot for the whole delay, the contract a broadcast subscription has always had.
+Size `prefetch_count` for the number of records you accept to have waiting at once.
+
 `kafka_external_topic()` is incompatible with `sequenced()` and with every topic-config method.
 Those are `with_topic_config`, `with_retention`, `with_retention_forever`, `with_retention_bytes`, `with_cleanup_policy` and `with_max_message_bytes`.
 They configure topic *creation* and *reconciliation*, which external mode skips, and `build()` panics if they are combined.
@@ -353,6 +374,9 @@ See the [Basic example](/backends/kafka/examples/basic) for a full runnable walk
 
 `Outcome::Ack` marks the offset complete as soon as the handler returns.
 `Outcome::Retry` and `Outcome::Defer` mark it complete only once the broker has acknowledged the delayed republish to the hold topic.
+On a topic bound with `kafka_external_topic()` there is no republish.
+The offset is marked complete only when the in-place retry or defer ends in a terminal outcome.
+That is an `Ack`, or a `Reject` or an exhausted retry budget that was dead-lettered or discarded.
 This closes the publish-then-commit race.
 A broker crash or process kill between handler return and republish redelivers the message on restart rather than silently dropping it.
 

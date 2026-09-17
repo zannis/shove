@@ -65,6 +65,14 @@ pub(crate) struct ConsumerOptionsInner {
     #[cfg(feature = "kafka")]
     pub kafka_commit_interval: Option<Duration>,
 
+    /// Kafka-only, `test-support` builds: the `max.poll.interval.ms` the
+    /// concurrent and FIFO members are created with, in place of the pinned
+    /// `MAX_POLL_INTERVAL_MS`. Exists so an integration test can observe a
+    /// member eviction in seconds rather than the pinned five minutes.
+    /// Propagated from `KafkaConsumerGroupConfig::with_max_poll_interval_for_test`.
+    #[cfg(all(feature = "kafka", feature = "test-support"))]
+    pub kafka_max_poll_interval: Option<Duration>,
+
     /// Kafka-only: where a broadcast subscription assigns each partition.
     /// `None` keeps the tail. Propagated from
     /// `ConsumerOptions::<Kafka>::with_broadcast_start`; the group paths
@@ -124,6 +132,8 @@ impl ConsumerOptionsInner {
             kafka_auto_offset_reset: None,
             #[cfg(feature = "kafka")]
             kafka_commit_interval: None,
+            #[cfg(all(feature = "kafka", feature = "test-support"))]
+            kafka_max_poll_interval: None,
             #[cfg(feature = "kafka")]
             kafka_broadcast_start: None,
             #[cfg(feature = "kafka-schema-registry")]

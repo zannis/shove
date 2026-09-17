@@ -591,6 +591,8 @@ impl<B: Backend> ConsumerOptions<B> {
             kafka_auto_offset_reset: self.kafka_auto_offset_reset,
             #[cfg(feature = "kafka")]
             kafka_commit_interval: self.kafka_commit_interval,
+            #[cfg(all(feature = "kafka", feature = "test-support"))]
+            kafka_max_poll_interval: None,
             #[cfg(feature = "kafka")]
             kafka_broadcast_start: self.kafka_broadcast_start,
             #[cfg(feature = "kafka-schema-registry")]
