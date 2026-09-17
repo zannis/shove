@@ -15,6 +15,7 @@ use rdkafka::consumer::{
 use rdkafka::error::{KafkaError, KafkaResult};
 use rdkafka::message::{BorrowedMessage, Header, Headers, Message, OwnedHeaders};
 use rdkafka::metadata::Metadata;
+use rdkafka::types::RDKafkaErrorCode;
 use rdkafka::{ClientConfig, ClientContext, Offset, Statistics, TopicPartitionList};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::Instant;
@@ -1488,12 +1489,20 @@ where
 /// Maps a rdkafka `KafkaError` to the appropriate `ShoveError` variant.
 /// Permanent errors (bad config, fatal consumption, cancelled) become
 /// `Topology`; transient errors (broker down, network) become `Connection`.
+///
+/// `AutoOffsetReset` is permanent too: librdkafka raises it when a
+/// partition has no committed offset (or the committed one is out of range)
+/// and the reset policy is `none`. Reconnecting rejoins the same group under
+/// the same policy and meets the same answer, so the consumer ends instead
+/// and names the fault; the operator either commits a starting position (see
+/// `reset_consumer_group_offsets`) or picks another `KafkaAutoOffsetReset`.
 fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
     let is_permanent = matches!(
         &e,
         KafkaError::ClientConfig(..)
             | KafkaError::ClientCreation(_)
             | KafkaError::MessageConsumptionFatal(_)
+            | KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset)
             | KafkaError::Canceled
             | KafkaError::Nul(_)
     );

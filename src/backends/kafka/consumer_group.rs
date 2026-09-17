@@ -70,15 +70,26 @@ pub enum KafkaAutoOffsetReset {
     /// Refuse to start without a committed offset; the consumer raises an
     /// error if no offset exists. Use this when accidentally replaying or
     /// skipping history would be a correctness bug.
+    ///
+    /// librdkafka spells this policy `error` - its `auto.offset.reset` accepts
+    /// `smallest`, `earliest`, `beginning`, `largest`, `latest`, `end` and
+    /// `error`, and nothing else. The variant keeps the name that describes
+    /// the behaviour; only the wire token differs.
     None,
 }
 
 impl KafkaAutoOffsetReset {
+    /// The `auto.offset.reset` token librdkafka accepts for this policy.
+    ///
+    /// Pinned by `every_auto_offset_reset_token_is_accepted_by_librdkafka`,
+    /// which feeds each token through `ClientConfig::create_native_config`:
+    /// a token librdkafka does not know fails consumer *creation*, so a wrong
+    /// spelling here would take down every group configured with it.
     pub(crate) fn as_rdkafka_str(self) -> &'static str {
         match self {
             KafkaAutoOffsetReset::Earliest => "earliest",
             KafkaAutoOffsetReset::Latest => "latest",
-            KafkaAutoOffsetReset::None => "none",
+            KafkaAutoOffsetReset::None => "error",
         }
     }
 }
@@ -1623,7 +1634,32 @@ mod tests {
     fn auto_offset_reset_rdkafka_strings_are_canonical() {
         assert_eq!(KafkaAutoOffsetReset::Earliest.as_rdkafka_str(), "earliest");
         assert_eq!(KafkaAutoOffsetReset::Latest.as_rdkafka_str(), "latest");
-        assert_eq!(KafkaAutoOffsetReset::None.as_rdkafka_str(), "none");
+        // librdkafka's token for "refuse to guess" is `error`, not `none`;
+        // `none` fails consumer creation with an invalid-value error.
+        assert_eq!(KafkaAutoOffsetReset::None.as_rdkafka_str(), "error");
+    }
+
+    /// The test that would have caught the old token: every token this enum emits
+    /// must survive librdkafka's own config validation, which runs at
+    /// consumer creation and needs no broker.
+    #[test]
+    fn every_auto_offset_reset_token_is_accepted_by_librdkafka() {
+        use rdkafka::config::ClientConfig;
+
+        for policy in [
+            KafkaAutoOffsetReset::Earliest,
+            KafkaAutoOffsetReset::Latest,
+            KafkaAutoOffsetReset::None,
+        ] {
+            let mut cfg = ClientConfig::new();
+            cfg.set("auto.offset.reset", policy.as_rdkafka_str());
+            cfg.create_native_config().unwrap_or_else(|e| {
+                panic!(
+                    "librdkafka rejected auto.offset.reset={} for {policy:?}: {e}",
+                    policy.as_rdkafka_str()
+                )
+            });
+        }
     }
 
     // -- group_id (arch-K-1) --
