@@ -241,6 +241,23 @@ impl TestBroker {
     fn brokers(&self) -> &str {
         &self.bootstrap_servers
     }
+
+    /// Freeze the broker process: every request in flight hangs until
+    /// [`unpause`](Self::unpause). The way to observe what a consumer does
+    /// when its coordinator stops answering.
+    async fn pause(&self) {
+        self._container
+            .pause()
+            .await
+            .expect("failed to pause the Kafka container");
+    }
+
+    async fn unpause(&self) {
+        self._container
+            .unpause()
+            .await
+            .expect("failed to unpause the Kafka container");
+    }
 }
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -2793,6 +2810,357 @@ async fn transactional_gaps_do_not_stall_commits() {
     broker.close().await;
 }
 
+/// `with_commit_interval` widens the commit gate. With a 5 s interval the
+/// first drain still commits at once (the gate opens due), so the second
+/// batch's completions sit uncommitted for about one interval before the
+/// gate reopens - where the default 500 ms gate would have committed them
+/// within a second.
+#[tokio::test]
+async fn commit_interval_bounds_how_far_committed_offsets_lag() {
+    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
+
+    shove::define_topic!(
+        CommitIntervalTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-commit-interval").build()
+    );
+
+    impl MessageHandler<CommitIntervalTopic> for CountingHandler {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<CommitIntervalTopic>()
+        .await
+        .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    let publish = |i: usize| {
+        let publisher = &publisher;
+        async move {
+            publisher
+                .publish::<CommitIntervalTopic>(&SimpleMessage {
+                    id: format!("interval-{i}"),
+                    content: "gate".into(),
+                })
+                .await
+                .unwrap();
+        }
+    };
+    for i in 0..3 {
+        publish(i).await;
+    }
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<CommitIntervalTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10)
+                    .with_commit_interval(Duration::from_secs(5)),
+            )
+            .await
+    });
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "should consume the first batch"
+    );
+
+    let stats_provider = KafkaLagStatsProvider::new(client.clone());
+    let lag = || async {
+        stats_provider
+            .get_queue_stats(
+                "kafka-commit-interval",
+                "kafka-commit-interval-consumer",
+                KafkaAutoOffsetReset::Earliest,
+            )
+            .await
+            .expect("get_queue_stats should succeed")
+            .messages_pending
+    };
+    // The first drain commits at once: the gate is due until a commit has
+    // been issued, whatever the interval.
+    let deadline = Instant::now() + TIMEOUT;
+    while lag().await != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the first batch must commit on the opening drain"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // The second batch completes inside the 5 s window opened by that commit
+    // and must still be uncommitted one second later.
+    for i in 3..6 {
+        publish(i).await;
+    }
+    assert!(
+        handler.counter.wait_for(6, TIMEOUT).await,
+        "should consume the second batch"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        lag().await,
+        3,
+        "a 5 s gate must hold the second batch's commit for the interval"
+    );
+
+    // ...and commit once the interval elapses.
+    let deadline = Instant::now() + TIMEOUT;
+    while lag().await != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the gate must reopen after the interval and commit the batch"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// The child half of [`shutdown_exits_the_process_while_the_broker_is_frozen`].
+///
+/// Re-invoked by the parent test through `current_exe()` with
+/// `--ignored --exact`, so it is never run on its own. It consumes one
+/// record with a commit gate too wide to ever reopen, reports that it is
+/// ready, consumes a second record whose completion therefore stays
+/// uncommitted, and shuts its consumer down when a line arrives on stdin.
+/// The parent has frozen the broker by then, so the final synchronous commit
+/// blocks: the consumer must give up at `SHUTDOWN_COMMIT_DEADLINE` and this
+/// process must exit while the commit thread is still stuck.
+#[tokio::test]
+#[ignore = "child process of shutdown_exits_the_process_while_the_broker_is_frozen"]
+async fn child_consumes_then_shuts_down_on_stdin() {
+    use std::io::Write as _;
+
+    shove::define_topic!(
+        FrozenShutdownTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-frozen-shutdown").build()
+    );
+
+    impl MessageHandler<FrozenShutdownTopic> for CountingHandler {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    let bootstrap = std::env::var("SHOVE_TEST_KAFKA_BOOTSTRAP")
+        .expect("SHOVE_TEST_KAFKA_BOOTSTRAP is set by the parent test");
+    // The parent asserts on the deadline warning, which needs a subscriber.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let client = KafkaClient::connect_with_retry(&KafkaConfig::new(&bootstrap), 10)
+        .await
+        .expect("child failed to connect to Kafka");
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let run = tokio::spawn(async move {
+        consumer
+            .run::<FrozenShutdownTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    // Wide enough that the second record's completion can only
+                    // be committed by the final commit at shutdown.
+                    .with_commit_interval(Duration::from_secs(3600)),
+            )
+            .await
+    });
+
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "child must receive the first record"
+    );
+    println!("ready");
+    std::io::stdout().flush().unwrap();
+    assert!(
+        handler.counter.wait_for(2, TIMEOUT).await,
+        "child must receive the second record"
+    );
+    println!("handled 2");
+    std::io::stdout().flush().unwrap();
+
+    // The parent writes a line once the broker is paused. EOF counts too.
+    tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    })
+    .await
+    .unwrap();
+
+    let started = Instant::now();
+    shutdown.cancel();
+    run.await.unwrap().expect("run returns Ok after shutdown");
+    println!("run returned after {} ms", started.elapsed().as_millis());
+    std::io::stdout().flush().unwrap();
+    // Return the way a service's `main` does. The commit thread is still
+    // blocked on the frozen broker; that this process nevertheless exits, which
+    // the parent waits for, is what proves the thread holds neither the
+    // runtime nor the process.
+}
+
+/// The final commit and the consumer's close run on a dedicated thread with a
+/// `SHUTDOWN_COMMIT_DEADLINE` bound, so a frozen coordinator cannot hold a
+/// shutting-down process past that deadline. Proven with a real process
+/// exit: a child consumer is driven to have an uncommitted completion, the
+/// broker is paused, the child is told to shut down, and it must exit within
+/// the deadline plus a margin while the broker stays paused. The parent
+/// unpauses only after the exit.
+#[tokio::test]
+async fn shutdown_exits_the_process_while_the_broker_is_frozen() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    shove::define_topic!(
+        FrozenShutdownParentTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-frozen-shutdown").build()
+    );
+
+    // Mirrors `SHUTDOWN_COMMIT_DEADLINE` in `kafka::constants`, which is
+    // `pub(super)`; the child's elapsed time is asserted against it.
+    const DEADLINE: Duration = Duration::from_secs(20);
+    const MARGIN: Duration = Duration::from_secs(15);
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<FrozenShutdownParentTopic>()
+        .await
+        .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    let publish = |id: &'static str| {
+        let publisher = &publisher;
+        async move {
+            publisher
+                .publish::<FrozenShutdownParentTopic>(&SimpleMessage {
+                    id: id.into(),
+                    content: "frozen".into(),
+                })
+                .await
+                .unwrap();
+        }
+    };
+    publish("first").await;
+
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut child = tokio::process::Command::new(exe)
+        .args([
+            "--ignored",
+            "--exact",
+            "child_consumes_then_shuts_down_on_stdin",
+            "--nocapture",
+        ])
+        .env("SHOVE_TEST_KAFKA_BOOTSTRAP", tb.brokers())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn child test process");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("child stdout")).lines();
+    let stderr = child.stderr.take().expect("child stderr");
+
+    async fn wait_for_line(
+        lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+        wanted: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let next = tokio::time::timeout_at(deadline, lines.next_line()).await;
+            match next {
+                Ok(Ok(Some(line))) if line.trim() == wanted => return,
+                Ok(Ok(Some(_))) => continue,
+                other => panic!("child did not print {wanted:?}: {other:?}"),
+            }
+        }
+    }
+
+    wait_for_line(&mut stdout, "ready").await;
+    // The first drain committed offset 1. This completion stays uncommitted
+    // behind the child's hour-long gate, so the final commit has work to do.
+    publish("second").await;
+    wait_for_line(&mut stdout, "handled 2").await;
+
+    tb.pause().await;
+    let exit = async {
+        stdin.write_all(b"\n").await.expect("write shutdown line");
+        stdin.flush().await.expect("flush shutdown line");
+        drop(stdin);
+        let status = tokio::time::timeout(DEADLINE + MARGIN, child.wait()).await;
+        // Drain the pipes after the exit so nothing here waits on a live child.
+        let mut elapsed_ms = None;
+        while let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(5), stdout.next_line()).await
+        {
+            if let Some(ms) = line.strip_prefix("run returned after ") {
+                elapsed_ms = ms.trim_end_matches(" ms").parse::<u128>().ok();
+            }
+        }
+        let mut stderr_text = String::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_string(&mut BufReader::new(stderr), &mut stderr_text),
+        )
+        .await;
+        (status, elapsed_ms, stderr_text)
+    }
+    .await;
+    // Only now may the broker run again: the assertions below are about what
+    // the child managed while it was frozen.
+    tb.unpause().await;
+
+    let (status, elapsed_ms, stderr_text) = exit;
+    let status = status
+        .expect(
+            "child must exit within the shutdown deadline plus margin while the broker is frozen",
+        )
+        .expect("child wait");
+    assert!(
+        status.success(),
+        "child exited with {status}, stderr: {stderr_text}"
+    );
+    let elapsed_ms = elapsed_ms.expect("child reports how long run took to return");
+    assert!(
+        Duration::from_millis(elapsed_ms as u64) >= DEADLINE - Duration::from_secs(1),
+        "run must wait out the deadline while the commit is blocked, took {elapsed_ms} ms"
+    );
+    assert!(
+        stderr_text.contains("did not finish within the shutdown deadline"),
+        "child stderr must carry the deadline warning: {stderr_text}"
+    );
+
+    broker.close().await;
+}
+
 // ===========================================================================
 // Partition expansion
 // ===========================================================================
@@ -4079,4 +4447,31 @@ mod sbe_codec {
         assert_eq!(handler.seen.lock().unwrap().clone(), vec![(250_000, 12, 1)]);
         broker.close().await;
     }
+}
+
+/// The direct FIFO path refuses a commit interval the way `register_fifo`
+/// does: `spawn_fifo_shards` is the one place every FIFO entry point goes
+/// through, so `run_fifo` returns `Topology` before it subscribes, and a
+/// supervisor-registered FIFO consumer fails its task the same way.
+#[tokio::test]
+async fn run_fifo_rejects_a_commit_interval() {
+    let tb = TestBroker::start().await;
+    let consumer = KafkaConsumer::new(tb.client());
+    let err = consumer
+        .run_fifo::<SeqSkipTopic, _>(
+            CountingHandler::new(),
+            (),
+            ConsumerOptions::<Kafka>::new().with_commit_interval(Duration::from_secs(5)),
+        )
+        .await
+        .expect_err("with_commit_interval must be rejected on the direct FIFO path");
+    let shove::ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("kafka-seq-skip")
+            && msg.contains("with_commit_interval")
+            && msg.contains("commits each message as it settles"),
+        "message must name the topic and the refused setting: {msg}"
+    );
 }

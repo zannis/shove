@@ -219,6 +219,8 @@ mod bounds_smoke {
             kafka_group_id: None,
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: None,
+            #[cfg(feature = "kafka")]
+            kafka_commit_interval: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: None,
             #[cfg(feature = "kafka-schema-registry")]

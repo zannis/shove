@@ -270,6 +270,13 @@ pub struct ConsumerOptions<B: Backend> {
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
     pub kafka_group_id: Option<Arc<str>>,
 
+    /// Kafka-only: how often the concurrent consumer commits the offsets its
+    /// handlers completed. `None` (the default) keeps the 500 ms gate. Set via
+    /// [`ConsumerOptions::<Kafka>::with_commit_interval`].
+    #[cfg(feature = "kafka")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
+    pub kafka_commit_interval: Option<Duration>,
+
     // Runtime coordination — crate-private.
     pub(crate) shutdown: Option<CancellationToken>,
     pub(crate) processing: Arc<AtomicBool>,
@@ -306,6 +313,8 @@ impl<B: Backend> ConsumerOptions<B> {
             schema_accepted_subjects: None,
             #[cfg(feature = "kafka")]
             kafka_group_id: None,
+            #[cfg(feature = "kafka")]
+            kafka_commit_interval: None,
             shutdown: None,
             processing: Arc::new(AtomicBool::new(false)),
             consumer_group: None,
@@ -551,6 +560,8 @@ impl<B: Backend> ConsumerOptions<B> {
             kafka_group_id: self.kafka_group_id,
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: None,
+            #[cfg(feature = "kafka")]
+            kafka_commit_interval: self.kafka_commit_interval,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: self.schema_registry,
             #[cfg(feature = "kafka-schema-registry")]
@@ -600,6 +611,8 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             schema_accepted_subjects: self.schema_accepted_subjects.clone(),
             #[cfg(feature = "kafka")]
             kafka_group_id: self.kafka_group_id.clone(),
+            #[cfg(feature = "kafka")]
+            kafka_commit_interval: self.kafka_commit_interval,
             shutdown: self.shutdown.clone(),
             processing: self.processing.clone(),
             consumer_group: self.consumer_group.clone(),
@@ -696,6 +709,25 @@ impl ConsumerOptions<Kafka> {
     /// [`KafkaConsumerGroupConfig::with_group_id`](crate::kafka::KafkaConsumerGroupConfig::with_group_id).
     pub fn with_group_id(mut self, group_id: impl Into<Arc<str>>) -> Self {
         self.kafka_group_id = Some(group_id.into());
+        self
+    }
+
+    /// How often the concurrent consumer commits the offsets its handlers
+    /// completed. Unset keeps the 500 ms default.
+    ///
+    /// Completions are tracked in memory and committed asynchronously at
+    /// most once per interval, so a longer interval trades coordinator
+    /// requests for a wider replay window after a crash or a rebalance. The
+    /// final commit at shutdown is synchronous whatever the interval. For the
+    /// coordinated registry path the equivalent is
+    /// [`KafkaConsumerGroupConfig::with_commit_interval`](crate::kafka::KafkaConsumerGroupConfig::with_commit_interval).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `interval` is zero.
+    pub fn with_commit_interval(mut self, interval: Duration) -> Self {
+        assert!(!interval.is_zero(), "commit_interval must be positive");
+        self.kafka_commit_interval = Some(interval);
         self
     }
 }
@@ -1055,6 +1087,32 @@ mod tests {
         use crate::markers::Kafka;
         let inner = ConsumerOptions::<Kafka>::new().into_inner();
         assert_eq!(inner.kafka_group_id, None);
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_with_commit_interval_propagates_through_into_inner() {
+        use crate::markers::Kafka;
+        let inner = ConsumerOptions::<Kafka>::new()
+            .with_commit_interval(Duration::from_secs(5))
+            .into_inner();
+        assert_eq!(inner.kafka_commit_interval, Some(Duration::from_secs(5)));
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_commit_interval_defaults_to_none() {
+        use crate::markers::Kafka;
+        let inner = ConsumerOptions::<Kafka>::new().into_inner();
+        assert_eq!(inner.kafka_commit_interval, None);
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    #[should_panic(expected = "commit_interval must be positive")]
+    fn kafka_with_commit_interval_rejects_zero() {
+        use crate::markers::Kafka;
+        let _ = ConsumerOptions::<Kafka>::new().with_commit_interval(Duration::ZERO);
     }
 
     #[cfg(any(

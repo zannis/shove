@@ -17,7 +17,7 @@ use rdkafka::message::{BorrowedMessage, Header, Headers, Message, OwnedHeaders};
 use rdkafka::metadata::Metadata;
 use rdkafka::types::RDKafkaErrorCode;
 use rdkafka::{ClientConfig, ClientContext, Offset, Statistics, TopicPartitionList};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -69,7 +69,7 @@ use super::client::KafkaClient;
 use super::constants::{
     DEATH_COUNT_HEADER, DEATH_REASON_HEADER, FETCH_MIN_BYTES, FETCH_WAIT_MAX_MS,
     MAX_POLL_INTERVAL_MS, MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER, ORIGINAL_QUEUE_HEADER,
-    RETRY_COUNT_HEADER, SESSION_TIMEOUT_MS,
+    RETRY_COUNT_HEADER, SESSION_TIMEOUT_MS, SHUTDOWN_COMMIT_DEADLINE,
 };
 use super::consumer_group::KafkaAutoOffsetReset;
 
@@ -2010,7 +2010,90 @@ const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(5);
 /// `OffsetTracker::fenced`). Well above `SESSION_TIMEOUT_MS` so an ordinary
 /// rebalance — which by protocol resolves inside that window — never trips
 /// it; well below the "silent multi-hour wedge" this guards against.
+///
+/// This is the floor. The receive loop uses [`fence_threshold`], which grows
+/// with a configured commit interval, because the streak can only clear on
+/// a drain and drains run once per interval.
 const COMMIT_FENCE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The fence threshold for a given commit interval.
+///
+/// A rejected commit is re-offered on the next drain, and the dirty streak
+/// clears only after `QUIET_DRAINS_TO_RESOLVE` further quiet drains, so a
+/// healthy recovery takes about three intervals. With the 60 s floor alone,
+/// an interval above 20 s would fence a consumer that merely recovered on
+/// schedule. Four intervals leaves one interval of margin above that, and the
+/// default 500 ms interval keeps the floor exactly as before.
+fn fence_threshold(commit_interval: Duration) -> Duration {
+    COMMIT_FENCE_TIMEOUT.max(commit_interval.saturating_mul(4))
+}
+
+/// The error every FIFO entry point returns for options that set a commit
+/// interval: a FIFO consumer commits each message as it settles (see
+/// `commit_fifo_settling`), so the interval would be read by nothing, and a
+/// setting that changes nothing is refused rather than silently dropped.
+/// `spawn_fifo_shards` applies it, so the direct, supervisor and registry
+/// paths all refuse alike; the registry also checks it before it spawns.
+pub(super) fn reject_fifo_commit_interval(queue: &str) -> ShoveError {
+    ShoveError::Topology(format!(
+        "topic '{queue}' is sequenced; `with_commit_interval` does not apply to a FIFO \
+         consumer, which commits each message as it settles. Drop \
+         `with_commit_interval(..)` or use `register` for unsequenced topics."
+    ))
+}
+
+/// Run the receive loop's final `CommitMode::Sync` commit, and the consumer's
+/// close, on a dedicated thread that owns the consumer, waiting at most
+/// `SHUTDOWN_COMMIT_DEADLINE` for the commit's result.
+///
+/// `consumer` must be the last `Arc` of the handle: the thread drops it after
+/// the commit, which is where `rd_kafka_consumer_close` runs. `None` for
+/// `tpl` means there is nothing to commit and the thread only closes.
+async fn final_commit_off_runtime(
+    consumer: Arc<KafkaStreamConsumer>,
+    tpl: Option<TopicPartitionList>,
+    queue: &str,
+) -> KafkaResult<()> {
+    let (done_tx, done_rx) = oneshot::channel::<KafkaResult<()>>();
+    let spawned = std::thread::Builder::new()
+        .name(format!("shove-kafka-final-commit {queue}"))
+        .spawn(move || {
+            let result = match tpl {
+                Some(tpl) => consumer.commit(&tpl, CommitMode::Sync),
+                None => Ok(()),
+            };
+            // Nobody may be listening any more; that is the deadline case.
+            let _ = done_tx.send(result);
+            // The last `Arc`: `rd_kafka_consumer_close` runs here, off the
+            // runtime, however long the broker takes to answer.
+            drop(consumer);
+        });
+    if let Err(e) = spawned {
+        // No thread, so nothing can commit: report it the way a rejected
+        // commit is reported and let the caller settle its discards.
+        return Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail)).inspect_err(
+            |_| tracing::error!(queue, error = %e, "could not spawn the final commit thread"),
+        );
+    }
+    match tokio::time::timeout(SHUTDOWN_COMMIT_DEADLINE, done_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_recv)) => {
+            tracing::warn!(queue, "final commit thread ended without a result");
+            Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail))
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                queue,
+                deadline = ?SHUTDOWN_COMMIT_DEADLINE,
+                "final offset commit did not finish within the shutdown deadline; \
+                 giving up on its result, the batch may be redelivered"
+            );
+            Err(KafkaError::ConsumerCommit(
+                RDKafkaErrorCode::RequestTimedOut,
+            ))
+        }
+    }
+}
 
 /// Timeout for `seek_partitions` when redelivering an un-acked batch.
 ///
@@ -3001,6 +3084,12 @@ impl KafkaConsumer {
         let auto_offset_reset = options
             .kafka_auto_offset_reset
             .unwrap_or(KafkaAutoOffsetReset::Earliest);
+        // The commit gate's window, and the fence threshold that has to grow
+        // with it - see `fence_threshold`.
+        let commit_interval = options
+            .kafka_commit_interval
+            .unwrap_or(ASYNC_COMMIT_INTERVAL);
+        let fence_timeout = fence_threshold(commit_interval);
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
@@ -3092,7 +3181,7 @@ impl KafkaConsumer {
                 // reads, and the loop body only runs when a select arm
                 // completes. A no-op when nothing is pending.
                 let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
-                let mut commit_gate = AsyncCommitGate::new(ASYNC_COMMIT_INTERVAL);
+                let mut commit_gate = AsyncCommitGate::new(commit_interval);
 
                 loop {
                     // Drain completed offsets, then apply any partition
@@ -3105,7 +3194,7 @@ impl KafkaConsumer {
                     }
                     let now = Instant::now();
                     tracker.apply_rebalance_events(&rebalance_rx, now);
-                    if let Some(partition) = tracker.fenced(now, COMMIT_FENCE_TIMEOUT) {
+                    if let Some(partition) = tracker.fenced(now, fence_timeout) {
                         metrics::record_backend_error(
                             metrics::BackendLabel::Kafka,
                             metrics::BackendErrorKind::Connection,
@@ -3114,14 +3203,14 @@ impl KafkaConsumer {
                             queue,
                             group_id,
                             partition,
-                            stuck_for = ?COMMIT_FENCE_TIMEOUT,
+                            stuck_for = ?fence_timeout,
                             "consumer appears fenced from its group (offset commits rejected \
                              with no resolving rebalance); forcing a clean reconnect"
                         );
                         return Err(ShoveError::Connection(format!(
                             "consumer on '{queue}' appears fenced from group '{group_id}': \
                              partition {partition} has had offset commits rejected for over \
-                             {COMMIT_FENCE_TIMEOUT:?} with no resolving rebalance"
+                             {fence_timeout:?} with no resolving rebalance"
                         )));
                     }
                     // The gate spaces commits out (see `ASYNC_COMMIT_INTERVAL`):
@@ -3179,18 +3268,33 @@ impl KafkaConsumer {
                                 tracker.mark_complete(completion);
                             }
                             tracker.apply_rebalance_events(&rebalance_rx, Instant::now());
-                            if let Some((tpl, discards)) = tracker.drain_committable() {
-                                match consumer.commit(&tpl, CommitMode::Sync) {
-                                    Ok(()) => {
-                                        for discard in discards {
-                                            discard.confirm();
-                                        }
+                            let (tpl, discards) = match tracker.drain_committable() {
+                                Some((tpl, discards)) => (Some(tpl), discards),
+                                None => (None, Vec::new()),
+                            };
+                            // The commit and the consumer's close both block:
+                            // `CommitMode::Sync` waits for the coordinator, and
+                            // `Drop` runs `rd_kafka_consumer_close`. A frozen
+                            // broker holds either for as long as librdkafka
+                            // retries - minutes - and a blocking task cannot be
+                            // aborted once started, so `spawn_blocking` would
+                            // only move the wait onto a thread the runtime's
+                            // shutdown then waits for. A dedicated thread that
+                            // owns the last `Arc` of the consumer holds neither
+                            // the runtime nor the process: `SHUTDOWN_COMMIT_DEADLINE`
+                            // bounds how long this loop waits for its result, and
+                            // past it the thread finishes on its own.
+                            let committed = final_commit_off_runtime(consumer, tpl, queue).await;
+                            match committed {
+                                Ok(()) => {
+                                    for discard in discards {
+                                        discard.confirm();
                                     }
-                                    Err(e) => {
-                                        tracing::warn!(queue, error = %e, "final offset commit failed during shutdown; batch may be redelivered");
-                                        for discard in discards {
-                                            discard.survived();
-                                        }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(queue, error = %e, "final offset commit failed during shutdown; batch may be redelivered");
+                                    for discard in discards {
+                                        discard.survived();
                                     }
                                 }
                             }
@@ -3969,6 +4073,13 @@ impl KafkaConsumer {
                 "run_fifo called on {queue} without sequencing config"
             ))
         })?;
+        // The direct and supervisor paths reach this function without the
+        // registry's own check, so the refusal lives here: every FIFO entry
+        // point then fails the same way on a setting the FIFO loop would
+        // never read.
+        if options.kafka_commit_interval.is_some() {
+            return Err(reject_fifo_commit_interval(&queue));
+        }
         // Kafka has a single FIFO task covering every assigned partition, so
         // one poison set covers every key this consumer sees. It lives outside
         // the reconnect wrapper below: a broker blip must not un-poison a key.
@@ -5265,6 +5376,47 @@ mod offset_tracker_tests {
         );
     }
 
+    /// A replayed lower offset - the same record delivered again after the
+    /// partition briefly left and returned - never lowers what the next
+    /// drain commits. Delivered and completed 1 to 4, then 1 once more: the
+    /// position stays at 5 and exactly one commit is offered.
+    #[test]
+    fn a_replayed_lower_offset_never_lowers_the_committed_position() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        for offset in 1..=4 {
+            tracker.track_received(0, offset);
+        }
+        for offset in 1..=4 {
+            tracker.mark_complete(Completion::plain(0, offset));
+        }
+        tracker.mark_complete(Completion::plain(0, 1));
+
+        let tpl = drain_tpl(&mut tracker).expect("1 to 4 have completed");
+        assert_eq!(committed_offset(&tpl, 0), Some(5));
+        assert!(
+            drain_tpl(&mut tracker).is_none(),
+            "the replayed 1 offered nothing, and nothing moved backwards"
+        );
+    }
+
+    /// The fence threshold is the 60 s floor for the default interval and
+    /// four intervals once the interval is long enough that a recovery
+    /// (three drains) would otherwise outlast the floor.
+    #[test]
+    fn fence_threshold_grows_with_the_commit_interval() {
+        assert_eq!(fence_threshold(ASYNC_COMMIT_INTERVAL), COMMIT_FENCE_TIMEOUT);
+        assert_eq!(
+            fence_threshold(Duration::from_secs(15)),
+            COMMIT_FENCE_TIMEOUT,
+            "four intervals of 15 s is exactly the floor"
+        );
+        assert_eq!(
+            fence_threshold(Duration::from_secs(30)),
+            Duration::from_secs(120),
+            "a 30 s interval needs 120 s so three recovery drains fit inside"
+        );
+    }
+
     /// A completion for an offset this assignment never delivered belongs to
     /// a previous epoch and must not become a commit position.
     #[test]
@@ -5665,6 +5817,44 @@ mod offset_tracker_tests {
         );
     }
 
+    /// A configured commit interval raises the threshold the loop asks
+    /// `fenced` about (see `fence_threshold`), and the tracker honours the
+    /// raised value: the streak that trips the 60 s floor is still within
+    /// bounds under a 120 s threshold, and trips it only once 120 s have
+    /// passed.
+    #[test]
+    fn fenced_honours_a_raised_threshold() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        let t0 = Instant::now();
+
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, t0);
+        let _ = drain_tpl(&mut tracker);
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, t0 + Duration::from_secs(30));
+
+        let raised = fence_threshold(Duration::from_secs(30));
+        assert_eq!(raised, Duration::from_secs(120));
+        let past_floor = t0 + Duration::from_secs(61);
+        assert_eq!(
+            tracker.fenced(past_floor, COMMIT_FENCE_TIMEOUT),
+            Some(0),
+            "the floor alone would fence this streak"
+        );
+        assert_eq!(
+            tracker.fenced(past_floor, raised),
+            None,
+            "under the raised threshold the streak is still within bounds"
+        );
+        assert_eq!(
+            tracker.fenced(t0 + Duration::from_secs(121), raised),
+            Some(0),
+            "past four intervals the raised threshold fences it"
+        );
+    }
+
     /// A *single* quiet drain does not resolve the streak: `commit_callback`
     /// only fires on failure, so silence one iteration after a re-offer is
     /// not yet evidence of success — a genuinely wedged partition looks
@@ -6040,6 +6230,24 @@ mod async_commit_gate_tests {
             t0 + INTERVAL,
             "past due, the deadline stays anchored rather than chasing `now`"
         );
+    }
+
+    /// The gate is built from the configured interval, so a consumer with
+    /// `with_commit_interval(5 s)` commits at most every 5 s - not every
+    /// `ASYNC_COMMIT_INTERVAL`.
+    #[test]
+    fn a_configured_interval_replaces_the_default_window() {
+        let configured = Duration::from_secs(5);
+        let mut gate = AsyncCommitGate::new(configured);
+        let t0 = Instant::now();
+        gate.mark(t0);
+        assert!(
+            !gate.due(t0 + ASYNC_COMMIT_INTERVAL * 4),
+            "the default window has no bearing on a configured gate"
+        );
+        assert!(!gate.due(t0 + configured - Duration::from_millis(1)));
+        assert!(gate.due(t0 + configured));
+        assert_eq!(gate.deadline(t0), t0 + configured);
     }
 }
 
