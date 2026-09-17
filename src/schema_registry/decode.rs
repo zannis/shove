@@ -3,11 +3,12 @@
 use std::sync::Arc;
 
 use crate::codec::Codec;
-use crate::error::Result;
+use crate::error::{Result, ShoveError};
 
 use super::client::SchemaRegistry;
+use super::error::SchemaRegistryError;
 use super::gate::{self, GateOutcome, SchemaEnforcement};
-use super::wire::{FrameResult, WireFormat, parse_frame};
+use super::wire::{FrameResult, SchemaId, WireFormat, parse_frame};
 
 /// Outcome of the registry decode stage.
 pub(crate) enum RegistryDecode<M> {
@@ -15,6 +16,41 @@ pub(crate) enum RegistryDecode<M> {
     Decoded(M),
     /// Reject to DLQ with this (payload-free) death reason.
     Dlq(&'static str),
+    /// The registry could not answer for `id` right now. Nothing is wrong
+    /// with the record: keep it and decode the same bytes again later.
+    Unavailable {
+        id: SchemaId,
+        error: SchemaRegistryError,
+    },
+}
+
+/// What a failed schema lookup means for the record that carried the id.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ResolveFailure {
+    /// The registry answered, and the answer rules the record out for good.
+    Dlq(&'static str),
+    /// The registry did not answer; the same lookup may succeed later.
+    Unavailable,
+    /// The deployment is wrong: credentials, the base URL, an unexpected or
+    /// undecodable response. Waiting would hide it, so the consumer stops.
+    Fatal,
+}
+
+/// Classify a `resolve` error. A 404 is the registry's definite answer that
+/// the id is unknown, so it stays a DLQ reason; a retriable transport failure
+/// is an outage to wait out; everything else is a deployment fault.
+pub(crate) fn classify_resolve_error(error: &SchemaRegistryError) -> ResolveFailure {
+    match error {
+        SchemaRegistryError::NotFound(_) => ResolveFailure::Dlq("schema_resolve_failed"),
+        SchemaRegistryError::Incompatible { .. } => ResolveFailure::Dlq("schema_validation_failed"),
+        SchemaRegistryError::Transport {
+            retriable: true, ..
+        } => ResolveFailure::Unavailable,
+        SchemaRegistryError::Transport {
+            retriable: false, ..
+        }
+        | SchemaRegistryError::Decode(_) => ResolveFailure::Fatal,
+    }
 }
 
 /// Whether a frame's protobuf message index satisfies the consumer's
@@ -68,10 +104,23 @@ where
 
     let schema = match registry.resolve(id).await {
         Ok(s) => s,
-        Err(e) => {
-            tracing::error!(schema_id = %id, error = %e, "schema resolve failed");
-            return Ok(RegistryDecode::Dlq("schema_resolve_failed"));
-        }
+        Err(e) => match classify_resolve_error(&e) {
+            ResolveFailure::Dlq(reason) => {
+                tracing::error!(schema_id = %id, error = %e, "schema resolve failed");
+                return Ok(RegistryDecode::Dlq(reason));
+            }
+            ResolveFailure::Unavailable => {
+                return Ok(RegistryDecode::Unavailable { id, error: e });
+            }
+            ResolveFailure::Fatal => {
+                return Err(ShoveError::Topology(format!(
+                    "schema registry lookup for schema id {id} failed in a way waiting cannot \
+                     fix: {e}. This is a deployment fault (credentials, the base URL or an \
+                     unexpected response), not an outage, so the consumer stops instead of \
+                     stalling on it"
+                )));
+            }
+        },
     };
 
     match gate::evaluate(&schema, accepted, enforcement) {
@@ -125,6 +174,71 @@ mod tests {
     #[test]
     fn a_frame_without_an_index_is_not_judged() {
         assert!(message_index_accepted(Some(&[0]), None));
+    }
+
+    /// One case per `SchemaRegistryError` variant: a 404 and a subject
+    /// mismatch are the registry's answer and go to the DLQ, a retriable
+    /// transport failure is an outage to wait out, and a non-retriable one or
+    /// an undecodable response is a deployment fault that stops the consumer.
+    #[test]
+    fn resolve_errors_map_one_case_per_variant() {
+        assert_eq!(
+            classify_resolve_error(&SchemaRegistryError::NotFound(7)),
+            ResolveFailure::Dlq("schema_resolve_failed")
+        );
+        assert_eq!(
+            classify_resolve_error(&SchemaRegistryError::Incompatible {
+                got: "other-value".into(),
+                accepted: vec!["t-value".into()],
+            }),
+            ResolveFailure::Dlq("schema_validation_failed")
+        );
+        assert_eq!(
+            classify_resolve_error(&SchemaRegistryError::Transport {
+                retriable: true,
+                message: "server error 503".into(),
+            }),
+            ResolveFailure::Unavailable
+        );
+        assert_eq!(
+            classify_resolve_error(&SchemaRegistryError::Transport {
+                retriable: false,
+                message: "unexpected status 401".into(),
+            }),
+            ResolveFailure::Fatal
+        );
+        assert_eq!(
+            classify_resolve_error(&SchemaRegistryError::Decode("not json".into())),
+            ResolveFailure::Fatal
+        );
+    }
+
+    /// A registry nobody listens on is an outage: the stage reports
+    /// `Unavailable` with the schema id, not a DLQ reason and not an error.
+    #[tokio::test]
+    async fn an_unreachable_registry_is_unavailable_not_poison() {
+        let registry = SchemaRegistry::builder("http://127.0.0.1:9")
+            .max_retries(0)
+            .build();
+        let frame = build_frame(WireFormat::Json, SchemaId(3), &[], b"{}");
+        let accepted: [Arc<str>; 1] = [Arc::from("t-value")];
+        let outcome = registry_decode::<serde_json::Value, JsonCodec>(
+            &registry,
+            WireFormat::Json,
+            SchemaEnforcement::Enforce,
+            &accepted,
+            None,
+            &frame,
+        )
+        .await
+        .expect("an outage is not a deployment fault");
+        assert!(matches!(
+            outcome,
+            RegistryDecode::Unavailable {
+                id: SchemaId(3),
+                ..
+            }
+        ));
     }
 
     /// The mismatch is decided before the registry is asked anything: a
