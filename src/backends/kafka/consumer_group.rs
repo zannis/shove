@@ -139,6 +139,10 @@ pub struct KafkaConsumerGroupConfig {
     /// `None` keeps the 500 ms default gate. See
     /// [`with_commit_interval`](Self::with_commit_interval).
     commit_interval: Option<Duration>,
+    /// `test-support` builds only: the members' `max.poll.interval.ms`, see
+    /// [`with_max_poll_interval_for_test`](Self::with_max_poll_interval_for_test).
+    #[cfg(feature = "test-support")]
+    max_poll_interval: Option<Duration>,
 
     /// Schema Registry client shared across every consumer spawned by this
     /// group. `None` disables registry-based decoding for the group.
@@ -191,6 +195,8 @@ impl KafkaConsumerGroupConfig {
             group_id: None,
             auto_offset_reset: None,
             commit_interval: None,
+            #[cfg(feature = "test-support")]
+            max_poll_interval: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: None,
             #[cfg(feature = "kafka-schema-registry")]
@@ -337,6 +343,18 @@ impl KafkaConsumerGroupConfig {
     pub fn with_commit_interval(mut self, interval: Duration) -> Self {
         validate_commit_interval(interval);
         self.commit_interval = Some(interval);
+        self
+    }
+
+    /// Test-only seam (see the `test-support` feature): create the group's
+    /// concurrent and FIFO members with this `max.poll.interval.ms` instead
+    /// of the pinned five minutes, so a test can observe an eviction in
+    /// seconds. librdkafka refuses a value below `session.timeout.ms`, which
+    /// is pinned at 10 s, so 10 s is the floor.
+    #[cfg(feature = "test-support")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "test-support")))]
+    pub fn with_max_poll_interval_for_test(mut self, interval: Duration) -> Self {
+        self.max_poll_interval = Some(interval);
         self
     }
 
@@ -891,6 +909,10 @@ impl KafkaConsumerGroup {
         }
         options.kafka_auto_offset_reset = self.config.auto_offset_reset;
         options.kafka_commit_interval = self.config.commit_interval;
+        #[cfg(feature = "test-support")]
+        {
+            options.kafka_max_poll_interval = self.config.max_poll_interval;
+        }
         #[cfg(feature = "kafka-schema-registry")]
         {
             options.schema_registry = self.config.schema_registry.clone();

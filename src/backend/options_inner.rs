@@ -72,6 +72,14 @@ pub(crate) struct ConsumerOptionsInner {
     /// every other entry point, which never reads it.
     pub broadcast_start: Option<BroadcastStart>,
 
+    /// Kafka-only, `test-support` builds: the `max.poll.interval.ms` the
+    /// concurrent and FIFO members are created with, in place of the pinned
+    /// `MAX_POLL_INTERVAL_MS`. Exists so an integration test can observe a
+    /// member eviction in seconds rather than the pinned five minutes.
+    /// Propagated from `KafkaConsumerGroupConfig::with_max_poll_interval_for_test`.
+    #[cfg(all(feature = "kafka", feature = "test-support"))]
+    pub kafka_max_poll_interval: Option<Duration>,
+
     /// Kafka-only: Schema Registry client for decoding Confluent wire-framed
     /// messages. `None` disables registry-based decoding.
     #[cfg(feature = "kafka-schema-registry")]
@@ -125,6 +133,8 @@ impl ConsumerOptionsInner {
             #[cfg(feature = "kafka")]
             kafka_commit_interval: None,
             broadcast_start: None,
+            #[cfg(all(feature = "kafka", feature = "test-support"))]
+            kafka_max_poll_interval: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: None,
             #[cfg(feature = "kafka-schema-registry")]

@@ -210,6 +210,9 @@ Because the count belongs to a *broker-level* message, anything that creates a n
 
 That last case is what `delivery_count` is for; see [Bounding a `Defer` loop](/guides/retries#defer-vs-retry).
 
+On a Kafka topic bound with `external()` neither `Retry` nor `Defer` publishes a copy.
+The same record is handed back in place, and its `retry_count` is kept in memory for the redelivery.
+
 ## Dead-letter handling
 
 When a message exhausts its retries or is permanently rejected, it lands in the DLQ. The `handle_dead` method is your hook for what happens next: send an alert, write to a quarantine store, push to an investigation queue, page an on-call engineer.

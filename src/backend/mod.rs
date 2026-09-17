@@ -222,6 +222,8 @@ mod bounds_smoke {
             #[cfg(feature = "kafka")]
             kafka_commit_interval: None,
             broadcast_start: None,
+            #[cfg(all(feature = "kafka", feature = "test-support"))]
+            kafka_max_poll_interval: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: None,
             #[cfg(feature = "kafka-schema-registry")]
