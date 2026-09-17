@@ -170,6 +170,14 @@ shove::define_topic!(
         .build()
 );
 
+// Eight default partitions, so the record coordinates a handler sees span
+// more than one partition.
+shove::define_topic!(
+    CoordinatesTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-coordinates").build()
+);
+
 // ---------------------------------------------------------------------------
 // Test harness: shared setup
 // ---------------------------------------------------------------------------
@@ -343,6 +351,32 @@ impl MessageHandler<NoDlqTopic> for CountingHandler {
 impl MessageHandler<DeferNoHoldTopic> for CountingHandler {
     type Context = ();
     async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// Keeps every `MessageMetadata` it is handed, for assertions on the record
+/// coordinates Kafka fills in.
+#[derive(Clone)]
+struct MetadataRecorder {
+    seen: Arc<Mutex<Vec<MessageMetadata>>>,
+    counter: WaitableCounter,
+}
+
+impl MetadataRecorder {
+    fn new() -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            counter: WaitableCounter::new(),
+        }
+    }
+}
+
+impl MessageHandler<CoordinatesTopic> for MetadataRecorder {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        self.seen.lock().await.push(meta);
         self.counter.increment();
         Outcome::Ack
     }
@@ -1832,6 +1866,89 @@ async fn consumer_group_processes_messages() {
     assert!(outcome.is_clean());
 
     assert_eq!(handler.counter.get(), 5);
+    broker.close().await;
+}
+
+/// Every Kafka delivery carries the record's coordinates: a partition, an
+/// offset that runs contiguously from zero inside each partition of a fresh
+/// topic, and a broker timestamp inside the test's own wall-clock window.
+#[tokio::test]
+async fn handler_sees_partition_offset_and_timestamp() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<CoordinatesTopic>()
+        .await
+        .unwrap();
+
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before the epoch")
+            .as_millis() as i64
+    };
+    let before = now_ms();
+    let publisher = broker.publisher().await.unwrap();
+    let messages: Vec<SimpleMessage> = (1..=12)
+        .map(|i| SimpleMessage {
+            id: format!("coord-{i}"),
+            content: format!("msg {i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<CoordinatesTopic>(&messages)
+        .await
+        .unwrap();
+
+    let handler = MetadataRecorder::new();
+    let handler_clone = handler.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<CoordinatesTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            move || handler_clone.clone(),
+        )
+        .await
+        .unwrap();
+    let token = group.cancellation_token();
+    let counter = handler.counter.clone();
+    let t = token.clone();
+    tokio::spawn(async move {
+        counter.wait_for(12, Duration::from_secs(60)).await;
+        t.cancel();
+    });
+    let outcome = group
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean());
+    let after = now_ms();
+
+    let seen = handler.seen.lock().await.clone();
+    assert_eq!(seen.len(), 12);
+    let mut per_partition: HashMap<i32, Vec<i64>> = HashMap::new();
+    for meta in &seen {
+        let partition = meta.partition.expect("Kafka reports the partition");
+        let offset = meta.offset.expect("Kafka reports the offset");
+        let timestamp = meta
+            .timestamp_ms
+            .expect("Kafka reports the broker timestamp");
+        // A second of margin on each side covers the clock skew between this
+        // process and the broker container.
+        assert!(
+            (before - 1_000..=after + 1_000).contains(&timestamp),
+            "timestamp {timestamp} outside the window {before}..={after}"
+        );
+        per_partition.entry(partition).or_default().push(offset);
+    }
+    for (partition, mut offsets) in per_partition {
+        offsets.sort_unstable();
+        let contiguous: Vec<i64> = (0..offsets.len() as i64).collect();
+        assert_eq!(
+            offsets, contiguous,
+            "partition {partition} of a fresh topic must yield offsets 0..n once each"
+        );
+    }
     broker.close().await;
 }
 

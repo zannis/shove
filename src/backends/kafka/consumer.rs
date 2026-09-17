@@ -577,9 +577,32 @@ fn get_retry_count(headers: &HashMap<String, String>) -> u32 {
         .unwrap_or(0)
 }
 
+/// Where a record sits in its topic: the partition, the offset inside it and
+/// the broker timestamp when the record carries one. Read once off the
+/// `BorrowedMessage` and carried to every `MessageMetadata` built for the
+/// delivery, including a deferred broadcast redelivery, which keeps the
+/// original record's coordinates rather than inventing new ones.
+#[derive(Debug, Clone, Copy)]
+struct RecordCoordinates {
+    partition: i32,
+    offset: i64,
+    timestamp_ms: Option<i64>,
+}
+
+impl RecordCoordinates {
+    fn of(msg: &BorrowedMessage<'_>) -> Self {
+        Self {
+            partition: msg.partition(),
+            offset: msg.offset(),
+            timestamp_ms: msg.timestamp().to_millis(),
+        }
+    }
+}
+
 fn build_message_metadata(
     headers: &Arc<HashMap<String, String>>,
     redelivered: bool,
+    coordinates: RecordCoordinates,
 ) -> MessageMetadata {
     let retry_count = get_retry_count(headers);
     let delivery_id = headers.get(MESSAGE_ID_HEADER).cloned().unwrap_or_default();
@@ -592,12 +615,20 @@ fn build_message_metadata(
         // indistinguishable from a first read. Reporting `retry_count + 1` here
         // would silently under-count exactly those cases, so report "unknown".
         delivery_count: None,
+        // What Kafka does have is a position in the log, which is exactly
+        // what an audit trail or a replay request needs.
+        partition: Some(coordinates.partition),
+        offset: Some(coordinates.offset),
+        timestamp_ms: coordinates.timestamp_ms,
         headers: Arc::clone(headers),
     }
 }
 
-fn build_dead_metadata(headers: &Arc<HashMap<String, String>>) -> DeadMessageMetadata {
-    let message = build_message_metadata(headers, false);
+fn build_dead_metadata(
+    headers: &Arc<HashMap<String, String>>,
+    coordinates: RecordCoordinates,
+) -> DeadMessageMetadata {
+    let message = build_message_metadata(headers, false, coordinates);
     let reason = headers.get(DEATH_REASON_HEADER).cloned();
     let original_queue = headers.get(ORIGINAL_QUEUE_HEADER).cloned();
     let death_count = headers
@@ -1286,6 +1317,7 @@ const BROADCAST_ASSIGN_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 struct DeferredDelivery {
     payload: Vec<u8>,
     headers: Arc<HashMap<String, String>>,
+    coordinates: RecordCoordinates,
 }
 
 /// Whether a `recv` error on the groupless broadcast path is the one error
@@ -3658,7 +3690,7 @@ impl KafkaConsumer {
                             // route_outcome (msg goes out of scope after this loop iteration).
                             let payload_bytes = payload_slice.to_vec();
 
-                            let metadata = build_message_metadata(&headers, false);
+                            let metadata = build_message_metadata(&headers, false, RecordCoordinates::of(&msg));
                             let retry_count = metadata.retry_count;
 
                             let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
@@ -4102,7 +4134,7 @@ impl KafkaConsumer {
                                         );
                                     }
                                     BatchDecode::Decoded(decoded) => {
-                                        let metadata = build_message_metadata(&headers, false);
+                                        let metadata = build_message_metadata(&headers, false, RecordCoordinates::of(&msg));
                                         let raw = retain_raw.then(|| RawMessage {
                                             payload: Bytes::copy_from_slice(payload_slice),
                                             key,
@@ -4597,7 +4629,7 @@ impl KafkaConsumer {
                                     }
                                 };
 
-                                let metadata = build_message_metadata(&headers, false);
+                                let metadata = build_message_metadata(&headers, false, RecordCoordinates::of(&msg));
                                 let retry_count = metadata.retry_count;
 
                                 processing.store(true, Ordering::Release);
@@ -5042,11 +5074,16 @@ impl KafkaConsumer {
                             DeferredDelivery {
                                 payload: msg.payload().unwrap_or_default().to_vec(),
                                 headers: extract_string_headers(&msg),
+                                coordinates: RecordCoordinates::of(&msg),
                             }
                         }
                     };
 
-                    let DeferredDelivery { payload, headers } = delivery;
+                    let DeferredDelivery {
+                        payload,
+                        headers,
+                        coordinates,
+                    } = delivery;
                     metrics::record_message_size(&topic, group.as_deref(), payload.len());
 
                     if let Err(e) = validate_message_size(payload.len(), max_message_size) {
@@ -5133,7 +5170,7 @@ impl KafkaConsumer {
                             }
                         };
 
-                    let metadata = build_message_metadata(&headers, false);
+                    let metadata = build_message_metadata(&headers, false, coordinates);
 
                     let permit = semaphore
                         .clone()
@@ -5170,7 +5207,11 @@ impl KafkaConsumer {
                             outcome,
                             &task_topic,
                             task_group.as_deref(),
-                            DeferredDelivery { payload, headers },
+                            DeferredDelivery {
+                                payload,
+                                headers,
+                                coordinates,
+                            },
                             &task_defer_tx,
                             &task_shutdown,
                         )
@@ -5438,7 +5479,7 @@ impl KafkaConsumer {
                                 }
                             };
 
-                            let metadata = build_dead_metadata(&headers);
+                            let metadata = build_dead_metadata(&headers, RecordCoordinates::of(&msg));
                             handler.handle_dead(payload, metadata, ctx.as_ref()).await;
 
                             if let Err(e) = consumer.commit_message(&msg, CommitMode::Async) {
@@ -6565,7 +6606,15 @@ mod batch_buffer_tests {
     }
 
     fn metadata() -> MessageMetadata {
-        build_message_metadata(&Arc::new(HashMap::new()), false)
+        build_message_metadata(
+            &Arc::new(HashMap::new()),
+            false,
+            RecordCoordinates {
+                partition: 0,
+                offset: 0,
+                timestamp_ms: None,
+            },
+        )
     }
 
     /// A fresh discard-accounting record, same shape `record_terminal` hands

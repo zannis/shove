@@ -296,6 +296,9 @@ async fn handle_entry<T, H>(
             delivery_id: delivery_id.clone(),
             redelivered: false,
             delivery_count: None,
+            partition: None,
+            offset: None,
+            timestamp_ms: None,
             headers: Arc::clone(&user_headers),
         };
 

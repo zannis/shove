@@ -166,6 +166,13 @@ Every `handle()` invocation receives a `MessageMetadata` describing the delivery
 - `redelivered: bool` — whether the broker flagged this as a redelivery at the transport layer.
 - `delivery_count: Option<u32>` — how many times the *broker* has delivered this message, including the current delivery. `None` where the backend has no such counter.
 - `headers: HashMap<String, String>` — string-valued headers attached to the delivery.
+- `partition: Option<i32>` - the partition the record was read from, on Kafka only, and `None` on every other backend.
+- `offset: Option<i64>` - the record's offset inside its partition, on Kafka only, and `None` on every other backend.
+- `timestamp_ms: Option<i64>` - the record's broker timestamp in milliseconds since the Unix epoch, `LogAppendTime` or `CreateTime` as the topic is configured.
+  Kafka only, and `None` when the record carries none.
+
+The three Kafka coordinates name a position in the log, which is what an audit trail or a replay request needs.
+They are not an attempt counter: the same record redelivered after a rebalance carries the same coordinates.
 
 Most handlers ignore all of these fields. They become useful when you need to trace a message (`headers["x-trace-id"]`), implement idempotency checks (`headers["x-message-id"]` on RabbitMQ), or adjust behavior on redelivery. The `retry_count` in particular is more reliable than `redelivered` for detecting retries because `shove` increments it explicitly, whereas `redelivered` reflects the broker's view of the transport.
 

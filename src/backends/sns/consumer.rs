@@ -103,6 +103,10 @@ fn extract_metadata(msg: &Message) -> MessageMetadata {
         delivery_id: msg.message_id().unwrap_or_default().to_string(),
         redelivered: retry_count > 0,
         delivery_count: approximate_receive_count(msg),
+        // SQS has no partitions and no log offset.
+        partition: None,
+        offset: None,
+        timestamp_ms: None,
         headers: Arc::new(router::extract_message_attributes(msg)),
     }
 }
