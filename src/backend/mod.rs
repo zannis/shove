@@ -229,6 +229,8 @@ mod bounds_smoke {
             schema_enforcement: SchemaEnforcement::Enforce,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]

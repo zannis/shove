@@ -265,6 +265,13 @@ pub struct ConsumerOptions<B: Backend> {
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka-schema-registry")))]
     pub schema_accepted_subjects: Option<Vec<Arc<str>>>,
 
+    /// Kafka-only: the protobuf message index a frame must carry. `None`
+    /// accepts any index. Set via
+    /// [`ConsumerOptions::<Kafka>::require_schema_message_index`].
+    #[cfg(feature = "kafka-schema-registry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kafka-schema-registry")))]
+    pub schema_message_index: Option<Vec<i32>>,
+
     /// Kafka-only: base consumer `group.id` override. `None` (the default)
     /// keeps the topic-derived ids. Set via
     /// [`ConsumerOptions::<Kafka>::with_group_id`].
@@ -327,6 +334,8 @@ impl<B: Backend> ConsumerOptions<B> {
             schema_enforcement: SchemaEnforcement::Enforce,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: None,
             #[cfg(feature = "kafka")]
             kafka_group_id: None,
             #[cfg(feature = "kafka")]
@@ -590,6 +599,8 @@ impl<B: Backend> ConsumerOptions<B> {
             schema_enforcement: self.schema_enforcement,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: self.schema_accepted_subjects,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: self.schema_message_index,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: self.exactly_once,
             #[cfg(feature = "aws-sns-sqs")]
@@ -631,6 +642,8 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             schema_enforcement: self.schema_enforcement,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: self.schema_accepted_subjects.clone(),
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: self.schema_message_index.clone(),
             #[cfg(feature = "kafka")]
             kafka_group_id: self.kafka_group_id.clone(),
             #[cfg(feature = "kafka")]
@@ -827,6 +840,19 @@ impl ConsumerOptions<Kafka> {
         S: Into<Arc<str>>,
     {
         self.schema_accepted_subjects = Some(subjects.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Accept only protobuf frames whose message index equals `index`, the
+    /// path of `M` inside its schema file: `[0]` is the first top-level
+    /// message, `[1]` the second, `[0, 2]` the third message nested in the
+    /// first. Unset accepts any index, so a `ProtobufCodec<M>` decodes
+    /// whatever message the producer framed as `M`. A frame with another
+    /// index is routed to the DLQ with reason `schema_message_index_rejected`
+    /// before its schema id is resolved. JSON frames carry no index and are
+    /// not judged.
+    pub fn require_schema_message_index(mut self, index: impl Into<Vec<i32>>) -> Self {
+        self.schema_message_index = Some(index.into());
         self
     }
 }
@@ -1401,6 +1427,20 @@ mod tests {
             assert_eq!(
                 inner.schema_accepted_subjects,
                 Some(vec![Arc::from("orders-value"), Arc::from("orders-key")])
+            );
+        }
+
+        #[test]
+        fn require_schema_message_index_propagates() {
+            let inner = ConsumerOptions::<Kafka>::new()
+                .require_schema_message_index([0, 2])
+                .into_inner();
+            assert_eq!(inner.schema_message_index, Some(vec![0, 2]));
+            assert!(
+                ConsumerOptions::<Kafka>::new()
+                    .into_inner()
+                    .schema_message_index
+                    .is_none()
             );
         }
 

@@ -138,6 +138,9 @@ pub struct KafkaConsumerGroupConfig {
     /// at decode time.
     #[cfg(feature = "kafka-schema-registry")]
     pub(crate) schema_accepted_subjects: Option<Vec<Arc<str>>>,
+    /// The protobuf message index a frame must carry. `None` accepts any.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub(crate) schema_message_index: Option<Vec<i32>>,
 }
 
 impl Default for KafkaConsumerGroupConfig {
@@ -181,6 +184,8 @@ impl KafkaConsumerGroupConfig {
             schema_enforcement: SchemaEnforcement::Enforce,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: None,
         }
     }
 
@@ -360,6 +365,20 @@ impl KafkaConsumerGroupConfig {
         S: Into<Arc<str>>,
     {
         self.schema_accepted_subjects = Some(subjects.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Accept only protobuf frames whose message index equals `index`, the
+    /// path of `M` inside its schema file: `[0]` is the first top-level
+    /// message, `[1]` the second, `[0, 2]` the third message nested in the
+    /// first. Unset accepts any index, so a `ProtobufCodec<M>` decodes
+    /// whatever message the producer framed as `M`. A frame with another
+    /// index is routed to the DLQ with reason `schema_message_index_rejected`
+    /// before its schema id is resolved. JSON frames carry no index and are
+    /// not judged.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub fn require_schema_message_index(mut self, index: impl Into<Vec<i32>>) -> Self {
+        self.schema_message_index = Some(index.into());
         self
     }
 
@@ -850,6 +869,7 @@ impl KafkaConsumerGroup {
             options.schema_registry = self.config.schema_registry.clone();
             options.schema_enforcement = self.config.schema_enforcement;
             options.schema_accepted_subjects = self.config.schema_accepted_subjects.clone();
+            options.schema_message_index = self.config.schema_message_index.clone();
         }
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
@@ -1870,6 +1890,17 @@ mod tests {
             assert_eq!(subjects.len(), 2);
             assert!(subjects.iter().any(|s| s.as_ref() == "orders-value"));
             assert!(subjects.iter().any(|s| s.as_ref() == "orders-dlq-value"));
+        }
+
+        #[test]
+        fn require_schema_message_index_stores_the_path() {
+            let cfg = KafkaConsumerGroupConfig::new(1..=1).require_schema_message_index([1]);
+            assert_eq!(cfg.schema_message_index, Some(vec![1]));
+            assert!(
+                KafkaConsumerGroupConfig::new(1..=1)
+                    .schema_message_index
+                    .is_none()
+            );
         }
     }
 

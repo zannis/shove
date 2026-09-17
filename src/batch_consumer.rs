@@ -82,6 +82,8 @@ pub struct BatchConsumerOptions<B: Backend> {
     pub(crate) schema_enforcement: SchemaEnforcement,
     #[cfg(feature = "kafka-schema-registry")]
     pub(crate) schema_accepted_subjects: Option<Vec<Arc<str>>>,
+    #[cfg(feature = "kafka-schema-registry")]
+    pub(crate) schema_message_index: Option<Vec<i32>>,
 
     _backend: PhantomData<fn() -> B>,
 }
@@ -115,6 +117,8 @@ impl<B: Backend> BatchConsumerOptions<B> {
             schema_enforcement: SchemaEnforcement::Enforce,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: None,
             _backend: PhantomData,
         }
     }
@@ -239,6 +243,8 @@ impl<B: Backend> BatchConsumerOptions<B> {
             schema_enforcement: self.schema_enforcement,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: self.schema_accepted_subjects,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: self.schema_message_index,
         }
     }
 }
@@ -294,6 +300,19 @@ impl BatchConsumerOptions<Kafka> {
         self.schema_accepted_subjects = Some(subjects.into_iter().map(Into::into).collect());
         self
     }
+
+    /// Accept only protobuf frames whose message index equals `index`, the
+    /// path of `M` inside its schema file: `[0]` is the first top-level
+    /// message, `[1]` the second, `[0, 2]` the third message nested in the
+    /// first. Unset accepts any index, so a `ProtobufCodec<M>` decodes
+    /// whatever message the producer framed as `M`. A frame with another
+    /// index is routed to the DLQ with reason `schema_message_index_rejected`
+    /// before its schema id is resolved. JSON frames carry no index and are
+    /// not judged.
+    pub fn require_schema_message_index(mut self, index: impl Into<Vec<i32>>) -> Self {
+        self.schema_message_index = Some(index.into());
+        self
+    }
 }
 
 /// Runs batch consumption for one topic. Obtained from
@@ -346,5 +365,27 @@ impl<B: HasBatchConsumption> BatchConsumer<B> {
         self.inner
             .run_batch::<T, H>(handler, ctx, options.into_inner())
             .await
+    }
+}
+
+#[cfg(all(test, feature = "kafka-schema-registry"))]
+mod tests {
+    use super::*;
+    use crate::markers::Kafka;
+
+    /// The message-index requirement reaches the backend through
+    /// `into_inner`, as it does from `ConsumerOptions` and the group config.
+    #[test]
+    fn require_schema_message_index_propagates() {
+        let inner = BatchConsumerOptions::<Kafka>::new()
+            .require_schema_message_index([0, 2])
+            .into_inner();
+        assert_eq!(inner.schema_message_index, Some(vec![0, 2]));
+        assert!(
+            BatchConsumerOptions::<Kafka>::new()
+                .into_inner()
+                .schema_message_index
+                .is_none()
+        );
     }
 }

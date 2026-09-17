@@ -126,6 +126,10 @@ pub(crate) struct BatchConsumerOptionsInner {
     /// decode time.
     #[cfg(feature = "kafka-schema-registry")]
     pub schema_accepted_subjects: Option<Vec<Arc<str>>>,
+    /// Kafka-only: the protobuf message index a frame must carry. `None`
+    /// accepts any index.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub schema_message_index: Option<Vec<i32>>,
 }
 
 /// Internal batch-consumption trait. Backend-specific consumer structs with a

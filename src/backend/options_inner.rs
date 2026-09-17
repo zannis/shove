@@ -85,6 +85,12 @@ pub(crate) struct ConsumerOptionsInner {
     #[cfg(feature = "kafka-schema-registry")]
     pub schema_accepted_subjects: Option<Vec<Arc<str>>>,
 
+    /// Kafka-only: the protobuf message index a frame must carry. `None`
+    /// accepts any index. Propagated from `require_schema_message_index` on
+    /// `ConsumerOptions::<Kafka>` and `KafkaConsumerGroupConfig`.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub schema_message_index: Option<Vec<i32>>,
+
     #[cfg(feature = "rabbitmq-transactional")]
     pub exactly_once: bool,
     #[cfg(feature = "aws-sns-sqs")]
@@ -126,6 +132,8 @@ impl ConsumerOptionsInner {
             schema_enforcement: SchemaEnforcement::Enforce,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]
