@@ -148,6 +148,10 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
 - **`with_concurrent_processing(bool)`** — dispatch each fetched message to its own tokio task (rejected for sequenced topics). Default `false`.
 - **`with_group_id(impl Into<String>)`** — override the broker-side consumer group ID. Defaults to `"{queue}-consumer"`. Set this when two independent services consume the same topic and must each receive every message (fan-out) — otherwise they share a group and compete for partitions. Prefer `.for_consumer_group(...)` on the topology (below), which sets the group *and* the DLQ/hold-queue names together.
 - **`with_auto_offset_reset(KafkaAutoOffsetReset)`** — `Earliest` (default, replay history), `Latest` (tail-only), or `None` (refuse silent replay/skip on a fresh group).
+  The same setting is available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths, which have no group config to carry it.
+  Under `None`, a group with no usable committed offset ends its consumer with a `ShoveError::Topology` naming librdkafka's `AutoOffsetReset` answer.
+  A reconnect would only meet the same answer.
+  Commit a starting position first, with `reset_consumer_group_offsets` (below), or pick another policy.
 - **`with_commit_interval(Duration)`** - how often each consumer commits the offsets its handlers completed.
   The default is `500ms`, and any positive interval is accepted.
   A longer interval sends fewer OffsetCommit requests and widens the replay window after a crash or rebalance by the same amount.
