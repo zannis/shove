@@ -213,6 +213,44 @@ The returned `KafkaOffsetResetReport` carries one entry per partition with the p
 
 Kafka is the only backend with this API: it is the only one shove supports where a group's read position is a broker-side committed offset an operator can rewrite. Redis Streams' `XGROUP SETID` is the nearest equivalent and is not yet exposed.
 
+### Starting a broadcast subscription elsewhere than the tail
+
+A [broadcast](/concepts/broadcast) subscription assigns every partition itself and never commits, so it has no stored position to reset.
+Where it starts is a property of the subscription, set on its options:
+
+```rust,no_run
+use shove::kafka::KafkaOffsetReset;
+
+let mut subscriber = broker.broadcast_subscriber();
+subscriber.subscribe::<CacheInvalidations, _>(
+    Evict,
+    ConsumerOptions::<Kafka>::new()
+        // Replay everything the topic still retains, then keep tailing.
+        .with_broadcast_start(KafkaOffsetReset::Earliest)
+        // The inert `group.id` the handle carries; see below.
+        .with_group_id("cache-invalidations-broadcast"),
+)?;
+```
+
+- **`KafkaOffsetReset::Latest`**, and no call at all - every partition at its end offset: deliver-new, the broadcast contract.
+- **`KafkaOffsetReset::Earliest`** - every partition at its beginning, so a fresh instance replays the retained log before it tails.
+  This is the right start for a subscriber that rebuilds an in-memory view from the topic instead of from a separate store.
+- **`KafkaOffsetReset::Timestamp(ms)`** - the first record at or after that point, in milliseconds since the Unix epoch.
+  The lookup is `offsets_for_times`, exactly as [`reset_consumer_group_offsets`](#re-anchoring-a-group-seek-to-tail--head--timestamp) resolves it.
+  A partition with no record at or after the point starts at its tail.
+  A partition the lookup cannot answer for fails the subscription rather than silently starting at the tail.
+
+A partition added while the subscription runs is picked up within a few seconds and assigned at the same start.
+A reconnect after a broker outage re-resolves the start as it stands then.
+An `Earliest` subscription therefore replays the retained log again, the price of having no stored position.
+
+`with_group_id` names the inert `group.id` the groupless handle is configured with, and the default is `{queue}-broadcast`.
+Nothing joins under it and nothing commits to it either way.
+Set it when the cluster's ACLs grant group Describe on one prefix only.
+librdkafka looks up the configured group's coordinator even for an assign-only handle, and an unauthorised lookup draws a `GroupAuthorizationFailed` on every attempt.
+The subscription tolerates that error: it warns once and keeps fetching, because fetching never goes through the coordinator.
+An id under the granted prefix keeps the logs clean.
+
 ### Replication factor
 
 Auto-created topics get replication factor `1` by default, which is fine for single-broker dev but unsafe in production. Set a cluster-wide default on the registry:
@@ -490,4 +528,5 @@ The Kafka backend emits `shove_messages_failed_total` with the following `reason
 ## See also
 
 - [Liveness Probes](/guides/liveness) — wire `Broker::ping` into a k8s health endpoint.
-- [Broadcast](/concepts/broadcast) — per-instance fan-out via a groupless `assign()` at the tail, leaving `__consumer_offsets` untouched.
+- [Broadcast](/concepts/broadcast) - per-instance fan-out via a groupless `assign()`, leaving `__consumer_offsets` untouched.
+  It starts at the tail by default, or at the head or a timestamp with `with_broadcast_start`.

@@ -27,6 +27,9 @@ pub(crate) trait BroadcastImpl: Send + Sync {
     ///
     /// - **Deliver-new.** Only messages published after this future has
     ///   subscribed are delivered. Nothing published earlier is replayed.
+    ///   Kafka is the one backend where the caller may opt out of this, per
+    ///   subscription, with `ConsumerOptions::<Kafka>::with_broadcast_start`;
+    ///   the default there is still the tail.
     /// - **Nothing survives.** Every piece of broker-side state the
     ///   subscription creates is torn down before the returned future
     ///   resolves — no consumer group, no durable consumer, no leftover queue.

@@ -73,7 +73,7 @@ pub trait HasCoordinatedGroups: Backend {
 /// | Backend | Implements `HasBroadcast` | Ephemeral primitive |
 /// |---|---|---|
 /// | **InMemory** | **yes** | a per-subscriber buffer |
-/// | **Kafka** | **yes** | groupless `assign()` at the latest offset |
+/// | **Kafka** | **yes** | groupless `assign()` at the latest offset by default; `with_broadcast_start` may pick the head or a timestamp |
 /// | **NATS** | **yes** | ephemeral pull consumer on an `Interest`-retention stream |
 /// | **RabbitMQ** | **yes** | exclusive auto-delete queue on a fanout exchange |
 /// | **Redis** (`redis-streams`) | **yes** | plain `XREAD` from `$`, no `XGROUP` |

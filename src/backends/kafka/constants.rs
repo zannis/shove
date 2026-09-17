@@ -81,6 +81,14 @@ pub(super) fn consumer_group_id_fifo_scoped(queue: &str, fan_out_group: Option<&
 /// a per-restart name in every tool that enumerates group ids, which is the
 /// residue this feature exists to avoid. Every instance sharing one inert
 /// string leaves nothing to accumulate.
+///
+/// An explicit `ConsumerOptions::<Kafka>::with_group_id` replaces this
+/// default verbatim. The value stays inert, but librdkafka looks up the
+/// configured group's coordinator even for an assign-only consumer, and a
+/// cluster ACL that grants group Describe on one prefix only answers that
+/// lookup with `GroupAuthorizationFailed` for any other name. The broadcast
+/// loop tolerates that error; picking an id under the granted prefix is how a
+/// deployment avoids provoking it at all.
 pub(super) fn broadcast_group_id(queue: &str) -> String {
     format!("{queue}-broadcast")
 }
