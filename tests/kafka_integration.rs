@@ -177,11 +177,37 @@ shove::define_topic!(
 struct TestBroker {
     _container: testcontainers::ContainerAsync<KafkaContainer>,
     client: KafkaClient,
+    bootstrap_servers: String,
 }
 
 impl TestBroker {
     async fn start() -> Self {
-        let container = KafkaContainer::default()
+        Self::start_image(KafkaContainer::default()).await
+    }
+
+    /// A single-broker container that can host a transactional producer.
+    ///
+    /// The module pins the offsets topic to one replica but leaves the
+    /// transaction-state log at Kafka's defaults of three replicas and two
+    /// in-sync, which a lone broker can never satisfy, so `init_transactions`
+    /// hangs until it times out. Only tests that produce transactionally
+    /// need this variant.
+    async fn start_with_transactions() -> Self {
+        use testcontainers::ImageExt;
+
+        Self::start_image(
+            KafkaContainer::default()
+                .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+                .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1"),
+        )
+        .await
+    }
+
+    async fn start_image<I>(image: I) -> Self
+    where
+        I: AsyncRunner<KafkaContainer>,
+    {
+        let container = image
             .start()
             .await
             .expect("failed to start Kafka container");
@@ -198,6 +224,7 @@ impl TestBroker {
         Self {
             _container: container,
             client,
+            bootstrap_servers,
         }
     }
 
@@ -207,6 +234,12 @@ impl TestBroker {
 
     fn client(&self) -> KafkaClient {
         self.client.clone()
+    }
+
+    /// The bootstrap address, for tests that need a raw rdkafka client
+    /// beside the one under test.
+    fn brokers(&self) -> &str {
+        &self.bootstrap_servers
     }
 }
 
@@ -2553,6 +2586,210 @@ async fn committed_offsets_advance_while_consumer_is_idle() {
 
     shutdown.cancel();
     handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// A transactional producer leaves a control record at the end of every
+/// transaction, at an offset no consumer ever receives. Log compaction leaves
+/// the same kind of hole. The tracker must commit past such a hole as soon as
+/// every *delivered* record below it has completed, instead of waiting for
+/// an offset that will never arrive.
+///
+/// Every record carries the same key so one partition holds the whole
+/// sequence: data, data, control, data, data, control, data, data, control.
+/// The consumer receives six records; the committed position must reach the
+/// last control record (highest delivered plus one), and a second member of
+/// the same group must then receive only records produced after it.
+#[tokio::test]
+async fn transactional_gaps_do_not_stall_commits() {
+    use rdkafka::ClientConfig;
+    use rdkafka::consumer::{BaseConsumer, Consumer as RdkafkaConsumer};
+    use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+    use rdkafka::util::Timeout;
+    use rdkafka::{Offset, TopicPartitionList};
+
+    shove::define_topic!(
+        TxnGapsTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-txn-gaps").build()
+    );
+
+    impl MessageHandler<TxnGapsTopic> for CountingHandler {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    const TOPIC: &str = "kafka-txn-gaps";
+    const GROUP: &str = "kafka-txn-gaps-consumer";
+    const KEY: &str = "one-partition";
+    let rpc = Timeout::After(Duration::from_secs(10));
+
+    let tb = TestBroker::start_with_transactions().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<TxnGapsTopic>().await.unwrap();
+
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", tb.brokers())
+        .set("transactional.id", "kafka-txn-gaps-producer")
+        .create()
+        .expect("failed to create transactional producer");
+    producer
+        .init_transactions(rpc)
+        .expect("init_transactions failed");
+
+    // Three transactions of two records each: offsets 0,1 | 3,4 | 6,7 are
+    // data and 2, 5, 8 are control records.
+    let mut produced = 0;
+    for txn in 0..3 {
+        producer
+            .begin_transaction()
+            .expect("begin_transaction failed");
+        for i in 0..2 {
+            let payload = serde_json::to_string(&SimpleMessage {
+                id: format!("txn-{txn}-{i}"),
+                content: "gap".into(),
+            })
+            .unwrap();
+            producer
+                .send(
+                    FutureRecord::to(TOPIC).key(KEY).payload(&payload),
+                    Timeout::After(Duration::from_secs(10)),
+                )
+                .await
+                .expect("transactional publish failed");
+            produced += 1;
+        }
+        producer
+            .commit_transaction(rpc)
+            .expect("commit_transaction failed");
+    }
+    assert_eq!(produced, 6);
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<TxnGapsTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10),
+            )
+            .await
+    });
+    assert!(
+        handler.counter.wait_for(6, TIMEOUT).await,
+        "should consume all 6 data records"
+    );
+
+    // Find the one partition the key landed on and its high watermark, then
+    // poll the committed offset until it sits at the trailing control record.
+    let probe: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", tb.brokers())
+        .set("group.id", GROUP)
+        .create()
+        .expect("failed to create committed-offset probe");
+    let metadata = probe
+        .fetch_metadata(Some(TOPIC), Duration::from_secs(10))
+        .expect("metadata");
+    let partitions: Vec<i32> = metadata.topics()[0]
+        .partitions()
+        .iter()
+        .map(|p| p.id())
+        .collect();
+    let (partition, high) = partitions
+        .iter()
+        .map(|&p| {
+            let (_, high) = probe
+                .fetch_watermarks(TOPIC, p, Duration::from_secs(10))
+                .expect("watermarks");
+            (p, high)
+        })
+        .find(|&(_, high)| high > 0)
+        .expect("one partition holds the keyed records");
+    assert_eq!(high, 9, "6 data records plus 3 control records");
+
+    let committed_offset = || {
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition(TOPIC, partition);
+        probe
+            .committed_offsets(tpl, Duration::from_secs(10))
+            .expect("committed_offsets")
+            .find_partition(TOPIC, partition)
+            .and_then(|e| match e.offset() {
+                Offset::Offset(o) => Some(o),
+                _ => None,
+            })
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let committed = committed_offset();
+        if committed == Some(high - 1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "committed offset must reach the trailing control record ({}), got {committed:?}",
+            high - 1
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    // A second member under the same group resumes at the committed position
+    // and must see only what is produced from now on.
+    let handler2 = CountingHandler::new();
+    let hc2 = handler2.clone();
+    let shutdown2 = CancellationToken::new();
+    let sc2 = shutdown2.clone();
+    let consumer2 = KafkaConsumer::new(client.clone());
+    let handle2 = tokio::spawn(async move {
+        consumer2
+            .run::<TxnGapsTopic, _>(hc2, (), ConsumerOptions::<Kafka>::new().with_shutdown(sc2))
+            .await
+    });
+    producer
+        .begin_transaction()
+        .expect("begin_transaction failed");
+    let payload = serde_json::to_string(&SimpleMessage {
+        id: "after-restart".into(),
+        content: "gap".into(),
+    })
+    .unwrap();
+    producer
+        .send(
+            FutureRecord::to(TOPIC).key(KEY).payload(&payload),
+            Timeout::After(Duration::from_secs(10)),
+        )
+        .await
+        .expect("transactional publish failed");
+    producer
+        .commit_transaction(rpc)
+        .expect("commit_transaction failed");
+
+    assert!(
+        handler2.counter.wait_for(1, TIMEOUT).await,
+        "the new record must arrive"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        handler2.counter.get(),
+        1,
+        "nothing below the committed position may be redelivered"
+    );
+
+    shutdown2.cancel();
+    handle2.await.unwrap().ok();
     broker.close().await;
 }
 
