@@ -169,11 +169,24 @@ impl AsyncCommitGate {
 }
 
 struct PartitionTracker {
-    /// Next offset to commit (exclusive — Kafka convention).
+    /// Next offset to commit (exclusive - Kafka convention): every offset
+    /// delivered under this assignment below it has completed.
     next_to_commit: i64,
-    /// Offsets that have been processed but not yet committable
-    /// (because earlier offsets are still in-flight).
-    completed: BTreeSet<i64>,
+    /// Offsets delivered under this assignment whose handler has not finished
+    /// yet. Bounded by `prefetch_count`, since every entry holds a permit.
+    ///
+    /// The commit position is derived from what was *delivered*, not from a
+    /// run of consecutive integers: log compaction removes records without
+    /// renumbering the survivors, and a transactional producer leaves a
+    /// control record at the end of every transaction that a consumer never
+    /// receives. Either leaves a hole in the offset sequence, and a tracker
+    /// that waited for the hole to fill stalled the partition for the life of
+    /// the assignment.
+    in_flight: BTreeSet<i64>,
+    /// Highest offset delivered under this assignment. With nothing in flight
+    /// the commit position is one past it, which steps over any hole the
+    /// broker never delivered.
+    highest_delivered: i64,
     /// Set when an async commit that included this partition was rejected
     /// (e.g. during a rebalance). Makes the next `drain_committable` re-offer
     /// the current `next_to_commit` even without new completions, so the
@@ -211,10 +224,13 @@ struct PartitionTracker {
 }
 
 impl PartitionTracker {
+    /// Seeds the tracker from the first offset delivered under this
+    /// assignment, which is also the first in-flight offset.
     fn new(first_offset: i64) -> Self {
         Self {
             next_to_commit: first_offset,
-            completed: BTreeSet::new(),
+            in_flight: BTreeSet::from([first_offset]),
+            highest_delivered: first_offset,
             dirty: false,
             dirty_since: None,
             quiet_drains: 0,
@@ -222,13 +238,41 @@ impl PartitionTracker {
         }
     }
 
-    fn mark_complete(&mut self, offset: i64, discard: Option<TerminalDiscard>) {
-        // Completions below the seed are stale: after a partition is removed
-        // on rebalance and re-seeded by the next delivery, completions of
-        // messages in flight from the previous assignment epoch would
-        // otherwise pile up in `completed` forever (never contiguous with
-        // `next_to_commit`).
+    /// Records a delivery under this assignment.
+    ///
+    /// An offset below `next_to_commit` is not tracked. Within one
+    /// assignment librdkafka delivers a partition in offset order, with one
+    /// exception: when offset validation finds the log truncated by a leader
+    /// change, it seeks the partition back to the new leader's end offset for
+    /// the old epoch (`rd_kafka_offset_validate` in the bundled source, under
+    /// every reset policy but `error`), and offsets this assignment already
+    /// committed past arrive again. The handler still sees them. Their
+    /// offsets stay out of `in_flight`, because `position()` is its lowest
+    /// entry and would otherwise drop below what is committed, and because a
+    /// completion for such an offset would meet the stale check below with
+    /// the entry still in the set.
+    fn track_received(&mut self, offset: i64) {
         if offset < self.next_to_commit {
+            return;
+        }
+        self.in_flight.insert(offset);
+        self.highest_delivered = self.highest_delivered.max(offset);
+    }
+
+    fn mark_complete(&mut self, offset: i64, discard: Option<TerminalDiscard>) {
+        // Taken out first, whatever the stale check decides: an entry left
+        // behind would pin `position()` at its offset for the rest of the
+        // assignment. `track_received` keeps such an entry from existing, and
+        // this keeps one from surviving if it ever did.
+        let known = self.in_flight.remove(&offset);
+        // A completion this assignment never delivered is stale: after a
+        // partition is removed on rebalance and re-seeded by the next
+        // delivery, completions of messages in flight from the previous
+        // assignment epoch still arrive. They sit either below the new seed
+        // or above it but outside `in_flight`; both are the old epoch's, and
+        // the new epoch redelivers those offsets itself. A completion below
+        // `next_to_commit` from a post-truncation redelivery lands here too.
+        if offset < self.next_to_commit || !known {
             // This epoch will never commit that offset, so any retirement
             // riding on it is not ours to claim.
             if let Some(discard) = discard {
@@ -239,7 +283,18 @@ impl PartitionTracker {
         if let Some(discard) = discard {
             self.pending_discards.insert(offset, discard);
         }
-        self.completed.insert(offset);
+    }
+
+    /// The exclusive commit position this assignment can offer right now:
+    /// the lowest offset still in flight, or one past the highest delivered
+    /// offset once nothing is in flight. Never consults offsets the broker
+    /// did not deliver, so a compacted or transactional hole does not hold
+    /// the position back.
+    fn position(&self) -> i64 {
+        self.in_flight
+            .first()
+            .copied()
+            .unwrap_or(self.highest_delivered + 1)
     }
 
     /// Flags this partition dirty (see the `dirty` field) because a commit
@@ -286,10 +341,7 @@ impl PartitionTracker {
     /// handed to the caller unsettled, because only the commit's result says
     /// whether the retirement actually happened.
     fn drain_committable(&mut self) -> Option<(i64, Vec<TerminalDiscard>)> {
-        let mut next = self.next_to_commit;
-        while self.completed.remove(&next) {
-            next += 1;
-        }
+        let next = self.position();
         let progressed = next > self.next_to_commit;
         let retry = self.dirty;
         self.dirty = false;
@@ -326,11 +378,11 @@ impl PartitionTracker {
     ///
     /// Read-only twin of `drain_committable`'s `progressed || retry`
     /// condition — the receive loop's wake arm uses it to decide whether the
-    /// commit gate's deadline is worth waking for. Completions that are not
-    /// contiguous with `next_to_commit` (a gap is still in flight) do not
-    /// count, exactly as they would not commit.
+    /// commit gate's deadline is worth waking for. Completions behind an
+    /// offset that is still in flight do not count, exactly as they would
+    /// not commit.
     fn has_committable(&self) -> bool {
-        self.dirty || self.completed.contains(&self.next_to_commit)
+        self.dirty || self.position() > self.next_to_commit
     }
 }
 
@@ -347,9 +399,15 @@ impl OffsetTracker {
         }
     }
 
+    /// Records a delivery: seeds the partition's tracker on its first offset
+    /// under this assignment, and marks every later offset in flight so the
+    /// commit position follows what was actually delivered. An offset below
+    /// the partition's committed position is not marked, see
+    /// `PartitionTracker::track_received`.
     fn track_received(&mut self, partition: i32, offset: i64) {
         self.partitions
             .entry(partition)
+            .and_modify(|tracker| tracker.track_received(offset))
             .or_insert_with(|| PartitionTracker::new(offset));
     }
 
@@ -5144,22 +5202,90 @@ mod offset_tracker_tests {
         })
     }
 
-    /// Regression: the normal contiguous drain still works — out-of-order
-    /// completions commit only up to the first gap, then advance once the
-    /// gap fills.
+    /// An offset the broker never delivered - a compacted record, or a
+    /// transaction's control record - must not hold the commit position
+    /// back. Delivered 0, 1 and 3, completed all three, the position is 4.
     #[test]
-    fn contiguous_drain_advances_past_gaps_only_when_filled() {
+    fn undelivered_gaps_do_not_block_the_commit_position() {
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
+        tracker.track_received(0, 1);
+        tracker.track_received(0, 3);
+        tracker.mark_complete(Completion::plain(0, 3));
+        tracker.mark_complete(Completion::plain(0, 0));
+        tracker.mark_complete(Completion::plain(0, 1));
+
+        let tpl = drain_tpl(&mut tracker).expect("everything delivered has completed");
+        assert_eq!(
+            committed_offset(&tpl, 0),
+            Some(4),
+            "the hole at 2 was never delivered, so it is not waited for"
+        );
+    }
+
+    /// A delivered offset whose handler is still running is a real gap:
+    /// out-of-order completions commit only up to it, then advance once it
+    /// completes.
+    #[test]
+    fn a_delivered_but_unfinished_offset_still_blocks() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        tracker.track_received(0, 1);
+        tracker.track_received(0, 2);
         tracker.mark_complete(Completion::plain(0, 2));
         tracker.mark_complete(Completion::plain(0, 0));
 
         let tpl = drain_tpl(&mut tracker).expect("offset 0 is committable");
-        assert_eq!(committed_offset(&tpl, 0), Some(1), "gap at 1 blocks 2");
+        assert_eq!(
+            committed_offset(&tpl, 0),
+            Some(1),
+            "1 is in flight and blocks 2"
+        );
 
         tracker.mark_complete(Completion::plain(0, 1));
         let tpl = drain_tpl(&mut tracker).expect("gap filled");
         assert_eq!(committed_offset(&tpl, 0), Some(3));
+    }
+
+    /// With nothing in flight the position is one past the highest delivered
+    /// offset, whatever holes the sequence had.
+    #[test]
+    fn nothing_in_flight_commits_highest_delivered_plus_one() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 10);
+        tracker.track_received(0, 14);
+        tracker.mark_complete(Completion::plain(0, 10));
+        tracker.mark_complete(Completion::plain(0, 14));
+
+        let tpl = drain_tpl(&mut tracker).expect("nothing is in flight");
+        assert_eq!(committed_offset(&tpl, 0), Some(15));
+        assert!(
+            drain_tpl(&mut tracker).is_none(),
+            "no new delivery, no new commit"
+        );
+    }
+
+    /// A completion for an offset this assignment never delivered belongs to
+    /// a previous epoch and must not become a commit position.
+    #[test]
+    fn a_completion_this_assignment_never_delivered_is_stale() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 105);
+        // The old epoch delivered 108 before the partition moved; its handler
+        // finishes after the re-seed.
+        tracker.mark_complete(Completion::plain(0, 108));
+        assert!(
+            drain_tpl(&mut tracker).is_none(),
+            "105 is still in flight, and 108 was not delivered in this epoch"
+        );
+
+        tracker.mark_complete(Completion::plain(0, 105));
+        let tpl = drain_tpl(&mut tracker).expect("105 completes");
+        assert_eq!(
+            committed_offset(&tpl, 0),
+            Some(106),
+            "the stale 108 did not lift the position past what this epoch handled"
+        );
     }
 
     /// After remove + re-track (a partition revoked and reassigned), the
@@ -5223,6 +5349,7 @@ mod offset_tracker_tests {
     fn terminal_discard_surfaces_only_once_its_offset_is_committable() {
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
+        tracker.track_received(0, 1);
         tracker.mark_complete(terminal(1));
 
         assert!(
@@ -5299,6 +5426,88 @@ mod offset_tracker_tests {
             committed_offset(&tpl, 0),
             Some(11),
             "stale offset 5 must not have corrupted the contiguous run"
+        );
+    }
+
+    /// librdkafka's seek after a detected log truncation delivers offsets
+    /// below the committed position inside the same assignment, with no
+    /// revoke or assign in between. The position must not drop below what
+    /// is committed, and the lower offset must leave no entry behind that
+    /// would pin the position once higher offsets complete.
+    #[test]
+    fn a_lower_offset_inside_one_assignment_never_lowers_the_position() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        for offset in 10..=12 {
+            tracker.track_received(0, offset);
+        }
+        tracker.mark_complete(Completion::plain(0, 10));
+        tracker.mark_complete(Completion::plain(0, 11));
+        let tpl = drain_tpl(&mut tracker).expect("10 and 11 completed");
+        assert_eq!(committed_offset(&tpl, 0), Some(12));
+
+        // The truncation seek: offsets 5 and 6 arrive after 12 was delivered.
+        tracker.track_received(0, 5);
+        tracker.track_received(0, 6);
+        let partition = &tracker.partitions[&0];
+        assert_eq!(partition.position(), 12, "the position never lowers");
+        assert_eq!(
+            partition.in_flight.iter().copied().collect::<Vec<_>>(),
+            vec![12],
+            "offsets below the committed position are not tracked"
+        );
+        assert!(
+            drain_tpl(&mut tracker).is_none(),
+            "nothing below the committed position is ever offered"
+        );
+
+        // Their completions are stale for this epoch and leave nothing behind.
+        tracker.mark_complete(Completion::plain(0, 5));
+        tracker.mark_complete(Completion::plain(0, 6));
+        assert!(drain_tpl(&mut tracker).is_none());
+        let partition = &tracker.partitions[&0];
+        assert_eq!(partition.position(), 12);
+        assert_eq!(partition.in_flight.len(), 1, "no entry leaked");
+
+        tracker.mark_complete(Completion::plain(0, 12));
+        let tpl = drain_tpl(&mut tracker).expect("12 completed");
+        assert_eq!(
+            committed_offset(&tpl, 0),
+            Some(13),
+            "the higher offsets commit as if the lower ones never came"
+        );
+        assert!(tracker.partitions[&0].in_flight.is_empty());
+    }
+
+    /// The belt under the braces: even if an offset below the committed
+    /// position sat in `in_flight`, its completion removes it instead of
+    /// short-circuiting past the removal and pinning the position there.
+    #[test]
+    fn a_stale_completion_removes_its_in_flight_entry() {
+        let mut partition = PartitionTracker::new(10);
+        partition.mark_complete(10, None);
+        assert_eq!(
+            partition.drain_committable().map(|(next, _)| next),
+            Some(11)
+        );
+        partition.track_received(12);
+        partition.in_flight.insert(5);
+        assert_eq!(
+            partition.position(),
+            5,
+            "the leaked entry is what the fix removes"
+        );
+
+        partition.mark_complete(5, None);
+        assert!(!partition.in_flight.contains(&5), "the stale entry is gone");
+        assert_eq!(
+            partition.position(),
+            12,
+            "the position is the real in-flight offset again"
+        );
+        assert_eq!(
+            partition.drain_committable().map(|(next, _)| next),
+            Some(12),
+            "the position the leaked entry held back is offered, and nothing lower"
         );
     }
 
