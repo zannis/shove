@@ -90,6 +90,47 @@ See [`examples/kafka/msk_iam.rs`](/backends/kafka/examples/msk_iam) for a runnab
 
 `topology().declare::<T>()` creates the Kafka topics for the main topic, hold topics, and DLQ. Idempotent — safe to call on every startup.
 
+### Bind to an infra-owned topic
+
+Sometimes infra owns the topic: a Terraform module, a platform team's provisioning job, or a cluster whose credentials carry no Create or Alter permission.
+Then use `kafka_external_topic()`:
+
+```rust,no_run
+use shove::TopologyBuilder;
+
+shove::define_topic!(
+    PriceChanges,
+    PriceChange,
+    // The queue name must match the externally provisioned topic name.
+    TopologyBuilder::new("price-changes")
+        .kafka_external_topic()
+        .dlq()
+        .build()
+);
+```
+
+In this mode `declare::<T>()` does **not** create the main topic.
+It verifies that the topic, named after the queue, already exists.
+If it does not, `declare` returns a `ShoveError::Topology`, so a missing or misnamed topic fails fast at startup.
+Nothing falls back to an auto-created topic with default partitions and config.
+The check is a metadata request from a consumer-type client with no `group.id`.
+It therefore needs no group permission and cannot trigger the broker's topic auto-creation.
+shove never expands the topic's partitions and never reconciles its config.
+A consumer group registered with more `max_consumers` than the topic has partitions runs with the extra members idle.
+`declare` logs a warning when that happens.
+shove still creates and owns its DLQ topic, and still manages its consumer group.
+Provision the topic before the consumer starts.
+
+A consumer then needs these ACLs: `Describe` and `Read` on the topic, and `Describe` and `Read` on the consumer group.
+The group is `{queue}-consumer` unless `for_consumer_group` or `with_group_id` names another.
+A publisher additionally needs `Write` on the topic.
+A declared DLQ needs `Create`, `Describe` and `Write` on the DLQ topic, so that shove can create it and route to it.
+
+`kafka_external_topic()` is incompatible with `sequenced()` and with every topic-config method.
+Those are `with_topic_config`, `with_retention`, `with_retention_forever`, `with_retention_bytes`, `with_cleanup_policy` and `with_max_message_bytes`.
+They configure topic *creation* and *reconciliation*, which external mode skips, and `build()` panics if they are combined.
+`dlq()`, `dlq_named()`, `hold_queue()`, `for_consumer_group()` and `broadcast()` stay available.
+
 ## Publish
 
 ```rust

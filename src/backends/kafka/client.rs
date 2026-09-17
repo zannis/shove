@@ -14,6 +14,7 @@ use rdkafka::admin::{
 use rdkafka::client::{ClientContext, DefaultClientContext};
 use rdkafka::error::RDKafkaErrorCode;
 use rdkafka::message::OwnedHeaders;
+use rdkafka::metadata::Metadata;
 use rdkafka::producer::{FutureProducer, Producer};
 
 use super::constants::{MESSAGE_TIMEOUT_MS, SHUTDOWN_GRACE};
@@ -28,7 +29,6 @@ use rdkafka::bindings::{
 };
 #[cfg(feature = "kafka-msk-iam")]
 use rdkafka::client::OAuthToken;
-#[cfg(feature = "kafka-msk-iam")]
 use rdkafka::types::RDKafkaRespErr;
 
 use crate::ShoveError;
@@ -704,6 +704,41 @@ impl KafkaClient {
             .map_err(|e| ShoveError::Connection(format!("kafka ping failed: {e}")))
     }
 
+    /// Confirm an infra-owned topic exists and return its partition count,
+    /// creating nothing. The check is deliberately not the producer's
+    /// metadata fetch `ping` uses; see `probe_external_topic_blocking`.
+    pub(super) async fn verify_external_topic(&self, name: &str) -> Result<i32> {
+        let base = (*self.base_config).clone();
+        let topic_name = name.to_string();
+        #[cfg(feature = "kafka-msk-iam")]
+        let msk_ctx = self.msk_context();
+        #[cfg(feature = "kafka-msk-iam")]
+        let shutdown = self.shutdown_token();
+        let probed = tokio::task::spawn_blocking(move || {
+            probe_external_topic_blocking(
+                base,
+                &topic_name,
+                #[cfg(feature = "kafka-msk-iam")]
+                msk_ctx,
+                #[cfg(feature = "kafka-msk-iam")]
+                shutdown,
+            )
+        })
+        .await
+        .map_err(|e| ShoveError::Topology(format!("metadata task failed: {e}")))??;
+        probed.ok_or_else(|| {
+            metrics::record_backend_error(
+                metrics::BackendLabel::Kafka,
+                metrics::BackendErrorKind::Topology,
+            );
+            ShoveError::Topology(format!(
+                "kafka_external_topic: topic `{name}` must be provisioned before the consumer \
+                 starts, but the broker has no topic by that name; shove never creates or \
+                 alters an external topic"
+            ))
+        })
+    }
+
     pub(super) async fn create_admin_default(&self) -> Result<AdminClient<DefaultClientContext>> {
         let admin: AdminClient<DefaultClientContext> = self
             .base_config
@@ -996,15 +1031,14 @@ fn overlay_dynamic_entries<'a>(
 /// synchronously, and return its partition count. Runs inside `spawn_blocking`
 /// because librdkafka's `fetch_metadata` is blocking.
 ///
-/// The cfg branching lives here so `ensure_partitions` stays readable.
+/// The cfg branching lives in [`fetch_topic_metadata_blocking`] so
+/// `ensure_partitions` stays readable.
 fn fetch_topic_partition_count_blocking(
     base: ClientConfig,
     topic_name: &str,
     #[cfg(feature = "kafka-msk-iam")] msk_ctx: Option<MskIamContext>,
     #[cfg(feature = "kafka-msk-iam")] shutdown: CancellationToken,
 ) -> Result<i32> {
-    use rdkafka::consumer::{BaseConsumer, Consumer as _};
-
     let mut cfg = base;
     // arch-K-10: per-process suffix on the group id so multiple shove
     // processes don't collide in kafka-consumer-groups.sh / Kafka UI /
@@ -1013,6 +1047,73 @@ fn fetch_topic_partition_count_blocking(
         "group.id",
         format!("shove-partition-check-{}", process::id()),
     );
+    let md = fetch_topic_metadata_blocking(
+        cfg,
+        topic_name,
+        #[cfg(feature = "kafka-msk-iam")]
+        msk_ctx,
+        #[cfg(feature = "kafka-msk-iam")]
+        shutdown,
+    )?;
+    let topic = md
+        .topics()
+        .first()
+        .ok_or_else(|| ShoveError::Topology(format!("no metadata for topic {topic_name}")))?;
+    Ok(topic.partitions().len() as i32)
+}
+
+/// Whether an infra-owned topic exists, and with how many partitions,
+/// without creating it. `Ok(None)` is the broker's answer that no such topic
+/// exists.
+///
+/// The probe is a consumer-type client with no `group.id`, and both halves
+/// matter. librdkafka defaults `allow.auto.create.topics` to true for a
+/// producer and sends it on a topic-specific metadata request, so the
+/// producer's own client (the one `ping` uses) would ask a broker running
+/// `auto.create.topics.enable=true` to create the very topic
+/// `kafka_external_topic()` promises never to create. A consumer defaults it
+/// to false, and it is set explicitly here anyway. Without a `group.id` there
+/// is no coordinator lookup, so the probe needs no group permission under a
+/// group-scoped ACL.
+fn probe_external_topic_blocking(
+    base: ClientConfig,
+    topic_name: &str,
+    #[cfg(feature = "kafka-msk-iam")] msk_ctx: Option<MskIamContext>,
+    #[cfg(feature = "kafka-msk-iam")] shutdown: CancellationToken,
+) -> Result<Option<i32>> {
+    let mut cfg = base;
+    cfg.set("allow.auto.create.topics", "false");
+    let md = fetch_topic_metadata_blocking(
+        cfg,
+        topic_name,
+        #[cfg(feature = "kafka-msk-iam")]
+        msk_ctx,
+        #[cfg(feature = "kafka-msk-iam")]
+        shutdown,
+    )?;
+    let Some(topic) = md.topics().iter().find(|t| t.name() == topic_name) else {
+        return Ok(None);
+    };
+    match topic.error() {
+        Some(RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART) => Ok(None),
+        Some(other) => Err(ShoveError::Topology(format!(
+            "metadata for topic {topic_name} returned {other:?}"
+        ))),
+        None if topic.partitions().is_empty() => Ok(None),
+        None => Ok(Some(topic.partitions().len() as i32)),
+    }
+}
+
+/// Build a one-shot metadata `BaseConsumer` from `cfg` and fetch one topic's
+/// metadata synchronously. Runs inside `spawn_blocking` because librdkafka's
+/// `fetch_metadata` is blocking; owns all the cfg-gated context selection.
+fn fetch_topic_metadata_blocking(
+    cfg: ClientConfig,
+    topic_name: &str,
+    #[cfg(feature = "kafka-msk-iam")] msk_ctx: Option<MskIamContext>,
+    #[cfg(feature = "kafka-msk-iam")] shutdown: CancellationToken,
+) -> Result<Metadata> {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
 
     #[cfg(feature = "kafka-msk-iam")]
     let metadata = if let Some(ctx) = msk_ctx {
@@ -1051,14 +1152,9 @@ fn fetch_topic_partition_count_blocking(
         consumer.fetch_metadata(Some(topic_name), Duration::from_secs(10))
     };
 
-    let md = metadata.map_err(|e| {
+    metadata.map_err(|e| {
         ShoveError::Connection(format!("failed to fetch metadata for {topic_name}: {e}"))
-    })?;
-    let topic = md
-        .topics()
-        .first()
-        .ok_or_else(|| ShoveError::Topology(format!("no metadata for topic {topic_name}")))?;
-    Ok(topic.partitions().len() as i32)
+    })
 }
 
 /// Generate an OAUTHBEARER token from `ctx` and set it on the admin client's

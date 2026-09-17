@@ -301,6 +301,11 @@ pub struct QueueTopology {
     /// [`TopologyBuilder::with_topic_config`]). Kafka-specific.
     #[cfg(feature = "kafka")]
     pub(crate) kafka_topic_config: Vec<(String, String)>,
+    /// When true, shove binds to an infra-owned Kafka topic instead of
+    /// creating, expanding or reconfiguring it (see
+    /// [`TopologyBuilder::kafka_external_topic`]). Kafka-specific.
+    #[cfg(feature = "kafka")]
+    pub(crate) kafka_external_topic: bool,
 }
 
 impl QueueTopology {
@@ -376,6 +381,15 @@ impl QueueTopology {
     #[cfg(feature = "kafka")]
     pub fn kafka_topic_config(&self) -> &[(String, String)] {
         &self.kafka_topic_config
+    }
+
+    /// Whether shove binds to an externally-provisioned Kafka topic rather
+    /// than creating it. When true, `declare()` verifies the topic exists and
+    /// fails fast if it doesn't, and never creates it, expands its partitions
+    /// or alters its config. Kafka-specific.
+    #[cfg(feature = "kafka")]
+    pub fn kafka_external_topic(&self) -> bool {
+        self.kafka_external_topic
     }
 
     pub fn shard_hold_queue_names(&self, shard_index: u16) -> Vec<HoldQueue> {
@@ -461,6 +475,8 @@ pub struct TopologyBuilder {
     kafka_retention_finite: bool,
     #[cfg(feature = "kafka")]
     kafka_retention_forever: bool,
+    #[cfg(feature = "kafka")]
+    kafka_external_topic: bool,
 }
 
 impl TopologyBuilder {
@@ -485,6 +501,8 @@ impl TopologyBuilder {
             kafka_retention_finite: false,
             #[cfg(feature = "kafka")]
             kafka_retention_forever: false,
+            #[cfg(feature = "kafka")]
+            kafka_external_topic: false,
         }
     }
 
@@ -745,6 +763,36 @@ impl TopologyBuilder {
         self.with_topic_config("max.message.bytes", bytes.to_string())
     }
 
+    /// Bind to an infra-owned Kafka topic instead of creating it.
+    ///
+    /// `declare()` verifies the topic (named after the queue) already exists
+    /// and **fails fast** if it doesn't. It never creates the topic, never
+    /// expands its partitions and never alters its config. Use this when infra
+    /// owns the topic (a Terraform module, a platform team's provisioning job)
+    /// or the credentials shove runs with carry no Create or Alter permission;
+    /// shove then only manages its consumer group and its own DLQ topic.
+    ///
+    /// The consumer group's `max_consumers` no longer sets a partition floor:
+    /// members beyond the topic's partition count sit idle, and `declare()`
+    /// logs a warning when that happens.
+    ///
+    /// Kafka-specific. Mutually exclusive with [`sequenced`](Self::sequenced),
+    /// which needs shove to own the partition count, and with every
+    /// topic-config method ([`with_topic_config`](Self::with_topic_config),
+    /// [`with_retention`](Self::with_retention),
+    /// [`with_retention_forever`](Self::with_retention_forever),
+    /// [`with_retention_bytes`](Self::with_retention_bytes),
+    /// [`with_cleanup_policy`](Self::with_cleanup_policy) and
+    /// [`with_max_message_bytes`](Self::with_max_message_bytes)), because an
+    /// external topic's config is owned by whoever provisions it. `build()`
+    /// panics if combined. `dlq()`, `dlq_named()`, `hold_queue()`,
+    /// `for_consumer_group()` and `broadcast()` stay available.
+    #[cfg(feature = "kafka")]
+    pub fn kafka_external_topic(mut self) -> Self {
+        self.kafka_external_topic = true;
+        self
+    }
+
     /// Enables strict per-key ordered delivery for this topic.
     ///
     /// Messages are routed through a consistent-hash exchange so that all
@@ -861,6 +909,8 @@ impl TopologyBuilder {
     ///   blank group name.
     /// - [`broadcast`](Self::broadcast) combined with `dlq()`, `dlq_named()`,
     ///   `hold_queue()`, `sequenced()` or `for_consumer_group()`.
+    /// - `kafka_external_topic()` combined with `sequenced()` or with any
+    ///   topic-config method (`kafka` feature).
     pub fn build(mut self) -> QueueTopology {
         if let Some(ref group) = self.consumer_group {
             assert!(
@@ -935,12 +985,35 @@ impl TopologyBuilder {
             );
         }
         #[cfg(feature = "kafka")]
-        assert!(
-            self.kafka_topic_config
-                .iter()
-                .all(|(k, _)| !k.trim().is_empty()),
-            "with_topic_config() keys must be non-empty"
-        );
+        {
+            assert!(
+                self.kafka_topic_config
+                    .iter()
+                    .all(|(k, _)| !k.trim().is_empty()),
+                "with_topic_config() keys must be non-empty"
+            );
+            // External mode skips topic creation and reconciliation, so it
+            // can't be combined with options that configure either.
+            if self.kafka_external_topic {
+                assert!(
+                    self.kafka_topic_config.is_empty(),
+                    "kafka_external_topic() cannot be combined with with_topic_config() or its \
+                     sugar (with_retention, with_retention_forever, with_retention_bytes, \
+                     with_cleanup_policy, with_max_message_bytes) - an external topic's config \
+                     is owned by whoever provisions it; this topology sets {}",
+                    self.kafka_topic_config
+                        .iter()
+                        .map(|(k, _)| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                assert!(
+                    self.sequencing.is_none(),
+                    "kafka_external_topic() cannot be combined with sequenced() - sequencing \
+                     requires shove to own the topic's partition count"
+                );
+            }
+        }
         if let Some(ref seq) = self.sequencing {
             assert!(
                 seq.routing_shards > 0,
@@ -1011,6 +1084,8 @@ impl TopologyBuilder {
             nats_stream_config: self.nats_stream_config,
             #[cfg(feature = "kafka")]
             kafka_topic_config: self.kafka_topic_config,
+            #[cfg(feature = "kafka")]
+            kafka_external_topic: self.kafka_external_topic,
         }
     }
 }
@@ -1769,6 +1844,121 @@ mod tests {
                 .hold_queue(Duration::from_secs(5))
                 .dlq()
                 .nats_external_stream()
+                .build();
+        }
+    }
+
+    // -- Kafka external topic (infra-owned bind) --
+
+    #[cfg(feature = "kafka")]
+    mod kafka_external_topic {
+        use super::*;
+
+        #[test]
+        fn builder_defaults_to_a_shove_owned_topic() {
+            let topology = TopologyBuilder::new("orders").build();
+            assert!(!topology.kafka_external_topic());
+        }
+
+        #[test]
+        fn builder_external_topic_sets_flag() {
+            let topology = TopologyBuilder::new("orders")
+                .kafka_external_topic()
+                .build();
+            assert!(topology.kafka_external_topic());
+            assert!(topology.kafka_topic_config().is_empty());
+        }
+
+        /// The retry chain and the fan-out shapes stay allowed: shove owns
+        /// its DLQ in both modes, a hold delay is a deferred republish to the
+        /// same topic, and a group name or a broadcast never touches the
+        /// topic itself.
+        #[test]
+        fn external_topic_keeps_dlq_hold_queues_group_and_broadcast() {
+            let topology = TopologyBuilder::new("orders")
+                .kafka_external_topic()
+                .for_consumer_group("pricing")
+                .dlq()
+                .hold_queue(Duration::from_secs(5))
+                .build();
+            assert!(topology.kafka_external_topic());
+            assert!(topology.dlq().is_some());
+            assert_eq!(topology.hold_queues().len(), 1);
+            assert_eq!(topology.consumer_group(), Some("pricing"));
+
+            let broadcast = TopologyBuilder::new("orders")
+                .kafka_external_topic()
+                .broadcast()
+                .build();
+            assert!(broadcast.kafka_external_topic());
+            assert!(broadcast.broadcast());
+        }
+
+        #[test]
+        #[should_panic(expected = "kafka_external_topic() cannot be combined with sequenced()")]
+        fn external_with_sequenced_panics() {
+            let _ = TopologyBuilder::new("q")
+                .sequenced(SequenceFailure::Skip)
+                .routing_shards(4)
+                .hold_queue(Duration::from_secs(5))
+                .dlq()
+                .kafka_external_topic()
+                .build();
+        }
+
+        #[test]
+        #[should_panic(
+            expected = "kafka_external_topic() cannot be combined with with_topic_config()"
+        )]
+        fn external_with_topic_config_panics() {
+            let _ = TopologyBuilder::new("q")
+                .kafka_external_topic()
+                .with_topic_config("retention.ms", "3600000")
+                .build();
+        }
+
+        #[test]
+        #[should_panic(expected = "this topology sets retention.ms")]
+        fn external_with_retention_panics() {
+            let _ = TopologyBuilder::new("q")
+                .with_retention(Duration::from_secs(3600))
+                .kafka_external_topic()
+                .build();
+        }
+
+        #[test]
+        #[should_panic(expected = "this topology sets retention.ms")]
+        fn external_with_retention_forever_panics() {
+            let _ = TopologyBuilder::new("q")
+                .kafka_external_topic()
+                .with_retention_forever()
+                .build();
+        }
+
+        #[test]
+        #[should_panic(expected = "this topology sets retention.bytes")]
+        fn external_with_retention_bytes_panics() {
+            let _ = TopologyBuilder::new("q")
+                .kafka_external_topic()
+                .with_retention_bytes(1_000_000)
+                .build();
+        }
+
+        #[test]
+        #[should_panic(expected = "this topology sets cleanup.policy")]
+        fn external_with_cleanup_policy_panics() {
+            let _ = TopologyBuilder::new("q")
+                .kafka_external_topic()
+                .with_cleanup_policy(KafkaCleanupPolicy::Compact)
+                .build();
+        }
+
+        #[test]
+        #[should_panic(expected = "this topology sets max.message.bytes")]
+        fn external_with_max_message_bytes_panics() {
+            let _ = TopologyBuilder::new("q")
+                .kafka_external_topic()
+                .with_max_message_bytes(1_048_576)
                 .build();
         }
     }

@@ -158,3 +158,6 @@ See [Sequenced Topics](/guides/sequenced) for the full story.
 ## Topology declaration
 
 Before publishing or consuming, call `broker.topology().declare::<MyTopic>().await?` once at startup. This call is idempotent — the backend creates queues, exchanges, streams, and any other infrastructure the topology requires, and does nothing if they already exist. It is safe to call on every restart.
+
+Two backends can bind to infrastructure that infra owns instead of creating it: `nats_external_stream()` on NATS and `kafka_external_topic()` on Kafka.
+With either flag, `declare` verifies that the stream or topic exists and fails fast when it does not, while shove still creates its own DLQ.
