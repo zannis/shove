@@ -94,7 +94,9 @@ Swap `InMemory` for `RabbitMq`, `Sqs`, `Nats`, `Kafka`, or `Redis` and the topic
 
 `cargo add shove --features <flag>`. Need help choosing? [Choosing a backend](https://shove.rs/backends/choosing).
 
-Optional add-ons: `audit`, `metrics`, `kafka-ssl`, `kafka-msk-iam`, `kafka-schema-registry`, `rabbitmq-transactional`, `pub-aws-sns` (SNS publishing on its own, without the SQS consumer), `protobuf`, `sbe`, `env-config`. Codec details, including the zero-copy SBE path: [Codecs](https://shove.rs/concepts/codecs). Configuring the tuning knobs from environment variables: [Environment Configuration](https://shove.rs/ops/env-config).
+Optional add-ons: `audit`, `metrics`, `kafka-ssl`, `kafka-gssapi`, `kafka-msk-iam`, `kafka-schema-registry`, `rabbitmq-transactional`, `pub-aws-sns` (SNS publishing on its own, without the SQS consumer), `protobuf`, `sbe`, `env-config`.
+Codec details, including the zero-copy SBE path: [Codecs](https://shove.rs/concepts/codecs).
+Configuring the tuning knobs from environment variables: [Environment Configuration](https://shove.rs/ops/env-config).
 
 ## Delivery
 

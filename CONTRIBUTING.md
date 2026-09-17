@@ -63,7 +63,7 @@ Per-backend feature sets (matching the CI matrix):
 | rabbitmq | `rabbitmq,audit,rabbitmq-transactional,metrics,sbe` |
 | aws-sns-sqs | `pub-aws-sns,aws-sns-sqs,audit,metrics,sbe` |
 | nats | `nats,audit,metrics,sbe,env-config` |
-| kafka | `kafka,kafka-ssl,kafka-msk-iam,test-support,audit,metrics,sbe,env-config` |
+| kafka | `kafka,kafka-ssl,kafka-gssapi,kafka-msk-iam,test-support,audit,metrics,sbe,env-config` |
 | kafka (schema registry) | `kafka,kafka-schema-registry,protobuf` |
 | redis-streams | `redis-streams,metrics,sbe` |
 
@@ -73,8 +73,9 @@ compiles them to zero tests and reports green without having run any of them.
 The authoritative copy is the `coverage` matrix in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
-The Kafka feature set also needs system libraries on Linux:
-`librdkafka-dev` and `libsasl2-dev`.
+The Kafka feature set also needs system libraries on Linux: `librdkafka-dev`,
+plus `libsasl2-dev` for `kafka-gssapi` (Cyrus SASL). `kafka-ssl` alone links
+OpenSSL only, and CI asserts that with `cargo tree ... -i sasl2-sys`.
 
 Backends that need no secrets (inmemory, rabbitmq, nats, kafka, redis-streams)
 can be run without `dotenvx`:

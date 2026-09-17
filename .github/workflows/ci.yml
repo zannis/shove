@@ -61,6 +61,11 @@ jobs:
       # feature no coverage entry enables can rot silently.
       - run: cargo clippy -q --all-features --all-targets -- -D warnings
       - run: cargo clippy -q --no-default-features --all-targets -- -D warnings
+      # `kafka-ssl` must not link Cyrus SASL: SCRAM and OAUTHBEARER are native
+      # to librdkafka's SSL build, and only `kafka-gssapi` may pull `sasl2-sys`.
+      # `cargo tree -i` exits non-zero when the package is absent from the
+      # graph, which is the outcome this step asserts.
+      - run: '! cargo tree -e features --no-default-features --features kafka-ssl -i sasl2-sys'
       - run: cargo test --no-default-features
       # The schema-registry mock suite drives an in-process axum registry, so
       # unlike the other two SR files it needs no Docker (11 tests, ~0.2s) and
@@ -114,7 +119,7 @@ jobs:
             pub-aws-sns,metrics \
             pub-aws-sns,aws-sns-sqs,audit,metrics,sbe \
             nats,audit,metrics,sbe,env-config \
-            kafka,kafka-ssl,kafka-msk-iam,test-support,audit,metrics,sbe,env-config \
+            kafka,kafka-ssl,kafka-gssapi,kafka-msk-iam,test-support,audit,metrics,sbe,env-config \
             kafka,kafka-schema-registry,protobuf \
             redis-streams,metrics,sbe \
           ; do
@@ -270,7 +275,10 @@ jobs:
             # kafka+inmemory) an executable target here, so the stress
             # harness's Kafka batch-knob wiring tests actually run in CI
             # instead of only type-checking under the clippy gate.
-            features: kafka,kafka-ssl,kafka-msk-iam,test-support,audit,metrics,sbe,env-config,inmemory
+            # `kafka-gssapi` gates no shove code; it is here so the Cyrus SASL
+            # link is exercised in one test job, since `kafka-ssl` no longer
+            # pulls it (the `check` job asserts that with `cargo tree`).
+            features: kafka,kafka-ssl,kafka-gssapi,kafka-msk-iam,test-support,audit,metrics,sbe,env-config,inmemory
           - name: kafka-schema-registry
             # Split out from the `kafka` entry rather than folded into it: the
             # two schema-registry suites each pin FIXED host ports (cp stack
