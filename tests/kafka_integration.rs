@@ -184,6 +184,26 @@ shove::define_topic!(
     SimpleMessage,
     TopologyBuilder::new("kafka-tail-only").build()
 );
+// An infra-owned topic shove binds to but never creates, expands or alters.
+// The DLQ stays shove-owned in this mode.
+shove::define_topic!(
+    ExternalOwnedTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-owned")
+        .kafka_external_topic()
+        .dlq()
+        .build()
+);
+
+// An external topic nobody provisions: declaring it must fail, not create it.
+shove::define_topic!(
+    ExternalMissingTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-missing")
+        .kafka_external_topic()
+        .build()
+);
+
 
 // ---------------------------------------------------------------------------
 // Test harness: shared setup
@@ -317,6 +337,64 @@ async fn live_topic_config(brokers: &str, topic: &str, key: &str) -> Option<Stri
     resource.entry_map().get(key).and_then(|e| e.value.clone())
 }
 
+/// Create `topic` with `partitions` partitions through a raw admin client,
+/// standing in for the infrastructure that owns an external topic, and wait
+/// until the broker's metadata shows it.
+async fn provision_topic(brokers: &str, topic: &str, partitions: i32) {
+    use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+    use rdkafka::client::DefaultClientContext;
+
+    let admin: AdminClient<DefaultClientContext> = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create admin client");
+    let results = admin
+        .create_topics(
+            [&NewTopic::new(
+                topic,
+                partitions,
+                TopicReplication::Fixed(1),
+            )],
+            &AdminOptions::new(),
+        )
+        .await
+        .expect("create_topics failed");
+    assert!(
+        matches!(results.as_slice(), [Ok(name)] if name == topic),
+        "provisioning {topic} failed: {results:?}"
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    while live_partition_count(brokers, topic) != Some(partitions as usize) {
+        assert!(
+            Instant::now() < deadline,
+            "{topic} did not show up in metadata with {partitions} partitions"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The broker's view of `topic`: `None` when it has no such topic, else the
+/// partition count. Read through a consumer-type client with no `group.id`
+/// and auto-creation disabled, so the probe itself can neither create the
+/// topic nor register a group.
+fn live_partition_count(brokers: &str, topic: &str) -> Option<usize> {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("allow.auto.create.topics", "false")
+        .create()
+        .expect("failed to create metadata probe");
+    let metadata = probe
+        .fetch_metadata(Some(topic), Duration::from_secs(10))
+        .expect("failed to fetch topic metadata");
+    let candidate = metadata.topics().iter().find(|t| t.name() == topic)?;
+    if candidate.error().is_some() || candidate.partitions().is_empty() {
+        return None;
+    }
+    Some(candidate.partitions().len())
+}
+
 /// Wait until the broker reports `group` as `Stable` with at least one
 /// member, so a record published afterwards lands after the group's
 /// assignment was taken.
@@ -427,6 +505,22 @@ impl MessageHandler<NoDlqTopic> for CountingHandler {
 }
 
 impl MessageHandler<DeferNoHoldTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<ExternalOwnedTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<ExternalMissingTopic> for CountingHandler {
     type Context = ();
     async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.counter.increment();
@@ -2234,6 +2328,116 @@ async fn supervisor_with_auto_offset_reset_latest_skips_history() {
     token.cancel();
     let outcome = sup_handle.await.unwrap();
     assert!(outcome.is_clean());
+    broker.close().await;
+}
+
+/// `kafka_external_topic()` binds to a topic infra created. Registering a
+/// group whose `max_consumers` exceeds the partition count consumes through
+/// it and leaves the partition count exactly as infra set it, while the DLQ
+/// is still shove's to create.
+#[tokio::test]
+async fn external_topic_is_never_created_or_expanded() {
+    const TOPIC: &str = "kafka-external-owned";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 3).await;
+
+    let broker = tb.broker();
+    let handler = CountingHandler::new();
+    let handler_clone = handler.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<ExternalOwnedTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=8)),
+            move || handler_clone.clone(),
+        )
+        .await
+        .expect("registering against a provisioned external topic must succeed");
+    assert_eq!(
+        live_partition_count(tb.brokers(), TOPIC),
+        Some(3),
+        "declare must not expand an external topic towards max_consumers"
+    );
+    assert!(
+        live_partition_count(tb.brokers(), "kafka-external-owned-dlq").is_some(),
+        "the DLQ is shove's own topic and is still created"
+    );
+
+    let publisher = broker.publisher().await.unwrap();
+    let messages: Vec<SimpleMessage> = (1..=5)
+        .map(|i| SimpleMessage {
+            id: format!("ext-{i}"),
+            content: format!("msg {i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<ExternalOwnedTopic>(&messages)
+        .await
+        .unwrap();
+
+    let token = group.cancellation_token();
+    let counter = handler.counter.clone();
+    let t = token.clone();
+    tokio::spawn(async move {
+        counter.wait_for(5, Duration::from_secs(60)).await;
+        t.cancel();
+    });
+    let outcome = group
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean());
+    assert_eq!(handler.counter.get(), 5);
+
+    assert_eq!(
+        live_partition_count(tb.brokers(), TOPIC),
+        Some(3),
+        "consuming must not expand the external topic either"
+    );
+    broker.close().await;
+}
+
+/// A missing external topic is a startup error, not a silent auto-create:
+/// `declare` returns `Topology`, the registry path surfaces the same error,
+/// and the topic is still absent afterwards, so the verification fetch
+/// itself created nothing.
+#[tokio::test]
+async fn external_topic_missing_fails_fast_at_declare() {
+    const TOPIC: &str = "kafka-external-missing";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+
+    let err = broker
+        .topology()
+        .declare::<ExternalMissingTopic>()
+        .await
+        .expect_err("declare must refuse a topic nobody provisioned");
+    assert!(
+        matches!(err, shove::ShoveError::Topology(_)),
+        "expected Topology, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("kafka_external_topic")
+            && err.to_string().contains("must be provisioned"),
+        "{err}"
+    );
+    assert_eq!(
+        live_partition_count(tb.brokers(), TOPIC),
+        None,
+        "the verification fetch must not auto-create the topic"
+    );
+
+    let mut group = broker.consumer_group();
+    let err = group
+        .register::<ExternalMissingTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            CountingHandler::new,
+        )
+        .await
+        .expect_err("register must refuse a topic nobody provisioned");
+    assert!(
+        matches!(err, shove::ShoveError::Topology(_)),
+        "expected Topology, got {err:?}"
+    );
+    assert_eq!(live_partition_count(tb.brokers(), TOPIC), None);
     broker.close().await;
 }
 
