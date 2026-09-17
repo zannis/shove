@@ -315,10 +315,25 @@ impl FetchCtx {
             };
             match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    return resp
-                        .json()
-                        .await
-                        .map_err(|e| SchemaRegistryError::Decode(e.to_string()));
+                    // The status is the registry's answer, but the body has
+                    // still to arrive. A connection that drops mid-body is a
+                    // transport failure like a failed send, not a malformed
+                    // answer, so it is retried the same way and surfaces as
+                    // retriable. Only a body that arrived whole and does not
+                    // parse is `Decode`, the registry's fault.
+                    match resp.bytes().await {
+                        Ok(body) => {
+                            return serde_json::from_slice(&body)
+                                .map_err(|e| SchemaRegistryError::Decode(e.to_string()));
+                        }
+                        Err(e) if attempt >= self.max_retries => {
+                            return Err(SchemaRegistryError::Transport {
+                                retriable: true,
+                                message: format!("response body read failed: {e}"),
+                            });
+                        }
+                        Err(_) => {}
+                    }
                 }
                 Ok(resp) if resp.status().as_u16() == 404 => {
                     return Err(not_found);
@@ -354,11 +369,20 @@ impl FetchCtx {
                         message,
                     });
                 }
-                Ok(resp) if resp.status().is_server_error() => {
+                // A 5xx is the registry failing; 429 is it shedding load and
+                // 408 is it giving up on a slow request. All three are answers
+                // about *now*, not about the deployment, and a client that
+                // repeats the request later gets through. Confluent's registry
+                // documents 429 for rate limiting; a non-retriable reading
+                // would end the consumer on a busy registry.
+                Ok(resp)
+                    if resp.status().is_server_error()
+                        || matches!(resp.status().as_u16(), 408 | 429) =>
+                {
                     if attempt >= self.max_retries {
                         return Err(SchemaRegistryError::Transport {
                             retriable: true,
-                            message: format!("server error {}", resp.status()),
+                            message: format!("retriable status {}", resp.status()),
                         });
                     }
                 }

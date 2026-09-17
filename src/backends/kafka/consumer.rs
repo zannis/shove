@@ -64,9 +64,13 @@ use crate::schema_registry::decode::{RegistryDecode, registry_decode};
 #[cfg(feature = "kafka-schema-registry")]
 use crate::schema_registry::default_subject;
 #[cfg(feature = "kafka-schema-registry")]
-use crate::schema_registry::{SchemaEnforcement, SchemaRegistry, WireFormat};
+use crate::schema_registry::{
+    SchemaEnforcement, SchemaId, SchemaRegistry, SchemaRegistryError, WireFormat,
+};
 
 use super::client::KafkaClient;
+#[cfg(feature = "kafka-schema-registry")]
+use super::constants::REGISTRY_RETRY_DELAY;
 use super::constants::{
     DEATH_COUNT_HEADER, DEATH_REASON_HEADER, FETCH_MIN_BYTES, FETCH_WAIT_MAX_MS,
     MAX_POLL_INTERVAL_MS, MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER, ORIGINAL_QUEUE_HEADER,
@@ -916,6 +920,133 @@ fn signal_completion(
     true
 }
 
+/// The wait a consume loop performs while the schema registry cannot answer
+/// for the record in hand.
+///
+/// Such a record is neither poison nor processed: discarding it would turn a
+/// registry outage into data loss, and skipping it would break at-least-once.
+/// So the loop keeps the record, pauses its assignment the way the
+/// external-topic loop does while every permit is held by a waiting handler,
+/// and decodes the same bytes again every `REGISTRY_RETRY_DELAY` until the
+/// registry answers or shutdown fires. Each wait counts one
+/// `messages_failed_total{reason="schema_unavailable"}` and warns with the
+/// schema id; nothing terminal is recorded, so `messages_discarded_total`
+/// does not move.
+///
+/// The wait keeps polling `recv()`, so the member stays in its group for
+/// the whole outage instead of being evicted at `max.poll.interval.ms`. A
+/// paused assignment yields nothing; the one thing `recv()` can still hand
+/// over is a record from a partition the group assigned after the pause
+/// took effect. That record is put back (see [`put_back`]) and the pause is
+/// widened to the new assignment, so it is delivered again, in order, once
+/// the wait ends.
+#[cfg(feature = "kafka-schema-registry")]
+#[derive(Default)]
+struct RegistryStall {
+    paused: bool,
+    /// Whether the consumer never joins a group, as the broadcast
+    /// subscription does not. Its inert group id still provokes a
+    /// `GroupAuthorizationFailed` on every coordinator lookup under a
+    /// restrictive ACL; the receive arm tolerates that answer, and so must
+    /// the wait, or an outage would turn it into a reconnect.
+    groupless: bool,
+}
+
+#[cfg(feature = "kafka-schema-registry")]
+impl RegistryStall {
+    /// A stall for the groupless broadcast subscription, see `groupless`.
+    fn groupless() -> Self {
+        Self {
+            paused: false,
+            groupless: true,
+        }
+    }
+
+    /// Pause on the first wait, count and warn, then wait out
+    /// `REGISTRY_RETRY_DELAY` while still polling. `Ok(false)` means shutdown
+    /// fired during the wait.
+    #[allow(clippy::too_many_arguments)]
+    async fn wait(
+        &mut self,
+        consumer: &KafkaStreamConsumer,
+        shutdown: &CancellationToken,
+        topic: &str,
+        group: Option<&str>,
+        queue: &str,
+        id: SchemaId,
+        error: &SchemaRegistryError,
+    ) -> Result<bool> {
+        if !self.paused {
+            consumer
+                .pause_assignment()
+                .map_err(|e| map_kafka_error("pause failed", e))?;
+            self.paused = true;
+        }
+        tracing::warn!(
+            queue,
+            schema_id = %id,
+            error = %error,
+            retry_after = ?REGISTRY_RETRY_DELAY,
+            "schema registry unavailable; keeping the record and retrying"
+        );
+        metrics::record_failed(topic, group, metrics::FailReason::SchemaUnavailable);
+        let retry = tokio::time::sleep(REGISTRY_RETRY_DELAY);
+        tokio::pin!(retry);
+        loop {
+            tokio::select! {
+                _ = &mut retry => return Ok(true),
+                _ = shutdown.cancelled() => return Ok(false),
+                received = consumer.recv() => {
+                    let msg = match received {
+                        Ok(msg) => msg,
+                        Err(e) if self.groupless && is_ignorable_groupless_error(&e) => continue,
+                        Err(e) => {
+                            return Err(map_kafka_error(
+                                &format!("consumer recv error on {queue} during a schema registry wait"),
+                                e,
+                            ));
+                        }
+                    };
+                    put_back(consumer, queue, msg.partition(), msg.offset())?;
+                    consumer
+                        .pause_assignment()
+                        .map_err(|e| map_kafka_error("pause failed", e))?;
+                    tracing::debug!(
+                        queue,
+                        partition = msg.partition(),
+                        offset = msg.offset(),
+                        "record from a partition assigned during a schema registry wait put back; pause widened"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Resume the assignment once the registry has answered.
+    fn end(&mut self, consumer: &KafkaStreamConsumer) -> Result<()> {
+        if self.paused {
+            consumer
+                .resume_assignment()
+                .map_err(|e| map_kafka_error("resume failed", e))?;
+            self.paused = false;
+        }
+        Ok(())
+    }
+}
+
+/// What the registry decode stage left a consume loop with, once any
+/// registry wait is over.
+#[cfg(feature = "kafka-schema-registry")]
+enum Staged<M> {
+    /// Decoded: hand it to the handler.
+    Ready(M),
+    /// A pre-handler drop under this reason pair.
+    Drop(metrics::FailReason, &'static str),
+    /// Shutdown fired during a registry wait. The record is untouched and
+    /// uncommitted; the loop's shutdown arm takes over.
+    Stop,
+}
+
 /// Count and settle a message dropped before the handler on the concurrent
 /// path: the failure is recorded now, the DLQ publish is attempted, and the
 /// discard accounting rides the offset into the tracker (same transport the
@@ -1416,6 +1547,12 @@ enum InPlaceEnd {
     /// Shutdown fired during a wait. Nothing was completed, so the record is
     /// redelivered on restart.
     Cancelled,
+    /// The schema registry answered with a deployment fault while the record
+    /// was being decoded again. Nothing is completed: the record stays
+    /// uncommitted, and the receive loop meets the same fault on its next
+    /// record and stops.
+    #[cfg(feature = "kafka-schema-registry")]
+    Fatal(ShoveError),
 }
 
 /// The delay before an in-place redelivery: the tier `hold_index` picks for a
@@ -1520,10 +1657,34 @@ where
         if increment {
             attempts += 1;
         }
-        let message = match decode_batch_message::<T>(decode, payload).await {
-            BatchDecode::Decoded(m) => m,
-            BatchDecode::Dlq { reason, fail } => {
-                return InPlaceEnd::Undecodable { reason, fail };
+        // Loops only through the registry wait arm, which the
+        // `kafka-schema-registry` feature adds.
+        #[allow(clippy::never_loop)]
+        let message = loop {
+            match decode_batch_message::<T>(decode, payload).await {
+                BatchDecode::Decoded(m) => break m,
+                BatchDecode::Dlq { reason, fail } => {
+                    return InPlaceEnd::Undecodable { reason, fail };
+                }
+                // An outage during the redelivery: keep waiting on the same
+                // bytes, as the receive loop would.
+                #[cfg(feature = "kafka-schema-registry")]
+                BatchDecode::Unavailable { id, error } => {
+                    tracing::warn!(
+                        queue = topic,
+                        schema_id = %id,
+                        error = %error,
+                        retry_after = ?REGISTRY_RETRY_DELAY,
+                        "schema registry unavailable during an in-place redelivery; keeping the record"
+                    );
+                    metrics::record_failed(topic, group, metrics::FailReason::SchemaUnavailable);
+                    tokio::select! {
+                        _ = tokio::time::sleep(REGISTRY_RETRY_DELAY) => {}
+                        _ = shutdown.cancelled() => return InPlaceEnd::Cancelled,
+                    }
+                }
+                #[cfg(feature = "kafka-schema-registry")]
+                BatchDecode::Fatal(e) => return InPlaceEnd::Fatal(e),
             }
         };
         let mut metadata = build_message_metadata(headers, true, coordinates);
@@ -2789,7 +2950,9 @@ struct BatchDecodeCtx<'a> {
     schema_message_index: Option<&'a [i32]>,
 }
 
-/// Outcome of decoding one message on its way into a batch.
+/// Outcome of decoding one message on its way into a batch. Also the decode
+/// stage of an in-place redelivery and of a broadcast redelivery, which
+/// decode the retained bytes again through the same context.
 enum BatchDecode<M> {
     Decoded(M),
     /// Undecodable: park the wire bytes for the DLQ under this reason, to be
@@ -2800,6 +2963,17 @@ enum BatchDecode<M> {
         reason: &'static str,
         fail: metrics::FailReason,
     },
+    /// The schema registry could not answer for `id` right now; the caller
+    /// keeps the bytes and decodes them again later.
+    #[cfg(feature = "kafka-schema-registry")]
+    Unavailable {
+        id: SchemaId,
+        error: SchemaRegistryError,
+    },
+    /// The schema registry answered with a deployment fault; the consumer
+    /// stops rather than waiting on it.
+    #[cfg(feature = "kafka-schema-registry")]
+    Fatal(ShoveError),
 }
 
 /// Decodes one message on its way into a batch, routing anything undecodable to
@@ -2852,6 +3026,9 @@ async fn decode_batch_message<T: Topic>(
                 reason,
                 fail: metrics::FailReason::for_schema_reason(reason),
             },
+            Ok(RegistryDecode::Unavailable { id, error }) => BatchDecode::Unavailable { id, error },
+            // A deployment fault, not an outage: stop instead of waiting.
+            Err(e @ ShoveError::Topology(_)) => BatchDecode::Fatal(e),
             Err(e) => {
                 tracing::error!(
                     error = %e,
@@ -2935,10 +3112,11 @@ struct BatchBuffer<T: Topic> {
     /// the commit makes it exactly one — and the publish still precedes the
     /// commit, so the payload is never lost. See [`Self::flush_len`].
     dropped: Vec<DroppedMessage>,
-    /// First offset seen per partition — where a non-`Ack` outcome seeks back
-    /// to. Always has the same key set as `end`.
+    /// Lowest offset seen per partition, where a non-`Ack` outcome seeks
+    /// back to. Always has the same key set as `end`.
     start: HashMap<i32, i64>,
-    /// Exclusive end offset per partition — what an `Ack` commits.
+    /// Exclusive end offset per partition, one past the highest offset seen,
+    /// which is what an `Ack` commits.
     end: HashMap<i32, i64>,
 }
 
@@ -2975,12 +3153,26 @@ impl<T: Topic> BatchBuffer<T> {
         self.messages.len() + self.dropped.len()
     }
 
-    /// Extends the offset span to cover `offset` on `partition`. The
-    /// exclusive end saturates at `i64::MAX`, as `PartitionTracker::position`
-    /// does, so the batch commit path carries no unchecked arithmetic.
+    /// Extends the offset span to cover `offset` on `partition`.
+    ///
+    /// Both bounds are taken against what the span already holds rather
+    /// than assumed from arrival order: `start` only ever moves down and
+    /// `end` only ever moves up. A record that reaches the buffer out of
+    /// offset order can then neither raise the seek target above records
+    /// the handler never acked nor pull the commit position below records
+    /// it did. The exclusive end saturates at `i64::MAX`, as
+    /// `PartitionTracker::position` does, so the batch commit path carries
+    /// no unchecked arithmetic.
     fn extend_span(&mut self, partition: i32, offset: i64) {
-        self.start.entry(partition).or_insert(offset);
-        self.end.insert(partition, offset.saturating_add(1));
+        let end = offset.saturating_add(1);
+        self.start
+            .entry(partition)
+            .and_modify(|start| *start = (*start).min(offset))
+            .or_insert(offset);
+        self.end
+            .entry(partition)
+            .and_modify(|current| *current = (*current).max(end))
+            .or_insert(end);
     }
 
     fn push(&mut self, message: T::Message, metadata: MessageMetadata, raw: Option<RawMessage>) {
@@ -3123,7 +3315,9 @@ async fn settle_dropped(
 /// `Retry`/`Defer` flushes and is reset on `Ack`.
 ///
 /// The buffer is left empty on every path; the caller only has to disarm the
-/// deadline.
+/// deadline. The returned [`Flushed`] says whether the span's offsets
+/// advanced or were rewound, because a caller holding a record that arrived
+/// after the span must not buffer it ahead of a rewound span.
 ///
 /// The handler itself is invoked through [`invoke_batch_handler`] —
 /// shared batching machinery, not Kafka-specific — which supplies the
@@ -3136,7 +3330,7 @@ async fn flush_batch<T, H>(
     ctx: &H::Context,
     buffer: &mut BatchBuffer<T>,
     redelivery_backoff: &mut Backoff,
-) -> Result<()>
+) -> Result<Flushed>
 where
     T: Topic,
     H: BatchMessageHandler<T>,
@@ -3163,7 +3357,7 @@ where
     // across restarts, forever.
     if batch_size == 0 {
         if buffer.end.is_empty() {
-            return Ok(());
+            return Ok(Flushed::Committed);
         }
         let dropped = std::mem::take(&mut buffer.dropped);
         let unsettled = settle_dropped(flush, dropped).await;
@@ -3175,7 +3369,7 @@ where
         committed?;
         tracing::debug!(queue, "committed offsets past a fully-dropped batch");
         buffer.clear();
-        return Ok(());
+        return Ok(Flushed::Committed);
     }
 
     let messages = std::mem::take(&mut buffer.messages);
@@ -3199,7 +3393,7 @@ where
     // The *selection* of which arm runs is the shared classifier; the
     // mechanics inside each arm (offset commits, seeks, DLQ publishes) are
     // Kafka's own and untouched by the move.
-    match settle_batch_outcome(&outcome) {
+    let flushed = match settle_batch_outcome(&outcome) {
         BatchSettlement::Commit => {
             let dropped = std::mem::take(&mut buffer.dropped);
             let unsettled = settle_dropped(flush, dropped).await;
@@ -3212,6 +3406,7 @@ where
             *redelivery_backoff = batch_redelivery_backoff();
             tracing::debug!(queue, batch_size, "batch committed");
             buffer.clear();
+            Flushed::Committed
         }
         // `Reject` means terminal-do-not-retry everywhere else in shove, and
         // it has to mean that here too: routing it through the seek-back arm
@@ -3288,6 +3483,7 @@ where
             committed?;
             *redelivery_backoff = batch_redelivery_backoff();
             buffer.clear();
+            Flushed::Committed
         }
         BatchSettlement::Redeliver => {
             let delay = next_redelivery_delay(redelivery_backoff);
@@ -3346,9 +3542,21 @@ where
                 () = tokio::time::sleep(delay) => {}
                 () = shutdown.cancelled() => {}
             }
+            Flushed::Redelivered
         }
-    }
-    Ok(())
+    };
+    Ok(flushed)
+}
+
+/// How [`flush_batch`] left the span it flushed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flushed {
+    /// The span's offsets were committed (an `Ack`, a `Reject`, or a span of
+    /// nothing but pre-handler drops). The broker will not deliver them again.
+    Committed,
+    /// The span's partitions were sought back to its start. Every record in
+    /// it is delivered again, in offset order, on the next polls.
+    Redelivered,
 }
 
 /// Drains librdkafka's rebalance events, returning the partitions of this
@@ -4160,33 +4368,74 @@ impl KafkaConsumer {
                             #[cfg(feature = "kafka-schema-registry")]
                             let payload: T::Message = if let Some(registry) = schema_registry.as_ref() {
                                 let codec_name = <T::Codec as crate::Codec<T::Message>>::NAME;
-                                let registry_result = match WireFormat::from_codec_name(codec_name) {
-                                    Some(fmt) => registry_decode::<T::Message, T::Codec>(
-                                        registry,
-                                        fmt,
-                                        schema_enforcement,
-                                        &schema_accepted,
-                                        schema_message_index.as_deref(),
-                                        payload_slice,
-                                    ).await,
+                                let staged = match WireFormat::from_codec_name(codec_name) {
+                                    Some(fmt) => {
+                                        // An unavailable registry stalls this
+                                        // record instead of discarding it; see
+                                        // `RegistryStall`.
+                                        let mut stall = RegistryStall::default();
+                                        let staged = loop {
+                                            match registry_decode::<T::Message, T::Codec>(
+                                                registry,
+                                                fmt,
+                                                schema_enforcement,
+                                                &schema_accepted,
+                                                schema_message_index.as_deref(),
+                                                payload_slice,
+                                            ).await {
+                                                Ok(RegistryDecode::Decoded(m)) => break Staged::Ready(m),
+                                                Ok(RegistryDecode::Dlq(reason)) => break Staged::Drop(
+                                                    metrics::FailReason::for_schema_reason(reason),
+                                                    reason,
+                                                ),
+                                                Ok(RegistryDecode::Unavailable { id, error }) => {
+                                                    if !stall
+                                                        .wait(&consumer, &shutdown, &topic, group.as_deref(), queue, id, &error)
+                                                        .await?
+                                                    {
+                                                        break Staged::Stop;
+                                                    }
+                                                }
+                                                // A deployment fault, not an outage: stop
+                                                // instead of waiting on it.
+                                                Err(e @ ShoveError::Topology(_)) => return Err(e),
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        error = %e,
+                                                        queue,
+                                                        "failed to deserialize message, sending to DLQ"
+                                                    );
+                                                    break Staged::Drop(
+                                                        metrics::FailReason::Deserialize,
+                                                        "deserialization_error",
+                                                    );
+                                                }
+                                            }
+                                        };
+                                        stall.end(&consumer)?;
+                                        staged
+                                    }
                                     None => {
                                         tracing::error!(
                                             codec = codec_name,
                                             queue,
                                             "codec has no Confluent wire format; routing to DLQ"
                                         );
-                                        Ok(RegistryDecode::Dlq("schema_unsupported_codec"))
+                                        Staged::Drop(
+                                            metrics::FailReason::for_schema_reason("schema_unsupported_codec"),
+                                            "schema_unsupported_codec",
+                                        )
                                     }
                                 };
-                                match registry_result {
-                                    Ok(RegistryDecode::Decoded(m)) => m,
-                                    Ok(RegistryDecode::Dlq(reason)) => {
+                                match staged {
+                                    Staged::Ready(m) => m,
+                                    Staged::Drop(fail, reason) => {
                                         discard_pre_handler(
                                             &client,
                                             topology,
                                             &topic,
                                             group.as_deref(),
-                                            metrics::FailReason::for_schema_reason(reason),
+                                            fail,
                                             reason,
                                             payload_slice,
                                             key.as_deref(),
@@ -4198,29 +4447,9 @@ impl KafkaConsumer {
                                         .await;
                                         continue;
                                     }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            error = %e,
-                                            queue,
-                                            "failed to deserialize message, sending to DLQ"
-                                        );
-                                        discard_pre_handler(
-                                            &client,
-                                            topology,
-                                            &topic,
-                                            group.as_deref(),
-                                            metrics::FailReason::Deserialize,
-                                            "deserialization_error",
-                                            payload_slice,
-                                            key.as_deref(),
-                                            &headers,
-                                            &completion_tx,
-                                            partition,
-                                            offset,
-                                        )
-                                        .await;
-                                        continue;
-                                    }
+                                    // The record is untouched; the shutdown arm of
+                                    // the select above drains and commits the rest.
+                                    Staged::Stop => continue,
                                 }
                             } else {
                                 match <T::Codec as crate::Codec<T::Message>>::decode(payload_slice) {
@@ -4431,6 +4660,16 @@ impl KafkaConsumer {
                                             // Nothing is completed: the offset stays
                                             // uncommitted and the shutdown drain
                                             // collects this permit.
+                                            drop(permit);
+                                            return;
+                                        }
+                                        #[cfg(feature = "kafka-schema-registry")]
+                                        InPlaceEnd::Fatal(e) => {
+                                            tracing::error!(
+                                                queue = %task_topic,
+                                                error = %e,
+                                                "schema registry deployment fault during an in-place redelivery; leaving the record uncommitted"
+                                            );
                                             drop(permit);
                                             return;
                                         }
@@ -4798,24 +5037,25 @@ impl KafkaConsumer {
 
                             metrics::record_message_size(&topic, group.as_deref(), payload_slice.len());
 
-                            // Extend the offset span *before* the drop checks
-                            // below. A message dropped pre-handler still has to
-                            // be committed past: leaving its offset out of
-                            // `batch_end` replays it after every restart, and a
-                            // window of nothing but poison would never commit
-                            // at all. Arming the deadline here — rather than
-                            // only once a message survives — is what guarantees
-                            // such an all-dropped window still reaches
-                            // `flush_batch` to have its offsets committed.
-                            buffer.extend_span(partition, offset);
-                            if deadline.is_none() {
-                                deadline = Some(Box::pin(tokio::time::sleep(max_batch_age)));
-                            }
-
                             let key = msg.key().map(Bytes::copy_from_slice);
                             let headers = extract_string_headers(&msg);
 
+                            // The record's fate is decided before its offset
+                            // joins the span, because the span is what the
+                            // next flush commits: a record the schema registry
+                            // cannot resolve right now must stay out of it
+                            // until it decodes. Every other outcome extends the
+                            // span, a pre-handler drop included: leaving a
+                            // dropped offset out of `batch_end` replays it
+                            // after every restart, and a window of nothing but
+                            // poison would never commit at all. Arming the
+                            // deadline with the span is what guarantees such an
+                            // all-dropped window still reaches `flush_batch`.
                             if let Err(e) = validate_message_size(payload_slice.len(), max_message_size) {
+                                buffer.extend_span(partition, offset);
+                                if deadline.is_none() {
+                                    deadline = Some(Box::pin(tokio::time::sleep(max_batch_age)));
+                                }
                                 tracing::warn!(error = %e, queue, partition, offset, dlq = retain_raw, "oversized message, dropped before the handler");
                                 let pending = metrics::record_terminal(
                                     &topic,
@@ -4833,7 +5073,89 @@ impl KafkaConsumer {
                                     pending,
                                 );
                             } else {
-                                match decode_batch_message::<T>(&decode_ctx, payload_slice).await {
+                                #[cfg(feature = "kafka-schema-registry")]
+                                let mut stall = RegistryStall::default();
+                                // Set when the flush ahead of a stalled record
+                                // rewound the span. The broker then delivers
+                                // this record again behind the rewound ones,
+                                // and the copy in hand must not be buffered
+                                // ahead of them: that would hand the handler a
+                                // batch out of offset order and, on a further
+                                // `Retry`, seek to a start above records it
+                                // never acked.
+                                #[cfg(feature = "kafka-schema-registry")]
+                                let mut rewound = false;
+                                // Loops only through the registry wait arm, which
+                                // the `kafka-schema-registry` feature adds.
+                                #[allow(clippy::never_loop)]
+                                let decoded = loop {
+                                    match decode_batch_message::<T>(&decode_ctx, payload_slice).await {
+                                        // The span must end before this record:
+                                        // flush what came before it, then wait
+                                        // for the registry. Nothing after it is
+                                        // read while the assignment is paused,
+                                        // so partition order holds.
+                                        #[cfg(feature = "kafka-schema-registry")]
+                                        BatchDecode::Unavailable { id, error } => {
+                                            if !buffer.is_empty() {
+                                                let spans_partition = buffer.start.contains_key(&partition);
+                                                let flushed = flush_batch(
+                                                    &flush_ctx,
+                                                    handler.as_ref(),
+                                                    ctx.as_ref(),
+                                                    &mut buffer,
+                                                    &mut redelivery_backoff,
+                                                )
+                                                .await?;
+                                                deadline = None;
+                                                if flushed == Flushed::Redelivered {
+                                                    // A `Retry` or `Defer` sought the
+                                                    // span's partitions back to its
+                                                    // start. This record sits after
+                                                    // that span, so it goes back too:
+                                                    // its partition is either rewound
+                                                    // below it already, or sought to
+                                                    // it here. The rewound records and
+                                                    // this one then arrive in offset
+                                                    // order once the wait ends.
+                                                    if !spans_partition {
+                                                        put_back(&consumer, queue, partition, offset)?;
+                                                    }
+                                                    rewound = true;
+                                                }
+                                            }
+                                            if !stall
+                                                .wait(&consumer, &shutdown, &topic, group.as_deref(), queue, id, &error)
+                                                .await?
+                                            {
+                                                // The buffer is empty and this record
+                                                // is uncommitted: nothing left to flush.
+                                                tracing::info!(queue, "shutdown signal received during a schema registry wait, batch consumer stopped");
+                                                return Ok(());
+                                            }
+                                        }
+                                        #[cfg(feature = "kafka-schema-registry")]
+                                        BatchDecode::Fatal(e) => return Err(e),
+                                        other => break other,
+                                    }
+                                };
+                                #[cfg(feature = "kafka-schema-registry")]
+                                stall.end(&consumer)?;
+                                #[cfg(feature = "kafka-schema-registry")]
+                                if rewound {
+                                    // The registry answers again and the
+                                    // assignment is resumed: the broker
+                                    // delivers this record behind the rewound
+                                    // span, and that copy is the one that gets
+                                    // buffered.
+                                    drop(decoded);
+                                    continue;
+                                }
+                                buffer.extend_span(partition, offset);
+                                if deadline.is_none() {
+                                    deadline = Some(Box::pin(tokio::time::sleep(max_batch_age)));
+                                }
+                                match decoded {
                                     BatchDecode::Dlq { reason, fail } => {
                                         let pending = metrics::record_terminal(
                                             &topic,
@@ -4859,6 +5181,10 @@ impl KafkaConsumer {
                                             headers: headers.clone(),
                                         });
                                         buffer.push(decoded, metadata, raw);
+                                    }
+                                    #[cfg(feature = "kafka-schema-registry")]
+                                    BatchDecode::Unavailable { .. } | BatchDecode::Fatal(_) => {
+                                        unreachable!("resolved by the wait loop above")
                                     }
                                 }
                             }
@@ -5233,27 +5559,66 @@ impl KafkaConsumer {
                                 #[cfg(feature = "kafka-schema-registry")]
                                 let payload: T::Message = if let Some(registry) = schema_registry.as_ref() {
                                     let codec_name = <T::Codec as crate::Codec<T::Message>>::NAME;
-                                    let registry_result = match WireFormat::from_codec_name(codec_name) {
-                                        Some(fmt) => registry_decode::<T::Message, T::Codec>(
-                                            registry,
-                                            fmt,
-                                            schema_enforcement,
-                                            &schema_accepted,
-                                            schema_message_index.as_deref(),
-                                            payload_bytes,
-                                        ).await,
+                                    let staged = match WireFormat::from_codec_name(codec_name) {
+                                        Some(fmt) => {
+                                            // An unavailable registry stalls this
+                                            // record instead of discarding it; see
+                                            // `RegistryStall`.
+                                            let mut stall = RegistryStall::default();
+                                            let staged = loop {
+                                                match registry_decode::<T::Message, T::Codec>(
+                                                    registry,
+                                                    fmt,
+                                                    schema_enforcement,
+                                                    &schema_accepted,
+                                                    schema_message_index.as_deref(),
+                                                    payload_bytes,
+                                                ).await {
+                                                    Ok(RegistryDecode::Decoded(m)) => break Staged::Ready(m),
+                                                    Ok(RegistryDecode::Dlq(reason)) => break Staged::Drop(
+                                                        metrics::FailReason::for_schema_reason(reason),
+                                                        reason,
+                                                    ),
+                                                    Ok(RegistryDecode::Unavailable { id, error }) => {
+                                                        if !stall
+                                                            .wait(&consumer, &shutdown, &topic, group.as_deref(), &queue, id, &error)
+                                                            .await?
+                                                        {
+                                                            break Staged::Stop;
+                                                        }
+                                                    }
+                                                    Err(e @ ShoveError::Topology(_)) => return Err(e),
+                                                    Err(e) => {
+                                                        tracing::error!(
+                                                            error = %e,
+                                                            queue,
+                                                            "failed to deserialize FIFO message, sending to DLQ"
+                                                        );
+                                                        break Staged::Drop(
+                                                            metrics::FailReason::Deserialize,
+                                                            "deserialization_error",
+                                                        );
+                                                    }
+                                                }
+                                            };
+                                            stall.end(&consumer)?;
+                                            staged
+                                        }
                                         None => {
                                             tracing::error!(
                                                 codec = codec_name,
                                                 queue,
                                                 "codec has no Confluent wire format; routing to DLQ"
                                             );
-                                            Ok(RegistryDecode::Dlq("schema_unsupported_codec"))
+                                            Staged::Drop(
+                                                metrics::FailReason::for_schema_reason("schema_unsupported_codec"),
+                                                "schema_unsupported_codec",
+                                            )
                                         }
                                     };
-                                    match registry_result {
-                                        Ok(RegistryDecode::Decoded(m)) => m,
-                                        Ok(RegistryDecode::Dlq(reason)) => {
+                                    match staged {
+                                        Staged::Ready(m) => m,
+                                        Staged::Drop(fail, reason) => {
                                             poison_key(&poisoned, &seq_key, &queue);
                                             discard_pre_handler_fifo(
                                                 &client,
@@ -5263,7 +5628,7 @@ impl KafkaConsumer {
                                                 &queue,
                                                 &topic,
                                                 group.as_deref(),
-                                                metrics::FailReason::for_schema_reason(reason),
+                                                fail,
                                                 reason,
                                                 payload_bytes,
                                                 key.as_deref(),
@@ -5273,31 +5638,7 @@ impl KafkaConsumer {
                                             .await;
                                             continue;
                                         }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                error = %e,
-                                                queue,
-                                                "failed to deserialize FIFO message, sending to DLQ"
-                                            );
-                                            poison_key(&poisoned, &seq_key, &queue);
-                                            discard_pre_handler_fifo(
-                                                &client,
-                                                topology,
-                                                &consumer,
-                                                &msg,
-                                                &queue,
-                                                &topic,
-                                                group.as_deref(),
-                                                metrics::FailReason::Deserialize,
-                                                "deserialization_error",
-                                                payload_bytes,
-                                                key.as_deref(),
-                                                &headers,
-                                                &mut parked,
-                                            )
-                                            .await;
-                                            continue;
-                                        }
+                                        Staged::Stop => continue,
                                     }
                                 } else {
                                     match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
@@ -5725,6 +6066,18 @@ impl KafkaConsumer {
                     client.msk_context(),
                 )?);
 
+                // A schema registry deployment fault met inside a handler's
+                // task (a deferred redelivery decodes there) ends the
+                // subscription the way the receive loop ends it when it meets
+                // the same fault: at once, with the record undelivered rather
+                // than counted as a discard. The sender stays alive here for
+                // the loop's lifetime so the arm below stays pending; it is
+                // cloned into tasks only under `kafka-schema-registry`, the
+                // one build with such a fault to report.
+                let (fault_tx, mut fault_rx) = mpsc::channel::<ShoveError>(1);
+                #[cfg(not(feature = "kafka-schema-registry"))]
+                let _ = &fault_tx;
+
                 // `fetch_metadata` blocks the calling thread, so the assignment
                 // runs off the runtime's worker threads. `create_stream_consumer`
                 // configures `cooperative-sticky`, which would refuse a
@@ -5772,6 +6125,14 @@ impl KafkaConsumer {
                             // which is dropped when this future resolves.
                             let _ = semaphore.acquire_many(prefetch_count as u32).await;
                             return Ok(());
+                        }
+
+                        fault = fault_rx.recv() => {
+                            // `None` cannot happen while `fault_tx` lives in
+                            // this scope; the arm is total anyway.
+                            let Some(e) = fault else { continue };
+                            tracing::error!(error = %e, queue, "schema registry deployment fault reported by a handler task; ending the broadcast subscription");
+                            return Err(e);
                         }
 
                         refresh = async {
@@ -5876,57 +6237,85 @@ impl KafkaConsumer {
 
                     #[cfg(feature = "kafka-schema-registry")]
                     let message: T::Message = {
-                        let decoded = if let Some(registry) = schema_registry.as_ref() {
+                        let staged = if let Some(registry) = schema_registry.as_ref() {
                             let codec_name = <T::Codec as crate::Codec<T::Message>>::NAME;
                             match WireFormat::from_codec_name(codec_name) {
-                                Some(fmt) => registry_decode::<T::Message, T::Codec>(
-                                    registry,
-                                    fmt,
-                                    schema_enforcement,
-                                    &schema_accepted,
-                                    schema_message_index.as_deref(),
-                                    &payload,
-                                )
-                                .await
-                                .map(|d| match d {
-                                    RegistryDecode::Decoded(m) => Ok(m),
-                                    RegistryDecode::Dlq(reason) => Err(
-                                        metrics::FailReason::for_schema_reason(reason),
-                                    ),
-                                }),
+                                Some(fmt) => {
+                                    // An unavailable registry stalls this record
+                                    // instead of discarding it; see `RegistryStall`.
+                                    // Groupless: the wait tolerates the inert
+                                    // group id's coordinator answer as the
+                                    // receive arm above does.
+                                    let mut stall = RegistryStall::groupless();
+                                    let staged = loop {
+                                        match registry_decode::<T::Message, T::Codec>(
+                                            registry,
+                                            fmt,
+                                            schema_enforcement,
+                                            &schema_accepted,
+                                            schema_message_index.as_deref(),
+                                            &payload,
+                                        )
+                                        .await
+                                        {
+                                            Ok(RegistryDecode::Decoded(m)) => break Staged::Ready(m),
+                                            Ok(RegistryDecode::Dlq(reason)) => {
+                                                break Staged::Drop(
+                                                    metrics::FailReason::for_schema_reason(reason),
+                                                    reason,
+                                                );
+                                            }
+                                            Ok(RegistryDecode::Unavailable { id, error }) => {
+                                                if !stall
+                                                    .wait(&consumer, &shutdown, &topic, group.as_deref(), queue, id, &error)
+                                                    .await?
+                                                {
+                                                    break Staged::Stop;
+                                                }
+                                            }
+                                            Err(e @ ShoveError::Topology(_)) => return Err(e),
+                                            Err(e) => {
+                                                tracing::error!(error = %e, queue, "failed to deserialize broadcast message; discarding");
+                                                break Staged::Drop(
+                                                    metrics::FailReason::Deserialize,
+                                                    "deserialization_error",
+                                                );
+                                            }
+                                        }
+                                    };
+                                    stall.end(&consumer)?;
+                                    staged
+                                }
                                 None => {
                                     tracing::error!(
                                         codec = codec_name,
                                         queue,
                                         "codec has no Confluent wire format; discarding"
                                     );
-                                    Ok(Err(metrics::FailReason::for_schema_reason(
+                                    Staged::Drop(
+                                        metrics::FailReason::for_schema_reason("schema_unsupported_codec"),
                                         "schema_unsupported_codec",
-                                    )))
+                                    )
                                 }
                             }
                         } else {
-                            Ok(<T::Codec as crate::Codec<T::Message>>::decode(&payload)
-                                .map_err(|e| {
-                                    tracing::error!(error = %e, queue, "failed to deserialize broadcast message — discarding");
-                                    metrics::FailReason::Deserialize
-                                }))
+                            match <T::Codec as crate::Codec<T::Message>>::decode(&payload) {
+                                Ok(m) => Staged::Ready(m),
+                                Err(e) => {
+                                    tracing::error!(error = %e, queue, "failed to deserialize broadcast message; discarding");
+                                    Staged::Drop(metrics::FailReason::Deserialize, "deserialization_error")
+                                }
+                            }
                         };
-                        match decoded {
-                            Ok(Ok(m)) => m,
-                            Ok(Err(reason)) => {
+                        match staged {
+                            Staged::Ready(m) => m,
+                            Staged::Drop(reason, _) => {
                                 discard_broadcast(&topic, group.as_deref(), reason);
                                 continue;
                             }
-                            Err(e) => {
-                                tracing::error!(error = %e, queue, "schema registry decode failed — discarding");
-                                discard_broadcast(
-                                    &topic,
-                                    group.as_deref(),
-                                    metrics::FailReason::Deserialize,
-                                );
-                                continue;
-                            }
+                            // Shutdown fired during a registry wait; the biased
+                            // select above ends the loop on its next pass.
+                            Staged::Stop => continue,
                         }
                     };
 
@@ -5964,6 +6353,8 @@ impl KafkaConsumer {
                     let task_ctx = ctx.clone();
                     let task_timeout_outcome = handler_timeout_outcome_cfg.clone();
                     let task_shutdown = shutdown.clone();
+                    #[cfg(feature = "kafka-schema-registry")]
+                    let task_fault = fault_tx.clone();
                     #[cfg(feature = "kafka-schema-registry")]
                     let task_schema_registry = schema_registry.clone();
                     #[cfg(feature = "kafka-schema-registry")]
@@ -6036,16 +6427,48 @@ impl KafkaConsumer {
                                     break;
                                 }
                             }
-                            match decode_batch_message::<T>(&decode, &payload).await {
-                                BatchDecode::Decoded(m) => {
-                                    message = m;
-                                    metadata = build_message_metadata(&headers, true, coordinates);
+                            // Loops only through the registry wait arm, which
+                            // the `kafka-schema-registry` feature adds.
+                            #[allow(clippy::never_loop)]
+                            let redelivered = loop {
+                                match decode_batch_message::<T>(&decode, &payload).await {
+                                    BatchDecode::Decoded(m) => break Some(m),
+                                    BatchDecode::Dlq { fail, .. } => {
+                                        discard_broadcast(&task_topic, task_group.as_deref(), fail);
+                                        break None;
+                                    }
+                                    #[cfg(feature = "kafka-schema-registry")]
+                                    BatchDecode::Unavailable { id, error } => {
+                                        tracing::warn!(
+                                            topic = %task_topic,
+                                            schema_id = %id,
+                                            error = %error,
+                                            retry_after = ?REGISTRY_RETRY_DELAY,
+                                            "schema registry unavailable during a deferred redelivery; keeping the record"
+                                        );
+                                        metrics::record_failed(&task_topic, task_group.as_deref(), metrics::FailReason::SchemaUnavailable);
+                                        tokio::select! {
+                                            _ = tokio::time::sleep(REGISTRY_RETRY_DELAY) => {}
+                                            _ = task_shutdown.cancelled() => break None,
+                                        }
+                                    }
+                                    #[cfg(feature = "kafka-schema-registry")]
+                                    BatchDecode::Fatal(e) => {
+                                        // A deployment fault, not poison: the
+                                        // record is not counted as a discard.
+                                        // The receive loop ends the subscription
+                                        // with this error, as it does when it
+                                        // meets the fault itself. A full channel
+                                        // means another task already reported.
+                                        tracing::error!(topic = %task_topic, error = %e, "schema registry deployment fault during a deferred redelivery; ending the subscription");
+                                        let _ = task_fault.try_send(e);
+                                        break None;
+                                    }
                                 }
-                                BatchDecode::Dlq { fail, .. } => {
-                                    discard_broadcast(&task_topic, task_group.as_deref(), fail);
-                                    break;
-                                }
-                            }
+                            };
+                            let Some(m) = redelivered else { break };
+                            message = m;
+                            metadata = build_message_metadata(&headers, true, coordinates);
                         }
 
                         task_processing.store(false, Ordering::Release);
@@ -6273,26 +6696,60 @@ impl KafkaConsumer {
                                         Ok(RegistryDecode::Dlq("schema_unsupported_codec"))
                                     }
                                 };
-                                match registry_result {
-                                    Ok(RegistryDecode::Decoded(m)) => m,
-                                    Ok(RegistryDecode::Dlq(reason)) => {
-                                        tracing::error!(
-                                            reason,
-                                            dlq,
-                                            "schema decode rejected dead message, acking anyway"
-                                        );
+                                // A registry outage stalls the drain the same
+                                // way it stalls a consumer, instead of acking
+                                // the dead message away unread.
+                                let mut stall = RegistryStall::default();
+                                let mut registry_result = registry_result;
+                                let staged = loop {
+                                    match registry_result {
+                                        Ok(RegistryDecode::Decoded(m)) => break Staged::Ready(m),
+                                        Ok(RegistryDecode::Dlq(reason)) => {
+                                            tracing::error!(
+                                                reason,
+                                                dlq,
+                                                "schema decode rejected dead message, acking anyway"
+                                            );
+                                            break Staged::Drop(metrics::FailReason::for_schema_reason(reason), reason);
+                                        }
+                                        Ok(RegistryDecode::Unavailable { id, error }) => {
+                                            if !stall
+                                                .wait(&consumer, &shutdown, &topic, group.as_deref(), dlq, id, &error)
+                                                .await?
+                                            {
+                                                break Staged::Stop;
+                                            }
+                                            registry_result = match WireFormat::from_codec_name(codec_name) {
+                                                Some(fmt) => registry_decode::<T::Message, T::Codec>(
+                                                    registry,
+                                                    fmt,
+                                                    schema_enforcement,
+                                                    &schema_accepted,
+                                                    schema_message_index.as_deref(),
+                                                    payload_bytes,
+                                                ).await,
+                                                None => Ok(RegistryDecode::Dlq("schema_unsupported_codec")),
+                                            };
+                                        }
+                                        Err(e @ ShoveError::Topology(_)) => return Err(e),
+                                        Err(e) => {
+                                            tracing::error!(
+                                                error = %e,
+                                                dlq,
+                                                "failed to deserialize DLQ message, acking anyway"
+                                            );
+                                            break Staged::Drop(metrics::FailReason::Deserialize, "deserialization_error");
+                                        }
+                                    }
+                                };
+                                stall.end(&consumer)?;
+                                match staged {
+                                    Staged::Ready(m) => m,
+                                    Staged::Drop(..) => {
                                         consumer.commit_message(&msg, CommitMode::Async).ok();
                                         continue;
                                     }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            error = %e,
-                                            dlq,
-                                            "failed to deserialize DLQ message, acking anyway"
-                                        );
-                                        consumer.commit_message(&msg, CommitMode::Async).ok();
-                                        continue;
-                                    }
+                                    Staged::Stop => continue,
                                 }
                             } else {
                                 match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {

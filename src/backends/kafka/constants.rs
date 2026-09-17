@@ -179,6 +179,13 @@ pub(super) const SHUTDOWN_COMMIT_DEADLINE: Duration = Duration::from_secs(20);
 /// panic before any consumer is created and never a fault in the loop.
 pub(super) const MAX_COMMIT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// How long a consume loop waits before asking the schema registry again for
+/// a record whose schema id it could not resolve: a transport failure, or a
+/// 5xx after the client's own retries. The record is kept, not discarded, so
+/// the only cost of a short interval is registry traffic during an outage.
+#[cfg(feature = "kafka-schema-registry")]
+pub(super) const REGISTRY_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 // ---------------------------------------------------------------------------
 // rdkafka producer / consumer tuning
 //
