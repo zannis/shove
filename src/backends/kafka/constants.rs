@@ -146,6 +146,18 @@ pub(super) const DEFAULT_REPLICATION: i32 = 1;
 /// shutdown indefinitely.
 pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
+/// How long the concurrent receive loop waits for its final synchronous
+/// offset commit at shutdown before giving up on the result.
+///
+/// The commit runs on a dedicated thread that also owns the consumer's
+/// close, so a frozen coordinator can hold that thread for as long as
+/// librdkafka retries - minutes - without holding the runtime or the
+/// process. Chosen against the 30 s termination grace Kubernetes gives a
+/// Pod by default, so a consumer that gives up still exits before it is
+/// killed. Past the deadline the loop logs that the batch may be redelivered
+/// and returns; the thread finishes on its own.
+pub(super) const SHUTDOWN_COMMIT_DEADLINE: Duration = Duration::from_secs(20);
+
 // ---------------------------------------------------------------------------
 // rdkafka producer / consumer tuning
 //

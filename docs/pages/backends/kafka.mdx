@@ -138,7 +138,8 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
     .with_handler_timeout(Duration::from_secs(30))
     .with_concurrent_processing(true)
     .with_group_id("billing-orders-consumer")          // override the default `{queue}-consumer`
-    .with_auto_offset_reset(KafkaAutoOffsetReset::Latest);
+    .with_auto_offset_reset(KafkaAutoOffsetReset::Latest)
+    .with_commit_interval(Duration::from_secs(5));     // commit at most every 5 s (default 500 ms)
 ```
 
 - **`with_prefetch_count(u16)`** — librdkafka in-flight cap per consumer task. Default `10`.
@@ -147,6 +148,12 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
 - **`with_concurrent_processing(bool)`** — dispatch each fetched message to its own tokio task (rejected for sequenced topics). Default `false`.
 - **`with_group_id(impl Into<String>)`** — override the broker-side consumer group ID. Defaults to `"{queue}-consumer"`. Set this when two independent services consume the same topic and must each receive every message (fan-out) — otherwise they share a group and compete for partitions. Prefer `.for_consumer_group(...)` on the topology (below), which sets the group *and* the DLQ/hold-queue names together.
 - **`with_auto_offset_reset(KafkaAutoOffsetReset)`** — `Earliest` (default, replay history), `Latest` (tail-only), or `None` (refuse silent replay/skip on a fresh group).
+- **`with_commit_interval(Duration)`** - how often each consumer commits the offsets its handlers completed.
+  The default is `500ms`, and any positive interval is accepted.
+  A longer interval sends fewer OffsetCommit requests and widens the replay window after a crash or rebalance by the same amount.
+  Standard groups only: a FIFO consumer commits each message as it settles, so `register_fifo` refuses a config that sets an interval.
+  See [Offset commit semantics](#offset-commit-semantics).
+  The same setting is available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths.
 
 ### Fan-out — a second reader on the same topic
 
@@ -261,15 +268,45 @@ See the [Basic example](/backends/kafka/examples/basic) for a full runnable walk
 
 ## Offset commit semantics
 
-`Outcome::Ack` commits the offset immediately after the handler returns. `Outcome::Retry` and `Outcome::Defer` defer the offset commit until the delayed republish to the hold topic has been acknowledged by the broker. This closes the publish-then-commit race: a broker crash or process kill between handler return and republish redelivers the message on restart rather than silently dropping it.
+`Outcome::Ack` marks the offset complete as soon as the handler returns.
+`Outcome::Retry` and `Outcome::Defer` mark it complete only once the broker has acknowledged the delayed republish to the hold topic.
+This closes the publish-then-commit race.
+A broker crash or process kill between handler return and republish redelivers the message on restart rather than silently dropping it.
 
-On shutdown the consumer drains the in-flight republish queue before exiting the poll loop, so pending Retry/Defer messages are persisted even if the shutdown signal arrives mid-batch.
-
-`Outcome::Reject` routes to the DLQ (if configured) and commits the offset; the original is not redelivered. Messages that exhaust `max_retries` follow the same DLQ-then-commit path.
+Completions are tracked in memory per partition and committed **asynchronously, at most once per commit interval**.
+The interval is 500 ms by default, configurable with `with_commit_interval` on `KafkaConsumerGroupConfig` or `ConsumerOptions::<Kafka>`.
+The gate keeps the number of in-flight commits O(1) however fast the consumer runs.
+A longer interval trades coordinator requests for a wider replay window.
+A commit the coordinator rejects is re-offered on a later drain.
+A consumer whose commits keep being rejected with no rebalance resolving them is treated as fenced and reconnects.
+That threshold grows with the interval, because the streak can only clear on a drain.
 
 The commit position is derived from the offsets the broker actually delivered, never from a run of consecutive integers.
 A hole left by log compaction or by a transactional producer's control records does not hold the position back.
 Compacted and transactional topics therefore commit past such a hole as soon as every delivered record below it has completed.
+
+On shutdown the consumer first waits for its in-flight handlers to finish.
+That wait is bounded by the handler timeout and by any in-place delays.
+It then drains the republish queue and commits its final position **synchronously**.
+The commit runs on a dedicated thread that also owns the consumer's close.
+The consumer waits for that commit for at most 20 s (`SHUTDOWN_COMMIT_DEADLINE` in `kafka::constants`).
+The deadline is chosen against the 30 s termination grace Kubernetes gives a Pod.
+Past the deadline the consumer logs that the batch may be redelivered and returns.
+The thread finishes on its own and never holds the runtime or the process, so a frozen coordinator cannot turn a deploy into a `SIGKILL`.
+
+What that means for replay:
+
+- After a crash, the records completed since the last accepted commit are redelivered.
+  That is about one interval's worth when commits are accepted and every earlier offset on the partition had completed.
+  A rejected commit that is still being re-offered, or an earlier record whose handler is still running, holds the position and widens that window.
+- After a rebalance, a moved partition replays from its last accepted commit.
+- After a clean shutdown, a record whose handler returned a terminal outcome and whose offset reached the final commit is not redelivered.
+  A record whose handler had not settled when shutdown fired stays uncommitted and is redelivered.
+  So is the last batch when the final commit hits its deadline.
+  An asynchronous commit librdkafka was still retrying can also land after the final one.
+  A coordinator hiccup overlapping the shutdown can therefore replay a few records.
+
+`Outcome::Reject` routes to the DLQ (if configured) and commits the offset; the original is not redelivered. Messages that exhaust `max_retries` follow the same DLQ-then-commit path.
 
 ## Schema Registry
 

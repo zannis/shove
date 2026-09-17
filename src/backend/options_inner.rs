@@ -55,6 +55,13 @@ pub(crate) struct ConsumerOptionsInner {
     #[cfg(feature = "kafka")]
     pub kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
 
+    /// Kafka-only: the concurrent consumer's commit-gate window. `None`
+    /// keeps the 500 ms default. Propagated from
+    /// `KafkaConsumerGroupConfig::with_commit_interval` on the registry path
+    /// and from `ConsumerOptions::<Kafka>::with_commit_interval` otherwise.
+    #[cfg(feature = "kafka")]
+    pub kafka_commit_interval: Option<Duration>,
+
     /// Kafka-only: Schema Registry client for decoding Confluent wire-framed
     /// messages. `None` disables registry-based decoding.
     #[cfg(feature = "kafka-schema-registry")]
@@ -99,6 +106,8 @@ impl ConsumerOptionsInner {
             kafka_group_id: None,
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: None,
+            #[cfg(feature = "kafka")]
+            kafka_commit_interval: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: None,
             #[cfg(feature = "kafka-schema-registry")]
