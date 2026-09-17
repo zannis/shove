@@ -15,8 +15,8 @@ use shove::consumer::ConsumerOptions;
 use shove::consumer_group::ConsumerGroupConfig;
 use shove::handler::MessageHandler;
 use shove::kafka::{
-    KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroupConfig, KafkaQueueStats,
-    KafkaTopologyDeclarer,
+    KafkaAutoOffsetReset, KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroupConfig,
+    KafkaQueueStats, KafkaTopologyDeclarer,
 };
 use shove::markers::Kafka;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -187,6 +187,13 @@ shove::define_topic!(
     CoordinatesTopic,
     SimpleMessage,
     TopologyBuilder::new("kafka-coordinates").build()
+);
+
+// A topic with history that a fresh supervisor consumer must tail, not replay.
+shove::define_topic!(
+    TailOnlyTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-tail-only").build()
 );
 
 // An external topic nobody provisions: declaring it must fail, not create it.
@@ -371,6 +378,36 @@ fn live_partition_count(brokers: &str, topic: &str) -> Option<usize> {
     Some(candidate.partitions().len())
 }
 
+/// Wait until the broker reports `group` as `Stable` with at least one
+/// member, so a record published afterwards lands after the group's
+/// assignment was taken.
+async fn wait_for_stable_group(brokers: &str, group: &str, timeout: Duration) {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create group probe");
+    let deadline = Instant::now() + timeout;
+    loop {
+        let list = probe
+            .fetch_group_list(Some(group), Duration::from_secs(10))
+            .expect("failed to fetch group list");
+        let stable = list
+            .groups()
+            .iter()
+            .any(|g| g.name() == group && g.state() == "Stable" && !g.members().is_empty());
+        if stable {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "group {group} did not become stable with a member within {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Poll [`live_topic_config`] until the key reads back as `expected` or the
 /// timeout elapses, returning the last observed value. Config changes commit
 /// on the controller before brokers apply them to their local metadata
@@ -437,6 +474,31 @@ impl MessageHandler<DeferNoHoldTopic> for CountingHandler {
 impl MessageHandler<ExternalOwnedTopic> for CountingHandler {
     type Context = ();
     async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// Records the id of every message it is handed.
+#[derive(Clone)]
+struct IdRecorder {
+    seen: Arc<Mutex<Vec<String>>>,
+    counter: WaitableCounter,
+}
+
+impl IdRecorder {
+    fn new() -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            counter: WaitableCounter::new(),
+        }
+    }
+}
+
+impl MessageHandler<TailOnlyTopic> for IdRecorder {
+    type Context = ();
+    async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.seen.lock().await.push(msg.id);
         self.counter.increment();
         Outcome::Ack
     }
@@ -2107,6 +2169,93 @@ async fn handler_sees_partition_offset_and_timestamp() {
             "partition {partition} of a fresh topic must yield offsets 0..n once each"
         );
     }
+    broker.close().await;
+}
+
+/// `ConsumerOptions::<Kafka>::with_auto_offset_reset(Latest)` reaches the
+/// supervisor path: a fresh group on a topic with history starts at the tail
+/// and receives only what is published after its assignment.
+#[tokio::test]
+async fn supervisor_with_auto_offset_reset_latest_skips_history() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<TailOnlyTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    let old: Vec<SimpleMessage> = (1..=3)
+        .map(|i| SimpleMessage {
+            id: format!("old-{i}"),
+            content: String::new(),
+        })
+        .collect();
+    publisher
+        .publish_batch::<TailOnlyTopic>(&old)
+        .await
+        .unwrap();
+
+    let handler = IdRecorder::new();
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<TailOnlyTopic, _>(
+            handler.clone(),
+            ConsumerOptions::<Kafka>::new().with_auto_offset_reset(KafkaAutoOffsetReset::Latest),
+        )
+        .unwrap();
+    let token = supervisor.cancellation_token();
+    let sup_handle =
+        tokio::spawn(supervisor.run_until_timeout(std::future::pending(), Duration::from_secs(10)));
+
+    wait_for_stable_group(tb.brokers(), "kafka-tail-only-consumer", TIMEOUT).await;
+    // A stable group proves the member joined, not that its fetch position
+    // is resolved: a `Latest` member reads the tail when its first fetch
+    // runs, after the assignment. A record published before that fetch
+    // would land below the tail and be skipped as history, so the test
+    // publishes a marker and waits for it to arrive before it publishes
+    // the records it asserts on.
+    publisher
+        .publish::<TailOnlyTopic>(&SimpleMessage {
+            id: "marker".into(),
+            content: String::new(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the marker published after the assignment must arrive"
+    );
+    let new: Vec<SimpleMessage> = (1..=2)
+        .map(|i| SimpleMessage {
+            id: format!("new-{i}"),
+            content: String::new(),
+        })
+        .collect();
+    publisher
+        .publish_batch::<TailOnlyTopic>(&new)
+        .await
+        .unwrap();
+
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "the records published after the marker must arrive"
+    );
+    // Room for a replayed history record to show up if `Latest` had not
+    // reached the consumer.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut seen = handler.seen.lock().await.clone();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            "marker".to_string(),
+            "new-1".to_string(),
+            "new-2".to_string()
+        ],
+        "a fresh group with Latest must skip the history"
+    );
+
+    token.cancel();
+    let outcome = sup_handle.await.unwrap();
+    assert!(outcome.is_clean());
     broker.close().await;
 }
 

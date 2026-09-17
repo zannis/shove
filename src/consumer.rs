@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::{Backend, ConsumerOptionsInner};
 #[cfg(feature = "kafka")]
-use crate::backends::kafka::KafkaOffsetReset;
+use crate::backends::kafka::{KafkaAutoOffsetReset, KafkaOffsetReset};
 use crate::error::{Result, ShoveError};
 #[cfg(feature = "kafka")]
 use crate::markers::Kafka;
@@ -272,6 +272,13 @@ pub struct ConsumerOptions<B: Backend> {
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
     pub kafka_group_id: Option<Arc<str>>,
 
+    /// Kafka-only: `auto.offset.reset` for a group with no committed offset.
+    /// `None` (the default) keeps librdkafka's `earliest`. Set via
+    /// [`ConsumerOptions::<Kafka>::with_auto_offset_reset`].
+    #[cfg(feature = "kafka")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
+    pub kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
+
     /// Kafka-only: how often the concurrent consumer commits the offsets its
     /// handlers completed. `None` (the default) keeps the 500 ms gate. Set via
     /// [`ConsumerOptions::<Kafka>::with_commit_interval`].
@@ -322,6 +329,8 @@ impl<B: Backend> ConsumerOptions<B> {
             schema_accepted_subjects: None,
             #[cfg(feature = "kafka")]
             kafka_group_id: None,
+            #[cfg(feature = "kafka")]
+            kafka_auto_offset_reset: None,
             #[cfg(feature = "kafka")]
             kafka_commit_interval: None,
             #[cfg(feature = "kafka")]
@@ -570,7 +579,7 @@ impl<B: Backend> ConsumerOptions<B> {
             #[cfg(feature = "kafka")]
             kafka_group_id: self.kafka_group_id,
             #[cfg(feature = "kafka")]
-            kafka_auto_offset_reset: None,
+            kafka_auto_offset_reset: self.kafka_auto_offset_reset,
             #[cfg(feature = "kafka")]
             kafka_commit_interval: self.kafka_commit_interval,
             #[cfg(feature = "kafka")]
@@ -624,6 +633,8 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             schema_accepted_subjects: self.schema_accepted_subjects.clone(),
             #[cfg(feature = "kafka")]
             kafka_group_id: self.kafka_group_id.clone(),
+            #[cfg(feature = "kafka")]
+            kafka_auto_offset_reset: self.kafka_auto_offset_reset,
             #[cfg(feature = "kafka")]
             kafka_commit_interval: self.kafka_commit_interval,
             #[cfg(feature = "kafka")]
@@ -731,6 +742,27 @@ impl ConsumerOptions<Kafka> {
     /// is authorised.
     pub fn with_group_id(mut self, group_id: impl Into<Arc<str>>) -> Self {
         self.kafka_group_id = Some(group_id.into());
+        self
+    }
+
+    /// Where a consumer group with no committed offset starts: rdkafka's
+    /// `auto.offset.reset`. Unset keeps `earliest`, which replays the
+    /// retained history on the first run.
+    ///
+    /// [`KafkaAutoOffsetReset::Latest`] starts a fresh group at the tail,
+    /// which is what a latest-value sink wants on its first deployment
+    /// against a topic with days of history. [`KafkaAutoOffsetReset::None`]
+    /// refuses to guess and ends the connection with an error instead. Once
+    /// the group has committed, the committed offset wins and this setting is
+    /// not consulted again; [`Broker::reset_consumer_group_offsets`](crate::Broker::reset_consumer_group_offsets)
+    /// is the way to move an existing group.
+    ///
+    /// Read by the direct and supervisor paths. For the coordinated registry
+    /// path the equivalent is
+    /// [`KafkaConsumerGroupConfig::with_auto_offset_reset`](crate::kafka::KafkaConsumerGroupConfig::with_auto_offset_reset),
+    /// which wins there exactly as `with_group_id` does.
+    pub fn with_auto_offset_reset(mut self, reset: KafkaAutoOffsetReset) -> Self {
+        self.kafka_auto_offset_reset = Some(reset);
         self
     }
 
@@ -1127,6 +1159,27 @@ mod tests {
         use crate::markers::Kafka;
         let inner = ConsumerOptions::<Kafka>::new().into_inner();
         assert_eq!(inner.kafka_group_id, None);
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_with_auto_offset_reset_propagates_through_into_inner() {
+        use crate::markers::Kafka;
+        let inner = ConsumerOptions::<Kafka>::new()
+            .with_auto_offset_reset(KafkaAutoOffsetReset::Latest)
+            .into_inner();
+        assert_eq!(
+            inner.kafka_auto_offset_reset,
+            Some(KafkaAutoOffsetReset::Latest)
+        );
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_auto_offset_reset_defaults_to_none() {
+        use crate::markers::Kafka;
+        let inner = ConsumerOptions::<Kafka>::new().into_inner();
+        assert_eq!(inner.kafka_auto_offset_reset, None);
     }
 
     #[cfg(feature = "kafka")]

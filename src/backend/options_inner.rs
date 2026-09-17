@@ -51,7 +51,10 @@ pub(crate) struct ConsumerOptionsInner {
 
     /// Kafka-only: rdkafka `auto.offset.reset` override. `None` falls back
     /// to the library default of `earliest`. Propagated from
-    /// `KafkaConsumerGroupConfig::with_auto_offset_reset`.
+    /// `KafkaConsumerGroupConfig::with_auto_offset_reset` on the registry
+    /// path, where the group config wins, and from
+    /// `ConsumerOptions::<Kafka>::with_auto_offset_reset` on the direct and
+    /// supervisor paths.
     #[cfg(feature = "kafka")]
     pub kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
 
