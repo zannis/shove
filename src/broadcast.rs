@@ -141,7 +141,10 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
     ///
     /// The subscription is created by the spawned task, so messages published
     /// before it is established are not delivered — deliver-new is the
-    /// contract, not a timing accident.
+    /// contract, not a timing accident. On Kafka, and only there,
+    /// [`ConsumerOptions::<Kafka>::with_broadcast_start`](crate::ConsumerOptions::with_broadcast_start)
+    /// opts a subscription into starting at the head or at a timestamp
+    /// instead.
     ///
     /// Returns an error if:
     /// - `T`'s topology does not declare

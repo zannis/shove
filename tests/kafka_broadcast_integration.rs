@@ -630,6 +630,234 @@ async fn broadcast_fans_out_to_every_instance_from_the_tail() {
     publisher_broker.close().await;
 }
 
+/// `with_broadcast_start(Earliest)` assigns every partition at the head, so a
+/// subscriber that starts late still receives what was published before it
+/// existed - the opposite of the default, which
+/// `broadcast_fans_out_to_every_instance_from_the_tail` pins.
+#[tokio::test]
+async fn broadcast_starts_from_the_head_when_asked() {
+    let tb = TestBroker::start().await;
+
+    let publisher_broker = tb.broker().await;
+    publisher_broker
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("failed to declare broadcast topic");
+    let pubr = publisher_broker
+        .publisher()
+        .await
+        .expect("failed to build publisher");
+    let before: Vec<Invalidate> = (0..3)
+        .map(|i| Invalidate {
+            key: format!("before:{i}"),
+        })
+        .collect();
+    for msg in &before {
+        pubr.publish::<CacheInvalidations>(msg)
+            .await
+            .expect("publish failed");
+    }
+
+    let broker = tb.broker().await;
+    let recorder = Recorder::default();
+    let mut sub = broker.broadcast_subscriber();
+    sub.subscribe::<CacheInvalidations, _>(
+        recorder.clone(),
+        ConsumerOptions::new().with_broadcast_start(KafkaOffsetReset::Earliest),
+    )
+    .expect("failed to subscribe");
+    recorder.wait_for(3, Duration::from_secs(30)).await;
+
+    // Deliver-new still holds for what comes after the assignment.
+    pubr.publish::<CacheInvalidations>(&Invalidate {
+        key: "after".into(),
+    })
+    .await
+    .expect("publish failed");
+    recorder.wait_for(4, Duration::from_secs(30)).await;
+
+    let delivered = recorder.keys().await;
+    let mut expected: Vec<String> = before.iter().map(|k| k.key.clone()).collect();
+    expected.push("after".into());
+    let seen: HashSet<String> = delivered.iter().cloned().collect();
+    assert_eq!(
+        delivered.len(),
+        expected.len(),
+        "each retained record exactly once: {delivered:?}"
+    );
+    assert_eq!(seen, expected.into_iter().collect::<HashSet<_>>());
+
+    sub.cancellation_token().cancel();
+    let _ = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    broker.close().await;
+    publisher_broker.close().await;
+}
+
+/// `with_broadcast_start(Timestamp)` assigns at the first record at or after
+/// the instant, resolved through `offsets_for_times` the way
+/// `reset_consumer_group_offsets` resolves it: two batches published around a
+/// captured timestamp, and only the second is delivered.
+#[tokio::test]
+async fn broadcast_starts_at_a_timestamp() {
+    let tb = TestBroker::start().await;
+
+    let publisher_broker = tb.broker().await;
+    publisher_broker
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("failed to declare broadcast topic");
+    let pubr = publisher_broker
+        .publisher()
+        .await
+        .expect("failed to build publisher");
+    for i in 0..3 {
+        pubr.publish::<CacheInvalidations>(&Invalidate {
+            key: format!("old:{i}"),
+        })
+        .await
+        .expect("publish failed");
+    }
+    // Broker timestamps are milliseconds since the epoch; a full second on
+    // each side keeps the two batches unambiguous whatever the clock skew
+    // between this process and the container.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let cut = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before the epoch")
+        .as_millis() as i64;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let after: Vec<Invalidate> = (0..3)
+        .map(|i| Invalidate {
+            key: format!("new:{i}"),
+        })
+        .collect();
+    for msg in &after {
+        pubr.publish::<CacheInvalidations>(msg)
+            .await
+            .expect("publish failed");
+    }
+
+    let broker = tb.broker().await;
+    let recorder = Recorder::default();
+    let mut sub = broker.broadcast_subscriber();
+    sub.subscribe::<CacheInvalidations, _>(
+        recorder.clone(),
+        ConsumerOptions::new().with_broadcast_start(KafkaOffsetReset::Timestamp(cut)),
+    )
+    .expect("failed to subscribe");
+    recorder.wait_for(3, Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let delivered = recorder.keys().await;
+    let expected: HashSet<String> = after.iter().map(|k| k.key.clone()).collect();
+    assert_eq!(
+        delivered.len(),
+        expected.len(),
+        "only the records at or after the timestamp, each once: {delivered:?}"
+    );
+    assert_eq!(delivered.into_iter().collect::<HashSet<_>>(), expected);
+
+    sub.cancellation_token().cancel();
+    let _ = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    broker.close().await;
+    publisher_broker.close().await;
+}
+
+/// `with_group_id` names the inert `group.id` the groupless handle carries.
+/// It stays inert: the configured name must be as absent from the broker's
+/// group list as the default is, while the control group registers.
+#[tokio::test]
+async fn broadcast_uses_the_configured_inert_group_id() {
+    let tb = TestBroker::start().await;
+
+    let setup = tb.broker().await;
+    setup
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("failed to declare broadcast topic");
+    setup
+        .topology()
+        .declare::<ControlTopic>()
+        .await
+        .expect("failed to declare control topic");
+    setup.close().await;
+
+    let broker = tb.broker().await;
+    let recorder = Recorder::default();
+    let mut sub = broker.broadcast_subscriber();
+    sub.subscribe::<CacheInvalidations, _>(
+        recorder.clone(),
+        ConsumerOptions::new().with_group_id("acl-prefix-invalidations"),
+    )
+    .expect("failed to subscribe");
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    // The subscription works under the configured id...
+    let pubr = tb
+        .broker()
+        .await
+        .publisher()
+        .await
+        .expect("failed to build publisher");
+    pubr.publish::<CacheInvalidations>(&Invalidate {
+        key: "under-a-custom-id".into(),
+    })
+    .await
+    .expect("publish failed");
+    recorder.wait_for(1, Duration::from_secs(30)).await;
+    assert_eq!(recorder.keys().await, vec!["under-a-custom-id".to_string()]);
+
+    // ...and the control from `broadcast_leaves_no_consumer_group` shows the
+    // id never became a broker-side group.
+    let control_broker = tb.broker().await;
+    let control_handler = Recorder::default();
+    let h = control_handler.clone();
+    let mut group = control_broker.consumer_group();
+    group
+        .register::<ControlTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            move || h.clone(),
+        )
+        .await
+        .expect("failed to register control group");
+    let token = group.cancellation_token();
+    let running_group = tokio::spawn(async move {
+        group
+            .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+            .await
+    });
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    let groups = tb.consumer_group_names();
+    assert!(
+        groups.contains("kafka-broadcast-control-consumer"),
+        "the control group is missing, so this query proves nothing; saw {groups:?}"
+    );
+    assert!(
+        !groups.contains("acl-prefix-invalidations"),
+        "the configured inert id registered a consumer group: {groups:?}"
+    );
+    assert!(
+        !groups.contains("kafka-broadcast-invalidations-broadcast"),
+        "the default inert id was used although one was configured: {groups:?}"
+    );
+
+    sub.cancellation_token().cancel();
+    let _ = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    broker.close().await;
+    control_broker.close().await;
+    let _ = running_group.await;
+}
+
 /// `Defer` redelivers within the deferring subscription and reaches no other.
 ///
 /// On Kafka this cannot be a requeue — there is no queue — so it is an

@@ -287,8 +287,9 @@ impl Broker<Kafka> {
             return Err(crate::ShoveError::Validation(format!(
                 "topic '{}' declares `.broadcast()`, so it has no consumer group to \
                  re-anchor: its subscribers assign partitions manually and never commit an \
-                 offset. A broadcast subscription always starts at the tail; there is no \
-                 stored position to reset.",
+                 offset, so there is no committed position to reset. Where a broadcast \
+                 subscription starts is a property of the subscription: set it with \
+                 `ConsumerOptions::<Kafka>::with_broadcast_start` instead.",
                 topology.queue()
             )));
         }

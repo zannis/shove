@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
@@ -72,6 +72,7 @@ use super::constants::{
     RETRY_COUNT_HEADER, SESSION_TIMEOUT_MS, SHUTDOWN_COMMIT_DEADLINE,
 };
 use super::consumer_group::KafkaAutoOffsetReset;
+use super::offset_reset::{KafkaOffsetReset, broadcast_start_offset, target_from_timestamp_lookup};
 
 // ---------------------------------------------------------------------------
 // Offset tracking for concurrent consumption
@@ -1268,7 +1269,7 @@ async fn route_outcome(
 // Broadcast — one groupless, assign-only subscription per call
 // ---------------------------------------------------------------------------
 
-/// How long `assign_all_partitions_at_end`'s metadata fetch may block.
+/// How long `assign_all_partitions_at`'s metadata fetch may block.
 ///
 /// Matches the timeout the topology declarer and the offset-reset path already
 /// use for their own metadata round trips.
@@ -1285,6 +1286,23 @@ const BROADCAST_ASSIGN_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 struct DeferredDelivery {
     payload: Vec<u8>,
     headers: Arc<HashMap<String, String>>,
+}
+
+/// Whether a `recv` error on the groupless broadcast path is the one error
+/// its inert `group.id` can provoke and nothing else.
+///
+/// librdkafka looks up the coordinator of the configured group even for a
+/// consumer that only ever calls `assign()`. A cluster ACL that grants group
+/// Describe on a prefix the inert id does not match answers that lookup with
+/// `GroupAuthorizationFailed`. Fetching does not go through the coordinator,
+/// so the subscription is unaffected, and a consumer that never joins has no
+/// use for the permission. Every other error keeps its meaning: it ends the
+/// connection and the reconnect loop decides.
+fn is_ignorable_groupless_error(error: &KafkaError) -> bool {
+    matches!(
+        error,
+        KafkaError::MessageConsumption(RDKafkaErrorCode::GroupAuthorizationFailed)
+    )
 }
 
 /// Count a broadcast message that is being dropped before or instead of
@@ -1801,21 +1819,26 @@ impl KafkaStreamConsumer {
         }
     }
 
-    /// Assign every partition of `topic` at its current end offset.
+    /// Assign every partition of `topic` at `start`.
     ///
     /// The groupless half of a broadcast subscription. `assign()` instead of
     /// `subscribe()` means librdkafka never sends JoinGroup, so no group is
-    /// created broker-side and no rebalance is paid at boot; `Offset::End`
-    /// means the subscription starts at the tail, so deliver-new falls out of
-    /// the assignment rather than out of a stored offset.
+    /// created broker-side and no rebalance is paid at boot. `None` and
+    /// `Some(Latest)` assign at `Offset::End`, so deliver-new falls out of the
+    /// assignment rather than out of a stored offset - byte for byte the
+    /// behaviour before a start could be configured. `Earliest` assigns at
+    /// `Offset::Beginning`, and `Timestamp` resolves each partition through
+    /// the same lookup `reset_consumer_group_offsets` uses; see
+    /// [`broadcast_start_positions`](Self::broadcast_start_positions).
     ///
     /// **Blocking** — `fetch_metadata` is a synchronous librdkafka call. Callers
     /// on an async runtime must wrap this in `spawn_blocking`.
     ///
     /// Returns the number of partitions assigned.
-    pub(super) fn assign_all_partitions_at_end(
+    pub(super) fn assign_all_partitions_at(
         &self,
         topic: &str,
+        start: Option<KafkaOffsetReset>,
         timeout: Duration,
     ) -> Result<usize> {
         let metadata = self
@@ -1845,28 +1868,106 @@ impl KafkaStreamConsumer {
             )));
         }
 
-        let mut tpl = TopicPartitionList::new();
-        for pid in &partitions {
-            tpl.add_partition_offset(topic, *pid, Offset::End)
-                .map_err(|e| {
-                    map_kafka_error(&format!("failed to target the tail of {topic}[{pid}]"), e)
-                })?;
-        }
+        let tpl = self.broadcast_start_positions(topic, &partitions, start, timeout)?;
         self.assign(&tpl)
             .map_err(|e| map_kafka_error(&format!("failed to assign partitions of {topic}"), e))?;
         Ok(partitions.len())
+    }
+
+    /// The offset each of `partitions` is assigned at for `start`.
+    ///
+    /// `None` and `Latest` are `Offset::End`, `Earliest` is
+    /// `Offset::Beginning`: lazy sentinels librdkafka resolves when the fetcher
+    /// starts, which is what a subscription with no stored position wants.
+    /// `Timestamp` needs the broker: the watermarks are fetched **first**, then
+    /// `offsets_for_times`, and each partition resolves through
+    /// [`target_from_timestamp_lookup`] - the order `run_reset` uses, because
+    /// a record landing between the lookup and a *later* watermark fetch would
+    /// otherwise be skipped by the tail fallback. A partition the lookup did
+    /// not resolve fails the whole assignment rather than silently starting at
+    /// the tail.
+    ///
+    /// **Blocking** on the `Timestamp` path; callers must use `spawn_blocking`.
+    fn broadcast_start_positions(
+        &self,
+        topic: &str,
+        partitions: &[i32],
+        start: Option<KafkaOffsetReset>,
+        timeout: Duration,
+    ) -> Result<TopicPartitionList> {
+        let mut tpl = TopicPartitionList::new();
+        if let Some(offset) = broadcast_start_offset(start) {
+            for pid in partitions {
+                tpl.add_partition_offset(topic, *pid, offset).map_err(|e| {
+                    map_kafka_error(&format!("failed to target {offset:?} of {topic}[{pid}]"), e)
+                })?;
+            }
+            return Ok(tpl);
+        }
+        let Some(KafkaOffsetReset::Timestamp(ts_ms)) = start else {
+            unreachable!("broadcast_start_offset resolves every start but Timestamp");
+        };
+
+        let mut watermarks = HashMap::with_capacity(partitions.len());
+        for pid in partitions {
+            let (low, high) = self.fetch_watermarks(topic, *pid, timeout).map_err(|e| {
+                map_kafka_error(&format!("failed to fetch watermarks for {topic}[{pid}]"), e)
+            })?;
+            watermarks.insert(*pid, (low, high));
+        }
+        let mut query = TopicPartitionList::new();
+        for pid in partitions {
+            query
+                .add_partition_offset(topic, *pid, Offset::Offset(ts_ms))
+                .map_err(|e| {
+                    map_kafka_error(
+                        &format!("failed to build the timestamp query for {topic}[{pid}]"),
+                        e,
+                    )
+                })?;
+        }
+        let resolved = self.offsets_for_times(query, timeout).map_err(|e| {
+            map_kafka_error(&format!("offset lookup by timestamp failed for {topic}"), e)
+        })?;
+        for elem in resolved.elements_for_topic(topic) {
+            let pid = elem.partition();
+            elem.error().map_err(|e| {
+                ShoveError::Connection(format!(
+                    "offset lookup by timestamp failed for {topic}[{pid}]: {e}"
+                ))
+            })?;
+            let (low, high) = watermarks.get(&pid).copied().ok_or_else(|| {
+                ShoveError::Connection(format!(
+                    "offset lookup by timestamp answered for {topic}[{pid}], which the \
+                     metadata did not list"
+                ))
+            })?;
+            let target = target_from_timestamp_lookup(elem.offset(), low, high, topic, pid)?;
+            tpl.add_partition_offset(topic, pid, Offset::Offset(target))
+                .map_err(|e| {
+                    map_kafka_error(&format!("failed to target {target} of {topic}[{pid}]"), e)
+                })?;
+        }
+        Ok(tpl)
     }
 
     /// Extend a manual broadcast assignment with partitions added since the
     /// previous metadata snapshot.
     ///
     /// Existing partitions are re-assigned at their current consumer position;
-    /// only newly discovered partitions start at `Offset::End`. This avoids
-    /// both replaying already-delivered records and moving an existing
-    /// partition to the tail.
+    /// only newly discovered partitions are resolved, at the same `start` the
+    /// subscription began with, so an `Earliest` subscription does not skip a
+    /// new partition's first records and a `Latest` one still joins it at the
+    /// tail. This avoids both replaying already-delivered records and moving
+    /// an existing partition.
     ///
     /// **Blocking** for the metadata fetch; callers must use `spawn_blocking`.
-    fn refresh_broadcast_partitions(&self, topic: &str, timeout: Duration) -> Result<usize> {
+    fn refresh_broadcast_partitions(
+        &self,
+        topic: &str,
+        start: Option<KafkaOffsetReset>,
+        timeout: Duration,
+    ) -> Result<usize> {
         let metadata = self
             .fetch_metadata(Some(topic), timeout)
             .map_err(|e| map_kafka_error(&format!("failed to refresh metadata for {topic}"), e))?;
@@ -1876,7 +1977,7 @@ impl KafkaStreamConsumer {
                 e,
             )
         })?;
-        let partition_ids = metadata
+        let new_partitions: Vec<i32> = metadata
             .topics()
             .iter()
             .find(|candidate| candidate.name() == topic)
@@ -1885,34 +1986,60 @@ impl KafkaStreamConsumer {
                     .partitions()
                     .iter()
                     .map(|partition| partition.id())
+                    .filter(|partition| positions.find_partition(topic, *partition).is_none())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-
-        let mut added = 0;
-        for partition in partition_ids {
-            if positions.find_partition(topic, partition).is_none() {
-                positions
-                    .add_partition_offset(topic, partition, Offset::End)
-                    .map_err(|e| {
-                        map_kafka_error(
-                            &format!("failed to target the tail of {topic}[{partition}]"),
-                            e,
-                        )
-                    })?;
-                added += 1;
-            }
+        if new_partitions.is_empty() {
+            return Ok(0);
         }
 
-        if added > 0 {
-            self.assign(&positions).map_err(|e| {
-                map_kafka_error(
-                    &format!("failed to extend broadcast assignment for {topic}"),
-                    e,
-                )
-            })?;
+        let additions = self.broadcast_start_positions(topic, &new_partitions, start, timeout)?;
+        for elem in additions.elements_for_topic(topic) {
+            positions
+                .add_partition_offset(topic, elem.partition(), elem.offset())
+                .map_err(|e| {
+                    map_kafka_error(
+                        &format!(
+                            "failed to extend the assignment with {topic}[{}]",
+                            elem.partition()
+                        ),
+                        e,
+                    )
+                })?;
         }
-        Ok(added)
+        self.assign(&positions).map_err(|e| {
+            map_kafka_error(
+                &format!("failed to extend broadcast assignment for {topic}"),
+                e,
+            )
+        })?;
+        Ok(new_partitions.len())
+    }
+
+    fn fetch_watermarks(
+        &self,
+        topic: &str,
+        partition: i32,
+        timeout: Duration,
+    ) -> KafkaResult<(i64, i64)> {
+        match self {
+            Self::Default(c) => c.fetch_watermarks(topic, partition, timeout),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.fetch_watermarks(topic, partition, timeout),
+        }
+    }
+
+    fn offsets_for_times(
+        &self,
+        timestamps: TopicPartitionList,
+        timeout: Duration,
+    ) -> KafkaResult<TopicPartitionList> {
+        match self {
+            Self::Default(c) => c.offsets_for_times(timestamps, timeout),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.offsets_for_times(timestamps, timeout),
+        }
     }
 
     fn fetch_metadata(&self, topic: Option<&str>, timeout: Duration) -> KafkaResult<Metadata> {
@@ -4648,18 +4775,21 @@ impl KafkaConsumer {
     ///
     /// # What makes it ephemeral
     ///
-    /// The subscription is `assign()` of every partition at the tail, with no
+    /// The subscription is `assign()` of every partition at the configured
+    /// start - the tail unless `with_broadcast_start` says otherwise - with no
     /// `subscribe()` and no commit anywhere in the loop. Nothing is written to
     /// the broker at any point in its life, so there is nothing to tear down
     /// when it ends and nothing to reap when the process dies without ending it
     /// — which is why the teardown here is "drop the consumer handle" and not a
     /// cleanup path that has to be reached. See
     /// [`broadcast_group_id`](super::constants::broadcast_group_id) for why a
-    /// `group.id` string is nonetheless configured, and why it is a fixed one.
+    /// `group.id` string is nonetheless configured, why it is a fixed one, and
+    /// why `with_group_id` may replace it.
     ///
-    /// A reconnect re-assigns at the *then*-current tail. Messages published
-    /// while the connection was down are not replayed — deliver-new applied to
-    /// the reconnect window, the same best-effort contract the subscription has
+    /// A reconnect re-assigns at the configured start as it stands *then*: at
+    /// the then-current tail by default, so messages published while the
+    /// connection was down are not replayed - deliver-new applied to the
+    /// reconnect window, the same best-effort contract the subscription has
     /// everywhere else.
     pub(crate) async fn run_broadcast_with_inner<T, H>(
         &self,
@@ -4680,7 +4810,18 @@ impl KafkaConsumer {
             )));
         }
         let queue = topology.queue();
-        let group_id = super::constants::broadcast_group_id(queue);
+        // An explicit `with_group_id` is honoured verbatim, as on the standard
+        // path. It is inert either way; the override exists for a cluster ACL
+        // that grants group Describe on one prefix only.
+        let group_id = options
+            .kafka_group_id
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| super::constants::broadcast_group_id(queue));
+        let start = options.kafka_broadcast_start;
+        // One warning per subscription, not per poll: the error repeats on
+        // every coordinator lookup for the life of the handle.
+        let warned_group_acl = Arc::new(AtomicBool::new(false));
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
@@ -4728,6 +4869,7 @@ impl KafkaConsumer {
             let topic = topic.clone();
             let group = group.clone();
             let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
+            let warned_group_acl = warned_group_acl.clone();
             #[cfg(feature = "kafka-schema-registry")]
             let schema_registry = schema_registry.clone();
             #[cfg(feature = "kafka-schema-registry")]
@@ -4761,8 +4903,11 @@ impl KafkaConsumer {
                 let assign_consumer = consumer.clone();
                 let assign_topic = queue.to_string();
                 let partitions = tokio::task::spawn_blocking(move || {
-                    assign_consumer
-                        .assign_all_partitions_at_end(&assign_topic, BROADCAST_ASSIGN_TIMEOUT)
+                    assign_consumer.assign_all_partitions_at(
+                        &assign_topic,
+                        start,
+                        BROADCAST_ASSIGN_TIMEOUT,
+                    )
                 })
                 .await
                 .map_err(|e| {
@@ -4772,7 +4917,8 @@ impl KafkaConsumer {
                 tracing::info!(
                     queue,
                     partitions,
-                    "broadcast subscription assigned at the tail"
+                    start = ?start,
+                    "broadcast subscription assigned"
                 );
 
                 // Redelivery for `Defer`, private to this subscription. One slot
@@ -4810,6 +4956,7 @@ impl KafkaConsumer {
                             tokio::task::spawn_blocking(move || {
                                 refresh_consumer.refresh_broadcast_partitions(
                                     &refresh_topic,
+                                    start,
                                     BROADCAST_ASSIGN_TIMEOUT,
                                 )
                             })
@@ -4858,6 +5005,26 @@ impl KafkaConsumer {
                         msg_result = consumer.recv() => {
                             let msg = match msg_result {
                                 Ok(msg) => msg,
+                                Err(e) if is_ignorable_groupless_error(&e) => {
+                                    // librdkafka looks up the inert group's
+                                    // coordinator anyway. A cluster ACL that
+                                    // does not grant Describe on it answers
+                                    // this on every lookup; fetching is
+                                    // unaffected, and a consumer that never
+                                    // joins needs no group permission.
+                                    if !warned_group_acl.swap(true, Ordering::Relaxed) {
+                                        tracing::warn!(
+                                            error = %e,
+                                            queue,
+                                            group_id,
+                                            "coordinator lookup for the inert broadcast \
+                                             group id is not authorized; fetching continues \
+                                             (grant Describe on it, or pick one with \
+                                             `with_group_id`, to silence this)"
+                                        );
+                                    }
+                                    continue;
+                                }
                                 Err(e) => {
                                     tracing::error!(error = %e, queue, "broadcast consumer recv error");
                                     return Err(map_kafka_error(
@@ -5415,6 +5582,30 @@ mod offset_tracker_tests {
             Duration::from_secs(120),
             "a 30 s interval needs 120 s so three recovery drains fit inside"
         );
+    }
+
+    // -- broadcast start position --
+
+    /// The groupless path ignores exactly one error, the coordinator lookup
+    /// its inert group id provokes under a restrictive ACL; every other code
+    /// still ends the connection.
+    #[test]
+    fn only_group_authorization_is_ignorable_on_the_groupless_path() {
+        assert!(is_ignorable_groupless_error(
+            &KafkaError::MessageConsumption(RDKafkaErrorCode::GroupAuthorizationFailed)
+        ));
+        for other in [
+            KafkaError::MessageConsumption(RDKafkaErrorCode::BrokerTransportFailure),
+            KafkaError::MessageConsumption(RDKafkaErrorCode::TopicAuthorizationFailed),
+            KafkaError::MessageConsumption(RDKafkaErrorCode::UnknownTopicOrPartition),
+            KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::Fatal),
+            KafkaError::Global(RDKafkaErrorCode::GroupAuthorizationFailed),
+        ] {
+            assert!(
+                !is_ignorable_groupless_error(&other),
+                "{other:?} must keep ending the connection"
+            );
+        }
     }
 
     /// A completion for an offset this assignment never delivered belongs to

@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "kafka")]
-use crate::backends::kafka::KafkaAutoOffsetReset;
+use crate::backends::kafka::{KafkaAutoOffsetReset, KafkaOffsetReset};
 use crate::consumer::{
     DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
     validate_message_size,
@@ -62,6 +62,13 @@ pub(crate) struct ConsumerOptionsInner {
     #[cfg(feature = "kafka")]
     pub kafka_commit_interval: Option<Duration>,
 
+    /// Kafka-only: where a broadcast subscription assigns each partition.
+    /// `None` keeps the tail. Propagated from
+    /// `ConsumerOptions::<Kafka>::with_broadcast_start`; the group paths
+    /// ignore it.
+    #[cfg(feature = "kafka")]
+    pub kafka_broadcast_start: Option<KafkaOffsetReset>,
+
     /// Kafka-only: Schema Registry client for decoding Confluent wire-framed
     /// messages. `None` disables registry-based decoding.
     #[cfg(feature = "kafka-schema-registry")]
@@ -108,6 +115,8 @@ impl ConsumerOptionsInner {
             kafka_auto_offset_reset: None,
             #[cfg(feature = "kafka")]
             kafka_commit_interval: None,
+            #[cfg(feature = "kafka")]
+            kafka_broadcast_start: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: None,
             #[cfg(feature = "kafka-schema-registry")]
