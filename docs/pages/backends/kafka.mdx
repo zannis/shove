@@ -452,6 +452,19 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
 
 `accept_schema_subjects([...])` pins the set of Confluent schema subjects that are accepted for a consumer. When not called, the default is derived from the queue name using the Confluent [TopicNameStrategy](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html#subject-name-strategy): `"{queue}-value"`. For a topic named `orders`, that resolves to `orders-value`.
 
+### Protobuf message index
+
+A Confluent protobuf frame carries a message-index array naming which message of the schema file the bytes encode.
+`[0]` is the file's first top-level message, `[1]` the second, and `[0, 2]` the third message nested in the first.
+shove reads the array as Confluent writes it: zigzag varints, with the single-byte shorthand for `[0]`.
+By default the index is read and ignored, so a `ProtobufCodec<M>` decodes whatever message the producer framed as `M`.
+Two messages with compatible field numbers then decode into each other silently.
+`require_schema_message_index([0])` pins the index a consumer accepts.
+A frame with any other index is routed to the DLQ with death reason `schema_message_index_rejected`, counted under `reason="schema_frame"`.
+The check runs before the schema id is resolved, so a rejected frame costs no registry round trip.
+JSON frames carry no index and the setting is inert on them.
+The setter lives on `ConsumerOptions::<Kafka>`, `BatchConsumerOptions::<Kafka>` and `KafkaConsumerGroupConfig`, next to `accept_schema_subjects`.
+
 ### Producer-side encoding
 
 The same feature lets a publisher emit Confluent-framed messages, symmetric with how the consumer is configured. Attach a `SchemaRegistry` to a `KafkaPublisherConfig` and obtain the publisher with `Broker::publisher_with`; the publisher then wraps each codec-encoded payload in the Confluent wire frame using the latest registered schema id for the subject. Like the consumer side, framing is a publisher-layer concern — it is **not** baked into the topic's `Codec`.
@@ -501,8 +514,17 @@ The Kafka backend emits `shove_messages_failed_total` with the following `reason
 - `timeout` — handler exceeded `handler_timeout`; retried.
 - `max_retries_exceeded` — retry budget exhausted; routed to DLQ.
 - `rejected` — handler returned `Outcome::Reject`; routed to DLQ.
-- `schema_validation_failed` — schema subject not in the accepted set under `Enforce` mode; routed to DLQ. Requires `kafka-schema-registry`.
-- `schema_unsupported_codec` — registry decoding requested but the topic uses a codec other than JSON or Protobuf; routed to DLQ. Requires `kafka-schema-registry`.
+- `schema_validation` - the registry answered and ruled the record out.
+  The death reason is `schema_validation_failed` when the subject is not in the accepted set under `Enforce` mode.
+  It is `schema_resolve_failed` when the registry does not know the schema id.
+  Routed to DLQ.
+  Requires `kafka-schema-registry`.
+- `schema_frame` - the Confluent frame cannot be used, so no lookup is made.
+  The death reason is `schema_frame_invalid` for a malformed frame.
+  It is `schema_unsupported_codec` when the topic uses a codec other than JSON or Protobuf.
+  It is `schema_message_index_rejected` when the protobuf message index is not the one `require_schema_message_index` pins.
+  Routed to DLQ.
+  Requires `kafka-schema-registry`.
 
 `shove_backend_errors_total` carries the `backend="kafka"` label for connection drops, produce failures, and consume-stream errors.
 

@@ -2402,6 +2402,8 @@ struct BatchDecodeCtx<'a> {
     schema_enforcement: SchemaEnforcement,
     #[cfg(feature = "kafka-schema-registry")]
     schema_accepted: &'a [Arc<str>],
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_message_index: Option<&'a [i32]>,
 }
 
 /// Outcome of decoding one message on its way into a batch.
@@ -2447,6 +2449,7 @@ async fn decode_batch_message<T: Topic>(
                     fmt,
                     dec.schema_enforcement,
                     dec.schema_accepted,
+                    dec.schema_message_index,
                     payload_slice,
                 )
                 .await
@@ -3285,6 +3288,9 @@ impl KafkaConsumer {
             .clone()
             .map(Arc::from)
             .unwrap_or_else(|| Arc::from(vec![default_subject(queue)]));
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_message_index: Option<Arc<[i32]>> =
+            options.schema_message_index.clone().map(Arc::from);
 
         run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, || {
             let handler = handler.clone();
@@ -3301,6 +3307,8 @@ impl KafkaConsumer {
             let schema_registry = schema_registry.clone();
             #[cfg(feature = "kafka-schema-registry")]
             let schema_accepted = schema_accepted.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_message_index = schema_message_index.clone();
             async move {
                 // Fresh channel per (re)connect, matching the fresh
                 // OffsetTracker below: rebalance events from a torn-down
@@ -3570,6 +3578,7 @@ impl KafkaConsumer {
                                         fmt,
                                         schema_enforcement,
                                         &schema_accepted,
+                                        schema_message_index.as_deref(),
                                         payload_slice,
                                     ).await,
                                     None => {
@@ -3930,6 +3939,9 @@ impl KafkaConsumer {
             .clone()
             .map(Arc::from)
             .unwrap_or_else(|| Arc::from(vec![default_subject(queue)]));
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_message_index: Option<Arc<[i32]>> =
+            options.schema_message_index.clone().map(Arc::from);
 
         tracing::info!(
             queue,
@@ -3952,6 +3964,8 @@ impl KafkaConsumer {
             let schema_registry = schema_registry.clone();
             #[cfg(feature = "kafka-schema-registry")]
             let schema_accepted = schema_accepted.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_message_index = schema_message_index.clone();
             async move {
                 let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
                 // Arc so `commit_batch_end` can hand the consumer to
@@ -3989,6 +4003,8 @@ impl KafkaConsumer {
                     schema_enforcement,
                     #[cfg(feature = "kafka-schema-registry")]
                     schema_accepted: schema_accepted.as_ref(),
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_message_index: schema_message_index.as_deref(),
                 };
 
                 // Retaining each message's wire bytes only pays for itself if
@@ -4291,6 +4307,9 @@ impl KafkaConsumer {
             .clone()
             .map(Arc::from)
             .unwrap_or_else(|| Arc::from(vec![default_subject(&queue)]));
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_message_index: Option<Arc<[i32]>> =
+            options.schema_message_index.clone().map(Arc::from);
 
         tracing::info!(queue, group_id, max_retries, "Kafka FIFO consumer started");
 
@@ -4310,6 +4329,8 @@ impl KafkaConsumer {
                 let schema_registry = schema_registry.clone();
                 #[cfg(feature = "kafka-schema-registry")]
                 let schema_accepted = schema_accepted.clone();
+                #[cfg(feature = "kafka-schema-registry")]
+                let schema_message_index = schema_message_index.clone();
                 let poisoned = poisoned.clone();
                 async move {
                     // FIFO commits per message via commit_message and keeps no
@@ -4505,6 +4526,7 @@ impl KafkaConsumer {
                                             fmt,
                                             schema_enforcement,
                                             &schema_accepted,
+                                            schema_message_index.as_deref(),
                                             payload_bytes,
                                         ).await,
                                         None => {
@@ -4882,6 +4904,9 @@ impl KafkaConsumer {
             .clone()
             .map(Arc::from)
             .unwrap_or_else(|| Arc::from(vec![default_subject(queue)]));
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_message_index: Option<Arc<[i32]>> =
+            options.schema_message_index.clone().map(Arc::from);
 
         tracing::info!(
             queue,
@@ -4906,6 +4931,8 @@ impl KafkaConsumer {
             let schema_registry = schema_registry.clone();
             #[cfg(feature = "kafka-schema-registry")]
             let schema_accepted = schema_accepted.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_message_index = schema_message_index.clone();
             async move {
                 // A groupless consumer never joins, so the rebalance callbacks
                 // wired into the shared context never fire; the receiver is
@@ -5106,6 +5133,7 @@ impl KafkaConsumer {
                                     fmt,
                                     schema_enforcement,
                                     &schema_accepted,
+                                    schema_message_index.as_deref(),
                                     &payload,
                                 )
                                 .await
@@ -5318,6 +5346,9 @@ impl KafkaConsumer {
             .clone()
             .map(Arc::from)
             .unwrap_or_else(|| Arc::from(vec![default_subject(dlq)]));
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_message_index: Option<Arc<[i32]>> =
+            options.schema_message_index.clone().map(Arc::from);
 
         tracing::info!(dlq, group_id = dlq_group_id, "Kafka DLQ consumer started");
 
@@ -5333,6 +5364,8 @@ impl KafkaConsumer {
             let schema_registry = schema_registry.clone();
             #[cfg(feature = "kafka-schema-registry")]
             let schema_accepted = schema_accepted.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_message_index = schema_message_index.clone();
             async move {
                 // DLQ consumers always drain from the earliest available
                 // offset — skipping dead messages on a tail-only join would
@@ -5418,6 +5451,7 @@ impl KafkaConsumer {
                                         fmt,
                                         schema_enforcement,
                                         &schema_accepted,
+                                        schema_message_index.as_deref(),
                                         payload_bytes,
                                     ).await,
                                     None => {
