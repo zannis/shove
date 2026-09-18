@@ -18,6 +18,8 @@ Type-safe async pub/sub for Rust. One API across RabbitMQ, AWS SNS+SQS, NATS Jet
 - **Strict per-key ordering** when you need it, with pluggable failure policies.
 - **Autoscaling consumer groups** driven by queue depth or consumer lag.
 - **Switch backends without changing your code.** Same topic, same handler, six transports.
+- **Batch consumption.** `BatchConsumer` hands your handler up to `max_batch_size` messages in one call, so a sink's per-call cost (one DB transaction, one HTTP request) is paid per flush instead of per message. Available on all six backends — SQS caps a batch at 10, RabbitMQ at `u16::MAX`. Measured gains: [Performance](https://shove.rs/ops/performance).
+- **Broadcast subscriptions.** Give every process its own ephemeral subscription, so each instance receives every message instead of competing for one queue. Every backend except SQS, where it is excluded permanently: [Broadcast](https://shove.rs/concepts/broadcast).
 - **Pluggable message codecs.** JSON by default; Protobuf, zero-copy SBE, raw bytes, or your own.
 - **Confluent Schema Registry** for Kafka — opt-in encode on publish and decode on consume (Confluent and Redpanda), with subject enforcement.
 
@@ -92,7 +94,7 @@ Swap `InMemory` for `RabbitMq`, `Sqs`, `Nats`, `Kafka`, or `Redis` and the topic
 
 `cargo add shove --features <flag>`. Need help choosing? [Choosing a backend](https://shove.rs/backends/choosing).
 
-Optional add-ons: `audit`, `metrics`, `kafka-ssl`, `rabbitmq-transactional`, `protobuf`, `sbe`, `env-config`. Codec details, including the zero-copy SBE path: [Codecs](https://shove.rs/concepts/codecs). Configuring the tuning knobs from environment variables: [Environment Configuration](https://shove.rs/ops/env-config).
+Optional add-ons: `audit`, `metrics`, `kafka-ssl`, `kafka-msk-iam`, `kafka-schema-registry`, `rabbitmq-transactional`, `pub-aws-sns` (SNS publishing on its own, without the SQS consumer), `protobuf`, `sbe`, `env-config`. Codec details, including the zero-copy SBE path: [Codecs](https://shove.rs/concepts/codecs). Configuring the tuning knobs from environment variables: [Environment Configuration](https://shove.rs/ops/env-config).
 
 ## Delivery
 
@@ -176,7 +178,7 @@ outward, so no rung falls outside a range stated here.
 
 - [Getting Started](https://shove.rs/getting-started)
 - [Core concepts](https://shove.rs/concepts/topics)
-- [Guides](https://shove.rs/guides/retries) — retries, sequenced delivery, consumer groups, audit, observability, exactly-once, shutdown, liveness
+- [Guides](https://shove.rs/guides/retries) — retries, sequenced delivery, batch publishing, consumer groups, audit, observability, exactly-once, shutdown, liveness
 - [Backends](https://shove.rs/backends/choosing)
 - [docs.rs/shove](https://docs.rs/shove)
 
