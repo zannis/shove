@@ -84,6 +84,17 @@ can be run without `dotenvx`:
 cargo nextest run --features <backend-feature-set>
 ```
 
+The Kafka suites start one broker container per test.
+On a small Docker host the default parallelism starves those brokers into startup and coordinator timeouts that look like test failures.
+A 2-CPU, 4 GiB VM is typical for a laptop.
+There, run one Kafka test binary at a time, and cap the largest:
+
+```sh
+cargo nextest run --features <kafka-feature-set> --test kafka_integration --test-threads 4
+```
+
+CI runs on larger hosts and needs neither.
+
 ## Before opening a PR — the gates CI enforces
 
 ```sh
