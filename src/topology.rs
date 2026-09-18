@@ -909,6 +909,7 @@ impl TopologyBuilder {
     ///   blank group name.
     /// - [`broadcast`](Self::broadcast) combined with `dlq()`, `dlq_named()`,
     ///   `hold_queue()`, `sequenced()` or `for_consumer_group()`.
+    /// - [`dlq_named`](Self::dlq_named) given the queue's own name.
     /// - `kafka_external_topic()` combined with `sequenced()` or with any
     ///   topic-config method (`kafka` feature).
     pub fn build(mut self) -> QueueTopology {
@@ -916,6 +917,21 @@ impl TopologyBuilder {
             assert!(
                 !group.trim().is_empty(),
                 "for_consumer_group() requires a non-empty group name"
+            );
+        }
+        // A DLQ is where a rejected message leaves its queue for. Naming the
+        // queue itself would republish every rejection into the topic it came
+        // from, and a backend that declares the DLQ would create or alter the
+        // source topic under the DLQ's settings - on an external Kafka topic
+        // that is precisely the write shove promised never to make. Refused
+        // here, before any broker request.
+        if let Some(DlqName::Explicit(ref name)) = self.dlq {
+            assert!(
+                name != &self.queue,
+                "dlq_named() cannot name the queue itself ('{}') - a rejected message would be \
+                 republished into the topic it came from, and declaring the DLQ would create or \
+                 alter that topic",
+                self.queue
             );
         }
         if self.broadcast {
@@ -1632,6 +1648,20 @@ mod tests {
             .dlq_named("shared-dead-letters")
             .broadcast()
             .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "dlq_named() cannot name the queue itself")]
+    fn dlq_named_as_the_queue_itself_panics() {
+        let _ = TopologyBuilder::new("orders").dlq_named("orders").build();
+    }
+
+    #[test]
+    fn dlq_named_differently_from_the_queue_builds() {
+        let topology = TopologyBuilder::new("orders")
+            .dlq_named("orders-dead-letters")
+            .build();
+        assert_eq!(topology.dlq(), Some("orders-dead-letters"));
     }
 
     #[test]
