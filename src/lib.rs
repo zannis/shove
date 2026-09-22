@@ -362,6 +362,12 @@ pub mod kafka {
     #[cfg(all(feature = "kafka-msk-iam", feature = "test-support"))]
     #[cfg_attr(docsrs, doc(cfg(feature = "test-support")))]
     pub use crate::backends::kafka::prime_admin_oauth_token_for_test;
+
+    /// Test-only seam (see the `test-support` feature): the receive loop's
+    /// shutdown commit deadline, for tests that time a shutdown against it.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::shutdown_commit_deadline_for_test;
 }
 
 /// Redis Streams backend.

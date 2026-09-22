@@ -259,7 +259,9 @@ impl TestBroker {
 
     /// Freeze the broker process: every request in flight hangs until
     /// [`unpause`](Self::unpause). The way to observe what a consumer does
-    /// when its coordinator stops answering.
+    /// when its coordinator stops answering. Used by the frozen-shutdown
+    /// test, which the `test-support` seam it reads gates.
+    #[cfg(feature = "test-support")]
     async fn pause(&self) {
         self._container
             .pause()
@@ -267,6 +269,7 @@ impl TestBroker {
             .expect("failed to pause the Kafka container");
     }
 
+    #[cfg(feature = "test-support")]
     async fn unpause(&self) {
         self._container
             .unpause()
@@ -3298,8 +3301,13 @@ async fn child_consumes_then_shuts_down_on_stdin() {
 /// broker is paused, the child is told to shut down, and it must exit within
 /// the deadline plus a margin while the broker stays paused. The parent
 /// unpauses only after the exit.
+// `test-support` gates the deadline seam this test reads; the Kafka coverage
+// row enables it, and the schema-registry row, which compiles this binary
+// without it, never runs this suite.
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn shutdown_exits_the_process_while_the_broker_is_frozen() {
+    use shove::kafka::shutdown_commit_deadline_for_test;
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -3309,9 +3317,10 @@ async fn shutdown_exits_the_process_while_the_broker_is_frozen() {
         TopologyBuilder::new("kafka-frozen-shutdown").build()
     );
 
-    // Mirrors `SHUTDOWN_COMMIT_DEADLINE` in `kafka::constants`, which is
-    // `pub(super)`; the child's elapsed time is asserted against it.
-    const DEADLINE: Duration = Duration::from_secs(20);
+    // The receive loop's own shutdown commit deadline, read through the
+    // `test-support` seam so this test cannot drift from the constant it
+    // asserts the child's elapsed time against.
+    let deadline: Duration = shutdown_commit_deadline_for_test();
     const MARGIN: Duration = Duration::from_secs(15);
 
     let tb = TestBroker::start().await;
@@ -3381,7 +3390,7 @@ async fn shutdown_exits_the_process_while_the_broker_is_frozen() {
         stdin.write_all(b"\n").await.expect("write shutdown line");
         stdin.flush().await.expect("flush shutdown line");
         drop(stdin);
-        let status = tokio::time::timeout(DEADLINE + MARGIN, child.wait()).await;
+        let status = tokio::time::timeout(deadline + MARGIN, child.wait()).await;
         // Drain the pipes after the exit so nothing here waits on a live child.
         let mut elapsed_ms = None;
         while let Ok(Ok(Some(line))) =
@@ -3416,7 +3425,7 @@ async fn shutdown_exits_the_process_while_the_broker_is_frozen() {
     );
     let elapsed_ms = elapsed_ms.expect("child reports how long run took to return");
     assert!(
-        Duration::from_millis(elapsed_ms as u64) >= DEADLINE - Duration::from_secs(1),
+        Duration::from_millis(elapsed_ms as u64) >= deadline - Duration::from_secs(1),
         "run must wait out the deadline while the commit is blocked, took {elapsed_ms} ms"
     );
     assert!(

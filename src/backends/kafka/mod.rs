@@ -20,6 +20,16 @@ pub use client::{KafkaClient, KafkaCompression, KafkaConfig};
 pub use client::{KafkaSasl, KafkaTls};
 pub use consumer::{BatchConsumerOptions, KafkaConsumer};
 pub(crate) use consumer_group::validate_commit_interval;
+
+/// Test-only seam (see the `test-support` feature): the deadline the
+/// concurrent receive loop gives its final synchronous commit at shutdown,
+/// so an integration test that times a shutdown against a frozen broker
+/// asserts against the constant itself rather than a hand-copied value.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn shutdown_commit_deadline_for_test() -> std::time::Duration {
+    constants::SHUTDOWN_COMMIT_DEADLINE
+}
 pub use consumer_group::{
     KafkaAutoOffsetReset, KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
 };
