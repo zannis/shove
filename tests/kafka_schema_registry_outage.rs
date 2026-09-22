@@ -60,6 +60,13 @@ const FLAKY_ID: u32 = 9;
 /// Answers with a second status the test can set on its own, 200 by default,
 /// for a test that needs one record to stall while another meets a fault.
 const SECOND_FLAKY_ID: u32 = 10;
+/// A "status" of zero for either flaky id means: accept the request and never
+/// answer it, the shape of a registry that is up but hung.
+const HANG_STATUS: u16 = 0;
+/// How long a shutdown that lands inside a hung lookup may take: far below
+/// the registry client's own timeout and retries, which the loop must not
+/// wait out.
+const PROMPT: Duration = Duration::from_secs(3);
 
 // ---------------------------------------------------------------------------
 // Mock schema registry with a flippable answer for one id
@@ -75,13 +82,26 @@ struct MockState {
     hits: Arc<AtomicUsize>,
 }
 
-fn flaky_response(s: &MockState, id: u32, body: serde_json::Value) -> Response {
-    s.hits.fetch_add(1, Ordering::SeqCst);
-    let status = match id {
+fn status_for(s: &MockState, id: u32) -> u16 {
+    match id {
         FLAKY_ID => s.flaky_status.load(Ordering::SeqCst),
         SECOND_FLAKY_ID => s.second_status.load(Ordering::SeqCst),
         _ => 200,
-    };
+    }
+}
+
+/// Never resolves when the id's status is [`HANG_STATUS`]; the request still
+/// counts as a hit, so a test can gate on the lookup being in flight.
+async fn hang_if_silent(s: &MockState, id: u32) {
+    if status_for(s, id) == HANG_STATUS {
+        s.hits.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+    }
+}
+
+fn flaky_response(s: &MockState, id: u32, body: serde_json::Value) -> Response {
+    s.hits.fetch_add(1, Ordering::SeqCst);
+    let status = status_for(s, id);
     if status != 200 {
         return StatusCode::from_u16(status)
             .expect("valid status")
@@ -91,11 +111,13 @@ fn flaky_response(s: &MockState, id: u32, body: serde_json::Value) -> Response {
 }
 
 async fn versions(State(s): State<MockState>, Path(id): Path<u32>) -> Response {
+    hang_if_silent(&s, id).await;
     let body = serde_json::json!([{ "subject": s.accepted_subject, "version": 1 }]);
     flaky_response(&s, id, body)
 }
 
 async fn schema(State(s): State<MockState>, Path(id): Path<u32>) -> Response {
+    hang_if_silent(&s, id).await;
     let body = serde_json::json!({ "schema": "{}", "schemaType": "JSON" });
     flaky_response(&s, id, body)
 }
@@ -297,28 +319,51 @@ async fn create_topic(brokers: &str, topic: &str, partitions: i32) {
 /// Wait until the broker reports `group` as `Stable` with exactly `members`
 /// members, so a record published afterwards lands after the assignment the
 /// test reasons about was taken.
+///
+/// A coordinator that is moving or loading while the member joins answers the
+/// probe with an error that means "ask again"; those are retried within the
+/// deadline, as `tests/kafka_offset_reset_integration.rs` retries them, and
+/// the last one is reported if the deadline passes. Any other error is a
+/// broken probe and fails at once.
 async fn wait_for_group_members(brokers: &str, group: &str, members: usize, timeout: Duration) {
     use rdkafka::consumer::{BaseConsumer, Consumer as _};
+    use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+
+    fn is_transient(code: RDKafkaErrorCode) -> bool {
+        matches!(
+            code,
+            RDKafkaErrorCode::NotCoordinator
+                | RDKafkaErrorCode::CoordinatorNotAvailable
+                | RDKafkaErrorCode::CoordinatorLoadInProgress
+                | RDKafkaErrorCode::OperationTimedOut
+        )
+    }
 
     let probe: BaseConsumer = rdkafka::ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .create()
         .expect("failed to create group probe");
     let deadline = Instant::now() + timeout;
+    let mut last_error: Option<KafkaError> = None;
     loop {
-        let list = probe
-            .fetch_group_list(Some(group), Duration::from_secs(10))
-            .expect("failed to fetch group list");
-        let ready = list
-            .groups()
-            .iter()
-            .any(|g| g.name() == group && g.state() == "Stable" && g.members().len() == members);
-        if ready {
-            return;
+        match probe.fetch_group_list(Some(group), Duration::from_secs(10)) {
+            Ok(list) => {
+                let ready = list.groups().iter().any(|g| {
+                    g.name() == group && g.state() == "Stable" && g.members().len() == members
+                });
+                if ready {
+                    return;
+                }
+            }
+            Err(KafkaError::GroupListFetch(code)) if is_transient(code) => {
+                last_error = Some(KafkaError::GroupListFetch(code));
+            }
+            Err(e) => panic!("failed to fetch group list: {e}"),
         }
         assert!(
             Instant::now() < deadline,
-            "group {group} did not become stable with {members} member(s) within {timeout:?}"
+            "group {group} did not become stable with {members} member(s) within {timeout:?}; \
+             last coordinator error: {last_error:?}"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -494,6 +539,56 @@ shove::define_topic!(
     Event,
     TopologyBuilder::new("kafka-sr-outage-silent").dlq().build()
 );
+// One topic per decode site a hung registry is driven through below.
+shove::define_topic!(
+    BatchSilentTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-batch-silent")
+        .dlq()
+        .build()
+);
+shove::define_sequenced_topic!(
+    FifoSilentTopic,
+    Event,
+    |msg: &Event| msg.id.to_string(),
+    TopologyBuilder::new("kafka-sr-outage-fifo-silent")
+        .sequenced(SequenceFailure::Skip)
+        .hold_queue(Duration::from_millis(200))
+        .dlq()
+        .build()
+);
+shove::define_topic!(
+    BroadcastSilentTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-broadcast-silent")
+        .broadcast()
+        .build()
+);
+shove::define_topic!(
+    DrainSilentTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-drain-silent")
+        .dlq()
+        .build()
+);
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    InPlaceSilentTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-inplace-silent")
+        .external()
+        .hold_queue(Duration::from_millis(200))
+        .allow_message_loss()
+        .build()
+);
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    BroadcastRedeliverySilentTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-broadcast-redelivery-silent")
+        .broadcast()
+        .build()
+);
 shove::define_topic!(
     AssignStallTopic,
     Event,
@@ -581,7 +676,9 @@ recorder_for!(
     AuthTopic,
     FifoStallTopic,
     BroadcastStallTopic,
-    SilentRegistryTopic
+    SilentRegistryTopic,
+    FifoSilentTopic,
+    BroadcastSilentTopic
 );
 
 /// Records every delivery and returns `Defer` for the first one it sees,
@@ -611,7 +708,12 @@ macro_rules! defer_once_for {
 }
 
 #[cfg(feature = "test-support")]
-defer_once_for!(InPlaceFaultTopic, StallFaultTopic);
+defer_once_for!(
+    InPlaceFaultTopic,
+    StallFaultTopic,
+    InPlaceSilentTopic,
+    BroadcastRedeliverySilentTopic
+);
 
 /// Counts its calls and defers every one of them, so each record it is
 /// handed cycles through the in-place wait for as long as its task lives.
@@ -692,16 +794,22 @@ impl DeadRecorder {
     }
 }
 
-impl MessageHandler<DrainStallTopic> for DeadRecorder {
-    type Context = ();
-    async fn handle(&self, _msg: Event, _meta: MessageMetadata, _: &()) -> Outcome {
-        Outcome::Ack
-    }
-    async fn handle_dead(&self, msg: Event, _meta: DeadMessageMetadata, _: &()) {
-        self.dead.lock().unwrap().push(msg.id);
-        self.counter.increment();
-    }
+macro_rules! dead_recorder_for {
+    ($($topic:ty),+ $(,)?) => {$(
+        impl MessageHandler<$topic> for DeadRecorder {
+            type Context = ();
+            async fn handle(&self, _msg: Event, _meta: MessageMetadata, _: &()) -> Outcome {
+                Outcome::Ack
+            }
+            async fn handle_dead(&self, msg: Event, _meta: DeadMessageMetadata, _: &()) {
+                self.dead.lock().unwrap().push(msg.id);
+                self.counter.increment();
+            }
+        }
+    )+};
 }
+
+dead_recorder_for!(DrainStallTopic, DrainSilentTopic);
 
 /// Records each flush as the ids it carried.
 #[derive(Clone)]
@@ -723,17 +831,23 @@ impl BatchRecorder {
     }
 }
 
-impl BatchMessageHandler<BatchStallTopic> for BatchRecorder {
-    type Context = ();
-    async fn handle_batch(&self, messages: Vec<(Event, MessageMetadata)>, _: &()) -> Outcome {
-        self.batches
-            .lock()
-            .unwrap()
-            .push(messages.iter().map(|(m, _)| m.id).collect());
-        self.counter.increment();
-        Outcome::Ack
-    }
+macro_rules! batch_recorder_for {
+    ($($topic:ty),+ $(,)?) => {$(
+        impl BatchMessageHandler<$topic> for BatchRecorder {
+            type Context = ();
+            async fn handle_batch(&self, messages: Vec<(Event, MessageMetadata)>, _: &()) -> Outcome {
+                self.batches
+                    .lock()
+                    .unwrap()
+                    .push(messages.iter().map(|(m, _)| m.id).collect());
+                self.counter.increment();
+                Outcome::Ack
+            }
+        }
+    )+};
 }
+
+batch_recorder_for!(BatchStallTopic, BatchSilentTopic);
 
 // ---------------------------------------------------------------------------
 // Metric helpers (used by the stall test only, which owns the recorder slot)
@@ -1840,6 +1954,343 @@ async fn shutdown_during_a_registry_lookup_returns_promptly() {
         handler.seen(),
         Vec::<u32>::new(),
         "nothing reached the handler"
+    );
+}
+
+/// The batch loop's lookup is dropped by a shutdown the same way: the batch
+/// in hand is flushed as the shutdown arm would flush it, which is nothing
+/// here, and the record whose schema never resolved stays uncommitted.
+#[tokio::test]
+async fn shutdown_during_a_batch_registry_lookup_returns_promptly() {
+    const TOPIC: &str = "kafka-sr-outage-batch-silent";
+    const GROUP: &str = "kafka-sr-outage-batch-silent-consumer";
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+    let (registry, _status, hits) =
+        mock_registry("kafka-sr-outage-batch-silent-value", HANG_STATUS).await;
+    let client = tb.client().await;
+    let body = serde_json::to_vec(&Event { id: 3 }).unwrap();
+    publish_raw(&tb.brokers, TOPIC, &frame_json(FLAKY_ID, &body)).await;
+
+    let handler = BatchRecorder::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<BatchSilentTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(10)
+                    .with_max_batch_age(Duration::from_secs(30))
+                    .with_schema_registry(registry)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    // Gate: the lookup is in flight.
+    wait_for_hits_above(&hits, 0, TIMEOUT).await;
+    let cancelled_at = Instant::now();
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task panicked")
+        .expect("consumer ended cleanly");
+    let took = cancelled_at.elapsed();
+    assert!(
+        took < PROMPT,
+        "shutdown must not wait out the registry client's timeout and retries, took {took:?}"
+    );
+    assert_eq!(
+        handler.batches(),
+        Vec::<Vec<u32>>::new(),
+        "nothing reached the batch handler"
+    );
+    assert_eq!(
+        lag(&client, TOPIC, GROUP).await,
+        1,
+        "the record whose schema never resolved stays uncommitted"
+    );
+}
+
+/// The FIFO loop's lookup is dropped by a shutdown the same way.
+#[tokio::test]
+async fn shutdown_during_a_fifo_registry_lookup_returns_promptly() {
+    const TOPIC: &str = "kafka-sr-outage-fifo-silent";
+    const GROUP: &str = "kafka-sr-outage-fifo-silent-fifo";
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+    let (registry, _status, hits) =
+        mock_registry("kafka-sr-outage-fifo-silent-value", HANG_STATUS).await;
+    let client = tb.client().await;
+    let body = serde_json::to_vec(&Event { id: 3 }).unwrap();
+    publish_raw(&tb.brokers, TOPIC, &frame_json(FLAKY_ID, &body)).await;
+
+    let handler = Recorder::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<FifoSilentTopic, _>(
+                h,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_schema_registry(registry)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    wait_for_hits_above(&hits, 0, TIMEOUT).await;
+    let cancelled_at = Instant::now();
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task panicked")
+        .expect("consumer ended cleanly");
+    let took = cancelled_at.elapsed();
+    assert!(
+        took < PROMPT,
+        "shutdown must not wait out the registry client's timeout and retries, took {took:?}"
+    );
+    assert_eq!(
+        handler.seen(),
+        Vec::<u32>::new(),
+        "nothing reached the handler"
+    );
+    assert_eq!(
+        lag(&client, TOPIC, GROUP).await,
+        1,
+        "the record whose schema never resolved stays uncommitted"
+    );
+}
+
+/// The broadcast loop's lookup is dropped by a shutdown the same way. The
+/// subscription starts at the head so the record published before it exists
+/// is what it reads.
+#[tokio::test]
+async fn shutdown_during_a_broadcast_registry_lookup_returns_promptly() {
+    const TOPIC: &str = "kafka-sr-outage-broadcast-silent";
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+    let (registry, _status, hits) =
+        mock_registry("kafka-sr-outage-broadcast-silent-value", HANG_STATUS).await;
+    let body = serde_json::to_vec(&Event { id: 3 }).unwrap();
+    publish_raw(&tb.brokers, TOPIC, &frame_json(FLAKY_ID, &body)).await;
+
+    let broker = Broker::<Kafka>::from_client(tb.client().await);
+    let handler = Recorder::new();
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<BroadcastSilentTopic, _>(
+            handler.clone(),
+            ConsumerOptions::new()
+                .with_schema_registry(registry)
+                .with_broadcast_start(BroadcastStart::Head),
+        )
+        .expect("failed to subscribe");
+
+    wait_for_hits_above(&hits, 0, TIMEOUT).await;
+    let cancelled_at = Instant::now();
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    let took = cancelled_at.elapsed();
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert!(
+        took < PROMPT,
+        "shutdown must not wait out the registry client's timeout and retries, took {took:?}"
+    );
+    assert_eq!(
+        handler.seen(),
+        Vec::<u32>::new(),
+        "nothing reached the handler"
+    );
+}
+
+/// The DLQ drain's lookup is dropped by its client's shutdown the same way,
+/// and the dead message it never decoded stays uncommitted.
+#[tokio::test]
+async fn shutdown_during_a_dlq_registry_lookup_returns_promptly() {
+    const DLQ: &str = "kafka-sr-outage-drain-silent-dlq";
+    const GROUP: &str = "kafka-sr-outage-drain-silent-dlq-consumer";
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, DLQ).await;
+    let (registry, _status, hits) =
+        mock_registry("kafka-sr-outage-drain-silent-dlq-value", HANG_STATUS).await;
+    let client = tb.client().await;
+    let body = serde_json::to_vec(&Event { id: 3 }).unwrap();
+    publish_raw(&tb.brokers, DLQ, &frame_json(FLAKY_ID, &body)).await;
+
+    let handler = DeadRecorder::new();
+    let h = handler.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_dlq_with_options::<DrainSilentTopic, _>(
+                h,
+                (),
+                ConsumerOptions::<Kafka>::new().with_schema_registry(registry),
+            )
+            .await
+    });
+
+    wait_for_hits_above(&hits, 0, TIMEOUT).await;
+    let cancelled_at = Instant::now();
+    // The DLQ loop stops on its client's shutdown token.
+    client.shutdown_token().cancel();
+    handle
+        .await
+        .expect("drain task panicked")
+        .expect("drain ended cleanly");
+    let took = cancelled_at.elapsed();
+    assert!(
+        took < PROMPT,
+        "shutdown must not wait out the registry client's timeout and retries, took {took:?}"
+    );
+    assert_eq!(
+        handler.dead(),
+        Vec::<u32>::new(),
+        "nothing reached handle_dead"
+    );
+    assert_eq!(
+        committed_offset(&tb.brokers, GROUP, DLQ, 0),
+        None,
+        "the dead message whose schema never resolved stays uncommitted"
+    );
+}
+
+/// An in-place redelivery decodes the retained bytes again inside the
+/// handler's task; a shutdown that lands inside that lookup ends the task at
+/// once, and the record stays uncommitted for a restart. The `test-support`
+/// seam evicts the cached id so the redelivery reaches the registry, which
+/// hangs by then.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn shutdown_during_an_in_place_redelivery_lookup_returns_promptly() {
+    const TOPIC: &str = "kafka-sr-outage-inplace-silent";
+    const GROUP: &str = "kafka-sr-outage-inplace-silent-consumer";
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+    let (registry, status, hits) = mock_registry("kafka-sr-outage-inplace-silent-value", 200).await;
+    let client = tb.client().await;
+    let body = serde_json::to_vec(&Event { id: 5 }).unwrap();
+    publish_raw(&tb.brokers, TOPIC, &frame_json(FLAKY_ID, &body)).await;
+
+    let handler = DeferOnceRecorder {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let task_registry = registry.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<InPlaceSilentTopic, _>(
+                h,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_schema_registry(task_registry)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the record reached the handler once"
+    );
+    // The redelivery's lookup hangs: forget the id and silence the mock
+    // before the in-place wait ends.
+    let before = hits.load(Ordering::SeqCst);
+    registry.evict_for_test(SchemaId(FLAKY_ID));
+    status.store(HANG_STATUS, Ordering::SeqCst);
+    wait_for_hits_above(&hits, before, TIMEOUT).await;
+
+    let cancelled_at = Instant::now();
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task panicked")
+        .expect("consumer ended cleanly");
+    let took = cancelled_at.elapsed();
+    assert!(
+        took < PROMPT,
+        "shutdown must not wait out the registry client's timeout and retries, took {took:?}"
+    );
+    assert_eq!(
+        handler.seen.lock().unwrap().clone(),
+        vec![5],
+        "one delivery, and the redelivery never reached the handler"
+    );
+    assert_eq!(
+        lag(&client, TOPIC, GROUP).await,
+        1,
+        "the record stays uncommitted for a restart"
+    );
+}
+
+/// A broadcast subscription redelivers a deferred message inside its handler
+/// task, decoding the retained bytes again; a shutdown inside that lookup
+/// ends the task at once.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn shutdown_during_a_broadcast_redelivery_lookup_returns_promptly() {
+    const TOPIC: &str = "kafka-sr-outage-broadcast-redelivery-silent";
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+    let (registry, status, hits) =
+        mock_registry("kafka-sr-outage-broadcast-redelivery-silent-value", 200).await;
+    let body = serde_json::to_vec(&Event { id: 5 }).unwrap();
+    publish_raw(&tb.brokers, TOPIC, &frame_json(FLAKY_ID, &body)).await;
+
+    let broker = Broker::<Kafka>::from_client(tb.client().await);
+    let handler = DeferOnceRecorder {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<BroadcastRedeliverySilentTopic, _>(
+            handler.clone(),
+            ConsumerOptions::new()
+                .with_schema_registry(registry.clone())
+                .with_broadcast_start(BroadcastStart::Head),
+        )
+        .expect("failed to subscribe");
+
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the message reached the handler once"
+    );
+    let before = hits.load(Ordering::SeqCst);
+    registry.evict_for_test(SchemaId(FLAKY_ID));
+    status.store(HANG_STATUS, Ordering::SeqCst);
+    wait_for_hits_above(&hits, before, TIMEOUT).await;
+
+    let cancelled_at = Instant::now();
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    let took = cancelled_at.elapsed();
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert!(
+        took < PROMPT,
+        "shutdown must not wait out the registry client's timeout and retries, took {took:?}"
+    );
+    assert_eq!(
+        handler.seen.lock().unwrap().clone(),
+        vec![5],
+        "one delivery, and the redelivery never reached the handler"
     );
 }
 
