@@ -492,6 +492,18 @@ shove::define_topic!(
         .build()
 );
 
+// An infra-owned topic whose handler never settles: every delivery waits in
+// place, so a fault the receive loop meets finds handler tasks mid-wait.
+shove::define_topic!(
+    LoopFaultTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-loop-fault")
+        .external()
+        .hold_queue(Duration::from_millis(200))
+        .allow_message_loss()
+        .build()
+);
+
 #[derive(Clone)]
 struct Recorder {
     seen: Arc<Mutex<Vec<u32>>>,
@@ -552,6 +564,21 @@ impl MessageHandler<InPlaceFaultTopic> for DeferOnceRecorder {
         drop(seen);
         self.counter.increment();
         if first { Outcome::Defer } else { Outcome::Ack }
+    }
+}
+
+/// Counts its calls and defers every one of them, so each record it is
+/// handed cycles through the in-place wait for as long as its task lives.
+#[derive(Clone)]
+struct DeferForeverRecorder {
+    calls: Arc<AtomicUsize>,
+}
+
+impl MessageHandler<LoopFaultTopic> for DeferForeverRecorder {
+    type Context = ();
+    async fn handle(&self, _msg: Event, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Outcome::Defer
     }
 }
 
@@ -1437,6 +1464,73 @@ async fn a_registry_deployment_fault_during_an_in_place_redelivery_ends_the_cons
         discarded_series(&snapshot, TOPIC),
         Vec::<(String, u64)>::new(),
         "a deployment fault is not a discard"
+    );
+}
+
+/// A registry deployment fault the receive loop meets itself ends every
+/// handler task before `run` returns, as a fault a task reports does: the
+/// records ahead of the faulty one were handed to handlers that wait in
+/// place, and those waits end with the consumer rather than cycling on in
+/// tasks nobody owns. Before, the direct decode path returned the error and
+/// skipped the fault arm's drain, so the handler kept being called after the
+/// consumer had returned `Err(Topology)` and the busy flag never cleared.
+#[tokio::test]
+async fn a_fault_met_by_the_receive_loop_ends_every_handler_task() {
+    const TOPIC: &str = "kafka-sr-outage-loop-fault";
+    const GROUP: &str = "kafka-sr-outage-loop-fault-consumer";
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+    let (registry, _status, _) = mock_registry("kafka-sr-outage-loop-fault-value", 401).await;
+    let client = tb.client().await;
+    // Two records that decode, then the one whose schema the registry
+    // refuses with a deployment fault.
+    for (schema_id, id) in [(HEALTHY_ID, 1u32), (HEALTHY_ID, 2), (FLAKY_ID, 3)] {
+        let body = serde_json::to_vec(&Event { id }).unwrap();
+        publish_raw(&tb.brokers, TOPIC, &frame_json(schema_id, &body)).await;
+    }
+
+    let handler = DeferForeverRecorder {
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let h = handler.clone();
+    let options = ConsumerOptions::<Kafka>::new()
+        .with_prefetch_count(3)
+        .with_schema_registry(registry)
+        .with_shutdown(CancellationToken::new());
+    let processing = options.processing_handle();
+    let consumer = KafkaConsumer::new(client.clone());
+    let running =
+        tokio::spawn(async move { consumer.run::<LoopFaultTopic, _>(h, (), options).await });
+
+    let outcome = tokio::time::timeout(TIMEOUT, running)
+        .await
+        .expect("the consumer must end on the fault it meets")
+        .expect("consumer task panicked");
+    assert!(
+        matches!(outcome, Err(ShoveError::Topology(_))),
+        "expected ShoveError::Topology, got {outcome:?}"
+    );
+    let at_return = handler.calls.load(Ordering::SeqCst);
+    assert!(
+        at_return >= 2,
+        "both records ahead of the fault reached the handler before it, calls: {at_return}"
+    );
+    assert!(
+        !processing.load(Ordering::Acquire),
+        "every handler task ended before the loop returned, so the member reads idle"
+    );
+    // Ten in-place cycles' worth of time: a task that survived the return
+    // would call the handler again within it.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        at_return,
+        "no handler task keeps redelivering after the consumer returned"
+    );
+    assert_eq!(
+        lag(&client, TOPIC, GROUP).await,
+        3,
+        "nothing is committed: every record stays for whoever runs next"
     );
 }
 

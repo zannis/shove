@@ -4274,6 +4274,17 @@ impl KafkaConsumer {
                 let mut paused = false;
                 let mut spare_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
 
+                // The receive loop runs inside one block so that every exit
+                // it takes lands on the tail below it: a clean shutdown
+                // returns `Ok` from its own arm after its drain and final
+                // commit, and every other exit is fatal and returns `Err`.
+                // The block owns the loop's state, the spare permit included,
+                // so that state is dropped before the tail runs; the tail
+                // keeps its own handles.
+                let tail_cancel = task_cancel.clone();
+                let tail_semaphore = semaphore.clone();
+                let tail_processing = processing.clone();
+                let ended: Result<()> = async move {
                 loop {
                     // Drain completed offsets, then apply any partition
                     // assignment changes BEFORE committing: a revoked
@@ -4441,17 +4452,9 @@ impl KafkaConsumer {
                                 queue,
                                 "schema registry deployment fault reported by a handler task; ending the consumer"
                             );
-                            // Every sibling task ends before the error is
-                            // returned: the child token ends their waits, the
-                            // permit drain is the only aggregate proof that
-                            // detached tasks have released their permits, and
-                            // only then is the busy flag cleared. Nothing is
-                            // committed here: every task's record stays
-                            // uncommitted and is redelivered on restart.
-                            drop(spare_permit.take());
-                            task_cancel.cancel();
-                            let _ = semaphore.acquire_many(prefetch_count as u32).await;
-                            processing.store(false, Ordering::Release);
+                            // The tail below the loop ends every sibling
+                            // task and drains the permits before the error
+                            // is returned.
                             return Err(e);
                         }
                         // Falls through to the top-of-loop drain — see the
@@ -4979,6 +4982,24 @@ impl KafkaConsumer {
                         }
                     }
                 }
+                }
+                .await;
+                // Every fatal exit passes through here, whether the fault arm
+                // took it, the loop met a registry deployment fault itself, a
+                // seek or pause failed, or the connection was lost: the child
+                // token ends every sibling task's in-place wait, the permit
+                // drain is the only aggregate proof that detached tasks have
+                // released their permits, and only then is the busy flag
+                // cleared. Nothing is committed here: every task's record stays
+                // uncommitted and is redelivered on restart, or by the
+                // reconnect a retryable error leads to. The spare permit, if
+                // one was held, went with the block's state, so the drain
+                // cannot wait on it.
+                let Err(e) = ended else { return Ok(()) };
+                tail_cancel.cancel();
+                let _ = tail_semaphore.acquire_many(prefetch_count as u32).await;
+                tail_processing.store(false, Ordering::Release);
+                Err(e)
             }
         })
         .await
@@ -6376,6 +6397,11 @@ impl KafkaConsumer {
                 let (fault_tx, mut fault_rx) = mpsc::channel::<ShoveError>(1);
                 #[cfg(not(feature = "kafka-schema-registry"))]
                 let _ = &fault_tx;
+                // Handler tasks wait on this child rather than on `shutdown`
+                // itself, so a fatal exit of the loop below can end their
+                // in-place redelivery waits without cancelling the token the
+                // subscriber owns.
+                let task_cancel = shutdown.child_token();
 
                 // `fetch_metadata` blocks the calling thread, so the assignment
                 // runs off the runtime's worker threads. `create_stream_consumer`
@@ -6413,6 +6439,10 @@ impl KafkaConsumer {
                 // above is already the authoritative metadata snapshot.
                 assignment_refresh.tick().await;
 
+                let tail_cancel = task_cancel.clone();
+                let tail_semaphore = semaphore.clone();
+                let tail_processing = processing.clone();
+                let ended: Result<()> = async move {
                 loop {
                     let (payload, headers, coordinates) = tokio::select! {
                         biased;
@@ -6657,7 +6687,7 @@ impl KafkaConsumer {
                     let task_handler = handler.clone();
                     let task_ctx = ctx.clone();
                     let task_timeout_outcome = handler_timeout_outcome_cfg.clone();
-                    let task_shutdown = shutdown.clone();
+                    let task_shutdown = task_cancel.clone();
                     #[cfg(feature = "kafka-schema-registry")]
                     let task_fault = fault_tx.clone();
                     #[cfg(feature = "kafka-schema-registry")]
@@ -6791,6 +6821,17 @@ impl KafkaConsumer {
                         drop(permit);
                     });
                 }
+                }
+                .await;
+                // Every fatal exit passes through here: the child token ends
+                // the handler task's redelivery wait, the permit drain proves
+                // it has released its permit, and only then is the busy flag
+                // cleared. Nothing is committed on this path at any time.
+                let Err(e) = ended else { return Ok(()) };
+                tail_cancel.cancel();
+                let _ = tail_semaphore.acquire_many(prefetch_count as u32).await;
+                tail_processing.store(false, Ordering::Release);
+                Err(e)
             }
         })
         .await
