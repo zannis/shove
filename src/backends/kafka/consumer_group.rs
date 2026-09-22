@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::kafka::client::KafkaClient;
 use crate::backends::kafka::consumer::{
-    KafkaConsumer, reject_fifo_commit_interval, reject_fifo_in_place,
+    KafkaConsumer, reject_fifo_commit_interval, reject_fifo_in_place, resolve_retry_strategy,
 };
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
 use crate::consumer::RetryStrategy;
@@ -1053,6 +1053,16 @@ impl KafkaConsumerGroupRegistry {
 
         let topology = T::topology();
         let name = topology.queue().to_string();
+        // Fail fast on a strategy the topology refuses, before anything is
+        // declared or a member spawned: `spawn_one` copies the strategy into
+        // every member's options, and each member would otherwise refuse it
+        // inside `run`, after registration had reported success.
+        resolve_retry_strategy(
+            topology,
+            config.retry_strategy,
+            &name,
+            "KafkaConsumerGroupRegistry::register",
+        )?;
 
         if self.groups.contains_key(&name) {
             metrics::record_backend_error(
@@ -2053,13 +2063,22 @@ mod tests {
     mod fifo_concurrency_guard {
         use super::*;
         use crate::topology::{SequenceFailure, TopologyBuilder};
-        use crate::{MessageMetadata, Outcome, define_sequenced_topic};
+        use crate::{MessageMetadata, Outcome, define_sequenced_topic, define_topic};
         use serde::{Deserialize, Serialize};
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct GuardEntry {
             account_id: String,
         }
+
+        define_topic!(
+            GuardExternal,
+            GuardEntry,
+            TopologyBuilder::new("kafka-register-guard-external")
+                .external()
+                .dlq()
+                .build()
+        );
 
         define_sequenced_topic!(
             GuardLedger,
@@ -2073,6 +2092,12 @@ mod tests {
         );
 
         struct NoopHandler;
+        impl MessageHandler<GuardExternal> for NoopHandler {
+            type Context = ();
+            async fn handle(&self, _: GuardEntry, _: MessageMetadata, _: &()) -> Outcome {
+                Outcome::Ack
+            }
+        }
         impl MessageHandler<GuardLedger> for NoopHandler {
             type Context = ();
             async fn handle(&self, _: GuardEntry, _: MessageMetadata, _: &()) -> Outcome {
@@ -2107,6 +2132,33 @@ mod tests {
                     && msg.contains("break per-key ordering")
                     && msg.contains("with_concurrent_processing(true)"),
                 "message must match the shared FIFO-concurrency wording: {msg}"
+            );
+        }
+
+        /// `register` resolves the retry strategy before it declares anything
+        /// or spawns a member: an external topology refuses `Republish` here,
+        /// not inside each member's `run` after registration reported success
+        /// and the autoscaler had a dead member to respawn. The test registry
+        /// has no client, so a check that ran after the client lookup would
+        /// surface as the client error instead of the refusal.
+        #[tokio::test]
+        async fn register_rejects_republish_on_an_external_topology() {
+            let config =
+                KafkaConsumerGroupConfig::new(1..=4).with_retry_strategy(RetryStrategy::Republish);
+
+            let err = registry()
+                .register::<GuardExternal, _>(config, || NoopHandler, ())
+                .await
+                .expect_err("RetryStrategy::Republish must be rejected on an external topology");
+
+            let ShoveError::Topology(msg) = err else {
+                panic!("expected ShoveError::Topology, got {err:?}");
+            };
+            assert!(
+                msg.contains("kafka-register-guard-external")
+                    && msg.contains("RetryStrategy::Republish")
+                    && msg.contains("KafkaConsumerGroupRegistry::register"),
+                "message must name the topic, the refused setting and the entry point: {msg}"
             );
         }
 

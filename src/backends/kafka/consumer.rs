@@ -2639,7 +2639,7 @@ fn lazy_positions(topic: &str, partitions: &[i32], offset: Offset) -> Result<Top
 /// republish would write a retried record into a topic infra owns, the one
 /// write external ownership rules out. A shove-owned topology defaults to
 /// `Republish`, the historical behaviour, and may opt into `InPlace`.
-fn resolve_retry_strategy(
+pub(super) fn resolve_retry_strategy(
     topology: &QueueTopology,
     requested: Option<RetryStrategy>,
     queue: &str,
