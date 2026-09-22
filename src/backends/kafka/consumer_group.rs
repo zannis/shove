@@ -352,7 +352,7 @@ impl KafkaConsumerGroupConfig {
     /// seconds. librdkafka refuses a value below `session.timeout.ms`, which
     /// is pinned at 10 s, so 10 s is the floor.
     #[cfg(feature = "test-support")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "test-support")))]
+    #[doc(hidden)]
     pub fn with_max_poll_interval_for_test(mut self, interval: Duration) -> Self {
         self.max_poll_interval = Some(interval);
         self

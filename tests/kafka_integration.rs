@@ -808,7 +808,11 @@ macro_rules! defer_once_for {
     )+};
 }
 
-defer_once_for!(ExternalDeferTopic, ExternalKeepaliveTopic);
+defer_once_for!(
+    ExternalDeferTopic,
+    ExternalKeepaliveTopic,
+    ExternalShutdownTopic
+);
 #[cfg(feature = "test-support")]
 defer_once_for!(ExternalTransitionTopic);
 
@@ -3031,6 +3035,61 @@ async fn external_topic_shutdown_during_a_wait_leaves_the_record_uncommitted() {
     token.cancel();
     assert!(running.await.unwrap().is_clean());
     restarted.close().await;
+    broker.close().await;
+}
+
+/// A shutdown that lands during an in-place wait ends the handler task with
+/// nothing completed, and the receive loop's drain then clears the consumer's
+/// busy flag: the flag is what the group's scale-down reads to find an idle
+/// member, so a member that exited cleanly must not read as still working.
+#[tokio::test]
+async fn external_topic_shutdown_during_a_wait_clears_the_processing_flag() {
+    const TOPIC: &str = "kafka-external-shutdown";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    let broker = tb.broker();
+
+    let handler = DeferOnceRecorder::new();
+    let shutdown = CancellationToken::new();
+    let options = ConsumerOptions::<Kafka>::new().with_shutdown(shutdown.clone());
+    let processing = options.processing_handle();
+    let h = handler.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let running = tokio::spawn(async move {
+        consumer
+            .run::<ExternalShutdownTopic, _>(h, (), options)
+            .await
+    });
+    wait_for_stable_group(tb.brokers(), "kafka-external-shutdown-consumer", TIMEOUT).await;
+
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<ExternalShutdownTopic>(&SimpleMessage {
+            id: "held".into(),
+            content: String::new(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the record reached the handler, which is now waiting out its deferral"
+    );
+    assert!(
+        processing.load(Ordering::Acquire),
+        "a waiting handler holds its slot, so the member reads as busy"
+    );
+
+    shutdown.cancel();
+    running
+        .await
+        .expect("consumer task panicked")
+        .expect("the consumer ends cleanly on shutdown");
+    assert!(
+        !processing.load(Ordering::Acquire),
+        "after a clean exit the member must not read as still working"
+    );
     broker.close().await;
 }
 

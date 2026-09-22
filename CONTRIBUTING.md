@@ -64,7 +64,7 @@ Per-backend feature sets (matching the CI matrix):
 | aws-sns-sqs | `pub-aws-sns,aws-sns-sqs,audit,metrics,sbe` |
 | nats | `nats,audit,metrics,sbe,env-config` |
 | kafka | `kafka,kafka-ssl,kafka-gssapi,kafka-msk-iam,test-support,audit,metrics,sbe,env-config` |
-| kafka (schema registry) | `kafka,kafka-schema-registry,protobuf` |
+| kafka (schema registry) | `kafka,kafka-schema-registry,protobuf,metrics,test-support` |
 | redis-streams | `redis-streams,metrics,sbe` |
 
 Take these verbatim. `metrics` in particular is load-bearing: the

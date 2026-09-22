@@ -297,7 +297,9 @@ jobs:
             # needs kafka + kafka-schema-registry + metrics all at once; this is
             # the only entry with the middle one, so without `metrics` here that
             # binary compiles empty in every job and its tests run nowhere.
-            features: kafka,kafka-schema-registry,protobuf,metrics
+            # `test-support` gates the registry test seam the outage suite uses
+            # to reach a deployment fault behind the client's permanent cache.
+            features: kafka,kafka-schema-registry,protobuf,metrics,test-support
             # `kafka-schema-registry` implies `kafka`, so without a filter this
             # entry would re-run the entire Kafka suite the `kafka` entry
             # already covers. Restrict it to the schema-registry binaries

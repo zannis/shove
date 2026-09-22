@@ -141,6 +141,17 @@ impl SchemaRegistry {
         result
     }
 
+    /// Test-only seam (see the `test-support` feature): forget a resolved
+    /// schema id, so the next decode asks the registry again and meets
+    /// whatever the mock answers now. The client caches a resolved id for the
+    /// process's lifetime, which is right in production and makes a later
+    /// registry fault unreachable from a test otherwise.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn evict_for_test(&self, id: SchemaId) {
+        self.resolved.remove(&id);
+    }
+
     /// True when `id` holds a negative entry that has not yet expired.
     fn negative_is_fresh(&self, id: SchemaId) -> bool {
         match self.negative.get(&id) {

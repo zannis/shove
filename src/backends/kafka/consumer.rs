@@ -1549,8 +1549,9 @@ enum InPlaceEnd {
     Cancelled,
     /// The schema registry answered with a deployment fault while the record
     /// was being decoded again. Nothing is completed: the record stays
-    /// uncommitted, and the receive loop meets the same fault on its next
-    /// record and stops.
+    /// uncommitted, and the task reports the fault over the receive loop's
+    /// fault channel, so the loop ends with it at once rather than on some
+    /// later record that may never come.
     #[cfg(feature = "kafka-schema-registry")]
     Fatal(ShoveError),
 }
@@ -4054,6 +4055,23 @@ impl KafkaConsumer {
                 // surfaced immediately rather than silently accumulating (sec-K-4).
                 let (completion_tx, mut completion_rx) =
                     mpsc::channel::<Completion>(prefetch_count as usize);
+                // A registry deployment fault met inside a handler task's
+                // in-place redelivery ends this loop the way the loop ends
+                // when it meets the fault itself: at once, with the `Topology`
+                // error and the record uncommitted rather than pinned in a
+                // consumer that keeps polling. The broadcast loop owns the
+                // same channel. The sender stays alive here for the loop's
+                // lifetime so the arm below stays pending; tasks clone it
+                // only under `kafka-schema-registry`, the one build with such
+                // a fault to report.
+                let (fault_tx, mut fault_rx) = mpsc::channel::<ShoveError>(1);
+                #[cfg(not(feature = "kafka-schema-registry"))]
+                let _ = &fault_tx;
+                // Handler tasks wait on this child rather than on `shutdown`
+                // itself. A shutdown still reaches them through the parent,
+                // and a fault lets the loop end every sibling's in-place wait
+                // without cancelling the token the group or supervisor owns.
+                let task_cancel = shutdown.child_token();
 
                 // Periodic wake so rebalance events and commit retries are
                 // drained even when no messages or completions arrive: the
@@ -4178,6 +4196,12 @@ impl KafkaConsumer {
                             // A spare permit would otherwise deadlock the drain below.
                             drop(spare_permit.take());
                             let _ = semaphore.acquire_many(prefetch_count as u32).await;
+                            // Every task has exited. A task that ended on a
+                            // cancelled wait could not clear the busy flag
+                            // itself: a permit it releases goes to the queued
+                            // `acquire_many` above first, so its own
+                            // availability check never sees the full count.
+                            processing.store(false, Ordering::Release);
                             // Final commit
                             while let Ok(completion) = completion_rx.try_recv() {
                                 tracker.mark_complete(completion);
@@ -4214,6 +4238,28 @@ impl KafkaConsumer {
                                 }
                             }
                             return Ok(());
+                        }
+                        fault = fault_rx.recv() => {
+                            // `None` cannot happen while `fault_tx` lives in
+                            // this scope; the arm is total anyway.
+                            let Some(e) = fault else { continue };
+                            tracing::error!(
+                                error = %e,
+                                queue,
+                                "schema registry deployment fault reported by a handler task; ending the consumer"
+                            );
+                            // Every sibling task ends before the error is
+                            // returned: the child token ends their waits, the
+                            // permit drain is the only aggregate proof that
+                            // detached tasks have released their permits, and
+                            // only then is the busy flag cleared. Nothing is
+                            // committed here: every task's record stays
+                            // uncommitted and is redelivered on restart.
+                            drop(spare_permit.take());
+                            task_cancel.cancel();
+                            let _ = semaphore.acquire_many(prefetch_count as u32).await;
+                            processing.store(false, Ordering::Release);
+                            return Err(e);
                         }
                         // Falls through to the top-of-loop drain — see the
                         // comment on `housekeeping` above.
@@ -4559,9 +4605,11 @@ impl KafkaConsumer {
                             let task_handler = handler.clone();
                             let task_ctx = ctx.clone();
                             let task_group = group.clone();
-                            let task_shutdown = shutdown.clone();
+                            let task_shutdown = task_cancel.clone();
                             let task_waiters = in_place_waiters.clone();
                             let task_timeout_outcome = handler_timeout_outcome_cfg.clone();
+                            #[cfg(feature = "kafka-schema-registry")]
+                            let task_fault = fault_tx.clone();
 
                             #[cfg(feature = "kafka-schema-registry")]
                             let task_schema_registry = schema_registry.clone();
@@ -4658,8 +4706,10 @@ impl KafkaConsumer {
                                         }
                                         InPlaceEnd::Cancelled => {
                                             // Nothing is completed: the offset stays
-                                            // uncommitted and the shutdown drain
-                                            // collects this permit.
+                                            // uncommitted and the loop's shutdown or
+                                            // fault arm collects this permit, then
+                                            // clears the busy flag itself once the
+                                            // drain proves every task has ended.
                                             drop(permit);
                                             return;
                                         }
@@ -4668,9 +4718,18 @@ impl KafkaConsumer {
                                             tracing::error!(
                                                 queue = %task_topic,
                                                 error = %e,
-                                                "schema registry deployment fault during an in-place redelivery; leaving the record uncommitted"
+                                                "schema registry deployment fault during an in-place redelivery; ending the consumer"
                                             );
+                                            // Cleanup before the report: the loop's fault
+                                            // arm drains every permit, and a permit still
+                                            // held here would hold that drain up.
                                             drop(permit);
+                                            if task_semaphore.available_permits() == task_prefetch as usize {
+                                                task_processing.store(false, Ordering::Release);
+                                            }
+                                            // A full channel means a sibling already
+                                            // reported the same fault.
+                                            let _ = task_fault.try_send(e);
                                             return;
                                         }
                                     }

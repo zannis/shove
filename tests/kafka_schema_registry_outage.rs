@@ -47,6 +47,8 @@ use shove::kafka::{
 use shove::markers::Kafka;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
 use shove::outcome::Outcome;
+#[cfg(feature = "test-support")]
+use shove::schema_registry::SchemaId;
 use shove::schema_registry::SchemaRegistry;
 use shove::topology::{SequenceFailure, TopologyBuilder};
 
@@ -326,6 +328,18 @@ shove::define_topic!(
     Event,
     TopologyBuilder::new("kafka-sr-outage-drain").dlq().build()
 );
+// An infra-owned topic, so a `Defer` waits in place and decodes the retained
+// bytes again: the registry is asked a second time for the same record.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    InPlaceFaultTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-inplace-fault")
+        .external()
+        .hold_queue(Duration::from_millis(200))
+        .allow_message_loss()
+        .build()
+);
 
 #[derive(Clone)]
 struct Recorder {
@@ -366,6 +380,28 @@ recorder_for!(
     FifoStallTopic,
     BroadcastStallTopic
 );
+
+/// Records every delivery and returns `Defer` for the first one it sees,
+/// then `Ack`.
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+struct DeferOnceRecorder {
+    seen: Arc<Mutex<Vec<u32>>>,
+    counter: WaitableCounter,
+}
+
+#[cfg(feature = "test-support")]
+impl MessageHandler<InPlaceFaultTopic> for DeferOnceRecorder {
+    type Context = ();
+    async fn handle(&self, msg: Event, _meta: MessageMetadata, _: &()) -> Outcome {
+        let mut seen = self.seen.lock().unwrap();
+        let first = seen.is_empty();
+        seen.push(msg.id);
+        drop(seen);
+        self.counter.increment();
+        if first { Outcome::Defer } else { Outcome::Ack }
+    }
+}
 
 /// Records what the DLQ drain hands to `handle_dead`.
 #[derive(Clone)]
@@ -1084,4 +1120,87 @@ async fn a_dlq_drain_stalls_and_resumes() {
         .await
         .expect("drain task panicked")
         .expect("drain ended cleanly");
+}
+
+/// A registry deployment fault met during an in-place redelivery ends the
+/// consumer with `Topology`, as the receive loop does when it meets the fault
+/// itself: the handler task reports it over the loop's fault channel, every
+/// sibling drains, the busy flag clears, and the record stays uncommitted
+/// rather than pinned in a consumer that keeps polling.
+///
+/// The public client caches a resolved schema id for good, so the second
+/// decode would never ask the registry again: the `test-support` seam evicts
+/// the id between the first delivery and the redelivery.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_registry_deployment_fault_during_an_in_place_redelivery_ends_the_consumer() {
+    const TOPIC: &str = "kafka-sr-outage-inplace-fault";
+    const GROUP: &str = "kafka-sr-outage-inplace-fault-consumer";
+    let recorder = DebuggingRecorder::new();
+    let snapshotter: Snapshotter = recorder.snapshotter();
+    recorder.install().expect("install debugging recorder");
+
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+    let (registry, status) = mock_registry("kafka-sr-outage-inplace-fault-value", 200).await;
+    let client = tb.client().await;
+    let body = serde_json::to_vec(&Event { id: 5 }).unwrap();
+    publish_raw(&tb.brokers, TOPIC, &frame_json(FLAKY_ID, &body)).await;
+
+    let handler = DeferOnceRecorder {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let h = handler.clone();
+    let options = ConsumerOptions::<Kafka>::new()
+        .with_concurrent_processing(false)
+        .with_schema_registry(registry.clone())
+        .with_shutdown(CancellationToken::new());
+    let processing = options.processing_handle();
+    let consumer = KafkaConsumer::new(client.clone());
+    let running =
+        tokio::spawn(async move { consumer.run::<InPlaceFaultTopic, _>(h, (), options).await });
+
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the record reached the handler once"
+    );
+    // The redelivery decodes the retained bytes again; make that lookup meet
+    // a fault instead of the cache.
+    registry.evict_for_test(SchemaId(FLAKY_ID));
+    status.store(401, Ordering::SeqCst);
+
+    let outcome = tokio::time::timeout(TIMEOUT, running)
+        .await
+        .expect("the consumer must end on its own, not keep polling with the record pinned")
+        .expect("consumer task panicked");
+    match outcome {
+        Err(ShoveError::Topology(message)) => {
+            assert!(
+                message.contains("schema id 9") && message.contains("deployment fault"),
+                "the error names the schema id and the fault: {message}"
+            );
+        }
+        other => panic!("expected ShoveError::Topology, got {other:?}"),
+    }
+    assert_eq!(
+        handler.seen.lock().unwrap().clone(),
+        vec![5],
+        "one delivery, no redelivery"
+    );
+    assert_eq!(
+        lag(&client, TOPIC, GROUP).await,
+        1,
+        "the record stays uncommitted for whoever runs next"
+    );
+    assert!(
+        !processing.load(Ordering::Acquire),
+        "every handler task ended before the loop returned, so the member reads idle"
+    );
+    let snapshot = snapshotter.snapshot().into_hashmap();
+    assert_eq!(
+        discarded_series(&snapshot, TOPIC),
+        Vec::<(String, u64)>::new(),
+        "a deployment fault is not a discard"
+    );
 }
