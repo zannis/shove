@@ -94,11 +94,14 @@ pub struct MessageMetadata {
     ///
     /// The count belongs to a *broker-level* message, so anything that creates a
     /// new one starts it over at 1. [`Outcome::Retry`](crate::Outcome::Retry)
-    /// publishes an incremented copy on every backend, so it always resets;
-    /// `retry_count` is the field that survives a retry. `Defer` resets it on
-    /// the backends where deferring re-sends the message (SQS) and preserves it
-    /// on the backends where deferring naks in place (NATS, and the in-process
-    /// broker, which models NATS here).
+    /// publishes an incremented copy on every backend that republishes, so it
+    /// resets there; a Kafka consumer running with `RetryStrategy::InPlace`
+    /// hands the same record back instead, so the count stays what the broker
+    /// reported for that one record. `retry_count` is the field that survives
+    /// a retry either way. `Defer` resets it on the backends where deferring
+    /// re-sends the message (SQS) and preserves it on the backends where
+    /// deferring naks in place (NATS, and the in-process broker, which models
+    /// NATS here) or waits in place (Kafka under `RetryStrategy::InPlace`).
     ///
     /// So: use `retry_count` to reason about `shove`'s retry budget, and
     /// `delivery_count` to reason about attempts the broker repeated on its own.
@@ -116,8 +119,10 @@ pub struct MessageMetadata {
     /// With [`offset`](Self::offset) this names the record's position in the
     /// log, which is what an audit trail or a replay request needs. It is a
     /// position, not an attempt: the same record redelivered after a
-    /// rebalance carries the same coordinates, and a `Retry` republishes a
-    /// new record with new ones.
+    /// rebalance carries the same coordinates, and a `Retry` that republishes,
+    /// the shove-owned default, produces a new record with new ones. A `Retry`
+    /// carried out in place, `RetryStrategy::InPlace` on Kafka, hands the same
+    /// record back, so the coordinates stay the same and `redelivered` is set.
     ///
     /// Each of the three coordinate fields is filled where the backend has
     /// the data, and carries its own availability table; `partition` is the
