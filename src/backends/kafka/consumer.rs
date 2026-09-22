@@ -3011,6 +3011,19 @@ struct BatchDecodeCtx<'a> {
     schema_message_index: Option<&'a [i32]>,
 }
 
+/// What the batch loop's decode stage leaves it with once any registry wait
+/// is over: a record to buffer, or a pre-handler drop to park. The wait loop
+/// resolves `Unavailable` by waiting and `Fatal` by returning, so neither
+/// reaches the buffering step, and this type says so where an `unreachable!`
+/// arm used to.
+enum BatchStaged<M> {
+    Decoded(M),
+    Dlq {
+        reason: &'static str,
+        fail: metrics::FailReason,
+    },
+}
+
 /// Outcome of decoding one message on its way into a batch. Also the decode
 /// stage of an in-place redelivery and of a broadcast redelivery, which
 /// decode the retained bytes again through the same context.
@@ -3693,12 +3706,7 @@ fn rewind_after_rebalance(
     batch_start: &HashMap<i32, i64>,
 ) -> Result<()> {
     let still_assigned = assigned_partitions(consumer, queue);
-    // `None` = librdkafka would not report the assignment.
-    let may_be_held = |partition: i32| {
-        still_assigned
-            .as_ref()
-            .is_none_or(|a| a.contains(&partition))
-    };
+    let may_be_held = |partition: i32| seek_failure_is_loss(still_assigned.as_ref(), partition);
     let mut lost = Vec::new();
 
     for (&partition, &start_offset) in batch_start {
@@ -3767,6 +3775,55 @@ fn rewind_after_rebalance(
     )))
 }
 
+/// Whether a failed seek on `partition` may have lost this member's position.
+///
+/// A seek fails harmlessly on a partition the group revoked in the same
+/// poll: the member taking it over resumes from the last committed offset,
+/// which is where a put-back or a rewind would have pointed anyway. It fails
+/// harmfully on a partition this member still holds, whose consumed position
+/// then stays past the record. `None` means librdkafka would not report the
+/// assignment, and the two cases cannot be told apart, so the failure counts
+/// as a loss: a needless reconnect costs a rejoin, guessing the other way
+/// costs data.
+fn seek_failure_is_loss(still_assigned: Option<&BTreeSet<i32>>, partition: i32) -> bool {
+    still_assigned.is_none_or(|assigned| assigned.contains(&partition))
+}
+
+/// Settle the result of a put-back seek on `partition` at `offset`.
+///
+/// `errors` are the per-partition errors of the seek response. An empty list
+/// is a clean seek. An error on a partition that `seek_failure_is_loss` calls
+/// a loss keeps the `Connection` error: the loop reconnects and resumes from
+/// the last committed offset, which redelivers the record. An error on a
+/// partition revoked in the same poll is settled as `Ok(())`, because the
+/// member taking the partition over resumes from that same committed offset
+/// and a reconnect here would only cost this member a rejoin.
+fn settle_put_back_seek(
+    queue: &str,
+    partition: i32,
+    offset: i64,
+    errors: Vec<(i32, KafkaError)>,
+    still_assigned: Option<&BTreeSet<i32>>,
+) -> Result<()> {
+    let Some((_, e)) = errors.into_iter().next() else {
+        return Ok(());
+    };
+    if !seek_failure_is_loss(still_assigned, partition) {
+        tracing::debug!(
+            error = %e,
+            queue,
+            partition,
+            offset,
+            "put-back seek failed on a partition revoked in the same poll; the member taking \
+             it over resumes from the last committed offset"
+        );
+        return Ok(());
+    }
+    Err(ShoveError::Connection(format!(
+        "put-back seek failed on {queue} partition {partition} at offset {offset}: {e}"
+    )))
+}
+
 /// Per-partition errors hiding inside a successful `seek_partitions` response.
 ///
 /// `rd_kafka_seek_partitions` reports each partition's outcome in that
@@ -3806,12 +3863,12 @@ fn put_back(
     let sought = consumer
         .seek_partitions(tpl, SEEK_TIMEOUT)
         .map_err(|e| map_kafka_error("put-back seek failed", e))?;
-    if let Some((_, e)) = seek_errors(&sought).into_iter().next() {
-        return Err(ShoveError::Connection(format!(
-            "put-back seek failed on {queue} partition {partition} at offset {offset}: {e}"
-        )));
+    let errors = seek_errors(&sought);
+    if errors.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let still_assigned = assigned_partitions(consumer, queue);
+    settle_put_back_seek(queue, partition, offset, errors, still_assigned.as_ref())
 }
 
 /// Wait for a prefetch permit on an infra-owned topic while the receive loop
@@ -3859,7 +3916,10 @@ async fn acquire_permit_while_polling(
                     .map_err(|e| map_kafka_error("pause failed", e))?;
                 if !*paused {
                     *paused = true;
-                    tracing::debug!(
+                    // A transition, at info: a member can sit paused for
+                    // minutes, and this is the only trace of it in
+                    // production. Each further record is put back at debug.
+                    tracing::info!(
                         queue,
                         "every prefetch permit is held while a record waits for one; assignment paused"
                     );
@@ -4254,7 +4314,7 @@ impl KafkaConsumer {
                             .pause_assignment()
                             .map_err(|e| map_kafka_error("pause failed", e))?;
                         paused = true;
-                        tracing::debug!(
+                        tracing::info!(
                             queue,
                             "every prefetch permit is held by a waiting handler; assignment paused"
                         );
@@ -4375,7 +4435,7 @@ impl KafkaConsumer {
                                 .map_err(|e| map_kafka_error("resume failed", e))?;
                             paused = false;
                             spare_permit = Some(permit);
-                            tracing::debug!(queue, "a prefetch permit freed; assignment resumed");
+                            tracing::info!(queue, "a prefetch permit freed; assignment resumed");
                         }
                         msg_result = consumer.recv() => {
                             let msg = match msg_result {
@@ -4434,7 +4494,7 @@ impl KafkaConsumer {
                                     .map_err(|e| map_kafka_error("pause failed", e))?;
                                 if !paused {
                                     paused = true;
-                                    tracing::debug!(
+                                    tracing::info!(
                                         queue,
                                         "every prefetch permit is held by a waiting handler; assignment paused"
                                     );
@@ -5296,7 +5356,10 @@ impl KafkaConsumer {
                                         }
                                         #[cfg(feature = "kafka-schema-registry")]
                                         BatchDecode::Fatal(e) => return Err(e),
-                                        other => break other,
+                                        BatchDecode::Decoded(m) => break BatchStaged::Decoded(m),
+                                        BatchDecode::Dlq { reason, fail } => {
+                                            break BatchStaged::Dlq { reason, fail };
+                                        }
                                     }
                                 };
                                 #[cfg(feature = "kafka-schema-registry")]
@@ -5316,7 +5379,7 @@ impl KafkaConsumer {
                                     deadline = Some(Box::pin(tokio::time::sleep(max_batch_age)));
                                 }
                                 match decoded {
-                                    BatchDecode::Dlq { reason, fail } => {
+                                    BatchStaged::Dlq { reason, fail } => {
                                         let pending = metrics::record_terminal(
                                             &topic,
                                             group.as_deref(),
@@ -5333,7 +5396,7 @@ impl KafkaConsumer {
                                             pending,
                                         );
                                     }
-                                    BatchDecode::Decoded(decoded) => {
+                                    BatchStaged::Decoded(decoded) => {
                                         let metadata = build_message_metadata(&headers, false, RecordCoordinates::of(&msg));
                                         let raw = retain_raw.then(|| RawMessage {
                                             payload: Bytes::copy_from_slice(payload_slice),
@@ -5341,10 +5404,6 @@ impl KafkaConsumer {
                                             headers: headers.clone(),
                                         });
                                         buffer.push(decoded, metadata, raw);
-                                    }
-                                    #[cfg(feature = "kafka-schema-registry")]
-                                    BatchDecode::Unavailable { .. } | BatchDecode::Fatal(_) => {
-                                        unreachable!("resolved by the wait loop above")
                                     }
                                 }
                             }
@@ -8242,6 +8301,43 @@ mod seek_error_tests {
     #[test]
     fn an_empty_seek_result_reports_no_errors() {
         assert!(seek_errors(&TopicPartitionList::new()).is_empty());
+    }
+
+    /// The three assignment shapes: a partition still held is a loss, one no
+    /// longer held is not, and an unreadable assignment counts as a loss
+    /// because the two cannot be told apart.
+    #[test]
+    fn seek_failure_on_a_revoked_partition_is_not_a_loss() {
+        let holding_zero: BTreeSet<i32> = BTreeSet::from([0]);
+        assert!(seek_failure_is_loss(Some(&holding_zero), 0), "still held");
+        assert!(!seek_failure_is_loss(Some(&holding_zero), 1), "revoked");
+        assert!(
+            seek_failure_is_loss(None, 1),
+            "unknown assignment is the losing case"
+        );
+    }
+
+    /// A put-back whose seek failed on a partition revoked in the same poll
+    /// settles cleanly: the member taking it over resumes from the committed
+    /// offset. The same error on a held partition, or with an unreadable
+    /// assignment, keeps forcing the reconnect that redelivers the record.
+    #[test]
+    fn a_put_back_seek_error_on_a_revoked_partition_is_settled_without_a_reconnect() {
+        let error = || vec![(1, KafkaError::Seek("Local: Erroneous state".into()))];
+        let holding_zero: BTreeSet<i32> = BTreeSet::from([0]);
+        let holding_one: BTreeSet<i32> = BTreeSet::from([1]);
+
+        settle_put_back_seek("q", 1, 7, error(), Some(&holding_zero))
+            .expect("a revoked partition's failed seek is not a loss");
+        assert!(matches!(
+            settle_put_back_seek("q", 1, 7, error(), Some(&holding_one)),
+            Err(ShoveError::Connection(_))
+        ));
+        assert!(matches!(
+            settle_put_back_seek("q", 1, 7, error(), None),
+            Err(ShoveError::Connection(_))
+        ));
+        settle_put_back_seek("q", 1, 7, Vec::new(), None).expect("a clean seek settles");
     }
 }
 
