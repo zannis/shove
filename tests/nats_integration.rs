@@ -3538,3 +3538,55 @@ async fn nats_delivery_fills_offset_and_timestamp_from_stream_info() {
     );
     broker.close().await;
 }
+
+/// The direct and FIFO entry points refuse a set broadcast start, as the
+/// supervisor and group paths do: `with_broadcast_start` reaches
+/// `NatsConsumer::run` and `run_fifo` as a `Topology` error before any
+/// consumer is created, synchronously, which the timeout pins.
+#[tokio::test]
+async fn direct_and_fifo_entry_points_refuse_a_broadcast_start() {
+    let tb = TestBroker::start().await;
+    let client = tb.client();
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        NatsConsumer::new(client.clone()).run::<WorkTopic, _>(
+            CountingHandler::new(),
+            (),
+            ConsumerOptions::<Nats>::new().with_broadcast_start(shove::BroadcastStart::Head),
+        ),
+    )
+    .await
+    .expect("the refusal is synchronous")
+    .expect_err("a set broadcast start must be refused on the direct path");
+    let shove::ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("nats-work")
+            && msg.contains("with_broadcast_start(Head)")
+            && msg.contains("NatsConsumer::run"),
+        "the error names the topic, the start and the entry point: {msg}"
+    );
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        NatsConsumer::new(client).run_fifo::<SeqSkipTopic, _>(
+            CountingHandler::new(),
+            (),
+            ConsumerOptions::<Nats>::new().with_broadcast_start(shove::BroadcastStart::Tail),
+        ),
+    )
+    .await
+    .expect("the refusal is synchronous")
+    .expect_err("a set broadcast start must be refused on the FIFO path");
+    let shove::ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("nats-seq-skip")
+            && msg.contains("with_broadcast_start(Tail)")
+            && msg.contains("NatsConsumer::run_fifo"),
+        "the error names the topic, the start and the entry point: {msg}"
+    );
+}

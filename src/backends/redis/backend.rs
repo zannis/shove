@@ -266,3 +266,50 @@ impl RegistryImpl for RedisConsumerGroupRegistry {
         self.drain_until_timeout(drain_timeout).await
     }
 }
+
+#[cfg(test)]
+mod broadcast_start_guard_tests {
+    use super::*;
+    use crate::backend::{BroadcastImpl, ConsumerOptionsInner};
+    use crate::broadcast::BroadcastStart;
+    use crate::error::ShoveError;
+    use tokio_util::sync::CancellationToken;
+
+    fn options(start: Option<BroadcastStart>) -> ConsumerOptionsInner {
+        let mut options = ConsumerOptionsInner::defaults_with_shutdown(CancellationToken::new());
+        options.broadcast_start = start;
+        options
+    }
+
+    /// The subscription starts at the tail only on this version, so
+    /// `subscribe()` refuses `Head` and `Timestamp` with this backend's name
+    /// and its reason, and admits an unset or `Tail` start.
+    #[test]
+    fn broadcast_subscribe_refuses_head_and_timestamp() {
+        for start in [None, Some(BroadcastStart::Tail)] {
+            <RedisConsumer as BroadcastImpl>::check_options("cache-invalidations", &options(start))
+                .expect("the tail changes nothing and passes");
+        }
+        for start in [
+            BroadcastStart::Head,
+            BroadcastStart::Timestamp(1_700_000_000_000),
+        ] {
+            let err = <RedisConsumer as BroadcastImpl>::check_options(
+                "cache-invalidations",
+                &options(Some(start)),
+            )
+            .expect_err("a start this backend cannot honour is refused at subscribe()");
+            let ShoveError::Topology(msg) = err else {
+                panic!("expected ShoveError::Topology, got {err:?}");
+            };
+            assert!(msg.contains("cache-invalidations"), "{msg}");
+            assert!(
+                msg.contains(&format!("with_broadcast_start({start:?})")),
+                "{msg}"
+            );
+            assert!(msg.contains("Redis Streams"), "{msg}");
+            assert!(msg.contains("reads from `$`"), "{msg}");
+            assert!(msg.contains("BroadcastStart::Tail"), "{msg}");
+        }
+    }
+}

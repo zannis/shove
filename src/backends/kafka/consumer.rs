@@ -6904,6 +6904,20 @@ mod broadcast_option_guard_tests {
     }
     impl NotSequenced for Plain {}
 
+    struct WithDlq;
+    impl Topic for WithDlq {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| {
+                TopologyBuilder::new("broadcast-option-guard-dlq")
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+
     struct Ledger;
     impl Topic for Ledger {
         type Message = Entry;
@@ -6994,6 +7008,31 @@ mod broadcast_option_guard_tests {
         assert!(msg.contains("broadcast-option-guard-ledger"), "{msg}");
         assert!(msg.contains("with_broadcast_start(Tail)"), "{msg}");
         assert!(msg.contains("KafkaConsumer::run_fifo"), "{msg}");
+    }
+
+    /// The DLQ drain refuses it too, after the DLQ check and before it
+    /// subscribes, so a start set on a drain's options is not dropped.
+    #[tokio::test]
+    async fn run_dlq_rejects_broadcast_start() {
+        let err = consumer()
+            .await
+            .run_dlq_with_options::<WithDlq, _>(
+                NoopHandler,
+                (),
+                crate::ConsumerOptions::<Kafka>::new()
+                    .with_broadcast_start(BroadcastStart::Timestamp(1_700_000_000_000))
+                    .with_max_reconnect_attempts(1)
+                    .with_shutdown(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a set broadcast start must be refused on the DLQ drain");
+        let msg = topology_message(err);
+        assert!(msg.contains("broadcast-option-guard-dlq"), "{msg}");
+        assert!(
+            msg.contains("with_broadcast_start(Timestamp(1700000000000))"),
+            "{msg}"
+        );
+        assert!(msg.contains("KafkaConsumer::run_dlq"), "{msg}");
     }
 
     /// A broadcast subscription commits nothing, so a commit interval would

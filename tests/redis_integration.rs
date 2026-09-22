@@ -26,8 +26,8 @@ use shove::redis::{
     RedisConfig, RedisConsumer, RedisConsumerGroupConfig, RedisMode, RedisQueueStatsProvider,
 };
 use shove::{
-    Broker, ConsumerOptions, JsonCodec, MessageHandler, MessageMetadata, Outcome, Redis,
-    SequenceFailure, SequencedTopic, Topic, TopologyBuilder,
+    BroadcastStart, Broker, ConsumerOptions, JsonCodec, MessageHandler, MessageMetadata, Outcome,
+    Redis, SequenceFailure, SequencedTopic, ShoveError, Topic, TopologyBuilder,
 };
 
 // ---------------------------------------------------------------------------
@@ -5320,5 +5320,91 @@ async fn redis_delivery_fills_timestamp_from_the_entry_id() {
     assert!(
         ts >= before_ms - tolerance && ts <= after_ms + tolerance,
         "timestamp_ms {ts} is not within the publish window {before_ms}..{after_ms}"
+    );
+}
+
+/// Acks everything; for the entry points that must refuse before a delivery.
+struct NoopGuardHandler;
+impl MessageHandler<HeadersTopic> for NoopGuardHandler {
+    type Context = ();
+    async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+}
+impl MessageHandler<LedgerTopic> for NoopGuardHandler {
+    type Context = ();
+    async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+}
+
+/// The direct and FIFO entry points refuse a set broadcast start, as the
+/// supervisor and group paths do: `with_broadcast_start` reaches
+/// `RedisConsumer::run` and `run_fifo` as a `Topology` error before any
+/// stream is read, synchronously, which the timeout pins.
+#[tokio::test]
+async fn direct_and_fifo_entry_points_refuse_a_broadcast_start() {
+    let url = redis_url().await;
+    // The same container-init retry as `make_broker`: the first connection
+    // can land while Redis is still starting.
+    let mut client = None;
+    for attempt in 0u32..5 {
+        let cfg = RedisConfig::new(RedisMode::Standalone {
+            url: url.to_owned(),
+        })
+        .with_group("redis-int-broadcast-start-guard");
+        match <Redis as shove::Backend>::connect(cfg).await {
+            Ok(c) => {
+                client = Some(c);
+                break;
+            }
+            Err(_) if attempt < 4 => {
+                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt + 1))).await;
+            }
+            Err(e) => panic!("connect RedisClient after retries: {e}"),
+        }
+    }
+    let client = client.expect("connected within the retry budget");
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        RedisConsumer::new(client.clone()).run::<HeadersTopic, _>(
+            NoopGuardHandler,
+            (),
+            ConsumerOptions::<Redis>::new().with_broadcast_start(BroadcastStart::Head),
+        ),
+    )
+    .await
+    .expect("the refusal is synchronous")
+    .expect_err("a set broadcast start must be refused on the direct path");
+    let ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains(HeadersTopic::topology().queue())
+            && msg.contains("with_broadcast_start(Head)")
+            && msg.contains("RedisConsumer::run"),
+        "the error names the topic, the start and the entry point: {msg}"
+    );
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        RedisConsumer::new(client).run_fifo::<LedgerTopic, _>(
+            NoopGuardHandler,
+            (),
+            ConsumerOptions::<Redis>::new().with_broadcast_start(BroadcastStart::Tail),
+        ),
+    )
+    .await
+    .expect("the refusal is synchronous")
+    .expect_err("a set broadcast start must be refused on the FIFO path");
+    let ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains(LedgerTopic::topology().queue())
+            && msg.contains("with_broadcast_start(Tail)")
+            && msg.contains("RedisConsumer::run_fifo"),
+        "the error names the topic, the start and the entry point: {msg}"
     );
 }

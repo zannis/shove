@@ -6344,3 +6344,55 @@ mod sbe_codec {
         ctx.cleanup().await;
     }
 }
+
+/// The direct and FIFO entry points refuse a set broadcast start, as the
+/// supervisor and group paths do: `with_broadcast_start` reaches
+/// `RabbitMqConsumer::run` and `run_fifo` as a `Topology` error before any
+/// channel is opened, synchronously, which the timeout pins.
+#[tokio::test]
+async fn direct_and_fifo_entry_points_refuse_a_broadcast_start() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        RabbitMqConsumer::new(client.clone()).run::<SimpleWork, _>(
+            CountingHandler::new(),
+            (),
+            ConsumerOptions::<RabbitMqMarker>::new().with_broadcast_start(BroadcastStart::Head),
+        ),
+    )
+    .await
+    .expect("the refusal is synchronous")
+    .expect_err("a set broadcast start must be refused on the direct path");
+    let ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("test-simple")
+            && msg.contains("with_broadcast_start(Head)")
+            && msg.contains("RabbitMqConsumer::run"),
+        "the error names the topic, the start and the entry point: {msg}"
+    );
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        RabbitMqConsumer::new(client).run_fifo::<OrderTopic, _>(
+            CountingHandler::new(),
+            (),
+            ConsumerOptions::<RabbitMqMarker>::new().with_broadcast_start(BroadcastStart::Tail),
+        ),
+    )
+    .await
+    .expect("the refusal is synchronous")
+    .expect_err("a set broadcast start must be refused on the FIFO path");
+    let ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("test-orders")
+            && msg.contains("with_broadcast_start(Tail)")
+            && msg.contains("RabbitMqConsumer::run_fifo"),
+        "the error names the topic, the start and the entry point: {msg}"
+    );
+}
