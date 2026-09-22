@@ -111,10 +111,13 @@ const QUIET_DRAINS_TO_RESOLVE: u32 = 2;
 /// the in-flight count O(1), so close stays prompt. Two costs, both accepted:
 /// a wider crash-redelivery window (which at-least-once semantics already
 /// promise), matching the spirit of Kafka's own 5 s auto-commit default while
-/// staying 10x tighter; and the tracker's `completed` set now buffers up to
-/// one window of completions between drains — memory bounded by consume rate
-/// × this interval (≈6k offsets at 12k msg/s), where it was bounded by
-/// `prefetch_count` before.
+/// staying 10x tighter; and the tracker's `in_flight` set, which holds every
+/// delivered offset until a drain commits past it, keeps up to one window of
+/// completed offsets between drains. The set's size is bounded by the permits:
+/// at most `prefetch_count` offsets are outstanding at once, and the ones a
+/// window completes wait in the set until the next drain (about 6k offsets at
+/// 12k msg/s), where the old `completed` set was bounded by `prefetch_count`
+/// alone.
 const ASYNC_COMMIT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Rate gate for the receive loop's offset commits: `due` says whether the
@@ -1997,10 +2000,10 @@ impl KafkaStreamConsumer {
     ///
     /// Existing partitions are re-assigned at their current consumer position;
     /// only newly discovered partitions are resolved, at the same `start` the
-    /// subscription began with, so an `Earliest` subscription does not skip a
-    /// new partition's first records and a `Latest` one still joins it at the
-    /// tail. This avoids both replaying already-delivered records and moving
-    /// an existing partition.
+    /// subscription began with, so a `Head` subscription does not skip a new
+    /// partition's first records and a `Tail` one still joins it at the tail.
+    /// This avoids both replaying already-delivered records and moving an
+    /// existing partition.
     ///
     /// **Blocking** for the metadata fetch; callers must use `spawn_blocking`.
     fn refresh_broadcast_partitions(

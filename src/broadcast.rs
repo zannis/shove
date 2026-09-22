@@ -21,9 +21,9 @@ use crate::topic::Topic;
 /// broker, as a Kafka offset, a JetStream deliver policy or a Redis stream
 /// id. Set with
 /// [`ConsumerOptions::with_broadcast_start`](crate::ConsumerOptions::with_broadcast_start),
-/// which is only available on a backend that implements
-/// [`HasBroadcast`](crate::backend::capability::HasBroadcast), and read only
-/// by [`BroadcastSubscriber::subscribe`]; the competing-consumer entry points
+/// which is only available on a backend that implements [`HasBroadcast`], and
+/// read only by [`BroadcastSubscriber::subscribe`]; the competing-consumer
+/// entry points
 /// refuse an options value that sets it.
 ///
 /// Kafka honours all three variants. Every other backend starts at the tail
