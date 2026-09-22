@@ -45,7 +45,11 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 /// has, and gains the setter as it declares its support: NATS follows with
 /// its native in-place redelivery, and its external mode keeps hold queues
 /// until then.
+///
+/// `#[non_exhaustive]`: a later shape, such as retry topics per delay tier,
+/// is a new variant and not a breaking change, so match with a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RetryStrategy {
     /// Publish an incremented copy after the tier's delay: into the hold
     /// queue on the backends that have one, into the consumed topic itself
@@ -344,7 +348,14 @@ pub struct ConsumerOptions<B: Backend> {
     /// default) lets the topology's ownership decide: in place on an external
     /// topology, a republish on a shove-owned one. See [`RetryStrategy`] for
     /// which backends honour an explicit choice.
-    pub retry_strategy: Option<RetryStrategy>,
+    ///
+    /// Crate-private on purpose: it is set through
+    /// `ConsumerOptions::<Kafka>::with_retry_strategy` and
+    /// `KafkaConsumerGroupConfig::with_retry_strategy`, the setters of the
+    /// one backend that reads it, so no other backend's options can carry a
+    /// strategy that nothing reads. Each backend gains its own setter as it
+    /// declares its support.
+    pub(crate) retry_strategy: Option<RetryStrategy>,
 
     // Runtime coordination — crate-private.
     pub(crate) shutdown: Option<CancellationToken>,

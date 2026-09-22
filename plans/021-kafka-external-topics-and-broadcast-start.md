@@ -783,7 +783,7 @@ pub enum RetryStrategy {
 }
 
 // src/consumer.rs, struct ConsumerOptions<B>, not feature-gated
-pub retry_strategy: Option<RetryStrategy>,
+pub(crate) retry_strategy: Option<RetryStrategy>, // set only through the two Kafka setters below
 
 // src/consumer.rs, impl ConsumerOptions<Kafka>; src/backends/kafka/consumer_group.rs, impl KafkaConsumerGroupConfig
 pub fn with_retry_strategy(mut self, strategy: RetryStrategy) -> Self
@@ -793,6 +793,7 @@ pub fn with_retry_strategy(mut self, strategy: RetryStrategy) -> Self
 The FIFO consumer refuses `InPlace`, which it does not implement, at `spawn_fifo_shards` and at `register_fifo`; the broadcast and DLQ loops refuse a set strategy they never read.
 What `external()` implies for the retry strategy is declared per backend: Kafka here, and NATS keeps its hold-queue retries on an external stream in this stack and follows when plan 019 lands.
 The setter lives on the Kafka options for now and reaches each backend as it declares its support, which is an additive change.
+The field is crate-private and the enum is `#[non_exhaustive]`, so no other backend's options can carry a strategy nothing reads, and a later shape is a new variant rather than a breaking change.
 
 Behaviour under `RetryStrategy::InPlace`, on the concurrent path:
 
