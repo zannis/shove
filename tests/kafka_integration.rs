@@ -3156,10 +3156,10 @@ async fn external_topic_shutdown_during_a_wait_clears_the_processing_flag() {
 /// during the wait arrives right after the redelivery, and the group reads
 /// as stable throughout.
 ///
-/// The pinned `max.poll.interval.ms` is five minutes and cannot be shortened
-/// for a test, so the wait here is four seconds: this pins the polling
-/// discipline (a paused assignment that keeps calling `recv()`), not the
-/// eviction itself.
+/// This test keeps the pinned five-minute limit and a four-second wait, so
+/// it pins the polling discipline (a paused assignment that keeps calling
+/// `recv()`), not the eviction. The next test lowers the limit through
+/// `with_max_poll_interval_for_test` and pins the eviction.
 #[tokio::test]
 async fn external_topic_waiting_handlers_keep_the_member_in_the_group() {
     const TOPIC: &str = "kafka-external-keepalive";

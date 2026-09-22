@@ -4085,8 +4085,10 @@ impl KafkaConsumer {
         let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let max_message_size = options.max_message_size;
         let hold_queues = topology.hold_queues();
-        // An infra-owned topic is read-only for shove: `Retry` and `Defer`
-        // wait in place instead of republishing, see `redeliver_in_place`.
+        // On an infra-owned topic the consumer never writes into the topic
+        // when it settles an outcome: `Retry` and `Defer` wait in place
+        // instead of republishing, see `redeliver_in_place`. Publishing is
+        // outside that guarantee; see the Kafka page.
         let external_topic = topology.external();
 
         let handler = Arc::new(handler);
@@ -4301,9 +4303,14 @@ impl KafkaConsumer {
                     // loop keeps calling `recv()`, which yields nothing but
                     // keeps the member alive; the first permit to free resumes
                     // it and is kept for the next record. Permits held only by
-                    // running handlers do not pause: a pause purges the fetch
-                    // queue and refetches on resume, a cost worth paying for a
-                    // delay of seconds but not for every busy moment.
+                    // running handlers do not pause by themselves: a pause
+                    // purges the fetch queue and refetches on resume, a cost
+                    // worth paying for a delay of seconds but not for every
+                    // busy moment. A record that arrives while every permit is
+                    // held by a running handler is decoded and waits for a
+                    // permit while the loop keeps polling, and a further
+                    // record during that wait is put back and the assignment
+                    // paused: see `acquire_permit_while_polling`.
                     if external_topic
                         && !paused
                         && spare_permit.is_none()

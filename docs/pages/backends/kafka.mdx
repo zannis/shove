@@ -126,7 +126,10 @@ The group is `{queue}-consumer` unless `for_consumer_group` or `with_group_id` n
 A publisher additionally needs `Write` on the topic.
 A declared DLQ needs `Create`, `Describe` and `Write` on the DLQ topic, so that shove can create it and route to it.
 
-An external topic is read-only for shove.
+On an external topic, shove's consumer never writes into the topic when it settles an outcome: a `Retry` or a `Defer` waits in place, and a `Reject` publishes to the shove-owned DLQ.
+That is the guarantee, and it covers declaring and consuming.
+Publishing is outside it: a `Publisher` on this topology writes to the topic, and the producer keeps librdkafka's default of `allow.auto.create.topics=true`, so a publish to a topic that does not exist can create it with broker defaults on a broker with `auto.create.topics.enable=true`.
+Provision the topic before any publisher starts, or pin the flag on the producer if that behaviour ever changes library-wide.
 `Ack` and `Reject` behave as everywhere else, because a `Reject` publishes to the shove-owned DLQ and not into the topic.
 The two outcomes that republish into a shove-owned topic wait in place instead:
 
@@ -140,9 +143,12 @@ The two outcomes that republish into a shove-owned topic wait in place instead:
 The redelivered `MessageMetadata` carries `redelivered: true` and the in-memory retry count.
 While every prefetch slot is held and at least one holder is a waiting handler, the consumer pauses its assignment and keeps polling.
 A long wait therefore does not evict the member from its group.
-Slots held only by running handlers do not pause the assignment, because a pause purges the fetch queue and refetches on resume.
+Slots held only by running handlers do not pause the assignment by themselves, because a pause purges the fetch queue and refetches on resume.
+A record that arrives while every slot is held by a running handler is decoded and waits for a slot while the consumer keeps polling.
+A further record that arrives during that wait is handed back to the broker, and the assignment is paused until a slot frees.
 A partition the group assigns to the member during a pause is paused too.
 A record it delivers first is handed back to the broker and arrives again, in order, once a slot frees.
+The pause lasts until a slot frees: the slot that ends the wait serves the record already in hand, so with one slot the assignment stays paused through that record's handler as well.
 A shutdown during a wait completes nothing: the record stays uncommitted and is redelivered on restart.
 A waiting handler holds its slot for the whole delay, the contract a broadcast subscription has always had.
 Size `prefetch_count` for the number of records you accept to have waiting at once.
@@ -582,6 +588,7 @@ Details:
 
 A record whose schema id the registry cannot resolve right now is neither poison nor processed.
 The consumer keeps it, pauses its partition assignment, and asks again every second (`REGISTRY_RETRY_DELAY` in `kafka::constants`).
+Every partition the member holds is paused, healthy ones included, so one stalled record stops that member's delivery until the registry answers.
 It keeps asking until the registry answers or the consumer shuts down.
 The offset stays uncommitted throughout, so a shutdown or a crash mid-wait redelivers the record.
 Each wait counts `shove_messages_failed_total{reason="schema_unavailable"}` once and logs a warning with the schema id.

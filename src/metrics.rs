@@ -184,8 +184,11 @@ pub(crate) enum FailReason {
     /// now: a transport failure, or a 5xx after the client's own retries.
     /// The consumer keeps the record and asks again after a delay, so this
     /// counts once per wait and is never a discard, because nothing was
-    /// dropped or dead-lettered. The one reason `record_failed` counts that
-    /// never reaches `record_terminal`. Kafka (`kafka-schema-registry`) only.
+    /// dropped or dead-lettered. One of the two reasons `record_failed`
+    /// counts that never reach `record_terminal` on their own: the other is
+    /// `Timeout`, which a timed-out handler counts before it routes to its
+    /// configured timeout outcome, counted under that outcome's own reason.
+    /// Kafka (`kafka-schema-registry`) only.
     SchemaUnavailable,
     /// The broker delivered something that is not a well-formed `shove`
     /// message for this consumer, so it was retired without ever reaching the
@@ -452,10 +455,12 @@ pub(crate) fn record_discarded(_: &str, _: Option<&str>, _: FailReason) {}
 /// - **Not every terminal outcome is a discard.** SNS/SQS deliberately never
 ///   calls this: its reject path deletes nothing, it makes the message visible
 ///   again for AWS-side redrive. See `backends::sns::router::route_reject`.
-/// - **Not every failure is terminal.** `FailReason::SchemaUnavailable` is
-///   the one reason `record_failed` counts that never reaches this function:
+/// - **Not every failure is terminal.** Two reasons `record_failed` counts
+///   never reach this function on their own. `FailReason::SchemaUnavailable`:
 ///   the consumer keeps the record and retries the lookup, so there is
 ///   nothing to retire and `messages_discarded_total` must not move for it.
+///   `FailReason::Timeout`: a timed-out handler counts it and then routes to
+///   its configured timeout outcome, whose own reason is what reaches here.
 ///
 /// `has_dlq` is `topology.dlq().is_some()` at the call site.
 ///
