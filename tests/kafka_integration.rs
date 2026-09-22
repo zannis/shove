@@ -280,6 +280,20 @@ impl TestBroker {
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// `(partition, offset, timestamp_ms)` for one delivery.
+type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
+
+/// Milliseconds since the Unix epoch, the unit of `MessageMetadata::timestamp_ms`.
+fn epoch_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_millis(),
+    )
+    .expect("fits an i64")
+}
+
 /// Read a live topic config value straight from the broker via a raw admin
 /// client, bypassing shove.
 async fn live_topic_config(brokers: &str, topic: &str, key: &str) -> Option<String> {
@@ -543,12 +557,15 @@ impl MessageHandler<WorkTopic> for SlowHandler {
 #[derive(Clone)]
 struct DlqRecordingHandler {
     counter: WaitableCounter,
+    /// The dead letter's own `(partition, offset, timestamp_ms)`.
+    dead: Arc<Mutex<Vec<Coordinates>>>,
 }
 
 impl DlqRecordingHandler {
     fn new() -> Self {
         Self {
             counter: WaitableCounter::new(),
+            dead: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -559,7 +576,12 @@ impl MessageHandler<WorkTopic> for DlqRecordingHandler {
         Outcome::Ack
     }
 
-    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata, _: &()) {
+    async fn handle_dead(&self, _msg: SimpleMessage, meta: DeadMessageMetadata, _: &()) {
+        self.dead.lock().await.push((
+            meta.message.partition,
+            meta.message.offset,
+            meta.message.timestamp_ms,
+        ));
         self.counter.increment();
     }
 }
@@ -567,6 +589,8 @@ impl MessageHandler<WorkTopic> for DlqRecordingHandler {
 #[derive(Clone)]
 struct OrderRecordingHandler {
     records: Arc<Mutex<Vec<(String, u64)>>>,
+    /// Each delivery's `(partition, offset, timestamp_ms)`, in arrival order.
+    coordinates: Arc<Mutex<Vec<Coordinates>>>,
     counter: WaitableCounter,
 }
 
@@ -574,6 +598,7 @@ impl OrderRecordingHandler {
     fn new() -> Self {
         Self {
             records: Arc::new(Mutex::new(Vec::new())),
+            coordinates: Arc::new(Mutex::new(Vec::new())),
             counter: WaitableCounter::new(),
         }
     }
@@ -585,8 +610,12 @@ impl OrderRecordingHandler {
 
 impl MessageHandler<SeqSkipTopic> for OrderRecordingHandler {
     type Context = ();
-    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+    async fn handle(&self, msg: OrderMessage, meta: MessageMetadata, _: &()) -> Outcome {
         self.records.lock().await.push((msg.order_id, msg.amount));
+        self.coordinates
+            .lock()
+            .await
+            .push((meta.partition, meta.offset, meta.timestamp_ms));
         self.counter.increment();
         Outcome::Ack
     }
@@ -1047,6 +1076,7 @@ async fn dlq_consumer_handles_dead_message() {
     let client = tb.client();
     broker.topology().declare::<WorkTopic>().await.unwrap();
 
+    let before = epoch_ms();
     let publisher = broker.publisher().await.unwrap();
     publisher
         .publish::<WorkTopic>(&SimpleMessage {
@@ -1086,6 +1116,28 @@ async fn dlq_consumer_handles_dead_message() {
         "DLQ handler should receive 1 dead message"
     );
     assert_eq!(dlq_handler.counter.get(), 1);
+    let after = epoch_ms();
+
+    // The DLQ drain reports the dead letter's own coordinates: the record on
+    // the dead-letter topic, not the original's, so a replay of the dead
+    // letters names a position that exists.
+    let dead = dlq_handler.dead.lock().await.clone();
+    assert_eq!(dead.len(), 1, "one dead letter, one set of coordinates");
+    let (partition, offset, ts) = dead[0];
+    assert!(
+        partition.is_some(),
+        "the dead letter's partition is reported: {dead:?}"
+    );
+    assert_eq!(
+        offset,
+        Some(0),
+        "the first record on a fresh dead-letter partition sits at offset 0"
+    );
+    let ts = ts.expect("the dead letter's broker timestamp is reported");
+    assert!(
+        (before - 1_000..=after + 1_000).contains(&ts),
+        "timestamp {ts} outside the window {before}..={after}"
+    );
 
     broker.close().await;
     h2.await.unwrap().ok();
@@ -1588,6 +1640,7 @@ async fn sequenced_consume_preserves_order() {
     let client = tb.client();
     broker.topology().declare::<SeqSkipTopic>().await.unwrap();
 
+    let before = epoch_ms();
     let publisher = broker.publisher().await.unwrap();
     for i in 0..5u64 {
         publisher
@@ -1624,10 +1677,42 @@ async fn sequenced_consume_preserves_order() {
 
     shutdown.cancel();
     handle.await.unwrap().ok();
+    let after = epoch_ms();
 
     let records = handler.records().await;
     let amounts: Vec<u64> = records.iter().map(|(_, a)| *a).collect();
     assert_eq!(amounts, vec![0, 1, 2, 3, 4], "messages should be in order");
+
+    // The FIFO path fills the same coordinates as the standard path: one key
+    // lands on one partition of a fresh topic, at offsets 0..5 in order,
+    // each with the broker's timestamp.
+    let coordinates = handler.coordinates.lock().await.clone();
+    assert_eq!(coordinates.len(), 5, "one set of coordinates per delivery");
+    let partitions: std::collections::HashSet<i32> = coordinates
+        .iter()
+        .map(|(p, _, _)| p.expect("Kafka reports the partition on the FIFO path"))
+        .collect();
+    assert_eq!(
+        partitions.len(),
+        1,
+        "one key maps to one partition: {coordinates:?}"
+    );
+    let offsets: Vec<i64> = coordinates
+        .iter()
+        .map(|(_, o, _)| o.expect("Kafka reports the offset on the FIFO path"))
+        .collect();
+    assert_eq!(
+        offsets,
+        vec![0, 1, 2, 3, 4],
+        "a fresh partition yields offsets 0..5 in order"
+    );
+    for (_, _, ts) in &coordinates {
+        let ts = ts.expect("Kafka reports the broker timestamp on the FIFO path");
+        assert!(
+            (before - 1_000..=after + 1_000).contains(&ts),
+            "timestamp {ts} outside the window {before}..={after}"
+        );
+    }
     broker.close().await;
 }
 

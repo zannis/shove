@@ -244,10 +244,25 @@ impl BatchMessage {
 
 /// `(seq, delivery_id, retry_count)` for one message.
 type Recorded = (u32, String, u32);
+/// `(partition, offset, timestamp_ms)` for one message.
+type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
+
+/// Milliseconds since the Unix epoch, the unit of `MessageMetadata::timestamp_ms`.
+fn epoch_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_millis(),
+    )
+    .expect("fits an i64")
+}
 
 #[derive(Clone)]
 struct RecordingBatchHandler {
     batches: Arc<Mutex<Vec<Vec<Recorded>>>>,
+    /// Every message's coordinates, across flushes, in arrival order.
+    coordinates: Arc<Mutex<Vec<Coordinates>>>,
     scripted: Arc<Mutex<std::collections::VecDeque<Outcome>>>,
     signal: Arc<Notify>,
 }
@@ -256,9 +271,14 @@ impl RecordingBatchHandler {
     fn new() -> Self {
         Self {
             batches: Arc::new(Mutex::new(Vec::new())),
+            coordinates: Arc::new(Mutex::new(Vec::new())),
             scripted: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             signal: Arc::new(Notify::new()),
         }
+    }
+
+    fn coordinates(&self) -> Vec<Coordinates> {
+        self.coordinates.lock().unwrap().clone()
     }
 
     fn scripting(self, outcomes: impl IntoIterator<Item = Outcome>) -> Self {
@@ -272,6 +292,11 @@ impl RecordingBatchHandler {
                 .iter()
                 .map(|(m, meta)| (m.seq, meta.delivery_id.clone(), meta.retry_count))
                 .collect(),
+        );
+        self.coordinates.lock().unwrap().extend(
+            batch
+                .iter()
+                .map(|(_, meta)| (meta.partition, meta.offset, meta.timestamp_ms)),
         );
         let outcome = self
             .scripted
@@ -737,7 +762,9 @@ async fn batch_flushes_on_max_batch_size() {
     let broker = make_broker("batch-size-grp").await;
     broker.topology().declare::<SizeTopic>().await.unwrap();
     let publisher = broker.publisher().await.unwrap();
+    let before_ms = epoch_ms();
     publish_seq::<SizeTopic>(&publisher, 0..10).await;
+    let after_ms = epoch_ms();
 
     let handler = RecordingBatchHandler::new();
     let shutdown = CancellationToken::new();
@@ -775,6 +802,23 @@ async fn batch_flushes_on_max_batch_size() {
     let mut seen = handler.seen();
     seen.sort_unstable();
     assert_eq!(seen, (0..10).collect::<Vec<_>>());
+
+    // The batch path fills the same coordinates as the standard path: no
+    // partition and no offset on a stream, and the entry id's time component
+    // as the timestamp, with the container-clock tolerance the standard
+    // test uses.
+    let coordinates = handler.coordinates();
+    assert_eq!(coordinates.len(), 10, "one set of coordinates per message");
+    let tolerance = 5 * 60 * 1000;
+    for (partition, offset, timestamp_ms) in &coordinates {
+        assert_eq!(*partition, None, "Redis Streams have no partitions");
+        assert_eq!(*offset, None, "an entry id is not a log position");
+        let ts = timestamp_ms.expect("an auto-generated entry id carries the instance clock");
+        assert!(
+            ts >= before_ms - tolerance && ts <= after_ms + tolerance,
+            "timestamp_ms {ts} is not within the publish window {before_ms}..{after_ms}"
+        );
+    }
 }
 
 /// A full batch must have the **next** read already outstanding while its

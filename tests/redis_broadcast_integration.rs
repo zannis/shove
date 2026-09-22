@@ -43,17 +43,37 @@ define_topic!(
         .build()
 );
 
-/// Records every key it is handed, then acks.
+/// `(partition, offset, timestamp_ms)` for one delivery.
+type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
+
+/// Milliseconds since the Unix epoch, the unit of `MessageMetadata::timestamp_ms`.
+fn epoch_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_millis(),
+    )
+    .expect("fits an i64")
+}
+
+/// Records every key it is handed, and its coordinates, then acks.
 #[derive(Clone)]
 struct Recorder {
     seen: Arc<Mutex<Vec<u64>>>,
+    coordinates: Arc<Mutex<Vec<Coordinates>>>,
 }
 
 impl Recorder {
     fn new() -> Self {
         Self {
             seen: Arc::new(Mutex::new(Vec::new())),
+            coordinates: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn coordinates(&self) -> Vec<Coordinates> {
+        self.coordinates.lock().expect("coordinates lock").clone()
     }
 
     /// Keys seen, minus the readiness probes — see [`warm_up`].
@@ -74,8 +94,13 @@ impl Recorder {
 
 impl MessageHandler<CacheInvalidations> for Recorder {
     type Context = ();
-    async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _ctx: &()) -> Outcome {
+    async fn handle(&self, msg: Invalidate, meta: MessageMetadata, _ctx: &()) -> Outcome {
         self.seen.lock().expect("seen lock").push(msg.key);
+        self.coordinates.lock().expect("coordinates lock").push((
+            meta.partition,
+            meta.offset,
+            meta.timestamp_ms,
+        ));
         Outcome::Ack
     }
 }
@@ -225,6 +250,7 @@ async fn two_subscribers_each_receive_every_message() {
         .subscribe::<CacheInvalidations, _>(second.clone(), ConsumerOptions::new())
         .expect("subscribe b");
 
+    let before_ms = epoch_ms();
     warm_up(&publisher, &[&first, &second]).await;
 
     for key in 1..=5u64 {
@@ -233,6 +259,7 @@ async fn two_subscribers_each_receive_every_message() {
             .await
             .expect("publish");
     }
+    let after_ms = epoch_ms();
     settle().await;
 
     sub_a.cancellation_token().cancel();
@@ -258,6 +285,26 @@ async fn two_subscribers_each_receive_every_message() {
     b.sort_unstable();
     assert_eq!(a, vec![1, 2, 3, 4, 5], "subscriber a saw every message");
     assert_eq!(b, vec![1, 2, 3, 4, 5], "subscriber b saw every message");
+
+    // The broadcast path fills the same coordinates as the standard path: no
+    // partition and no offset on a stream, and the entry id's time component
+    // as the timestamp, with the container-clock tolerance the standard
+    // test uses. The probes count too: they are entries like any other.
+    let coordinates = first.coordinates();
+    assert!(
+        coordinates.len() >= 5,
+        "every delivery carries coordinates: {coordinates:?}"
+    );
+    let tolerance = 5 * 60 * 1000;
+    for (partition, offset, timestamp_ms) in &coordinates {
+        assert_eq!(*partition, None, "Redis Streams have no partitions");
+        assert_eq!(*offset, None, "an entry id is not a log position");
+        let ts = timestamp_ms.expect("an auto-generated entry id carries the instance clock");
+        assert!(
+            ts >= before_ms - tolerance && ts <= after_ms + tolerance,
+            "timestamp_ms {ts} is not within the publish window {before_ms}..{after_ms}"
+        );
+    }
 }
 
 /// AC4 — deliver-new. `$` means "entries added after this call", so an entry

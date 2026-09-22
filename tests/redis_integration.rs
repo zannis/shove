@@ -182,6 +182,17 @@ async fn connect_with_retry(url: &str, group: &str, budget: Duration) -> Broker<
     );
 }
 
+/// Milliseconds since the Unix epoch, the unit of `MessageMetadata::timestamp_ms`.
+fn epoch_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_millis(),
+    )
+    .expect("fits an i64")
+}
+
 async fn poll_until<F: Fn() -> bool>(cond: F, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
@@ -801,6 +812,7 @@ async fn fifo_same_key_in_order() {
         .await
         .expect("declare");
 
+    let before_ms = epoch_ms();
     let publisher = broker.publisher().await.expect("publisher");
     for seq in 0..10u64 {
         publisher
@@ -811,25 +823,36 @@ async fn fifo_same_key_in_order() {
             .await
             .expect("publish");
     }
+    let after_ms = epoch_ms();
 
+    type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
     let received = Arc::new(tokio::sync::Mutex::new(Vec::<u64>::new()));
+    let coordinates = Arc::new(tokio::sync::Mutex::new(Vec::<Coordinates>::new()));
 
     #[derive(Clone)]
-    struct H(Arc<tokio::sync::Mutex<Vec<u64>>>);
+    struct H(
+        Arc<tokio::sync::Mutex<Vec<u64>>>,
+        Arc<tokio::sync::Mutex<Vec<Coordinates>>>,
+    );
     impl MessageHandler<LedgerTopic> for H {
         type Context = ();
-        async fn handle(&self, msg: Event, _: MessageMetadata, _: &()) -> Outcome {
+        async fn handle(&self, msg: Event, meta: MessageMetadata, _: &()) -> Outcome {
             self.0.lock().await.push(msg.seq);
+            self.1
+                .lock()
+                .await
+                .push((meta.partition, meta.offset, meta.timestamp_ms));
             Outcome::Ack
         }
     }
 
     let received_c = received.clone();
+    let coordinates_c = coordinates.clone();
     let mut group = broker.consumer_group();
     group
         .register_fifo::<LedgerTopic, _>(
             ConsumerGroupConfig::new(RedisConsumerGroupConfig::default()),
-            move || H(Arc::clone(&received_c)),
+            move || H(Arc::clone(&received_c), Arc::clone(&coordinates_c)),
         )
         .await
         .expect("register_fifo");
@@ -852,6 +875,23 @@ async fn fifo_same_key_in_order() {
     assert_eq!(seqs.len(), 10, "expected 10 messages, got {}", seqs.len());
     let expected: Vec<u64> = (0..10).collect();
     assert_eq!(*seqs, expected, "messages must arrive in sequence order");
+
+    // The FIFO path fills the same coordinates as the standard path: no
+    // partition and no offset on a stream, and the entry id's time component
+    // as the timestamp. Five minutes of tolerance absorb the container's
+    // clock and still rule out a unit mix-up.
+    let coordinates = coordinates.lock().await;
+    assert_eq!(coordinates.len(), 10, "one set of coordinates per delivery");
+    let tolerance = 5 * 60 * 1000;
+    for (partition, offset, timestamp_ms) in coordinates.iter() {
+        assert_eq!(*partition, None, "Redis Streams have no partitions");
+        assert_eq!(*offset, None, "an entry id is not a log position");
+        let ts = timestamp_ms.expect("an auto-generated entry id carries the instance clock");
+        assert!(
+            ts >= before_ms - tolerance && ts <= after_ms + tolerance,
+            "timestamp_ms {ts} is not within the publish window {before_ms}..{after_ms}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
