@@ -1014,12 +1014,16 @@ impl RegistryStall {
 
     /// Pause on the first wait, count and warn, then wait out
     /// `REGISTRY_RETRY_DELAY` while still polling. `Ok(false)` means shutdown
-    /// fired during the wait.
+    /// fired during the wait. A fault a handler task reports over `fault_rx`
+    /// meanwhile ends the wait with that error: the loop's own fault arm sits
+    /// in a `select!` this wait is nested inside, and an outage has no time
+    /// bound, so the wait must read the channel itself.
     #[allow(clippy::too_many_arguments)]
     async fn wait(
         &mut self,
         consumer: &KafkaStreamConsumer,
         shutdown: &CancellationToken,
+        fault_rx: Option<&mut mpsc::Receiver<ShoveError>>,
         topic: &str,
         group: Option<&str>,
         queue: &str,
@@ -1042,10 +1046,13 @@ impl RegistryStall {
         metrics::record_failed(topic, group, metrics::FailReason::SchemaUnavailable);
         let retry = tokio::time::sleep(REGISTRY_RETRY_DELAY);
         tokio::pin!(retry);
+        let fault = handler_fault(fault_rx);
+        tokio::pin!(fault);
         loop {
             tokio::select! {
                 _ = &mut retry => return Ok(true),
                 _ = shutdown.cancelled() => return Ok(false),
+                e = &mut fault => return Err(e),
                 received = consumer.recv() => {
                     let msg = match received {
                         Ok(msg) => msg,
@@ -3919,6 +3926,19 @@ fn put_back(
     settle_put_back_seek(queue, partition, offset, errors, still_assigned.as_ref())
 }
 
+/// The fault a handler task reported over the receive loop's channel, or a
+/// future that never resolves: a loop without such a channel passes `None`,
+/// and a channel whose senders are all gone has nothing more to report.
+async fn handler_fault(rx: Option<&mut mpsc::Receiver<ShoveError>>) -> ShoveError {
+    match rx {
+        Some(rx) => match rx.recv().await {
+            Some(e) => e,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
+}
+
 /// Wait for a prefetch permit on an infra-owned topic while the receive loop
 /// keeps polling.
 ///
@@ -3932,14 +3952,20 @@ fn put_back(
 /// yields meanwhile comes from a partition that is not paused; it is put back
 /// (see [`put_back`]) and the assignment is paused, so it arrives again, in
 /// order, once a permit frees and the loop resumes. `Ok(None)` means shutdown
-/// fired first.
+/// fired first. A fault a handler task reports over `fault_rx` meanwhile ends
+/// the wait with that error, for the reason `RegistryStall::wait` gives: the
+/// loop's fault arm is not polled while this wait runs, and a permit may
+/// never free if the holder is the task that faulted.
 async fn acquire_permit_while_polling(
     semaphore: &Arc<tokio::sync::Semaphore>,
     consumer: &KafkaStreamConsumer,
     shutdown: &CancellationToken,
+    fault_rx: Option<&mut mpsc::Receiver<ShoveError>>,
     queue: &str,
     paused: &mut bool,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    let fault = handler_fault(fault_rx);
+    tokio::pin!(fault);
     loop {
         tokio::select! {
             biased;
@@ -3950,6 +3976,7 @@ async fn acquire_permit_while_polling(
                 return Ok(Some(permit));
             }
             _ = shutdown.cancelled() => return Ok(None),
+            e = &mut fault => return Err(e),
             received = consumer.recv() => {
                 let msg = received.map_err(|e| {
                     tracing::error!(error = %e, queue, "consumer recv error");
@@ -4640,7 +4667,7 @@ impl KafkaConsumer {
                                                 ),
                                                 Ok(RegistryDecode::Unavailable { id, error }) => {
                                                     if !stall
-                                                        .wait(&consumer, &shutdown, &topic, group.as_deref(), queue, id, &error)
+                                                        .wait(&consumer, &shutdown, Some(&mut fault_rx), &topic, group.as_deref(), queue, id, &error)
                                                         .await?
                                                     {
                                                         break Staged::Stop;
@@ -4782,6 +4809,7 @@ impl KafkaConsumer {
                                         &semaphore,
                                         &consumer,
                                         &shutdown,
+                                        Some(&mut fault_rx),
                                         queue,
                                         &mut paused,
                                     )
@@ -5429,7 +5457,7 @@ impl KafkaConsumer {
                                                 }
                                             }
                                             if !stall
-                                                .wait(&consumer, &shutdown, &topic, group.as_deref(), queue, id, &error)
+                                                .wait(&consumer, &shutdown, None, &topic, group.as_deref(), queue, id, &error)
                                                 .await?
                                             {
                                                 // The buffer is empty and this record
@@ -5895,7 +5923,7 @@ impl KafkaConsumer {
                                                     ),
                                                     Ok(RegistryDecode::Unavailable { id, error }) => {
                                                         if !stall
-                                                            .wait(&consumer, &shutdown, &topic, group.as_deref(), &queue, id, &error)
+                                                            .wait(&consumer, &shutdown, None, &topic, group.as_deref(), &queue, id, &error)
                                                             .await?
                                                         {
                                                             break Staged::Stop;
@@ -6602,7 +6630,7 @@ impl KafkaConsumer {
                                             }
                                             Ok(RegistryDecode::Unavailable { id, error }) => {
                                                 if !stall
-                                                    .wait(&consumer, &shutdown, &topic, group.as_deref(), queue, id, &error)
+                                                    .wait(&consumer, &shutdown, Some(&mut fault_rx), &topic, group.as_deref(), queue, id, &error)
                                                     .await?
                                                 {
                                                     break Staged::Stop;
@@ -7086,7 +7114,7 @@ impl KafkaConsumer {
                                         }
                                         Some(Ok(RegistryDecode::Unavailable { id, error })) => {
                                             if !stall
-                                                .wait(&consumer, shutdown, &topic, group.as_deref(), dlq, id, &error)
+                                                .wait(&consumer, shutdown, None, &topic, group.as_deref(), dlq, id, &error)
                                                 .await?
                                             {
                                                 break Staged::Stop;

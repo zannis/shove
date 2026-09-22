@@ -57,6 +57,9 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 const HEALTHY_ID: u32 = 1;
 /// Answers with whatever status the test has set.
 const FLAKY_ID: u32 = 9;
+/// Answers with a second status the test can set on its own, 200 by default,
+/// for a test that needs one record to stall while another meets a fault.
+const SECOND_FLAKY_ID: u32 = 10;
 
 // ---------------------------------------------------------------------------
 // Mock schema registry with a flippable answer for one id
@@ -67,13 +70,19 @@ struct MockState {
     accepted_subject: &'static str,
     /// The HTTP status returned for `FLAKY_ID`; 200 means "answer normally".
     flaky_status: Arc<AtomicU16>,
+    /// The same for `SECOND_FLAKY_ID`.
+    second_status: Arc<AtomicU16>,
     hits: Arc<AtomicUsize>,
 }
 
 fn flaky_response(s: &MockState, id: u32, body: serde_json::Value) -> Response {
     s.hits.fetch_add(1, Ordering::SeqCst);
-    let status = s.flaky_status.load(Ordering::SeqCst);
-    if id == FLAKY_ID && status != 200 {
+    let status = match id {
+        FLAKY_ID => s.flaky_status.load(Ordering::SeqCst),
+        SECOND_FLAKY_ID => s.second_status.load(Ordering::SeqCst),
+        _ => 200,
+    };
+    if status != 200 {
         return StatusCode::from_u16(status)
             .expect("valid status")
             .into_response();
@@ -99,7 +108,24 @@ async fn mock_registry(
     accepted_subject: &'static str,
     initial_status: u16,
 ) -> (Arc<SchemaRegistry>, Arc<AtomicU16>, Arc<AtomicUsize>) {
+    let (registry, flaky_status, _second, hits) =
+        mock_registry_with_second_id(accepted_subject, initial_status).await;
+    (registry, flaky_status, hits)
+}
+
+/// [`mock_registry`] plus the handle for `SECOND_FLAKY_ID`'s status, which
+/// starts at 200.
+async fn mock_registry_with_second_id(
+    accepted_subject: &'static str,
+    initial_status: u16,
+) -> (
+    Arc<SchemaRegistry>,
+    Arc<AtomicU16>,
+    Arc<AtomicU16>,
+    Arc<AtomicUsize>,
+) {
     let flaky_status = Arc::new(AtomicU16::new(initial_status));
+    let second_status = Arc::new(AtomicU16::new(200));
     let hits = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/schemas/ids/{id}/versions", get(versions))
@@ -107,6 +133,7 @@ async fn mock_registry(
         .with_state(MockState {
             accepted_subject,
             flaky_status: flaky_status.clone(),
+            second_status: second_status.clone(),
             hits: hits.clone(),
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -122,7 +149,7 @@ async fn mock_registry(
     let registry = SchemaRegistry::builder(format!("http://{addr}"))
         .max_retries(1)
         .build();
-    (registry, flaky_status, hits)
+    (registry, flaky_status, second_status, hits)
 }
 
 /// Read up to `expected` raw payloads off `topic` with a throwaway group,
@@ -492,6 +519,18 @@ shove::define_topic!(
         .build()
 );
 
+// An infra-owned topic for a fault reported while the receive loop waits out
+// a registry stall on the record behind the one that faults.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    StallFaultTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-stall-fault")
+        .external()
+        .hold_queue(Duration::from_millis(200))
+        .allow_message_loss()
+        .build()
+);
 // An infra-owned topic whose handler never settles: every delivery waits in
 // place, so a fault the receive loop meets finds handler tasks mid-wait.
 shove::define_topic!(
@@ -555,17 +594,24 @@ struct DeferOnceRecorder {
 }
 
 #[cfg(feature = "test-support")]
-impl MessageHandler<InPlaceFaultTopic> for DeferOnceRecorder {
-    type Context = ();
-    async fn handle(&self, msg: Event, _meta: MessageMetadata, _: &()) -> Outcome {
-        let mut seen = self.seen.lock().unwrap();
-        let first = seen.is_empty();
-        seen.push(msg.id);
-        drop(seen);
-        self.counter.increment();
-        if first { Outcome::Defer } else { Outcome::Ack }
-    }
+macro_rules! defer_once_for {
+    ($($topic:ty),+ $(,)?) => {$(
+        impl MessageHandler<$topic> for DeferOnceRecorder {
+            type Context = ();
+            async fn handle(&self, msg: Event, _meta: MessageMetadata, _: &()) -> Outcome {
+                let mut seen = self.seen.lock().unwrap();
+                let first = seen.is_empty();
+                seen.push(msg.id);
+                drop(seen);
+                self.counter.increment();
+                if first { Outcome::Defer } else { Outcome::Ack }
+            }
+        }
+    )+};
 }
+
+#[cfg(feature = "test-support")]
+defer_once_for!(InPlaceFaultTopic, StallFaultTopic);
 
 /// Counts its calls and defers every one of them, so each record it is
 /// handed cycles through the in-place wait for as long as its task lives.
@@ -1531,6 +1577,84 @@ async fn a_fault_met_by_the_receive_loop_ends_every_handler_task() {
         lag(&client, TOPIC, GROUP).await,
         3,
         "nothing is committed: every record stays for whoever runs next"
+    );
+}
+
+/// A fault a handler task reports while the receive loop waits out a registry
+/// stall ends the consumer at once. The loop's fault arm sits in a `select!`
+/// the stall wait is nested inside, so a fault that landed during the wait
+/// was read only when the outage ended, and an outage has no time bound:
+/// the wait reads the channel itself now, as the permit wait does.
+///
+/// The public client caches a resolved schema id for good, so the
+/// redelivery's lookup would never reach the registry: the `test-support`
+/// seam evicts the id between the first delivery and the redelivery.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_fault_reported_during_a_registry_stall_ends_the_consumer() {
+    const TOPIC: &str = "kafka-sr-outage-stall-fault";
+    const GROUP: &str = "kafka-sr-outage-stall-fault-consumer";
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+    // `FLAKY_ID` stalls for the whole test; `SECOND_FLAKY_ID` answers until
+    // the test flips it to a deployment fault.
+    let (registry, _stalled, second, _) =
+        mock_registry_with_second_id("kafka-sr-outage-stall-fault-value", 503).await;
+    let client = tb.client().await;
+    for (schema_id, id) in [(SECOND_FLAKY_ID, 1u32), (FLAKY_ID, 2)] {
+        let body = serde_json::to_vec(&Event { id }).unwrap();
+        publish_raw(&tb.brokers, TOPIC, &frame_json(schema_id, &body)).await;
+    }
+
+    let handler = DeferOnceRecorder {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let h = handler.clone();
+    let options = ConsumerOptions::<Kafka>::new()
+        .with_prefetch_count(2)
+        .with_schema_registry(registry.clone())
+        .with_shutdown(CancellationToken::new());
+    let processing = options.processing_handle();
+    let consumer = KafkaConsumer::new(client.clone());
+    let running =
+        tokio::spawn(async move { consumer.run::<StallFaultTopic, _>(h, (), options).await });
+
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the first record reached the handler once"
+    );
+    // The receive loop is waiting out the second record's stall by now. Make
+    // the first record's redelivery meet a fault instead of the cache.
+    registry.evict_for_test(SchemaId(SECOND_FLAKY_ID));
+    second.store(401, Ordering::SeqCst);
+
+    let outcome = tokio::time::timeout(TIMEOUT, running)
+        .await
+        .expect("the consumer must end on the reported fault, not wait out an outage with no end")
+        .expect("consumer task panicked");
+    match outcome {
+        Err(ShoveError::Topology(message)) => {
+            assert!(
+                message.contains("schema id 10") && message.contains("deployment fault"),
+                "the error names the schema id and the fault: {message}"
+            );
+        }
+        other => panic!("expected ShoveError::Topology, got {other:?}"),
+    }
+    assert_eq!(
+        handler.seen.lock().unwrap().clone(),
+        vec![1],
+        "one delivery, no redelivery, and the stalled record never reached the handler"
+    );
+    assert_eq!(
+        lag(&client, TOPIC, GROUP).await,
+        2,
+        "both records stay uncommitted for whoever runs next"
+    );
+    assert!(
+        !processing.load(Ordering::Acquire),
+        "every handler task ended before the loop returned"
     );
 }
 
