@@ -6070,6 +6070,35 @@ mod seek_error_tests {
 }
 
 #[cfg(test)]
+mod error_classifier_tests {
+    use super::*;
+
+    /// librdkafka raises `AutoOffsetReset` when a partition has no committed
+    /// offset and the policy is `error`. A reconnect rejoins the same group
+    /// under the same policy and meets the same answer, so the classifier
+    /// must end the consumer (`Topology`) rather than loop on `Connection`.
+    #[test]
+    fn a_missing_offset_under_the_error_policy_is_permanent() {
+        let e = KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset);
+        assert!(matches!(
+            map_kafka_error("recv", e),
+            ShoveError::Topology(msg) if msg.starts_with("recv: ")
+        ));
+    }
+
+    /// The transient direction stays transient: a broker that is merely
+    /// unreachable is a `Connection` error and the reconnect loop owns it.
+    #[test]
+    fn an_unreachable_broker_stays_transient() {
+        let e = KafkaError::MessageConsumption(RDKafkaErrorCode::BrokerTransportFailure);
+        assert!(matches!(
+            map_kafka_error("recv", e),
+            ShoveError::Connection(_)
+        ));
+    }
+}
+
+#[cfg(test)]
 mod batch_sequencing_guard_tests {
     use super::*;
     use crate::topology::{SequenceFailure, TopologyBuilder};

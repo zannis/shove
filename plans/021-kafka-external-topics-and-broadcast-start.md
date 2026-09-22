@@ -4,7 +4,6 @@
 > Run every verification command before moving on.
 > On any STOP condition, stop and report.
 > Your reviewer maintains `plans/README.md`, so do not update it.
-> This plan is numbered 021 provisionally, as the next free number after 020.
 >
 > **Drift check (run first)**:
 > `git diff --stat 5bc4979..HEAD -- Cargo.toml src/consumer.rs src/batch_consumer.rs src/backend/options_inner.rs src/backend/batch_consumer.rs src/backend/mod.rs src/metadata.rs src/metrics.rs src/handler.rs src/audit.rs src/topology.rs src/broker.rs src/broadcast.rs src/backend/broadcast.rs src/backend/capability.rs src/consumer_group.rs src/backends/kafka/ src/schema_registry/decode.rs src/schema_registry/wire.rs docs/pages/backends/kafka.mdx docs/pages/concepts/broadcast.mdx docs/pages/concepts/handlers.mdx`
@@ -21,9 +20,18 @@
 - **Depends on**: none, plan 011 is not required
 - **Category**: bug + feature + dx
 - **Planned at**: commit `5bc4979` (main), 2026-09-17
-- **Maintainer decision**: pending review of this plan
-- **Delivery**: three PRs by risk class, one minor release after the third.
-  Steps 1 and 2 ship first, then steps 3 to 9, then steps 10 and 11.
+- **Maintainer decision**: reviewed on the three pull requests below on 2026-09-22.
+  The review asked for backend-neutral shapes in four places, and steps 5, 6, 7 and 10 now carry them: `BroadcastStart` on the broadcast options, `external()` on the topology builder, per-field availability on `MessageMetadata`, and an explicit retry strategy on the consumer options.
+  The maintainer proposed to merge the stack and ship it as the next minor release, and records the decision in `plans/README.md`.
+- **Delivery**: three pull requests by risk class, one minor release after the third.
+  - https://github.com/zannis/shove/pull/210 delivers steps 1 and 2.
+    Step 1 maps `KafkaAutoOffsetReset::None` to the `error` token and classifies librdkafka's `AutoOffsetReset` error as permanent in `map_kafka_error`.
+    Step 2 splits Cyrus SASL out of `kafka-ssl` into `kafka-gssapi`.
+  - https://github.com/zannis/shove/pull/211 delivers steps 3 to 9.
+    Step 3 commits past undelivered offsets, step 4 makes the commit interval configurable and bounds the shutdown commit, step 5 adds the broadcast start position, step 6 adds the external topology binding, step 7 exposes partition, offset and timestamp on deliveries, step 8 exposes `auto.offset.reset` on the direct consumer options, and step 9 adds the protobuf message-index check.
+    The DLQ-name guard in `TopologyBuilder::build` landed in the same pull request as a fix found on the way.
+  - https://github.com/zannis/shove/pull/212 delivers steps 10 and 11.
+    Step 10 retries and defers in place instead of republishing into the topic, and step 11 waits through a Schema Registry outage instead of discarding the record.
 
 ## Why this matters
 
@@ -192,9 +200,15 @@ librdkafka's `auto.offset.reset` accepts `smallest`, `earliest`, `beginning`, `l
 
 - Change the mapping to `"error"`.
   Keep the variant name, because the rustdoc semantics at `:70-73` are right and only the wire token is wrong.
+- Classify `RDKafkaErrorCode::AutoOffsetReset` as permanent in `map_kafka_error` (`consumer.rs`), beside `ClientConfig` and `MessageConsumptionFatal`.
+  librdkafka raises it when a partition has no committed offset, or the committed one is out of range, and the policy is `error`.
+  A reconnect rejoins the same group under the same policy and meets the same answer, so the consumer ends with `ShoveError::Topology` and names the fault.
+  The operator either commits a starting position with `reset_consumer_group_offsets` or picks another `KafkaAutoOffsetReset`.
+  Without this classification the error is `Connection` and the consumer reconnects in a loop.
 - Rewrite the unit test at `:1623` to assert `"error"`.
 - Add a native-config unit test: for each variant, set `auto.offset.reset` on an `rdkafka::ClientConfig` and call `create_native_config`, which must succeed.
   This is the test that would have caught the bug, and it needs no broker.
+- Add a classifier unit test: `map_kafka_error` turns `KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset)` into `ShoveError::Topology`.
 
 Docs: `docs/pages/backends/kafka.mdx:137` describes `None` as "refuse silent replay/skip on a fresh group", which stays true.
 
@@ -763,7 +777,7 @@ That is the at-least-once contract the rest of the crate keeps, and the PR body 
 
 - [ ] `cargo fmt -- --check` and the four clippy commands exit 0.
 - [ ] `cargo doc --no-deps --all-features` exits 0 and the new rustdoc tables render.
-- [ ] `cargo tree -e features --no-default-features --features kafka-ssl -i sasl2-sys` finds no package.
+- [ ] `cargo tree -e features --no-default-features --features kafka-ssl` prints no `sasl2-sys`, and the same command with `kafka-gssapi` prints it.
 - [ ] `cargo nextest run --no-default-features` passes, including the new metadata and topology unit tests.
 - [ ] The Kafka unit suite passes, including the native-config test for every reset variant and the rewritten tracker tests.
 - [ ] The Kafka unit suite also covers the replay guard, the gate interval, the fence scaling, the error classifier and the registry mapping.
