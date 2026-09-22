@@ -111,13 +111,13 @@ const QUIET_DRAINS_TO_RESOLVE: u32 = 2;
 /// the in-flight count O(1), so close stays prompt. Two costs, both accepted:
 /// a wider crash-redelivery window (which at-least-once semantics already
 /// promise), matching the spirit of Kafka's own 5 s auto-commit default while
-/// staying 10x tighter; and the tracker's `in_flight` set, which holds every
-/// delivered offset until a drain commits past it, keeps up to one window of
-/// completed offsets between drains. The set's size is bounded by the permits:
-/// at most `prefetch_count` offsets are outstanding at once, and the ones a
-/// window completes wait in the set until the next drain (about 6k offsets at
-/// 12k msg/s), where the old `completed` set was bounded by `prefetch_count`
-/// alone.
+/// staying 10x tighter; and a wider gap between the committed offset and the
+/// consumed position. That gap costs no memory: the tracker's `in_flight` set
+/// holds each delivered offset only from `track_received` until
+/// `mark_complete` removes it, so it never holds more than `prefetch_count`
+/// entries whatever the interval, and the offsets completed since the last
+/// drain are summed up by `position()` alone. A longer interval widens what a
+/// crash redelivers (about 6k offsets at 12k msg/s), nothing else.
 const ASYNC_COMMIT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Rate gate for the receive loop's offset commits: `due` says whether the
