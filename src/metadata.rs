@@ -119,31 +119,48 @@ pub struct MessageMetadata {
     /// rebalance carries the same coordinates, and a `Retry` republishes a
     /// new record with new ones.
     ///
+    /// Each of the three coordinate fields is filled where the backend has
+    /// the data, and carries its own availability table; `partition` is the
+    /// one Kafka-shaped field.
+    ///
     /// ## Per-backend availability
     ///
-    /// | Backend | `partition` | `offset` | `timestamp_ms` |
-    /// |---|---|---|---|
-    /// | Apache Kafka | `Some(p)` | `Some(o)` | `Some(ms)` when the record carries a broker timestamp, `None` otherwise |
-    /// | RabbitMQ | `None` | `None` | `None` |
-    /// | AWS SQS | `None` | `None` | `None` |
-    /// | NATS JetStream | `None` | `None` | `None` |
-    /// | Redis Streams | `None` | `None` | `None` |
-    /// | In-process | `None` | `None` | `None` |
-    ///
-    /// NATS and Redis do have a stream sequence and an entry id, but neither
-    /// is a partition and an offset, so they are not squeezed into these
-    /// fields.
+    /// | Backend | `partition` |
+    /// |---|---|
+    /// | Apache Kafka | `Some(p)`, the partition the record was read from |
+    /// | NATS JetStream, Redis Streams, RabbitMQ, AWS SQS, In-process | `None`: no partitions |
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition: Option<i32>,
-    /// The record's offset inside its partition, or `None` where the backend
-    /// has no log offset. See [`partition`](Self::partition) for the
-    /// per-backend availability.
+    /// The record's position in its log: the offset inside its partition on
+    /// Kafka, the stream sequence on NATS. `None` where the backend has no log
+    /// position.
+    ///
+    /// ## Per-backend availability
+    ///
+    /// | Backend | `offset` |
+    /// |---|---|
+    /// | Apache Kafka | `Some(o)`, the record's offset inside [`partition`](Self::partition) |
+    /// | NATS JetStream | `Some(seq)`, the stream sequence from the message's stream metadata: a log position with no partition. Checked from `u64`, so `None` for a sequence past `i64::MAX` |
+    /// | Redis Streams | `None`: an entry id is a time and a sequence, not a log position (its time is in [`timestamp_ms`](Self::timestamp_ms)) |
+    /// | RabbitMQ, AWS SQS, In-process | `None`: no log position |
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<i64>,
-    /// The record's broker timestamp in milliseconds since the Unix epoch:
-    /// `LogAppendTime` or `CreateTime`, as the topic is configured. `None`
-    /// where the backend has no such timestamp or the record carries none.
-    /// See [`partition`](Self::partition) for the per-backend availability.
+    /// When the broker took the message, in milliseconds since the Unix
+    /// epoch, or `None` where the backend has no such time or the message
+    /// carries none. What "took" means is per backend, below; a handler that
+    /// anchors a dedup window or a time-lag gauge to it reads the row for its
+    /// backend first.
+    ///
+    /// ## Per-backend availability
+    ///
+    /// | Backend | `timestamp_ms` |
+    /// |---|---|
+    /// | Apache Kafka | `Some(ms)`, the record's broker timestamp: `LogAppendTime` or `CreateTime`, as the topic is configured. `None` when the record carries none |
+    /// | NATS JetStream | `Some(ms)`, the time the server received the message from its publisher (`published` in the stream metadata), checked into an `i64` |
+    /// | Redis Streams | `Some(ms)`, the **time component of the entry id**: the instance clock at the moment Redis generated the id. Not a publish time in general: a publisher may supply an explicit id, and after a clock rollback Redis reuses the top entry's time and increments the sequence part. `None` for an id whose time part does not parse or does not fit an `i64` |
+    /// | RabbitMQ | `None` on this version: the optional AMQP `timestamp` property is not read |
+    /// | AWS SQS | `None` on this version: the `SentTimestamp` attribute is not requested |
+    /// | In-process | `None` |
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_ms: Option<i64>,
     /// String-valued headers attached to the delivery (e.g. `x-trace-id`).
@@ -193,6 +210,15 @@ pub struct MessageMetadata {
 #[derive(Debug, Clone)]
 pub struct DeadMessageMetadata {
     /// Base message metadata.
+    ///
+    /// Two provenances meet in this value. `retry_count`, `delivery_id` and
+    /// the headers describe the **original** message, read back from the
+    /// headers shove stamped on the dead letter. The coordinates
+    /// (`partition`, `offset`, `timestamp_ms`) are the **dead letter's own**,
+    /// the position of the copy in the dead-letter topic: on a Kafka DLQ drain
+    /// `offset` is an offset on the DLQ topic, not on the topic the message
+    /// died on. A replay request needs the source coordinates, which the
+    /// dead-letter headers do not carry on this version.
     pub message: MessageMetadata,
     /// Why the message was dead-lettered (e.g., "rejected", "expired").
     pub reason: Option<String>,

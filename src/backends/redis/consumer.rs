@@ -908,11 +908,13 @@ where
                         // XREADGROUP does not return the counter — surfacing it
                         // would cost an XPENDING round-trip per message.
                         delivery_count: None,
-                        // A stream entry id is not a partition and an offset; see the
-                        // field docs on `MessageMetadata::partition`.
+                        // A stream entry id is not a partition and an offset, but
+                        // its first field is the instance clock when Redis generated
+                        // it; see `stream_id::time_component_ms` for what that time
+                        // is and is not.
                         partition: None,
                         offset: None,
-                        timestamp_ms: None,
+                        timestamp_ms: super::stream_id::time_component_ms(&entry_id),
                         headers: Arc::clone(&user_headers),
                     };
 
@@ -1349,7 +1351,7 @@ where
                         delivery_count: None,
                         partition: None,
                         offset: None,
-                        timestamp_ms: None,
+                        timestamp_ms: super::stream_id::time_component_ms(&entry_id),
                         headers: Arc::clone(&user_headers),
                     };
 
@@ -2606,7 +2608,7 @@ async fn ingest_batch_entry<T: Topic>(
         delivery_count: None,
         partition: None,
         offset: None,
-        timestamp_ms: None,
+        timestamp_ms: super::stream_id::time_component_ms(&entry_id),
         headers: Arc::clone(&user_headers),
     };
 

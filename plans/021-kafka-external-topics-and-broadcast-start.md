@@ -580,16 +580,23 @@ pub timestamp_ms: Option<i64>,
 ```
 
 Plus three builder setters, `partition`, `offset` and `timestamp_ms`, each `impl Into<Option<_>>` like `delivery_count` at `:223-226`.
-Add a per-backend availability table to the rustdoc, modelled on the `delivery_count` table at `:79-88`.
-Kafka is `Some` and every other backend is `None`.
+Each field carries its own per-backend availability table in the rustdoc, modelled on the `delivery_count` table at `:79-88`, and each is filled where the backend has the data.
+The maintainer's review of 2026-09-22 asked for this in place of the first shape, which documented the three fields as Kafka-only.
+`partition` is the one Kafka-shaped field.
+`offset` is the offset inside the partition on Kafka and the stream sequence on NATS, a log position with no partition, converted with `i64::try_from` so a sequence past `i64::MAX` reads as `None`.
+`timestamp_ms` is the broker timestamp on Kafka, the server's receive time (`Info.published`) on NATS as Unix milliseconds through a checked conversion, and on Redis the time component of the entry id.
+The Redis value is worded as the id's time component and never as a publish time: Redis fills it with the instance clock only for an id it generated, a publisher may supply an explicit id, and after a clock rollback Redis reuses the top entry's time and increments the sequence part.
+SQS (`SentTimestamp`) and RabbitMQ (the optional AMQP `timestamp` property) stay `None` on this version and follow later.
 The struct is `#[non_exhaustive]` since PR 71, so downstream code that reads fields or uses the builder is unaffected.
 
-Construction sites that gain the three fields, all set to `None` except Kafka:
+Construction sites that gain the three fields, filled where the backend has the data and `None` elsewhere:
 
 - `src/metadata.rs:241-249` builder `build`.
 - `src/backends/sns/consumer.rs:101`, `src/backends/redis/consumer.rs:901`, `:1335`, `:2592`, `src/backends/redis/broadcast.rs:292`.
 - `src/backends/rabbitmq/headers.rs:50`, `src/backends/inmemory/consumer.rs:2545`, `src/backends/nats/consumer.rs:137`.
 - Test fixtures at `src/handler.rs:191`, `src/audit.rs:310`, `:406`, `:459`.
+- NATS fills `offset` and `timestamp_ms` from the message's stream metadata through two checked helpers, `sequence_to_offset` and `published_to_millis`.
+- The four Redis sites fill `timestamp_ms` through `stream_id::time_component_ms`, which reuses the existing id parser and reads a malformed id or a time past `i64::MAX` as `None`.
 
 Kafka backend:
 
@@ -598,15 +605,20 @@ Kafka backend:
 - `build_message_metadata` takes it as a third parameter and fills the three fields.
   Call sites: `:3363`, `:3807`, `:4295`, `:4791`, and `build_dead_metadata` at `:539-556` for the DLQ drain.
 - `DeferredDelivery` (`:1226-1229`) carries the coordinates so a deferred broadcast redelivery keeps the original ones.
+- `DeadMessageMetadata::message` documents that on a DLQ drain the coordinates are the dead letter's own, on the DLQ topic, while `retry_count` and `delivery_id` come from the original's headers; source coordinates in the DLQ headers are a later change.
 
 Tests:
 
 - Unit, `src/metadata.rs`: defaults are `None`, setters work, serde round-trips and a JSON without the fields deserializes.
+- Unit, `src/backends/nats/consumer.rs`: the two checked conversions pass the representable range and read the rest as `None`.
+- Unit, `src/backends/redis/stream_id.rs`: the time component is the id's first field, checked.
+- Integration, `tests/nats_integration.rs`: `nats_delivery_fills_offset_and_timestamp_from_stream_info` sees sequence 1 on a fresh stream and a publish time inside the test's wall-clock window.
+- Integration, `tests/redis_integration.rs`: `redis_delivery_fills_timestamp_from_the_entry_id` sees the id's time inside the publish window and no partition or offset.
 - Integration, `tests/kafka_integration.rs`: `handler_sees_partition_offset_and_timestamp`.
   It asserts all three are `Some`, offsets increase per partition, and the timestamp lies inside the test's wall-clock window.
   One assertion each goes into the broadcast suite and into `tests/kafka_batch_integration.rs`.
 
-Docs: `docs/pages/concepts/handlers.mdx:160-170` lists the three fields with their availability.
+Docs: `docs/pages/concepts/handlers.mdx:160-170` lists the three fields with one availability table per backend and field, and the dead-letter provenance sentence.
 
 Migration note: none for readers and builder users.
 A downstream test that destructures without `..` already fails to compile since PR 71.
@@ -816,6 +828,13 @@ That is the at-least-once contract the rest of the crate keeps, and the PR body 
 
 The maintainer's review of 2026-09-22 asked for backend-neutral shapes in four places.
 This section records, per changed step, the patterns weighed and the one chosen, so the choice stays legible without the review thread.
+
+### Step 7, the metadata fields
+
+- Kafka-only fields with one combined table was the first shape; it hid different capabilities behind one `None` row per backend.
+- Filling each field where the backend has the data is the chosen shape: NATS supplies the stream sequence and the publish time, Redis supplies the id's time component, and every fill is a checked conversion because `offset` is `i64` while the NATS sequence is `u64`.
+- Per-field rows with the fill deferred was the alternative, and it keeps the non-Kafka fields empty.
+- The Redis wording is the constraint that survived verification: an entry id carries the instance's millisecond only when Redis generated it, so the field exposes the id's time component, never an exact publish time.
 
 ### Step 5, the broadcast start
 

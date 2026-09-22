@@ -3440,3 +3440,101 @@ mod sbe_codec {
         broker.close().await;
     }
 }
+
+/// The stream sequence and the receive time JetStream keeps on every message
+/// reach the handler as `offset` and `timestamp_ms`: a log position with no
+/// partition, and the server's receive time in Unix milliseconds. A fresh
+/// stream starts its sequence at 1.
+#[tokio::test]
+async fn nats_delivery_fills_offset_and_timestamp_from_stream_info() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
+
+    #[derive(Clone)]
+    struct CoordinateCapture(Arc<Mutex<Option<Coordinates>>>);
+
+    impl MessageHandler<WorkTopic> for CoordinateCapture {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+            *self.0.lock().await = Some((meta.partition, meta.offset, meta.timestamp_ms));
+            Outcome::Ack
+        }
+    }
+
+    let millis_now = || {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after the epoch")
+                .as_millis(),
+        )
+        .expect("fits an i64")
+    };
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    let before_ms = millis_now();
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "coord-1".into(),
+            content: "coordinates".into(),
+        })
+        .await
+        .expect("publish should succeed");
+    let after_ms = millis_now();
+
+    let captured = Arc::new(Mutex::new(None));
+    let handler = CoordinateCapture(captured.clone());
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let coordinates = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            if let Some(coordinates) = *captured.lock().await {
+                return coordinates;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("should receive the delivery within timeout");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let (partition, offset, timestamp_ms) = coordinates;
+    assert_eq!(partition, None, "JetStream has no partitions");
+    assert_eq!(
+        offset,
+        Some(1),
+        "the first message on a fresh stream has stream sequence 1"
+    );
+    let ts = timestamp_ms.expect("a stream message always carries its publish time");
+    // The container's clock and the host's may differ a little; a tolerance
+    // of five minutes still rules out a unit mix-up (seconds or nanoseconds).
+    let tolerance = 5 * 60 * 1000;
+    assert!(
+        ts >= before_ms - tolerance && ts <= after_ms + tolerance,
+        "timestamp_ms {ts} is not within the publish window {before_ms}..{after_ms}"
+    );
+    broker.close().await;
+}

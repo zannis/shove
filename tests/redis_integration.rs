@@ -5229,3 +5229,96 @@ mod lease_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The entry id's time component reaches the handler as `timestamp_ms`
+// ---------------------------------------------------------------------------
+
+/// The first field of a stream entry id is the instance clock when Redis
+/// generated the id, and it reaches the handler as `timestamp_ms`: the id's
+/// time component in Unix milliseconds. No partition and no offset, because
+/// an entry id is not a log position.
+#[tokio::test]
+async fn redis_delivery_fills_timestamp_from_the_entry_id() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
+
+    let broker = make_broker("redis-int-coordinates-grp").await;
+    broker
+        .topology()
+        .declare::<HeadersTopic>()
+        .await
+        .expect("declare");
+
+    let millis_now = || {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after the epoch")
+                .as_millis(),
+        )
+        .expect("fits an i64")
+    };
+    let before_ms = millis_now();
+    broker
+        .publisher()
+        .await
+        .expect("publisher")
+        .publish::<HeadersTopic>(&Order { id: 11 })
+        .await
+        .expect("publish");
+    let after_ms = millis_now();
+
+    let captured: Arc<tokio::sync::Mutex<Option<Coordinates>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let call_count = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct H(
+        Arc<tokio::sync::Mutex<Option<Coordinates>>>,
+        Arc<AtomicUsize>,
+    );
+    impl MessageHandler<HeadersTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, meta: MessageMetadata, _: &()) -> Outcome {
+            *self.0.lock().await = Some((meta.partition, meta.offset, meta.timestamp_ms));
+            self.1.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<HeadersTopic, _>(
+            H(captured.clone(), call_count.clone()),
+            ConsumerOptions::<Redis>::new(),
+        )
+        .expect("register");
+
+    let probe = call_count.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 1,
+            Duration::from_secs(15),
+        )
+        .await;
+    };
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    let (partition, offset, timestamp_ms) =
+        captured.lock().await.expect("the delivery was captured");
+    assert_eq!(partition, None, "Redis Streams have no partitions");
+    assert_eq!(offset, None, "an entry id is not a log position");
+    let ts = timestamp_ms.expect("an auto-generated entry id carries the instance clock");
+    // The container's clock and the host's may differ a little; a tolerance
+    // of five minutes still rules out a unit mix-up (seconds or nanoseconds).
+    let tolerance = 5 * 60 * 1000;
+    assert!(
+        ts >= before_ms - tolerance && ts <= after_ms + tolerance,
+        "timestamp_ms {ts} is not within the publish window {before_ms}..{after_ms}"
+    );
+}
