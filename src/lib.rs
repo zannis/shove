@@ -363,6 +363,12 @@ pub mod kafka {
     #[cfg_attr(docsrs, doc(cfg(feature = "test-support")))]
     pub use crate::backends::kafka::prime_admin_oauth_token_for_test;
 
+    /// Test-only probe (see the `test-support` feature) on the concurrent
+    /// consumer's completion channel, for tests that prove a completion sat
+    /// in the channel during a stall.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::completion_probe;
     /// Test-only seam (see the `test-support` feature): the receive loop's
     /// shutdown commit deadline, for tests that time a shutdown against it.
     #[cfg(feature = "test-support")]

@@ -904,6 +904,8 @@ fn signal_completion(
         offset,
         discard,
     }) {
+        #[cfg(feature = "test-support")]
+        completion_probe::REFUSED.fetch_add(1, Ordering::SeqCst);
         tracing::error!(
             queue,
             partition,
@@ -917,7 +919,33 @@ fn signal_completion(
         }
         return false;
     }
+    #[cfg(feature = "test-support")]
+    completion_probe::QUEUED.fetch_add(1, Ordering::SeqCst);
     true
+}
+
+/// Test-only probe (see the `test-support` feature) on the completion
+/// channel: how many completions `signal_completion` queued and how many it
+/// refused for a full channel, process-wide. The channel's sender is internal
+/// to the receive loop, so its occupancy cannot be read from a test any other
+/// way. nextest runs each test in its own process, so both start at zero.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod completion_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub static QUEUED: AtomicUsize = AtomicUsize::new(0);
+    pub static REFUSED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Completions `try_send` accepted so far.
+    pub fn queued() -> usize {
+        QUEUED.load(Ordering::SeqCst)
+    }
+
+    /// Completions `try_send` refused for a full channel so far.
+    pub fn refused() -> usize {
+        REFUSED.load(Ordering::SeqCst)
+    }
 }
 
 /// The wait a consume loop performs while the schema registry cannot answer
@@ -4048,13 +4076,23 @@ impl KafkaConsumer {
                 // message (drain at top + track_received in the message branch).
                 let mut tracker = OffsetTracker::new(queue_owned.clone());
                 let consumer = Arc::new(consumer);
-                // Bounded to prefetch_count: the semaphore already limits in-flight
-                // handler tasks to this count, so the channel can never grow beyond
-                // it under correct operation. An Err from try_send would indicate a
-                // logic bug (handler completing without holding a permit) and is
-                // surfaced immediately rather than silently accumulating (sec-K-4).
+                // One slot per sender that can hold a completion while this
+                // loop is not draining. The `prefetch_count` permit holders
+                // are `prefetch_count` of them. The loop itself is one more:
+                // a pre-handler discard signals through `signal_completion`
+                // without a permit, and the loop sends at most one such
+                // completion per iteration, so with every handler completion
+                // already queued the loop's own send still fits. The longest
+                // drain-free window is a registry stall, which holds the loop
+                // for the whole outage without draining; a handler that
+                // completed during it filled a `prefetch_count`-sized channel,
+                // and the stalled record's own verdict was refused and its
+                // offset lost. The bound stays, and so does `try_send`: the
+                // loop is the only receiver, so a `send().await` from it would
+                // deadlock, and a refusal past this count is a logic bug
+                // surfaced at once rather than silently accumulating (sec-K-4).
                 let (completion_tx, mut completion_rx) =
-                    mpsc::channel::<Completion>(prefetch_count as usize);
+                    mpsc::channel::<Completion>(prefetch_count as usize + 1);
                 // A registry deployment fault met inside a handler task's
                 // in-place redelivery ends this loop the way the loop ends
                 // when it meets the fault itself: at once, with the `Topology`

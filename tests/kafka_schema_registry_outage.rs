@@ -92,19 +92,22 @@ async fn schema(State(s): State<MockState>, Path(id): Path<u32>) -> Response {
 }
 
 /// A registry client over a mock whose answer for `FLAKY_ID` starts as
-/// `initial_status`, plus the handle that flips it.
+/// `initial_status`, plus the handle that flips it and the mock's request
+/// counter, so a test can gate on an observed registry request instead of a
+/// sleep.
 async fn mock_registry(
     accepted_subject: &'static str,
     initial_status: u16,
-) -> (Arc<SchemaRegistry>, Arc<AtomicU16>) {
+) -> (Arc<SchemaRegistry>, Arc<AtomicU16>, Arc<AtomicUsize>) {
     let flaky_status = Arc::new(AtomicU16::new(initial_status));
+    let hits = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/schemas/ids/{id}/versions", get(versions))
         .route("/schemas/ids/{id}", get(schema))
         .with_state(MockState {
             accepted_subject,
             flaky_status: flaky_status.clone(),
-            hits: Arc::new(AtomicUsize::new(0)),
+            hits: hits.clone(),
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -119,7 +122,55 @@ async fn mock_registry(
     let registry = SchemaRegistry::builder(format!("http://{addr}"))
         .max_retries(1)
         .build();
-    (registry, flaky_status)
+    (registry, flaky_status, hits)
+}
+
+/// Read up to `expected` raw payloads off `topic` with a throwaway group,
+/// from the beginning. The dead-letter topic's records keep the Confluent
+/// frame the original carried, so they are read raw rather than decoded.
+#[cfg(feature = "test-support")]
+async fn drain_raw(brokers: &str, topic: &str, expected: usize, timeout: Duration) -> Vec<Vec<u8>> {
+    use rdkafka::Message as _;
+    use rdkafka::consumer::{Consumer as _, StreamConsumer};
+
+    let consumer: StreamConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", format!("{topic}-raw-drain"))
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("failed to create raw drain consumer");
+    consumer
+        .subscribe(&[topic])
+        .expect("failed to subscribe the raw drain");
+    let deadline = Instant::now() + timeout;
+    let mut out = Vec::new();
+    while out.len() < expected {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, consumer.recv()).await {
+            Ok(Ok(msg)) => out.push(msg.payload().unwrap_or_default().to_vec()),
+            Ok(Err(e)) => panic!("raw drain recv failed: {e}"),
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// Poll `hits` until it exceeds `above`, the observable proof that the
+/// registry was asked again.
+#[cfg(feature = "test-support")]
+async fn wait_for_hits_above(hits: &AtomicUsize, above: usize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if hits.load(Ordering::SeqCst) > above {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the registry was not asked again within {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +379,12 @@ shove::define_topic!(
     Event,
     TopologyBuilder::new("kafka-sr-outage-drain").dlq().build()
 );
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    FreezeTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-freeze").dlq().build()
+);
 // An infra-owned topic, so a `Defer` waits in place and decodes the retained
 // bytes again: the registry is asked a second time for the same record.
 #[cfg(feature = "test-support")]
@@ -400,6 +457,50 @@ impl MessageHandler<InPlaceFaultTopic> for DeferOnceRecorder {
         drop(seen);
         self.counter.increment();
         if first { Outcome::Defer } else { Outcome::Ack }
+    }
+}
+
+/// Holds its first delivery on a gate until the test releases it, so a
+/// completion can be made to land while the receive loop is stalled.
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+struct GatedRecorder {
+    seen: Arc<Mutex<Vec<u32>>>,
+    counter: WaitableCounter,
+    gate: Arc<Notify>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "test-support")]
+impl GatedRecorder {
+    fn new() -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            counter: WaitableCounter::new(),
+            gate: Arc::new(Notify::new()),
+            released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.gate.notify_waiters();
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl MessageHandler<FreezeTopic> for GatedRecorder {
+    type Context = ();
+    async fn handle(&self, msg: Event, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.seen.lock().unwrap().push(msg.id);
+        self.counter.increment();
+        loop {
+            let notified = self.gate.notified();
+            if self.released.load(Ordering::SeqCst) {
+                return Outcome::Ack;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -543,7 +644,7 @@ async fn an_unavailable_registry_stalls_the_record_and_resumes() {
 
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
-    let (registry, status) = mock_registry("kafka-sr-outage-stall-value", 503).await;
+    let (registry, status, _) = mock_registry("kafka-sr-outage-stall-value", 503).await;
     let client = tb.client().await;
     let body = serde_json::to_vec(&Event { id: 1 }).unwrap();
     publish_raw(&tb.brokers, TOPIC, &frame_json(FLAKY_ID, &body)).await;
@@ -629,7 +730,7 @@ async fn a_batch_flushes_before_the_parked_record_and_resumes() {
     const GROUP: &str = "kafka-sr-outage-batch-consumer";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
-    let (registry, status) = mock_registry("kafka-sr-outage-batch-value", 503).await;
+    let (registry, status, _) = mock_registry("kafka-sr-outage-batch-value", 503).await;
     let client = tb.client().await;
     for (schema_id, id) in [(HEALTHY_ID, 1u32), (HEALTHY_ID, 2), (FLAKY_ID, 3)] {
         let body = serde_json::to_vec(&Event { id }).unwrap();
@@ -740,7 +841,7 @@ async fn a_retry_before_a_registry_stall_redelivers_the_rewound_span_in_order() 
     const GROUP: &str = "kafka-sr-outage-batch-retry-consumer";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
-    let (registry, status) = mock_registry("kafka-sr-outage-batch-retry-value", 503).await;
+    let (registry, status, _) = mock_registry("kafka-sr-outage-batch-retry-value", 503).await;
     let client = tb.client().await;
     for (schema_id, id) in [(HEALTHY_ID, 1u32), (HEALTHY_ID, 2), (FLAKY_ID, 3)] {
         let body = serde_json::to_vec(&Event { id }).unwrap();
@@ -810,7 +911,7 @@ async fn shutdown_during_a_registry_wait_leaves_the_record_uncommitted() {
     const GROUP: &str = "kafka-sr-outage-shutdown-consumer";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
-    let (registry, status) = mock_registry("kafka-sr-outage-shutdown-value", 503).await;
+    let (registry, status, _) = mock_registry("kafka-sr-outage-shutdown-value", 503).await;
     let client = tb.client().await;
     let body = serde_json::to_vec(&Event { id: 7 }).unwrap();
     publish_raw(&tb.brokers, TOPIC, &frame_json(FLAKY_ID, &body)).await;
@@ -893,7 +994,7 @@ async fn an_authentication_failure_ends_the_consumer() {
     const GROUP: &str = "kafka-sr-outage-auth-consumer";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
-    let (registry, _status) = mock_registry("kafka-sr-outage-auth-value", 401).await;
+    let (registry, _status, _) = mock_registry("kafka-sr-outage-auth-value", 401).await;
     let client = tb.client().await;
     let body = serde_json::to_vec(&Event { id: 4 }).unwrap();
     publish_raw(&tb.brokers, TOPIC, &frame_json(FLAKY_ID, &body)).await;
@@ -944,7 +1045,7 @@ async fn a_fifo_consumer_stalls_and_resumes() {
     const GROUP: &str = "kafka-sr-outage-fifo-fifo";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
-    let (registry, status) = mock_registry("kafka-sr-outage-fifo-value", 503).await;
+    let (registry, status, _) = mock_registry("kafka-sr-outage-fifo-value", 503).await;
     let client = tb.client().await;
     for (schema_id, id) in [(FLAKY_ID, 1u32), (HEALTHY_ID, 2)] {
         let body = serde_json::to_vec(&Event { id }).unwrap();
@@ -1012,7 +1113,7 @@ async fn a_broadcast_subscription_stalls_and_resumes() {
     const TOPIC: &str = "kafka-sr-outage-broadcast";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
-    let (registry, status) = mock_registry("kafka-sr-outage-broadcast-value", 503).await;
+    let (registry, status, _) = mock_registry("kafka-sr-outage-broadcast-value", 503).await;
     for (schema_id, id) in [(FLAKY_ID, 1u32), (HEALTHY_ID, 2)] {
         let body = serde_json::to_vec(&Event { id }).unwrap();
         publish_raw(&tb.brokers, TOPIC, &frame_json(schema_id, &body)).await;
@@ -1066,7 +1167,7 @@ async fn a_dlq_drain_stalls_and_resumes() {
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, DLQ).await;
     // The drain accepts the DLQ's own default subject.
-    let (registry, status) = mock_registry("kafka-sr-outage-drain-dlq-value", 503).await;
+    let (registry, status, _) = mock_registry("kafka-sr-outage-drain-dlq-value", 503).await;
     let client = tb.client().await;
     for (schema_id, id) in [(FLAKY_ID, 1u32), (HEALTHY_ID, 2)] {
         let body = serde_json::to_vec(&Event { id }).unwrap();
@@ -1142,7 +1243,7 @@ async fn a_registry_deployment_fault_during_an_in_place_redelivery_ends_the_cons
 
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
-    let (registry, status) = mock_registry("kafka-sr-outage-inplace-fault-value", 200).await;
+    let (registry, status, _) = mock_registry("kafka-sr-outage-inplace-fault-value", 200).await;
     let client = tb.client().await;
     let body = serde_json::to_vec(&Event { id: 5 }).unwrap();
     publish_raw(&tb.brokers, TOPIC, &frame_json(FLAKY_ID, &body)).await;
@@ -1202,5 +1303,102 @@ async fn a_registry_deployment_fault_during_an_in_place_redelivery_ends_the_cons
         discarded_series(&snapshot, TOPIC),
         Vec::<(String, u64)>::new(),
         "a deployment fault is not a discard"
+    );
+}
+
+/// The completion channel holds one slot per prefetch permit, and every
+/// permit holder is a sender. The receive loop itself is a sender too: a
+/// pre-handler discard signals without a permit, and `RegistryStall::wait`
+/// never drains. With one permit and one slot, a handler completion that
+/// landed during a stall filled the channel, and the stalled record's own
+/// verdict was refused: its offset never reached the tracker and lag stayed
+/// at one for good. The channel now holds one slot more than the permits.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_completion_during_a_registry_stall_does_not_freeze_the_committed_offset() {
+    use shove::kafka::completion_probe;
+
+    const TOPIC: &str = "kafka-sr-outage-freeze";
+    const GROUP: &str = "kafka-sr-outage-freeze-consumer";
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+    let (registry, status, hits) = mock_registry("kafka-sr-outage-freeze-value", 503).await;
+    let client = tb.client().await;
+    for (schema_id, id) in [(HEALTHY_ID, 1u32), (FLAKY_ID, 2)] {
+        let body = serde_json::to_vec(&Event { id }).unwrap();
+        publish_raw(&tb.brokers, TOPIC, &frame_json(schema_id, &body)).await;
+    }
+
+    let handler = GatedRecorder::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<FreezeTopic, _>(
+                h,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_concurrent_processing(false)
+                    .with_schema_registry(registry)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    // Gate one: record 1 is in its handler, and the loop has asked the
+    // registry about record 2 at least once more, so it is stalled.
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "record 1 delivered"
+    );
+    let after_first = hits.load(Ordering::SeqCst);
+    wait_for_hits_above(&hits, after_first, TIMEOUT).await;
+
+    // Gate two: the handler's Ack completion is queued while the loop is
+    // still stalled and cannot drain it.
+    let queued_before = completion_probe::queued();
+    handler.release();
+    let deadline = Instant::now() + TIMEOUT;
+    while completion_probe::queued() <= queued_before {
+        assert!(
+            Instant::now() < deadline,
+            "record 1's completion was never queued"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The registry's verdict on record 2 arrives into a channel that already
+    // holds record 1's completion.
+    status.store(404, Ordering::SeqCst);
+    wait_for_lag(&client, TOPIC, GROUP, 0, TIMEOUT).await;
+    assert_eq!(
+        completion_probe::refused(),
+        0,
+        "no completion may be refused for a full channel"
+    );
+    assert_eq!(
+        handler.seen.lock().unwrap().clone(),
+        vec![1],
+        "record 2 never reached the handler"
+    );
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task panicked")
+        .expect("consumer ended cleanly");
+
+    // Record 2 went to the dead-letter topic, the registry's definite answer,
+    // with the bytes it arrived with.
+    let dead = drain_raw(&tb.brokers, "kafka-sr-outage-freeze-dlq", 1, TIMEOUT).await;
+    assert_eq!(
+        dead,
+        vec![frame_json(
+            FLAKY_ID,
+            &serde_json::to_vec(&Event { id: 2 }).unwrap()
+        )],
+        "the dead letter is record 2, framed as it was published"
     );
 }
