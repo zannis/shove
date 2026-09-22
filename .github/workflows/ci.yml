@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev libsasl2-dev
       - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
         with:
           components: rustfmt, clippy
@@ -63,9 +63,15 @@ jobs:
       - run: cargo clippy -q --no-default-features --all-targets -- -D warnings
       # `kafka-ssl` must not link Cyrus SASL: SCRAM and OAUTHBEARER are native
       # to librdkafka's SSL build, and only `kafka-gssapi` may pull `sasl2-sys`.
-      # `cargo tree -i` exits non-zero when the package is absent from the
-      # graph, which is the outcome this step asserts.
-      - run: '! cargo tree -e features --no-default-features --features kafka-ssl -i sasl2-sys'
+      # Assert on the output, not on a negated exit code: `! cargo tree ...`
+      # also passes when `cargo tree` itself fails (index fetch, lockfile, a
+      # mistyped feature). The `kafka-gssapi` line is the positive control, so
+      # a broken invocation cannot pass either check. `shell: bash` gives
+      # `pipefail`, which the default shell lacks.
+      - shell: bash
+        run: |
+          cargo tree -e features --no-default-features --features kafka-ssl | (! grep -F sasl2-sys)
+          cargo tree -e features --no-default-features --features kafka-gssapi | grep -F sasl2-sys
       - run: cargo test --no-default-features
       # The schema-registry mock suite drives an in-process axum registry, so
       # unlike the other two SR files it needs no Docker (11 tests, ~0.2s) and
@@ -88,7 +94,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev libsasl2-dev
       - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
         with:
           components: clippy
@@ -132,7 +138,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev libsasl2-dev
       - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --all-features
@@ -319,7 +325,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - if: startsWith(matrix.name, 'kafka')
-        run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libsasl2-dev
       - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo install -q cargo-llvm-cov cargo-nextest --locked
