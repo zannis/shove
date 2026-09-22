@@ -209,9 +209,14 @@ fn target_from_watermarks(target: WatermarkTarget, low: i64, high: i64) -> i64 {
 /// was asked to replay, so it is refused here along with any other offset that
 /// is not a real position.
 ///
-/// Every accepted branch resolves inside `low..=high`, never to a symbolic
-/// offset: a committed offset outside the retained range would be silently
-/// reinterpreted by `auto.offset.reset` on the next join, undoing the reset.
+/// Every accepted branch resolves to a real position, never a symbolic
+/// offset, and never below `low`: a committed offset the retention window
+/// has since passed would be silently reinterpreted by `auto.offset.reset`
+/// on the next join, undoing the reset. It is not pulled down to `high`: the
+/// watermarks are read before the lookup, so a record appended between the
+/// two calls resolves above a `high` that is already stale, and clamping it
+/// there would replay, or for a broadcast start deliver, records before the
+/// timestamp.
 ///
 /// Shared with the broadcast subscriber's `Timestamp` start, which assigns
 /// the resolved offset instead of committing it and needs the same refusal
@@ -224,7 +229,7 @@ pub(super) fn target_from_timestamp_lookup(
     partition: i32,
 ) -> Result<i64> {
     match looked_up {
-        Offset::Offset(n) if n >= 0 => Ok(n.clamp(low, high)),
+        Offset::Offset(n) if n >= 0 => Ok(n.max(low)),
         Offset::Beginning => Ok(low),
         Offset::End => Ok(high),
         other => Err(ShoveError::Connection(format!(
@@ -731,10 +736,17 @@ mod tests {
         assert_eq!(ts_target(Offset::Beginning, 40, 100).unwrap(), 40);
     }
 
+    /// A resolved offset below the low watermark has aged out between the
+    /// watermark fetch and the lookup, so it is raised to `low`; one above the
+    /// high watermark was appended between the two calls, so it is kept. The
+    /// watermarks are read first, and pulling a real answer down to a stale
+    /// `high` would replay, or for a broadcast start deliver, records before
+    /// the timestamp.
     #[test]
-    fn a_resolved_offset_is_clamped_into_the_retained_range() {
+    fn a_resolved_offset_is_raised_to_the_low_watermark_and_never_lowered() {
         assert_eq!(ts_target(Offset::Offset(5), 40, 100).unwrap(), 40);
-        assert_eq!(ts_target(Offset::Offset(500), 40, 100).unwrap(), 100);
+        assert_eq!(ts_target(Offset::Offset(500), 40, 100).unwrap(), 500);
+        assert_eq!(ts_target(Offset::Offset(12), 0, 10).unwrap(), 12);
     }
 
     #[test]
