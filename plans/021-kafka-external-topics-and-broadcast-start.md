@@ -193,7 +193,9 @@ All line numbers are at `5bc4979`.
 - Changing any pinned constant value, including `ASYNC_COMMIT_INTERVAL`, `SESSION_TIMEOUT_MS` and `MAX_POLL_INTERVAL_MS`.
 - Committing inside `pre_rebalance` before a revoke, which plan 007 deferred and the Maintenance notes discuss.
 - A start position for NATS, Redis or RabbitMQ broadcast subscriptions.
-- Filling the new metadata fields on SQS and RabbitMQ; NATS fills `offset` and `timestamp_ms` and Redis fills `timestamp_ms` in step 7, and the Maintenance notes list what the other two could fill.
+- Filling the new metadata fields on SQS and RabbitMQ.
+  NATS fills `offset` and `timestamp_ms` and Redis fills `timestamp_ms` in step 7.
+  The Maintenance notes list what the other two could fill.
 - The FIFO commit cadence, which commits per message.
 - Moving `commit_batch_end` off `spawn_blocking`, which the Maintenance notes discuss.
 - A partition-count accessor on the public API.
@@ -336,7 +338,9 @@ pub fn with_commit_interval(mut self, interval: Duration) -> Self
 
 The builders assert `!interval.is_zero()`, copying `RedisConfig::with_trim_interval` at `src/backends/redis/client.rs:151-153`.
 Any nonzero interval up to one hour is accepted, above or below 500 ms.
-`MAX_COMMIT_INTERVAL` in `constants.rs` is the upper bound: the gate adds the interval to an `Instant` and the fence threshold grows with four intervals, so both setters panic past an hour, at configuration time and never in the receive loop.
+`MAX_COMMIT_INTERVAL` in `constants.rs` is the upper bound.
+The gate adds the interval to an `Instant`, and the fence threshold grows with four intervals.
+Both setters panic past an hour, at configuration time and never in the receive loop.
 `ConsumerOptionsInner` gains `kafka_commit_interval`, and every literal of it sets the field: `src/consumer.rs:537`, `src/backend/options_inner.rs:84`, `src/backend/mod.rs:205`.
 `spawn_one` copies the group value into the options like `auto_offset_reset` at `consumer_group.rs:801`.
 The receive loop builds the gate from `options.kafka_commit_interval.unwrap_or(ASYNC_COMMIT_INTERVAL)` at `consumer.rs:3028`.
@@ -413,7 +417,8 @@ It now runs on a dedicated thread and gives up after 20 s, where it previously w
 Commit: `feat(kafka): let a broadcast subscription start at the head, the tail or a timestamp`.
 
 Where an ephemeral subscription starts is not a Kafka idea: NATS has `DeliverPolicy::{New, All, ByStartTime}` and a Redis stream id carries its millisecond.
-The maintainer's review of 2026-09-22 therefore asked for a backend-neutral shape in place of the Kafka-typed knob this step first shipped, and the shape below is the one that landed.
+The maintainer's review of 2026-09-22 therefore asked for a backend-neutral shape in place of the Kafka-typed knob this step first shipped.
+The shape below is the one that landed.
 
 Public API, the type, the field and the setter, scoped to `HasBroadcast` like the rest of the broadcast surface:
 
@@ -441,22 +446,29 @@ fn check_options(queue: &str, options: &ConsumerOptionsInner) -> Result<()>;
 
 `ConsumerOptionsInner` gains `broadcast_start`, and the three literals named in step 4 set it.
 Neither field is feature-gated, because the concept is not.
-`BroadcastSubscriber::subscribe` calls `check_options` before it spawns the loop, so a backend refuses what it cannot honour synchronously, at the call site, with `ShoveError::Topology`, and a refused subscribe leaves the handle free to retry.
+`BroadcastSubscriber::subscribe` calls `check_options` before it spawns the loop.
+A backend therefore refuses what it cannot honour synchronously, at the call site, with `ShoveError::Topology`.
+A refused subscribe leaves the handle free to retry.
 Kafka honours all three variants.
-NATS, Redis, RabbitMQ and the in-process broker start at the tail only on this version: `None` and `Tail` pass, `Head` and `Timestamp` are refused through one shared helper, `refuse_start_other_than_tail`, whose message names the topic, the variant, the backend and the way out.
+NATS, Redis, RabbitMQ and the in-process broker start at the tail only on this version.
+`None` and `Tail` pass, and `Head` and `Timestamp` are refused through one shared helper, `refuse_start_other_than_tail`.
+Its message names the topic, the variant, the backend and the way out.
 Mapping `Head` and `Timestamp` onto `DeliverPolicy::All`, `DeliverPolicy::ByStartTime` and a Redis id is a later step, and needs a checked conversion for the NATS `OffsetDateTime`.
 The timestamp unit is Unix epoch milliseconds on every backend, the unit `KafkaOffsetReset::Timestamp` already documents.
 `KafkaOffsetReset` stays the type of `reset_consumer_group_offsets` and no longer names the broadcast start.
 The refusal policy is the FIFO consumer's, applied to every knob an entry point never reads.
 The Kafka broadcast subscription refuses `with_commit_interval` and `with_auto_offset_reset` in `check_options`, because it commits nothing and assigns every partition at an explicit offset.
-Every competing-consumer entry point refuses a set `broadcast_start` through `ConsumerOptionsInner::refuse_broadcast_start`: `ConsumerSupervisor::register` and `register_fifo` generically, and each backend's direct, FIFO and DLQ paths, so a caller meets the same `Topology` error whichever way it starts a consumer.
+Every competing-consumer entry point refuses a set `broadcast_start` through `ConsumerOptionsInner::refuse_broadcast_start`.
+`ConsumerSupervisor::register` and `register_fifo` do so generically, and each backend's direct, FIFO and DLQ paths do so themselves.
+A caller therefore meets the same `Topology` error whichever way it starts a consumer.
 
 Kafka backend:
 
 - Rename `assign_all_partitions_at_end` to `assign_all_partitions_at(topic, start: Option<BroadcastStart>, timeout)`.
 - `None` and `Some(Tail)` add every partition at `Offset::End`, byte for byte the current behaviour.
 - `Some(Head)` adds every partition at `Offset::Beginning`.
-- `broadcast_start_positions` is one exhaustive match over the start, so a new variant is a compile error there and no `unreachable!` arm sits on the runtime path.
+- `broadcast_start_positions` is one exhaustive match over the start.
+  A new variant is a compile error there, and no `unreachable!` arm sits on the runtime path.
 - `Some(Timestamp(ms))` fetches every partition's watermarks first, then calls `offsets_for_times`.
   It then resolves each partition through `target_from_timestamp_lookup`, made `pub(super)`.
   The order matters, because a record that lands between the lookup and a later watermark fetch would be skipped.
@@ -476,11 +488,14 @@ Kafka backend:
 Tests:
 
 - Unit, `offset_reset.rs`: a `Timestamp` start resolves through the group reset's lookup helper.
-- Unit, `src/backend/broadcast.rs`: the tail-only helper passes `None` and `Tail` and refuses `Head` and `Timestamp` with a message that names the topic, the variant and the way out.
+- Unit, `src/backend/broadcast.rs`: the tail-only helper passes `None` and `Tail` and refuses `Head` and `Timestamp`.
+  Its message names the topic, the variant and the way out.
 - Unit, `consumer.rs`: the error classifier ignores `GroupAuthorizationFailed` and passes every other code through.
 - Unit, `src/consumer.rs`: `with_broadcast_start` propagates through `into_inner`, modelled on `kafka_with_group_id_propagates_through_into_inner` (`:1044-1050`).
 - Integration, `tests/inmemory_broadcast.rs`: `broadcast_start_is_refused_by_a_backend_that_cannot_honour_it` asserts the synchronous `Topology` error from `subscribe()` for `Head` and `Timestamp`, and that `Tail` is then accepted on the same handle.
-- Unit, `kafka/consumer.rs`: `run_rejects_broadcast_start` and `run_fifo_rejects_broadcast_start` against a client that never connects, and `broadcast_subscribe_rejects_commit_interval` and `broadcast_subscribe_rejects_auto_offset_reset` on `check_broadcast_options`, with a negative control that admits every start and the inert group id.
+- Unit, `kafka/consumer.rs`: `run_rejects_broadcast_start` and `run_fifo_rejects_broadcast_start` against a client that never connects.
+  `broadcast_subscribe_rejects_commit_interval` and `broadcast_subscribe_rejects_auto_offset_reset` cover `check_broadcast_options`.
+  A negative control admits every start and the inert group id.
 - Unit, `src/consumer_supervisor.rs`: `supervisor_register_rejects_broadcast_start` and `supervisor_register_fifo_rejects_broadcast_start` on the in-process broker, each proving the topic stays registrable after the refusal.
 - Integration, `tests/kafka_broadcast_integration.rs`, three new tests.
   `broadcast_starts_from_the_head_when_asked` publishes before subscribing, subscribes with `Head`, and receives everything.
@@ -534,8 +549,10 @@ Kafka backend:
   When the topic is absent it returns `ShoveError::Topology` naming the topic, with the fail-fast wording of `src/backends/nats/topology.rs:127-129`.
   It never calls `create_topic`, `ensure_partitions` or `ensure_topic_configs` for the main topic.
 - The verification fetch uses a one-shot consumer-type metadata client with `allow.auto.create.topics=false` set explicitly and no `group.id`, `probe_external_topic_blocking` in `client.rs`.
-  The producer's own client, the one `KafkaClient::ping` uses, defaults that flag to true and sends it on a topic-specific metadata request, so on a broker with `auto.create.topics.enable=true` it would create the very topic `external()` promises never to create.
-  Without a `group.id` there is no coordinator lookup, so the probe needs no group permission under a group-scoped ACL; do not reuse `fetch_topic_partition_count_blocking`, which sets one.
+  The producer's own client, the one `KafkaClient::ping` uses, defaults that flag to true and sends it on a topic-specific metadata request.
+  On a broker with `auto.create.topics.enable=true` it would create the very topic `external()` promises never to create.
+  Without a `group.id` there is no coordinator lookup, so the probe needs no group permission under a group-scoped ACL.
+  Do not reuse `fetch_topic_partition_count_blocking`, which sets one.
 - The DLQ, when declared, is still created, because shove owns its dead-letter topic in both modes.
   NATS does the same at `nats/topology.rs:152-154`.
 - `register` and `register_fifo` need no change, because the flag travels inside the topology they hand to the declarer.
@@ -581,12 +598,17 @@ pub timestamp_ms: Option<i64>,
 ```
 
 Plus three builder setters, `partition`, `offset` and `timestamp_ms`, each `impl Into<Option<_>>` like `delivery_count` at `:223-226`.
-Each field carries its own per-backend availability table in the rustdoc, modelled on the `delivery_count` table at `:79-88`, and each is filled where the backend has the data.
+Each field carries its own per-backend availability table in the rustdoc, modelled on the `delivery_count` table at `:79-88`.
+Each is filled where the backend has the data.
 The maintainer's review of 2026-09-22 asked for this in place of the first shape, which documented the three fields as Kafka-only.
 `partition` is the one Kafka-shaped field.
-`offset` is the offset inside the partition on Kafka and the stream sequence on NATS, a log position with no partition, converted with `i64::try_from` so a sequence past `i64::MAX` reads as `None`.
-`timestamp_ms` is the broker timestamp on Kafka, the server's receive time (`Info.published`) on NATS as Unix milliseconds through a checked conversion, and on Redis the time component of the entry id.
-The Redis value is worded as the id's time component and never as a publish time: Redis fills it with the instance clock only for an id it generated, a publisher may supply an explicit id, and after a clock rollback Redis reuses the top entry's time and increments the sequence part.
+`offset` is the offset inside the partition on Kafka and the stream sequence on NATS, a log position with no partition.
+The NATS sequence is converted with `i64::try_from`, so a sequence past `i64::MAX` reads as `None`.
+`timestamp_ms` is the broker timestamp on Kafka and the time component of the entry id on Redis.
+On NATS it is the server's receive time, `Info.published`, as Unix milliseconds through a checked conversion.
+The Redis value is worded as the id's time component and never as a publish time.
+Redis fills it with the instance clock only for an id it generated, and a publisher may supply an explicit id.
+After a clock rollback Redis reuses the top entry's time and increments the sequence part.
 SQS (`SentTimestamp`) and RabbitMQ (the optional AMQP `timestamp` property) stay `None` on this version and follow later.
 The struct is `#[non_exhaustive]` since PR 71, so downstream code that reads fields or uses the builder is unaffected.
 
@@ -597,7 +619,8 @@ Construction sites that gain the three fields, filled where the backend has the 
 - `src/backends/rabbitmq/headers.rs:50`, `src/backends/inmemory/consumer.rs:2545`, `src/backends/nats/consumer.rs:137`.
 - Test fixtures at `src/handler.rs:191`, `src/audit.rs:310`, `:406`, `:459`.
 - NATS fills `offset` and `timestamp_ms` from the message's stream metadata through two checked helpers, `sequence_to_offset` and `published_to_millis`.
-- The four Redis sites fill `timestamp_ms` through `stream_id::time_component_ms`, which reuses the existing id parser and reads a malformed id or a time past `i64::MAX` as `None`.
+- The four Redis sites fill `timestamp_ms` through `stream_id::time_component_ms`, which reuses the existing id parser.
+  A malformed id or a time past `i64::MAX` reads as `None`.
 
 Kafka backend:
 
@@ -606,7 +629,9 @@ Kafka backend:
 - `build_message_metadata` takes it as a third parameter and fills the three fields.
   Call sites: `:3363`, `:3807`, `:4295`, `:4791`, and `build_dead_metadata` at `:539-556` for the DLQ drain.
 - `DeferredDelivery` (`:1226-1229`) carries the coordinates so a deferred broadcast redelivery keeps the original ones.
-- `DeadMessageMetadata::message` documents that on a DLQ drain the coordinates are the dead letter's own, on the DLQ topic, while `retry_count` and `delivery_id` come from the original's headers; source coordinates in the DLQ headers are a later change.
+- `DeadMessageMetadata::message` documents that on a DLQ drain the coordinates are the dead letter's own, on the DLQ topic.
+  `retry_count` and `delivery_id` come from the original's headers.
+  Source coordinates in the DLQ headers are a later change.
 
 Tests:
 
@@ -832,12 +857,20 @@ This section records, per changed step, the patterns weighed and the one chosen,
 
 ### Step 7, the metadata fields
 
-- Kafka-only fields with one combined table was the first shape; it hid different capabilities behind one `None` row per backend.
-- Filling each field where the backend has the data is the chosen shape: NATS supplies the stream sequence and the publish time, Redis supplies the id's time component, and every fill is a checked conversion because `offset` is `i64` while the NATS sequence is `u64`.
+- Kafka-only fields with one combined table was the first shape.
+  It hid different capabilities behind one `None` row per backend.
+- Filling each field where the backend has the data is the chosen shape.
+  NATS supplies the stream sequence and the publish time, and Redis supplies the id's time component.
+  Every fill is a checked conversion, because `offset` is `i64` while the NATS sequence is `u64`.
 - Per-field rows with the fill deferred was the alternative, and it keeps the non-Kafka fields empty.
-- The Redis wording is the constraint that survived verification: an entry id carries the instance's millisecond only when Redis generated it, so the field exposes the id's time component, never an exact publish time.
-- A namespaced attribute map, the shape of the OpenTelemetry messaging conventions (`messaging.kafka.offset`, `messaging.kafka.partition`), was weighed too: it carries any backend's coordinates without new fields, at the price of typed access, a string lookup and a parse where a field gives an `Option<i64>`.
-  The typed fields are kept because a handler reads them on every delivery and the set is small; the attribute map stays the shape for an export layer, not for the handler's argument.
+- The Redis wording is the constraint that survived verification.
+  An entry id carries the instance's millisecond only when Redis generated it.
+  The field therefore exposes the id's time component, never an exact publish time.
+- A namespaced attribute map, the shape of the OpenTelemetry messaging conventions (`messaging.kafka.offset`, `messaging.kafka.partition`), was weighed too.
+  It carries any backend's coordinates without new fields.
+  The price is typed access: a string lookup and a parse where a field gives an `Option<i64>`.
+  The typed fields are kept because a handler reads them on every delivery and the set is small.
+  The attribute map stays the shape for an export layer, not for the handler's argument.
 
 ### Step 5, the broadcast start
 
@@ -846,9 +879,11 @@ This section records, per changed step, the patterns weighed and the one chosen,
 - A backend-neutral enum on the `HasBroadcast`-scoped options is the chosen shape.
   NATS has `DeliverPolicy::{All, New, ByStartTime}` and a Redis stream id starts with a millisecond, so head, tail and timestamp map onto both.
   Each backend refuses at `subscribe()` what it cannot honour, the rule the FIFO consumer already applies to the commit interval.
-- Implementing the NATS and Redis mappings in the same step was set aside for scope: the type and the refusal land now, the mappings later, each with its own tests.
+- Implementing the NATS and Redis mappings in the same step was set aside for scope.
+  The type and the refusal land now, and the mappings land later, each with its own tests.
 - An absolute position is the pattern the brokers offer as well: async-nats has `DeliverPolicy::ByStartSequence` and RabbitMQ Streams take a numeric offset.
-  It is deferred because a sequence or an offset names a position on one backend's log and means nothing on another, so it would be the first backend-specific variant on a neutral enum; `#[non_exhaustive]` leaves the room for it.
+  It is deferred because a sequence or an offset names a position on one backend's log and means nothing on another.
+  It would be the first backend-specific variant on a neutral enum, and `#[non_exhaustive]` leaves the room for it.
 
 ## Done criteria
 
@@ -896,12 +931,15 @@ This section records, per changed step, the patterns weighed and the one chosen,
   Revisit if a user runs intervals above a few seconds.
 - `commit_batch_end` still runs its `Sync` commit on `spawn_blocking`, which runtime shutdown waits for.
   The dedicated-thread shape of step 4 applies there too, as a follow-up.
-- The three metadata fields are filled where a backend has the data: Kafka fills all three, NATS fills `offset` from the stream sequence and `timestamp_ms` from the message info, and Redis fills `timestamp_ms` from the entry id's time component.
+- The three metadata fields are filled where a backend has the data.
+  Kafka fills all three, and NATS fills `offset` from the stream sequence and `timestamp_ms` from the message info.
+  Redis fills `timestamp_ms` from the entry id's time component.
   SQS could fill `timestamp_ms` from `SentTimestamp` and RabbitMQ from the AMQP `timestamp` property.
   Do it per backend with its own availability row, as `delivery_count` did.
 - `kafka_external_topic()` refuses `sequenced()` for now.
   Nothing in the Kafka FIFO consumer depends on shove having created the topic, so lifting the guard is additive once a user needs it.
-- `KafkaOffsetReset` describes a position for `reset_consumer_group_offsets` alone; the broadcast start is the backend-neutral `BroadcastStart`, and `KafkaAutoOffsetReset` is the group's librdkafka policy.
+- `KafkaOffsetReset` describes a position for `reset_consumer_group_offsets` alone.
+  The broadcast start is the backend-neutral `BroadcastStart`, and `KafkaAutoOffsetReset` is the group's librdkafka policy.
   The three types share the timestamp unit and nothing else, so a variant added to one does not touch the others.
 - Every new `.set(` on the Kafka client config still has to be checked against plan 011's reserved-key list when that plan lands.
 - `FailReason::SchemaUnavailable` is the first reason that `record_failed` counts and `record_terminal` never does.
