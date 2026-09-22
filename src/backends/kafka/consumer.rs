@@ -291,11 +291,15 @@ impl PartitionTracker {
     /// offset once nothing is in flight. Never consults offsets the broker
     /// did not deliver, so a compacted or transactional hole does not hold
     /// the position back.
+    ///
+    /// Saturating, like every other successor on the commit path: at
+    /// `i64::MAX` the exclusive position does not exist, and an unchecked
+    /// `+ 1` would wrap to a negative offset in a release build.
     fn position(&self) -> i64 {
         self.in_flight
             .first()
             .copied()
-            .unwrap_or(self.highest_delivered + 1)
+            .unwrap_or_else(|| self.highest_delivered.saturating_add(1))
     }
 
     /// Flags this partition dirty (see the `dirty` field) because a commit
@@ -2592,10 +2596,12 @@ impl<T: Topic> BatchBuffer<T> {
         self.messages.len() + self.dropped.len()
     }
 
-    /// Extends the offset span to cover `offset` on `partition`.
+    /// Extends the offset span to cover `offset` on `partition`. The
+    /// exclusive end saturates at `i64::MAX`, as `PartitionTracker::position`
+    /// does, so the batch commit path carries no unchecked arithmetic.
     fn extend_span(&mut self, partition: i32, offset: i64) {
         self.start.entry(partition).or_insert(offset);
-        self.end.insert(partition, offset + 1);
+        self.end.insert(partition, offset.saturating_add(1));
     }
 
     fn push(&mut self, message: T::Message, metadata: MessageMetadata, raw: Option<RawMessage>) {
@@ -5576,6 +5582,18 @@ mod offset_tracker_tests {
         );
     }
 
+    /// `position()` is one past the highest delivered offset once nothing
+    /// is in flight. At `i64::MAX` that successor does not exist: an
+    /// unchecked `+ 1` panics in a debug build and wraps to `i64::MIN` in a
+    /// release build, which would offer a negative commit position.
+    /// Saturating keeps the commit path free of unchecked arithmetic.
+    #[test]
+    fn position_saturates_at_the_maximum_offset() {
+        let mut tracker = PartitionTracker::new(i64::MAX);
+        tracker.mark_complete(i64::MAX, None);
+        assert_eq!(tracker.position(), i64::MAX);
+    }
+
     /// A delivered offset whose handler is still running is a real gap:
     /// out-of-order completions commit only up to it, then advance once it
     /// completes.
@@ -6731,6 +6749,17 @@ mod batch_buffer_tests {
         assert!(!buf.is_empty());
         assert_eq!(buf.end.get(&0), Some(&8));
         assert_eq!(buf.start.get(&0), Some(&7));
+    }
+
+    /// The exclusive end of a span is `offset + 1`, which does not exist at
+    /// `i64::MAX`. The same saturating rule as `PartitionTracker::position`
+    /// keeps the batch commit path free of unchecked arithmetic.
+    #[test]
+    fn extend_span_saturates_at_the_maximum_offset() {
+        let mut buf = buffer();
+        buf.extend_span(1, i64::MAX);
+        assert_eq!(buf.start.get(&1), Some(&i64::MAX));
+        assert_eq!(buf.end.get(&1), Some(&i64::MAX));
     }
 }
 
