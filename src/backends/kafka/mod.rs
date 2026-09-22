@@ -19,6 +19,7 @@ pub use client::{KafkaClient, KafkaCompression, KafkaConfig};
 #[cfg(feature = "kafka-ssl")]
 pub use client::{KafkaSasl, KafkaTls};
 pub use consumer::{BatchConsumerOptions, KafkaConsumer};
+pub(crate) use consumer_group::validate_commit_interval;
 pub use consumer_group::{
     KafkaAutoOffsetReset, KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
 };

@@ -5,9 +5,11 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::backend::capability::HasBroadcast;
 use crate::backend::{Backend, ConsumerOptionsInner};
 #[cfg(feature = "kafka")]
-use crate::backends::kafka::{KafkaAutoOffsetReset, KafkaOffsetReset};
+use crate::backends::kafka::{KafkaAutoOffsetReset, validate_commit_interval};
+use crate::broadcast::BroadcastStart;
 use crate::error::{Result, ShoveError};
 #[cfg(feature = "kafka")]
 use crate::markers::Kafka;
@@ -293,12 +295,12 @@ pub struct ConsumerOptions<B: Backend> {
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
     pub kafka_commit_interval: Option<Duration>,
 
-    /// Kafka-only: where a broadcast subscription assigns each partition.
-    /// `None` (the default) and `Some(Latest)` keep the tail assignment. Set
-    /// via [`ConsumerOptions::<Kafka>::with_broadcast_start`].
-    #[cfg(feature = "kafka")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
-    pub kafka_broadcast_start: Option<KafkaOffsetReset>,
+    /// Where a broadcast subscription starts reading. `None` (the default)
+    /// and `Some(BroadcastStart::Tail)` keep deliver-new. Set via
+    /// [`ConsumerOptions::with_broadcast_start`], which only a backend
+    /// implementing [`HasBroadcast`] offers; see [`BroadcastStart`] for which
+    /// backends honour the other two variants.
+    pub broadcast_start: Option<BroadcastStart>,
 
     // Runtime coordination — crate-private.
     pub(crate) shutdown: Option<CancellationToken>,
@@ -342,8 +344,7 @@ impl<B: Backend> ConsumerOptions<B> {
             kafka_auto_offset_reset: None,
             #[cfg(feature = "kafka")]
             kafka_commit_interval: None,
-            #[cfg(feature = "kafka")]
-            kafka_broadcast_start: None,
+            broadcast_start: None,
             shutdown: None,
             processing: Arc::new(AtomicBool::new(false)),
             consumer_group: None,
@@ -591,8 +592,7 @@ impl<B: Backend> ConsumerOptions<B> {
             kafka_auto_offset_reset: self.kafka_auto_offset_reset,
             #[cfg(feature = "kafka")]
             kafka_commit_interval: self.kafka_commit_interval,
-            #[cfg(feature = "kafka")]
-            kafka_broadcast_start: self.kafka_broadcast_start,
+            broadcast_start: self.broadcast_start,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: self.schema_registry,
             #[cfg(feature = "kafka-schema-registry")]
@@ -650,8 +650,7 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             kafka_auto_offset_reset: self.kafka_auto_offset_reset,
             #[cfg(feature = "kafka")]
             kafka_commit_interval: self.kafka_commit_interval,
-            #[cfg(feature = "kafka")]
-            kafka_broadcast_start: self.kafka_broadcast_start,
+            broadcast_start: self.broadcast_start,
             shutdown: self.shutdown.clone(),
             processing: self.processing.clone(),
             consumer_group: self.consumer_group.clone(),
@@ -791,28 +790,38 @@ impl ConsumerOptions<Kafka> {
     ///
     /// # Panics
     ///
-    /// Panics if `interval` is zero.
+    /// Panics if `interval` is zero or longer than one hour, the same bound
+    /// `KafkaConsumerGroupConfig::with_commit_interval` applies: the commit
+    /// gate adds the interval to an `Instant`, so the bound keeps every
+    /// deadline representable.
     pub fn with_commit_interval(mut self, interval: Duration) -> Self {
-        assert!(!interval.is_zero(), "commit_interval must be positive");
+        validate_commit_interval(interval);
         self.kafka_commit_interval = Some(interval);
         self
     }
+}
 
-    /// Where a broadcast subscription assigns each partition when it starts.
+impl<B: HasBroadcast> ConsumerOptions<B> {
+    /// Where a broadcast subscription starts reading.
     ///
-    /// Unset, and [`KafkaOffsetReset::Latest`], assign at the tail: deliver-new,
-    /// the broadcast contract. [`KafkaOffsetReset::Earliest`] replays every
-    /// retained record first, and [`KafkaOffsetReset::Timestamp`] starts at the
-    /// first record at or after that instant, resolved the same way
+    /// Unset, and [`BroadcastStart::Tail`], start at the tail: deliver-new,
+    /// the broadcast contract. [`BroadcastStart::Head`] replays everything
+    /// the broker still retains first, and [`BroadcastStart::Timestamp`]
+    /// starts at the first message at or after that instant, in milliseconds
+    /// since the Unix epoch. A reconnect re-resolves the same start, so a
+    /// `Head` subscription replays retention again after a broker blip.
+    ///
+    /// Read only by
+    /// [`BroadcastSubscriber::subscribe`](crate::BroadcastSubscriber::subscribe).
+    /// Kafka honours all three variants, resolving a timestamp the same way
     /// [`Broker::reset_consumer_group_offsets`](crate::Broker::reset_consumer_group_offsets)
-    /// resolves it. A reconnect re-resolves the same start, so an `Earliest`
-    /// subscription replays retention again after a broker blip.
-    ///
-    /// Read only by [`BroadcastSubscriber::subscribe`](crate::BroadcastSubscriber::subscribe)
-    /// on Kafka; a consumer group ignores it, because a group's start is its
-    /// committed offset and `with_auto_offset_reset`.
-    pub fn with_broadcast_start(mut self, start: KafkaOffsetReset) -> Self {
-        self.kafka_broadcast_start = Some(start);
+    /// does; every other backend starts at the tail only on this version and
+    /// refuses `Head` and `Timestamp` at `subscribe()`. The direct, group,
+    /// FIFO and supervisor entry points refuse a set start too, because a
+    /// group's start is its committed offset and, on Kafka,
+    /// `with_auto_offset_reset`.
+    pub fn with_broadcast_start(mut self, start: BroadcastStart) -> Self {
+        self.broadcast_start = Some(start);
         self
     }
 }
@@ -1234,25 +1243,36 @@ mod tests {
         let _ = ConsumerOptions::<Kafka>::new().with_commit_interval(Duration::ZERO);
     }
 
+    /// The twin of `KafkaConsumerGroupConfig::with_commit_interval` applies
+    /// the same bound, so the direct and supervisor paths fail as fast as the
+    /// registry path does.
     #[cfg(feature = "kafka")]
     #[test]
-    fn kafka_with_broadcast_start_propagates_through_into_inner() {
+    #[should_panic(expected = "commit_interval must be at most")]
+    fn kafka_with_commit_interval_rejects_an_unrepresentable_interval() {
+        use crate::markers::Kafka;
+        let _ = ConsumerOptions::<Kafka>::new().with_commit_interval(Duration::MAX);
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn with_broadcast_start_propagates_through_into_inner() {
         use crate::markers::Kafka;
         let inner = ConsumerOptions::<Kafka>::new()
-            .with_broadcast_start(KafkaOffsetReset::Timestamp(1_700_000_000_000))
+            .with_broadcast_start(BroadcastStart::Timestamp(1_700_000_000_000))
             .into_inner();
         assert_eq!(
-            inner.kafka_broadcast_start,
-            Some(KafkaOffsetReset::Timestamp(1_700_000_000_000))
+            inner.broadcast_start,
+            Some(BroadcastStart::Timestamp(1_700_000_000_000))
         );
     }
 
     #[cfg(feature = "kafka")]
     #[test]
-    fn kafka_broadcast_start_defaults_to_none() {
+    fn broadcast_start_defaults_to_none() {
         use crate::markers::Kafka;
         let inner = ConsumerOptions::<Kafka>::new().into_inner();
-        assert_eq!(inner.kafka_broadcast_start, None);
+        assert_eq!(inner.broadcast_start, None);
     }
 
     #[cfg(any(

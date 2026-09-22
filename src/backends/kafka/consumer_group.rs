@@ -98,6 +98,19 @@ impl KafkaAutoOffsetReset {
 // KafkaConsumerGroupConfig
 // ---------------------------------------------------------------------------
 
+/// The one commit-interval check both `with_commit_interval` setters apply,
+/// on [`KafkaConsumerGroupConfig`] and on `ConsumerOptions::<Kafka>`, so the
+/// registry, direct and supervisor paths refuse the same values at the same
+/// fail-fast point. Zero would make the gate always due, and anything past
+/// `MAX_COMMIT_INTERVAL` is refused for the reasons on that constant.
+pub(crate) fn validate_commit_interval(interval: Duration) {
+    assert!(!interval.is_zero(), "commit_interval must be positive");
+    assert!(
+        interval <= super::constants::MAX_COMMIT_INTERVAL,
+        "commit_interval must be at most {:?}, got {interval:?}",
+        super::constants::MAX_COMMIT_INTERVAL
+    );
+}
 #[derive(Clone)]
 pub struct KafkaConsumerGroupConfig {
     prefetch_count: u16,
@@ -317,9 +330,12 @@ impl KafkaConsumerGroupConfig {
     ///
     /// # Panics
     ///
-    /// Panics if `interval` is zero.
+    /// Panics if `interval` is zero or longer than one hour. The gate adds
+    /// the interval to an `Instant`, so the bound keeps every deadline
+    /// representable, and an hour is already far past any sane commit
+    /// cadence: the interval is the replay window after a crash.
     pub fn with_commit_interval(mut self, interval: Duration) -> Self {
-        assert!(!interval.is_zero(), "commit_interval must be positive");
+        validate_commit_interval(interval);
         self.commit_interval = Some(interval);
         self
     }
@@ -1704,6 +1720,15 @@ mod tests {
     #[should_panic(expected = "commit_interval must be positive")]
     fn with_commit_interval_rejects_zero() {
         let _ = KafkaConsumerGroupConfig::new(1..=1).with_commit_interval(Duration::ZERO);
+    }
+
+    /// `AsyncCommitGate::deadline` adds the interval to an `Instant`, so an
+    /// interval the sum cannot represent must be refused here, at the
+    /// fail-fast point, and not first met as a panic in the receive loop.
+    #[test]
+    #[should_panic(expected = "commit_interval must be at most")]
+    fn with_commit_interval_rejects_an_unrepresentable_interval() {
+        let _ = KafkaConsumerGroupConfig::new(1..=1).with_commit_interval(Duration::MAX);
     }
 
     #[test]

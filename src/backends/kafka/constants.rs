@@ -166,6 +166,18 @@ pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// and returns; the thread finishes on its own.
 pub(super) const SHUTDOWN_COMMIT_DEADLINE: Duration = Duration::from_secs(20);
 
+/// The longest commit interval `with_commit_interval` admits, on both the
+/// group config and the consumer options.
+///
+/// The gate adds the interval to an `Instant`, so an unbounded value can
+/// make that sum unrepresentable, and the fence threshold grows with four
+/// intervals. An hour is already far past any sane commit cadence: the
+/// interval bounds the replay window after a crash, and a group that
+/// commits once an hour replays up to an hour of records on every restart.
+/// Refused at the setter, so the mistake is a panic at configuration time
+/// and never a fault in the receive loop.
+pub(super) const MAX_COMMIT_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 // ---------------------------------------------------------------------------
 // rdkafka producer / consumer tuning
 //

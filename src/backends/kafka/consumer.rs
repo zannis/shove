@@ -161,11 +161,14 @@ impl AsyncCommitGate {
     /// resetting the gate), a stale-`now` deadline would make the wake arm
     /// ready on construction forever — a hot spin. `now + interval` degrades
     /// to a bounded wake instead.
+    ///
+    /// Checked: a sum `Instant` cannot represent is treated as due now. The
+    /// setters bound the interval to `MAX_COMMIT_INTERVAL`, so this is a
+    /// second line, not the first; the gate must not be the place a bad
+    /// interval first panics.
     fn deadline(&self, now: Instant) -> Instant {
-        match self.last {
-            None => now + self.interval,
-            Some(last) => last + self.interval,
-        }
+        let anchor = self.last.unwrap_or(now);
+        anchor.checked_add(self.interval).unwrap_or(now)
     }
 }
 
@@ -6514,6 +6517,18 @@ mod async_commit_gate_tests {
             t0 + INTERVAL,
             "past due, the deadline stays anchored rather than chasing `now`"
         );
+    }
+
+    /// An interval the public setters no longer admit, but the gate must not
+    /// panic on either: `last + interval` overflows `Instant`, and the checked
+    /// form treats an unrepresentable deadline as already due.
+    #[test]
+    fn commit_gate_deadline_treats_overflow_as_due() {
+        let mut gate = AsyncCommitGate::new(Duration::MAX);
+        let now = Instant::now();
+        assert_eq!(gate.deadline(now), now, "no commit yet: due now");
+        gate.mark(now);
+        assert_eq!(gate.deadline(now), now, "after a commit: due now");
     }
 
     /// The gate is built from the configured interval, so a consumer with
