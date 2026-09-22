@@ -21,17 +21,23 @@
 - **Category**: bug + feature + dx
 - **Planned at**: commit `5bc4979` (main), 2026-09-17
 - **Maintainer decision**: reviewed on the three pull requests below on 2026-09-22.
-  The review asked for backend-neutral shapes in four places, and steps 5, 6, 7 and 10 now carry them: `BroadcastStart` on the broadcast options, `external()` on the topology builder, per-field availability on `MessageMetadata`, and an explicit retry strategy on the consumer options.
+  The review asked for backend-neutral shapes in four places, and steps 5, 6, 7 and 10 now carry them.
+  They are `BroadcastStart` on the broadcast options, `external()` on the topology builder, per-field availability on `MessageMetadata`, and an explicit retry strategy on the consumer options.
   The maintainer proposed to merge the stack and ship it as the next minor release, and records the decision in `plans/README.md`.
 - **Delivery**: three pull requests by risk class, one minor release after the third.
   - https://github.com/zannis/shove/pull/210 delivers steps 1 and 2.
     Step 1 maps `KafkaAutoOffsetReset::None` to the `error` token and classifies librdkafka's `AutoOffsetReset` error as permanent in `map_kafka_error`.
     Step 2 splits Cyrus SASL out of `kafka-ssl` into `kafka-gssapi`.
   - https://github.com/zannis/shove/pull/211 delivers steps 3 to 9.
-    Step 3 commits past undelivered offsets, step 4 makes the commit interval configurable and bounds the shutdown commit, step 5 adds the broadcast start position, step 6 adds the external topology binding, step 7 exposes partition, offset and timestamp on deliveries, step 8 exposes `auto.offset.reset` on the direct consumer options, and step 9 adds the protobuf message-index check.
+    Step 3 commits past undelivered offsets.
+    Step 4 makes the commit interval configurable and bounds the shutdown commit.
+    Step 5 adds the broadcast start position, and step 6 adds the external topology binding.
+    Step 7 exposes partition, offset and timestamp on deliveries.
+    Step 8 exposes `auto.offset.reset` on the direct consumer options, and step 9 adds the protobuf message-index check.
     The DLQ-name guard in `TopologyBuilder::build` landed in the same pull request as a fix found on the way.
   - https://github.com/zannis/shove/pull/212 delivers steps 10 and 11.
-    Step 10 retries and defers in place instead of republishing into the topic, and step 11 waits through a Schema Registry outage instead of discarding the record.
+    Step 10 retries and defers in place instead of republishing into the topic.
+    Step 11 waits through a Schema Registry outage instead of discarding the record.
 
 ## Why this matters
 
