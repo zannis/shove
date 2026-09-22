@@ -15,6 +15,37 @@ use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
 
+/// Where an ephemeral broadcast subscription starts reading.
+///
+/// Backend-neutral: the same three positions exist on every log-shaped
+/// broker, as a Kafka offset, a JetStream deliver policy or a Redis stream
+/// id. Set with
+/// [`ConsumerOptions::with_broadcast_start`](crate::ConsumerOptions::with_broadcast_start),
+/// which is only available on a backend that implements
+/// [`HasBroadcast`](crate::backend::capability::HasBroadcast), and read only
+/// by [`BroadcastSubscriber::subscribe`]; the competing-consumer entry points
+/// refuse an options value that sets it.
+///
+/// Kafka honours all three variants. Every other backend starts at the tail
+/// only on this version, and refuses [`Head`](Self::Head) and
+/// [`Timestamp`](Self::Timestamp) at `subscribe()` with a
+/// [`ShoveError::Topology`], rather than silently subscribing at the tail:
+/// a start that changes nothing must not be accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcastStart {
+    /// Only messages published after the subscription exists: deliver-new,
+    /// the broadcast contract, and the default on every backend.
+    Tail,
+    /// Every message the broker still retains, then the tail. The right
+    /// start for an instance that rebuilds an in-memory view from the topic
+    /// instead of from a separate store.
+    Head,
+    /// The first message at or after this instant, in **milliseconds since
+    /// the Unix epoch**. A partition or stream with nothing at or after the
+    /// instant starts at its tail.
+    Timestamp(i64),
+}
+
 /// Reject a `.broadcast()` topology arriving at a competing-consumer entry
 /// point.
 ///
@@ -141,10 +172,10 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
     ///
     /// The subscription is created by the spawned task, so messages published
     /// before it is established are not delivered — deliver-new is the
-    /// contract, not a timing accident. On Kafka, and only there,
-    /// [`ConsumerOptions::<Kafka>::with_broadcast_start`](crate::ConsumerOptions::with_broadcast_start)
+    /// contract, not a timing accident.
+    /// [`ConsumerOptions::with_broadcast_start`](crate::ConsumerOptions::with_broadcast_start)
     /// opts a subscription into starting at the head or at a timestamp
-    /// instead.
+    /// instead, on a backend that can honour it (see [`BroadcastStart`]).
     ///
     /// Returns an error if:
     /// - `T`'s topology does not declare
@@ -152,6 +183,11 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
     ///   shared-queue topology run through here would be competing consumption
     ///   wearing a broadcast label.
     /// - `T` is already subscribed on this handle.
+    /// - `options` sets something this backend's subscription cannot honour:
+    ///   a [`BroadcastStart`] other than `Tail` on a backend that starts at
+    ///   the tail only, or a Kafka knob the broadcast loop never reads. The
+    ///   refusal is synchronous, here, and not a task error surfaced at
+    ///   shutdown.
     ///
     /// [`ConsumerOptions::with_max_retries`](crate::ConsumerOptions::with_max_retries)
     /// is ignored: broadcast has no retry chain, so the retry budget is pinned
@@ -190,9 +226,19 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
             )));
         }
 
+        let mut inner = options.with_shutdown(self.shutdown.clone()).into_inner();
+        // Each backend refuses, before anything is spawned, the options its
+        // subscription cannot honour: the FIFO consumer already refuses a
+        // commit interval it would never read, and a start position or a
+        // group knob that changes nothing here must not be accepted silently
+        // either. Checked before the `registered` insert is relied on, so a
+        // refused subscribe leaves the handle free to retry with fixed options.
+        if let Err(e) = B::BroadcastImpl::check_options(queue, &inner) {
+            self.registered.remove(queue);
+            return Err(e);
+        }
         let broadcast = self.broadcast.clone();
         let ctx = self.ctx.clone();
-        let mut inner = options.with_shutdown(self.shutdown.clone()).into_inner();
         // A broadcast topology has neither a DLQ nor hold queues, so a retry
         // budget above zero would mean re-enqueuing to this subscription until
         // it is spent before discarding — redelivery to one subscriber of a

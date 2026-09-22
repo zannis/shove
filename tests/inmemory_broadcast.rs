@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use shove::inmemory::{InMemoryBroker, InMemoryConsumerGroupConfig};
 use shove::{
-    Broker, ConsumerGroupConfig, ConsumerOptions, InMemory, MessageHandler, MessageMetadata,
-    Outcome, ShoveError, Topic, TopologyBuilder, define_topic,
+    BroadcastStart, Broker, ConsumerGroupConfig, ConsumerOptions, InMemory, MessageHandler,
+    MessageMetadata, Outcome, ShoveError, Topic, TopologyBuilder, define_topic,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -721,4 +721,47 @@ async fn an_ordinary_topology_is_unaffected() {
         0,
         "an ordinary topology creates no broadcast state"
     );
+}
+
+/// `with_broadcast_start` is backend-neutral, and a backend that cannot
+/// honour a variant refuses it at `subscribe()`, synchronously, rather than
+/// subscribing at the tail and calling the setting honoured. The in-process
+/// broker's per-subscriber buffer exists only from the subscription on, so
+/// `Head` and `Timestamp` are refused here; `Tail` changes nothing and passes.
+#[tokio::test]
+async fn broadcast_start_is_refused_by_a_backend_that_cannot_honour_it() {
+    let broker = Broker::<InMemory>::new(Default::default())
+        .await
+        .expect("in-memory broker");
+    let mut subscriber = broker.broadcast_subscriber();
+
+    for start in [
+        BroadcastStart::Head,
+        BroadcastStart::Timestamp(1_700_000_000_000),
+    ] {
+        let err = subscriber
+            .subscribe::<CacheInvalidations, _>(
+                Recorder::new(),
+                ConsumerOptions::new().with_broadcast_start(start),
+            )
+            .expect_err("a start the in-process broker cannot honour must be refused");
+        let ShoveError::Topology(msg) = err else {
+            panic!("expected ShoveError::Topology, got {err:?}");
+        };
+        assert!(
+            msg.contains("cache-invalidations-bcast")
+                && msg.contains(&format!("with_broadcast_start({start:?})"))
+                && msg.contains("BroadcastStart::Tail"),
+            "the error names the topic, the refused start and the way out: {msg}"
+        );
+    }
+
+    // A refused subscribe leaves the handle free: the tail is accepted after
+    // the refusals above, on the same topic.
+    subscriber
+        .subscribe::<CacheInvalidations, _>(
+            Recorder::new(),
+            ConsumerOptions::new().with_broadcast_start(BroadcastStart::Tail),
+        )
+        .expect("the tail is every backend's default and is accepted");
 }

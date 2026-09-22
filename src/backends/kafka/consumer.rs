@@ -31,6 +31,7 @@ use crate::backend::batch_consumer::{
 };
 use crate::backend::broadcast::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_broadcast_outcome};
 use crate::batch_consumer::BatchConsumerOptions as GenericBatchConsumerOptions;
+use crate::broadcast::BroadcastStart;
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::Result;
@@ -72,7 +73,7 @@ use super::constants::{
     RETRY_COUNT_HEADER, SESSION_TIMEOUT_MS, SHUTDOWN_COMMIT_DEADLINE,
 };
 use super::consumer_group::KafkaAutoOffsetReset;
-use super::offset_reset::{KafkaOffsetReset, broadcast_start_offset, target_from_timestamp_lookup};
+use super::offset_reset::target_from_timestamp_lookup;
 
 // ---------------------------------------------------------------------------
 // Offset tracking for concurrent consumption
@@ -1863,9 +1864,9 @@ impl KafkaStreamConsumer {
     /// The groupless half of a broadcast subscription. `assign()` instead of
     /// `subscribe()` means librdkafka never sends JoinGroup, so no group is
     /// created broker-side and no rebalance is paid at boot. `None` and
-    /// `Some(Latest)` assign at `Offset::End`, so deliver-new falls out of the
+    /// `Some(Tail)` assign at `Offset::End`, so deliver-new falls out of the
     /// assignment rather than out of a stored offset - byte for byte the
-    /// behaviour before a start could be configured. `Earliest` assigns at
+    /// behaviour before a start could be configured. `Head` assigns at
     /// `Offset::Beginning`, and `Timestamp` resolves each partition through
     /// the same lookup `reset_consumer_group_offsets` uses; see
     /// [`broadcast_start_positions`](Self::broadcast_start_positions).
@@ -1877,7 +1878,7 @@ impl KafkaStreamConsumer {
     pub(super) fn assign_all_partitions_at(
         &self,
         topic: &str,
-        start: Option<KafkaOffsetReset>,
+        start: Option<BroadcastStart>,
         timeout: Duration,
     ) -> Result<usize> {
         let metadata = self
@@ -1915,10 +1916,10 @@ impl KafkaStreamConsumer {
 
     /// The offset each of `partitions` is assigned at for `start`.
     ///
-    /// `None` and `Latest` are `Offset::End`, `Earliest` is
-    /// `Offset::Beginning`: lazy sentinels librdkafka resolves when the fetcher
-    /// starts, which is what a subscription with no stored position wants.
-    /// `Timestamp` needs the broker: the watermarks are fetched **first**, then
+    /// `None` and `Tail` are `Offset::End`, `Head` is `Offset::Beginning`:
+    /// lazy sentinels librdkafka resolves when the fetcher starts, which is
+    /// what a subscription with no stored position wants. `Timestamp` needs
+    /// the broker: the watermarks are fetched **first**, then
     /// `offsets_for_times`, and each partition resolves through
     /// [`target_from_timestamp_lookup`] - the order `run_reset` uses, because
     /// a record landing between the lookup and a *later* watermark fetch would
@@ -1926,27 +1927,28 @@ impl KafkaStreamConsumer {
     /// not resolve fails the whole assignment rather than silently starting at
     /// the tail.
     ///
+    /// One exhaustive match over the start, so adding a variant is a compile
+    /// error here rather than a runtime `unreachable!`.
+    ///
     /// **Blocking** on the `Timestamp` path; callers must use `spawn_blocking`.
     fn broadcast_start_positions(
         &self,
         topic: &str,
         partitions: &[i32],
-        start: Option<KafkaOffsetReset>,
+        start: Option<BroadcastStart>,
         timeout: Duration,
     ) -> Result<TopicPartitionList> {
-        let mut tpl = TopicPartitionList::new();
-        if let Some(offset) = broadcast_start_offset(start) {
-            for pid in partitions {
-                tpl.add_partition_offset(topic, *pid, offset).map_err(|e| {
-                    map_kafka_error(&format!("failed to target {offset:?} of {topic}[{pid}]"), e)
-                })?;
+        let ts_ms = match start {
+            None | Some(BroadcastStart::Tail) => {
+                return lazy_positions(topic, partitions, Offset::End);
             }
-            return Ok(tpl);
-        }
-        let Some(KafkaOffsetReset::Timestamp(ts_ms)) = start else {
-            unreachable!("broadcast_start_offset resolves every start but Timestamp");
+            Some(BroadcastStart::Head) => {
+                return lazy_positions(topic, partitions, Offset::Beginning);
+            }
+            Some(BroadcastStart::Timestamp(ts_ms)) => ts_ms,
         };
 
+        let mut tpl = TopicPartitionList::new();
         let mut watermarks = HashMap::with_capacity(partitions.len());
         for pid in partitions {
             let (low, high) = self.fetch_watermarks(topic, *pid, timeout).map_err(|e| {
@@ -2004,7 +2006,7 @@ impl KafkaStreamConsumer {
     fn refresh_broadcast_partitions(
         &self,
         topic: &str,
-        start: Option<KafkaOffsetReset>,
+        start: Option<BroadcastStart>,
         timeout: Duration,
     ) -> Result<usize> {
         let metadata = self
@@ -2192,6 +2194,18 @@ const COMMIT_FENCE_TIMEOUT: Duration = Duration::from_secs(60);
 /// default 500 ms interval keeps the floor exactly as before.
 fn fence_threshold(commit_interval: Duration) -> Duration {
     COMMIT_FENCE_TIMEOUT.max(commit_interval.saturating_mul(4))
+}
+
+/// Every partition of `topic` at one lazy sentinel offset, the assignment a
+/// `Tail` or `Head` broadcast start resolves to without asking the broker.
+fn lazy_positions(topic: &str, partitions: &[i32], offset: Offset) -> Result<TopicPartitionList> {
+    let mut tpl = TopicPartitionList::new();
+    for pid in partitions {
+        tpl.add_partition_offset(topic, *pid, offset).map_err(|e| {
+            map_kafka_error(&format!("failed to target {offset:?} of {topic}[{pid}]"), e)
+        })?;
+    }
+    Ok(tpl)
 }
 
 /// The error every FIFO entry point returns for options that set a commit
@@ -4829,6 +4843,14 @@ impl KafkaConsumer {
         drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
     }
 
+    /// The Kafka half of `BroadcastImpl::check_options`: what a broadcast
+    /// subscription refuses at `subscribe()`, before its loop is spawned.
+    ///
+    /// Every [`BroadcastStart`] is honoured here, so none is refused.
+    pub(crate) fn check_broadcast_options(_queue: &str, _options: &ConsumerOptions) -> Result<()> {
+        Ok(())
+    }
+
     /// Run this process's own groupless subscription to `T` until shutdown.
     ///
     /// Reached only through
@@ -4881,7 +4903,7 @@ impl KafkaConsumer {
             .as_deref()
             .map(str::to_string)
             .unwrap_or_else(|| super::constants::broadcast_group_id(queue));
-        let start = options.kafka_broadcast_start;
+        let start = options.broadcast_start;
         // One warning per subscription, not per poll: the error repeats on
         // every coordinator lookup for the life of the handle.
         let warned_group_acl = Arc::new(AtomicBool::new(false));

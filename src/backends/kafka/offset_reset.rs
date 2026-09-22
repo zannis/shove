@@ -40,15 +40,15 @@ use super::msk_iam::MskIamContext;
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A position on a topic: where to re-anchor a consumer group's committed
-/// offsets, or where a broadcast subscription starts.
+/// offsets.
 ///
 /// Mirrors the `--to-*` flags of `kafka-consumer-groups.sh --reset-offsets`.
 /// [`Broker::reset_consumer_group_offsets`](crate::Broker::reset_consumer_group_offsets)
-/// rewrites a group's committed offsets to it;
-/// [`ConsumerOptions::<Kafka>::with_broadcast_start`](crate::ConsumerOptions::with_broadcast_start)
-/// assigns a groupless broadcast subscription's partitions at it. The three
-/// variants resolve the same way for both: a watermark, or the first record
-/// at or after a timestamp.
+/// rewrites a group's committed offsets to it. A broadcast subscription's
+/// start is the backend-neutral
+/// [`BroadcastStart`](crate::BroadcastStart) instead, whose three variants
+/// the Kafka broadcast loop resolves the same way: a watermark, or the first
+/// record at or after a timestamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KafkaOffsetReset {
     /// The low watermark of every partition: replay all retained history.
@@ -232,22 +232,6 @@ pub(super) fn target_from_timestamp_lookup(
              (got {other:?}); refusing to re-anchor it at a position the broker \
              never gave"
         ))),
-    }
-}
-
-/// The lazy sentinel a broadcast start resolves to without asking the broker,
-/// or `None` for [`KafkaOffsetReset::Timestamp`], which needs a lookup.
-///
-/// The unset start and `Latest` are both the tail, so a subscription that
-/// never configured a start assigns byte for byte as it always did. The
-/// resolution is the one `run_reset` applies to a group: `Earliest` is the
-/// low watermark, `Latest` the high one, and a timestamp goes through
-/// `offsets_for_times` and [`target_from_timestamp_lookup`].
-pub(super) fn broadcast_start_offset(start: Option<KafkaOffsetReset>) -> Option<Offset> {
-    match start {
-        None | Some(KafkaOffsetReset::Latest) => Some(Offset::End),
-        Some(KafkaOffsetReset::Earliest) => Some(Offset::Beginning),
-        Some(KafkaOffsetReset::Timestamp(_)) => None,
     }
 }
 
@@ -593,27 +577,11 @@ mod context_generic_smoke {
 mod tests {
     use super::*;
 
-    /// The unset start and `Latest` are the tail, byte for byte the assignment
-    /// before a start could be configured; `Earliest` is the head; only a
-    /// timestamp needs the broker, and it goes through the same lookup helper
-    /// a group reset uses.
+    /// The lookup a `BroadcastStart::Timestamp` feeds into is the group
+    /// reset's: an answered offset is taken as is, and a partition with
+    /// nothing at or after the point re-anchors at its high watermark.
     #[test]
-    fn broadcast_start_resolves_lazily_except_for_a_timestamp() {
-        assert_eq!(broadcast_start_offset(None), Some(Offset::End));
-        assert_eq!(
-            broadcast_start_offset(Some(KafkaOffsetReset::Latest)),
-            Some(Offset::End)
-        );
-        assert_eq!(
-            broadcast_start_offset(Some(KafkaOffsetReset::Earliest)),
-            Some(Offset::Beginning)
-        );
-        assert_eq!(
-            broadcast_start_offset(Some(KafkaOffsetReset::Timestamp(1_700_000_000_000))),
-            None,
-            "a timestamp is resolved through offsets_for_times, not a sentinel"
-        );
-        // The lookup a Timestamp start then feeds into is the group reset's.
+    fn a_timestamp_start_resolves_through_the_group_reset_lookup() {
         assert_eq!(
             target_from_timestamp_lookup(Offset::Offset(7), 3, 12, "q", 0).unwrap(),
             7

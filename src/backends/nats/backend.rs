@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::autoscaler::AutoscalerConfig;
+use crate::backend::broadcast::refuse_start_other_than_tail;
 use crate::backend::{
     AutoscalerBackendImpl, Backend, BatchConsumerImpl, BatchConsumerOptionsInner, BroadcastImpl,
     ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
@@ -160,6 +161,15 @@ impl BroadcastImpl for NatsConsumer {
         H: MessageHandler<T>,
     {
         NatsConsumer::run_broadcast_with_inner::<T, H>(self, handler, ctx, options).await
+    }
+
+    fn check_options(queue: &str, options: &ConsumerOptionsInner) -> Result<()> {
+        refuse_start_other_than_tail(
+            "NATS JetStream",
+            queue,
+            options,
+            "the ephemeral consumer is created at `DeliverPolicy::New` on this version",
+        )
     }
 }
 

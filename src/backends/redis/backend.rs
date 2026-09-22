@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::autoscaler::AutoscalerConfig;
+use crate::backend::broadcast::refuse_start_other_than_tail;
 use crate::backend::{
     AutoscalerBackendImpl, Backend, BatchConsumerImpl, BatchConsumerOptionsInner, BroadcastImpl,
     ConsumerOptionsInner, QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
@@ -112,6 +113,15 @@ impl BroadcastImpl for RedisConsumer {
         H: MessageHandler<T>,
     {
         RedisConsumer::run_broadcast_with_inner::<T, H>(self, handler, ctx, options).await
+    }
+
+    fn check_options(queue: &str, options: &ConsumerOptionsInner) -> Result<()> {
+        refuse_start_other_than_tail(
+            "Redis Streams",
+            queue,
+            options,
+            "the subscription reads from `$` on this version",
+        )
     }
 }
 

@@ -29,6 +29,7 @@ use rdkafka::consumer::{BaseConsumer, Consumer as _};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
 use serde::{Deserialize, Serialize};
+use shove::BroadcastStart;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
 use shove::consumer_group::ConsumerGroupConfig;
@@ -653,7 +654,7 @@ async fn broadcast_fans_out_to_every_instance_from_the_tail() {
     publisher_broker.close().await;
 }
 
-/// `with_broadcast_start(Earliest)` assigns every partition at the head, so a
+/// `with_broadcast_start(Head)` assigns every partition at the head, so a
 /// subscriber that starts late still receives what was published before it
 /// existed - the opposite of the default, which
 /// `broadcast_fans_out_to_every_instance_from_the_tail` pins.
@@ -687,7 +688,7 @@ async fn broadcast_starts_from_the_head_when_asked() {
     let mut sub = broker.broadcast_subscriber();
     sub.subscribe::<CacheInvalidations, _>(
         recorder.clone(),
-        ConsumerOptions::new().with_broadcast_start(KafkaOffsetReset::Earliest),
+        ConsumerOptions::new().with_broadcast_start(BroadcastStart::Head),
     )
     .expect("failed to subscribe");
     recorder.wait_for(3, Duration::from_secs(30)).await;
@@ -769,7 +770,7 @@ async fn broadcast_starts_at_a_timestamp() {
     let mut sub = broker.broadcast_subscriber();
     sub.subscribe::<CacheInvalidations, _>(
         recorder.clone(),
-        ConsumerOptions::new().with_broadcast_start(KafkaOffsetReset::Timestamp(cut)),
+        ConsumerOptions::new().with_broadcast_start(BroadcastStart::Timestamp(cut)),
     )
     .expect("failed to subscribe");
     recorder.wait_for(3, Duration::from_secs(30)).await;

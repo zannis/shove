@@ -411,36 +411,54 @@ It now runs on a dedicated thread and gives up after 20 s, where it previously w
 
 Commit: `feat(kafka): let a broadcast subscription start at the head, the tail or a timestamp`.
 
-Public API, the field on the struct and the setter in the Kafka `impl` block:
+Where an ephemeral subscription starts is not a Kafka idea: NATS has `DeliverPolicy::{New, All, ByStartTime}` and a Redis stream id carries its millisecond.
+The maintainer's review of 2026-09-22 therefore asked for a backend-neutral shape in place of the Kafka-typed knob this step first shipped, and the shape below is the one that landed.
+
+Public API, the type, the field and the setter, scoped to `HasBroadcast` like the rest of the broadcast surface:
 
 ```rust
-// src/consumer.rs, struct ConsumerOptions<B>
-/// Kafka-only: where a broadcast subscription assigns each partition.
-/// `None` (the default) and `Some(Latest)` keep the current tail assignment.
-#[cfg(feature = "kafka")]
-pub kafka_broadcast_start: Option<KafkaOffsetReset>,
+// src/broadcast.rs, re-exported at the crate root
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcastStart {
+    /// Deliver-new, the default on every backend.
+    Tail,
+    /// Every retained message, then the tail.
+    Head,
+    /// The first message at or after this instant, in milliseconds since the Unix epoch.
+    Timestamp(i64),
+}
 
-// src/consumer.rs, impl ConsumerOptions<Kafka>
-pub fn with_broadcast_start(mut self, start: KafkaOffsetReset) -> Self
+// src/consumer.rs, struct ConsumerOptions<B>
+pub broadcast_start: Option<BroadcastStart>,
+
+// src/consumer.rs, impl<B: HasBroadcast> ConsumerOptions<B>
+pub fn with_broadcast_start(mut self, start: BroadcastStart) -> Self
+
+// src/backend/broadcast.rs, trait BroadcastImpl
+fn check_options(queue: &str, options: &ConsumerOptionsInner) -> Result<()>;
 ```
 
-The field carries the `docsrs` attribute like `kafka_group_id` at `:265-271`.
-`ConsumerOptionsInner` gains `kafka_broadcast_start`, and the three literals named in step 4 set it.
-Reuse `KafkaOffsetReset` rather than a new enum.
-Its three variants resolve exactly as a broadcast start must, and its resolvers already exist.
-Broaden the enum's rustdoc from "where to re-anchor a group" to "a position on a topic", and keep the type name.
+`ConsumerOptionsInner` gains `broadcast_start`, and the three literals named in step 4 set it.
+Neither field is feature-gated, because the concept is not.
+`BroadcastSubscriber::subscribe` calls `check_options` before it spawns the loop, so a backend refuses what it cannot honour synchronously, at the call site, with `ShoveError::Topology`, and a refused subscribe leaves the handle free to retry.
+Kafka honours all three variants.
+NATS, Redis, RabbitMQ and the in-process broker start at the tail only on this version: `None` and `Tail` pass, `Head` and `Timestamp` are refused through one shared helper, `refuse_start_other_than_tail`, whose message names the topic, the variant, the backend and the way out.
+Mapping `Head` and `Timestamp` onto `DeliverPolicy::All`, `DeliverPolicy::ByStartTime` and a Redis id is a later step, and needs a checked conversion for the NATS `OffsetDateTime`.
+The timestamp unit is Unix epoch milliseconds on every backend, the unit `KafkaOffsetReset::Timestamp` already documents.
+`KafkaOffsetReset` stays the type of `reset_consumer_group_offsets` and no longer names the broadcast start.
 
 Kafka backend:
 
-- Rename `assign_all_partitions_at_end` to `assign_all_partitions_at(topic, start: Option<KafkaOffsetReset>, timeout)`.
-- `None` and `Some(Latest)` add every partition at `Offset::End`, byte for byte the current behaviour.
-- `Some(Earliest)` adds every partition at `Offset::Beginning`.
+- Rename `assign_all_partitions_at_end` to `assign_all_partitions_at(topic, start: Option<BroadcastStart>, timeout)`.
+- `None` and `Some(Tail)` add every partition at `Offset::End`, byte for byte the current behaviour.
+- `Some(Head)` adds every partition at `Offset::Beginning`.
+- `broadcast_start_positions` is one exhaustive match over the start, so a new variant is a compile error there and no `unreachable!` arm sits on the runtime path.
 - `Some(Timestamp(ms))` fetches every partition's watermarks first, then calls `offsets_for_times`.
   It then resolves each partition through `target_from_timestamp_lookup`, made `pub(super)`.
   The order matters, because a record that lands between the lookup and a later watermark fetch would be skipped.
   `run_reset`'s order at `offset_reset.rs:380` and `:401` is the one to copy.
 - `refresh_broadcast_partitions` resolves a newly discovered partition with the same start.
-  An `Earliest` subscription then does not skip a new partition's first records.
+  A `Head` subscription then does not skip a new partition's first records.
 - `run_broadcast_with_inner` uses `options.kafka_group_id` verbatim as the inert `group.id` when set, else `broadcast_group_id(queue)`.
   The value is inert either way.
   The doc on `broadcast_group_id` says why a caller may want to pick it: a cluster ACL that grants group Describe on one prefix only.
@@ -453,23 +471,25 @@ Kafka backend:
 
 Tests:
 
-- Unit, `offset_reset.rs`: the new resolver maps `None` and `Latest` to `End`, `Earliest` to `Beginning`, and a `Timestamp` through the lookup helper.
+- Unit, `offset_reset.rs`: a `Timestamp` start resolves through the group reset's lookup helper.
+- Unit, `src/backend/broadcast.rs`: the tail-only helper passes `None` and `Tail` and refuses `Head` and `Timestamp` with a message that names the topic, the variant and the way out.
 - Unit, `consumer.rs`: the error classifier ignores `GroupAuthorizationFailed` and passes every other code through.
 - Unit, `src/consumer.rs`: `with_broadcast_start` propagates through `into_inner`, modelled on `kafka_with_group_id_propagates_through_into_inner` (`:1044-1050`).
+- Integration, `tests/inmemory_broadcast.rs`: `broadcast_start_is_refused_by_a_backend_that_cannot_honour_it` asserts the synchronous `Topology` error from `subscribe()` for `Head` and `Timestamp`, and that `Tail` is then accepted on the same handle.
 - Integration, `tests/kafka_broadcast_integration.rs`, three new tests.
-  `broadcast_starts_from_the_head_when_asked` publishes before subscribing and receives everything.
-  `broadcast_starts_at_a_timestamp` publishes two batches around a captured timestamp and receives only the second.
+  `broadcast_starts_from_the_head_when_asked` publishes before subscribing, subscribes with `Head`, and receives everything.
+  `broadcast_starts_at_a_timestamp` publishes two batches around a captured timestamp, subscribes with `Timestamp`, and receives only the second.
   `broadcast_uses_the_configured_inert_group_id` asserts the group list still shows nothing under the configured name, reusing the control in `broadcast_leaves_no_consumer_group`.
 - The existing `broadcast_fans_out_to_every_instance_from_the_tail` must pass unchanged, which is the byte-for-byte proof for the default.
 
 Docs:
 
-- `docs/pages/concepts/broadcast.mdx:33`: "Deliver-new only" gains one sentence.
-  On Kafka a subscriber may opt into the head or a timestamp, and deliver-new stays the default.
+- `docs/pages/concepts/broadcast.mdx:33`: "Deliver-new only" gains the neutral `BroadcastStart`.
+  Kafka honours all three starts, every other backend refuses `Head` and `Timestamp` at `subscribe()`, and deliver-new stays the default.
 - `broadcast.mdx:116-124`, the Kafka section: describe the three starts and the configurable inert `group.id`.
 - `docs/pages/backends/kafka.mdx`: a new `### Starting a broadcast subscription elsewhere than the tail` after the re-anchoring section (`:164-199`).
   The "See also" broadcast line at `:439` is updated.
-- `src/backend/broadcast.rs:28-30`, `src/backend/capability.rs:75`, `src/broadcast.rs:142-144`: each gains the Kafka exception in one sentence.
+- `src/backend/broadcast.rs:28-30`, `src/backend/capability.rs:75`, `src/broadcast.rs:142-144`: each names the neutral start and which backends honour it.
 
 Migration note for existing users: none, every default is unchanged.
 
@@ -786,6 +806,20 @@ One that hit a 401 now ends its member instead of dead-lettering.
 That is the at-least-once contract the rest of the crate keeps, and the PR body says so.
 
 **Verify**: registry mock suite, the new outage suite, Kafka integration suite and both schema-registry coverage entries pass.
+
+## Known patterns and alternatives
+
+The maintainer's review of 2026-09-22 asked for backend-neutral shapes in four places.
+This section records, per changed step, the patterns weighed and the one chosen, so the choice stays legible without the review thread.
+
+### Step 5, the broadcast start
+
+- A Kafka-typed knob, `with_broadcast_start(KafkaOffsetReset)` on `ConsumerOptions<Kafka>`, was the first shape.
+  It bakes Kafka into a concept every log-shaped broker has, and a later NATS or Redis start would have needed a second knob.
+- A backend-neutral enum on the `HasBroadcast`-scoped options is the chosen shape.
+  NATS has `DeliverPolicy::{All, New, ByStartTime}` and a Redis stream id starts with a millisecond, so head, tail and timestamp map onto both.
+  Each backend refuses at `subscribe()` what it cannot honour, the rule the FIFO consumer already applies to the commit interval.
+- Implementing the NATS and Redis mappings in the same step was set aside for scope: the type and the refusal land now, the mappings later, each with its own tests.
 
 ## Done criteria
 

@@ -257,7 +257,7 @@ pub use queue_depth::QueueDepthSampler;
 
 // --- v2 generic wrappers (Phase 5) ---
 pub use batch_consumer::{BatchConsumer, BatchConsumerOptions};
-pub use broadcast::BroadcastSubscriber;
+pub use broadcast::{BroadcastStart, BroadcastSubscriber};
 pub use broker::Broker;
 pub use consumer_group::{ConsumerGroup, ConsumerGroupConfig};
 pub use publisher::Publisher;

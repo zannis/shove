@@ -224,30 +224,32 @@ A [broadcast](/concepts/broadcast) subscription assigns every partition itself a
 Where it starts is a property of the subscription, set on its options:
 
 ```rust,no_run
-use shove::kafka::KafkaOffsetReset;
+use shove::BroadcastStart;
 
 let mut subscriber = broker.broadcast_subscriber();
 subscriber.subscribe::<CacheInvalidations, _>(
     Evict,
     ConsumerOptions::<Kafka>::new()
         // Replay everything the topic still retains, then keep tailing.
-        .with_broadcast_start(KafkaOffsetReset::Earliest)
+        .with_broadcast_start(BroadcastStart::Head)
         // The inert `group.id` the handle carries; see below.
         .with_group_id("cache-invalidations-broadcast"),
 )?;
 ```
 
-- **`KafkaOffsetReset::Latest`**, and no call at all - every partition at its end offset: deliver-new, the broadcast contract.
-- **`KafkaOffsetReset::Earliest`** - every partition at its beginning, so a fresh instance replays the retained log before it tails.
+`BroadcastStart` is backend-neutral, and Kafka is the backend that honours all three variants on this version.
+
+- **`BroadcastStart::Tail`**, and no call at all - every partition at its end offset: deliver-new, the broadcast contract.
+- **`BroadcastStart::Head`** - every partition at its beginning, so a fresh instance replays the retained log before it tails.
   This is the right start for a subscriber that rebuilds an in-memory view from the topic instead of from a separate store.
-- **`KafkaOffsetReset::Timestamp(ms)`** - the first record at or after that point, in milliseconds since the Unix epoch.
+- **`BroadcastStart::Timestamp(ms)`** - the first record at or after that point, in milliseconds since the Unix epoch.
   The lookup is `offsets_for_times`, exactly as [`reset_consumer_group_offsets`](#re-anchoring-a-group-seek-to-tail--head--timestamp) resolves it.
   A partition with no record at or after the point starts at its tail.
   A partition the lookup cannot answer for fails the subscription rather than silently starting at the tail.
 
 A partition added while the subscription runs is picked up within a few seconds and assigned at the same start.
 A reconnect after a broker outage re-resolves the start as it stands then.
-An `Earliest` subscription therefore replays the retained log again, the price of having no stored position.
+A `Head` subscription therefore replays the retained log again, the price of having no stored position.
 
 `with_group_id` names the inert `group.id` the groupless handle is configured with, and the default is `{queue}-broadcast`.
 Nothing joins under it and nothing commits to it either way.

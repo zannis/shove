@@ -27,9 +27,11 @@ pub(crate) trait BroadcastImpl: Send + Sync {
     ///
     /// - **Deliver-new.** Only messages published after this future has
     ///   subscribed are delivered. Nothing published earlier is replayed.
-    ///   Kafka is the one backend where the caller may opt out of this, per
-    ///   subscription, with `ConsumerOptions::<Kafka>::with_broadcast_start`;
-    ///   the default there is still the tail.
+    ///   A caller may opt out of this per subscription with
+    ///   `ConsumerOptions::with_broadcast_start`, on a backend whose
+    ///   [`check_options`](Self::check_options) admits the start; the default
+    ///   is the tail everywhere, and Kafka is the one backend that honours
+    ///   the head and a timestamp on this version.
     /// - **Nothing survives.** Every piece of broker-side state the
     ///   subscription creates is torn down before the returned future
     ///   resolves — no consumer group, no durable consumer, no leftover queue.
@@ -58,7 +60,114 @@ pub(crate) trait BroadcastImpl: Send + Sync {
     where
         T: Topic,
         H: MessageHandler<T>;
+
+    /// Refuse, synchronously and before [`run_broadcast`](Self::run_broadcast)
+    /// is spawned, every option this backend's subscription would not read.
+    ///
+    /// `BroadcastSubscriber::subscribe` calls this and returns the error to
+    /// the caller, so a setting that changes nothing is a `Topology` error at
+    /// the call site rather than a silent no-op. Two things are checked here:
+    /// a [`BroadcastStart`] the backend cannot honour (every backend but Kafka
+    /// starts at the tail only on this version, so it refuses `Head` and
+    /// `Timestamp` through [`unsupported_broadcast_start`]), and a
+    /// backend-specific knob whose only readers are the group paths, such as
+    /// Kafka's commit interval and `auto.offset.reset`.
+    fn check_options(queue: &str, options: &ConsumerOptionsInner) -> Result<()>;
 }
+
+// Gated to the tail-only backends, which are the only callers; Kafka honours
+// every start and never builds this error.
+#[cfg(any(
+    feature = "inmemory",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "redis-streams"
+))]
+mod tail_only {
+    use crate::backend::ConsumerOptionsInner;
+    use crate::broadcast::BroadcastStart;
+    use crate::error::{Result, ShoveError};
+
+    /// The error a backend returns from `BroadcastImpl::check_options` for a
+    /// start it cannot honour. `backend` is the display name, `why` one
+    /// clause that names the primitive that fixes the start at the tail.
+    fn unsupported_broadcast_start(
+        backend: &str,
+        queue: &str,
+        start: BroadcastStart,
+        why: &str,
+    ) -> ShoveError {
+        ShoveError::Topology(format!(
+            "topic '{queue}': `with_broadcast_start({start:?})` is not supported on {backend}, \
+             whose broadcast subscription starts at the tail only ({why}). Drop the call or \
+             pass `BroadcastStart::Tail`."
+        ))
+    }
+
+    /// The `check_options` body every tail-only backend shares: `None` and
+    /// `Tail` change nothing and pass, `Head` and `Timestamp` are refused.
+    pub(crate) fn refuse_start_other_than_tail(
+        backend: &str,
+        queue: &str,
+        options: &ConsumerOptionsInner,
+        why: &str,
+    ) -> Result<()> {
+        match options.broadcast_start {
+            None | Some(BroadcastStart::Tail) => Ok(()),
+            Some(start) => Err(unsupported_broadcast_start(backend, queue, start, why)),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use tokio_util::sync::CancellationToken;
+
+        fn options(start: Option<BroadcastStart>) -> ConsumerOptionsInner {
+            let mut options =
+                ConsumerOptionsInner::defaults_with_shutdown(CancellationToken::new());
+            options.broadcast_start = start;
+            options
+        }
+
+        /// A start that changes nothing passes; a start the backend cannot
+        /// honour is a `Topology` error that names the topic, the variant,
+        /// the backend and the way out.
+        #[test]
+        fn a_tail_only_backend_refuses_head_and_timestamp() {
+            for start in [None, Some(BroadcastStart::Tail)] {
+                refuse_start_other_than_tail("Example", "q", &options(start), "why")
+                    .expect("the tail changes nothing and passes");
+            }
+            for start in [
+                BroadcastStart::Head,
+                BroadcastStart::Timestamp(1_700_000_000_000),
+            ] {
+                let err =
+                    refuse_start_other_than_tail("Example", "q", &options(Some(start)), "why")
+                        .expect_err("a start the backend cannot honour is refused");
+                let ShoveError::Topology(msg) = err else {
+                    panic!("expected ShoveError::Topology, got {err:?}");
+                };
+                assert!(msg.contains("topic 'q'"), "{msg}");
+                assert!(
+                    msg.contains(&format!("with_broadcast_start({start:?})")),
+                    "{msg}"
+                );
+                assert!(msg.contains("Example") && msg.contains("(why)"), "{msg}");
+                assert!(msg.contains("BroadcastStart::Tail"), "{msg}");
+            }
+        }
+    }
+}
+
+#[cfg(any(
+    feature = "inmemory",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "redis-streams"
+))]
+pub(crate) use tail_only::refuse_start_other_than_tail;
 
 // Gated to the backends that actually call into it, for two reasons.
 // `routing` is itself compiled only when some backend is, so an ungated body

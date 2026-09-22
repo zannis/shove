@@ -31,8 +31,10 @@ subscriber.run_until_timeout(shutdown_signal(), Duration::from_secs(5)).await;
 Broadcast is deliberately lossy. Each constraint below exists because the alternative is a durable per-instance group — which is just N consumer groups plus a lifecycle problem, and which `shove` already supports if that is what you need.
 
 **Deliver-new only.** An instance receives what is published while it is subscribed. Nothing is replayed for an instance that was down, and nothing accumulates for one that has not started. This is correct for invalidation — a process that just booted has an empty cache, so there is nothing stale to invalidate — and it is what removes the need to store a per-instance offset anywhere.
-On Kafka a subscriber may opt into the head of the retained log or a point in time with `ConsumerOptions::<Kafka>::with_broadcast_start`.
-Deliver-new stays the default there and the only behaviour elsewhere.
+A subscriber may opt into the head of the retained log or a point in time with `ConsumerOptions::with_broadcast_start`, which takes the backend-neutral `BroadcastStart { Tail, Head, Timestamp(ms) }`.
+Kafka honours all three starts on this version.
+Every other backend starts at the tail only, and refuses `Head` and `Timestamp` at `subscribe()` with a `ShoveError::Topology` instead of subscribing at the tail silently.
+Deliver-new stays the default everywhere.
 
 **No retry chain.** `.dlq()`, `.dlq_named()`, `.hold_queue()` and `.sequenced()` each panic in `build()` when combined with `.broadcast()`. (`.for_consumer_group()` panics too — broadcast is already a per-process group, so a named one would name nothing.) This is not an oversight to be filled in later. Redelivery to *one* subscriber of a fan-out is not expressible on most of these brokers, and a shared DLQ would collect one copy of every failure per subscriber — the failure of a single message would look like N failures.
 
@@ -120,8 +122,8 @@ The consequence: **a publisher and its subscribers must agree on the topology.**
 A Kafka broadcast subscriber `assign()`s every partition of the topic at its current end offset. It never calls `subscribe()` and never commits, so the broker receives no JoinGroup and no OffsetCommit: no group is created, nothing lands in `__consumer_offsets`, and `kafka-consumer-groups --list` shows nothing for the topic no matter how many times instances restart.
 
 The tail is the default start, not the only one.
-`ConsumerOptions::<Kafka>::with_broadcast_start` takes a `KafkaOffsetReset`.
-`Latest` is the tail, and `Earliest` replays every retained record before tailing.
+`ConsumerOptions::with_broadcast_start` takes a `BroadcastStart`, and Kafka honours all three variants.
+`Tail` is the default, and `Head` replays every retained record before tailing.
 `Timestamp(ms)` starts at the first record at or after that instant, resolved with the same lookup `reset_consumer_group_offsets` uses.
 A partition added while the subscription runs is assigned at the same start.
 See [Starting a broadcast subscription elsewhere than the tail](/backends/kafka#starting-a-broadcast-subscription-elsewhere-than-the-tail).
@@ -134,7 +136,7 @@ The subscription tolerates the `GroupAuthorizationFailed` that lookup then draws
 An id under the granted prefix avoids provoking it.
 
 Because the assignment is taken at the tail, a reconnect re-assigns at the *then*-current tail: messages published while a subscriber was disconnected are not replayed. That is deliver-new applied to the reconnect window rather than a separate caveat.
-With `with_broadcast_start` the reconnect re-resolves the configured start instead, so an `Earliest` subscription replays the retained log again.
+With `with_broadcast_start` the reconnect re-resolves the configured start instead, so a `Head` subscription replays the retained log again.
 
 `reset_consumer_group_offsets::<T>()` returns a validation error for a broadcast topic. There is no group to re-anchor and no stored position to reset, and rewriting the `{queue}-consumer` offsets — which nothing on the broadcast path reads — would be an ops-facing call that succeeded at nothing.
 The start is a property of the subscription, so it is set with `with_broadcast_start` instead.
