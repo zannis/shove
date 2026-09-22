@@ -177,14 +177,16 @@ All line numbers are at `5bc4979`.
 
 **In scope**:
 
-- `Cargo.toml` features, `.github/workflows/ci.yml`, `CONTRIBUTING.md`, `README.md`, `src/lib.rs` feature table.
-- `src/consumer.rs`, `src/batch_consumer.rs`, `src/backend/options_inner.rs`, `src/backend/batch_consumer.rs`, `src/backend/mod.rs` (the options literal in its test anchor).
-- `src/metadata.rs`, `src/metrics.rs`, `src/handler.rs` and `src/audit.rs` (metadata literals in tests), `src/topology.rs`, `src/broker.rs`, `src/broadcast.rs`, `src/backend/broadcast.rs`, `src/backend/capability.rs` docs, `src/consumer_group.rs` docs.
-- `src/backends/kafka/consumer.rs`, `consumer_group.rs`, `topology.rs`, `client.rs`, `constants.rs`, `offset_reset.rs`, `mod.rs`.
-- `src/schema_registry/decode.rs`, `src/schema_registry/wire.rs`.
-- Every other backend's `MessageMetadata` construction site, for the three new fields only: `src/backends/sns/consumer.rs`, `src/backends/redis/consumer.rs`, `src/backends/redis/broadcast.rs`, `src/backends/rabbitmq/headers.rs`, `src/backends/inmemory/consumer.rs`, `src/backends/nats/consumer.rs`.
-- `tests/kafka_integration.rs`, `tests/kafka_broadcast_integration.rs`, `tests/kafka_batch_integration.rs`, `tests/kafka_schema_registry.rs`, and two new files, `tests/kafka_schema_registry_outage.rs` and `tests/metrics_kafka_external_topic_discard.rs`.
-- `docs/pages/backends/kafka.mdx`, `docs/pages/concepts/broadcast.mdx`, `docs/pages/concepts/handlers.mdx`, `docs/pages/concepts/topics.mdx`, `docs/pages/concepts/outcomes.mdx`, `docs/pages/ops/backends.mdx`, and the metric reference in `docs/pages/guides/observability.mdx`.
+- `Cargo.toml` features and `Cargo.lock`, `.github/workflows/ci.yml`, `.github/workflows/publish.yml`, `CONTRIBUTING.md`, `README.md`, `src/lib.rs` feature table and re-exports.
+- `src/consumer.rs`, `src/consumer_group.rs`, `src/consumer_supervisor.rs`, `src/batch_consumer.rs`, `src/backend/options_inner.rs`, `src/backend/batch_consumer.rs`, `src/backend/mod.rs` (the options literal in its test anchor).
+- `src/metadata.rs`, `src/metrics.rs`, `src/handler.rs` and `src/audit.rs` (metadata literals in tests), `src/topology.rs`, `src/broker.rs`, `src/broadcast.rs`, `src/backend/broadcast.rs`, `src/backend/capability.rs` docs.
+- `src/backends/kafka/backend.rs`, `consumer.rs`, `consumer_group.rs`, `topology.rs`, `client.rs`, `constants.rs`, `offset_reset.rs`, `mod.rs`.
+- `src/schema_registry/client.rs`, `src/schema_registry/decode.rs`, `src/schema_registry/wire.rs`.
+- Every other backend's `MessageMetadata` construction site, for the three new fields: `src/backends/sns/consumer.rs`, `src/backends/redis/consumer.rs`, `src/backends/redis/broadcast.rs`, `src/backends/redis/stream_id.rs`, `src/backends/rabbitmq/headers.rs`, `src/backends/inmemory/consumer.rs`, `src/backends/nats/consumer.rs`.
+- Every other backend's `BroadcastImpl::check_options`, its `refuse_broadcast_start` call sites, and its `external()` verification or refusal: `backend.rs`, `consumer.rs` and `topology.rs` under `src/backends/inmemory`, `nats`, `rabbitmq` and `redis`, plus `src/backends/sns/topology.rs`.
+- `tests/kafka_integration.rs`, `tests/kafka_broadcast_integration.rs`, `tests/kafka_batch_integration.rs`, `tests/kafka_offset_reset_integration.rs`, `tests/kafka_schema_registry.rs`, `tests/kafka_schema_registry_integration.rs`, `tests/kafka_schema_registry_message_index.rs`, and two new files, `tests/kafka_schema_registry_outage.rs` and `tests/metrics_kafka_external_topic_discard.rs`.
+- The other backends' suites, for the neutral shapes' refusals and the metadata fills: `tests/inmemory_broadcast.rs`, `tests/nats_integration.rs`, `tests/rabbitmq_integration.rs`, `tests/redis_integration.rs`, `tests/redis_batch_integration.rs`, `tests/redis_broadcast_integration.rs`.
+- `docs/pages/backends/kafka.mdx`, `docs/pages/backends/nats.mdx`, `docs/pages/concepts/broadcast.mdx`, `docs/pages/concepts/handlers.mdx`, `docs/pages/concepts/topics.mdx`, `docs/pages/concepts/outcomes.mdx`, `docs/pages/ops/backends.mdx`, and the metric reference in `docs/pages/guides/observability.mdx`.
 - `plans/021-kafka-external-topics-and-broadcast-start.md`, this plan document, committed on the first branch.
 
 **Out of scope**:
@@ -963,6 +965,7 @@ This section records, per changed step, the patterns weighed and the one chosen,
   It stays a later option.
 - In-place retry of the same record is the chosen shape for an external topic, and the one NATS has natively through a delayed negative acknowledgement.
 - Retry topics owned by shove is the other later option, with no design in the tree yet.
+  Its costs are known from the libraries that ship it: shove would need permission to create topics on the cluster, the topic count grows by one per delay tier per topic, and a record forwarded between tiers leaves its partition's order, the ordering cost the Spring Kafka retry-topic documentation states for its own tiers.
 - The review selected an explicit `RetryStrategy` that names the republish or the in-place shape per consumer, implied by ownership and refused where a backend or a path cannot honour it; the strategy lives on the consumer options rather than the topology, because it is how one consumer settles an outcome and two groups on one topic may differ.
 
 ## Done criteria
