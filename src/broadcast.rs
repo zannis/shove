@@ -31,7 +31,12 @@ use crate::topic::Topic;
 /// [`Timestamp`](Self::Timestamp) at `subscribe()` with a
 /// [`ShoveError::Topology`], rather than silently subscribing at the tail:
 /// a start that changes nothing must not be accepted.
+///
+/// `#[non_exhaustive]`: a later position, such as an absolute sequence or
+/// offset, is a new variant and not a breaking change, so match with a
+/// wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BroadcastStart {
     /// Only messages published after the subscription exists: deliver-new,
     /// the broadcast contract, and the default on every backend.
@@ -44,6 +49,24 @@ pub enum BroadcastStart {
     /// the Unix epoch**. A partition or stream with nothing at or after the
     /// instant starts at its tail.
     Timestamp(i64),
+}
+
+impl BroadcastStart {
+    /// The check every backend shares, run by
+    /// [`BroadcastSubscriber::subscribe`] before the backend's own: a
+    /// timestamp is milliseconds since the Unix epoch, so a negative one
+    /// names no instant and is refused here rather than handed to a broker
+    /// as a sentinel it may read as something else.
+    pub(crate) fn validate(self, queue: &str) -> Result<()> {
+        match self {
+            BroadcastStart::Timestamp(ms) if ms < 0 => Err(ShoveError::Topology(format!(
+                "topic '{queue}': `with_broadcast_start(Timestamp({ms}))` is before the Unix \
+                 epoch; a timestamp start is milliseconds since 1970-01-01T00:00:00Z and \
+                 cannot be negative."
+            ))),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Reject a `.broadcast()` topology arriving at a competing-consumer entry
@@ -227,6 +250,15 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
         }
 
         let mut inner = options.with_shutdown(self.shutdown.clone()).into_inner();
+        // The neutral check first: a start no backend can honour is refused
+        // with the same error everywhere, before the backend names its own
+        // reasons.
+        if let Some(start) = inner.broadcast_start
+            && let Err(e) = start.validate(queue)
+        {
+            self.registered.remove(queue);
+            return Err(e);
+        }
         // Each backend refuses, before anything is spawned, the options its
         // subscription cannot honour: the FIFO consumer already refuses a
         // commit interval it would never read, and a start position or a
@@ -315,6 +347,42 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
                     timed_out: true,
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The neutral check names the topic, the value and the unit, so the
+    /// error reads the same on every backend.
+    #[test]
+    fn a_negative_timestamp_start_is_refused_with_the_unit_in_the_error() {
+        let err = BroadcastStart::Timestamp(-1)
+            .validate("q")
+            .expect_err("a negative timestamp names no instant");
+        let ShoveError::Topology(msg) = err else {
+            panic!("expected ShoveError::Topology, got {err:?}");
+        };
+        assert!(msg.contains("topic 'q'"), "{msg}");
+        assert!(msg.contains("Timestamp(-1)"), "{msg}");
+        assert!(msg.contains("Unix epoch"), "{msg}");
+    }
+
+    /// Negative control: every other start passes, the epoch itself
+    /// included, so the refusal is conditional on the sign alone.
+    #[test]
+    fn every_other_start_passes_the_neutral_check() {
+        for start in [
+            BroadcastStart::Tail,
+            BroadcastStart::Head,
+            BroadcastStart::Timestamp(0),
+            BroadcastStart::Timestamp(1_700_000_000_000),
+        ] {
+            start
+                .validate("q")
+                .expect("a start with an instant passes the neutral check");
         }
     }
 }

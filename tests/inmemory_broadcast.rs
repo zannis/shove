@@ -723,6 +723,43 @@ async fn an_ordinary_topology_is_unaffected() {
     );
 }
 
+/// A timestamp start is milliseconds since the Unix epoch on every backend,
+/// so a negative one names no instant. It is refused at `subscribe()` by the
+/// neutral layer, before the backend's own check, with the value in the
+/// error; a backend that honours `Timestamp` would otherwise hand a negative
+/// sentinel to its broker, and one that refuses it would name the wrong reason.
+#[tokio::test]
+async fn a_negative_timestamp_start_is_refused_before_the_backend_check() {
+    let broker = Broker::<InMemory>::new(Default::default())
+        .await
+        .expect("in-memory broker");
+    let mut subscriber = broker.broadcast_subscriber();
+
+    let err = subscriber
+        .subscribe::<CacheInvalidations, _>(
+            Recorder::new(),
+            ConsumerOptions::new().with_broadcast_start(BroadcastStart::Timestamp(-1)),
+        )
+        .expect_err("a negative timestamp must be refused");
+    let ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("cache-invalidations-bcast")
+            && msg.contains("Timestamp(-1)")
+            && msg.contains("Unix epoch"),
+        "the error names the topic, the value and the unit: {msg}"
+    );
+
+    // The refusal leaves the handle free to retry with a valid start.
+    subscriber
+        .subscribe::<CacheInvalidations, _>(
+            Recorder::new(),
+            ConsumerOptions::new().with_broadcast_start(BroadcastStart::Tail),
+        )
+        .expect("the tail is accepted after the refusal");
+}
+
 /// `with_broadcast_start` is backend-neutral, and a backend that cannot
 /// honour a variant refuses it at `subscribe()`, synchronously, rather than
 /// subscribing at the tail and calling the setting honoured. The in-process
