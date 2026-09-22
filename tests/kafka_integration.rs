@@ -306,28 +306,52 @@ async fn live_topic_config(brokers: &str, topic: &str, key: &str) -> Option<Stri
 /// Wait until the broker reports `group` as `Stable` with at least one
 /// member, so a record published afterwards lands after the group's
 /// assignment was taken.
+///
+/// A coordinator that is moving or loading while the member joins answers the
+/// probe with an error that means "ask again"; those are retried within the
+/// deadline, as `tests/kafka_offset_reset_integration.rs` retries them, and
+/// the last one is reported if the deadline passes. Any other error is a
+/// broken probe and fails at once.
 async fn wait_for_stable_group(brokers: &str, group: &str, timeout: Duration) {
     use rdkafka::consumer::{BaseConsumer, Consumer as _};
+    use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+
+    fn is_transient(code: RDKafkaErrorCode) -> bool {
+        matches!(
+            code,
+            RDKafkaErrorCode::NotCoordinator
+                | RDKafkaErrorCode::CoordinatorNotAvailable
+                | RDKafkaErrorCode::CoordinatorLoadInProgress
+                | RDKafkaErrorCode::OperationTimedOut
+        )
+    }
 
     let probe: BaseConsumer = rdkafka::ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .create()
         .expect("failed to create group probe");
     let deadline = Instant::now() + timeout;
+    let mut last_error: Option<KafkaError> = None;
     loop {
-        let list = probe
-            .fetch_group_list(Some(group), Duration::from_secs(10))
-            .expect("failed to fetch group list");
-        let stable = list
-            .groups()
-            .iter()
-            .any(|g| g.name() == group && g.state() == "Stable" && !g.members().is_empty());
-        if stable {
-            return;
+        match probe.fetch_group_list(Some(group), Duration::from_secs(10)) {
+            Ok(list) => {
+                let stable = list
+                    .groups()
+                    .iter()
+                    .any(|g| g.name() == group && g.state() == "Stable" && !g.members().is_empty());
+                if stable {
+                    return;
+                }
+            }
+            Err(KafkaError::GroupListFetch(code)) if is_transient(code) => {
+                last_error = Some(KafkaError::GroupListFetch(code));
+            }
+            Err(e) => panic!("failed to fetch group list: {e}"),
         }
         assert!(
             Instant::now() < deadline,
-            "group {group} did not become stable with a member within {timeout:?}"
+            "group {group} did not become stable with a member within {timeout:?}; \
+             last coordinator error: {last_error:?}"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -2054,20 +2078,34 @@ async fn supervisor_with_auto_offset_reset_latest_skips_history() {
     // A stable group proves the member joined, not that its fetch position
     // is resolved: a `Latest` member reads the tail when its first fetch
     // runs, after the assignment. A record published before that fetch
-    // would land below the tail and be skipped as history, so the test
-    // publishes a marker and waits for it to arrive before it publishes
-    // the records it asserts on.
-    publisher
-        .publish::<TailOnlyTopic>(&SimpleMessage {
-            id: "marker".into(),
-            content: String::new(),
-        })
-        .await
-        .unwrap();
-    assert!(
-        handler.counter.wait_for(1, TIMEOUT).await,
-        "the marker published after the assignment must arrive"
-    );
+    // lands below the tail and is skipped as history, so one marker is not
+    // enough on a slow host. The test publishes a marker every half second
+    // until one arrives: each later marker lands after the one before it was
+    // fetched or skipped, and the first delivered marker proves the member
+    // reads the tail. The records it asserts on are published after that.
+    let marker_deadline = Instant::now() + TIMEOUT;
+    let mut markers = 0u32;
+    loop {
+        publisher
+            .publish::<TailOnlyTopic>(&SimpleMessage {
+                id: format!("marker-{markers}"),
+                content: String::new(),
+            })
+            .await
+            .unwrap();
+        markers += 1;
+        if handler
+            .counter
+            .wait_for(1, Duration::from_millis(500))
+            .await
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < marker_deadline,
+            "no readiness marker arrived within {TIMEOUT:?}"
+        );
+    }
     let new: Vec<SimpleMessage> = (1..=2)
         .map(|i| SimpleMessage {
             id: format!("new-{i}"),
@@ -2079,23 +2117,33 @@ async fn supervisor_with_auto_offset_reset_latest_skips_history() {
         .await
         .unwrap();
 
-    assert!(
-        handler.counter.wait_for(3, TIMEOUT).await,
-        "the records published after the marker must arrive"
-    );
+    // Wait for the two records by id, not by count: more than one marker
+    // may have arrived.
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let seen = handler.seen.lock().await.clone();
+        if seen.iter().any(|id| id == "new-1") && seen.iter().any(|id| id == "new-2") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the records published after the marker must arrive, seen {seen:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     // Room for a replayed history record to show up if `Latest` had not
     // reached the consumer.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let mut seen = handler.seen.lock().await.clone();
-    seen.sort();
-    assert_eq!(
-        seen,
-        vec![
-            "marker".to_string(),
-            "new-1".to_string(),
-            "new-2".to_string()
-        ],
-        "a fresh group with Latest must skip the history"
+    let seen = handler.seen.lock().await.clone();
+    let history: Vec<&String> = seen.iter().filter(|id| id.starts_with("old-")).collect();
+    assert!(
+        history.is_empty(),
+        "a fresh group with Latest must skip the history, saw {history:?}"
+    );
+    let markers_seen = seen.iter().filter(|id| id.starts_with("marker-")).count();
+    assert!(
+        markers_seen >= 1 && seen.len() == markers_seen + 2,
+        "only readiness markers and the two new records arrive: {seen:?}"
     );
 
     token.cancel();
