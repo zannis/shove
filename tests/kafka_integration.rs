@@ -9,6 +9,7 @@
 
 use rdkafka::Message;
 use serde::{Deserialize, Serialize};
+use shove::RetryStrategy;
 use shove::SequencedTopic as _;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
@@ -305,6 +306,16 @@ shove::define_topic!(
         .allow_message_loss()
         .build(),
     codec = DecodeOnlyJson
+);
+
+// A shove-owned topic whose consumer opts into the in-place retry shape.
+shove::define_topic!(
+    OwnedInPlaceTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-owned-inplace")
+        .hold_queue(Duration::from_millis(300))
+        .dlq()
+        .build()
 );
 
 // ---------------------------------------------------------------------------
@@ -869,7 +880,8 @@ macro_rules! defer_once_for {
 defer_once_for!(
     ExternalDeferTopic,
     ExternalKeepaliveTopic,
-    ExternalShutdownTopic
+    ExternalShutdownTopic,
+    OwnedInPlaceTopic
 );
 #[cfg(feature = "test-support")]
 defer_once_for!(ExternalTransitionTopic, ExternalPermitWaitTopic);
@@ -2894,6 +2906,77 @@ async fn external_topic_defer_redelivers_in_place_without_producing() {
     token.cancel();
     let outcome = running.await.unwrap();
     assert!(outcome.is_clean());
+    broker.close().await;
+}
+
+/// The in-place shape is a retry strategy, not an ownership flag: a consumer
+/// of a shove-owned topic opts into it with `RetryStrategy::InPlace`, and its
+/// `Defer` then waits in place and hands the same record back before any
+/// later record, with no copy republished into the topic.
+#[tokio::test]
+async fn retry_in_place_on_an_owned_topic_does_not_republish() {
+    const TOPIC: &str = "kafka-owned-inplace";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<OwnedInPlaceTopic>()
+        .await
+        .expect("shove declares its own topic");
+
+    let handler = DeferOnceRecorder::new();
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<OwnedInPlaceTopic, _>(
+            handler.clone(),
+            ConsumerOptions::<Kafka>::new()
+                .with_concurrent_processing(false)
+                .with_retry_strategy(RetryStrategy::InPlace),
+        )
+        .expect("register");
+    let token = supervisor.cancellation_token();
+    let running =
+        tokio::spawn(supervisor.run_until_timeout(std::future::pending(), Duration::from_secs(15)));
+    wait_for_stable_group(tb.brokers(), "kafka-owned-inplace-consumer", TIMEOUT).await;
+
+    let publisher = broker.publisher().await.unwrap();
+    let msg = |id: &str| SimpleMessage {
+        id: id.into(),
+        content: String::new(),
+    };
+    publisher
+        .publish::<OwnedInPlaceTopic>(&msg("1"))
+        .await
+        .unwrap();
+    assert!(handler.counter.wait_for(1, TIMEOUT).await, "first delivery");
+    publisher
+        .publish::<OwnedInPlaceTopic>(&msg("2"))
+        .await
+        .unwrap();
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "the in-place redelivery, then the second record"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        handler.ids().await,
+        vec!["1".to_string(), "1".to_string(), "2".to_string()],
+        "the deferred record is redelivered before the record behind it"
+    );
+    // A shove-declared topic has the default partition count, so the proof
+    // that nothing was republished is the sum over every partition.
+    let partitions = live_partition_count(tb.brokers(), TOPIC).expect("the topic exists");
+    let records: i64 = (0..partitions)
+        .map(|p| high_watermark(tb.brokers(), TOPIC, i32::try_from(p).expect("partition id")))
+        .sum();
+    assert_eq!(
+        records, 2,
+        "nothing was republished into the shove-owned topic"
+    );
+
+    token.cancel();
+    assert!(running.await.unwrap().is_clean());
     broker.close().await;
 }
 

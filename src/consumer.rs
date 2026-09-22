@@ -26,6 +26,38 @@ use crate::schema_registry::{SchemaEnforcement, SchemaRegistry, validate_message
 /// Default maximum message payload size: 10 MiB.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
+/// How a consumer carries out [`Outcome::Retry`] and [`Outcome::Defer`].
+///
+/// Backend-neutral: the choice is how a delivery is retried, not who owns
+/// the topic. Ownership implies it: a topology bound to infrastructure that
+/// infra owns is never written into when an outcome is settled, so it runs
+/// with [`InPlace`](Self::InPlace) and refuses
+/// [`Republish`](Self::Republish). A shove-owned topology runs with
+/// `Republish`, the historical behaviour, and may opt into `InPlace`, so a
+/// consumer that must not duplicate a retried record for the other groups on
+/// a fan-out topic can wait in place too.
+///
+/// Set with `with_retry_strategy` on the options of a backend that honours
+/// the choice. Kafka honours both on this version, through
+/// `ConsumerOptions::<Kafka>::with_retry_strategy` and
+/// `KafkaConsumerGroupConfig::with_retry_strategy`. Every other backend
+/// carries a retry through its hold queues on this version, as it always
+/// has, and gains the setter as it declares its support: NATS follows with
+/// its native in-place redelivery, and its external mode keeps hold queues
+/// until then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryStrategy {
+    /// Publish an incremented copy after the tier's delay: into the hold
+    /// queue on the backends that have one, into the consumed topic itself
+    /// on Kafka, which has none. The default on a shove-owned topology.
+    Republish,
+    /// Wait the tier's delay inside the handler's task, holding its prefetch
+    /// slot, then hand the same record back with the retry count kept in
+    /// memory. Nothing is published, and the record stays at its position.
+    /// Implied by an external topology.
+    InPlace,
+}
+
 /// Default flush size for the generic batch consumer: 500 messages.
 ///
 /// Used by [`BatchConsumerOptions`](crate::batch_consumer::BatchConsumerOptions)
@@ -308,6 +340,12 @@ pub struct ConsumerOptions<B: Backend> {
     /// backends honour the other two variants.
     pub broadcast_start: Option<BroadcastStart>,
 
+    /// How this consumer carries out `Retry` and `Defer`. `None` (the
+    /// default) lets the topology's ownership decide: in place on an external
+    /// topology, a republish on a shove-owned one. See [`RetryStrategy`] for
+    /// which backends honour an explicit choice.
+    pub retry_strategy: Option<RetryStrategy>,
+
     // Runtime coordination — crate-private.
     pub(crate) shutdown: Option<CancellationToken>,
     pub(crate) processing: Arc<AtomicBool>,
@@ -351,6 +389,7 @@ impl<B: Backend> ConsumerOptions<B> {
             #[cfg(feature = "kafka")]
             kafka_commit_interval: None,
             broadcast_start: None,
+            retry_strategy: None,
             shutdown: None,
             processing: Arc::new(AtomicBool::new(false)),
             consumer_group: None,
@@ -609,6 +648,7 @@ impl<B: Backend> ConsumerOptions<B> {
             broadcast_start: self.broadcast_start,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: None,
+            retry_strategy: self.retry_strategy,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: self.schema_registry,
             #[cfg(feature = "kafka-schema-registry")]
@@ -667,6 +707,7 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             #[cfg(feature = "kafka")]
             kafka_commit_interval: self.kafka_commit_interval,
             broadcast_start: self.broadcast_start,
+            retry_strategy: self.retry_strategy,
             shutdown: self.shutdown.clone(),
             processing: self.processing.clone(),
             consumer_group: self.consumer_group.clone(),
@@ -822,6 +863,22 @@ impl ConsumerOptions<Kafka> {
     pub fn with_commit_interval(mut self, interval: Duration) -> Self {
         validate_commit_interval(interval);
         self.kafka_commit_interval = Some(interval);
+        self
+    }
+
+    /// How this consumer carries out `Retry` and `Defer`; see
+    /// [`RetryStrategy`].
+    ///
+    /// Unset, the topology's ownership decides: an external topology runs in
+    /// place, a shove-owned one republishes. An external topology refuses
+    /// `Republish` at the consumer's start with `ShoveError::Topology`,
+    /// because the republish would write into a topic infra owns. A FIFO
+    /// consumer refuses `InPlace`, which it does not implement: it carries a
+    /// retry through the republish that keeps its per-key order. Read by the
+    /// direct and supervisor paths; for the coordinated registry path the
+    /// equivalent is `KafkaConsumerGroupConfig::with_retry_strategy`.
+    pub fn with_retry_strategy(mut self, strategy: RetryStrategy) -> Self {
+        self.retry_strategy = Some(strategy);
         self
     }
 }

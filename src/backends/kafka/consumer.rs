@@ -32,6 +32,7 @@ use crate::backend::batch_consumer::{
 use crate::backend::broadcast::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_broadcast_outcome};
 use crate::batch_consumer::BatchConsumerOptions as GenericBatchConsumerOptions;
 use crate::broadcast::BroadcastStart;
+use crate::consumer::RetryStrategy;
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::Result;
@@ -2624,6 +2625,53 @@ fn lazy_positions(topic: &str, partitions: &[i32], offset: Offset) -> Result<Top
     Ok(tpl)
 }
 
+/// The retry strategy a consumer runs with, from its options and the
+/// topology's ownership.
+///
+/// An external topology implies `InPlace` and refuses `Republish`: the
+/// republish would write a retried record into a topic infra owns, the one
+/// write external ownership rules out. A shove-owned topology defaults to
+/// `Republish`, the historical behaviour, and may opt into `InPlace`.
+fn resolve_retry_strategy(
+    topology: &QueueTopology,
+    requested: Option<RetryStrategy>,
+    queue: &str,
+    entry_point: &str,
+) -> Result<RetryStrategy> {
+    match (topology.external(), requested) {
+        (true, Some(RetryStrategy::Republish)) => Err(ShoveError::Topology(format!(
+            "topic '{queue}' is an external topology; `RetryStrategy::Republish` would \
+             republish a retried record into a topic infra owns, so `{entry_point}` refuses \
+             it. Drop `with_retry_strategy(..)`: an external topology implies \
+             `RetryStrategy::InPlace`."
+        ))),
+        (true, _) => Ok(RetryStrategy::InPlace),
+        (false, requested) => Ok(requested.unwrap_or(RetryStrategy::Republish)),
+    }
+}
+
+/// The error every FIFO entry point returns for options that ask for
+/// `RetryStrategy::InPlace`: the FIFO consumer carries a retry through the
+/// republish that keeps its per-key order and has no in-place shape, so the
+/// setting would change nothing and is refused rather than dropped.
+pub(super) fn reject_fifo_in_place(queue: &str) -> ShoveError {
+    ShoveError::Topology(format!(
+        "topic '{queue}' is sequenced; `RetryStrategy::InPlace` is not implemented on a FIFO \
+         consumer, which carries a retry through the republish that keeps its per-key order. \
+         Drop `with_retry_strategy(..)`."
+    ))
+}
+
+/// The error the broadcast and DLQ entry points return for options that set
+/// a retry strategy: neither loop retries through a strategy, so the setting
+/// would be read by nothing.
+fn reject_retry_strategy_unread(queue: &str, entry_point: &str) -> ShoveError {
+    ShoveError::Topology(format!(
+        "topic '{queue}': `with_retry_strategy` applies to the standard consumer only; \
+         `{entry_point}` never reads it. Drop the call."
+    ))
+}
+
 /// The error every FIFO entry point returns for options that set a commit
 /// interval: a FIFO consumer commits each message as it settles (see
 /// `commit_fifo_settling`), so the interval would be read by nothing, and a
@@ -4085,11 +4133,19 @@ impl KafkaConsumer {
         let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let max_message_size = options.max_message_size;
         let hold_queues = topology.hold_queues();
-        // On an infra-owned topic the consumer never writes into the topic
-        // when it settles an outcome: `Retry` and `Defer` wait in place
-        // instead of republishing, see `redeliver_in_place`. Publishing is
-        // outside that guarantee; see the Kafka page.
-        let external_topic = topology.external();
+        // How a `Retry` or a `Defer` is carried out here. Ownership implies
+        // it: an infra-owned topic is never written into when an outcome is
+        // settled, so it retries in place and refuses the republish, see
+        // `redeliver_in_place`. A shove-owned topic republishes by default
+        // and may opt into the in-place shape. Publishing is outside that
+        // guarantee; see the Kafka page.
+        let retry_strategy = resolve_retry_strategy(
+            topology,
+            options.retry_strategy,
+            queue,
+            "KafkaConsumer::run",
+        )?;
+        let in_place = retry_strategy == RetryStrategy::InPlace;
 
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
@@ -4100,7 +4156,7 @@ impl KafkaConsumer {
             group_id,
             prefetch_count,
             max_retries,
-            external_topic,
+            retry_strategy = ?retry_strategy,
             "Kafka consumer started"
         );
 
@@ -4311,7 +4367,7 @@ impl KafkaConsumer {
                     // permit while the loop keeps polling, and a further
                     // record during that wait is put back and the assignment
                     // paused: see `acquire_permit_while_polling`.
-                    if external_topic
+                    if in_place
                         && !paused
                         && spare_permit.is_none()
                         && semaphore.available_permits() == 0
@@ -4489,7 +4545,7 @@ impl KafkaConsumer {
                             // is due but not yet applied: every permit is held
                             // and one holder started waiting after the check
                             // at the top of this pass.
-                            if external_topic
+                            if in_place
                                 && (paused
                                     || (spare_permit.is_none()
                                         && semaphore.available_permits() == 0
@@ -4718,7 +4774,7 @@ impl KafkaConsumer {
                                 // them may turn into an in-place wait while
                                 // this record waits for a permit, so the wait
                                 // must keep polling; see the helper.
-                                None if external_topic => {
+                                None if in_place => {
                                     match acquire_permit_while_polling(
                                         &semaphore,
                                         &consumer,
@@ -4783,13 +4839,13 @@ impl KafkaConsumer {
                                     .await
                                 };
 
-                                // On an infra-owned topic the Hold arms of
-                                // `route_outcome` would republish into a topic
-                                // shove must not write to, so `Retry` and
-                                // `Defer` are resolved here first, in place and
-                                // holding the permit, and only a terminal
-                                // outcome goes on to `route_outcome`.
-                                let (outcome, retry_count) = if external_topic {
+                                // Under `RetryStrategy::InPlace` the Hold arms
+                                // of `route_outcome`, which republish, are not
+                                // taken: `Retry` and `Defer` are resolved here
+                                // first, in place and holding the permit, and
+                                // only a terminal outcome goes on to
+                                // `route_outcome`.
+                                let (outcome, retry_count) = if in_place {
                                     let decode = BatchDecodeCtx {
                                         queue: &task_topic,
                                         #[cfg(feature = "kafka-schema-registry")]
@@ -5510,6 +5566,9 @@ impl KafkaConsumer {
         if options.kafka_commit_interval.is_some() {
             return Err(reject_fifo_commit_interval(&queue));
         }
+        if options.retry_strategy == Some(RetryStrategy::InPlace) {
+            return Err(reject_fifo_in_place(&queue));
+        }
         // Kafka has a single FIFO task covering every assigned partition, so
         // one poison set covers every key this consumer sees. It lives outside
         // the reconnect wrapper below: a broker blip must not un-poison a key.
@@ -6212,6 +6271,12 @@ impl KafkaConsumer {
             )));
         }
         let queue = topology.queue();
+        if options.retry_strategy.is_some() {
+            return Err(reject_retry_strategy_unread(
+                queue,
+                "BroadcastSubscriber::subscribe",
+            ));
+        }
         // An explicit `with_group_id` is honoured verbatim, as on the standard
         // path. It is inert either way; the override exists for a cluster ACL
         // that grants group Describe on one prefix only.
@@ -6781,6 +6846,12 @@ impl KafkaConsumer {
         })?;
         options.refuse_broadcast_start(topology.queue(), "KafkaConsumer::run_dlq")?;
         Self::check_dlq_options(topology.queue(), dlq, &options)?;
+        if options.retry_strategy.is_some() {
+            return Err(reject_retry_strategy_unread(
+                topology.queue(),
+                "KafkaConsumer::run_dlq",
+            ));
+        }
 
         // Honor the `group.id` override (set via
         // `ConsumerOptions::<Kafka>::with_group_id`) by rebasing the DLQ group
@@ -8525,6 +8596,188 @@ mod error_classifier_tests {
             map_kafka_error("recv", e),
             ShoveError::Connection(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod retry_strategy_guard_tests {
+    use super::*;
+    use crate::topology::{SequenceFailure, TopologyBuilder};
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct Entry {
+        account: String,
+    }
+
+    struct Owned;
+    impl Topic for Owned {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("retry-strategy-guard-owned").build())
+        }
+    }
+
+    struct External;
+    impl Topic for External {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| {
+                TopologyBuilder::new("retry-strategy-guard-external")
+                    .external()
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+
+    struct Ledger;
+    impl Topic for Ledger {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| {
+                TopologyBuilder::new("retry-strategy-guard-ledger")
+                    .sequenced(SequenceFailure::FailAll)
+                    .hold_queue(Duration::from_secs(5))
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+    impl SequencedTopic for Ledger {
+        fn sequence_key(msg: &Entry) -> String {
+            msg.account.clone()
+        }
+    }
+
+    struct NoopHandler;
+    impl<T: Topic<Message = Entry>> MessageHandler<T> for NoopHandler {
+        type Context = ();
+        async fn handle(&self, _: Entry, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    async fn consumer() -> KafkaConsumer {
+        // Port 1 is never listening; every guard returns before any I/O.
+        let client = KafkaClient::connect(&super::super::client::KafkaConfig::new("127.0.0.1:1"))
+            .await
+            .expect("client construction is lazy");
+        KafkaConsumer::new(client)
+    }
+
+    fn topology_message(err: ShoveError) -> String {
+        match err {
+            ShoveError::Topology(msg) => msg,
+            other => panic!("expected ShoveError::Topology, got {other:?}"),
+        }
+    }
+
+    /// Ownership decides when nothing is asked, an explicit choice stands on
+    /// a shove-owned topology, and an external topology refuses the one
+    /// choice that would write into the topic.
+    #[test]
+    fn resolve_retry_strategy_lets_ownership_decide() {
+        let owned = Owned::topology();
+        let external = External::topology();
+        let resolve = |t, requested| resolve_retry_strategy(t, requested, t.queue(), "test");
+
+        assert_eq!(resolve(owned, None).unwrap(), RetryStrategy::Republish);
+        assert_eq!(
+            resolve(owned, Some(RetryStrategy::InPlace)).unwrap(),
+            RetryStrategy::InPlace,
+            "a shove-owned topology opts in"
+        );
+        assert_eq!(
+            resolve(owned, Some(RetryStrategy::Republish)).unwrap(),
+            RetryStrategy::Republish
+        );
+        assert_eq!(
+            resolve(external, None).unwrap(),
+            RetryStrategy::InPlace,
+            "implied"
+        );
+        assert_eq!(
+            resolve(external, Some(RetryStrategy::InPlace)).unwrap(),
+            RetryStrategy::InPlace
+        );
+        let msg = topology_message(
+            resolve(external, Some(RetryStrategy::Republish))
+                .expect_err("a republish into an infra-owned topic is refused"),
+        );
+        assert!(msg.contains("retry-strategy-guard-external"), "{msg}");
+        assert!(msg.contains("RetryStrategy::Republish"), "{msg}");
+        assert!(msg.contains("RetryStrategy::InPlace"), "{msg}");
+    }
+
+    /// The direct path refuses the republish on an external topology before
+    /// any broker request, naming the entry point.
+    #[tokio::test]
+    async fn run_rejects_republish_on_an_external_topology() {
+        let msg = topology_message(
+            consumer()
+                .await
+                .run::<External, _>(
+                    NoopHandler,
+                    (),
+                    crate::ConsumerOptions::<Kafka>::new()
+                        .with_retry_strategy(RetryStrategy::Republish)
+                        .with_shutdown(CancellationToken::new()),
+                )
+                .await
+                .expect_err("Republish on an external topology must be refused"),
+        );
+        assert!(msg.contains("KafkaConsumer::run"), "{msg}");
+        assert!(msg.contains("RetryStrategy::Republish"), "{msg}");
+    }
+
+    /// The FIFO consumer has no in-place shape and refuses the request rather
+    /// than dropping it, from `spawn_fifo_shards` so every FIFO entry point
+    /// fails alike.
+    #[tokio::test]
+    async fn run_fifo_rejects_in_place() {
+        let msg = topology_message(
+            consumer()
+                .await
+                .run_fifo::<Ledger, _>(
+                    NoopHandler,
+                    (),
+                    crate::ConsumerOptions::<Kafka>::new()
+                        .with_retry_strategy(RetryStrategy::InPlace)
+                        .with_shutdown(CancellationToken::new()),
+                )
+                .await
+                .expect_err("InPlace on a FIFO consumer must be refused"),
+        );
+        assert!(msg.contains("retry-strategy-guard-ledger"), "{msg}");
+        assert!(msg.contains("is sequenced"), "{msg}");
+        assert!(msg.contains("RetryStrategy::InPlace"), "{msg}");
+    }
+
+    /// The DLQ drain never retries, so a strategy set on its options is a
+    /// setting it would never read, and is refused.
+    #[tokio::test]
+    async fn run_dlq_rejects_a_retry_strategy() {
+        let msg = topology_message(
+            consumer()
+                .await
+                .run_dlq_with_options::<External, _>(
+                    NoopHandler,
+                    (),
+                    crate::ConsumerOptions::<Kafka>::new()
+                        .with_retry_strategy(RetryStrategy::InPlace)
+                        .with_shutdown(CancellationToken::new()),
+                )
+                .await
+                .expect_err("a strategy the DLQ drain never reads must be refused"),
+        );
+        assert!(msg.contains("KafkaConsumer::run_dlq"), "{msg}");
+        assert!(msg.contains("with_retry_strategy"), "{msg}");
     }
 }
 

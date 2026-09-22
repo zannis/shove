@@ -210,7 +210,7 @@ Because the count belongs to a *broker-level* message, anything that creates a n
 
 That last case is what `delivery_count` is for; see [Bounding a `Defer` loop](/guides/retries#defer-vs-retry).
 
-On a Kafka topic bound with `external()` neither `Retry` nor `Defer` publishes a copy.
+On Kafka, a consumer running with `RetryStrategy::InPlace`, which an external topology implies and a shove-owned one may opt into, publishes no copy on `Retry` or `Defer`.
 The same record is handed back in place, and its `retry_count` is kept in memory for the redelivery.
 
 ## Dead-letter handling

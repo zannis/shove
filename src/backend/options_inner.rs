@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::backends::kafka::KafkaAutoOffsetReset;
 use crate::broadcast::BroadcastStart;
 use crate::consumer::{
-    DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
+    DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, RetryStrategy,
     validate_message_size,
 };
 use crate::error::{Result, ShoveError};
@@ -80,6 +80,12 @@ pub(crate) struct ConsumerOptionsInner {
     #[cfg(all(feature = "kafka", feature = "test-support"))]
     pub kafka_max_poll_interval: Option<Duration>,
 
+    /// How the consumer carries out `Retry` and `Defer`. `None` lets the
+    /// topology's ownership decide. Propagated from
+    /// `ConsumerOptions::with_retry_strategy` on the direct and supervisor
+    /// paths and from `KafkaConsumerGroupConfig::with_retry_strategy` on the
+    /// registry path.
+    pub retry_strategy: Option<RetryStrategy>,
     /// Kafka-only: Schema Registry client for decoding Confluent wire-framed
     /// messages. `None` disables registry-based decoding.
     #[cfg(feature = "kafka-schema-registry")]
@@ -135,6 +141,7 @@ impl ConsumerOptionsInner {
             broadcast_start: None,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: None,
+            retry_strategy: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: None,
             #[cfg(feature = "kafka-schema-registry")]

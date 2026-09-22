@@ -131,9 +131,12 @@ That is the guarantee, and it covers declaring and consuming.
 Publishing is outside it: a `Publisher` on this topology writes to the topic, and the producer keeps librdkafka's default of `allow.auto.create.topics=true`, so a publish to a topic that does not exist can create it with broker defaults on a broker with `auto.create.topics.enable=true`.
 Provision the topic before any publisher starts, or pin the flag on the producer if that behaviour ever changes library-wide.
 `Ack` and `Reject` behave as everywhere else, because a `Reject` publishes to the shove-owned DLQ and not into the topic.
-The two outcomes that republish into a shove-owned topic wait in place instead:
+How `Retry` and `Defer` are carried out is the consumer's **retry strategy**, `RetryStrategy::Republish` or `RetryStrategy::InPlace`, set with `with_retry_strategy` on `ConsumerOptions::<Kafka>` or `KafkaConsumerGroupConfig`.
+Ownership implies it: an external topology runs with `InPlace` and refuses `Republish`, because the republish would write into a topic infra owns.
+A shove-owned topology runs with `Republish` by default and may opt into `InPlace`, so a consumer that must not duplicate a retried record for the other groups on a fan-out topic can wait in place too.
+A FIFO consumer refuses `InPlace`, which it does not implement.
 
-| Outcome | Shove-owned topic | External topic |
+| Outcome | `RetryStrategy::Republish`, the shove-owned default | `RetryStrategy::InPlace`, implied by an external topology |
 |---|---|---|
 | `Ack` | commits the offset | the same |
 | `Reject` | publishes to the DLQ when one is declared, then commits | the same, the DLQ is shove's own topic |
@@ -390,7 +393,7 @@ See the [Basic example](/backends/kafka/examples/basic) for a full runnable walk
 
 `Outcome::Ack` marks the offset complete as soon as the handler returns.
 `Outcome::Retry` and `Outcome::Defer` mark it complete only once the broker has acknowledged the delayed republish to the hold topic.
-On a topic bound with `external()` there is no republish.
+Under `RetryStrategy::InPlace`, which an external topology implies and a shove-owned one may opt into, there is no republish.
 The offset is marked complete only when the in-place retry or defer ends in a terminal outcome.
 That is an `Ack`, or a `Reject` or an exhausted retry budget that was dead-lettered or discarded.
 This closes the publish-then-commit race.

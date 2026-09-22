@@ -763,12 +763,38 @@ Migration note: none, unset keeps today's behaviour.
 
 ### Step 10: On an external topic, Retry and Defer never produce into the topic
 
-Commit: `feat(kafka)!: retry and defer in place on an external topic instead of republishing into it`.
+Commit: `feat(kafka)!: retry and defer in place on an external topic instead of republishing into it`, and the review fix `feat(consumer)!: make the retry strategy explicit, implied by external ownership`.
 
-Rule: an external topic is read-only for shove.
+Rule: shove's consumer never writes into an external topic when it settles an outcome.
 A shove-owned DLQ is still a legal publish target, because `dlq()` stays allowed on an external topology.
+Publishing through a `Publisher` is outside the rule, and so is the producer's `allow.auto.create.topics`, which keeps librdkafka's default.
 
-Behaviour when `topology.external()` is true, on the concurrent path and the FIFO path:
+The maintainer's review of 2026-09-22 observed that the ownership flag was deciding a retry strategy, and that a republish into a fan-out topic duplicates the record for every other group on it.
+The strategy is therefore explicit, backend-neutral, and only implied by ownership:
+
+```rust
+// src/consumer.rs, re-exported at the crate root
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryStrategy {
+    /// An incremented copy after the tier's delay: into the hold queue, or on Kafka into the topic. The shove-owned default.
+    Republish,
+    /// The same record, handed back after waiting the delay inside the handler's task. Implied by an external topology.
+    InPlace,
+}
+
+// src/consumer.rs, struct ConsumerOptions<B>, not feature-gated
+pub retry_strategy: Option<RetryStrategy>,
+
+// src/consumer.rs, impl ConsumerOptions<Kafka>; src/backends/kafka/consumer_group.rs, impl KafkaConsumerGroupConfig
+pub fn with_retry_strategy(mut self, strategy: RetryStrategy) -> Self
+```
+
+`resolve_retry_strategy` in `kafka/consumer.rs` decides at the consumer's start: an external topology implies `InPlace` and refuses `Republish` with `ShoveError::Topology`, a shove-owned topology defaults to `Republish` and honours an explicit `InPlace`.
+The FIFO consumer refuses `InPlace`, which it does not implement, at `spawn_fifo_shards` and at `register_fifo`; the broadcast and DLQ loops refuse a set strategy they never read.
+What `external()` implies for the retry strategy is declared per backend: Kafka here, and NATS keeps its hold-queue retries on an external stream in this stack and follows when plan 019 lands.
+The setter lives on the Kafka options for now and reaches each backend as it declares its support, which is an additive change.
+
+Behaviour under `RetryStrategy::InPlace`, on the concurrent path:
 
 - `Outcome::Defer` waits `hold_queues[0].delay()`, or 1 s without hold queues, inside the same task and holding its permit.
   It then decodes the retained raw bytes again and calls the handler with the fresh value.
@@ -795,8 +821,8 @@ The broadcast path gets the same in-place shape:
 - Replace the channel with the in-task wait above, holding the pinned single permit across the delay, so the order becomes `[1, 1, 2]`.
   `DeferredDelivery` and the `defer` channel go away.
 
-When the flag is false, nothing changes on the group paths, so every existing Retry and Defer test stays green.
-Kafka is the only backend where this arises.
+Under `RetryStrategy::Republish` nothing changes on the group paths, so every existing Retry and Defer test stays green.
+Kafka is the only backend where this arises in this stack.
 It simulates hold queues by republishing into the consumed topic (`src/backends/kafka/topology.rs:225-236`), while NATS publishes retries into shove-owned hold streams.
 
 Tests:
@@ -809,6 +835,8 @@ Tests:
 - Integration, `tests/kafka_integration.rs`: `external_topic_waiting_handlers_keep_the_member_in_the_group` defers past a shortened test wait and asserts no rebalance in the logs.
   If the pinned 5 min cannot be shortened in a test, record that in NOTES.
 - Integration, `tests/kafka_broadcast_integration.rs`: `defer_redelivers_in_place_before_later_records` asserts `[1, 1, 2]` on a broadcast subscription.
+- Integration, `tests/kafka_integration.rs`: `retry_in_place_on_an_owned_topic_does_not_republish` opts a shove-owned topic's consumer into `InPlace` and asserts `[1, 1, 2]` with the high watermark unchanged.
+- Unit, `kafka/consumer.rs`: `resolve_retry_strategy_lets_ownership_decide`, and the refusals of `Republish` on an external topology, of `InPlace` on a FIFO consumer and of any strategy on the DLQ drain, against a client that never connects; `register_fifo_rejects_in_place_retries` on the registry.
 - Metrics: a `tests/metrics_kafka_external_topic_discard.rs` twin of `metrics_kafka_failall_no_dlq.rs`.
   It asserts `shove_messages_discarded_total{reason="max_retries_exceeded"}` moves once per exhausted record.
 
@@ -926,6 +954,15 @@ This section records, per changed step, the patterns weighed and the one chosen,
 - An absolute position is the pattern the brokers offer as well: async-nats has `DeliverPolicy::ByStartSequence` and RabbitMQ Streams take a numeric offset.
   It is deferred because a sequence or an offset names a position on one backend's log and means nothing on another.
   It would be the first backend-specific variant on a neutral enum, and `#[non_exhaustive]` leaves the room for it.
+### Step 10, the retry strategy
+
+- Republish into the consumed topic after a delay tier is the historical Kafka shape: `hold_queue()` selects the delay by retry count, and no broker-side hold topics are created.
+  Its cost is the duplicate every other reader of the topic receives, and on an infra-owned topic it is the write that ownership rules out.
+- Retry topics per delay tier is the standard pattern elsewhere: a failed record is forwarded to a retry topic with a back-off timestamp, then to the next tier, then to the dead-letter topic, at the price of the topic's ordering guarantee.
+  It stays a later option.
+- In-place retry of the same record is the chosen shape for an external topic, and the one NATS has natively through a delayed negative acknowledgement.
+- Retry topics owned by shove is the other later option, with no design in the tree yet.
+- The review selected an explicit `RetryStrategy` that names the republish or the in-place shape per consumer, implied by ownership and refused where a backend or a path cannot honour it; the strategy lives on the consumer options rather than the topology, because it is how one consumer settles an outcome and two groups on one topic may differ.
 
 ## Done criteria
 

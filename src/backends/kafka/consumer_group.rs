@@ -13,8 +13,11 @@ use tracing::{debug, info, warn};
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::kafka::client::KafkaClient;
-use crate::backends::kafka::consumer::{KafkaConsumer, reject_fifo_commit_interval};
+use crate::backends::kafka::consumer::{
+    KafkaConsumer, reject_fifo_commit_interval, reject_fifo_in_place,
+};
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
+use crate::consumer::RetryStrategy;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_group::reject_fifo_concurrency;
 use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally};
@@ -139,6 +142,10 @@ pub struct KafkaConsumerGroupConfig {
     /// `None` keeps the 500 ms default gate. See
     /// [`with_commit_interval`](Self::with_commit_interval).
     commit_interval: Option<Duration>,
+    /// How the members carry out `Retry` and `Defer`, see
+    /// [`with_retry_strategy`](Self::with_retry_strategy). `None` lets the
+    /// topology's ownership decide.
+    retry_strategy: Option<RetryStrategy>,
     /// `test-support` builds only: the members' `max.poll.interval.ms`, see
     /// [`with_max_poll_interval_for_test`](Self::with_max_poll_interval_for_test).
     #[cfg(feature = "test-support")]
@@ -195,6 +202,7 @@ impl KafkaConsumerGroupConfig {
             group_id: None,
             auto_offset_reset: None,
             commit_interval: None,
+            retry_strategy: None,
             #[cfg(feature = "test-support")]
             max_poll_interval: None,
             #[cfg(feature = "kafka-schema-registry")]
@@ -362,6 +370,27 @@ impl KafkaConsumerGroupConfig {
     /// 500 ms default should apply.
     pub fn commit_interval(&self) -> Option<Duration> {
         self.commit_interval
+    }
+
+    /// How the group's members carry out `Retry` and `Defer`; see
+    /// [`RetryStrategy`].
+    ///
+    /// Unset, the topology's ownership decides: an external topology runs in
+    /// place, a shove-owned one republishes into the topic. An external
+    /// topology refuses `Republish` when a member starts, because the
+    /// republish would write into a topic infra owns. `register_fifo` refuses
+    /// `InPlace`, which the FIFO consumer does not implement. For the direct
+    /// and supervisor paths the equivalent is
+    /// `ConsumerOptions::<Kafka>::with_retry_strategy`.
+    pub fn with_retry_strategy(mut self, strategy: RetryStrategy) -> Self {
+        self.retry_strategy = Some(strategy);
+        self
+    }
+
+    /// Returns the explicitly configured retry strategy, or `None` if the
+    /// topology's ownership decides.
+    pub fn retry_strategy(&self) -> Option<RetryStrategy> {
+        self.retry_strategy
     }
 
     /// Set the Schema Registry client for this consumer group.
@@ -909,6 +938,7 @@ impl KafkaConsumerGroup {
         }
         options.kafka_auto_offset_reset = self.config.auto_offset_reset;
         options.kafka_commit_interval = self.config.commit_interval;
+        options.retry_strategy = self.config.retry_strategy;
         #[cfg(feature = "test-support")]
         {
             options.kafka_max_poll_interval = self.config.max_poll_interval;
@@ -1087,6 +1117,9 @@ impl KafkaConsumerGroupRegistry {
         }
         if config.commit_interval().is_some() {
             return Err(reject_fifo_commit_interval(T::topology().queue()));
+        }
+        if config.retry_strategy() == Some(RetryStrategy::InPlace) {
+            return Err(reject_fifo_in_place(T::topology().queue()));
         }
 
         let mut config = config;
@@ -1750,6 +1783,17 @@ mod tests {
     }
 
     #[test]
+    fn with_retry_strategy_is_unset_by_default_and_stores_the_choice() {
+        assert_eq!(KafkaConsumerGroupConfig::new(1..=1).retry_strategy(), None);
+        assert_eq!(
+            KafkaConsumerGroupConfig::new(1..=1)
+                .with_retry_strategy(RetryStrategy::InPlace)
+                .retry_strategy(),
+            Some(RetryStrategy::InPlace)
+        );
+    }
+
+    #[test]
     #[should_panic(expected = "commit_interval must be positive")]
     fn with_commit_interval_rejects_zero() {
         let _ = KafkaConsumerGroupConfig::new(1..=1).with_commit_interval(Duration::ZERO);
@@ -2063,6 +2107,30 @@ mod tests {
                     && msg.contains("break per-key ordering")
                     && msg.contains("with_concurrent_processing(true)"),
                 "message must match the shared FIFO-concurrency wording: {msg}"
+            );
+        }
+
+        /// The in-place retry strategy is refused the same way: the FIFO
+        /// consumer carries a retry through the republish that keeps its
+        /// per-key order and has no in-place shape.
+        #[tokio::test]
+        async fn register_fifo_rejects_in_place_retries() {
+            let config =
+                KafkaConsumerGroupConfig::new(1..=4).with_retry_strategy(RetryStrategy::InPlace);
+
+            let err = registry()
+                .register_fifo::<GuardLedger, _>(config, || NoopHandler, ())
+                .await
+                .expect_err("RetryStrategy::InPlace must be rejected on a FIFO consumer");
+
+            let ShoveError::Topology(msg) = err else {
+                panic!("expected ShoveError::Topology, got {err:?}");
+            };
+            assert!(
+                msg.contains("kafka-fifo-concurrency-guard")
+                    && msg.contains("is sequenced")
+                    && msg.contains("RetryStrategy::InPlace"),
+                "message must name the topic and the refused setting: {msg}"
             );
         }
 
