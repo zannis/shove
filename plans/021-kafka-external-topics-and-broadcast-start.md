@@ -528,31 +528,48 @@ Migration note for existing users: none, every default is unchanged.
 
 **Verify**: broadcast integration suite and Kafka unit suite pass.
 
-### Step 6: `kafka_external_topic()`, a topology that shove reads but never creates or alters
+### Step 6: `external()`, a topology that shove reads but never creates or alters
 
-Commit: `feat(topology): kafka_external_topic() binds to an infra-owned topic without declaring it`.
+Commit: `feat(topology): kafka_external_topic() binds to an infra-owned topic without declaring it`, and the review fix `feat(topology): replace the backend-prefixed external flags with external()`.
+
+The first shape was a second backend-prefixed spelling of one concept: `nats_external_stream()` already said "infra owns the primary, shove binds and verifies".
+The maintainer's review of 2026-09-22 asked for one backend-neutral flag, with each declarer deciding what verification means, and that is the shape that landed.
 
 Public API:
 
 ```rust
-// src/topology.rs, struct TopologyBuilder and struct QueueTopology
-#[cfg(feature = "kafka")]
-kafka_external_topic: bool,
+// src/topology.rs, struct TopologyBuilder and struct QueueTopology, not feature-gated
+external: bool,
 
 // src/topology.rs, impl TopologyBuilder
-#[cfg(feature = "kafka")]
-pub fn kafka_external_topic(mut self) -> Self
+pub fn external(mut self) -> Self
+#[deprecated(since = "0.15.0", note = "use `external()`")]
+pub fn nats_external_stream(self) -> Self // alias for one release, sets the same flag
 
 // src/topology.rs, impl QueueTopology
-#[cfg(feature = "kafka")]
-pub fn kafka_external_topic(&self) -> bool
+pub fn external(&self) -> bool
+#[deprecated(since = "0.15.0", note = "use `external()`")]
+pub fn nats_external_stream(&self) -> bool // alias for one release
 ```
 
-`build()` panics when the flag is combined with `sequenced()` or with any of the six Kafka topic-config methods at `src/topology.rs:685-744`.
+The Kafka name never shipped, so it is replaced outright; the NATS name is public in 0.14 and stays one release as a deprecated alias.
+`build()` panics when the flag is combined with `sequenced()` on any backend, because sequencing needs shove to own the shard space everywhere.
+It panics with `nats_stream_config()` or `nats_subjects()` under the `nats` feature, and with any of the six Kafka topic-config methods under the `kafka` feature.
 Those are `with_topic_config`, `with_retention`, `with_retention_forever`, `with_retention_bytes`, `with_cleanup_policy` and `with_max_message_bytes`.
-The wording follows the NATS guards at `:923-935`.
+The per-backend config guards keep their wording with `external()` in place of the old names.
 `dlq()`, `dlq_named()`, `hold_queue()`, `for_consumer_group()` and `broadcast()` stay allowed.
-Sequenced topics are refused for now to mirror NATS and keep the test matrix small, see Maintenance notes.
+
+Per declarer, what `declare()` does with an external topology:
+
+- Kafka: the metadata probe below; the topic is never created, expanded or reconciled.
+- NATS: `get_stream`, as before; the durable consumer and the DLQ stream stay shove's.
+- RabbitMQ, SQS and Redis: `declare` refuses the topology with `ShoveError::Topology` through `QueueTopology::refuse_external`, until each declarer gains its verification step.
+  Those steps are a passive `queue.declare`, `GetQueueUrl` together with the SNS topic, the queue policy and the subscription the SQS declarer also owns, and `EXISTS` on the stream key.
+  Refusing is the safe direction, because creating the resource is the write the flag promises never to make.
+- In-process: a no-op, because nothing in-process can be owned by infra.
+
+Ownership says who creates the resource, not how a `Retry` is carried out.
+What `external()` implies for a consumer's retry strategy is declared per backend: step 10 states it for Kafka, and NATS keeps its hold-queue retries on an external stream unchanged in this stack and follows when plan 019 lands.
 
 Kafka backend:
 
@@ -574,7 +591,8 @@ Kafka backend:
 
 Tests:
 
-- Unit, `src/topology.rs`: the flag round-trips, and each of the seven forbidden combinations panics with its message.
+- Unit, `src/topology.rs`: `external()` round-trips on every feature set, `nats_external_stream()` is a deprecated alias for it, and each forbidden combination panics with its message: `sequenced()` un-gated, two NATS creation options, six Kafka topic-config methods.
+- Integration, `tests/nats_integration.rs`: the existing external-stream test binds with `external()`.
 - Integration, `tests/kafka_integration.rs`, two new tests.
   `external_topic_is_never_created_or_expanded` pre-creates a three-partition topic through rdkafka's admin client.
   It then registers a group with `max_consumers` 8 on an external topology, consumes, and asserts the partition count is still three.
@@ -582,10 +600,10 @@ Tests:
 
 Docs:
 
-- `docs/pages/backends/kafka.mdx:77-83`, "Declare topology": add `### Bind to an infra-owned topic`, mirroring `docs/pages/backends/nats.mdx:126-146`.
+- `docs/pages/backends/kafka.mdx:77-83`, "Declare topology": add `### Bind to an infra-owned topic`, mirroring `docs/pages/backends/nats.mdx:126-146`, both on `external()`.
   State the ACLs a reader then needs: Describe and Read on the topic, Describe and Read on the group.
-- `docs/pages/concepts/topics.mdx:158`, "Topology declaration": one sentence pointing at both external flags.
-- `src/consumer_group.rs:123-128` and `:160-165`: the "automatically declares" rustdoc gains the two exceptions.
+- `docs/pages/concepts/topics.mdx:158`, "Topology declaration": describe the one neutral flag, which backends verify, which refuse, and the deprecated alias.
+- `src/consumer_group.rs:123-128` and `:160-165`: the "automatically declares" rustdoc gains the external exception.
 
 Migration note: none, the flag is opt-in.
 
@@ -750,7 +768,7 @@ Commit: `feat(kafka)!: retry and defer in place on an external topic instead of 
 Rule: an external topic is read-only for shove.
 A shove-owned DLQ is still a legal publish target, because `dlq()` stays allowed on an external topology.
 
-Behaviour when `topology.kafka_external_topic()` is true, on the concurrent path and the FIFO path:
+Behaviour when `topology.external()` is true, on the concurrent path and the FIFO path:
 
 - `Outcome::Defer` waits `hold_queues[0].delay()`, or 1 s without hold queues, inside the same task and holding its permit.
   It then decodes the retained raw bytes again and calls the handler with the fresh value.
@@ -872,6 +890,13 @@ That is the at-least-once contract the rest of the crate keeps, and the PR body 
 The maintainer's review of 2026-09-22 asked for backend-neutral shapes in four places.
 This section records, per changed step, the patterns weighed and the one chosen, so the choice stays legible without the review thread.
 
+### Step 6, external ownership
+
+- One backend-prefixed builder per backend, `nats_external_stream()` and then `kafka_external_topic()`, was the first shape: two spellings of one bind-and-verify concept, and a third backend would have added a third.
+- One neutral flag with per-declarer verification is the chosen shape.
+  Kafka probes metadata, NATS calls `get_stream`, and the other clients already expose a passive declare, `GetQueueUrl` and `EXISTS` for later.
+  Two constraints stay visible: NATS external mode allows hold queues today, so a neutral flag that implies in-place retry needs a per-backend support statement (step 10); and SQS external ownership must cover the SNS topic, the queue policy and the subscription, not only the queue.
+- The bounded form landed: Kafka and NATS implement the flag now, every other declarer refuses it until it verifies the resource, and the in-process broker treats it as a no-op.
 ### Step 7, the metadata fields
 
 - Kafka-only fields with one combined table was the first shape.
@@ -953,7 +978,7 @@ This section records, per changed step, the patterns weighed and the one chosen,
   Redis fills `timestamp_ms` from the entry id's time component.
   SQS could fill `timestamp_ms` from `SentTimestamp` and RabbitMQ from the AMQP `timestamp` property.
   Do it per backend with its own availability row, as `delivery_count` did.
-- `kafka_external_topic()` refuses `sequenced()` for now.
+- `external()` refuses `sequenced()` for now.
   Nothing in the Kafka FIFO consumer depends on shove having created the topic, so lifting the guard is additive once a user needs it.
 - `KafkaOffsetReset` describes a position for `reset_consumer_group_offsets` alone.
   The broadcast start is the backend-neutral `BroadcastStart`, and `KafkaAutoOffsetReset` is the group's librdkafka policy.

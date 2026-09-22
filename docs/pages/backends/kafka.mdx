@@ -93,7 +93,7 @@ See [`examples/kafka/msk_iam.rs`](/backends/kafka/examples/msk_iam) for a runnab
 ### Bind to an infra-owned topic
 
 Sometimes infra owns the topic: a Terraform module, a platform team's provisioning job, or a cluster whose credentials carry no Create or Alter permission.
-Then use `kafka_external_topic()`:
+Then use `external()`, the backend-neutral flag NATS shares:
 
 ```rust,no_run
 use shove::TopologyBuilder;
@@ -103,7 +103,7 @@ shove::define_topic!(
     PriceChange,
     // The queue name must match the externally provisioned topic name.
     TopologyBuilder::new("price-changes")
-        .kafka_external_topic()
+        .external()
         .dlq()
         .build()
 );
@@ -126,7 +126,7 @@ The group is `{queue}-consumer` unless `for_consumer_group` or `with_group_id` n
 A publisher additionally needs `Write` on the topic.
 A declared DLQ needs `Create`, `Describe` and `Write` on the DLQ topic, so that shove can create it and route to it.
 
-`kafka_external_topic()` is incompatible with `sequenced()` and with every topic-config method.
+`external()` is incompatible with `sequenced()` and with every topic-config method.
 Those are `with_topic_config`, `with_retention`, `with_retention_forever`, `with_retention_bytes`, `with_cleanup_policy` and `with_max_message_bytes`.
 They configure topic *creation* and *reconciliation*, which external mode skips, and `build()` panics if they are combined.
 `dlq()`, `dlq_named()`, `hold_queue()`, `for_consumer_group()` and `broadcast()` stay available.

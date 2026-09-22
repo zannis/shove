@@ -732,9 +732,9 @@ impl KafkaClient {
                 metrics::BackendErrorKind::Topology,
             );
             ShoveError::Topology(format!(
-                "kafka_external_topic: topic `{name}` must be provisioned before the consumer \
-                 starts, but the broker has no topic by that name; shove never creates or \
-                 alters an external topic"
+                "external(): topic `{name}` must be provisioned before the consumer starts, \
+                 but the broker has no topic by that name; shove never creates or alters an \
+                 external topic"
             ))
         })
     }
@@ -1070,8 +1070,8 @@ fn fetch_topic_partition_count_blocking(
 /// matter. librdkafka defaults `allow.auto.create.topics` to true for a
 /// producer and sends it on a topic-specific metadata request, so the
 /// producer's own client (the one `ping` uses) would ask a broker running
-/// `auto.create.topics.enable=true` to create the very topic
-/// `kafka_external_topic()` promises never to create. A consumer defaults it
+/// `auto.create.topics.enable=true` to create the very topic `external()`
+/// promises never to create. A consumer defaults it
 /// to false, and it is set explicitly here anyway. Without a `group.id` there
 /// is no coordinator lookup, so the probe needs no group permission under a
 /// group-scoped ACL.

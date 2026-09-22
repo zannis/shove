@@ -153,7 +153,7 @@ shove::define_topic!(
     ExternalTopic,
     SimpleMessage,
     TopologyBuilder::new("nats-external")
-        .nats_external_stream()
+        .external()
         .dlq()
         .build()
 );

@@ -72,8 +72,7 @@ impl NatsTopologyDeclarer {
     /// `max_messages`/`num_replicas`) are applied; immutable ones (`retention`,
     /// `storage`) make the JetStream UPDATE fail loud rather than no-op silently —
     /// the operator must recreate the stream (or use
-    /// [`nats_external_stream`](crate::TopologyBuilder::nats_external_stream) to
-    /// let infra own it).
+    /// [`external`](crate::TopologyBuilder::external) to let infra own it).
     async fn create_stream(
         &self,
         name: &str,
@@ -116,7 +115,7 @@ impl NatsTopologyDeclarer {
     async fn declare_standard(&self, topology: &QueueTopology) -> Result<()> {
         let queue = topology.queue();
 
-        if topology.nats_external_stream() {
+        if topology.external() {
             // Bind to an infra-provisioned stream: verify it exists and fail fast
             // rather than silently creating a (differently-configured) fallback.
             self.client
@@ -125,7 +124,7 @@ impl NatsTopologyDeclarer {
                 .await
                 .map_err(|e| {
                     ShoveError::Topology(format!(
-                        "nats_external_stream: stream `{queue}` must be provisioned before the consumer starts, but get_stream failed: {e}"
+                        "external(): stream `{queue}` must be provisioned before the consumer starts, but get_stream failed: {e}"
                     ))
                 })?;
         } else {

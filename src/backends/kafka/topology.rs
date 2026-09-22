@@ -99,9 +99,9 @@ impl KafkaTopologyDeclarer {
         }
     }
 
-    /// Ensure the main topic has at least `n` partitions. Has no effect on a
-    /// `kafka_external_topic()` topology, which shove never expands: `declare`
-    /// then warns when the topic has fewer partitions than `n`.
+    /// Ensure the main topic has at least `n` partitions. Has no effect on an
+    /// `external()` topology, which shove never expands: `declare` then warns
+    /// when the topic has fewer partitions than `n`.
     pub fn with_min_partitions(mut self, n: i32) -> Self {
         self.min_partitions = Some(n);
         self
@@ -178,7 +178,7 @@ impl KafkaTopologyDeclarer {
         let queue = topology.queue();
         let replication = self.effective_replication();
 
-        if topology.kafka_external_topic() {
+        if topology.external() {
             // Bind to an infra-provisioned topic: verify it exists and fail
             // fast rather than silently creating a differently-configured
             // fallback. Nothing here touches the main topic: no create, no
@@ -264,7 +264,7 @@ impl KafkaTopologyDeclarer {
         }
         // The nudge is about topics shove auto-creates. An external main topic
         // is never created, so only a declared DLQ can still earn it there.
-        if !topology.kafka_external_topic() || topology.dlq().is_some() {
+        if !topology.external() || topology.dlq().is_some() {
             warn_if_under_replicated_for_acks_all(topology.queue(), self.effective_replication());
         }
         if topology.sequencing().is_some() {

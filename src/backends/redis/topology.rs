@@ -54,6 +54,11 @@ impl RedisTopologyDeclarer {
     /// Returns `ShoveError::Topology` if stream or group creation fails
     /// (other than BUSYGROUP, which is idempotent).
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+        // No verification step yet for an infra-owned stream, so external
+        // mode is refused rather than declared: `XGROUP CREATE ... MKSTREAM`
+        // would create the stream it promises never to touch. The step to add
+        // is an `EXISTS` on the stream key.
+        topology.refuse_external("Redis Streams", "`EXISTS` on the stream key")?;
         // A broadcast topology declares nothing, and that is the point rather
         // than a shortcut. Its subscribers read with a bare `XREAD` from `$`, so
         // the consumer group this method would otherwise create is never read

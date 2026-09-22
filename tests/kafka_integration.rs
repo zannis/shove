@@ -190,7 +190,7 @@ shove::define_topic!(
     ExternalOwnedTopic,
     SimpleMessage,
     TopologyBuilder::new("kafka-external-owned")
-        .kafka_external_topic()
+        .external()
         .dlq()
         .build()
 );
@@ -200,7 +200,7 @@ shove::define_topic!(
     ExternalMissingTopic,
     SimpleMessage,
     TopologyBuilder::new("kafka-external-missing")
-        .kafka_external_topic()
+        .external()
         .build()
 );
 
@@ -2331,7 +2331,7 @@ async fn supervisor_with_auto_offset_reset_latest_skips_history() {
     broker.close().await;
 }
 
-/// `kafka_external_topic()` binds to a topic infra created. Registering a
+/// `external()` binds to a topic infra created. Registering a
 /// group whose `max_consumers` exceeds the partition count consumes through
 /// it and leaves the partition count exactly as infra set it, while the DLQ
 /// is still shove's to create.
@@ -2415,8 +2415,7 @@ async fn external_topic_missing_fails_fast_at_declare() {
         "expected Topology, got {err:?}"
     );
     assert!(
-        err.to_string().contains("kafka_external_topic")
-            && err.to_string().contains("must be provisioned"),
+        err.to_string().contains("external()") && err.to_string().contains("must be provisioned"),
         "{err}"
     );
     assert_eq!(

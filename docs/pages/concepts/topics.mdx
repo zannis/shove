@@ -159,5 +159,8 @@ See [Sequenced Topics](/guides/sequenced) for the full story.
 
 Before publishing or consuming, call `broker.topology().declare::<MyTopic>().await?` once at startup. This call is idempotent — the backend creates queues, exchanges, streams, and any other infrastructure the topology requires, and does nothing if they already exist. It is safe to call on every restart.
 
-Two backends can bind to infrastructure that infra owns instead of creating it: `nats_external_stream()` on NATS and `kafka_external_topic()` on Kafka.
-With either flag, `declare` verifies that the stream or topic exists and fails fast when it does not, while shove still creates its own DLQ.
+`TopologyBuilder::external()` binds to infrastructure that infra owns instead of creating it: one flag on every backend, with each declarer deciding what verification means.
+On Kafka and NATS, `declare` verifies that the topic or stream exists and fails fast when it does not, while shove still creates its own DLQ.
+RabbitMQ, SQS and Redis refuse an external topology at `declare` on this version, until their declarers gain a verification step, because creating the resource is the write the flag promises never to make; the in-process broker treats the flag as a no-op.
+`nats_external_stream()` remains for one release as a deprecated alias.
+Ownership says who creates the resource, not how a `Retry` is carried out: what an external topology implies for a consumer's retry strategy is declared per backend, on that backend's page.

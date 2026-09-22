@@ -404,6 +404,14 @@ impl SnsTopologyDeclarer {
 
 impl SnsTopologyDeclarer {
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+        // No verification step yet for infra-owned resources, so external
+        // mode is refused rather than declared. The step to add has to cover
+        // more than `GetQueueUrl`: this declarer owns an SNS topic, a queue
+        // policy and a subscription as well as the queue.
+        topology.refuse_external(
+            "AWS SNS/SQS",
+            "`GetQueueUrl` on the queue, plus the SNS topic, its policy and its subscription",
+        )?;
         // If the registry already has an ARN for this queue (pre-configured),
         // validate it exists and skip creation.
         if let Some(arn) = self.topic_registry().get(topology.queue()).await {
