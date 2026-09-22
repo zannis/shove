@@ -258,6 +258,19 @@ shove::define_topic!(
         .build()
 );
 
+// Two partitions, so a record can arrive from one while a record from the
+// other waits for the only prefetch slot.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    ExternalPermitWaitTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-permit-wait")
+        .external()
+        .hold_queue(Duration::from_millis(300))
+        .allow_message_loss()
+        .build()
+);
+
 /// A message type that derives only `Deserialize`: no `Clone`, no
 /// `Serialize`. An in-place redelivery must work from the retained bytes,
 /// never from a copy of the value.
@@ -571,6 +584,51 @@ async fn publish_raw(brokers: &str, topic: &str, payload: &[u8]) {
         .expect("raw publish should succeed");
 }
 
+/// `publish_raw` onto one partition, for topics with more than one.
+#[cfg(feature = "test-support")]
+async fn publish_raw_to(brokers: &str, topic: &str, partition: i32, payload: &[u8]) {
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+
+    let producer: FutureProducer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create raw producer");
+    producer
+        .send(
+            FutureRecord::to(topic)
+                .partition(partition)
+                .key("k")
+                .payload(payload),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("raw publish should succeed");
+}
+
+/// The group's committed offset on one partition, or `None` when it has
+/// never committed there.
+#[cfg(feature = "test-support")]
+fn committed_offset(brokers: &str, group: &str, topic: &str, partition: i32) -> Option<i64> {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+    use rdkafka::{Offset, TopicPartitionList};
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group)
+        .create()
+        .expect("failed to create committed-offset probe");
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition(topic, partition);
+    probe
+        .committed_offsets(tpl, Duration::from_secs(10))
+        .expect("committed_offsets")
+        .find_partition(topic, partition)
+        .and_then(|e| match e.offset() {
+            Offset::Offset(o) => Some(o),
+            _ => None,
+        })
+}
+
 /// Poll until the group's lag on `topic` reads zero, the broker-side proof
 /// that every consumed offset was committed.
 async fn wait_for_zero_lag(client: &KafkaClient, topic: &str, group: &str, timeout: Duration) {
@@ -814,7 +872,7 @@ defer_once_for!(
     ExternalShutdownTopic
 );
 #[cfg(feature = "test-support")]
-defer_once_for!(ExternalTransitionTopic);
+defer_once_for!(ExternalTransitionTopic, ExternalPermitWaitTopic);
 
 impl MessageHandler<ExternalNoCloneTopic> for DeferOnceRecorder {
     type Context = ();
@@ -3159,6 +3217,81 @@ async fn external_topic_waiting_handlers_keep_the_member_in_the_group() {
         vec!["a".to_string(), "a".to_string(), "b".to_string()]
     );
     assert_eq!(high_watermark(tb.brokers(), TOPIC, 0), 2);
+
+    token.cancel();
+    assert!(running.await.unwrap().is_clean());
+    broker.close().await;
+}
+
+/// The rule the docs state: a record that arrives while every slot is held
+/// by a running handler is decoded and waits for a slot while the loop keeps
+/// polling, and a further record that arrives during that wait is handed
+/// back to the broker and the assignment paused until a slot frees. With one
+/// slot, `a` on partition 0 runs for three seconds, `b` on partition 1
+/// arrives meanwhile and waits for the slot, and `c` on partition 0 arrives
+/// during that wait. `c` must arrive again once the slot frees: the order is
+/// `[a, a, b, c]`, nothing is republished, and both partitions commit.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn external_topic_record_received_during_the_permit_wait_is_put_back_and_redelivered() {
+    const TOPIC: &str = "kafka-external-permit-wait";
+    const GROUP: &str = "kafka-external-permit-wait-consumer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 2).await;
+    let broker = tb.broker();
+
+    let handler = DeferOnceRecorder::new().running_first_for(Duration::from_secs(3));
+    let h = handler.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<ExternalPermitWaitTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+    let token = group.cancellation_token();
+    let running = tokio::spawn(
+        group.run_until_timeout(token.clone().cancelled_owned(), Duration::from_secs(15)),
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
+
+    let record = |id: &str| {
+        serde_json::to_vec(&SimpleMessage {
+            id: id.into(),
+            content: String::new(),
+        })
+        .unwrap()
+    };
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record("a")).await;
+    assert!(handler.counter.wait_for(1, TIMEOUT).await, "a is running");
+    // `b` waits for the slot `a` holds; `c` arrives during that wait.
+    publish_raw_to(tb.brokers(), TOPIC, 1, &record("b")).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record("c")).await;
+
+    assert!(
+        handler.counter.wait_for(4, TIMEOUT).await,
+        "a's redelivery, then b, then the put-back c"
+    );
+    assert_eq!(
+        handler.ids().await,
+        vec![
+            "a".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string()
+        ]
+    );
+    assert_eq!(
+        high_watermark(tb.brokers(), TOPIC, 0),
+        2,
+        "nothing was republished"
+    );
+    assert_eq!(high_watermark(tb.brokers(), TOPIC, 1), 1);
+    wait_for_zero_lag(&tb.client(), TOPIC, GROUP, TIMEOUT).await;
+    assert_eq!(committed_offset(tb.brokers(), GROUP, TOPIC, 0), Some(2));
+    assert_eq!(committed_offset(tb.brokers(), GROUP, TOPIC, 1), Some(1));
 
     token.cancel();
     assert!(running.await.unwrap().is_clean());

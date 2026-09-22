@@ -158,7 +158,6 @@ async fn drain_raw(brokers: &str, topic: &str, expected: usize, timeout: Duratio
 
 /// Poll `hits` until it exceeds `above`, the observable proof that the
 /// registry was asked again.
-#[cfg(feature = "test-support")]
 async fn wait_for_hits_above(hits: &AtomicUsize, above: usize, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -246,13 +245,18 @@ impl TestBroker {
 
 /// One partition, so publish order is consume order.
 async fn create_single_partition_topic(brokers: &str, topic: &str) {
+    create_topic(brokers, topic, 1).await;
+}
+
+/// `topic` with `partitions` partitions, through a raw admin client.
+async fn create_topic(brokers: &str, topic: &str, partitions: i32) {
     let admin: AdminClient<DefaultClientContext> = rdkafka::ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .create()
         .expect("failed to create admin client");
     admin
         .create_topics(
-            &[NewTopic::new(topic, 1, TopicReplication::Fixed(1))],
+            &[NewTopic::new(topic, partitions, TopicReplication::Fixed(1))],
             &AdminOptions::new(),
         )
         .await
@@ -261,6 +265,59 @@ async fn create_single_partition_topic(brokers: &str, topic: &str) {
         .for_each(|r| {
             r.expect("topic creation failed");
         });
+}
+
+/// Wait until the broker reports `group` as `Stable` with exactly `members`
+/// members, so a record published afterwards lands after the assignment the
+/// test reasons about was taken.
+async fn wait_for_group_members(brokers: &str, group: &str, members: usize, timeout: Duration) {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create group probe");
+    let deadline = Instant::now() + timeout;
+    loop {
+        let list = probe
+            .fetch_group_list(Some(group), Duration::from_secs(10))
+            .expect("failed to fetch group list");
+        let ready = list
+            .groups()
+            .iter()
+            .any(|g| g.name() == group && g.state() == "Stable" && g.members().len() == members);
+        if ready {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "group {group} did not become stable with {members} member(s) within {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The group's committed offset on one partition, or `None` when it has
+/// never committed there.
+fn committed_offset(brokers: &str, group: &str, topic: &str, partition: i32) -> Option<i64> {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+    use rdkafka::{Offset, TopicPartitionList};
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group)
+        .create()
+        .expect("failed to create committed-offset probe");
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition(topic, partition);
+    probe
+        .committed_offsets(tpl, Duration::from_secs(10))
+        .expect("committed_offsets")
+        .find_partition(topic, partition)
+        .and_then(|e| match e.offset() {
+            Offset::Offset(o) => Some(o),
+            _ => None,
+        })
 }
 
 /// Confluent JSON wire frame: `0x00` magic + big-endian schema id + JSON.
@@ -282,6 +339,26 @@ async fn publish_raw(brokers: &str, topic: &str, payload: &[u8]) {
     producer
         .send(
             FutureRecord::to(topic).key("k").payload(payload),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("raw publish should succeed");
+}
+
+/// `publish_raw` onto one partition, for topics with more than one.
+async fn publish_raw_to(brokers: &str, topic: &str, partition: i32, payload: &[u8]) {
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+
+    let producer: FutureProducer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create raw producer");
+    producer
+        .send(
+            FutureRecord::to(topic)
+                .partition(partition)
+                .key("k")
+                .payload(payload),
             Duration::from_secs(10),
         )
         .await
@@ -389,6 +466,18 @@ shove::define_topic!(
     SilentRegistryTopic,
     Event,
     TopologyBuilder::new("kafka-sr-outage-silent").dlq().build()
+);
+shove::define_topic!(
+    AssignStallTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-assign").dlq().build()
+);
+shove::define_topic!(
+    BatchRewindPutBackTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-batch-rewind-putback")
+        .dlq()
+        .build()
 );
 // An infra-owned topic, so a `Defer` waits in place and decodes the retained
 // bytes again: the registry is asked a second time for the same record.
@@ -815,22 +904,61 @@ impl RetryTwiceRecorder {
     }
 }
 
-impl BatchMessageHandler<BatchRetryStallTopic> for RetryTwiceRecorder {
-    type Context = ();
-    async fn handle_batch(&self, messages: Vec<(Event, MessageMetadata)>, _: &()) -> Outcome {
-        let ids: Vec<u32> = messages.iter().map(|(m, _)| m.id).collect();
-        let flushes = {
-            let mut batches = self.batches.lock().unwrap();
-            batches.push(ids.clone());
-            batches.len()
-        };
-        self.counter.increment();
-        if flushes <= 2 {
-            Outcome::Retry
-        } else {
-            self.acked.lock().unwrap().extend(ids);
-            Outcome::Ack
+macro_rules! retry_twice_for {
+    ($($topic:ty),+ $(,)?) => {$(
+        impl BatchMessageHandler<$topic> for RetryTwiceRecorder {
+            type Context = ();
+            async fn handle_batch(&self, messages: Vec<(Event, MessageMetadata)>, _: &()) -> Outcome {
+                let ids: Vec<u32> = messages.iter().map(|(m, _)| m.id).collect();
+                let flushes = {
+                    let mut batches = self.batches.lock().unwrap();
+                    batches.push(ids.clone());
+                    batches.len()
+                };
+                self.counter.increment();
+                if flushes <= 2 {
+                    Outcome::Retry
+                } else {
+                    self.acked.lock().unwrap().extend(ids);
+                    Outcome::Ack
+                }
+            }
         }
+    )+};
+}
+
+retry_twice_for!(BatchRetryStallTopic, BatchRewindPutBackTopic);
+
+/// Records every delivery as `(id, partition)`, so a test can tell which
+/// member of a group holds which partition.
+#[derive(Clone)]
+struct PartitionRecorder {
+    seen: Arc<Mutex<Vec<(u32, i32)>>>,
+    counter: WaitableCounter,
+}
+
+impl PartitionRecorder {
+    fn new() -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            counter: WaitableCounter::new(),
+        }
+    }
+
+    fn seen(&self) -> Vec<(u32, i32)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl MessageHandler<AssignStallTopic> for PartitionRecorder {
+    type Context = ();
+    async fn handle(&self, msg: Event, meta: MessageMetadata, _: &()) -> Outcome {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((msg.id, meta.partition.expect("Kafka fills the partition")));
+        self.counter.increment();
+        Outcome::Ack
     }
 }
 
@@ -1495,4 +1623,210 @@ async fn shutdown_during_a_registry_lookup_returns_promptly() {
         Vec::<u32>::new(),
         "nothing reached the handler"
     );
+}
+
+/// A partition the group assigns to a member during a registry stall may
+/// deliver a record into the stall's `recv()`. That record is put back and
+/// the pause widened, so it arrives again, in order, once the wait ends;
+/// without the put-back the consumed position has moved past it, a resume
+/// does not refetch it, and the record is skipped for good.
+#[tokio::test]
+async fn a_partition_assigned_during_a_registry_stall_is_put_back_and_delivered_after_it() {
+    const TOPIC: &str = "kafka-sr-outage-assign";
+    const GROUP: &str = "kafka-sr-outage-assign-consumer";
+    let tb = TestBroker::start().await;
+    create_topic(&tb.brokers, TOPIC, 2).await;
+    let (registry, status, hits) = mock_registry("kafka-sr-outage-assign-value", 200).await;
+    let client = tb.client().await;
+    let body = |id: u32| serde_json::to_vec(&Event { id }).unwrap();
+
+    // Two members of one group, one partition each.
+    let mut members = Vec::new();
+    for _ in 0..2 {
+        let recorder = PartitionRecorder::new();
+        let shutdown = CancellationToken::new();
+        let (h, sc, reg) = (recorder.clone(), shutdown.clone(), registry.clone());
+        let consumer = KafkaConsumer::new(tb.client().await);
+        let handle = tokio::spawn(async move {
+            consumer
+                .run::<AssignStallTopic, _>(
+                    h,
+                    (),
+                    ConsumerOptions::<Kafka>::new()
+                        .with_concurrent_processing(false)
+                        .with_schema_registry(reg)
+                        .with_shutdown(sc),
+                )
+                .await
+        });
+        members.push((recorder, shutdown, handle));
+    }
+    wait_for_group_members(&tb.brokers, GROUP, 2, TIMEOUT).await;
+
+    // One healthy record per partition says which member holds partition 0.
+    for partition in 0..2i32 {
+        publish_raw_to(
+            &tb.brokers,
+            TOPIC,
+            partition,
+            &frame_json(HEALTHY_ID, &body(10 + partition as u32)),
+        )
+        .await;
+    }
+    let deadline = Instant::now() + TIMEOUT;
+    while members
+        .iter()
+        .map(|(r, _, _)| r.seen().len())
+        .sum::<usize>()
+        < 2
+    {
+        assert!(
+            Instant::now() < deadline,
+            "both healthy records must be delivered"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let holds_zero = members
+        .iter()
+        .position(|(r, _, _)| r.seen().iter().any(|(_, p)| *p == 0))
+        .expect("one member holds partition 0");
+    let other = 1 - holds_zero;
+    let after_healthy = hits.load(Ordering::SeqCst);
+
+    // The member on partition 0 stalls on a record the registry cannot answer for.
+    status.store(503, Ordering::SeqCst);
+    publish_raw_to(&tb.brokers, TOPIC, 0, &frame_json(FLAKY_ID, &body(1))).await;
+    wait_for_hits_above(&hits, after_healthy, TIMEOUT).await;
+
+    // The other member leaves, so the group hands partition 1 to the stalled
+    // member during its wait, and a record lands on it.
+    members[other].1.cancel();
+    (&mut members[other].2)
+        .await
+        .expect("member task panicked")
+        .expect("the leaving member ends cleanly");
+    wait_for_group_members(&tb.brokers, GROUP, 1, TIMEOUT).await;
+    publish_raw_to(&tb.brokers, TOPIC, 1, &frame_json(HEALTHY_ID, &body(2))).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        members[holds_zero].0.seen().len(),
+        1,
+        "nothing new is handled while the member waits on the registry"
+    );
+    assert_eq!(
+        lag(&client, TOPIC, GROUP).await,
+        2,
+        "the stalled record and the put-back record stay uncommitted"
+    );
+
+    status.store(200, Ordering::SeqCst);
+    assert!(
+        members[holds_zero].0.counter.wait_for(3, TIMEOUT).await,
+        "the stalled record and then the put-back record are delivered"
+    );
+    let seen = members[holds_zero].0.seen();
+    assert_eq!(
+        &seen[1..],
+        &[(1, 0), (2, 1)],
+        "the stalled record first, then the record from the partition assigned during the wait"
+    );
+    wait_for_lag(&client, TOPIC, GROUP, 0, TIMEOUT).await;
+
+    members[holds_zero].1.cancel();
+    (&mut members[holds_zero].2)
+        .await
+        .expect("member task panicked")
+        .expect("the stalled member ends cleanly");
+}
+
+/// On the batch path a `Retry` ahead of a stall rewinds the flushed span.
+/// A stalled record on a partition outside that span must be put back too:
+/// otherwise the copy in hand is dropped at the rewound check and, with its
+/// partition never sought back, the record is skipped for good.
+#[tokio::test]
+async fn a_stalled_record_on_another_partition_is_put_back_behind_a_rewound_span() {
+    const TOPIC: &str = "kafka-sr-outage-batch-rewind-putback";
+    const GROUP: &str = "kafka-sr-outage-batch-rewind-putback-consumer";
+    let tb = TestBroker::start().await;
+    create_topic(&tb.brokers, TOPIC, 2).await;
+    let (registry, status, hits) =
+        mock_registry("kafka-sr-outage-batch-rewind-putback-value", 503).await;
+    let client = tb.client().await;
+    let body = |id: u32| serde_json::to_vec(&Event { id }).unwrap();
+    // Two healthy records under two schema ids on partition 0, so the barrier
+    // below can count both resolutions.
+    publish_raw_to(&tb.brokers, TOPIC, 0, &frame_json(HEALTHY_ID, &body(1))).await;
+    publish_raw_to(&tb.brokers, TOPIC, 0, &frame_json(HEALTHY_ID + 1, &body(2))).await;
+
+    let handler = RetryTwiceRecorder::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<BatchRewindPutBackTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(3)
+                    .with_max_batch_age(Duration::from_secs(5))
+                    .with_schema_registry(registry)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    // Barrier: both healthy ids resolved, two requests each, so records 1
+    // and 2 are decoded and buffered before the stalled record arrives.
+    // Without it record 3 can arrive first into an empty buffer, and neither
+    // the flush nor the put-back runs.
+    wait_for_hits_above(&hits, 3, TIMEOUT).await;
+    publish_raw_to(&tb.brokers, TOPIC, 1, &frame_json(FLAKY_ID, &body(3))).await;
+
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the records ahead of the stalled one flush first"
+    );
+    assert_eq!(handler.batches.lock().unwrap().clone(), vec![vec![1, 2]]);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        lag(&client, TOPIC, GROUP).await,
+        3,
+        "nothing is committed during the stall"
+    );
+
+    status.store(200, Ordering::SeqCst);
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "the rewound span and the put-back record are redelivered, twice"
+    );
+    wait_for_lag(&client, TOPIC, GROUP, 0, TIMEOUT).await;
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task panicked")
+        .expect("consumer ended cleanly");
+
+    let batches = handler.batches.lock().unwrap().clone();
+    assert_eq!(
+        batches[0],
+        vec![1, 2],
+        "the first flush is the span ahead of the stall"
+    );
+    assert_eq!(batches.len(), 3, "two redeliveries follow");
+    for batch in &batches[1..] {
+        let mut sorted = batch.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            vec![1, 2, 3],
+            "every later batch holds the rewound records and the put-back record: {batches:?}"
+        );
+    }
+    let mut acked = handler.acked.lock().unwrap().clone();
+    acked.sort_unstable();
+    assert_eq!(acked, vec![1, 2, 3]);
+    assert_eq!(committed_offset(&tb.brokers, GROUP, TOPIC, 0), Some(2));
+    assert_eq!(committed_offset(&tb.brokers, GROUP, TOPIC, 1), Some(1));
 }
