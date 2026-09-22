@@ -552,4 +552,26 @@ mod tests {
         let registry = QueueRegistry::new();
         assert_eq!(registry.get("nonexistent").await, None);
     }
+
+    /// `external()` is refused before any request is made: this declarer
+    /// owns an SNS topic, a queue policy and a subscription as well as the
+    /// queue, and verifies none of them yet. The mock client reaches no AWS
+    /// endpoint, so a refusal that came after a request would surface as a
+    /// transport error instead of `Topology`.
+    #[cfg(feature = "aws-sns-sqs")]
+    #[tokio::test]
+    async fn declare_refuses_an_external_topology_before_any_request() {
+        let topology = TopologyBuilder::new("infra-orders").external().build();
+        let err = SnsTopologyDeclarer::new(SnsClient::mock())
+            .declare(&topology)
+            .await
+            .expect_err("external() must be refused on AWS SNS/SQS");
+        let ShoveError::Topology(msg) = err else {
+            panic!("expected ShoveError::Topology, got {err:?}");
+        };
+        assert!(msg.contains("infra-orders"), "{msg}");
+        assert!(msg.contains("external()"), "{msg}");
+        assert!(msg.contains("AWS SNS/SQS"), "{msg}");
+        assert!(msg.contains("GetQueueUrl"), "{msg}");
+    }
 }

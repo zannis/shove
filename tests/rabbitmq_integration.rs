@@ -9,7 +9,8 @@
 //!
 //! Run with: `cargo test --features rabbitmq,audit --test rabbitmq_integration`
 
-use lapin::options::BasicPublishOptions;
+use lapin::options::{BasicPublishOptions, QueueDeclareOptions};
+use lapin::types::FieldTable;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
 use shove::handler::MessageHandler;
@@ -6394,5 +6395,56 @@ async fn direct_and_fifo_entry_points_refuse_a_broadcast_start() {
             && msg.contains("with_broadcast_start(Tail)")
             && msg.contains("RabbitMqConsumer::run_fifo"),
         "the error names the topic, the start and the entry point: {msg}"
+    );
+}
+
+define_topic!(
+    ExternalWork,
+    SimpleMessage,
+    TopologyBuilder::new("test-external").external().build()
+);
+
+/// `external()` is refused at `declare` on RabbitMQ, which verifies no
+/// infra-owned queue yet: a `queue.declare` would be the write the flag
+/// promises never to make. The refusal comes before that frame, so a passive
+/// declare on a fresh channel afterwards finds no such queue.
+#[tokio::test]
+async fn declaring_an_external_topology_is_refused_before_any_queue_exists() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+
+    let err = b
+        .topology()
+        .declare::<ExternalWork>()
+        .await
+        .expect_err("external() must be refused on RabbitMQ");
+    let ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("test-external")
+            && msg.contains("external()")
+            && msg.contains("RabbitMQ")
+            && msg.contains("passive"),
+        "the error names the topic, the flag, the backend and the missing step: {msg}"
+    );
+
+    // A passive declare only checks that the queue exists; it fails, and
+    // closes the channel, when it does not.
+    let channel = client.create_channel().await.unwrap();
+    let passive = channel
+        .queue_declare(
+            "test-external".into(),
+            QueueDeclareOptions {
+                passive: true,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await;
+    assert!(
+        passive.is_err(),
+        "the refused declare created no queue, so a passive declare must fail: {passive:?}"
     );
 }

@@ -5448,3 +5448,54 @@ async fn direct_and_fifo_entry_points_refuse_a_broadcast_start() {
         "the error names the topic, the start and the entry point: {msg}"
     );
 }
+
+struct ExternalLedgerTopic;
+impl Topic for ExternalLedgerTopic {
+    type Message = Event;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-external")
+                .external()
+                .build()
+        })
+    }
+}
+
+/// `external()` is refused at `declare` on Redis Streams, which verifies no
+/// infra-owned stream yet: `XGROUP CREATE ... MKSTREAM` would create the
+/// stream the flag promises never to touch. The refusal comes before that
+/// command, so the key does not exist afterwards.
+#[tokio::test]
+async fn declaring_an_external_topology_is_refused_before_any_stream_exists() {
+    let broker = make_broker("redis-int-external-grp").await;
+    let err = broker
+        .topology()
+        .declare::<ExternalLedgerTopic>()
+        .await
+        .expect_err("external() must be refused on Redis Streams");
+    let ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("redis-int-external")
+            && msg.contains("external()")
+            && msg.contains("Redis Streams")
+            && msg.contains("EXISTS"),
+        "the error names the topic, the flag, the backend and the missing step: {msg}"
+    );
+
+    let url = redis_url().await;
+    let probe_client = redis::Client::open(url).expect("raw client");
+    let mut probe = probe_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("probe conn");
+    let exists: i64 = redis::cmd("EXISTS")
+        .arg("redis-int-external")
+        .query_async(&mut probe)
+        .await
+        .expect("EXISTS");
+    assert_eq!(exists, 0, "the refused declare created no stream");
+}
