@@ -638,6 +638,7 @@ impl NatsConsumer {
     {
         let topology = T::topology();
         let queue = topology.queue();
+        options.refuse_broadcast_start(queue, "NatsConsumer::run")?;
         // All tasks in a consumer group bind to the same durable consumer name;
         // the JetStream server load-balances messages across them. The registry
         // pre-configures this consumer with an aggregate `max_ack_pending` so
@@ -1015,6 +1016,7 @@ impl NatsConsumer {
     {
         let topology = T::topology();
         let queue = topology.queue();
+        options.refuse_broadcast_start(queue, "NatsConsumer::run_fifo")?;
         let seq_config = topology
             .sequencing()
             .expect("run_fifo requires a sequenced topology");

@@ -261,6 +261,7 @@ impl ConsumerImpl for RedisConsumer {
     {
         let client = self.client.clone();
         async move {
+            options.refuse_broadcast_start(T::topology().queue(), "RedisConsumer::run")?;
             // `ConsumerOptions::into_inner` pins `prefetch_count` to 1 when
             // `concurrent_processing` is off, so a prefetch above 1 is the
             // caller asking for concurrent dispatch: the same rule the group
@@ -362,6 +363,7 @@ impl ConsumerImpl for RedisConsumer {
         let client = self.client.clone();
         async move {
             let topology = T::topology();
+            options.refuse_broadcast_start(topology.queue(), "RedisConsumer::run_fifo")?;
             let seq = topology.sequencing().ok_or_else(|| {
                 ShoveError::Topology(format!(
                     "spawn_fifo_shards called on topic {} without sequencing config",

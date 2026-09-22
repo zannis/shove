@@ -772,7 +772,10 @@ impl ConsumerOptions<Kafka> {
     /// Read by the direct and supervisor paths. For the coordinated registry
     /// path the equivalent is
     /// [`KafkaConsumerGroupConfig::with_auto_offset_reset`](crate::kafka::KafkaConsumerGroupConfig::with_auto_offset_reset),
-    /// which wins there exactly as `with_group_id` does.
+    /// which wins there exactly as `with_group_id` does. A broadcast
+    /// subscription refuses it at `subscribe()`: it assigns every partition
+    /// at an explicit offset and never consults the policy, and its start is
+    /// [`with_broadcast_start`](Self::with_broadcast_start).
     pub fn with_auto_offset_reset(mut self, reset: KafkaAutoOffsetReset) -> Self {
         self.kafka_auto_offset_reset = Some(reset);
         self
@@ -787,6 +790,8 @@ impl ConsumerOptions<Kafka> {
     /// final commit at shutdown is synchronous whatever the interval. For the
     /// coordinated registry path the equivalent is
     /// [`KafkaConsumerGroupConfig::with_commit_interval`](crate::kafka::KafkaConsumerGroupConfig::with_commit_interval).
+    /// A FIFO consumer and a broadcast subscription refuse it at their entry
+    /// points, because neither commits on an interval.
     ///
     /// # Panics
     ///

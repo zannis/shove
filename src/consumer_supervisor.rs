@@ -273,6 +273,8 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
                  would silently drop FIFO ordering. Use `register_fifo` instead."
             )));
         }
+        let inner = options.with_shutdown(self.shutdown.clone()).into_inner();
+        inner.refuse_broadcast_start(queue, "ConsumerSupervisor::register")?;
         if !self.registered.insert(queue) {
             return Err(ShoveError::Topology(format!(
                 "topic '{queue}' is already registered on this supervisor"
@@ -280,7 +282,6 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
         }
         let consumer = self.consumer.clone();
         let ctx = self.ctx.clone();
-        let inner = options.with_shutdown(self.shutdown.clone()).into_inner();
         self.tasks
             .spawn(async move { consumer.run::<T, H>(handler, ctx, inner).await });
         Ok(())
@@ -341,13 +342,14 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
                  unsequenced topics, or add `.sequenced(...)` to the topology."
             )));
         }
+        let inner = options.with_shutdown(self.shutdown.clone()).into_inner();
+        inner.refuse_broadcast_start(queue, "ConsumerSupervisor::register_fifo")?;
         if !self.registered.insert(queue) {
             return Err(ShoveError::Topology(format!(
                 "topic '{queue}' is already registered on this supervisor"
             )));
         }
         let ctx = self.ctx.clone();
-        let inner = options.with_shutdown(self.shutdown.clone()).into_inner();
         let handles = self
             .consumer
             .spawn_fifo_shards::<T, H>(handler, ctx, inner)
@@ -733,6 +735,69 @@ mod inmemory_tests {
             }
             other => panic!("expected Topology error, got {other:?}"),
         }
+    }
+
+    /// `with_broadcast_start` is read by `BroadcastSubscriber::subscribe`
+    /// alone. The supervisor refuses it at registration, synchronously, and
+    /// leaves the topic registrable with fixed options.
+    #[tokio::test]
+    async fn supervisor_register_rejects_broadcast_start() {
+        use crate::broadcast::BroadcastStart;
+
+        let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+            .await
+            .expect("broker");
+        broker.topology().declare::<Notes>().await.expect("declare");
+
+        let mut sup = broker.consumer_supervisor();
+        let err = sup
+            .register::<Notes, _>(
+                NoteHandler,
+                ConsumerOptions::<InMemory>::new().with_broadcast_start(BroadcastStart::Head),
+            )
+            .expect_err("a set broadcast start must be refused at register");
+        let ShoveError::Topology(msg) = err else {
+            panic!("expected ShoveError::Topology, got {err:?}");
+        };
+        assert!(msg.contains("supervisor-notes-test"), "{msg}");
+        assert!(msg.contains("with_broadcast_start(Head)"), "{msg}");
+        assert!(msg.contains("ConsumerSupervisor::register"), "{msg}");
+
+        sup.register::<Notes, _>(NoteHandler, ConsumerOptions::<InMemory>::new())
+            .expect("a refused register leaves the topic free to register again");
+    }
+
+    #[tokio::test]
+    async fn supervisor_register_fifo_rejects_broadcast_start() {
+        use crate::broadcast::BroadcastStart;
+
+        let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+            .await
+            .expect("broker");
+        broker
+            .topology()
+            .declare::<Ledger>()
+            .await
+            .expect("declare");
+
+        let mut sup = broker.consumer_supervisor();
+        let err = sup
+            .register_fifo::<Ledger, _>(
+                NoopHandler,
+                ConsumerOptions::<InMemory>::new().with_broadcast_start(BroadcastStart::Tail),
+            )
+            .await
+            .expect_err("a set broadcast start must be refused at register_fifo");
+        let ShoveError::Topology(msg) = err else {
+            panic!("expected ShoveError::Topology, got {err:?}");
+        };
+        assert!(msg.contains("supervisor-ledger-test"), "{msg}");
+        assert!(msg.contains("with_broadcast_start(Tail)"), "{msg}");
+        assert!(msg.contains("ConsumerSupervisor::register_fifo"), "{msg}");
+
+        sup.register_fifo::<Ledger, _>(NoopHandler, ConsumerOptions::<InMemory>::new())
+            .await
+            .expect("a refused register_fifo leaves the topic free to register again");
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use crate::consumer::{
     DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
     validate_message_size,
 };
-use crate::error::Result;
+use crate::error::{Result, ShoveError};
 use crate::outcome::Outcome;
 #[cfg(feature = "kafka-schema-registry")]
 use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
@@ -150,6 +150,27 @@ impl ConsumerOptionsInner {
 }
 
 impl ConsumerOptionsInner {
+    /// Refuse a set [`BroadcastStart`] at an entry point that never reads it.
+    ///
+    /// `with_broadcast_start` is read by `BroadcastSubscriber::subscribe`
+    /// alone: a competing consumer starts at its committed position, so the
+    /// direct, FIFO, DLQ and supervisor paths would drop the setting
+    /// silently. They call this first instead, so the mistake is a
+    /// `Topology` error at the call site, the same rule the FIFO consumer
+    /// applies to a commit interval. `entry_point` names the caller in the
+    /// message.
+    pub(crate) fn refuse_broadcast_start(&self, queue: &str, entry_point: &str) -> Result<()> {
+        match self.broadcast_start {
+            None => Ok(()),
+            Some(start) => Err(ShoveError::Topology(format!(
+                "topic '{queue}': `with_broadcast_start({start:?})` applies only to \
+                 `BroadcastSubscriber::subscribe`; `{entry_point}` never reads it, because a \
+                 competing consumer starts at its committed position. Drop the call, or \
+                 subscribe through `broker.broadcast_subscriber()`."
+            ))),
+        }
+    }
+
     /// Returns `Ok(())` if the payload is within the configured
     /// `max_message_size`, or an error if it exceeds the limit. Always
     /// succeeds when no limit is set.

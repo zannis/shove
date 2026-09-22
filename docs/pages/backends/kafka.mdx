@@ -238,6 +238,8 @@ subscriber.subscribe::<CacheInvalidations, _>(
 ```
 
 `BroadcastStart` is backend-neutral, and Kafka is the backend that honours all three variants on this version.
+A broadcast subscription refuses `with_commit_interval` and `with_auto_offset_reset` at `subscribe()`: it commits nothing and assigns every partition at an explicit offset, so neither setting would change anything, and a setting that changes nothing is refused rather than dropped.
+The competing-consumer entry points refuse `with_broadcast_start` for the same reason.
 
 - **`BroadcastStart::Tail`**, and no call at all - every partition at its end offset: deliver-new, the broadcast contract.
 - **`BroadcastStart::Head`** - every partition at its beginning, so a fresh instance replays the retained log before it tails.

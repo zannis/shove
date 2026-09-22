@@ -446,6 +446,9 @@ NATS, Redis, RabbitMQ and the in-process broker start at the tail only on this v
 Mapping `Head` and `Timestamp` onto `DeliverPolicy::All`, `DeliverPolicy::ByStartTime` and a Redis id is a later step, and needs a checked conversion for the NATS `OffsetDateTime`.
 The timestamp unit is Unix epoch milliseconds on every backend, the unit `KafkaOffsetReset::Timestamp` already documents.
 `KafkaOffsetReset` stays the type of `reset_consumer_group_offsets` and no longer names the broadcast start.
+The refusal policy is the FIFO consumer's, applied to every knob an entry point never reads.
+The Kafka broadcast subscription refuses `with_commit_interval` and `with_auto_offset_reset` in `check_options`, because it commits nothing and assigns every partition at an explicit offset.
+Every competing-consumer entry point refuses a set `broadcast_start` through `ConsumerOptionsInner::refuse_broadcast_start`: `ConsumerSupervisor::register` and `register_fifo` generically, and each backend's direct, FIFO and DLQ paths, so a caller meets the same `Topology` error whichever way it starts a consumer.
 
 Kafka backend:
 
@@ -476,6 +479,8 @@ Tests:
 - Unit, `consumer.rs`: the error classifier ignores `GroupAuthorizationFailed` and passes every other code through.
 - Unit, `src/consumer.rs`: `with_broadcast_start` propagates through `into_inner`, modelled on `kafka_with_group_id_propagates_through_into_inner` (`:1044-1050`).
 - Integration, `tests/inmemory_broadcast.rs`: `broadcast_start_is_refused_by_a_backend_that_cannot_honour_it` asserts the synchronous `Topology` error from `subscribe()` for `Head` and `Timestamp`, and that `Tail` is then accepted on the same handle.
+- Unit, `kafka/consumer.rs`: `run_rejects_broadcast_start` and `run_fifo_rejects_broadcast_start` against a client that never connects, and `broadcast_subscribe_rejects_commit_interval` and `broadcast_subscribe_rejects_auto_offset_reset` on `check_broadcast_options`, with a negative control that admits every start and the inert group id.
+- Unit, `src/consumer_supervisor.rs`: `supervisor_register_rejects_broadcast_start` and `supervisor_register_fifo_rejects_broadcast_start` on the in-process broker, each proving the topic stays registrable after the refusal.
 - Integration, `tests/kafka_broadcast_integration.rs`, three new tests.
   `broadcast_starts_from_the_head_when_asked` publishes before subscribing, subscribes with `Head`, and receives everything.
   `broadcast_starts_at_a_timestamp` publishes two batches around a captured timestamp, subscribes with `Timestamp`, and receives only the second.

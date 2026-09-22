@@ -3257,6 +3257,10 @@ impl KafkaConsumer {
     {
         let topology = T::topology();
         let queue = topology.queue();
+        // The direct and supervisor paths reach this function without the
+        // subscriber's check, so a knob only the broadcast loop reads is
+        // refused here rather than dropped.
+        options.refuse_broadcast_start(queue, "KafkaConsumer::run")?;
         // Precedence: explicit `with_group_id` > the topology's fan-out group
         // (`{queue}-{group}-consumer`) > the topic default `{queue}-consumer`.
         let group_id = options
@@ -4272,9 +4276,10 @@ impl KafkaConsumer {
             ))
         })?;
         // The direct and supervisor paths reach this function without the
-        // registry's own check, so the refusal lives here: every FIFO entry
+        // registry's own check, so the refusals live here: every FIFO entry
         // point then fails the same way on a setting the FIFO loop would
         // never read.
+        options.refuse_broadcast_start(&queue, "KafkaConsumer::run_fifo")?;
         if options.kafka_commit_interval.is_some() {
             return Err(reject_fifo_commit_interval(&queue));
         }
@@ -4846,8 +4851,29 @@ impl KafkaConsumer {
     /// The Kafka half of `BroadcastImpl::check_options`: what a broadcast
     /// subscription refuses at `subscribe()`, before its loop is spawned.
     ///
-    /// Every [`BroadcastStart`] is honoured here, so none is refused.
-    pub(crate) fn check_broadcast_options(_queue: &str, _options: &ConsumerOptions) -> Result<()> {
+    /// Every [`BroadcastStart`] is honoured here, so none is refused. The
+    /// two group knobs are: the loop commits nothing, so a commit interval
+    /// would be read by nothing, and it assigns every partition at an
+    /// explicit offset, so librdkafka never consults `auto.offset.reset`.
+    /// The FIFO consumer already refuses a commit interval on the same
+    /// ground, and a setting that changes nothing is refused rather than
+    /// dropped.
+    pub(crate) fn check_broadcast_options(queue: &str, options: &ConsumerOptions) -> Result<()> {
+        if options.kafka_commit_interval.is_some() {
+            return Err(ShoveError::Topology(format!(
+                "topic '{queue}' is a broadcast topology; `with_commit_interval` does not \
+                 apply to a broadcast subscription, which commits nothing. Drop \
+                 `with_commit_interval(..)`."
+            )));
+        }
+        if options.kafka_auto_offset_reset.is_some() {
+            return Err(ShoveError::Topology(format!(
+                "topic '{queue}' is a broadcast topology; `with_auto_offset_reset` does not \
+                 apply to a broadcast subscription, which assigns every partition at an \
+                 explicit offset and never consults `auto.offset.reset`. Drop \
+                 `with_auto_offset_reset(..)` and set the start with `with_broadcast_start`."
+            )));
+        }
         Ok(())
     }
 
@@ -5336,6 +5362,7 @@ impl KafkaConsumer {
         let dlq = topology.dlq().ok_or_else(|| {
             ShoveError::Topology("run_dlq requires a DLQ to be configured".into())
         })?;
+        options.refuse_broadcast_start(topology.queue(), "KafkaConsumer::run_dlq")?;
 
         // Honor the `group.id` override (set via
         // `ConsumerOptions::<Kafka>::with_group_id`) by rebasing the DLQ group
@@ -6852,6 +6879,173 @@ mod error_classifier_tests {
             map_kafka_error("recv", e),
             ShoveError::Connection(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod broadcast_option_guard_tests {
+    use super::*;
+    use crate::broadcast::BroadcastStart;
+    use crate::topology::{SequenceFailure, TopologyBuilder};
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct Entry {
+        account: String,
+    }
+
+    struct Plain;
+    impl Topic for Plain {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("broadcast-option-guard-plain").build())
+        }
+    }
+    impl NotSequenced for Plain {}
+
+    struct Ledger;
+    impl Topic for Ledger {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| {
+                TopologyBuilder::new("broadcast-option-guard-ledger")
+                    .sequenced(SequenceFailure::FailAll)
+                    .hold_queue(Duration::from_secs(5))
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+    impl SequencedTopic for Ledger {
+        fn sequence_key(msg: &Entry) -> String {
+            msg.account.clone()
+        }
+    }
+
+    struct NoopHandler;
+    impl<T: Topic<Message = Entry>> MessageHandler<T> for NoopHandler {
+        type Context = ();
+        async fn handle(&self, _: Entry, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    async fn consumer() -> KafkaConsumer {
+        // Port 1 is never listening; every guard returns before any I/O, and
+        // the reconnect budget of one bounds the unfixed path to one refused
+        // connection instead of an endless reconnect loop.
+        let client = KafkaClient::connect(&super::super::client::KafkaConfig::new("127.0.0.1:1"))
+            .await
+            .expect("client construction is lazy");
+        KafkaConsumer::new(client)
+    }
+
+    fn topology_message(err: ShoveError) -> String {
+        match err {
+            ShoveError::Topology(msg) => msg,
+            other => panic!("expected ShoveError::Topology, got {other:?}"),
+        }
+    }
+
+    /// `with_broadcast_start` is read by `BroadcastSubscriber::subscribe`
+    /// alone. The direct path refuses it, at the same fail-fast point where
+    /// the FIFO path refuses a commit interval, rather than starting a group
+    /// consumer at its committed offset with the setting silently dropped.
+    #[tokio::test]
+    async fn run_rejects_broadcast_start() {
+        let err = consumer()
+            .await
+            .run::<Plain, _>(
+                NoopHandler,
+                (),
+                crate::ConsumerOptions::<Kafka>::new()
+                    .with_broadcast_start(BroadcastStart::Head)
+                    .with_max_reconnect_attempts(1)
+                    .with_shutdown(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a set broadcast start must be refused on the direct path");
+        let msg = topology_message(err);
+        assert!(msg.contains("broadcast-option-guard-plain"), "{msg}");
+        assert!(msg.contains("with_broadcast_start(Head)"), "{msg}");
+        assert!(msg.contains("KafkaConsumer::run"), "{msg}");
+    }
+
+    /// The FIFO path refuses it too, from `spawn_fifo_shards`, so the direct,
+    /// supervisor and registry FIFO entry points all fail alike.
+    #[tokio::test]
+    async fn run_fifo_rejects_broadcast_start() {
+        let err = consumer()
+            .await
+            .run_fifo::<Ledger, _>(
+                NoopHandler,
+                (),
+                crate::ConsumerOptions::<Kafka>::new()
+                    .with_broadcast_start(BroadcastStart::Tail)
+                    .with_max_reconnect_attempts(1)
+                    .with_shutdown(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a set broadcast start must be refused on the FIFO path");
+        let msg = topology_message(err);
+        assert!(msg.contains("broadcast-option-guard-ledger"), "{msg}");
+        assert!(msg.contains("with_broadcast_start(Tail)"), "{msg}");
+        assert!(msg.contains("KafkaConsumer::run_fifo"), "{msg}");
+    }
+
+    /// A broadcast subscription commits nothing, so a commit interval would
+    /// be read by nothing: refused at `subscribe()`, the FIFO policy.
+    #[test]
+    fn broadcast_subscribe_rejects_commit_interval() {
+        let inner = crate::ConsumerOptions::<Kafka>::new()
+            .with_commit_interval(Duration::from_secs(5))
+            .into_inner();
+        let msg = topology_message(
+            KafkaConsumer::check_broadcast_options("cache-invalidations", &inner)
+                .expect_err("a commit interval must be refused on a broadcast subscription"),
+        );
+        assert!(msg.contains("cache-invalidations"), "{msg}");
+        assert!(msg.contains("with_commit_interval"), "{msg}");
+        assert!(msg.contains("broadcast"), "{msg}");
+    }
+
+    /// Every partition is assigned at an explicit offset, so librdkafka never
+    /// consults `auto.offset.reset`: the setting is refused, and the error
+    /// points at the knob that does decide where the subscription starts.
+    #[test]
+    fn broadcast_subscribe_rejects_auto_offset_reset() {
+        let inner = crate::ConsumerOptions::<Kafka>::new()
+            .with_auto_offset_reset(KafkaAutoOffsetReset::Latest)
+            .into_inner();
+        let msg = topology_message(
+            KafkaConsumer::check_broadcast_options("cache-invalidations", &inner)
+                .expect_err("auto.offset.reset must be refused on a broadcast subscription"),
+        );
+        assert!(msg.contains("cache-invalidations"), "{msg}");
+        assert!(msg.contains("with_auto_offset_reset"), "{msg}");
+        assert!(msg.contains("with_broadcast_start"), "{msg}");
+    }
+
+    /// Negative control: the options a broadcast subscription does read pass,
+    /// every start included, so the refusals above are conditional on the
+    /// knob and not on the check itself.
+    #[test]
+    fn broadcast_subscribe_admits_every_start_and_the_group_id() {
+        for start in [
+            BroadcastStart::Tail,
+            BroadcastStart::Head,
+            BroadcastStart::Timestamp(1_700_000_000_000),
+        ] {
+            let inner = crate::ConsumerOptions::<Kafka>::new()
+                .with_broadcast_start(start)
+                .with_group_id("cache-invalidations-broadcast")
+                .into_inner();
+            KafkaConsumer::check_broadcast_options("cache-invalidations", &inner)
+                .expect("the start and the inert group id are read by the broadcast loop");
+        }
     }
 }
 
