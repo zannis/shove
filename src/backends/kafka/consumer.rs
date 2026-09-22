@@ -948,6 +948,27 @@ pub mod completion_probe {
     }
 }
 
+/// Runs a decode until it answers or `shutdown` fires, whichever comes
+/// first. `None` means shutdown fired.
+///
+/// A registry lookup can take the client's timeout and retries to fail,
+/// about twenty seconds with the defaults, and a shutdown that landed
+/// meanwhile used to wait all of it out. Dropping the request future here
+/// takes this waiter off the registry client's single-flight entry (see
+/// `SchemaRegistry::resolve`), and a fetch nobody waits on any more is
+/// dropped with it. Each caller decides what its loop does next; every one
+/// leaves the record in hand uncommitted.
+async fn decode_or_shutdown<F, T>(decode: F, shutdown: &CancellationToken) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => None,
+        out = decode => Some(out),
+    }
+}
+
 /// The wait a consume loop performs while the schema registry cannot answer
 /// for the record in hand.
 ///
@@ -1666,10 +1687,12 @@ where
             RetryDecision::Hold { increment } => increment,
         };
         let delay = in_place_delay(hold_queues, attempts, increment);
-        {
-            // Counted for the delay only: the receive loop pauses its
-            // assignment for permits held by *waiting* handlers, not for
-            // ones that are running.
+        // Counted from the delay through the decode and any registry wait,
+        // and uncounted before the handler runs: the receive loop pauses its
+        // assignment for permits held by *waiting* handlers, not by running
+        // ones, and a task waiting on the registry is waiting, not running.
+        // The guard drops on every exit path, a shutdown mid-wait included.
+        let message = {
             let _waiting = InPlaceWait::begin(waiters);
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
@@ -1682,38 +1705,47 @@ where
                     return InPlaceEnd::Cancelled;
                 }
             }
-        }
-        if increment {
-            attempts += 1;
-        }
-        // Loops only through the registry wait arm, which the
-        // `kafka-schema-registry` feature adds.
-        #[allow(clippy::never_loop)]
-        let message = loop {
-            match decode_batch_message::<T>(decode, payload).await {
-                BatchDecode::Decoded(m) => break m,
-                BatchDecode::Dlq { reason, fail } => {
-                    return InPlaceEnd::Undecodable { reason, fail };
-                }
-                // An outage during the redelivery: keep waiting on the same
-                // bytes, as the receive loop would.
-                #[cfg(feature = "kafka-schema-registry")]
-                BatchDecode::Unavailable { id, error } => {
-                    tracing::warn!(
-                        queue = topic,
-                        schema_id = %id,
-                        error = %error,
-                        retry_after = ?REGISTRY_RETRY_DELAY,
-                        "schema registry unavailable during an in-place redelivery; keeping the record"
-                    );
-                    metrics::record_failed(topic, group, metrics::FailReason::SchemaUnavailable);
-                    tokio::select! {
-                        _ = tokio::time::sleep(REGISTRY_RETRY_DELAY) => {}
-                        _ = shutdown.cancelled() => return InPlaceEnd::Cancelled,
+            if increment {
+                attempts += 1;
+            }
+            // Loops only through the registry wait arm, which the
+            // `kafka-schema-registry` feature adds.
+            #[allow(clippy::never_loop)]
+            loop {
+                let Some(decoded) =
+                    decode_or_shutdown(decode_batch_message::<T>(decode, payload), shutdown).await
+                else {
+                    return InPlaceEnd::Cancelled;
+                };
+                match decoded {
+                    BatchDecode::Decoded(m) => break m,
+                    BatchDecode::Dlq { reason, fail } => {
+                        return InPlaceEnd::Undecodable { reason, fail };
                     }
+                    // An outage during the redelivery: keep waiting on the same
+                    // bytes, as the receive loop would.
+                    #[cfg(feature = "kafka-schema-registry")]
+                    BatchDecode::Unavailable { id, error } => {
+                        tracing::warn!(
+                            queue = topic,
+                            schema_id = %id,
+                            error = %error,
+                            retry_after = ?REGISTRY_RETRY_DELAY,
+                            "schema registry unavailable during an in-place redelivery; keeping the record"
+                        );
+                        metrics::record_failed(
+                            topic,
+                            group,
+                            metrics::FailReason::SchemaUnavailable,
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(REGISTRY_RETRY_DELAY) => {}
+                            _ = shutdown.cancelled() => return InPlaceEnd::Cancelled,
+                        }
+                    }
+                    #[cfg(feature = "kafka-schema-registry")]
+                    BatchDecode::Fatal(e) => return InPlaceEnd::Fatal(e),
                 }
-                #[cfg(feature = "kafka-schema-registry")]
-                BatchDecode::Fatal(e) => return InPlaceEnd::Fatal(e),
             }
         };
         let mut metadata = build_message_metadata(headers, true, coordinates);
@@ -4459,14 +4491,22 @@ impl KafkaConsumer {
                                         // `RegistryStall`.
                                         let mut stall = RegistryStall::default();
                                         let staged = loop {
-                                            match registry_decode::<T::Message, T::Codec>(
-                                                registry,
-                                                fmt,
-                                                schema_enforcement,
-                                                &schema_accepted,
-                                                schema_message_index.as_deref(),
-                                                payload_slice,
-                                            ).await {
+                                            let Some(result) = decode_or_shutdown(
+                                                registry_decode::<T::Message, T::Codec>(
+                                                    registry,
+                                                    fmt,
+                                                    schema_enforcement,
+                                                    &schema_accepted,
+                                                    schema_message_index.as_deref(),
+                                                    payload_slice,
+                                                ),
+                                                &shutdown,
+                                            )
+                                            .await
+                                            else {
+                                                break Staged::Stop;
+                                            };
+                                            match result {
                                                 Ok(RegistryDecode::Decoded(m)) => break Staged::Ready(m),
                                                 Ok(RegistryDecode::Dlq(reason)) => break Staged::Drop(
                                                     metrics::FailReason::for_schema_reason(reason),
@@ -5186,7 +5226,30 @@ impl KafkaConsumer {
                                 // the `kafka-schema-registry` feature adds.
                                 #[allow(clippy::never_loop)]
                                 let decoded = loop {
-                                    match decode_batch_message::<T>(&decode_ctx, payload_slice).await {
+                                    let Some(decoded) = decode_or_shutdown(
+                                        decode_batch_message::<T>(&decode_ctx, payload_slice),
+                                        &shutdown,
+                                    )
+                                    .await
+                                    else {
+                                        // Shutdown fired mid-lookup. The record in
+                                        // hand stays uncommitted, and what came
+                                        // before it is flushed as the shutdown arm
+                                        // would flush it.
+                                        if !buffer.is_empty() {
+                                            flush_batch(
+                                                &flush_ctx,
+                                                handler.as_ref(),
+                                                ctx.as_ref(),
+                                                &mut buffer,
+                                                &mut redelivery_backoff,
+                                            )
+                                            .await?;
+                                        }
+                                        tracing::info!(queue, "shutdown signal received during a schema registry lookup, batch consumer stopped");
+                                        return Ok(());
+                                    };
+                                    match decoded {
                                         // The span must end before this record:
                                         // flush what came before it, then wait
                                         // for the registry. Nothing after it is
@@ -5663,14 +5726,22 @@ impl KafkaConsumer {
                                             // `RegistryStall`.
                                             let mut stall = RegistryStall::default();
                                             let staged = loop {
-                                                match registry_decode::<T::Message, T::Codec>(
-                                                    registry,
-                                                    fmt,
-                                                    schema_enforcement,
-                                                    &schema_accepted,
-                                                    schema_message_index.as_deref(),
-                                                    payload_bytes,
-                                                ).await {
+                                                let Some(result) = decode_or_shutdown(
+                                                    registry_decode::<T::Message, T::Codec>(
+                                                        registry,
+                                                        fmt,
+                                                        schema_enforcement,
+                                                        &schema_accepted,
+                                                        schema_message_index.as_deref(),
+                                                        payload_bytes,
+                                                    ),
+                                                    &shutdown,
+                                                )
+                                                .await
+                                                else {
+                                                    break Staged::Stop;
+                                                };
+                                                match result {
                                                     Ok(RegistryDecode::Decoded(m)) => break Staged::Ready(m),
                                                     Ok(RegistryDecode::Dlq(reason)) => break Staged::Drop(
                                                         metrics::FailReason::for_schema_reason(reason),
@@ -6345,16 +6416,22 @@ impl KafkaConsumer {
                                     // receive arm above does.
                                     let mut stall = RegistryStall::groupless();
                                     let staged = loop {
-                                        match registry_decode::<T::Message, T::Codec>(
-                                            registry,
-                                            fmt,
-                                            schema_enforcement,
-                                            &schema_accepted,
-                                            schema_message_index.as_deref(),
-                                            &payload,
+                                        let Some(result) = decode_or_shutdown(
+                                            registry_decode::<T::Message, T::Codec>(
+                                                registry,
+                                                fmt,
+                                                schema_enforcement,
+                                                &schema_accepted,
+                                                schema_message_index.as_deref(),
+                                                &payload,
+                                            ),
+                                            &shutdown,
                                         )
                                         .await
-                                        {
+                                        else {
+                                            break Staged::Stop;
+                                        };
+                                        match result {
                                             Ok(RegistryDecode::Decoded(m)) => break Staged::Ready(m),
                                             Ok(RegistryDecode::Dlq(reason)) => {
                                                 break Staged::Drop(
@@ -6528,7 +6605,15 @@ impl KafkaConsumer {
                             // the `kafka-schema-registry` feature adds.
                             #[allow(clippy::never_loop)]
                             let redelivered = loop {
-                                match decode_batch_message::<T>(&decode, &payload).await {
+                                let Some(decoded) = decode_or_shutdown(
+                                    decode_batch_message::<T>(&decode, &payload),
+                                    &task_shutdown,
+                                )
+                                .await
+                                else {
+                                    break None;
+                                };
+                                match decoded {
                                     BatchDecode::Decoded(m) => break Some(m),
                                     BatchDecode::Dlq { fail, .. } => {
                                         discard_broadcast(&task_topic, task_group.as_deref(), fail);
@@ -6775,33 +6860,45 @@ impl KafkaConsumer {
                             #[cfg(feature = "kafka-schema-registry")]
                             let payload: T::Message = if let Some(registry) = schema_registry.as_ref() {
                                 let codec_name = <T::Codec as crate::Codec<T::Message>>::NAME;
-                                let registry_result = match WireFormat::from_codec_name(codec_name) {
-                                    Some(fmt) => registry_decode::<T::Message, T::Codec>(
-                                        registry,
-                                        fmt,
-                                        schema_enforcement,
-                                        &schema_accepted,
-                                        schema_message_index.as_deref(),
-                                        payload_bytes,
-                                    ).await,
-                                    None => {
-                                        tracing::error!(
-                                            codec = codec_name,
-                                            dlq,
-                                            "codec has no Confluent wire format; acking dead message anyway"
-                                        );
-                                        Ok(RegistryDecode::Dlq("schema_unsupported_codec"))
+                // A registry outage stalls the drain the same way it stalls
+                                // a consumer, instead of acking the dead message away
+                                // unread; a shutdown mid-lookup ends the drain with the
+                                // dead message uncommitted.
+                                let accepted: &[Arc<str>] = &schema_accepted;
+                                let message_index = schema_message_index.as_deref();
+                                let shutdown = &shutdown;
+                                let decode_once = || async move {
+                                    match WireFormat::from_codec_name(codec_name) {
+                                        Some(fmt) => {
+                                            decode_or_shutdown(
+                                                registry_decode::<T::Message, T::Codec>(
+                                                    registry,
+                                                    fmt,
+                                                    schema_enforcement,
+                                                    accepted,
+                                                    message_index,
+                                                    payload_bytes,
+                                                ),
+                                                shutdown,
+                                            )
+                                            .await
+                                        }
+                                        None => {
+                                            tracing::error!(
+                                                codec = codec_name,
+                                                dlq,
+                                                "codec has no Confluent wire format; acking dead message anyway"
+                                            );
+                                            Some(Ok(RegistryDecode::Dlq("schema_unsupported_codec")))
+                                        }
                                     }
                                 };
-                                // A registry outage stalls the drain the same
-                                // way it stalls a consumer, instead of acking
-                                // the dead message away unread.
                                 let mut stall = RegistryStall::default();
-                                let mut registry_result = registry_result;
                                 let staged = loop {
-                                    match registry_result {
-                                        Ok(RegistryDecode::Decoded(m)) => break Staged::Ready(m),
-                                        Ok(RegistryDecode::Dlq(reason)) => {
+                                    match decode_once().await {
+                                        None => break Staged::Stop,
+                                        Some(Ok(RegistryDecode::Decoded(m))) => break Staged::Ready(m),
+                                        Some(Ok(RegistryDecode::Dlq(reason))) => {
                                             tracing::error!(
                                                 reason,
                                                 dlq,
@@ -6809,27 +6906,16 @@ impl KafkaConsumer {
                                             );
                                             break Staged::Drop(metrics::FailReason::for_schema_reason(reason), reason);
                                         }
-                                        Ok(RegistryDecode::Unavailable { id, error }) => {
+                                        Some(Ok(RegistryDecode::Unavailable { id, error })) => {
                                             if !stall
-                                                .wait(&consumer, &shutdown, &topic, group.as_deref(), dlq, id, &error)
+                                                .wait(&consumer, shutdown, &topic, group.as_deref(), dlq, id, &error)
                                                 .await?
                                             {
                                                 break Staged::Stop;
                                             }
-                                            registry_result = match WireFormat::from_codec_name(codec_name) {
-                                                Some(fmt) => registry_decode::<T::Message, T::Codec>(
-                                                    registry,
-                                                    fmt,
-                                                    schema_enforcement,
-                                                    &schema_accepted,
-                                                    schema_message_index.as_deref(),
-                                                    payload_bytes,
-                                                ).await,
-                                                None => Ok(RegistryDecode::Dlq("schema_unsupported_codec")),
-                                            };
                                         }
-                                        Err(e @ ShoveError::Topology(_)) => return Err(e),
-                                        Err(e) => {
+                                        Some(Err(e @ ShoveError::Topology(_))) => return Err(e),
+                                        Some(Err(e)) => {
                                             tracing::error!(
                                                 error = %e,
                                                 dlq,
@@ -8156,6 +8242,157 @@ mod seek_error_tests {
     #[test]
     fn an_empty_seek_result_reports_no_errors() {
         assert!(seek_errors(&TopicPartitionList::new()).is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "kafka-schema-registry"))]
+mod in_place_wait_accounting_tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+    use crate::schema_registry::SchemaRegistry;
+    use crate::topology::TopologyBuilder;
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct Note {
+        id: u32,
+    }
+
+    struct Notes;
+    impl Topic for Notes {
+        type Message = Note;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("in-place-wait-accounting").build())
+        }
+    }
+
+    struct Noop;
+    impl MessageHandler<Notes> for Noop {
+        type Context = ();
+        async fn handle(&self, _: Note, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    /// A registry that answers 503 to everything and counts the requests.
+    async fn unavailable_registry() -> (Arc<SchemaRegistry>, Arc<AtomicUsize>) {
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::{Router, routing::get};
+
+        async fn unavailable(State(hits): State<Arc<AtomicUsize>>) -> StatusCode {
+            hits.fetch_add(1, Ordering::SeqCst);
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/schemas/ids/{id}/versions", get(unavailable))
+            .route("/schemas/ids/{id}", get(unavailable))
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock registry");
+        let addr = listener.local_addr().expect("mock registry addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock registry serve");
+        });
+        let registry = SchemaRegistry::builder(format!("http://{addr}"))
+            .max_retries(1)
+            .build();
+        (registry, hits)
+    }
+
+    /// The receive loop pauses its assignment for permits held by *waiting*
+    /// handlers, and a redelivery that waits on the registry is waiting, not
+    /// running: it counts in `in_place_waiters` from its delay through the
+    /// decode and the registry retry wait, and uncounts on every exit.
+    #[tokio::test]
+    async fn redeliver_in_place_counts_the_registry_retry_wait() {
+        let (registry, hits) = unavailable_registry().await;
+        let waiters = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+
+        let task = {
+            let registry = registry.clone();
+            let waiters = waiters.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let hold = [HoldQueue {
+                    name: "in-place-wait-accounting-hold-10ms".into(),
+                    delay: Duration::from_millis(10),
+                }];
+                // A Confluent frame naming a schema id the mock never answers for.
+                let mut payload = vec![0u8];
+                payload.extend_from_slice(&9u32.to_be_bytes());
+                payload.extend_from_slice(br#"{"id":1}"#);
+                let accepted: [Arc<str>; 1] = [Arc::from("in-place-wait-accounting-value")];
+                let decode = BatchDecodeCtx {
+                    queue: "in-place-wait-accounting",
+                    schema_registry: Some(&registry),
+                    schema_enforcement: SchemaEnforcement::Enforce,
+                    schema_accepted: &accepted,
+                    schema_message_index: None,
+                };
+                let handler = Arc::new(Noop);
+                let ctx = Arc::new(());
+                let headers = Arc::new(HashMap::new());
+                let end = redeliver_in_place::<Notes, Noop>(
+                    &handler,
+                    &ctx,
+                    &decode,
+                    &payload,
+                    &headers,
+                    RecordCoordinates {
+                        partition: 0,
+                        offset: 0,
+                        timestamp_ms: None,
+                    },
+                    Outcome::Defer,
+                    0,
+                    10,
+                    &hold,
+                    None,
+                    None,
+                    "in-place-wait-accounting",
+                    None,
+                    &shutdown,
+                    &waiters,
+                )
+                .await;
+                matches!(end, InPlaceEnd::Cancelled)
+            })
+        };
+
+        // The registry has been asked, so the task is past its delay and
+        // either mid-lookup or inside the registry retry wait.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while hits.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the mock registry was never asked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            waiters.load(Ordering::SeqCst),
+            1,
+            "a redelivery waiting on the registry counts as a waiting handler"
+        );
+
+        shutdown.cancel();
+        assert!(
+            task.await.expect("redelivery task panicked"),
+            "a shutdown during the registry wait ends the redelivery as Cancelled"
+        );
+        assert_eq!(
+            waiters.load(Ordering::SeqCst),
+            0,
+            "the count is released on exit"
+        );
     }
 }
 

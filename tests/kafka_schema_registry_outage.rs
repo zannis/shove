@@ -385,6 +385,11 @@ shove::define_topic!(
     Event,
     TopologyBuilder::new("kafka-sr-outage-freeze").dlq().build()
 );
+shove::define_topic!(
+    SilentRegistryTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-silent").dlq().build()
+);
 // An infra-owned topic, so a `Defer` waits in place and decodes the retained
 // bytes again: the registry is asked a second time for the same record.
 #[cfg(feature = "test-support")]
@@ -435,7 +440,8 @@ recorder_for!(
     ShutdownTopic,
     AuthTopic,
     FifoStallTopic,
-    BroadcastStallTopic
+    BroadcastStallTopic,
+    SilentRegistryTopic
 );
 
 /// Records every delivery and returns `Defer` for the first one it sees,
@@ -1400,5 +1406,93 @@ async fn a_completion_during_a_registry_stall_does_not_freeze_the_committed_offs
             &serde_json::to_vec(&Event { id: 2 }).unwrap()
         )],
         "the dead letter is record 2, framed as it was published"
+    );
+}
+
+/// A shutdown that lands while a registry lookup is in flight returns at
+/// once: the request future is dropped, and the client forgets the fetch
+/// nobody waits on any more. Before, the loop waited out the client's own
+/// timeout and retries first, about ten seconds with one retry and twenty
+/// with the defaults.
+#[tokio::test]
+async fn shutdown_during_a_registry_lookup_returns_promptly() {
+    const TOPIC: &str = "kafka-sr-outage-silent";
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+
+    // A registry that accepts the connection and never answers.
+    let accepted = Arc::new(Notify::new());
+    let accepted_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind silent registry");
+    let addr = listener.local_addr().expect("silent registry addr");
+    {
+        let accepted = accepted.clone();
+        let accepted_once = accepted_once.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (socket, _) = listener.accept().await.expect("accept");
+                accepted_once.store(true, Ordering::SeqCst);
+                accepted.notify_waiters();
+                held.push(socket);
+            }
+        });
+    }
+    let registry = SchemaRegistry::builder(format!("http://{addr}"))
+        .max_retries(1)
+        .build();
+    let client = tb.client().await;
+    let body = serde_json::to_vec(&Event { id: 3 }).unwrap();
+    publish_raw(&tb.brokers, TOPIC, &frame_json(HEALTHY_ID, &body)).await;
+
+    let handler = Recorder::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<SilentRegistryTopic, _>(
+                h,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_concurrent_processing(false)
+                    .with_schema_registry(registry)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    // Gate: the lookup is in flight. Without it the shutdown arm can win
+    // before the decode starts, and the unfixed code passes.
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let notified = accepted.notified();
+        if accepted_once.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep_until(deadline) => panic!("the registry was never contacted"),
+        }
+    }
+
+    let cancelled_at = Instant::now();
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task panicked")
+        .expect("consumer ended cleanly");
+    let took = cancelled_at.elapsed();
+    assert!(
+        took < Duration::from_secs(3),
+        "shutdown must not wait out the registry client's timeout and retries, took {took:?}"
+    );
+    assert_eq!(
+        handler.seen(),
+        Vec::<u32>::new(),
+        "nothing reached the handler"
     );
 }

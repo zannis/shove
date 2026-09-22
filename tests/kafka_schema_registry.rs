@@ -86,6 +86,80 @@ async fn spawn_recovering_mock(status: u16, failures: usize) -> (String, Arc<Ato
     (format!("http://{addr}"), calls)
 }
 
+/// Holds every `/versions` answer until the test releases it, and counts the
+/// fetches it saw on that endpoint, so a test can cancel a `resolve` while
+/// its request is in flight and then see whether a later call fetches again.
+#[derive(Clone)]
+struct DelayingMockState {
+    fetches: Arc<AtomicUsize>,
+    first_hit: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+}
+
+async fn delaying_versions(
+    State(s): State<DelayingMockState>,
+    Path(_id): Path<u32>,
+) -> Json<serde_json::Value> {
+    s.fetches.fetch_add(1, Ordering::SeqCst);
+    s.first_hit.notify_waiters();
+    loop {
+        let notified = s.release.notified();
+        if s.released.load(Ordering::SeqCst) {
+            break;
+        }
+        notified.await;
+    }
+    Json(serde_json::json!([{ "subject": "orders-value", "version": 3 }]))
+}
+
+async fn delaying_schema(
+    State(_s): State<DelayingMockState>,
+    Path(_id): Path<u32>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "schema": "{}", "schemaType": "JSON" }))
+}
+
+/// Spawn the delaying mock, returning (base_url, state).
+async fn spawn_delaying_mock() -> (String, DelayingMockState) {
+    let state = DelayingMockState {
+        fetches: Arc::new(AtomicUsize::new(0)),
+        first_hit: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+        released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let app = Router::new()
+        .route("/schemas/ids/{id}/versions", get(delaying_versions))
+        .route("/schemas/ids/{id}", get(delaying_schema))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), state)
+}
+
+impl DelayingMockState {
+    /// Wait until the mock has seen its first `/versions` request.
+    async fn wait_for_first_fetch(&self) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let notified = self.first_hit.notified();
+            if self.fetches.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => panic!("the mock was never asked"),
+            }
+        }
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
 /// Spawn a mock registry that always returns the given HTTP status, returning (base_url, calls-counter).
 async fn spawn_status_mock(status: u16) -> (String, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -781,5 +855,149 @@ async fn second_latest_id_is_served_from_cache() {
         calls.load(Ordering::SeqCst),
         after_first,
         "subject -> id must be cached: no second HTTP call"
+    );
+}
+
+/// A `resolve` cancelled while its fetch is in flight must not leave that
+/// fetch behind: the next call for the same id fetches again instead of
+/// attaching to a future nobody drives any more.
+#[tokio::test]
+async fn a_cancelled_resolve_removes_its_abandoned_fetch() {
+    let (url, mock) = spawn_delaying_mock().await;
+    let registry = SchemaRegistry::builder(url).build();
+
+    let first = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.resolve(SchemaId(1)).await })
+    };
+    mock.wait_for_first_fetch().await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    mock.release();
+
+    registry
+        .resolve(SchemaId(1))
+        .await
+        .expect("a fresh fetch after the abandoned one resolves");
+    assert_eq!(
+        mock.fetches.load(Ordering::SeqCst),
+        2,
+        "the abandoned fetch was removed, so the second call fetched again"
+    );
+}
+
+/// A sibling still waiting on the same fetch keeps it alive: cancelling one
+/// waiter removes only that waiter.
+#[tokio::test]
+async fn a_cancelled_resolve_keeps_the_fetch_for_a_sibling_waiter() {
+    let (url, mock) = spawn_delaying_mock().await;
+    let registry = SchemaRegistry::builder(url).build();
+
+    let first = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.resolve(SchemaId(1)).await })
+    };
+    mock.wait_for_first_fetch().await;
+    let second = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.resolve(SchemaId(1)).await })
+    };
+    // The sibling has joined the in-flight entry before the first is cancelled.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    mock.release();
+
+    second
+        .await
+        .expect("sibling task panicked")
+        .expect("the sibling still gets the shared fetch's answer");
+    assert_eq!(
+        mock.fetches.load(Ordering::SeqCst),
+        1,
+        "one fetch served the surviving waiter"
+    );
+}
+
+/// Two waiters cancelled together remove the fetch exactly once: the second
+/// drop is the one that finds no waiter left.
+#[tokio::test]
+async fn two_cancelled_waiters_remove_the_fetch_once() {
+    let (url, mock) = spawn_delaying_mock().await;
+    let registry = SchemaRegistry::builder(url).build();
+
+    let first = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.resolve(SchemaId(1)).await })
+    };
+    mock.wait_for_first_fetch().await;
+    let second = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.resolve(SchemaId(1)).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    first.abort();
+    second.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(second.await.unwrap_err().is_cancelled());
+    mock.release();
+
+    registry
+        .resolve(SchemaId(1))
+        .await
+        .expect("a fresh fetch after both waiters left resolves");
+    assert_eq!(
+        mock.fetches.load(Ordering::SeqCst),
+        2,
+        "the entry was removed once both waiters had gone, so the third call fetched again"
+    );
+}
+
+/// A cancellation after the fetch completed, while `resolve` waits on the
+/// negative-cache insert mutex, leaves no in-flight entry either: the next
+/// call goes to the registry instead of being served the finished fetch's
+/// error from a retained entry.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_cancellation_during_the_negative_cache_step_leaves_no_inflight_entry() {
+    let (url, calls) = spawn_status_mock(401).await;
+    let registry = SchemaRegistry::builder(url).build();
+
+    let waits_before = SchemaRegistry::negative_cache_lock_waits();
+    let held = registry.negative_cache_lock_for_test().lock().await;
+    let parked = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.resolve(SchemaId(1)).await })
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while SchemaRegistry::negative_cache_lock_waits() <= waits_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the call never reached the negative-cache step"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let calls_after_first = calls.load(Ordering::SeqCst);
+    parked.abort();
+    assert!(parked.await.unwrap_err().is_cancelled());
+    drop(held);
+
+    let err = registry
+        .resolve(SchemaId(1))
+        .await
+        .expect_err("a 401 is not retriable and is returned as an error");
+    assert!(
+        matches!(
+            err,
+            SchemaRegistryError::Transport {
+                retriable: false,
+                ..
+            }
+        ),
+        "the same non-retriable error comes back: {err:?}"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) > calls_after_first,
+        "the second call reached the registry rather than a retained entry"
     );
 }
