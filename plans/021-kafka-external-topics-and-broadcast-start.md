@@ -27,7 +27,8 @@
   The second pull request therefore ships on its own.
   They bound NATS to the same invariant and stated the SQS ownership row.
   They also asked for the producer's `allow.auto.create.topics` as a pull request of its own in the same release.
-  The maintainer proposed to merge the stack and ship it as the next minor release, and records the decision in `plans/README.md`.
+  The maintainer proposed to merge the stack and ship it as the next minor release.
+  The plan 021 row of `plans/README.md` is the maintainer's to add, as the executor instructions above say.
 - **Delivery**: four pull requests by risk class, one minor release after the fourth.
   - https://github.com/zannis/shove/pull/210 delivers steps 1 and 2.
     Step 1 maps `KafkaAutoOffsetReset::None` to the `error` token and classifies librdkafka's `AutoOffsetReset` error as permanent in `map_kafka_error`.
