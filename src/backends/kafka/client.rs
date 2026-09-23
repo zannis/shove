@@ -1068,13 +1068,13 @@ fn fetch_topic_partition_count_blocking(
 ///
 /// The probe is a consumer-type client with no `group.id`, and both halves
 /// matter. librdkafka defaults `allow.auto.create.topics` to true for a
-/// producer and sends it on a topic-specific metadata request, so the
-/// producer's own client (the one `ping` uses) would ask a broker running
-/// `auto.create.topics.enable=true` to create the very topic `external()`
-/// promises never to create. A consumer defaults it
-/// to false, and it is set explicitly here anyway. Without a `group.id` there
-/// is no coordinator lookup, so the probe needs no group permission under a
-/// group-scoped ACL.
+/// producer and sends it on a topic-specific metadata request, which is how
+/// a topic gets created behind `external()`'s back on a broker running
+/// `auto.create.topics.enable=true`; shove's own producer pins the flag to
+/// false (`producer_config`), and the probe does not lean on that: a
+/// consumer-type client defaults it to false, and it is set explicitly here
+/// anyway. Without a `group.id` there is no coordinator lookup, so the probe
+/// needs no group permission under a group-scoped ACL.
 fn probe_external_topic_blocking(
     base: ClientConfig,
     topic_name: &str,

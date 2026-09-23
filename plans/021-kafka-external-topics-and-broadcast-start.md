@@ -799,8 +799,8 @@ The maintainer's answers added `feat(nats)!: retry in place on an external strea
 Rule: shove's consumer never writes into an external topology when it settles an outcome, on every backend.
 A shove-owned DLQ is still a legal publish target, because `dlq()` stays allowed on an external topology.
 Publishing through a `Publisher` is outside the rule.
-The producer's `allow.auto.create.topics` is pinned to `false` in a pull request of its own, `feat/kafka-producer-no-auto-create`.
-The maintainer asked for it in the same release, and until it lands the guarantee covers declare and consume, as the docs say.
+The producer's `allow.auto.create.topics` is pinned to `false` in `producer_config`, delivered as its own pull request, `feat/kafka-producer-no-auto-create`, in the same release.
+A publish to a topic that does not exist then fails and leaves it absent, so the guarantee covers declare, consume and publish.
 
 The maintainer's review of 2026-09-22 observed that the ownership flag was deciding a retry strategy.
 It also observed that a republish into a fan-out topic duplicates the record for every other group on it.
