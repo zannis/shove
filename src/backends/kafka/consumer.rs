@@ -949,6 +949,44 @@ pub mod completion_probe {
     }
 }
 
+/// Test-only counters (see the `test-support` feature) on the four `put_back`
+/// call sites, one per site, so a test can prove that a record went back to
+/// the broker on the path it drives instead of inferring it from timing.
+/// nextest runs each test in its own process, so every counter starts at
+/// zero.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod put_back_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A record received while `RegistryStall::wait` polled through a stall.
+    pub static REGISTRY_STALL: AtomicUsize = AtomicUsize::new(0);
+    /// A record received while `acquire_permit_while_polling` waited for a
+    /// prefetch permit.
+    pub static PERMIT_WAIT: AtomicUsize = AtomicUsize::new(0);
+    /// A record the receive arm put back because the assignment was, or had
+    /// to be, paused for waiting handlers.
+    pub static PAUSED_RECEIVE: AtomicUsize = AtomicUsize::new(0);
+    /// A record on another partition put back behind a rewound batch span.
+    pub static BATCH_REWIND: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn registry_stall() -> usize {
+        REGISTRY_STALL.load(Ordering::SeqCst)
+    }
+
+    pub fn permit_wait() -> usize {
+        PERMIT_WAIT.load(Ordering::SeqCst)
+    }
+
+    pub fn paused_receive() -> usize {
+        PAUSED_RECEIVE.load(Ordering::SeqCst)
+    }
+
+    pub fn batch_rewind() -> usize {
+        BATCH_REWIND.load(Ordering::SeqCst)
+    }
+}
+
 /// Runs a decode until it answers or `shutdown` fires, whichever comes
 /// first. `None` means shutdown fired.
 ///
@@ -1064,6 +1102,8 @@ impl RegistryStall {
                             ));
                         }
                     };
+                    #[cfg(feature = "test-support")]
+                    put_back_probe::REGISTRY_STALL.fetch_add(1, Ordering::SeqCst);
                     put_back(consumer, queue, msg.partition(), msg.offset())?;
                     consumer
                         .pause_assignment()
@@ -1597,9 +1637,13 @@ enum InPlaceEnd {
     Terminal { outcome: Outcome, attempts: u32 },
     /// The retained bytes no longer decode, so the record cannot be handed
     /// back to the handler; the caller settles it as a pre-handler drop.
+    /// `attempts` is the in-memory retry count at that point, which the dead
+    /// letter carries as its `Shove-Retry-Count` in place of the count the
+    /// record arrived with, as an exhausted in-place retry does.
     Undecodable {
         reason: &'static str,
         fail: metrics::FailReason,
+        attempts: u32,
     },
     /// Shutdown fired during a wait. Nothing was completed, so the record is
     /// redelivered on restart.
@@ -1728,7 +1772,11 @@ where
                 match decoded {
                     BatchDecode::Decoded(m) => break m,
                     BatchDecode::Dlq { reason, fail } => {
-                        return InPlaceEnd::Undecodable { reason, fail };
+                        return InPlaceEnd::Undecodable {
+                            reason,
+                            fail,
+                            attempts,
+                        };
                     }
                     // An outage during the redelivery: keep waiting on the same
                     // bytes, as the receive loop would.
@@ -3987,6 +4035,11 @@ async fn acquire_permit_while_polling(
     loop {
         tokio::select! {
             biased;
+            // The fault is read before the permit: a task that reports one
+            // ends and frees its permit in the same instant, and taking that
+            // permit first would hand the record in hand to a handler on a
+            // consumer that is about to return.
+            e = &mut fault => return Err(e),
             permit = semaphore.clone().acquire_owned() => {
                 let permit = permit.map_err(|_| {
                     ShoveError::Connection("semaphore closed".to_string())
@@ -3994,7 +4047,6 @@ async fn acquire_permit_while_polling(
                 return Ok(Some(permit));
             }
             _ = shutdown.cancelled() => return Ok(None),
-            e = &mut fault => return Err(e),
             received = consumer.recv() => {
                 let msg = received.map_err(|e| {
                     tracing::error!(error = %e, queue, "consumer recv error");
@@ -4003,6 +4055,8 @@ async fn acquire_permit_while_polling(
                         e,
                     )
                 })?;
+                #[cfg(feature = "test-support")]
+                put_back_probe::PERMIT_WAIT.fetch_add(1, Ordering::SeqCst);
                 put_back(consumer, queue, msg.partition(), msg.offset())?;
                 consumer
                     .pause_assignment()
@@ -4601,6 +4655,8 @@ impl KafkaConsumer {
                                         && semaphore.available_permits() == 0
                                         && in_place_waiters.load(Ordering::Acquire) > 0))
                             {
+                                #[cfg(feature = "test-support")]
+                                put_back_probe::PAUSED_RECEIVE.fetch_add(1, Ordering::SeqCst);
                                 put_back(&consumer, queue, partition, offset)?;
                                 consumer
                                     .pause_assignment()
@@ -4934,12 +4990,17 @@ impl KafkaConsumer {
                                     .await
                                     {
                                         InPlaceEnd::Terminal { outcome, attempts } => (outcome, attempts),
-                                        InPlaceEnd::Undecodable { reason, fail } => {
+                                        InPlaceEnd::Undecodable { reason, fail, attempts } => {
                                             tracing::error!(
                                                 queue = %task_topic,
                                                 reason,
                                                 "record no longer decodes for its in-place redelivery; dropping it as a pre-handler discard"
                                             );
+                                            // The dead letter carries the attempts made in memory, as an
+                                            // exhausted in-place retry does, not the count the record
+                                            // arrived with.
+                                            let mut dead_headers: HashMap<String, String> = (*headers).clone();
+                                            dead_headers.insert(RETRY_COUNT_HEADER.to_string(), attempts.to_string());
                                             discard_pre_handler(
                                                 &task_client,
                                                 topology,
@@ -4949,7 +5010,7 @@ impl KafkaConsumer {
                                                 reason,
                                                 &payload_bytes,
                                                 key.as_deref(),
-                                                &headers,
+                                                &dead_headers,
                                                 &task_tx,
                                                 partition,
                                                 offset,
@@ -5478,6 +5539,8 @@ impl KafkaConsumer {
                                                     // this one then arrive in offset
                                                     // order once the wait ends.
                                                     if !spans_partition {
+                                                        #[cfg(feature = "test-support")]
+                                                        put_back_probe::BATCH_REWIND.fetch_add(1, Ordering::SeqCst);
                                                         put_back(&consumer, queue, partition, offset)?;
                                                     }
                                                     rewound = true;

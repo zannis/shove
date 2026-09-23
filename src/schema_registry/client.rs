@@ -237,10 +237,13 @@ impl SchemaRegistry {
     /// whatever the mock answers now. The client caches a resolved id for the
     /// process's lifetime, which is right in production and makes a later
     /// registry fault unreachable from a test otherwise.
+    /// The negative entry goes with it, so a test that flips the mock from
+    /// a 404 back to an answer is not held to the negative cache's TTL.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn evict_for_test(&self, id: SchemaId) {
         self.resolved.remove(&id);
+        self.negative.remove(&id);
     }
 
     /// True when `id` holds a negative entry that has not yet expired.

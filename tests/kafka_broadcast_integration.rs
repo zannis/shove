@@ -151,6 +151,9 @@ impl MessageHandler<RetryTopic> for AlwaysRetry {
 #[derive(Clone, Default)]
 struct DeferOnce {
     calls: Arc<Mutex<Vec<String>>>,
+    /// The coordinates of every delivery, in order, so the test can prove
+    /// that a redelivery is the same record.
+    coordinates: Arc<Mutex<Vec<Coordinates>>>,
 }
 
 impl DeferOnce {
@@ -161,7 +164,11 @@ impl DeferOnce {
 
 impl MessageHandler<DeferTopic> for DeferOnce {
     type Context = ();
-    async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _: &()) -> Outcome {
+    async fn handle(&self, msg: Invalidate, meta: MessageMetadata, _: &()) -> Outcome {
+        self.coordinates
+            .lock()
+            .await
+            .push((meta.partition, meta.offset, meta.timestamp_ms));
         let mut calls = self.calls.lock().await;
         let seen_before = calls.iter().filter(|k| **k == msg.key).count();
         calls.push(msg.key);
@@ -1005,6 +1012,19 @@ async fn defer_redelivers_in_place_before_later_records() {
         deferring.calls().await,
         vec!["1".to_string(), "1".to_string(), "2".to_string()],
         "the deferred record must come back before the record behind it"
+    );
+    let coordinates = deferring.coordinates.lock().await.clone();
+    assert!(
+        coordinates[0].0.is_some() && coordinates[0].1.is_some() && coordinates[0].2.is_some(),
+        "the first delivery carries partition, offset and timestamp: {coordinates:?}"
+    );
+    assert_eq!(
+        coordinates[1], coordinates[0],
+        "the redelivery keeps the record's partition, offset and timestamp"
+    );
+    assert_ne!(
+        coordinates[2], coordinates[0],
+        "the record behind it has its own coordinates"
     );
 
     sub.cancellation_token().cancel();

@@ -370,6 +370,13 @@ pub mod kafka {
     #[doc(hidden)]
     pub use crate::backends::kafka::completion_probe;
 
+    /// Test-only counters (see the `test-support` feature) on the consumer's
+    /// four `put_back` call sites, for tests that prove a record went back to
+    /// the broker on the path they drive.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::put_back_probe;
+
     /// Test-only seam (see the `test-support` feature): the receive loop's
     /// shutdown commit deadline, for tests that time a shutdown against it.
     #[cfg(feature = "test-support")]

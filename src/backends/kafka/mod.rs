@@ -21,6 +21,9 @@ pub use client::{KafkaSasl, KafkaTls};
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use consumer::completion_probe;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use consumer::put_back_probe;
 pub use consumer::{BatchConsumerOptions, KafkaConsumer};
 pub(crate) use consumer_group::validate_commit_interval;
 

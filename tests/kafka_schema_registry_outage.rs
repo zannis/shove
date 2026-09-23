@@ -2483,19 +2483,46 @@ async fn a_stalled_record_on_another_partition_is_put_back_behind_a_rewound_span
         vec![1, 2],
         "the first flush is the span ahead of the stall"
     );
-    assert_eq!(batches.len(), 3, "two redeliveries follow");
-    for batch in &batches[1..] {
-        let mut sorted = batch.clone();
-        sorted.sort_unstable();
-        assert_eq!(
-            sorted,
-            vec![1, 2, 3],
-            "every later batch holds the rewound records and the put-back record: {batches:?}"
+    assert!(
+        batches.len() >= 3,
+        "at least two redeliveries follow: {batches:?}"
+    );
+    // The age timer may split one redelivery across two valid batches, so
+    // the later flushes are judged together: every record comes back, nothing
+    // else appears, and partition 0 keeps its order in every redelivery.
+    let later: Vec<u32> = batches[1..].iter().flatten().copied().collect();
+    let mut distinct = later.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct,
+        vec![1, 2, 3],
+        "the rewound records and the put-back record all come back: {batches:?}"
+    );
+    let positions = |id: u32| -> Vec<usize> {
+        later
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v == id)
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let (first, second) = (positions(1), positions(2));
+    assert_eq!(
+        first.len(),
+        second.len(),
+        "partition 0's two records come back the same number of times: {batches:?}"
+    );
+    for (a, b) in first.iter().zip(&second) {
+        assert!(
+            a < b,
+            "partition 0 keeps its order in every redelivery: {batches:?}"
         );
     }
     let mut acked = handler.acked.lock().unwrap().clone();
     acked.sort_unstable();
-    assert_eq!(acked, vec![1, 2, 3]);
+    acked.dedup();
+    assert_eq!(acked, vec![1, 2, 3], "every record is acked in the end");
     assert_eq!(committed_offset(&tb.brokers, GROUP, TOPIC, 0), Some(2));
     assert_eq!(committed_offset(&tb.brokers, GROUP, TOPIC, 1), Some(1));
 }
@@ -2608,4 +2635,392 @@ async fn a_hung_registry_lookup_keeps_the_member_in_its_group() {
 
     token.cancel();
     assert!(running.await.unwrap().is_clean());
+}
+
+// ---------------------------------------------------------------------------
+// Faults met while a record waits for a permit or a broadcast stall, and a
+// redelivery whose bytes no longer decode
+// ---------------------------------------------------------------------------
+
+shove::define_topic!(
+    PermitWaitFaultTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-permit-wait-fault")
+        .external()
+        .hold_queue(Duration::from_millis(200))
+        .allow_message_loss()
+        .build()
+);
+
+/// Runs the first delivery for `first_runs_for` before deferring, and defers
+/// every delivery, so the one prefetch slot is held by a *running* handler
+/// long enough for the loop to take the next record in hand and wait for a
+/// permit, and then by a *waiting* one whose redelivery can meet a fault.
+#[derive(Clone)]
+struct SlowDeferRecorder {
+    calls: Arc<AtomicUsize>,
+    first_runs_for: Duration,
+}
+
+impl MessageHandler<PermitWaitFaultTopic> for SlowDeferRecorder {
+    type Context = ();
+    async fn handle(&self, _msg: Event, _meta: MessageMetadata, _: &()) -> Outcome {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            tokio::time::sleep(self.first_runs_for).await;
+        }
+        Outcome::Defer
+    }
+}
+
+/// With the one prefetch slot held by a running handler, the loop takes the
+/// next record in hand and waits for a permit in
+/// `acquire_permit_while_polling`. The handler then defers, its in-place
+/// redelivery meets a deployment fault, and that fault must win the permit
+/// wait: the loop returns `Topology` instead of waiting for a permit the
+/// faulted task will never free.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_handler_fault_reported_during_a_permit_wait_ends_the_consumer() {
+    const TOPIC: &str = "kafka-sr-outage-permit-wait-fault";
+    const GROUP: &str = "kafka-sr-outage-permit-wait-fault-consumer";
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+    let (registry, status, _) = mock_registry("kafka-sr-outage-permit-wait-fault-value", 200).await;
+    let client = tb.client().await;
+    let body = |id: u32| serde_json::to_vec(&Event { id }).unwrap();
+    publish_raw(&tb.brokers, TOPIC, &frame_json(FLAKY_ID, &body(1))).await;
+
+    let handler = SlowDeferRecorder {
+        calls: Arc::new(AtomicUsize::new(0)),
+        first_runs_for: Duration::from_secs(4),
+    };
+    let h = handler.clone();
+    let options = ConsumerOptions::<Kafka>::new()
+        .with_prefetch_count(1)
+        .with_schema_registry(registry.clone())
+        .with_shutdown(CancellationToken::new());
+    let processing = options.processing_handle();
+    let consumer = KafkaConsumer::new(client.clone());
+    let started = Instant::now();
+    let running = tokio::spawn(async move {
+        consumer
+            .run::<PermitWaitFaultTopic, _>(h, (), options)
+            .await
+    });
+
+    let deadline = Instant::now() + TIMEOUT;
+    while handler.calls.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the first record reaches the handler"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let first_delivery = Instant::now();
+    // The handler runs for four seconds. The second record arrives well
+    // inside that window and finds every permit held by a running handler,
+    // so the loop waits for a permit; the fault is armed meanwhile, and the
+    // handler's deferral then meets it on the first redelivery.
+    publish_raw(&tb.brokers, TOPIC, &frame_json(HEALTHY_ID, &body(2))).await;
+    registry.evict_for_test(SchemaId(FLAKY_ID));
+    status.store(401, Ordering::SeqCst);
+
+    let outcome = tokio::time::timeout(TIMEOUT, running)
+        .await
+        .expect("the consumer must end on the fault reported during the permit wait")
+        .expect("consumer task panicked");
+    assert!(
+        first_delivery.elapsed() >= Duration::from_secs(4),
+        "the loop ended only once the running handler had deferred, {:?} after the start",
+        started.elapsed()
+    );
+    match outcome {
+        Err(ShoveError::Topology(message)) => {
+            assert!(
+                message.contains("schema id 9") && message.contains("deployment fault"),
+                "the error names the schema id and the fault: {message}"
+            );
+        }
+        other => panic!("expected ShoveError::Topology, got {other:?}"),
+    }
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        1,
+        "the first record ran once and was never handed back; the second never reached the handler"
+    );
+    assert!(
+        !processing.load(Ordering::Acquire),
+        "every handler task ended before the loop returned"
+    );
+    assert_eq!(
+        lag(&client, TOPIC, GROUP).await,
+        2,
+        "nothing is committed: both records stay for whoever runs next"
+    );
+}
+
+shove::define_topic!(
+    BroadcastStallFaultTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-broadcast-stall-fault")
+        .broadcast()
+        .build()
+);
+
+impl MessageHandler<BroadcastStallFaultTopic> for DeferForeverRecorder {
+    type Context = ();
+    async fn handle(&self, _msg: Event, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Outcome::Defer
+    }
+}
+
+/// The broadcast loop decodes a record before it takes the one permit, so a
+/// record ahead that defers forever holds the permit while the record behind
+/// it stalls on the registry, and the stall wait is where the loop sits with
+/// the handler fault channel in its select. When the deferring record's
+/// redelivery meets a deployment fault, that wait ends the subscriber instead
+/// of waiting out an outage with no end.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_handler_fault_reported_during_a_broadcast_registry_stall_ends_the_subscriber() {
+    const TOPIC: &str = "kafka-sr-outage-broadcast-stall-fault";
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+    let (registry, stalled, second, hits) =
+        mock_registry_with_second_id("kafka-sr-outage-broadcast-stall-fault-value", 503).await;
+    let body = |id: u32| serde_json::to_vec(&Event { id }).unwrap();
+    publish_raw(&tb.brokers, TOPIC, &frame_json(SECOND_FLAKY_ID, &body(1))).await;
+    publish_raw(&tb.brokers, TOPIC, &frame_json(FLAKY_ID, &body(2))).await;
+
+    let broker = Broker::<Kafka>::from_client(tb.client().await);
+    let handler = DeferForeverRecorder {
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<BroadcastStallFaultTopic, _>(
+            handler.clone(),
+            ConsumerOptions::new()
+                .with_schema_registry(registry.clone())
+                .with_broadcast_start(BroadcastStart::Head),
+        )
+        .expect("failed to subscribe");
+
+    let deadline = Instant::now() + TIMEOUT;
+    while handler.calls.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the first record reaches the handler, which defers it in place"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The stalled record's lookup has been asked at least once since: the
+    // loop is in its stall wait, with the fault channel in the select.
+    let hits_before = hits.load(Ordering::SeqCst);
+    wait_for_hits_above(&hits, hits_before, TIMEOUT).await;
+    let _ = &stalled;
+
+    registry.evict_for_test(SchemaId(SECOND_FLAKY_ID));
+    second.store(401, Ordering::SeqCst);
+
+    // The drain runs once the signal fires; a subscription still running at
+    // that point is cancelled and ends cleanly, so one counted error is the
+    // proof that the fault ended the task on its own, well before the signal.
+    let outcome = subscriber
+        .run_until_timeout(
+            tokio::time::sleep(Duration::from_secs(15)),
+            Duration::from_secs(10),
+        )
+        .await;
+    assert_eq!(
+        outcome.errors, 1,
+        "the subscription ended on the fault its redelivery met, not on the cancel: {outcome:?}"
+    );
+    assert!(
+        !outcome.timed_out,
+        "the ended task drains at once: {outcome:?}"
+    );
+    let at_return = handler.calls.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        at_return,
+        "no handler task keeps redelivering after the subscriber returned"
+    );
+}
+
+shove::define_topic!(
+    InPlaceUndecodableTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-inplace-undecodable")
+        .external()
+        .dlq()
+        .hold_queue(Duration::from_millis(200))
+        .build()
+);
+
+/// Returns `Retry` for the first delivery and `Ack` afterwards, so the first
+/// in-place redelivery carries one attempt in memory.
+#[derive(Clone)]
+struct RetryOnceRecorder {
+    calls: Arc<AtomicUsize>,
+}
+
+impl MessageHandler<InPlaceUndecodableTopic> for RetryOnceRecorder {
+    type Context = ();
+    async fn handle(&self, _msg: Event, _meta: MessageMetadata, _: &()) -> Outcome {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Outcome::Retry
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+/// Keeps every dead letter with the retry count its metadata carries.
+#[derive(Clone)]
+struct DeadCountRecorder {
+    dead: Arc<Mutex<Vec<(u32, u32)>>>,
+    counter: WaitableCounter,
+}
+
+impl MessageHandler<InPlaceUndecodableTopic> for DeadCountRecorder {
+    type Context = ();
+    async fn handle(&self, _msg: Event, _meta: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+    async fn handle_dead(&self, msg: Event, meta: DeadMessageMetadata, _: &()) {
+        self.dead
+            .lock()
+            .unwrap()
+            .push((msg.id, meta.message.retry_count));
+        self.counter.increment();
+    }
+}
+
+/// A record whose schema the registry no longer knows when its in-place
+/// redelivery decodes it again cannot be handed back: it is settled as a
+/// pre-handler drop, to the DLQ here, with the attempts made in memory as the
+/// dead letter's retry count, and the consumer goes on.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn an_undecodable_in_place_redelivery_is_dead_lettered_with_the_in_memory_count() {
+    const TOPIC: &str = "kafka-sr-outage-inplace-undecodable";
+    const GROUP: &str = "kafka-sr-outage-inplace-undecodable-consumer";
+    let recorder = DebuggingRecorder::new();
+    let snapshotter: Snapshotter = recorder.snapshotter();
+    recorder.install().expect("install debugging recorder");
+
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+    let (registry, status, _) =
+        mock_registry("kafka-sr-outage-inplace-undecodable-value", 200).await;
+    let client = tb.client().await;
+    let body = serde_json::to_vec(&Event { id: 4 }).unwrap();
+    publish_raw(&tb.brokers, TOPIC, &frame_json(FLAKY_ID, &body)).await;
+
+    let handler = RetryOnceRecorder {
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let consumer_registry = registry.clone();
+    let running = tokio::spawn(async move {
+        consumer
+            .run::<InPlaceUndecodableTopic, _>(
+                h,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_concurrent_processing(false)
+                    .with_schema_registry(consumer_registry)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    let deadline = Instant::now() + TIMEOUT;
+    while handler.calls.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the record reaches the handler once"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The schema is gone from the registry, and from the cache, before the
+    // redelivery decodes the retained bytes again.
+    registry.evict_for_test(SchemaId(FLAKY_ID));
+    status.store(404, Ordering::SeqCst);
+
+    wait_for_lag(&client, TOPIC, GROUP, 0, TIMEOUT).await;
+    assert!(
+        !running.is_finished(),
+        "an undecodable redelivery is a drop, not a fault: the consumer goes on"
+    );
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        1,
+        "the record reached the handler once and was never handed back"
+    );
+
+    // The DLQ drain reads the dead letter with its schema answered again,
+    // and with the client's negative entry for the 404 gone.
+    status.store(200, Ordering::SeqCst);
+    registry.evict_for_test(SchemaId(FLAKY_ID));
+    let dead = DeadCountRecorder {
+        dead: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let d = dead.clone();
+    let drain_client = client.clone();
+    let drain = tokio::spawn(async move {
+        KafkaConsumer::new(drain_client)
+            .run_dlq_with_options::<InPlaceUndecodableTopic, _>(
+                d,
+                (),
+                // The dead letter keeps the frame and the subject of the
+                // topic it came from; the drain derives its own from the
+                // DLQ topic's name.
+                ConsumerOptions::<Kafka>::new()
+                    .with_schema_registry(registry)
+                    .accept_schema_subjects(["kafka-sr-outage-inplace-undecodable-value"]),
+            )
+            .await
+    });
+    assert!(
+        dead.counter.wait_for(1, TIMEOUT).await,
+        "the dropped record reached the DLQ"
+    );
+    assert_eq!(
+        dead.dead.lock().unwrap().clone(),
+        vec![(4, 1)],
+        "the dead letter carries the one attempt made in memory, not the count it arrived with"
+    );
+
+    let snapshot = snapshotter.snapshot().into_hashmap();
+    assert_eq!(
+        counter_total(
+            &snapshot,
+            "shove_messages_failed_total",
+            TOPIC,
+            "schema_validation"
+        ),
+        1,
+        "the drop is counted once, under the label a registry answer that rules the record out gets"
+    );
+    assert_eq!(
+        discarded_series(&snapshot, TOPIC),
+        Vec::<(String, u64)>::new(),
+        "a record in the DLQ is not a discard"
+    );
+
+    shutdown.cancel();
+    running
+        .await
+        .expect("consumer task panicked")
+        .expect("consumer ended cleanly");
+    client.shutdown_token().cancel();
+    drain.await.expect("drain task panicked").ok();
 }

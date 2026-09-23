@@ -816,6 +816,9 @@ impl MessageHandler<ExternalOwnedTopic> for CountingHandler {
 #[derive(Clone)]
 struct DeferOnceRecorder {
     seen: Arc<Mutex<Vec<(String, u32, bool)>>>,
+    /// The coordinates of every delivery, in order, so a test can prove that
+    /// a redelivery is the same record and not a copy.
+    coordinates: Arc<Mutex<Vec<Coordinates>>>,
     counter: WaitableCounter,
     /// How long the first delivery runs before it returns `Defer`, so a test
     /// can hold the handler in its running state for a while.
@@ -826,6 +829,7 @@ impl DeferOnceRecorder {
     fn new() -> Self {
         Self {
             seen: Arc::new(Mutex::new(Vec::new())),
+            coordinates: Arc::new(Mutex::new(Vec::new())),
             counter: WaitableCounter::new(),
             first_runs_for: Duration::ZERO,
         }
@@ -847,6 +851,10 @@ impl DeferOnceRecorder {
     }
 
     async fn record(&self, id: String, meta: &MessageMetadata) -> Outcome {
+        self.coordinates
+            .lock()
+            .await
+            .push((meta.partition, meta.offset, meta.timestamp_ms));
         let mut seen = self.seen.lock().await;
         let first = seen.is_empty();
         seen.push((id, meta.retry_count, meta.redelivered));
@@ -2855,6 +2863,25 @@ async fn external_topic_defer_redelivers_in_place_without_producing() {
         ("1".to_string(), 0, true),
         "a Defer keeps the retry count and marks the redelivery"
     );
+    let coordinates = handler.coordinates.lock().await.clone();
+    assert_eq!(
+        coordinates[0],
+        (Some(0), Some(0), coordinates[0].2),
+        "the first delivery is the first record of the one partition"
+    );
+    assert!(
+        coordinates[0].2.is_some(),
+        "Kafka reports the broker timestamp on the first delivery"
+    );
+    assert_eq!(
+        coordinates[1], coordinates[0],
+        "the redelivery is the same record: partition, offset and timestamp unchanged"
+    );
+    assert_eq!(
+        coordinates[2],
+        (Some(0), Some(1), coordinates[2].2),
+        "the record behind it has the next offset"
+    );
     assert_eq!(
         high_watermark(tb.brokers(), TOPIC, 0),
         2,
@@ -3241,6 +3268,22 @@ async fn external_topic_waiting_handlers_keep_the_member_in_the_group() {
         .publish::<ExternalKeepaliveTopic>(&msg("b"))
         .await
         .unwrap();
+    // The receive arm puts `b` back because the one slot is held by a waiting
+    // handler; the probe is the signal that this happened, in place of a
+    // sleep that only made it likely.
+    #[cfg(feature = "test-support")]
+    {
+        use shove::kafka::put_back_probe;
+
+        let put_back_deadline = Instant::now() + TIMEOUT;
+        while put_back_probe::paused_receive() == 0 {
+            assert!(
+                Instant::now() < put_back_deadline,
+                "the record received while the slot is held must be put back by the receive arm"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
     tokio::time::sleep(Duration::from_secs(2)).await;
     wait_for_stable_group(tb.brokers(), GROUP, Duration::from_secs(5)).await;
     assert_eq!(
@@ -3275,6 +3318,8 @@ async fn external_topic_waiting_handlers_keep_the_member_in_the_group() {
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn external_topic_record_received_during_the_permit_wait_is_put_back_and_redelivered() {
+    use shove::kafka::put_back_probe;
+
     const TOPIC: &str = "kafka-external-permit-wait";
     const GROUP: &str = "kafka-external-permit-wait-consumer";
     let tb = TestBroker::start().await;
@@ -3310,6 +3355,16 @@ async fn external_topic_record_received_during_the_permit_wait_is_put_back_and_r
     publish_raw_to(tb.brokers(), TOPIC, 1, &record("b")).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     publish_raw_to(tb.brokers(), TOPIC, 0, &record("c")).await;
+    // The probe proves that `c` went back to the broker from inside the
+    // permit wait, rather than inferring it from the sleep above.
+    let put_back_deadline = Instant::now() + TIMEOUT;
+    while put_back_probe::permit_wait() == 0 {
+        assert!(
+            Instant::now() < put_back_deadline,
+            "the record received during the permit wait must be put back from that wait"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     assert!(
         handler.counter.wait_for(4, TIMEOUT).await,

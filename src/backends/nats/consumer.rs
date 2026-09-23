@@ -1397,10 +1397,10 @@ impl NatsConsumer {
                                         }
                                     };
 
-                                    let mut metadata = extract_message_metadata(&msg);
-                                    if retry_strategy == RetryStrategy::InPlace {
-                                        metadata.retry_count = in_place_retry_count(&metadata);
-                                    }
+                                    // `build()` refuses `external()` with `sequenced()`, so the
+                                    // strategy here is always the republish and the count is the
+                                    // header's; see `retry_strategy` above.
+                                    let metadata = extract_message_metadata(&msg);
                                     let retry_count = metadata.retry_count;
 
                                     shard_processing.store(true, Ordering::Release);
