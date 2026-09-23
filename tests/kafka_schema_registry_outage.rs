@@ -3024,3 +3024,212 @@ async fn an_undecodable_in_place_redelivery_is_dead_lettered_with_the_in_memory_
     client.shutdown_token().cancel();
     drain.await.expect("drain task panicked").ok();
 }
+
+// ---------------------------------------------------------------------------
+// A broker whose authorizer denies group Describe on one inert group id
+// ---------------------------------------------------------------------------
+
+/// Starts `apache/kafka` with the KRaft `StandardAuthorizer`, every request
+/// allowed unless an ACL says otherwise, and one DENY ACL: `Describe` on the
+/// consumer group `denied_group`, for every principal. The plaintext client
+/// listener authenticates nobody, so every client is `User:ANONYMOUS`, and the
+/// deny reaches the coordinator lookup librdkafka makes for a configured
+/// `group.id` even when the consumer never joins.
+///
+/// Returns the container and the bootstrap address.
+async fn start_kafka_denying_group_describe(
+    denied_group: &str,
+) -> (
+    testcontainers::ContainerAsync<testcontainers::GenericImage>,
+    String,
+) {
+    use testcontainers::core::{ContainerPort, ExecCommand, WaitFor};
+    use testcontainers::{GenericImage, ImageExt};
+
+    const KAFKA_PORT: u16 = 9092;
+    let start_script = "/tmp/tc_start.sh";
+    let image = GenericImage::new("apache/kafka", "3.8.0")
+        .with_exposed_port(ContainerPort::Tcp(KAFKA_PORT))
+        .with_entrypoint("bash")
+        .with_cmd(vec![
+            "-c".to_string(),
+            format!(
+                "while [ ! -f {s} ]; do sleep 0.1; done; chmod 755 {s} && {s}",
+                s = start_script
+            ),
+        ])
+        .with_env_var("CLUSTER_ID", "5L6g3nShT-eMCtK--X86sw")
+        .with_env_var("KAFKA_NODE_ID", "1")
+        .with_env_var("KAFKA_PROCESS_ROLES", "broker,controller")
+        .with_env_var("KAFKA_CONTROLLER_QUORUM_VOTERS", "1@localhost:9094")
+        .with_env_var("KAFKA_CONTROLLER_LISTENER_NAMES", "CONTROLLER")
+        .with_env_var("KAFKA_INTER_BROKER_LISTENER_NAME", "BROKER")
+        .with_env_var(
+            "KAFKA_LISTENERS",
+            format!(
+                "CLIENT://0.0.0.0:{KAFKA_PORT},BROKER://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094"
+            ),
+        )
+        .with_env_var(
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
+            "CLIENT:PLAINTEXT,BROKER:PLAINTEXT,CONTROLLER:PLAINTEXT",
+        )
+        .with_env_var(
+            "KAFKA_AUTHORIZER_CLASS_NAME",
+            "org.apache.kafka.metadata.authorizer.StandardAuthorizer",
+        )
+        .with_env_var("KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND", "true")
+        .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+        .with_env_var("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0");
+
+    let container = image
+        .start()
+        .await
+        .expect("failed to start the ACL Kafka container");
+    let host_port = container
+        .get_host_port_ipv4(ContainerPort::Tcp(KAFKA_PORT))
+        .await
+        .expect("failed to get the mapped Kafka port");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+         export KAFKA_ADVERTISED_LISTENERS='CLIENT://127.0.0.1:{host_port},BROKER://localhost:9093'\n\
+         exec /etc/kafka/docker/run\n"
+    );
+    let write_cmd = ExecCommand::new(vec![
+        "bash".to_string(),
+        "-c".to_string(),
+        format!("cat > {start_script} <<'EOF'\n{script}EOF"),
+    ])
+    .with_container_ready_conditions(vec![WaitFor::message_on_stdout("Kafka Server started")]);
+    container
+        .exec(write_cmd)
+        .await
+        .expect("failed to write the start script");
+
+    let deny = ExecCommand::new(vec![
+        "/opt/kafka/bin/kafka-acls.sh".to_string(),
+        "--bootstrap-server".to_string(),
+        "localhost:9093".to_string(),
+        "--add".to_string(),
+        "--deny-principal".to_string(),
+        "User:*".to_string(),
+        "--operation".to_string(),
+        "Describe".to_string(),
+        "--group".to_string(),
+        denied_group.to_string(),
+    ]);
+    let mut result = container.exec(deny).await.expect("kafka-acls.sh ran");
+    let stdout = result.stdout_to_vec().await.unwrap_or_default();
+    let stderr = result.stderr_to_vec().await.unwrap_or_default();
+    let exit = result.exit_code().await.expect("exit code");
+    assert_eq!(
+        exit,
+        Some(0),
+        "the deny ACL must be created: {}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+
+    (container, format!("127.0.0.1:{host_port}"))
+}
+
+/// Proves the deny ACL is in force: a consumer that joins `group` is refused
+/// at the coordinator with `GroupAuthorizationFailed`, the very answer the
+/// groupless subscription has to tolerate on its inert group id.
+fn assert_group_describe_is_denied(brokers: &str, group: &str, topic: &str) {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+    use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+
+    let joiner: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group)
+        .set("auto.offset.reset", "earliest")
+        .create()
+        .expect("failed to create the joining probe");
+    joiner.subscribe(&[topic]).expect("subscribe");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match joiner.poll(Duration::from_secs(1)) {
+            Some(Err(KafkaError::MessageConsumption(
+                RDKafkaErrorCode::GroupAuthorizationFailed,
+            ))) => {
+                return;
+            }
+            Some(Err(e)) => panic!("unexpected error while proving the denial: {e}"),
+            Some(Ok(_)) => panic!("the denied group must not be able to join and consume"),
+            None => assert!(
+                std::time::Instant::now() < deadline,
+                "the deny ACL on group {group} never answered the join"
+            ),
+        }
+    }
+}
+
+shove::define_topic!(
+    BroadcastAclStallTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-broadcast-acl-stall")
+        .broadcast()
+        .build()
+);
+recorder_for!(BroadcastAclStallTopic);
+
+/// The stall wait of a groupless subscription tolerates the inert group id's
+/// coordinator answer the way the receive arm does. Under an ACL that denies
+/// `Describe` on that group, a record stalls on the registry, the wait keeps
+/// polling through the denied lookups, and the record is delivered once the
+/// registry answers.
+#[tokio::test]
+async fn a_broadcast_registry_stall_survives_a_group_describe_denial() {
+    const TOPIC: &str = "kafka-sr-outage-broadcast-acl-stall";
+    const GROUP: &str = "acl-denied-stall-broadcast";
+    let (_container, brokers) = start_kafka_denying_group_describe(GROUP).await;
+    create_single_partition_topic(&brokers, TOPIC).await;
+    let brokers_for_probe = brokers.clone();
+    tokio::task::spawn_blocking(move || {
+        assert_group_describe_is_denied(&brokers_for_probe, GROUP, TOPIC)
+    })
+    .await
+    .expect("probe task panicked");
+    let (registry, status, _) =
+        mock_registry("kafka-sr-outage-broadcast-acl-stall-value", 503).await;
+    let body = serde_json::to_vec(&Event { id: 1 }).unwrap();
+    publish_raw(&brokers, TOPIC, &frame_json(FLAKY_ID, &body)).await;
+
+    let client = KafkaClient::connect_with_retry(&KafkaConfig::new(&brokers), 10)
+        .await
+        .expect("failed to connect to the ACL Kafka");
+    let broker = Broker::<Kafka>::from_client(client);
+    let handler = Recorder::new();
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<BroadcastAclStallTopic, _>(
+            handler.clone(),
+            ConsumerOptions::new()
+                .with_schema_registry(registry)
+                .with_group_id(GROUP)
+                .with_broadcast_start(BroadcastStart::Head),
+        )
+        .expect("failed to subscribe");
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(
+        handler.seen(),
+        Vec::<u32>::new(),
+        "nothing reaches the handler while the record stalls"
+    );
+
+    status.store(200, Ordering::SeqCst);
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the record is delivered once the registry answers, denied lookups notwithstanding"
+    );
+
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending(), Duration::from_secs(5))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+}
