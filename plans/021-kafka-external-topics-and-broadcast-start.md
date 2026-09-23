@@ -1009,6 +1009,11 @@ This section records, per changed step, the patterns weighed and the one chosen,
   A per-backend table names the primitive that honours it.
   No backend can opt out of the invariant.
   The table only says how far each has come.
+- Spring Cloud Stream's Kafka binder has the same bind-without-create shape.
+  With `autoCreateTopics=false` the binder verifies the topic at startup and fails the application when it is missing.
+  Its check is a partition-count read through the admin client, and it applies to the whole binder rather than per topic.
+  shove verifies per topology, with a consumer-type metadata probe that cannot create the topic.
+  It keeps creating its own DLQ, which the binder's flag would also stop.
 
 ### Step 7, the metadata fields
 
@@ -1062,6 +1067,39 @@ This section records, per changed step, the patterns weighed and the one chosen,
   It is implied by ownership and refused where a backend or a path cannot honour it.
   The strategy lives on the consumer options rather than the topology.
   It is how one consumer settles an outcome, and two groups on one topic may differ.
+- Refusing retry-capable configurations on an external NATS stream at build time was the maintainer's fallback.
+  It applied if the in-place shape had been too large for this stack.
+  The in-place shape is a `Nak(Some(delay))` the `Defer` arm already used and a count read from `num_delivered`, so the refusal was not needed.
+  It stays the answer for RabbitMQ, SQS and Redis until each implements its own primitive.
+- Seeking the partition back to the record, Kafka's `seek(TopicPartition, offset)`, is the broker's own rewind and was weighed as the redelivery primitive.
+  A seek rewinds every record after the retried one as well, refetches them, and pays the fetch round trip on each attempt.
+  The pause-and-wait keeps the record's bytes in the task and hands them back without a fetch.
+  It still pauses the assignment so the member polls.
+  A seek is kept for the put-back of a record the loop cannot take.
+- Spring Kafka's `DefaultErrorHandler` is the closest prior art.
+  It retries the failed record in place with a back-off, by seeking the partition back and re-polling.
+  It recovers the record to a dead-letter topic once the back-off is exhausted.
+  Its retries block the poll loop for the back-off, so it relies on `max.poll.interval.ms` being longer than the sum of the back-offs.
+  shove keeps polling during the wait and pauses instead.
+- Confluent's Parallel Consumer processes the records of one partition concurrently by key.
+  It retries a failed record in its own worker with a back-off, and commits the highest contiguous offset while holding the rest.
+  It is the model for the per-key concurrency shove does not have.
+  shove keeps one prefetch slot per waiting record, and the partition's order under `concurrent_processing(false)`.
+
+### Step 11, the registry outage
+
+- An unbounded wait on the record in hand is the chosen shape.
+  The record is neither poison nor processed, so it stays uncommitted while the loop polls.
+  It decodes again every `REGISTRY_RETRY_DELAY`, and goes on once the registry answers.
+  Nothing is lost and nothing is reordered, at the price of a stalled partition for the length of the outage.
+- Retained-record retry with a bounded back-off, the shape of Spring Kafka's `DefaultErrorHandler`, was the alternative.
+  It retries the same record a fixed number of times and then recovers it to a dead-letter topic.
+  A registry outage has no fixed length, so a bound turns an outage into dead letters, which is the discard the step removes.
+- Bounded retry followed by tolerance or dead-lettering, Kafka Connect's `errors.tolerance` and `errors.deadletterqueue` of KIP-298, was the other alternative.
+  It is right for a converter that will never succeed and wrong for one that will as soon as the registry is back.
+- The lookup itself is bounded below the member's poll interval.
+  A registry that accepts and never answers therefore cannot cost the group membership.
+  The wait between lookups is what has no bound.
 
 ## Done criteria
 
