@@ -25,7 +25,7 @@ use crate::backend::batch_consumer::settling::{
 use crate::backend::batch_consumer::{
     BatchConsumerOptionsInner, BatchSettlement, settle_batch_outcome,
 };
-use crate::consumer::{DEFAULT_HANDLER_TIMEOUT, validate_message_size};
+use crate::consumer::{DEFAULT_HANDLER_TIMEOUT, RetryStrategy, validate_message_size};
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::Result;
 use crate::handler::{BatchMessageHandler, MessageHandler};
@@ -87,6 +87,36 @@ fn get_retry_count(headers: &Option<HeaderMap>) -> u32 {
         .and_then(|hm| hm.get(RETRY_COUNT_HEADER))
         .and_then(|v| v.as_str().parse::<u32>().ok())
         .unwrap_or(0)
+}
+
+/// The retry strategy a NATS consumer runs with, from the topology's
+/// ownership.
+///
+/// An external stream implies [`RetryStrategy::InPlace`]: the consumer never
+/// writes into a stream infra owns, so a `Retry` is the same delayed negative
+/// acknowledgement a `Defer` uses, and the count is read from JetStream's
+/// delivery info. A shove-owned stream keeps [`RetryStrategy::Republish`],
+/// the hold-then-republish path with the header-based count. The setter on
+/// the consumer options reaches NATS with plan 019, when an owned stream can
+/// opt into `InPlace` as well.
+fn resolve_retry_strategy(topology: &QueueTopology) -> RetryStrategy {
+    if topology.external() {
+        RetryStrategy::InPlace
+    } else {
+        RetryStrategy::Republish
+    }
+}
+
+/// The retry count an in-place consumer settles with.
+///
+/// A republish carries the count in the `Shove-Retry-Count` header of every
+/// copy it publishes. An in-place retry publishes nothing, so the count is the
+/// number of redeliveries JetStream itself reports: `num_delivered - 1`, 0 on
+/// the first delivery. An `ack_wait` expiry and a `Defer` nak are redeliveries
+/// too, so on an external stream both consume the retry budget; the
+/// `MessageMetadata::delivery_count` doc states the same.
+fn in_place_retry_count(metadata: &MessageMetadata) -> u32 {
+    metadata.delivery_count.map_or(0, |n| n.saturating_sub(1))
 }
 
 /// Reads `Shove-Sequence-Key` from headers.
@@ -222,12 +252,29 @@ fn adjust_outcome_for_fifo(outcome: Outcome) -> Outcome {
     }
 }
 
-/// Publishes a message to the DLQ stream with death headers.
+/// Publishes a message to the DLQ stream with death headers, the message's
+/// own `Shove-Retry-Count` header kept as it is.
 async fn publish_to_dlq(
     client: &NatsClient,
     topology: &QueueTopology,
     msg: &Message,
     reason: &str,
+) -> Result<()> {
+    publish_dead_letter(client, topology, msg, reason, None).await
+}
+
+/// Publishes a message to the DLQ stream with death headers.
+///
+/// `retry_count` is `Some` on the in-place path, where the count lives in the
+/// delivery info and not in a header: the dead letter is stamped with it, so a
+/// DLQ handler reads the same `retry_count` a republish would have carried.
+/// `None` keeps the message's own header.
+async fn publish_dead_letter(
+    client: &NatsClient,
+    topology: &QueueTopology,
+    msg: &Message,
+    reason: &str,
+    retry_count: Option<u32>,
 ) -> Result<()> {
     let dlq_subject = match topology.dlq() {
         Some(dlq) => dlq.to_string(),
@@ -243,6 +290,9 @@ async fn publish_to_dlq(
     let mut headers = msg.headers.clone().unwrap_or_default();
     headers.insert(DEATH_REASON_HEADER, reason);
     headers.insert(ORIGINAL_QUEUE_HEADER, topology.queue());
+    if let Some(count) = retry_count {
+        headers.insert(RETRY_COUNT_HEADER, count.to_string().as_str());
+    }
 
     let current_death_count = msg
         .headers
@@ -385,10 +435,12 @@ async fn route_outcome(
     topology: &'static QueueTopology,
     retry_count: u32,
     max_retries: u32,
+    retry_strategy: RetryStrategy,
     hold_queues: &[HoldQueue],
     ack_wait: Duration,
     shutdown: &CancellationToken,
 ) {
+    let in_place = retry_strategy == RetryStrategy::InPlace;
     let result: Result<()> = match decide_retry(&outcome, retry_count, max_retries) {
         RetryDecision::Ack => {
             if let Err(e) = msg.ack().await {
@@ -407,7 +459,8 @@ async fn route_outcome(
                 fail_reason,
                 topology.dlq().is_some(),
             );
-            match publish_to_dlq(client, topology, msg, reason).await {
+            let stamped = in_place.then_some(retry_count);
+            match publish_dead_letter(client, topology, msg, reason, stamped).await {
                 Ok(()) => {
                     // The ack is what retires the message; until it lands
                     // JetStream still owns the delivery and will redeliver on
@@ -447,6 +500,17 @@ async fn route_outcome(
                 let idx = hold_index(retry_count, hold_queues.len());
                 hold_queues[idx].delay()
             };
+
+            if in_place {
+                // An external stream is never written by its consumer: the
+                // retry is the same delayed negative acknowledgement a `Defer`
+                // uses, and the redelivery it triggers increments the
+                // `num_delivered` that `in_place_retry_count` reads.
+                if let Err(e) = msg.ack_with(AckKind::Nak(Some(delay))).await {
+                    tracing::error!(error = %e, "failed to nak-with-delay for in-place retry");
+                }
+                return;
+            }
 
             // Hold the original un-acked through the backoff, then durably
             // republish an incremented copy and ack — see
@@ -679,6 +743,7 @@ impl NatsConsumer {
         let handler_timeout = options.handler_timeout;
         let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let hold_queues = topology.hold_queues();
+        let retry_strategy = resolve_retry_strategy(topology);
 
         let max_message_size = options.max_message_size;
         let max_ack_pending = options.max_ack_pending.unwrap_or(prefetch_count as i64);
@@ -696,6 +761,7 @@ impl NatsConsumer {
             prefetch_count,
             max_ack_pending,
             max_retries,
+            retry_strategy = ?retry_strategy,
             "NATS consumer started"
         );
 
@@ -875,7 +941,10 @@ impl NatsConsumer {
                                 }
                             };
 
-                            let metadata = extract_message_metadata(&msg);
+                            let mut metadata = extract_message_metadata(&msg);
+                            if retry_strategy == RetryStrategy::InPlace {
+                                metadata.retry_count = in_place_retry_count(&metadata);
+                            }
                             let retry_count = metadata.retry_count;
 
                             let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
@@ -915,6 +984,7 @@ impl NatsConsumer {
                                     topology,
                                     retry_count,
                                     max_retries,
+                                    retry_strategy,
                                     hold_queues,
                                     ack_wait,
                                     &task_shutdown,
@@ -1057,6 +1127,13 @@ impl NatsConsumer {
         let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let max_message_size = options.max_message_size;
         let hold_queues = topology.hold_queues();
+        // `build()` refuses `external()` with `sequenced()`, so a FIFO consumer
+        // always runs the republish path.
+        debug_assert!(
+            !topology.external(),
+            "external() is refused on a sequenced topology at build()"
+        );
+        let retry_strategy = RetryStrategy::Republish;
         let topic: Arc<str> = Arc::from(queue);
         let group: Option<Arc<str>> = options.consumer_group.clone();
         let derived_ack_wait = derive_ack_wait(handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT));
@@ -1320,7 +1397,10 @@ impl NatsConsumer {
                                         }
                                     };
 
-                                    let metadata = extract_message_metadata(&msg);
+                                    let mut metadata = extract_message_metadata(&msg);
+                                    if retry_strategy == RetryStrategy::InPlace {
+                                        metadata.retry_count = in_place_retry_count(&metadata);
+                                    }
                                     let retry_count = metadata.retry_count;
 
                                     shard_processing.store(true, Ordering::Release);
@@ -1367,6 +1447,7 @@ impl NatsConsumer {
                                         topology,
                                         retry_count,
                                         max_retries,
+                                        retry_strategy,
                                         hold_queues,
                                         ack_wait,
                                         &shard_shutdown,
@@ -2175,6 +2256,44 @@ impl NatsConsumer {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod retry_strategy_tests {
+    use super::*;
+    use crate::TopologyBuilder;
+
+    fn metadata(delivery_count: Option<u32>) -> MessageMetadata {
+        MessageMetadata {
+            retry_count: 0,
+            delivery_id: String::new(),
+            redelivered: false,
+            delivery_count,
+            partition: None,
+            offset: None,
+            timestamp_ms: None,
+            headers: Arc::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn ownership_decides_the_strategy() {
+        let owned = TopologyBuilder::new("nats-owned").build();
+        let external = TopologyBuilder::new("nats-external").external().build();
+        assert_eq!(resolve_retry_strategy(&owned), RetryStrategy::Republish);
+        assert_eq!(resolve_retry_strategy(&external), RetryStrategy::InPlace);
+    }
+
+    #[test]
+    fn in_place_count_is_the_redelivery_count() {
+        assert_eq!(in_place_retry_count(&metadata(None)), 0);
+        assert_eq!(in_place_retry_count(&metadata(Some(1))), 0);
+        assert_eq!(in_place_retry_count(&metadata(Some(4))), 3);
+        assert_eq!(
+            in_place_retry_count(&metadata(Some(u32::MAX))),
+            u32::MAX - 1
+        );
     }
 }
 

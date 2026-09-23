@@ -128,8 +128,8 @@ A declared DLQ needs `Create`, `Describe` and `Write` on the DLQ topic, so that 
 
 On an external topic, shove's consumer never writes into the topic when it settles an outcome: a `Retry` or a `Defer` waits in place, and a `Reject` publishes to the shove-owned DLQ.
 That is the guarantee, and it covers declaring and consuming.
-Publishing is outside it: a `Publisher` on this topology writes to the topic, and the producer keeps librdkafka's default of `allow.auto.create.topics=true`, so a publish to a topic that does not exist can create it with broker defaults on a broker with `auto.create.topics.enable=true`.
-Provision the topic before any publisher starts, or pin the flag on the producer if that behaviour ever changes library-wide.
+Publishing is outside it: a `Publisher` on this topology writes to the topic.
+Until the producer pins `allow.auto.create.topics=false`, a separate change in the same release, a publish to a topic that does not exist can create it with broker defaults on a broker with `auto.create.topics.enable=true`, so provision the topic before any publisher starts.
 `Ack` and `Reject` behave as everywhere else, because a `Reject` publishes to the shove-owned DLQ and not into the topic.
 How `Retry` and `Defer` are carried out is the consumer's **retry strategy**, `RetryStrategy::Republish` or `RetryStrategy::InPlace`, set with `with_retry_strategy` on `ConsumerOptions::<Kafka>` or `KafkaConsumerGroupConfig`.
 Ownership implies it: an external topology runs with `InPlace` and refuses `Republish`, because the republish would write into a topic infra owns.

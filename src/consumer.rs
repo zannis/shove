@@ -37,14 +37,23 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 /// consumer that must not duplicate a retried record for the other groups on
 /// a fan-out topic can wait in place too.
 ///
-/// Set with `with_retry_strategy` on the options of a backend that honours
-/// the choice. Kafka honours both on this version, through
-/// `ConsumerOptions::<Kafka>::with_retry_strategy` and
-/// `KafkaConsumerGroupConfig::with_retry_strategy`. Every other backend
-/// carries a retry through its hold queues on this version, as it always
-/// has, and gains the setter as it declares its support: NATS follows with
-/// its native in-place redelivery, and its external mode keeps hold queues
-/// until then.
+/// One invariant binds every backend: a consumer never writes into an
+/// external topology when it settles an outcome, so an external topology
+/// implies `InPlace` everywhere. Every broker has a native primitive for it,
+/// and each backend adopts it in turn:
+///
+/// | Backend | In-place primitive | This version |
+/// |---|---|---|
+/// | Apache Kafka | pauses the assignment and waits in the handler's task, the count kept in memory | both strategies, set with `ConsumerOptions::<Kafka>::with_retry_strategy` or `KafkaConsumerGroupConfig::with_retry_strategy` |
+/// | NATS JetStream | naks with the tier's delay, the count from JetStream's `num_delivered` | `InPlace` on an external stream, `Republish` on a shove-owned one; the setter follows |
+/// | AWS SQS | extends the visibility timeout, the path the FIFO consumer already uses | later, additive; `declare` refuses `external()` |
+/// | RabbitMQ | `basic.nack` with requeue | later, additive; `declare` refuses `external()` |
+/// | Redis Streams | leaves the entry pending for idle redelivery | later, additive; `declare` refuses `external()` |
+///
+/// The in-process broker has nothing infra can own, so `external()` is a
+/// no-op there and its hold queues stay as they are. On NATS every
+/// redelivery counts, so on an external stream a `Defer` and an `ack_wait`
+/// expiry consume the retry budget too.
 ///
 /// `#[non_exhaustive]`: a later shape, such as retry topics per delay tier,
 /// is a new variant and not a breaking change, so match with a wildcard arm.

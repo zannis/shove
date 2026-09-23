@@ -163,4 +163,7 @@ Before publishing or consuming, call `broker.topology().declare::<MyTopic>().awa
 On Kafka and NATS, `declare` verifies that the topic or stream exists and fails fast when it does not, while shove still creates its own DLQ.
 RabbitMQ, SQS and Redis refuse an external topology at `declare` on this version, until their declarers gain a verification step, because creating the resource is the write the flag promises never to make; the in-process broker treats the flag as a no-op.
 `nats_external_stream()` remains for one release as a deprecated alias.
-Ownership says who creates the resource, not how a `Retry` is carried out: what an external topology implies for a consumer's retry strategy is declared per backend, on that backend's page.
+Ownership also binds how an outcome settles: a consumer never writes into an external topology, so an external topology implies `RetryStrategy::InPlace` on every backend.
+Kafka and NATS implement it on this version, each with its broker's own primitive: Kafka pauses the assignment and waits, and NATS naks with a delay and counts attempts from the delivery info.
+SQS (the visibility timeout), RabbitMQ (`basic.nack` with requeue) and Redis Streams (idle redelivery of a pending entry) adopt theirs when their declarers gain the verification step; [Outcomes](/concepts/outcomes) has the table.
+On SQS, infra owns the topic, the queue, the queue policy, the subscription and the redrive policy, so `dlq()` on an external queue will be verify-only or refused, and shove never sets a redrive policy it does not own.

@@ -143,6 +143,13 @@ shove::define_topic!(
 
 In this mode `declare::<T>()` does **not** create the main stream — it verifies the stream (named after the queue) already exists and returns an error if it doesn't, so a missing or misnamed stream fails fast at startup instead of silently falling back to a default-configured one. shove still creates and owns its own DLQ stream and the durable consumer on the external stream. Provision the stream before the consumer starts (e.g. order a bootstrap job ahead of the deployment).
 
+On an external stream the consumer never writes into the stream when it settles an outcome.
+A `Retry` is the same delayed negative acknowledgement a `Defer` uses: the record stays at its sequence, `hold_queue()` still selects the delay by attempt, and 1 s applies without hold queues.
+The retry count comes from JetStream's `num_delivered` instead of the `Shove-Retry-Count` header, so `MessageMetadata::retry_count` is the redelivery count, and a `Defer` or an `ack_wait` expiry consumes the retry budget there.
+An exhausted budget dead-letters to shove's own DLQ stream as before, and the dead letter carries that count in `Shove-Retry-Count`.
+A shove-owned stream keeps the hold-then-republish path: the incremented copy is published after the delay, and only a `Defer` naks in place.
+This is `RetryStrategy::InPlace`, implied by `external()`; [Outcomes](/concepts/outcomes) has the per-backend table.
+
 `external()` and `nats_stream_config()` are mutually exclusive - and both are incompatible with `nats_subjects()` and `sequenced()`, which configure stream *creation* that external mode skips. `build()` panics if they are combined.
 `nats_external_stream()` remains for one release as a deprecated alias of `external()`.
 
