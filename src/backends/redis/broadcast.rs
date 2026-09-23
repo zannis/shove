@@ -94,6 +94,7 @@ where
     H: MessageHandler<T>,
 {
     let topology = T::topology();
+    super::consumer::refuse_external(topology)?;
     let stream = topology.queue();
     if !topology.broadcast() {
         return Err(ShoveError::Topology(format!(

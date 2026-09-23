@@ -405,6 +405,33 @@ impl QueueTopology {
         )))
     }
 
+    /// The refusal every consume entry point of a backend without an in-place
+    /// retry returns for an external topology, before any I/O.
+    ///
+    /// `declare` refuses the flag on the same backends, see
+    /// [`refuse_external`](Self::refuse_external), but a consumer can run
+    /// without `declare` against a resource infra created, and its `Retry`
+    /// would then republish into that resource: the one write external
+    /// ownership rules out. `primitive` names the broker's own in-place
+    /// redelivery, which the backend adopts before it honours the flag.
+    #[cfg(any(
+        feature = "rabbitmq",
+        feature = "aws-sns-sqs",
+        feature = "redis-streams"
+    ))]
+    pub(crate) fn refuse_external_consume(&self, backend: &str, primitive: &str) -> Result<()> {
+        if !self.external {
+            return Ok(());
+        }
+        Err(ShoveError::Topology(format!(
+            "topic '{}' declares `external()`, which {backend} does not honour yet: a `Retry` \
+             would republish into the resource infra owns, and the in-place redelivery \
+             ({primitive}) is not implemented. Drop `external()` or provision the topology \
+             through shove.",
+            self.queue
+        )))
+    }
+
     /// Explicit config for a shove-managed stream, if set via
     /// [`TopologyBuilder::nats_stream_config`]. `None` keeps shove's defaults
     /// (WorkQueue / unbounded / single-replica). NATS-specific.
@@ -795,9 +822,9 @@ impl TopologyBuilder {
     /// |---|---|
     /// | Kafka | a metadata probe from a client with no `group.id`, which cannot auto-create the topic; the topic's partitions are never expanded and its config never reconciled |
     /// | NATS JetStream | `get_stream`; the durable consumer and the DLQ stream are still shove's |
-    /// | RabbitMQ | refused with `ShoveError::Topology` on this version, until the declarer verifies with a passive `queue.declare`; refusing is the safe direction, because creating the resource is the write this flag promises never to make |
-    /// | AWS SNS/SQS | refused with `ShoveError::Topology` on this version; infra owns the topic, the queue, the queue policy, the subscription and the redrive policy, and the declarer will verify them: `GetQueueUrl` proves the queue, and `GetTopicAttributes` with `ListSubscriptionsByTopic` prove the rest best effort; `dlq()` on an external queue is then verify-only or refused, because the dead-letter wiring is the primary's `RedrivePolicy` and infra sets it; a `Retry` there uses the visibility-timeout path the FIFO consumer already has, because the standard path's delete plus `SendMessage` is a write into the queue; none of it changes the API, so adding SQS is additive |
-    /// | Redis Streams | refused with `ShoveError::Topology` on this version, until the declarer verifies with `EXISTS` on the stream key |
+    /// | RabbitMQ | refused with `ShoveError::Topology` on this version, at `declare` and at every consumer entry point, until the declarer verifies with a passive `queue.declare` and the consumer retries with `basic.nack` and requeue; refusing is the safe direction, because creating the resource is the write this flag promises never to make, and so is a `Retry` republished into it |
+    /// | AWS SNS/SQS | refused with `ShoveError::Topology` on this version; infra owns the topic, the queue, the queue policy, the subscription and the redrive policy, and the declarer will verify them: `GetQueueUrl` proves the queue, and `GetTopicAttributes` with `ListSubscriptionsByTopic` prove the rest best effort; `dlq()` on an external queue is then verify-only or refused, because the dead-letter wiring is the primary's `RedrivePolicy` and infra sets it; a `Retry` there uses the visibility-timeout path the FIFO consumer already has, because the standard path's delete plus `SendMessage` is a write into the queue; none of it changes the API, so adding SQS is additive; until then `declare` and every consumer entry point refuse the flag |
+    /// | Redis Streams | refused with `ShoveError::Topology` on this version, at `declare` and at every consumer entry point, until the declarer verifies with `EXISTS` on the stream key and the consumer leaves a retried entry pending for idle redelivery instead of `XADD` |
     /// | In-process | a no-op: nothing in-process can be owned by infra, so the queue is created as always |
     ///
     /// The per-backend creation options stay refused in external mode, because

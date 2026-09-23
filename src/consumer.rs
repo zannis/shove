@@ -46,9 +46,9 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 /// |---|---|---|
 /// | Apache Kafka | pauses the assignment and waits in the handler's task, the count kept in memory | both strategies, set with `ConsumerOptions::<Kafka>::with_retry_strategy` or `KafkaConsumerGroupConfig::with_retry_strategy` |
 /// | NATS JetStream | naks with the tier's delay, the count from JetStream's `num_delivered` | `InPlace` on an external stream, `Republish` on a shove-owned one; the setter follows |
-/// | AWS SQS | extends the visibility timeout, the path the FIFO consumer already uses | later, additive; `declare` refuses `external()` |
-/// | RabbitMQ | `basic.nack` with requeue | later, additive; `declare` refuses `external()` |
-/// | Redis Streams | leaves the entry pending for idle redelivery | later, additive; `declare` refuses `external()` |
+/// | AWS SQS | extends the visibility timeout, the path the FIFO consumer already uses | later, additive; `declare` and every consumer entry point refuse `external()` |
+/// | RabbitMQ | `basic.nack` with requeue | later, additive; `declare` and every consumer entry point refuse `external()` |
+/// | Redis Streams | leaves the entry pending for idle redelivery | later, additive; `declare` and every consumer entry point refuse `external()` |
 ///
 /// The in-process broker has nothing infra can own, so `external()` is a
 /// no-op there and its hold queues stay as they are. On NATS every

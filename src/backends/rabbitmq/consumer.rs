@@ -1856,6 +1856,16 @@ async fn try_deserialize_or_reject<T: Topic>(
     }
 }
 
+/// The refusal every RabbitMQ consume entry point returns for an external
+/// topology, before any channel work. `declare` refuses the flag too, but a
+/// consumer can run against a queue infra created, and the router carries a
+/// `Retry` and a `Defer` by publishing into a hold queue that shove never
+/// declared there, the write external ownership rules out. The in-place
+/// shape, `basic.nack` with requeue, is not implemented on this version.
+pub(super) fn refuse_external(topology: &QueueTopology) -> Result<()> {
+    topology.refuse_external_consume("RabbitMQ", "`basic.nack` with requeue")
+}
+
 impl RabbitMqConsumer {
     pub async fn run<T, H>(
         &self,
@@ -1882,6 +1892,7 @@ impl RabbitMqConsumer {
         H: MessageHandler<T>,
     {
         let topology = T::topology();
+        refuse_external(topology)?;
         options.refuse_broadcast_start(topology.queue(), "RabbitMqConsumer::run")?;
         let consumer = RabbitMqConsumer::new(self.client.clone());
         let handler = Arc::new(handler);
@@ -1921,6 +1932,7 @@ impl RabbitMqConsumer {
         H: MessageHandler<T>,
     {
         let topology = T::topology();
+        refuse_external(topology)?;
         if !topology.broadcast() {
             return Err(ShoveError::Topology(format!(
                 "topic '{}' is not a broadcast topology; a fanout subscription to it would \
@@ -1995,6 +2007,7 @@ impl RabbitMqConsumer {
         H: MessageHandler<T>,
     {
         let topology = T::topology();
+        refuse_external(topology)?;
         options.refuse_broadcast_start(topology.queue(), "RabbitMqConsumer::run_fifo")?;
         let seq = topology.sequencing().ok_or_else(|| {
             ShoveError::Topology("run_fifo called on topic without sequencing config".into())
@@ -2110,6 +2123,7 @@ impl RabbitMqConsumer {
         H: MessageHandler<T>,
     {
         let topology = T::topology();
+        refuse_external(topology)?;
         let dlq = topology
             .dlq()
             .ok_or_else(|| ShoveError::Topology("run_dlq called on topic without DLQ".into()))?;
@@ -2476,6 +2490,7 @@ impl RabbitMqConsumer {
         H: BatchMessageHandler<T>,
     {
         let topology = T::topology();
+        refuse_external(topology)?;
         let queue = topology.queue();
         let configured = options.max_batch_size.max(1);
         let effective_max = effective_batch_size(options.max_batch_size);

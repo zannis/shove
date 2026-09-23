@@ -28,6 +28,7 @@ use crate::error::Result;
 use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::markers::Redis;
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
+use crate::topology::QueueTopology;
 
 use super::autoscaler::{RedisAutoscalerBackend, XlenStatsProvider};
 use super::client::{RedisClient, RedisConfig};
@@ -122,6 +123,10 @@ impl BroadcastImpl for RedisConsumer {
             options,
             "the subscription reads from `$` on this version",
         )
+    }
+
+    fn refuse_external(topology: &QueueTopology) -> Result<()> {
+        super::consumer::refuse_external(topology)
     }
 }
 

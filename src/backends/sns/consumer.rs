@@ -69,6 +69,17 @@ where
     }
 }
 
+/// The refusal every SQS consume entry point returns for an external
+/// topology, before any request. `declare` refuses the flag too, and the
+/// queue URL registry it fills is keyed by queue name alone, so a managed
+/// topology with the same queue name would let an external one reach the
+/// router, whose `Retry` is a delete plus `SendMessage` into the queue: the
+/// write external ownership rules out. The in-place shape, the visibility
+/// timeout, is the FIFO consumer's path and not wired here on this version.
+pub(super) fn refuse_external(topology: &QueueTopology) -> Result<()> {
+    topology.refuse_external_consume("AWS SNS/SQS", "the visibility timeout")
+}
+
 #[derive(Clone)]
 pub struct SqsConsumer {
     client: SnsClient,
@@ -2364,6 +2375,7 @@ impl SqsConsumer {
         let queue_registry = self.queue_registry.clone();
         async move {
             let topology = T::topology();
+            refuse_external(topology)?;
             let consumer = SqsConsumer::new(client, queue_registry);
             let queue_url = consumer.resolve_queue_url(topology.queue()).await?;
             let handler = Arc::new(handler);
@@ -2482,6 +2494,7 @@ impl SqsConsumer {
         H: MessageHandler<T>,
     {
         let topology = T::topology();
+        refuse_external(topology)?;
         let seq = topology
             .sequencing()
             .ok_or_else(|| ShoveError::Topology("run_fifo requires a sequenced topic".into()))?;
@@ -2532,6 +2545,7 @@ impl SqsConsumer {
         let queue_registry = self.queue_registry.clone();
         async move {
             let topology = T::topology();
+            refuse_external(topology)?;
             let dlq = topology.dlq().ok_or_else(|| {
                 ShoveError::Topology(format!(
                     "topic '{}' has no DLQ configured",
@@ -2581,6 +2595,7 @@ impl SqsConsumer {
             validate_sqs_batch_size(options.max_batch_size)?;
 
             let topology = T::topology();
+            refuse_external(topology)?;
             let consumer = SqsConsumer::new(client, queue_registry);
             let queue_url = consumer.resolve_queue_url(topology.queue()).await?;
             let handler = Arc::new(handler);
@@ -2676,5 +2691,89 @@ mod batch_cap_tests {
         assert!(msg.contains("DeleteMessageBatch"), "message: {msg}");
         assert!(msg.contains("10"), "message: {msg}");
         assert!(msg.contains("500"), "message: {msg}");
+    }
+}
+
+/// The consume-side refusal of an external topology, which closes the gap a
+/// queue-URL registry keyed by queue name alone leaves open: a managed
+/// topology with the same queue name fills the registry, and an external one
+/// would then reach the router.
+#[cfg(test)]
+mod external_refusal_tests {
+    use std::sync::OnceLock;
+
+    use super::*;
+    use crate::{JsonCodec, TopologyBuilder};
+
+    struct InfraOrders;
+    impl Topic for InfraOrders {
+        type Message = String;
+        type Codec = JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static T: OnceLock<QueueTopology> = OnceLock::new();
+            T.get_or_init(|| {
+                TopologyBuilder::new("infra-orders")
+                    .external()
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+
+    struct Noop;
+    impl MessageHandler<InfraOrders> for Noop {
+        type Context = ();
+        async fn handle(&self, _: String, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    fn expect_external_refusal(err: ShoveError, entry_point: &str) {
+        let ShoveError::Topology(msg) = err else {
+            panic!("{entry_point}: expected ShoveError::Topology, got {err:?}");
+        };
+        assert!(
+            msg.contains("infra-orders")
+                && msg.contains("external()")
+                && msg.contains("AWS SNS/SQS")
+                && msg.contains("visibility timeout"),
+            "{entry_point}: {msg}"
+        );
+    }
+
+    /// With the URL registered, as a same-name managed topology would leave
+    /// it, the direct and DLQ paths still refuse before any request. The
+    /// mock client reaches no endpoint, so a run that passed the guard would
+    /// surface as a transport error instead of `Topology`.
+    #[tokio::test]
+    async fn consume_entry_points_refuse_an_external_topology_before_any_request() {
+        let registry = Arc::new(QueueRegistry::new());
+        for queue in ["infra-orders", "infra-orders-dlq"] {
+            registry
+                .insert(
+                    queue.to_string(),
+                    format!("https://sqs.us-east-1.amazonaws.com/123/{queue}"),
+                )
+                .await;
+        }
+        let consumer = SqsConsumer::new(SnsClient::mock(), registry);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            consumer.run::<InfraOrders, _>(Noop, (), crate::ConsumerOptions::<Sqs>::new()),
+        )
+        .await
+        .expect("the refusal is synchronous")
+        .expect_err("external() must be refused on the SQS direct path");
+        expect_external_refusal(err, "SqsConsumer::run");
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            consumer.run_dlq::<InfraOrders, _>(Noop, ()),
+        )
+        .await
+        .expect("the refusal is synchronous")
+        .expect_err("external() must be refused on the SQS DLQ drain");
+        expect_external_refusal(err, "SqsConsumer::run_dlq");
     }
 }

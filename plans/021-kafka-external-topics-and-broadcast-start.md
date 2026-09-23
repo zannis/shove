@@ -580,6 +580,9 @@ Per declarer, what `declare()` does with an external topology:
   None of that changes the API shape: one `external()` flag, a per-backend verification table and build-time refusals.
   Adding SQS later is therefore additive.
   Refusing is the safe direction, because creating the resource is the write the flag promises never to make.
+  Their consumers refuse the flag too, at every entry point and before any request, through `QueueTopology::refuse_external_consume`.
+  A consumer can run without `declare` against a resource infra created, and a `Retry` there republished into it on all three backends.
+  The review's Docker probe of 2026-09-23 showed it on Redis: one `Retry` on an infra-owned stream left two entries in it.
 - In-process: a no-op, because nothing in-process can be owned by infra.
 
 Ownership says who creates the resource, and it binds one invariant on every backend.
@@ -593,9 +596,9 @@ Step 10 states the Kafka and NATS mechanics.
 |---|---|---|
 | Kafka | pause the assignment and wait in the handler's task | implemented, step 10 |
 | NATS JetStream | `Nak(Some(delay))`, the count from `num_delivered` | implemented, step 10 |
-| AWS SQS | the visibility timeout, the path the FIFO consumer already uses | later, additive; `declare` refuses `external()` |
-| RabbitMQ | `basic.nack` with requeue | later, additive; `declare` refuses `external()` |
-| Redis Streams | leave the entry pending for idle redelivery | later, additive; `declare` refuses `external()` |
+| AWS SQS | the visibility timeout, the path the FIFO consumer already uses | later, additive; `declare` and every consumer entry point refuse `external()` |
+| RabbitMQ | `basic.nack` with requeue | later, additive; `declare` and every consumer entry point refuse `external()` |
+| Redis Streams | leave the entry pending for idle redelivery | later, additive; `declare` and every consumer entry point refuse `external()` |
 
 Kafka backend:
 

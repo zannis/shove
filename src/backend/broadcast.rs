@@ -14,6 +14,7 @@ use crate::backend::ConsumerOptionsInner;
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
+use crate::topology::QueueTopology;
 
 // Anchored by the InMemory port's `_anchor_broadcast_impl` helper in
 // `backend::mod`; genuinely uncalled under `--no-default-features`, where no
@@ -73,6 +74,14 @@ pub(crate) trait BroadcastImpl: Send + Sync {
     /// backend-specific knob whose only readers are the group paths, such as
     /// Kafka's commit interval and `auto.offset.reset`.
     fn check_options(queue: &str, options: &ConsumerOptionsInner) -> Result<()>;
+
+    /// Refuse an external topology before the subscription is spawned, on a
+    /// backend whose broadcast loop does not honour `external()` yet. The
+    /// default accepts; Redis and RabbitMQ refuse through
+    /// `QueueTopology::refuse_external_consume`.
+    fn refuse_external(_topology: &QueueTopology) -> Result<()> {
+        Ok(())
+    }
 }
 
 // Gated to the tail-only backends, which are the only callers; Kafka honours

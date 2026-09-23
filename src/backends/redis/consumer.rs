@@ -133,6 +133,20 @@ impl RedisConsumer {
 // through the generic ConsumerSupervisor<B>.
 // ---------------------------------------------------------------------------
 
+/// The refusal every Redis consume entry point returns for an external
+/// topology, before any command is sent. `declare` refuses the flag too, but
+/// a consumer can run against a stream and group infra created, and every
+/// `Retry` here is an `XADD` into the consumed stream (`requeue_to_stream`,
+/// or the hold-stream republish), the write external ownership rules out.
+/// The in-place shape, leaving the entry pending for idle redelivery, is not
+/// implemented on this version.
+pub(super) fn refuse_external(topology: &QueueTopology) -> Result<()> {
+    topology.refuse_external_consume(
+        "Redis Streams",
+        "leaving the entry pending for idle redelivery",
+    )
+}
+
 impl RedisConsumer {
     /// Run the non-FIFO consumer loop until `options.shutdown` is cancelled.
     ///
@@ -261,6 +275,7 @@ impl ConsumerImpl for RedisConsumer {
     {
         let client = self.client.clone();
         async move {
+            refuse_external(T::topology())?;
             options.refuse_broadcast_start(T::topology().queue(), "RedisConsumer::run")?;
             // `ConsumerOptions::into_inner` pins `prefetch_count` to 1 when
             // `concurrent_processing` is off, so a prefetch above 1 is the
@@ -328,6 +343,7 @@ impl ConsumerImpl for RedisConsumer {
         let client = self.client.clone();
         async move {
             let topology = T::topology();
+            refuse_external(topology)?;
             let dlq_name = topology.dlq().ok_or_else(|| {
                 ShoveError::Topology(format!(
                     "run_dlq called on topic {} without DLQ",
@@ -363,6 +379,7 @@ impl ConsumerImpl for RedisConsumer {
         let client = self.client.clone();
         async move {
             let topology = T::topology();
+            refuse_external(topology)?;
             options.refuse_broadcast_start(topology.queue(), "RedisConsumer::run_fifo")?;
             let seq = topology.sequencing().ok_or_else(|| {
                 ShoveError::Topology(format!(
@@ -3066,6 +3083,7 @@ where
     H: BatchMessageHandler<T>,
 {
     let topology = T::topology();
+    refuse_external(topology)?;
     let stream = topology.queue();
     let group = client.group().to_owned();
     let shutdown = options.shutdown.clone();
