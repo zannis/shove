@@ -1,6 +1,7 @@
 //! Shared registry decode stage used by the Kafka consumer decode sites.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::codec::Codec;
 use crate::error::{Result, ShoveError};
@@ -70,12 +71,22 @@ pub(crate) fn message_index_accepted(required: Option<&[i32]>, actual: Option<&[
 ///
 /// The index check runs before the registry lookup: a rejected frame costs no
 /// network round trip.
+///
+/// `lookup_bound` caps one lookup. A consume loop calls this from its receive
+/// arm, where nothing polls the broker until the lookup answers, and a
+/// registry that accepts the connection and never answers holds the request
+/// for the client's whole timeout and retries; a bound below the member's
+/// `max.poll.interval.ms` turns that into `Unavailable`, which the loop
+/// resolves by waiting while it keeps polling, so the member stays in its
+/// group. The lookup itself is dropped with the future, which takes this
+/// waiter off the client's single-flight entry.
 pub(crate) async fn registry_decode<M, C>(
     registry: &SchemaRegistry,
     wire_format: WireFormat,
     enforcement: SchemaEnforcement,
     accepted: &[Arc<str>],
     required_index: Option<&[i32]>,
+    lookup_bound: Duration,
     bytes: &[u8],
 ) -> Result<RegistryDecode<M>>
 where
@@ -102,7 +113,22 @@ where
         return Ok(RegistryDecode::Dlq("schema_message_index_rejected"));
     }
 
-    let schema = match registry.resolve(id).await {
+    let resolved = match tokio::time::timeout(lookup_bound, registry.resolve(id)).await {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            return Ok(RegistryDecode::Unavailable {
+                id,
+                error: SchemaRegistryError::Transport {
+                    retriable: true,
+                    message: format!(
+                        "registry lookup exceeded the {lookup_bound:?} bound that keeps the \
+                         consumer polling inside its poll interval"
+                    ),
+                },
+            });
+        }
+    };
+    let schema = match resolved {
         Ok(s) => s,
         Err(e) => match classify_resolve_error(&e) {
             ResolveFailure::Dlq(reason) => {
@@ -228,6 +254,7 @@ mod tests {
             SchemaEnforcement::Enforce,
             &accepted,
             None,
+            Duration::from_secs(60),
             &frame,
         )
         .await
@@ -255,6 +282,7 @@ mod tests {
             SchemaEnforcement::Enforce,
             &accepted,
             Some(&[0]),
+            Duration::from_secs(60),
             &frame,
         )
         .await

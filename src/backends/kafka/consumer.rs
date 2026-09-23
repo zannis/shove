@@ -2497,6 +2497,20 @@ fn max_poll_interval_ms(options: &ConsumerOptions) -> u32 {
     MAX_POLL_INTERVAL_MS
 }
 
+/// The bound on one schema registry lookup made from a consume loop: a third
+/// of the member's `max.poll.interval.ms`, and at least a second.
+///
+/// The lookup runs in the receive arm, where nothing polls until it answers,
+/// so an unbounded one against a registry that accepts and never answers
+/// would let the group evict the member; `RegistryStall::wait` polls while
+/// it waits, so a lookup that becomes `Unavailable` at the bound keeps the
+/// member alive and retries every `REGISTRY_RETRY_DELAY`. A third leaves
+/// room for the wait and the next attempt inside one interval.
+#[cfg(feature = "kafka-schema-registry")]
+fn registry_lookup_bound(max_poll_interval_ms: u32) -> Duration {
+    Duration::from_millis(u64::from(max_poll_interval_ms) / 3).max(Duration::from_secs(1))
+}
+
 fn create_stream_consumer(
     mut base: ClientConfig,
     group_id: &str,
@@ -3064,6 +3078,9 @@ struct BatchDecodeCtx<'a> {
     schema_accepted: &'a [Arc<str>],
     #[cfg(feature = "kafka-schema-registry")]
     schema_message_index: Option<&'a [i32]>,
+    /// See `registry_lookup_bound`.
+    #[cfg(feature = "kafka-schema-registry")]
+    registry_lookup_bound: Duration,
 }
 
 /// What the batch loop's decode stage leaves it with once any registry wait
@@ -3136,6 +3153,7 @@ async fn decode_batch_message<T: Topic>(
                     dec.schema_enforcement,
                     dec.schema_accepted,
                     dec.schema_message_index,
+                    dec.registry_lookup_bound,
                     payload_slice,
                 )
                 .await
@@ -4151,6 +4169,8 @@ impl KafkaConsumer {
         #[cfg(feature = "test-support")]
         fence_probe::record(fence_timeout);
         let max_poll_interval_ms = max_poll_interval_ms(&options);
+        #[cfg(feature = "kafka-schema-registry")]
+        let lookup_bound = registry_lookup_bound(max_poll_interval_ms);
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
@@ -4651,6 +4671,7 @@ impl KafkaConsumer {
                                                     schema_enforcement,
                                                     &schema_accepted,
                                                     schema_message_index.as_deref(),
+                                                    lookup_bound,
                                                     payload_slice,
                                                 ),
                                                 &shutdown,
@@ -4849,6 +4870,8 @@ impl KafkaConsumer {
                             let task_schema_accepted = schema_accepted.clone();
                             #[cfg(feature = "kafka-schema-registry")]
                             let task_schema_message_index = schema_message_index.clone();
+                            #[cfg(feature = "kafka-schema-registry")]
+                            let task_lookup_bound = lookup_bound;
 
                             // perf-K-7: single spawn per message (was three).
                             // invoke_handler awaits the handler with catch_unwind +
@@ -4887,6 +4910,8 @@ impl KafkaConsumer {
                                         schema_accepted: task_schema_accepted.as_ref(),
                                         #[cfg(feature = "kafka-schema-registry")]
                                         schema_message_index: task_schema_message_index.as_deref(),
+                                        #[cfg(feature = "kafka-schema-registry")]
+                                        registry_lookup_bound: task_lookup_bound,
                                     };
                                     match redeliver_in_place::<T, H>(
                                         &task_handler,
@@ -5255,6 +5280,8 @@ impl KafkaConsumer {
                     schema_accepted: schema_accepted.as_ref(),
                     #[cfg(feature = "kafka-schema-registry")]
                     schema_message_index: schema_message_index.as_deref(),
+                    #[cfg(feature = "kafka-schema-registry")]
+                    registry_lookup_bound: registry_lookup_bound(MAX_POLL_INTERVAL_MS),
                 };
 
                 // Retaining each message's wire bytes only pays for itself if
@@ -5658,6 +5685,8 @@ impl KafkaConsumer {
             .kafka_auto_offset_reset
             .unwrap_or(KafkaAutoOffsetReset::Earliest);
         let max_poll_interval_ms = max_poll_interval_ms(&options);
+        #[cfg(feature = "kafka-schema-registry")]
+        let lookup_bound = registry_lookup_bound(max_poll_interval_ms);
         let topic: Arc<str> = Arc::from(queue.as_str());
         let group: Option<Arc<str>> = options.consumer_group.clone();
 
@@ -5907,6 +5936,7 @@ impl KafkaConsumer {
                                                         schema_enforcement,
                                                         &schema_accepted,
                                                         schema_message_index.as_deref(),
+                                                        lookup_bound,
                                                         payload_bytes,
                                                     ),
                                                     &shutdown,
@@ -6614,6 +6644,7 @@ impl KafkaConsumer {
                                                 schema_enforcement,
                                                 &schema_accepted,
                                                 schema_message_index.as_deref(),
+                                                registry_lookup_bound(MAX_POLL_INTERVAL_MS),
                                                 &payload,
                                             ),
                                             &shutdown,
@@ -6726,6 +6757,8 @@ impl KafkaConsumer {
                     let task_schema_accepted = schema_accepted.clone();
                     #[cfg(feature = "kafka-schema-registry")]
                     let task_schema_message_index = schema_message_index.clone();
+                    #[cfg(feature = "kafka-schema-registry")]
+                    let task_lookup_bound = registry_lookup_bound(MAX_POLL_INTERVAL_MS);
 
                     // Outcome routing for a broadcast subscription. The
                     // decision is `settle_broadcast_outcome`, shared with NATS
@@ -6757,6 +6790,8 @@ impl KafkaConsumer {
                             schema_accepted: task_schema_accepted.as_ref(),
                             #[cfg(feature = "kafka-schema-registry")]
                             schema_message_index: task_schema_message_index.as_deref(),
+                            #[cfg(feature = "kafka-schema-registry")]
+                            registry_lookup_bound: task_lookup_bound,
                         };
                         let mut message = message;
                         let mut metadata = metadata;
@@ -7074,6 +7109,7 @@ impl KafkaConsumer {
                                 // dead message uncommitted.
                                 let accepted: &[Arc<str>] = &schema_accepted;
                                 let message_index = schema_message_index.as_deref();
+                                let lookup_bound = registry_lookup_bound(MAX_POLL_INTERVAL_MS);
                                 let shutdown = &shutdown;
                                 let decode_once = || async move {
                                     match WireFormat::from_codec_name(codec_name) {
@@ -7085,6 +7121,7 @@ impl KafkaConsumer {
                                                     schema_enforcement,
                                                     accepted,
                                                     message_index,
+                                                    lookup_bound,
                                                     payload_bytes,
                                                 ),
                                                 shutdown,
@@ -8581,6 +8618,7 @@ mod in_place_wait_accounting_tests {
                     schema_enforcement: SchemaEnforcement::Enforce,
                     schema_accepted: &accepted,
                     schema_message_index: None,
+                    registry_lookup_bound: Duration::from_secs(60),
                 };
                 let handler = Arc::new(Noop);
                 let ctx = Arc::new(());

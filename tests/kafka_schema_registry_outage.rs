@@ -2499,3 +2499,113 @@ async fn a_stalled_record_on_another_partition_is_put_back_behind_a_rewound_span
     assert_eq!(committed_offset(&tb.brokers, GROUP, TOPIC, 0), Some(2));
     assert_eq!(committed_offset(&tb.brokers, GROUP, TOPIC, 1), Some(1));
 }
+
+// ---------------------------------------------------------------------------
+// A lookup the registry never answers must not cost the group membership
+// ---------------------------------------------------------------------------
+
+use shove::consumer_group::ConsumerGroupConfig;
+use shove::kafka::KafkaConsumerGroupConfig;
+
+shove::define_topic!(
+    HungLookupTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-hung-lookup").build()
+);
+recorder_for!(HungLookupTopic);
+
+/// A registry that accepts the connection and never answers holds a lookup
+/// for the client's whole timeout, 60 s here against a 10 s poll interval.
+/// The lookup runs in the receive arm, where nothing polls until it answers,
+/// so an unbounded lookup lets the group evict the member before the client
+/// gives up. Bounded at a third of the interval, the lookup becomes
+/// `Unavailable`, the stall wait polls, and the member is still in its
+/// group well past the interval.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_hung_registry_lookup_keeps_the_member_in_its_group() {
+    const TOPIC: &str = "kafka-sr-outage-hung-lookup";
+    const GROUP: &str = "kafka-sr-outage-hung-lookup-consumer";
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+
+    let accepted = Arc::new(Notify::new());
+    let accepted_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind silent registry");
+    let addr = listener.local_addr().expect("silent registry addr");
+    {
+        let accepted = accepted.clone();
+        let accepted_once = accepted_once.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (socket, _) = listener.accept().await.expect("accept");
+                accepted_once.store(true, Ordering::SeqCst);
+                accepted.notify_waiters();
+                held.push(socket);
+            }
+        });
+    }
+    // A client timeout far past the poll interval, as an operator might set
+    // for a slow registry, and no client retries, so the bound is the only
+    // thing that ends the lookup.
+    let registry = SchemaRegistry::builder(format!("http://{addr}"))
+        .timeout(Duration::from_secs(60))
+        .max_retries(0)
+        .build();
+    let client = tb.client().await;
+    let body = serde_json::to_vec(&Event { id: 7 }).unwrap();
+    publish_raw(&tb.brokers, TOPIC, &frame_json(HEALTHY_ID, &body)).await;
+
+    let broker = Broker::<Kafka>::from_client(client.clone());
+    let handler = Recorder::new();
+    let h = handler.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<HungLookupTopic, _>(
+            ConsumerGroupConfig::new(
+                KafkaConsumerGroupConfig::new(1..=1)
+                    .with_schema_registry(registry)
+                    .with_max_poll_interval_for_test(Duration::from_secs(10)),
+            ),
+            move || h.clone(),
+        )
+        .await
+        .expect("register");
+    let token = group.cancellation_token();
+    let running = tokio::spawn(
+        group.run_until_timeout(token.clone().cancelled_owned(), Duration::from_secs(15)),
+    );
+    wait_for_group_members(&tb.brokers, GROUP, 1, TIMEOUT).await;
+
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let notified = accepted.notified();
+        if accepted_once.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep_until(deadline) => panic!("the registry was never contacted"),
+        }
+    }
+
+    // Past the poll interval by half again, with the registry still silent.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    wait_for_group_members(&tb.brokers, GROUP, 1, Duration::from_secs(5)).await;
+    assert_eq!(
+        handler.seen(),
+        Vec::<u32>::new(),
+        "nothing reached the handler while the registry never answered"
+    );
+    assert_eq!(
+        lag(&client, TOPIC, GROUP).await,
+        1,
+        "the record stays uncommitted for the wait"
+    );
+
+    token.cancel();
+    assert!(running.await.unwrap().is_clean());
+}
