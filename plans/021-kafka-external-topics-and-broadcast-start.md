@@ -16,28 +16,35 @@
 - **Effort**: L, as eleven steps sized S, S, M, M, M, M, S, S, S, L, M
 - **Risk**: LOW for steps 1, 2 and 5 to 9, which are one-token or additive with unchanged defaults.
   MED for steps 3 and 4, which change the commit position and the shutdown commit on the default path.
-  HIGH for steps 10 and 11, which change what an outcome does on a Kafka consumer.
+  HIGH for steps 10 and 11, which change what an outcome does on a Kafka consumer and on a NATS consumer of an external stream.
 - **Depends on**: none, plan 011 is not required
 - **Category**: bug + feature + dx
 - **Planned at**: commit `5bc4979` (main), 2026-09-17
-- **Maintainer decision**: reviewed on the three pull requests below on 2026-09-22.
+- **Maintainer decision**: reviewed on the three pull requests below on 2026-09-22, and answered the four open questions the same evening.
   The review asked for backend-neutral shapes in four places, and steps 5, 6, 7 and 10 now carry them.
   They are `BroadcastStart` on the broadcast options, `external()` on the topology builder, per-field availability on `MessageMetadata`, and an explicit retry strategy on the consumer options.
+  The answers moved step 6 next to step 10, so external ownership and in-place retry land together.
+  The second pull request therefore ships on its own.
+  They bound NATS to the same invariant and stated the SQS ownership row.
+  They also asked for the producer's `allow.auto.create.topics` as a pull request of its own in the same release.
   The maintainer proposed to merge the stack and ship it as the next minor release, and records the decision in `plans/README.md`.
-- **Delivery**: three pull requests by risk class, one minor release after the third.
+- **Delivery**: four pull requests by risk class, one minor release after the fourth.
   - https://github.com/zannis/shove/pull/210 delivers steps 1 and 2.
     Step 1 maps `KafkaAutoOffsetReset::None` to the `error` token and classifies librdkafka's `AutoOffsetReset` error as permanent in `map_kafka_error`.
     Step 2 splits Cyrus SASL out of `kafka-ssl` into `kafka-gssapi`.
-  - https://github.com/zannis/shove/pull/211 delivers steps 3 to 9.
+  - https://github.com/zannis/shove/pull/211 delivers steps 3, 4, 5, 7, 8 and 9, and ships on its own.
     Step 3 commits past undelivered offsets.
     Step 4 makes the commit interval configurable and bounds the shutdown commit.
-    Step 5 adds the broadcast start position, and step 6 adds the external topology binding.
+    Step 5 adds the broadcast start position.
     Step 7 exposes partition, offset and timestamp on deliveries.
     Step 8 exposes `auto.offset.reset` on the direct consumer options, and step 9 adds the protobuf message-index check.
     The DLQ-name guard in `TopologyBuilder::build` landed in the same pull request as a fix found on the way.
-  - https://github.com/zannis/shove/pull/212 delivers steps 10 and 11.
-    Step 10 retries and defers in place instead of republishing into the topic.
+  - https://github.com/zannis/shove/pull/212 delivers steps 6, 10 and 11.
+    Step 6 adds the external topology binding.
+    Step 10 retries and defers in place instead of republishing into the topology, on Kafka and on an external NATS stream.
     Step 11 waits through a Schema Registry outage instead of discarding the record.
+  - A fourth pull request, from `feat/kafka-producer-no-auto-create`, pins `allow.auto.create.topics=false` on the Kafka producer.
+    A publish then fails on a topic nobody declared instead of creating it, a breaking change of its own in the same minor release.
 
 ## Why this matters
 
