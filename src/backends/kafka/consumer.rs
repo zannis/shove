@@ -7103,8 +7103,9 @@ mod broadcast_option_guard_tests {
     }
 
     /// Negative control: the options a broadcast subscription does read pass,
-    /// every start included, so the refusals above are conditional on the
-    /// knob and not on the check itself.
+    /// every start included, so the refusals of the commit interval and of
+    /// the reset policy are conditional on the knob and not on the check
+    /// itself.
     #[test]
     fn broadcast_subscribe_admits_every_start_and_the_group_id() {
         for start in [

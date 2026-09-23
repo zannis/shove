@@ -882,7 +882,7 @@ async fn broadcast_start_is_refused_by_a_backend_that_cannot_honour_it() {
     }
 
     // A refused subscribe leaves the handle free: the tail is accepted after
-    // the refusals above, on the same topic.
+    // the refusals of `Head` and `Timestamp`, on the same topic.
     subscriber
         .subscribe::<CacheInvalidations, _>(
             Recorder::new(),
