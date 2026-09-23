@@ -30,6 +30,10 @@ pub(crate) use consumer_group::validate_commit_interval;
 pub fn shutdown_commit_deadline_for_test() -> std::time::Duration {
     constants::SHUTDOWN_COMMIT_DEADLINE
 }
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use consumer::fence_probe;
 pub use consumer_group::{
     KafkaAutoOffsetReset, KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
 };

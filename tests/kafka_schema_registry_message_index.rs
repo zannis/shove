@@ -492,3 +492,313 @@ async fn a_batch_consumer_drops_a_frame_with_another_message_index_before_the_re
         "the rejected frame must not add a resolve on the batch path either"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The same requirement on every other decoder: FIFO, broadcast, DLQ drain
+// and a consumer-group member
+// ---------------------------------------------------------------------------
+
+use shove::BroadcastStart;
+use shove::SequencedTopic as _;
+use shove::broker::Broker;
+use shove::consumer_group::ConsumerGroupConfig;
+use shove::kafka::KafkaConsumerGroupConfig;
+use shove::metadata::DeadMessageMetadata;
+use shove::topology::SequenceFailure;
+
+/// The subject the mock answers for every id; the other topics derive a
+/// different default from their own names, so each consumer accepts this one.
+const ACCEPTED: &str = "kafka-schema-message-index-value";
+
+shove::define_sequenced_topic!(
+    FifoTickTopic,
+    Tick,
+    |tick: &Tick| tick.seq.to_string(),
+    TopologyBuilder::new("kafka-schema-message-index-fifo")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_millis(200))
+        .dlq()
+        .build(),
+    codec = shove::ProtobufCodec
+);
+
+shove::define_topic!(
+    FanoutTickTopic,
+    Tick,
+    TopologyBuilder::new("kafka-schema-message-index-fanout")
+        .broadcast()
+        .build(),
+    codec = shove::ProtobufCodec
+);
+
+shove::define_topic!(
+    DrainTickTopic,
+    Tick,
+    TopologyBuilder::new("kafka-schema-message-index-drain")
+        .dlq()
+        .build(),
+    codec = shove::ProtobufCodec
+);
+
+shove::define_topic!(
+    GroupTickTopic,
+    Tick,
+    TopologyBuilder::new("kafka-schema-message-index-group").build(),
+    codec = shove::ProtobufCodec
+);
+
+macro_rules! recorder_for {
+    ($($topic:ty),+ $(,)?) => {$(
+        impl MessageHandler<$topic> for Recorder {
+            type Context = ();
+            async fn handle(&self, msg: Tick, _meta: MessageMetadata, _: &()) -> Outcome {
+                self.seen.lock().unwrap().push(msg.seq);
+                self.counter.increment();
+                Outcome::Ack
+            }
+        }
+    )+};
+}
+
+recorder_for!(FifoTickTopic, FanoutTickTopic, GroupTickTopic);
+
+/// Keeps every dead letter it is handed.
+#[derive(Clone)]
+struct DeadRecorder {
+    dead: Arc<Mutex<Vec<u32>>>,
+    counter: WaitableCounter,
+}
+
+impl MessageHandler<DrainTickTopic> for DeadRecorder {
+    type Context = ();
+    async fn handle(&self, _msg: Tick, _meta: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+    async fn handle_dead(&self, msg: Tick, _meta: DeadMessageMetadata, _: &()) {
+        self.dead.lock().unwrap().push(msg.seq);
+        self.counter.increment();
+    }
+}
+
+/// Three frames: two carrying the required index `[0]` around one carrying
+/// `[1]`, all naming the same schema.
+async fn publish_three_frames(brokers: &str, topic: &str) {
+    use prost::Message as _;
+    let tick = |seq: u32| Tick { seq }.encode_to_vec();
+    publish_raw(
+        brokers,
+        topic,
+        &frame_protobuf(SCHEMA_ID, &[0x00], &tick(1)),
+    )
+    .await;
+    publish_raw(
+        brokers,
+        topic,
+        &frame_protobuf(SCHEMA_ID, &[0x02, 0x02], &tick(2)),
+    )
+    .await;
+    publish_raw(
+        brokers,
+        topic,
+        &frame_protobuf(SCHEMA_ID, &[0x02, 0x00], &tick(3)),
+    )
+    .await;
+}
+
+/// The FIFO decoder enforces the requirement before the registry: the frame
+/// with another index is a pre-handler drop, and the two around it reach the
+/// handler in order.
+#[tokio::test]
+async fn a_fifo_consumer_drops_a_frame_with_another_message_index_before_the_registry() {
+    const TOPIC: &str = "kafka-schema-message-index-fifo";
+    let tb = TestBroker::start().await;
+    let client = tb.client().await;
+    Broker::<Kafka>::from_client(client.clone())
+        .topology()
+        .declare::<FifoTickTopic>()
+        .await
+        .expect("declare");
+    let (registry, resolves) = mock_registry().await;
+    publish_three_frames(&tb.brokers, TOPIC).await;
+
+    let handler = Recorder::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client);
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<FifoTickTopic, _>(
+                h,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_schema_registry(registry)
+                    .accept_schema_subjects([ACCEPTED])
+                    .require_schema_message_index([0]),
+            )
+            .await
+    });
+
+    assert!(
+        handler.counter.wait_for(2, TIMEOUT).await,
+        "both [0] frames reach the handler"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    shutdown.cancel();
+    handle.await.expect("consumer task panicked").ok();
+
+    assert_eq!(handler.seen.lock().unwrap().clone(), vec![1, 3]);
+    assert_eq!(
+        resolves.load(Ordering::SeqCst),
+        1,
+        "the rejected frame adds no resolve"
+    );
+}
+
+/// The broadcast decoder enforces the requirement too: the subscription's
+/// handler sees the two `[0]` frames and never the other one.
+#[tokio::test]
+async fn a_broadcast_subscription_drops_a_frame_with_another_message_index_before_the_registry() {
+    const TOPIC: &str = "kafka-schema-message-index-fanout";
+    let tb = TestBroker::start().await;
+    let client = tb.client().await;
+    let broker = Broker::<Kafka>::from_client(client);
+    broker
+        .topology()
+        .declare::<FanoutTickTopic>()
+        .await
+        .expect("declare");
+    let (registry, resolves) = mock_registry().await;
+    publish_three_frames(&tb.brokers, TOPIC).await;
+
+    let handler = Recorder::new();
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<FanoutTickTopic, _>(
+            handler.clone(),
+            ConsumerOptions::new()
+                .with_schema_registry(registry)
+                .accept_schema_subjects([ACCEPTED])
+                .require_schema_message_index([0])
+                .with_broadcast_start(BroadcastStart::Head),
+        )
+        .expect("subscribe");
+
+    assert!(
+        handler.counter.wait_for(2, TIMEOUT).await,
+        "both [0] frames reach the handler"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(handler.seen.lock().unwrap().clone(), vec![1, 3]);
+    assert_eq!(
+        resolves.load(Ordering::SeqCst),
+        1,
+        "the rejected frame adds no resolve"
+    );
+
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+}
+
+/// The DLQ drain enforces the requirement on dead letters: a dead letter
+/// carrying another index never reaches `handle_dead`.
+#[tokio::test]
+async fn a_dlq_drain_drops_a_dead_letter_with_another_message_index_before_the_registry() {
+    const DLQ: &str = "kafka-schema-message-index-drain-dlq";
+    let tb = TestBroker::start().await;
+    let client = tb.client().await;
+    Broker::<Kafka>::from_client(client.clone())
+        .topology()
+        .declare::<DrainTickTopic>()
+        .await
+        .expect("declare");
+    let (registry, resolves) = mock_registry().await;
+    publish_three_frames(&tb.brokers, DLQ).await;
+
+    let handler = DeadRecorder {
+        dead: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let h = handler.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_dlq_with_options::<DrainTickTopic, _>(
+                h,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_schema_registry(registry)
+                    .accept_schema_subjects([ACCEPTED])
+                    .require_schema_message_index([0]),
+            )
+            .await
+    });
+
+    assert!(
+        handler.counter.wait_for(2, TIMEOUT).await,
+        "both [0] dead letters reach handle_dead"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(handler.dead.lock().unwrap().clone(), vec![1, 3]);
+    assert_eq!(
+        resolves.load(Ordering::SeqCst),
+        1,
+        "the rejected dead letter adds no resolve"
+    );
+
+    client.shutdown_token().cancel();
+    handle.await.expect("drain task panicked").ok();
+}
+
+/// A consumer-group member is created from the group config, so the
+/// requirement set there must reach its decoder: the member drops the frame
+/// with another index and never hands it to the handler.
+#[tokio::test]
+async fn a_consumer_group_member_drops_a_frame_with_another_message_index_before_the_registry() {
+    const TOPIC: &str = "kafka-schema-message-index-group";
+    let tb = TestBroker::start().await;
+    let client = tb.client().await;
+    let broker = Broker::<Kafka>::from_client(client);
+    let (registry, resolves) = mock_registry().await;
+
+    let handler = Recorder::new();
+    let h = handler.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<GroupTickTopic, _>(
+            ConsumerGroupConfig::new(
+                KafkaConsumerGroupConfig::new(1..=1)
+                    .with_schema_registry(registry)
+                    .accept_schema_subjects([ACCEPTED])
+                    .require_schema_message_index([0]),
+            ),
+            move || h.clone(),
+        )
+        .await
+        .expect("register");
+    let token = group.cancellation_token();
+    let running = tokio::spawn(
+        group.run_until_timeout(token.clone().cancelled_owned(), Duration::from_secs(15)),
+    );
+    publish_three_frames(&tb.brokers, TOPIC).await;
+
+    assert!(
+        handler.counter.wait_for(2, TIMEOUT).await,
+        "both [0] frames reach the handler through the member"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(handler.seen.lock().unwrap().clone(), vec![1, 3]);
+    assert_eq!(
+        resolves.load(Ordering::SeqCst),
+        1,
+        "the rejected frame adds no resolve"
+    );
+
+    token.cancel();
+    assert!(running.await.unwrap().is_clean());
+}

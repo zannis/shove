@@ -4883,3 +4883,49 @@ async fn run_fifo_rejects_a_commit_interval() {
         "message must name the topic and the refused setting: {msg}"
     );
 }
+
+/// The receive loop judges rejected commits by a threshold that grows with
+/// the commit interval, `fence_threshold`, and not by the fixed sixty
+/// seconds alone. The probe reads the threshold the loop started with, so
+/// this fails if the loop ever computed it from the constant instead of the
+/// configured interval.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_raised_commit_interval_raises_the_receive_loops_fence_threshold() {
+    use shove::kafka::fence_probe;
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    let client = tb.client();
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_commit_interval(Duration::from_secs(20)),
+            )
+            .await
+    });
+    let deadline = Instant::now() + TIMEOUT;
+    while fence_probe::last_threshold().is_none() {
+        assert!(Instant::now() < deadline, "the receive loop started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        fence_probe::last_threshold(),
+        Some(Duration::from_secs(80)),
+        "four commit intervals of 20 s, above the 60 s floor the default interval keeps"
+    );
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}

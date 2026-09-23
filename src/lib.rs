@@ -368,6 +368,12 @@ pub mod kafka {
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::shutdown_commit_deadline_for_test;
+
+    /// Test-only probe (see the `test-support` feature): the fence threshold
+    /// the last concurrent receive loop started with.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::fence_probe;
 }
 
 /// Redis Streams backend.

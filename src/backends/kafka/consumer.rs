@@ -2187,6 +2187,35 @@ const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(5);
 /// a drain and drains run once per interval.
 const COMMIT_FENCE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Test-only probe (see the `test-support` feature): the fence threshold the
+/// last concurrent receive loop started with, so a test can prove that a
+/// raised commit interval raised the threshold the loop judges commits by,
+/// and not only the helper the loop calls. nextest runs each test in its
+/// own process, so the value belongs to that test's consumers alone.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod fence_probe {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn record(threshold: Duration) {
+        LAST_MS.store(
+            u64::try_from(threshold.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// The threshold the last receive loop started with, `None` before any.
+    pub fn last_threshold() -> Option<Duration> {
+        match LAST_MS.load(Ordering::SeqCst) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
+    }
+}
+
 /// The fence threshold for a given commit interval.
 ///
 /// A rejected commit is re-offered on the next drain, and the dirty streak
@@ -3282,6 +3311,8 @@ impl KafkaConsumer {
             .kafka_commit_interval
             .unwrap_or(ASYNC_COMMIT_INTERVAL);
         let fence_timeout = fence_threshold(commit_interval);
+        #[cfg(feature = "test-support")]
+        fence_probe::record(fence_timeout);
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
