@@ -812,7 +812,7 @@ The strategy is therefore explicit, backend-neutral, and only implied by ownersh
 pub enum RetryStrategy {
     /// An incremented copy after the tier's delay: into the hold queue, or on Kafka into the topic. The shove-owned default.
     Republish,
-    /// The same record, handed back after waiting the delay inside the handler's task. Implied by an external topology.
+    /// The same record again after the tier's delay, with nothing published. Kafka waits in the handler's task and keeps the count in memory. NATS naks with the delay and reads the count from `num_delivered`. Implied by an external topology.
     InPlace,
 }
 
@@ -834,7 +834,11 @@ The setter lives on the Kafka options for now and reaches each backend as its ow
 The field is crate-private, so no other backend's options can carry a strategy nothing reads.
 The enum is `#[non_exhaustive]`, so a later shape is a new variant rather than a breaking change.
 
-Behaviour under `RetryStrategy::InPlace`, on the concurrent path:
+The bullets below are Kafka's primitive from the step 6 table, the wait in the handler's task.
+On an external NATS stream the same strategy is a `Nak` with the tier's delay, and the count is JetStream's `num_delivered`.
+A `Defer` and an `ack_wait` expiry are redeliveries there, so they advance the count too.
+
+Behaviour under `RetryStrategy::InPlace` on Kafka's concurrent path:
 
 - `Outcome::Defer` waits `hold_queues[0].delay()`, or 1 s without hold queues, inside the same task and holding its permit.
   It then decodes the retained raw bytes again and calls the handler with the fresh value.
