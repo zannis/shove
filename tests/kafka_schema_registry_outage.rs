@@ -1788,6 +1788,10 @@ async fn a_completion_during_a_registry_stall_does_not_freeze_the_committed_offs
     const GROUP: &str = "kafka-sr-outage-freeze-consumer";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
+    // The test never declares `FreezeTopic`, so the dead-letter topic its last
+    // assertion drains is created here: a publish never creates a topic, and a
+    // dead letter to an absent topic is a discard, not a dead letter.
+    create_single_partition_topic(&tb.brokers, "kafka-sr-outage-freeze-dlq").await;
     let (registry, status, hits) = mock_registry("kafka-sr-outage-freeze-value", 503).await;
     let client = tb.client().await;
     for (schema_id, id) in [(HEALTHY_ID, 1u32), (FLAKY_ID, 2)] {
@@ -2914,6 +2918,10 @@ async fn an_undecodable_in_place_redelivery_is_dead_lettered_with_the_in_memory_
 
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
+    // The topology is external and never declared, so the shove-owned
+    // dead-letter topic `declare` would create is created here: a publish never
+    // creates a topic, and a dead letter to an absent topic is a discard.
+    create_single_partition_topic(&tb.brokers, "kafka-sr-outage-inplace-undecodable-dlq").await;
     let (registry, status, _) =
         mock_registry("kafka-sr-outage-inplace-undecodable-value", 200).await;
     let client = tb.client().await;
