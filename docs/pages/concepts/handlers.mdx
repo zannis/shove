@@ -211,7 +211,9 @@ Because the count belongs to a *broker-level* message, anything that creates a n
 That last case is what `delivery_count` is for; see [Bounding a `Defer` loop](/guides/retries#defer-vs-retry).
 
 A consumer running with `RetryStrategy::InPlace` publishes no copy on `Retry` or `Defer`: on Kafka, where an external topology implies it and a shove-owned one may opt into it, the handler's task waits and hands the record back; on an external NATS stream the broker redelivers after a delayed `Nak`.
-The same record is handed back in place, and its `retry_count` is kept in memory for the redelivery.
+The same record comes back in place.
+On Kafka its `retry_count` is kept in memory for the redelivery.
+On an external NATS stream it is read from the JetStream delivery information, which counts every redelivery.
 
 ## Dead-letter handling
 
