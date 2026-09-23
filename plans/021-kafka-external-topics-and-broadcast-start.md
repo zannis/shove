@@ -1077,10 +1077,14 @@ This section records, per changed step, the patterns weighed and the one chosen,
   It still pauses the assignment so the member polls.
   A seek is kept for the put-back of a record the loop cannot take.
 - Spring Kafka's `DefaultErrorHandler` is the closest prior art.
-  It retries the failed record in place with a back-off, by seeking the partition back and re-polling.
+  By default it retries the failed record in place with a back-off, by seeking the partition back and re-polling.
   It recovers the record to a dead-letter topic once the back-off is exhausted.
-  Its retries block the poll loop for the back-off, so it relies on `max.poll.interval.ms` being longer than the sum of the back-offs.
-  shove keeps polling during the wait and pauses instead.
+  That default blocks the poll loop for the back-off, so it relies on `max.poll.interval.ms` being longer than the sum of the back-offs.
+  With `seekAfterError=false` it retains the remaining records instead of seeking, and hands them to the listener after the back-off.
+  The consumer stays paused in between, so its polls return nothing and keep the membership.
+  Its `ContainerPausingBackOffHandler` pauses the container for a back-off longer than `max.poll.interval.ms`, so the member keeps polling and stays in the group.
+  Both are documented at https://docs.spring.io/spring-kafka/reference/kafka/annotation-error-handling.html.
+  shove keeps polling during the wait and pauses instead, the shape of the pausing handler with retained records.
 - Confluent's Parallel Consumer processes the records of one partition concurrently by key.
   It retries a failed record in its own worker with a back-off, and commits the highest contiguous offset while holding the rest.
   It is the model for the per-key concurrency shove does not have.
