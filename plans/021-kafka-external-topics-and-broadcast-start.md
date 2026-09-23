@@ -555,7 +555,8 @@ pub fn external(&self) -> bool
 pub fn nats_external_stream(&self) -> bool // alias for one release
 ```
 
-The Kafka name never shipped, so it is replaced outright; the NATS name is public in 0.14 and stays one release as a deprecated alias.
+The Kafka name never shipped, so it is replaced outright.
+The NATS name is public in 0.14 and stays one release as a deprecated alias.
 `build()` panics when the flag is combined with `sequenced()` on any backend, because sequencing needs shove to own the shard space everywhere.
 It panics with `nats_stream_config()` or `nats_subjects()` under the `nats` feature, and with any of the six Kafka topic-config methods under the `kafka` feature.
 Those are `with_topic_config`, `with_retention`, `with_retention_forever`, `with_retention_bytes`, `with_cleanup_policy` and `with_max_message_bytes`.
@@ -564,15 +565,20 @@ The per-backend config guards keep their wording with `external()` in place of t
 
 Per declarer, what `declare()` does with an external topology:
 
-- Kafka: the metadata probe below; the topic is never created, expanded or reconciled.
-- NATS: `get_stream`, as before; the durable consumer and the DLQ stream stay shove's.
+- Kafka: the metadata probe below.
+  The topic is never created, expanded or reconciled.
+- NATS: `get_stream`, as before.
+  The durable consumer and the DLQ stream stay shove's.
 - RabbitMQ, SQS and Redis: `declare` refuses the topology with `ShoveError::Topology` through `QueueTopology::refuse_external`, until each declarer gains its verification step.
-  Those steps are a passive `queue.declare`, `GetQueueUrl` together with the SNS topic, the queue policy and the subscription the SQS declarer also owns, and `EXISTS` on the stream key.
+  Those steps are a passive `queue.declare` on RabbitMQ and `EXISTS` on the Redis stream key.
+  On SQS the step is `GetQueueUrl` together with the SNS topic, the queue policy and the subscription the declarer also owns.
   Refusing is the safe direction, because creating the resource is the write the flag promises never to make.
 - In-process: a no-op, because nothing in-process can be owned by infra.
 
 Ownership says who creates the resource, not how a `Retry` is carried out.
-What `external()` implies for a consumer's retry strategy is declared per backend: step 10 states it for Kafka, and NATS keeps its hold-queue retries on an external stream unchanged in this stack and follows when plan 019 lands.
+What `external()` implies for a consumer's retry strategy is declared per backend.
+Step 10 states it for Kafka.
+NATS keeps its hold-queue retries on an external stream unchanged in this stack and follows when plan 019 lands.
 
 Kafka backend:
 
@@ -594,7 +600,8 @@ Kafka backend:
 
 Tests:
 
-- Unit, `src/topology.rs`: `external()` round-trips on every feature set, `nats_external_stream()` is a deprecated alias for it, and each forbidden combination panics with its message: `sequenced()` un-gated, two NATS creation options, six Kafka topic-config methods.
+- Unit, `src/topology.rs`: `external()` round-trips on every feature set, and `nats_external_stream()` is a deprecated alias for it.
+  Each forbidden combination panics with its message: `sequenced()` un-gated, two NATS creation options, six Kafka topic-config methods.
 - Integration, `tests/nats_integration.rs`: the existing external-stream test binds with `external()`.
 - Integration, `tests/kafka_integration.rs`, two new tests.
   `external_topic_is_never_created_or_expanded` pre-creates a three-partition topic through rdkafka's admin client.
@@ -932,11 +939,19 @@ This section records, per changed step, the patterns weighed and the one chosen,
 
 ### Step 6, external ownership
 
-- One backend-prefixed builder per backend, `nats_external_stream()` and then `kafka_external_topic()`, was the first shape: two spellings of one bind-and-verify concept, and a third backend would have added a third.
+- One backend-prefixed builder per backend, `nats_external_stream()` and then `kafka_external_topic()`, was the first shape.
+  It gave two spellings to one bind-and-verify concept, and a third backend would have added a third.
 - One neutral flag with per-declarer verification is the chosen shape.
   Kafka probes metadata, NATS calls `get_stream`, and the other clients already expose a passive declare, `GetQueueUrl` and `EXISTS` for later.
-  Two constraints stay visible: NATS external mode allows hold queues today, so a neutral flag that implies in-place retry needs a per-backend support statement (step 10); and SQS external ownership must cover the SNS topic, the queue policy and the subscription, not only the queue.
-- The bounded form landed: Kafka and NATS implement the flag now, every other declarer refuses it until it verifies the resource, and the in-process broker treats it as a no-op.
+  Two constraints stay visible.
+  NATS external mode allows hold queues today, so a neutral flag that implies in-place retry needs a per-backend support statement (step 10).
+  SQS external ownership must cover the SNS topic, the queue policy and the subscription, not only the queue.
+- The bounded form landed: Kafka and NATS implement the flag now.
+  Every other declarer refuses it until it verifies the resource, and the in-process broker treats it as a no-op.
+- The refusal is at runtime and per declarer because `TopologyBuilder` is not typed by backend.
+  One `QueueTopology` serves every backend, so a `Has*` capability trait cannot hide `external()` from the backends that do not verify it yet.
+  The declarer that owns the resource is the first place that knows.
+
 ### Step 7, the metadata fields
 
 - Kafka-only fields with one combined table was the first shape.
@@ -966,6 +981,7 @@ This section records, per changed step, the patterns weighed and the one chosen,
 - An absolute position is the pattern the brokers offer as well: async-nats has `DeliverPolicy::ByStartSequence` and RabbitMQ Streams take a numeric offset.
   It is deferred because a sequence or an offset names a position on one backend's log and means nothing on another.
   It would be the first backend-specific variant on a neutral enum, and `#[non_exhaustive]` leaves the room for it.
+
 ### Step 10, the retry strategy
 
 - Republish into the consumed topic after a delay tier is the historical Kafka shape.

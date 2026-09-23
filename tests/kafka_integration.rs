@@ -171,6 +171,17 @@ shove::define_topic!(
         .build()
 );
 
+// An infra-owned topic shove binds to but never creates, expands or alters.
+// The DLQ stays shove-owned in this mode.
+shove::define_topic!(
+    ExternalOwnedTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-owned")
+        .external()
+        .dlq()
+        .build()
+);
+
 // Eight default partitions, so the record coordinates a handler sees span
 // more than one partition.
 shove::define_topic!(
@@ -185,25 +196,7 @@ shove::define_topic!(
     SimpleMessage,
     TopologyBuilder::new("kafka-tail-only").build()
 );
-// An infra-owned topic shove binds to but never creates, expands or alters.
-// The DLQ stays shove-owned in this mode.
-shove::define_topic!(
-    ExternalOwnedTopic,
-    SimpleMessage,
-    TopologyBuilder::new("kafka-external-owned")
-        .external()
-        .dlq()
-        .build()
-);
 
-// An external topic nobody provisions: declaring it must fail, not create it.
-shove::define_topic!(
-    ExternalMissingTopic,
-    SimpleMessage,
-    TopologyBuilder::new("kafka-external-missing")
-        .external()
-        .build()
-);
 // External topics for the in-place Retry and Defer contract: shove never
 // produces into them, so a wait happens inside the handler's task instead.
 shove::define_topic!(
@@ -315,6 +308,15 @@ shove::define_topic!(
     TopologyBuilder::new("kafka-owned-inplace")
         .hold_queue(Duration::from_millis(300))
         .dlq()
+        .build()
+);
+
+// An external topic nobody provisions: declaring it must fail, not create it.
+shove::define_topic!(
+    ExternalMissingTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-missing")
+        .external()
         .build()
 );
 
@@ -518,6 +520,7 @@ fn live_partition_count(brokers: &str, topic: &str) -> Option<usize> {
     }
     Some(candidate.partitions().len())
 }
+
 /// The high watermark of `partition`, read through a plain consumer client:
 /// the number of records the topic holds, which an external topic must keep
 /// while shove retries and defers in place.
@@ -808,14 +811,6 @@ impl MessageHandler<ExternalOwnedTopic> for CountingHandler {
     }
 }
 
-impl MessageHandler<ExternalMissingTopic> for CountingHandler {
-    type Context = ();
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
-        self.counter.increment();
-        Outcome::Ack
-    }
-}
-
 /// Records every delivery as `(id, retry_count, redelivered)` and returns
 /// `Defer` for the very first delivery it sees, then `Ack` for everything.
 #[derive(Clone)]
@@ -972,6 +967,14 @@ impl MessageHandler<CoordinatesTopic> for MetadataRecorder {
     type Context = ();
     async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
         self.seen.lock().await.push(meta);
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<ExternalMissingTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.counter.increment();
         Outcome::Ack
     }
@@ -2535,6 +2538,70 @@ async fn consumer_group_processes_messages() {
     broker.close().await;
 }
 
+/// `external()` binds to a topic infra created. Registering a
+/// group whose `max_consumers` exceeds the partition count consumes through
+/// it and leaves the partition count exactly as infra set it, while the DLQ
+/// is still shove's to create.
+#[tokio::test]
+async fn external_topic_is_never_created_or_expanded() {
+    const TOPIC: &str = "kafka-external-owned";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 3).await;
+
+    let broker = tb.broker();
+    let handler = CountingHandler::new();
+    let handler_clone = handler.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<ExternalOwnedTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=8)),
+            move || handler_clone.clone(),
+        )
+        .await
+        .expect("registering against a provisioned external topic must succeed");
+    assert_eq!(
+        live_partition_count(tb.brokers(), TOPIC),
+        Some(3),
+        "declare must not expand an external topic towards max_consumers"
+    );
+    assert!(
+        live_partition_count(tb.brokers(), "kafka-external-owned-dlq").is_some(),
+        "the DLQ is shove's own topic and is still created"
+    );
+
+    let publisher = broker.publisher().await.unwrap();
+    let messages: Vec<SimpleMessage> = (1..=5)
+        .map(|i| SimpleMessage {
+            id: format!("ext-{i}"),
+            content: format!("msg {i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<ExternalOwnedTopic>(&messages)
+        .await
+        .unwrap();
+
+    let token = group.cancellation_token();
+    let counter = handler.counter.clone();
+    let t = token.clone();
+    tokio::spawn(async move {
+        counter.wait_for(5, Duration::from_secs(60)).await;
+        t.cancel();
+    });
+    let outcome = group
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean());
+    assert_eq!(handler.counter.get(), 5);
+
+    assert_eq!(
+        live_partition_count(tb.brokers(), TOPIC),
+        Some(3),
+        "consuming must not expand the external topic either"
+    );
+    broker.close().await;
+}
+
 /// Every Kafka delivery carries the record's coordinates: a partition, an
 /// offset that runs contiguously from zero inside each partition of a fresh
 /// topic, and a broker timestamp inside the test's own wall-clock window.
@@ -2726,115 +2793,6 @@ async fn supervisor_with_auto_offset_reset_latest_skips_history() {
     token.cancel();
     let outcome = sup_handle.await.unwrap();
     assert!(outcome.is_clean());
-    broker.close().await;
-}
-
-/// `external()` binds to a topic infra created. Registering a
-/// group whose `max_consumers` exceeds the partition count consumes through
-/// it and leaves the partition count exactly as infra set it, while the DLQ
-/// is still shove's to create.
-#[tokio::test]
-async fn external_topic_is_never_created_or_expanded() {
-    const TOPIC: &str = "kafka-external-owned";
-    let tb = TestBroker::start().await;
-    provision_topic(tb.brokers(), TOPIC, 3).await;
-
-    let broker = tb.broker();
-    let handler = CountingHandler::new();
-    let handler_clone = handler.clone();
-    let mut group = broker.consumer_group();
-    group
-        .register::<ExternalOwnedTopic, _>(
-            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=8)),
-            move || handler_clone.clone(),
-        )
-        .await
-        .expect("registering against a provisioned external topic must succeed");
-    assert_eq!(
-        live_partition_count(tb.brokers(), TOPIC),
-        Some(3),
-        "declare must not expand an external topic towards max_consumers"
-    );
-    assert!(
-        live_partition_count(tb.brokers(), "kafka-external-owned-dlq").is_some(),
-        "the DLQ is shove's own topic and is still created"
-    );
-
-    let publisher = broker.publisher().await.unwrap();
-    let messages: Vec<SimpleMessage> = (1..=5)
-        .map(|i| SimpleMessage {
-            id: format!("ext-{i}"),
-            content: format!("msg {i}"),
-        })
-        .collect();
-    publisher
-        .publish_batch::<ExternalOwnedTopic>(&messages)
-        .await
-        .unwrap();
-
-    let token = group.cancellation_token();
-    let counter = handler.counter.clone();
-    let t = token.clone();
-    tokio::spawn(async move {
-        counter.wait_for(5, Duration::from_secs(60)).await;
-        t.cancel();
-    });
-    let outcome = group
-        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
-        .await;
-    assert!(outcome.is_clean());
-    assert_eq!(handler.counter.get(), 5);
-
-    assert_eq!(
-        live_partition_count(tb.brokers(), TOPIC),
-        Some(3),
-        "consuming must not expand the external topic either"
-    );
-    broker.close().await;
-}
-
-/// A missing external topic is a startup error, not a silent auto-create:
-/// `declare` returns `Topology`, the registry path surfaces the same error,
-/// and the topic is still absent afterwards, so the verification fetch
-/// itself created nothing.
-#[tokio::test]
-async fn external_topic_missing_fails_fast_at_declare() {
-    const TOPIC: &str = "kafka-external-missing";
-    let tb = TestBroker::start().await;
-    let broker = tb.broker();
-
-    let err = broker
-        .topology()
-        .declare::<ExternalMissingTopic>()
-        .await
-        .expect_err("declare must refuse a topic nobody provisioned");
-    assert!(
-        matches!(err, shove::ShoveError::Topology(_)),
-        "expected Topology, got {err:?}"
-    );
-    assert!(
-        err.to_string().contains("external()") && err.to_string().contains("must be provisioned"),
-        "{err}"
-    );
-    assert_eq!(
-        live_partition_count(tb.brokers(), TOPIC),
-        None,
-        "the verification fetch must not auto-create the topic"
-    );
-
-    let mut group = broker.consumer_group();
-    let err = group
-        .register::<ExternalMissingTopic, _>(
-            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
-            CountingHandler::new,
-        )
-        .await
-        .expect_err("register must refuse a topic nobody provisioned");
-    assert!(
-        matches!(err, shove::ShoveError::Topology(_)),
-        "expected Topology, got {err:?}"
-    );
-    assert_eq!(live_partition_count(tb.brokers(), TOPIC), None);
     broker.close().await;
 }
 
@@ -3458,6 +3416,51 @@ async fn external_topic_queued_record_keeps_the_member_when_a_running_handler_st
 
     token.cancel();
     assert!(running.await.unwrap().is_clean());
+    broker.close().await;
+}
+
+/// A missing external topic is a startup error, not a silent auto-create:
+/// `declare` returns `Topology`, the registry path surfaces the same error,
+/// and the topic is still absent afterwards, so the verification fetch
+/// itself created nothing.
+#[tokio::test]
+async fn external_topic_missing_fails_fast_at_declare() {
+    const TOPIC: &str = "kafka-external-missing";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+
+    let err = broker
+        .topology()
+        .declare::<ExternalMissingTopic>()
+        .await
+        .expect_err("declare must refuse a topic nobody provisioned");
+    assert!(
+        matches!(err, shove::ShoveError::Topology(_)),
+        "expected Topology, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("external()") && err.to_string().contains("must be provisioned"),
+        "{err}"
+    );
+    assert_eq!(
+        live_partition_count(tb.brokers(), TOPIC),
+        None,
+        "the verification fetch must not auto-create the topic"
+    );
+
+    let mut group = broker.consumer_group();
+    let err = group
+        .register::<ExternalMissingTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            CountingHandler::new,
+        )
+        .await
+        .expect_err("register must refuse a topic nobody provisioned");
+    assert!(
+        matches!(err, shove::ShoveError::Topology(_)),
+        "expected Topology, got {err:?}"
+    );
+    assert_eq!(live_partition_count(tb.brokers(), TOPIC), None);
     broker.close().await;
 }
 

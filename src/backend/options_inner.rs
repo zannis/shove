@@ -66,12 +66,6 @@ pub(crate) struct ConsumerOptionsInner {
     #[cfg(feature = "kafka")]
     pub kafka_commit_interval: Option<Duration>,
 
-    /// Where a broadcast subscription starts reading. `None` keeps the tail.
-    /// Propagated from `ConsumerOptions::with_broadcast_start`; read by
-    /// `BroadcastImpl::check_options` and the broadcast loops, and refused by
-    /// every other entry point, which never reads it.
-    pub broadcast_start: Option<BroadcastStart>,
-
     /// Kafka-only, `test-support` builds: the `max.poll.interval.ms` the
     /// concurrent and FIFO members are created with, in place of the pinned
     /// `MAX_POLL_INTERVAL_MS`. Exists so an integration test can observe a
@@ -80,12 +74,19 @@ pub(crate) struct ConsumerOptionsInner {
     #[cfg(all(feature = "kafka", feature = "test-support"))]
     pub kafka_max_poll_interval: Option<Duration>,
 
+    /// Where a broadcast subscription starts reading. `None` keeps the tail.
+    /// Propagated from `ConsumerOptions::with_broadcast_start`; read by
+    /// `BroadcastImpl::check_options` and the broadcast loops, and refused by
+    /// every other entry point, which never reads it.
+    pub broadcast_start: Option<BroadcastStart>,
+
     /// How the consumer carries out `Retry` and `Defer`. `None` lets the
     /// topology's ownership decide. Propagated from
     /// `ConsumerOptions::with_retry_strategy` on the direct and supervisor
     /// paths and from `KafkaConsumerGroupConfig::with_retry_strategy` on the
     /// registry path.
     pub retry_strategy: Option<RetryStrategy>,
+
     /// Kafka-only: Schema Registry client for decoding Confluent wire-framed
     /// messages. `None` disables registry-based decoding.
     #[cfg(feature = "kafka-schema-registry")]
@@ -138,9 +139,9 @@ impl ConsumerOptionsInner {
             kafka_auto_offset_reset: None,
             #[cfg(feature = "kafka")]
             kafka_commit_interval: None,
-            broadcast_start: None,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: None,
+            broadcast_start: None,
             retry_strategy: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: None,

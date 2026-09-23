@@ -1023,11 +1023,11 @@ impl TopologyBuilder {
             // options that configure how the stream is created.
             assert!(
                 !(self.external && self.nats_stream_config.is_some()),
-                "external() cannot be combined with nats_stream_config() — an external stream's config is owned by whoever provisions it"
+                "external() cannot be combined with nats_stream_config(): an external stream's config is owned by whoever provisions it"
             );
             assert!(
                 !(self.external && self.nats_stream_subjects.is_some()),
-                "external() cannot be combined with nats_subjects() — an external stream's subjects are owned by whoever provisions it"
+                "external() cannot be combined with nats_subjects(): an external stream's subjects are owned by whoever provisions it"
             );
         }
         #[cfg(feature = "kafka")]

@@ -2620,18 +2620,6 @@ fn fence_threshold(commit_interval: Duration) -> Duration {
     COMMIT_FENCE_TIMEOUT.max(commit_interval.saturating_mul(4))
 }
 
-/// Every partition of `topic` at one lazy sentinel offset, the assignment a
-/// `Tail` or `Head` broadcast start resolves to without asking the broker.
-fn lazy_positions(topic: &str, partitions: &[i32], offset: Offset) -> Result<TopicPartitionList> {
-    let mut tpl = TopicPartitionList::new();
-    for pid in partitions {
-        tpl.add_partition_offset(topic, *pid, offset).map_err(|e| {
-            map_kafka_error(&format!("failed to target {offset:?} of {topic}[{pid}]"), e)
-        })?;
-    }
-    Ok(tpl)
-}
-
 /// The retry strategy a consumer runs with, from its options and the
 /// topology's ownership.
 ///
@@ -2677,6 +2665,18 @@ fn reject_retry_strategy_unread(queue: &str, entry_point: &str) -> ShoveError {
         "topic '{queue}': `with_retry_strategy` applies to the standard consumer only; \
          `{entry_point}` never reads it. Drop the call."
     ))
+}
+
+/// Every partition of `topic` at one lazy sentinel offset, the assignment a
+/// `Tail` or `Head` broadcast start resolves to without asking the broker.
+fn lazy_positions(topic: &str, partitions: &[i32], offset: Offset) -> Result<TopicPartitionList> {
+    let mut tpl = TopicPartitionList::new();
+    for pid in partitions {
+        tpl.add_partition_offset(topic, *pid, offset).map_err(|e| {
+            map_kafka_error(&format!("failed to target {offset:?} of {topic}[{pid}]"), e)
+        })?;
+    }
+    Ok(tpl)
 }
 
 /// The error every FIFO entry point returns for options that set a commit
@@ -5675,8 +5675,8 @@ impl KafkaConsumer {
         let schema_message_index: Option<Arc<[i32]>> =
             options.schema_message_index.clone().map(Arc::from);
 
-        // `TopologyBuilder::build` refuses `external()` with
-        // `sequenced()`, so the FIFO loop never has to retry in place.
+        // `TopologyBuilder::build` refuses `external()` with `sequenced()`,
+        // so the FIFO loop never has to retry in place.
         debug_assert!(
             !topology.external(),
             "build() refuses external() on a sequenced topology"
@@ -6256,7 +6256,9 @@ impl KafkaConsumer {
     /// explicit offset, so librdkafka never consults `auto.offset.reset`.
     /// The FIFO consumer already refuses a commit interval on the same
     /// ground, and a setting that changes nothing is refused rather than
-    /// dropped.
+    /// dropped. A retry strategy is refused on that ground too: the loop
+    /// settles every outcome without one, so `with_retry_strategy` would be
+    /// read by nothing.
     pub(crate) fn check_broadcast_options(queue: &str, options: &ConsumerOptions) -> Result<()> {
         if options.kafka_commit_interval.is_some() {
             return Err(ShoveError::Topology(format!(
@@ -6272,6 +6274,12 @@ impl KafkaConsumer {
                  explicit offset and never consults `auto.offset.reset`. Drop \
                  `with_auto_offset_reset(..)` and set the start with `with_broadcast_start`."
             )));
+        }
+        if options.retry_strategy.is_some() {
+            return Err(reject_retry_strategy_unread(
+                queue,
+                "BroadcastSubscriber::subscribe",
+            ));
         }
         Ok(())
     }
@@ -6320,12 +6328,6 @@ impl KafkaConsumer {
             )));
         }
         let queue = topology.queue();
-        if options.retry_strategy.is_some() {
-            return Err(reject_retry_strategy_unread(
-                queue,
-                "BroadcastSubscriber::subscribe",
-            ));
-        }
         // An explicit `with_group_id` is honoured verbatim, as on the standard
         // path. It is inert either way; the override exists for a cluster ACL
         // that grants group Describe on one prefix only.
@@ -9104,6 +9106,23 @@ mod broadcast_option_guard_tests {
         assert!(msg.contains("cache-invalidations"), "{msg}");
         assert!(msg.contains("with_auto_offset_reset"), "{msg}");
         assert!(msg.contains("with_broadcast_start"), "{msg}");
+    }
+
+    /// The broadcast loop settles every outcome without a retry strategy, so
+    /// `with_retry_strategy` would be read by nothing: refused at
+    /// `subscribe()`, next to the other knobs the loop never reads.
+    #[test]
+    fn broadcast_subscribe_rejects_a_retry_strategy() {
+        let inner = crate::ConsumerOptions::<Kafka>::new()
+            .with_retry_strategy(RetryStrategy::InPlace)
+            .into_inner();
+        let msg = topology_message(
+            KafkaConsumer::check_broadcast_options("cache-invalidations", &inner)
+                .expect_err("a retry strategy must be refused on a broadcast subscription"),
+        );
+        assert!(msg.contains("cache-invalidations"), "{msg}");
+        assert!(msg.contains("with_retry_strategy"), "{msg}");
+        assert!(msg.contains("BroadcastSubscriber::subscribe"), "{msg}");
     }
 
     /// Negative control: the options a broadcast subscription does read pass,
