@@ -66,12 +66,12 @@ pub struct MessageMetadata {
     /// an ack that never landed, a visibility timeout expiring, and — on NATS —
     /// [`Outcome::Defer`](crate::Outcome::Defer) hops.
     ///
-    /// That last one is the reason this field exists. `Defer` deliberately
-    /// leaves `retry_count` untouched, so a handler that defers forever bounces
-    /// between the main queue and the first hold queue with `retry_count`
-    /// pinned at its original value and nothing to alert on beyond
-    /// [`redelivered`](Self::redelivered), a bare boolean. `delivery_count`
-    /// makes "stuck at N attempts" expressible:
+    /// That last one is the reason this field exists. Under the republish
+    /// strategy `Defer` deliberately leaves `retry_count` untouched, so a
+    /// handler that defers forever bounces between the main queue and the
+    /// first hold queue with `retry_count` pinned at its original value and
+    /// nothing to alert on beyond [`redelivered`](Self::redelivered), a bare
+    /// boolean. `delivery_count` makes "stuck at N attempts" expressible:
     ///
     /// ```ignore
     /// // NATS: Defer naks in place, so this climbs with every deferred hop.
@@ -80,6 +80,10 @@ pub struct MessageMetadata {
     ///     return Outcome::Reject; // to the DLQ instead of deferring again
     /// }
     /// ```
+    ///
+    /// On an external NATS stream the loop above is not needed: `retry_count`
+    /// is derived from this count there, so a `Defer` consumes the retry
+    /// budget and the record reaches the DLQ at `max_retries` on its own.
     ///
     /// ## Per-backend availability
     ///

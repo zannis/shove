@@ -4801,8 +4801,9 @@ impl KafkaConsumer {
                                         .await;
                                         continue;
                                     }
-                                    // The record is untouched; the shutdown arm of
-                                    // the select above drains and commits the rest.
+                                    // The record is untouched; the receive loop's
+                                    // `shutdown.cancelled()` arm drains and commits
+                                    // the rest on its next pass.
                                     Staged::Stop => continue,
                                 }
                             } else {
@@ -4877,7 +4878,8 @@ impl KafkaConsumer {
                             let permit = match spare_permit.take() {
                                 Some(permit) => permit,
                                 // Every permit is held, by running handlers as
-                                // far as the checks above could tell. Any of
+                                // far as the pause check at the top of this pass
+                                // and `in_place_waiters` could tell. Any of
                                 // them may turn into an in-place wait while
                                 // this record waits for a permit, so the wait
                                 // must keep polling; see the helper.
@@ -6696,8 +6698,8 @@ impl KafkaConsumer {
                                     // An unavailable registry stalls this record
                                     // instead of discarding it; see `RegistryStall`.
                                     // Groupless: the wait tolerates the inert
-                                    // group id's coordinator answer as the
-                                    // receive arm above does.
+                                    // group id's coordinator answer as this loop's
+                                    // `consumer.recv()` arm does.
                                     let mut stall = RegistryStall::groupless();
                                     let staged = loop {
                                         let Some(result) = decode_or_shutdown(
@@ -6772,8 +6774,8 @@ impl KafkaConsumer {
                                 discard_broadcast(&topic, group.as_deref(), reason);
                                 continue;
                             }
-                            // Shutdown fired during a registry wait; the biased
-                            // select above ends the loop on its next pass.
+                            // Shutdown fired during a registry wait; the loop's
+                            // `shutdown.cancelled()` arm ends it on its next pass.
                             Staged::Stop => continue,
                         }
                     };

@@ -206,11 +206,11 @@ The two counters answer different questions, and neither is a total-attempts-eve
 
 Treat `None` as "unknown", never as zero. Where it is reported, a first delivery is `Some(1)`.
 
-Because the count belongs to a *broker-level* message, anything that creates a new one restarts it at 1. `Retry` publishes an incremented copy on every backend, so it always resets `delivery_count` — `retry_count` is the field that survives a retry. `Defer` resets it where deferring re-sends the message (SQS) and preserves it where deferring naks in place (NATS, and the in-process broker, which models NATS here).
+Because the count belongs to a *broker-level* message, anything that creates a new one restarts it at 1. Under `RetryStrategy::Republish`, the default on a shove-owned topology, `Retry` publishes an incremented copy and so resets `delivery_count`; `retry_count` is the field that survives a retry. Under `RetryStrategy::InPlace`, Kafka on an external or opted-in topology and NATS on an external stream, no copy is published and the same record comes back: Kafka keeps `retry_count` in memory, and NATS reads it from this very count, which climbs with every redelivery there. `Defer` resets `delivery_count` where deferring re-sends the message (SQS) and preserves it where deferring naks in place (NATS, and the in-process broker, which models NATS here).
 
 That last case is what `delivery_count` is for; see [Bounding a `Defer` loop](/guides/retries#defer-vs-retry).
 
-On Kafka, a consumer running with `RetryStrategy::InPlace`, which an external topology implies and a shove-owned one may opt into, publishes no copy on `Retry` or `Defer`.
+A consumer running with `RetryStrategy::InPlace` publishes no copy on `Retry` or `Defer`: on Kafka, where an external topology implies it and a shove-owned one may opt into it, the handler's task waits and hands the record back; on an external NATS stream the broker redelivers after a delayed `Nak`.
 The same record is handed back in place, and its `retry_count` is kept in memory for the redelivery.
 
 ## Dead-letter handling

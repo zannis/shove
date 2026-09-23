@@ -144,6 +144,7 @@ A FIFO consumer refuses `InPlace`, which it does not implement.
 | `Defer` | republishes into the topic after the first tier's delay | waits the first tier's delay in place, then hands the same record back |
 
 The redelivered `MessageMetadata` carries `redelivered: true` and the in-memory retry count.
+A `Defer` leaves that in-memory budget unchanged, as it does under the republish strategy; on an external NATS stream, by contrast, the count is the broker's redelivery count, so a `Defer` there consumes budget.
 While every prefetch slot is held and at least one holder is a waiting handler, the consumer pauses its assignment and keeps polling.
 A long wait therefore does not evict the member from its group.
 Slots held only by running handlers do not pause the assignment by themselves, because a pause purges the fetch queue and refetches on resume.

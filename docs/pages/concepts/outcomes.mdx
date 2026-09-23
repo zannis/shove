@@ -59,7 +59,8 @@ One caution: because `Defer` never increments the retry counter, a handler that 
 
 If no hold queues are configured on the topic, `Defer` falls back to broker nack-with-requeue and logs a warning.
 
-How a consumer carries out `Retry` and `Defer` is its `RetryStrategy`: `Republish`, an incremented copy after the tier's delay, or `InPlace`, the same record handed back after waiting the delay inside the handler's task.
+How a consumer carries out `Retry` and `Defer` is its `RetryStrategy`: `Republish`, an incremented copy after the tier's delay, or `InPlace`, the same record delivered again after the tier's delay with nothing published.
+`InPlace` says what is not done, a replacement publish; how the record comes back is the broker's own primitive, in the table below: Kafka waits inside the handler's task and hands the record back, NATS lets JetStream redeliver after a delayed `Nak`.
 One invariant binds every backend: a consumer never writes into an external topology when it settles an outcome, so an external topology implies `InPlace` everywhere, and each broker has a native primitive for it.
 
 | Backend | In-place primitive | This version |

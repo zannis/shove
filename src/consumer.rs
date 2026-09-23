@@ -64,10 +64,12 @@ pub enum RetryStrategy {
     /// queue on the backends that have one, into the consumed topic itself
     /// on Kafka, which has none. The default on a shove-owned topology.
     Republish,
-    /// Wait the tier's delay inside the handler's task, holding its prefetch
-    /// slot, then hand the same record back with the retry count kept in
-    /// memory. Nothing is published, and the record stays at its position.
-    /// Implied by an external topology.
+    /// Deliver the same record again after the tier's delay, with nothing
+    /// published and the record at its position. How the wait and the count
+    /// are carried is the backend's own primitive, in the table above: Kafka
+    /// waits inside the handler's task, holding its prefetch slot, with the
+    /// count kept in memory; NATS naks with the delay and reads the count from
+    /// the delivery info. Implied by an external topology.
     InPlace,
 }
 
