@@ -90,6 +90,10 @@ See [`examples/kafka/msk_iam.rs`](/backends/kafka/examples/msk_iam) for a runnab
 
 `topology().declare::<T>()` creates the Kafka topics for the main topic, hold topics, and DLQ. Idempotent — safe to call on every startup.
 
+A publish never creates a topic.
+The producer runs with `allow.auto.create.topics=false`, so a publish to a topic nobody declared fails with a `Connection` error after the produce timeout, and the topic stays absent.
+Declare the topology before the first publish, or provision the topic outside shove.
+
 ## Publish
 
 ```rust
@@ -97,6 +101,7 @@ See [`examples/kafka/msk_iam.rs`](/backends/kafka/examples/msk_iam) for a runnab
 ```
 
 `publisher().await?` returns a `Publisher<Kafka>`. Messages are produced via `rdkafka`. The message key is derived from the topic's partition-key logic (or from `T::sequence_key()` for sequenced topics).
+The producer never creates the topic it publishes to; see [Declare topology](#declare-topology).
 
 ### Producer tuning
 
@@ -561,6 +566,7 @@ The Kafka backend emits `shove_messages_failed_total` with the following `reason
   librdkafka implements PLAIN itself in every build, and SCRAM and OAUTHBEARER in its OpenSSL build, which `kafka-ssl` selects.
   GSSAPI/Kerberos needs Cyrus SASL and is behind the separate `kafka-gssapi` feature.
   For AWS MSK IAM, use the `kafka-msk-iam` feature instead.
+- **A publish to an undeclared topic fails.** The producer pins `allow.auto.create.topics=false`, so a broker with `auto.create.topics.enable=true` no longer creates a topic with broker defaults on the first publish. Call `topology().declare::<T>()` before the first publish, or provision the topic outside shove. The retry and DLQ publishes of a consumer are unaffected, because `declare` creates those topics.
 - **`librdkafka` system dependencies** on Debian/Ubuntu CI runners: `libsasl2-dev` is required only with `kafka-gssapi`.
   `kafka-ssl` alone links OpenSSL and no SASL library, and the shove `ci.yml` asserts that with `cargo tree`.
 

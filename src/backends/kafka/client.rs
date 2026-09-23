@@ -426,6 +426,33 @@ enum KafkaProducerInner {
     MskIam(FutureProducer<MskIamContext>),
 }
 
+/// The producer's client config: the connection settings of `base`, the
+/// pinned correctness settings, and the tuning `config` opts into.
+///
+/// `allow.auto.create.topics` is pinned to `false`. librdkafka defaults it to
+/// `true` for a producer, so a publish to a topic nobody declared would ask a
+/// broker running `auto.create.topics.enable=true` to create that topic with
+/// broker defaults, outside `declare()` and outside any topology config.
+/// Pinned, the publish fails with an unknown-topic error once
+/// `message.timeout.ms` elapses and the topic stays absent, which is what the
+/// topology model needs: a topic exists because `declare()` created it or
+/// because infra owns it, never because a publisher named it first.
+fn producer_config(
+    base: &ClientConfig,
+    client_name: &str,
+    config: &KafkaConfig,
+) -> Result<ClientConfig> {
+    let mut producer_config = base.clone();
+    producer_config
+        .set("client.id", client_name)
+        .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
+        .set("acks", "all")
+        .set("enable.idempotence", "true")
+        .set("allow.auto.create.topics", "false");
+    config.apply_producer_tuning(&mut producer_config)?;
+    Ok(producer_config)
+}
+
 impl KafkaClient {
     pub async fn connect(config: &KafkaConfig) -> Result<Self> {
         let client_name = format!("shove-rs-{}", process::id());
@@ -541,13 +568,7 @@ impl KafkaClient {
         // once into exactly-once-on-the-broker semantics. Requires Kafka
         // ≥ 0.11 (universal today) and caps in-flight requests per
         // connection at 5.
-        let mut producer_config = base_config.clone();
-        producer_config
-            .set("client.id", &client_name)
-            .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
-            .set("acks", "all")
-            .set("enable.idempotence", "true");
-        config.apply_producer_tuning(&mut producer_config)?;
+        let producer_config = producer_config(&base_config, &client_name, config)?;
 
         fn create_default_producer(cfg: &ClientConfig) -> Result<KafkaProducerInner> {
             let p: FutureProducer<DefaultClientContext> = cfg.create().map_err(|e| {
@@ -1322,6 +1343,21 @@ mod tests {
         assert!(rendered.contains("Zstd"));
         assert!(rendered.contains("producer_linger_ms"));
         assert!(rendered.contains("25"));
+    }
+
+    /// The producer never creates the topic it publishes to, and the pinned
+    /// correctness settings travel with that flag.
+    #[test]
+    fn producer_config_never_auto_creates_topics() {
+        let mut base = ClientConfig::new();
+        base.set("bootstrap.servers", "broker:9092");
+        let cfg = producer_config(&base, "shove-rs-test", &KafkaConfig::new("broker:9092"))
+            .expect("the default tuning is valid");
+        assert_eq!(cfg.get("allow.auto.create.topics"), Some("false"));
+        assert_eq!(cfg.get("enable.idempotence"), Some("true"));
+        assert_eq!(cfg.get("acks"), Some("all"));
+        assert_eq!(cfg.get("client.id"), Some("shove-rs-test"));
+        assert_eq!(cfg.get("bootstrap.servers"), Some("broker:9092"));
     }
 
     // -- overlay_dynamic_entries: legacy AlterConfigs merge correctness --
