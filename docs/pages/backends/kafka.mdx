@@ -20,17 +20,23 @@ cargo add shove --features kafka
 
 For TLS and SASL (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512).
 librdkafka implements PLAIN in every build.
-SCRAM and OAUTHBEARER come from its OpenSSL build, which is why shove keeps the whole `KafkaSasl` type behind this feature:
+SCRAM and OAUTHBEARER come from its OpenSSL build, which is why shove keeps the whole `KafkaSasl` type behind this feature.
+OAUTHBEARER is compiled in, but shove exposes it only as `KafkaSasl::MskIam` under `kafka-msk-iam` (below); there is no generic token provider.
+For TLS, PLAIN and SCRAM:
 
 ```sh
 cargo add shove --features kafka-ssl
 ```
 
-For GSSAPI/Kerberos, which needs Cyrus SASL (`libsasl2`) linked into the build:
+For GSSAPI/Kerberos on an `rdkafka` client you build yourself in the same binary, which needs Cyrus SASL (`libsasl2`) linked into the build:
 
 ```sh
 cargo add shove --features kafka-gssapi
 ```
+
+This feature only links the library.
+`KafkaSasl` exposes no GSSAPI variant and `KafkaConfig` passes no raw client properties, so shove itself cannot authenticate with Kerberos.
+The feature gates no shove code and exists for direct `rdkafka` use.
 
 For AWS MSK with IAM authentication:
 
@@ -566,7 +572,9 @@ The Kafka backend emits `shove_messages_failed_total` with the following `reason
 - **SASL and TLS** require the `kafka-ssl` feature.
   PLAIN, SCRAM-SHA-256 and SCRAM-SHA-512 are supported out of the box.
   librdkafka implements PLAIN itself in every build, and SCRAM and OAUTHBEARER in its OpenSSL build, which `kafka-ssl` selects.
-  GSSAPI/Kerberos needs Cyrus SASL and is behind the separate `kafka-gssapi` feature.
+  Shove exposes OAUTHBEARER only as `KafkaSasl::MskIam` under `kafka-msk-iam`; there is no generic token provider.
+  GSSAPI/Kerberos needs Cyrus SASL, which the separate `kafka-gssapi` feature links for direct `rdkafka` use.
+  `KafkaSasl` exposes no GSSAPI variant, so that feature gates no shove code and shove itself cannot authenticate with Kerberos.
   For AWS MSK IAM, use the `kafka-msk-iam` feature instead.
 - **`librdkafka` system dependencies** on Debian/Ubuntu CI runners: `libsasl2-dev` is required only with `kafka-gssapi`.
   `kafka-ssl` alone links OpenSSL and no SASL library, and the shove `ci.yml` asserts that with `cargo tree`.
