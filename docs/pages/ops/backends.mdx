@@ -76,15 +76,24 @@ The **batch consumer** is the exception, and it has no equivalent knob: when not
 
 **`cmake` is required on Windows.** The `rdkafka` crate links `librdkafka`, which requires `cmake` during the build on Windows. Linux and macOS use the standard `librdkafka` build path without additional prerequisites.
 
-**SASL/TLS.** Enable the `kafka-ssl` feature for TLS transport. `KafkaSasl` configuration supports SCRAM-SHA-256 and SCRAM-SHA-512. GSSAPI/Kerberos requires activating the `rdkafka/gssapi` feature downstream in your own `Cargo.toml`. For Amazon MSK with IAM authentication, enable the `kafka-msk-iam` feature instead — see the [Kafka backend page](/backends/kafka) for setup details.
+**SASL/TLS.** Enable the `kafka-ssl` feature for TLS transport.
+`KafkaSasl` configuration supports PLAIN, SCRAM-SHA-256 and SCRAM-SHA-512.
+librdkafka implements PLAIN itself in every build.
+SCRAM and OAUTHBEARER come from its OpenSSL build, which `kafka-ssl` selects.
+GSSAPI/Kerberos needs Cyrus SASL and is behind the separate `kafka-gssapi` feature.
+For Amazon MSK with IAM authentication, enable the `kafka-msk-iam` feature instead, and see the [Kafka backend page](/backends/kafka) for setup details.
 
-**`librdkafka` system dependency.** On Debian/Ubuntu CI runners, install the SASL development headers before building:
+**`librdkafka` system dependency.** `kafka-ssl` links OpenSSL and nothing else.
+Only `kafka-gssapi` needs the SASL development headers, and on Debian/Ubuntu CI runners you install them before building:
 
 ```sh
 apt-get install -y libsasl2-dev
 ```
 
-On macOS, the dependency is typically satisfied via Homebrew. `librdkafka` is a runtime dependency — it is not statically bundled.
+On macOS, Homebrew's `cyrus-sasl` satisfies it.
+`librdkafka` itself is not a runtime dependency: `rdkafka-sys` compiles the librdkafka source it bundles and links it statically, so the binary carries it.
+Only OpenSSL, and Cyrus SASL under `kafka-gssapi`, are linked from the system.
+The `rdkafka` crate's `dynamic-linking` feature is the opt-in exception, and shove does not enable it.
 
 **Consumer offsets are committed asynchronously.** `librdkafka` commits offsets in the background. On clean shutdown, shove flushes pending commits before exiting. On a crash or SIGKILL, expect at-least-once redelivery from the last committed offset when the consumer restarts. Design handlers to be idempotent or use the dedup layer to handle this.
 

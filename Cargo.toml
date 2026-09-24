@@ -93,10 +93,18 @@ nats = ["dep:async-nats", "dep:futures-util"]
 # Apache Kafka pubsub
 kafka = ["dep:rdkafka", "dep:futures-util"]
 
-# TLS + SASL support for Kafka. Pulls in rdkafka's `ssl` (OpenSSL) and `sasl`
-# (Cyrus SASL) features. For GSSAPI/Kerberos or a vendored OpenSSL, users can
-# additionally enable `rdkafka/gssapi` or `rdkafka/ssl-vendored` downstream.
-kafka-ssl = ["kafka", "rdkafka?/ssl", "rdkafka?/sasl"]
+# TLS plus the SASL mechanisms librdkafka implements itself: PLAIN,
+# SCRAM-SHA-256, SCRAM-SHA-512 and OAUTHBEARER. Pulls in rdkafka's `ssl`
+# (OpenSSL) feature and nothing else: librdkafka's `configure` and cmake
+# builds both enable SCRAM and OAUTHBEARER from SSL alone. For a vendored
+# OpenSSL, users can additionally enable `rdkafka/ssl-vendored` downstream.
+kafka-ssl = ["kafka", "rdkafka?/ssl"]
+
+# GSSAPI/Kerberos through Cyrus SASL. Pulls in rdkafka's `gssapi` feature,
+# which links libsasl2 into every build and runtime image. Only needed when a
+# broker requires the GSSAPI mechanism; `KafkaSasl` exposes no GSSAPI variant,
+# so this feature gates no shove code and exists for downstream `rdkafka` use.
+kafka-gssapi = ["kafka-ssl", "rdkafka?/gssapi"]
 
 # AWS MSK IAM authentication. Adds the `MskIam` variant to `KafkaSasl`,
 # which uses `SASL_SSL` + `OAUTHBEARER` with auto-refreshed presigned tokens

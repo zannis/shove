@@ -63,7 +63,7 @@ Per-backend feature sets (matching the CI matrix):
 | rabbitmq | `rabbitmq,audit,rabbitmq-transactional,metrics,sbe` |
 | aws-sns-sqs | `pub-aws-sns,aws-sns-sqs,audit,metrics,sbe` |
 | nats | `nats,audit,metrics,sbe,env-config` |
-| kafka | `kafka,kafka-ssl,kafka-msk-iam,test-support,audit,metrics,sbe,env-config` |
+| kafka | `kafka,kafka-ssl,kafka-gssapi,kafka-msk-iam,test-support,audit,metrics,sbe,env-config` |
 | kafka (schema registry) | `kafka,kafka-schema-registry,protobuf` |
 | redis-streams | `redis-streams,metrics,sbe` |
 
@@ -73,8 +73,12 @@ compiles them to zero tests and reports green without having run any of them.
 The authoritative copy is the `coverage` matrix in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
-The Kafka feature set also needs system libraries on Linux:
-`librdkafka-dev` and `libsasl2-dev`.
+The Kafka feature sets need no `librdkafka` package: `rdkafka-sys` compiles the
+librdkafka source it bundles and links it statically. The prerequisites are a C
+toolchain, the OpenSSL headers (`libssl-dev` on Debian/Ubuntu) for `kafka-ssl`,
+and `libsasl2-dev` for `kafka-gssapi` (Cyrus SASL). `kafka-ssl` alone links
+OpenSSL only, and CI asserts that by checking that `sasl2-sys` is absent from
+its `cargo tree -e features` output and present under `kafka-gssapi`.
 
 Backends that need no secrets (inmemory, rabbitmq, nats, kafka, redis-streams)
 can be run without `dotenvx`:
@@ -82,6 +86,17 @@ can be run without `dotenvx`:
 ```sh
 cargo nextest run --features <backend-feature-set>
 ```
+
+The Kafka suites start one broker container per test.
+On a small Docker host the default parallelism starves those brokers into startup and coordinator timeouts that look like test failures.
+A 2-CPU, 4 GiB VM is typical for a laptop.
+There, run one Kafka test binary at a time, and cap the largest:
+
+```sh
+cargo nextest run --features <kafka-feature-set> --test kafka_integration --test-threads 4
+```
+
+CI runs on larger hosts and needs neither.
 
 ## Before opening a PR — the gates CI enforces
 
