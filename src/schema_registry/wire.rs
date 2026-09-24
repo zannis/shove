@@ -189,13 +189,15 @@ fn read_message_indexes(bytes: &[u8]) -> Option<(Vec<i32>, &[u8])> {
 /// The one check every `require_schema_message_index` setter applies, on
 /// `ConsumerOptions::<Kafka>`, `KafkaConsumerGroupConfig` and
 /// `BatchConsumerOptions::<Kafka>`, at the same fail-fast point as
-/// `validate_commit_interval`.
+/// `validate_commit_interval`. `ConsumerOptions::into_inner` applies it once
+/// more, because that field is public and a value written past the setter
+/// reaches the consumer through no other funnel.
 ///
-/// [`read_message_indexes`] only ever yields a non-empty array of
-/// non-negative indexes, so an empty or negative requirement can never equal
-/// a parsed index: every protobuf frame would go to the DLQ as
-/// `schema_message_index_rejected`, and nothing at startup would point at
-/// the cause. Refused at configuration time instead.
+/// [`read_message_indexes`] only ever yields a non-empty array of at most
+/// [`MAX_MESSAGE_INDEXES`] non-negative indexes, so an empty, negative or
+/// longer requirement can never equal a parsed index: every protobuf frame
+/// would go to the DLQ as `schema_message_index_rejected`, and nothing at
+/// startup would point at the cause. Refused at configuration time instead.
 pub(crate) fn validate_message_index(index: &[i32]) {
     assert!(
         !index.is_empty(),
@@ -205,6 +207,12 @@ pub(crate) fn validate_message_index(index: &[i32]) {
     assert!(
         index.iter().all(|i| *i >= 0),
         "schema_message_index must not contain a negative index, got {index:?}"
+    );
+    assert!(
+        index.len() <= MAX_MESSAGE_INDEXES as usize,
+        "schema_message_index must not hold more than {MAX_MESSAGE_INDEXES} indexes, got {}: the \
+         parser treats a longer frame as unframed, so the requirement could never match",
+        index.len()
     );
 }
 
@@ -517,5 +525,33 @@ mod tests {
     )]
     fn validate_message_index_rejects_a_negative_requirement() {
         validate_message_index(&[0, -1]);
+    }
+
+    /// The cap is the parser's own: a frame with `MAX_MESSAGE_INDEXES`
+    /// indexes parses and its index passes the validator.
+    #[test]
+    fn validate_message_index_accepts_a_path_at_the_parser_cap() {
+        let cap = MAX_MESSAGE_INDEXES as usize;
+        let indexes = vec![0u32; cap];
+        let frame = build_frame(WireFormat::Protobuf, SchemaId(7), &indexes, &[0xAA]);
+        let FrameResult::Framed { message_index, .. } = parse_frame(WireFormat::Protobuf, &frame)
+        else {
+            panic!("a frame at the cap must parse");
+        };
+        let parsed = message_index.expect("protobuf frames carry an index");
+        assert_eq!(parsed.len(), cap);
+        validate_message_index(&parsed);
+    }
+
+    /// One index past the cap is unframed to the parser
+    /// (`protobuf_implausible_index_count_is_unframed`), so a requirement
+    /// that long could never match and is refused like an empty one.
+    #[test]
+    #[should_panic(
+        expected = "schema_message_index must not hold more than 1024 indexes, got 1025"
+    )]
+    fn validate_message_index_rejects_a_path_past_the_parser_cap() {
+        let past_cap = vec![0; MAX_MESSAGE_INDEXES as usize + 1];
+        validate_message_index(&past_cap);
     }
 }

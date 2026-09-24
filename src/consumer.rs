@@ -269,7 +269,10 @@ pub struct ConsumerOptions<B: Backend> {
 
     /// Kafka-only: the protobuf message index a frame must carry. `None`
     /// accepts any index. Set via
-    /// [`ConsumerOptions::<Kafka>::require_schema_message_index`].
+    /// [`ConsumerOptions::<Kafka>::require_schema_message_index`], which
+    /// refuses a requirement the wire parser can never yield; a value written
+    /// here directly meets the same check when the options are handed to the
+    /// consumer.
     #[cfg(feature = "kafka-schema-registry")]
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka-schema-registry")))]
     pub schema_message_index: Option<Vec<i32>>,
@@ -571,6 +574,14 @@ impl<B: Backend> ConsumerOptions<B> {
     /// processes one message at a time — matching the semantic of the
     /// per-backend `ConsumerGroupConfig::with_concurrent_processing`.
     pub(crate) fn into_inner(self) -> ConsumerOptionsInner {
+        // `schema_message_index` is a public field, so a value written past
+        // `require_schema_message_index` arrives here unchecked. Every entry
+        // point (direct, FIFO, DLQ, broadcast, supervisor) passes the options
+        // through this one funnel, so this is the one place to refuse it.
+        #[cfg(feature = "kafka-schema-registry")]
+        if let Some(index) = &self.schema_message_index {
+            validate_message_index(index);
+        }
         let effective_prefetch = if self.concurrent_processing {
             self.prefetch_count.max(1)
         } else {
@@ -779,8 +790,10 @@ impl ConsumerOptions<Kafka> {
     /// subscription refuses it at `subscribe()`: it assigns every partition
     /// at an explicit offset and never consults the policy, and its start is
     /// [`with_broadcast_start`](Self::with_broadcast_start). The DLQ drain
-    /// (`run_dlq_with_options`) refuses it too: a drain always starts a fresh
-    /// group at the earliest retained offset, so it never skips a dead letter.
+    /// (`run_dlq_with_options`) refuses it too: the drain hard-codes
+    /// `earliest`, which applies only while its group has no usable committed
+    /// offset, so a fresh drain never skips a dead letter and a restarted one
+    /// resumes from its commit.
     pub fn with_auto_offset_reset(mut self, reset: KafkaAutoOffsetReset) -> Self {
         self.kafka_auto_offset_reset = Some(reset);
         self
@@ -873,11 +886,14 @@ impl ConsumerOptions<Kafka> {
     ///
     /// # Panics
     ///
-    /// Panics if `index` is empty or holds a negative element, the same check
-    /// `KafkaConsumerGroupConfig` and `BatchConsumerOptions::<Kafka>` apply:
-    /// the wire parser never yields such an index, so the requirement could
-    /// never match and every protobuf frame would be dead-lettered with
-    /// nothing at startup pointing at the cause.
+    /// Panics if `index` is empty, holds a negative element or has more than
+    /// 1024 entries, the wire parser's own cap; `KafkaConsumerGroupConfig`
+    /// and `BatchConsumerOptions::<Kafka>` apply the same check. The parser
+    /// never yields such an index, so the requirement could never match and
+    /// every protobuf frame would be dead-lettered with nothing at startup
+    /// pointing at the cause. The check runs again when the options are
+    /// handed to the consumer, so a value written to the public
+    /// `schema_message_index` field past this setter is refused there.
     pub fn require_schema_message_index(mut self, index: impl Into<Vec<i32>>) -> Self {
         let index = index.into();
         validate_message_index(&index);
@@ -1512,6 +1528,60 @@ mod tests {
         #[should_panic(expected = "schema_message_index must not contain a negative index")]
         fn require_schema_message_index_rejects_a_negative_index() {
             let _ = ConsumerOptions::<Kafka>::new().require_schema_message_index([0, -1]);
+        }
+
+        /// The cap is the parser's: 1024 indexes match a frame at the cap,
+        /// and 1025 can never match, so they are refused like an empty path.
+        #[test]
+        fn require_schema_message_index_accepts_a_path_at_the_parser_cap() {
+            let at_cap = ConsumerOptions::<Kafka>::new()
+                .require_schema_message_index(vec![0; 1024])
+                .into_inner();
+            assert_eq!(at_cap.schema_message_index.map(|i| i.len()), Some(1024));
+        }
+
+        #[test]
+        #[should_panic(
+            expected = "schema_message_index must not hold more than 1024 indexes, got 1025"
+        )]
+        fn require_schema_message_index_rejects_a_path_past_the_parser_cap() {
+            let _ = ConsumerOptions::<Kafka>::new().require_schema_message_index(vec![0; 1025]);
+        }
+
+        /// `schema_message_index` is a public field, so a value written past
+        /// the setter reaches the consumer through `into_inner`, the one
+        /// funnel every entry point passes the options through. The same
+        /// check runs there: a valid path goes through, and the three shapes
+        /// the setter refuses are refused before any consumer is created.
+        #[test]
+        fn into_inner_admits_a_valid_path_written_to_the_field() {
+            let mut opts = ConsumerOptions::<Kafka>::new();
+            opts.schema_message_index = Some(vec![0, 2]);
+            assert_eq!(opts.into_inner().schema_message_index, Some(vec![0, 2]));
+        }
+
+        #[test]
+        #[should_panic(expected = "schema_message_index must not be empty")]
+        fn into_inner_rejects_an_empty_path_written_to_the_field() {
+            let mut opts = ConsumerOptions::<Kafka>::new();
+            opts.schema_message_index = Some(Vec::new());
+            let _ = opts.into_inner();
+        }
+
+        #[test]
+        #[should_panic(expected = "schema_message_index must not contain a negative index")]
+        fn into_inner_rejects_a_negative_index_written_to_the_field() {
+            let mut opts = ConsumerOptions::<Kafka>::new();
+            opts.schema_message_index = Some(vec![0, -1]);
+            let _ = opts.into_inner();
+        }
+
+        #[test]
+        #[should_panic(expected = "schema_message_index must not hold more than 1024 indexes")]
+        fn into_inner_rejects_a_path_past_the_parser_cap_written_to_the_field() {
+            let mut opts = ConsumerOptions::<Kafka>::new();
+            opts.schema_message_index = Some(vec![0; 1025]);
+            let _ = opts.into_inner();
         }
 
         #[test]

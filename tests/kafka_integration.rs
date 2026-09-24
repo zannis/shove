@@ -4929,3 +4929,124 @@ async fn a_raised_commit_interval_raises_the_receive_loops_fence_threshold() {
     handle.await.unwrap().ok();
     broker.close().await;
 }
+
+/// The last resort of the final-commit thread, N1: when no thread can be
+/// spawned for the commit or for the close, the handle is leaked rather than
+/// closed on the runtime thread. This pins, against a real broker, the cost
+/// the Kafka page and plan 021 step 4 state for that leak: the leaked
+/// instance keeps heartbeating, so the group keeps its member past the
+/// `session.timeout.ms` a crash would have freed it by. The member leaves
+/// only when `max.poll.interval.ms` (five minutes) passes without a poll,
+/// which this test does not wait for, or when the process exits.
+// `test-support` gates the spawn switch and the timeout seam this test reads.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_leaked_consumer_keeps_its_group_member_past_the_session_timeout() {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+    use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+    use shove::kafka::{final_commit_spawn_probe, session_timeout_for_test};
+
+    shove::define_topic!(
+        LeakedCloseTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-leaked-close").build()
+    );
+
+    impl MessageHandler<LeakedCloseTopic> for CountingHandler {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    const GROUP: &str = "kafka-leaked-close-consumer";
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<LeakedCloseTopic>()
+        .await
+        .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<LeakedCloseTopic>(&SimpleMessage {
+            id: "leaked-close".into(),
+            content: "test".into(),
+        })
+        .await
+        .unwrap();
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let run = tokio::spawn(async move {
+        consumer
+            .run::<LeakedCloseTopic, _>(hc, (), ConsumerOptions::<Kafka>::new().with_shutdown(sc))
+            .await
+    });
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the consumer receives the record"
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
+
+    // From here on no thread can be had, for the final commit or for the close.
+    final_commit_spawn_probe::refuse_threads(true);
+    let started = Instant::now();
+    shutdown.cancel();
+    run.await
+        .unwrap()
+        .expect("run returns Ok: the missing commit is settled as a rejected one");
+    // The close blocks for as long as librdkafka takes to leave the group. A
+    // run that returns at once did not run it on the runtime thread.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "shutdown must return without closing the consumer here, took {:?}",
+        started.elapsed()
+    );
+
+    let session_timeout = session_timeout_for_test();
+    tokio::time::sleep(session_timeout + Duration::from_secs(2)).await;
+
+    // A coordinator that is moving or loading answers "ask again"; retried
+    // as `wait_for_stable_group` retries them.
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", tb.brokers())
+        .create()
+        .expect("failed to create group probe");
+    let deadline = Instant::now() + TIMEOUT;
+    let members = loop {
+        match probe.fetch_group_list(Some(GROUP), Duration::from_secs(10)) {
+            Ok(list) => {
+                break list
+                    .groups()
+                    .iter()
+                    .find(|g| g.name() == GROUP)
+                    .map_or(0, |g| g.members().len());
+            }
+            Err(KafkaError::GroupListFetch(
+                RDKafkaErrorCode::NotCoordinator
+                | RDKafkaErrorCode::CoordinatorNotAvailable
+                | RDKafkaErrorCode::CoordinatorLoadInProgress
+                | RDKafkaErrorCode::OperationTimedOut,
+            )) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the coordinator answers the group probe"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("failed to fetch group list: {e}"),
+        }
+    };
+    assert_eq!(
+        members, 1,
+        "the leaked handle keeps heartbeating, so the broker keeps the member past the \
+         {session_timeout:?} session timeout while the process lives"
+    );
+    broker.close().await;
+}

@@ -2271,12 +2271,42 @@ async fn final_commit_off_runtime(
     queue: &str,
 ) -> KafkaResult<()> {
     final_commit_on_thread(consumer, tpl, queue, &mut |name, body| {
+        #[cfg(feature = "test-support")]
+        if final_commit_spawn_probe::refused() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "thread spawn refused by final_commit_spawn_probe",
+            ));
+        }
         std::thread::Builder::new()
             .name(name)
             .spawn(body)
             .map(|_detached| ())
     })
     .await
+}
+
+/// Test-only switch (see the `test-support` feature): refuses every thread
+/// the shutdown path asks for, the way an exhausted host does, so an
+/// integration test can drive the last-resort leak against a real broker and
+/// watch what the leaked member does. nextest runs each test in its own
+/// process, so the switch belongs to that test's consumers alone.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod final_commit_spawn_probe {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static REFUSE: AtomicBool = AtomicBool::new(false);
+
+    /// Refuse, or with `false` allow again, the spawn of the final-commit
+    /// thread and of the close-only thread that follows a failed one.
+    pub fn refuse_threads(refuse: bool) {
+        REFUSE.store(refuse, Ordering::SeqCst);
+    }
+
+    pub(super) fn refused() -> bool {
+        REFUSE.load(Ordering::SeqCst)
+    }
 }
 
 /// What the final-commit thread does with what it owns: the synchronous
@@ -2408,10 +2438,15 @@ where
 /// thread is tried first: a failed spawn is often a momentary `EAGAIN`. If
 /// that fails too the handle is leaked, deliberately, and logged at error
 /// level: the process has just failed to create two threads and is degraded
-/// already, the broker drops the member after the session timeout exactly
-/// as it does after a crash, which at-least-once delivery already covers,
-/// and the alternative is a runtime thread blocked for as long as a frozen
-/// coordinator keeps librdkafka retrying.
+/// already, and the alternative is a runtime thread blocked for as long as
+/// a frozen coordinator keeps librdkafka retrying.
+///
+/// What the leak costs. The leaked instance keeps heartbeating, so while the
+/// process lives the member holds its partitions until `max.poll.interval.ms`
+/// (five minutes) passes without a poll and librdkafka leaves the group on
+/// its own; the session timeout does not apply to a member that still
+/// heartbeats. Once the process exits the broker drops the member after the
+/// session timeout, as after a crash. At-least-once delivery covers both.
 fn close_off_runtime_or_leak<C, S>(consumer: C, queue: &str, spawn: &mut S)
 where
     C: Send + 'static,
@@ -2432,8 +2467,9 @@ where
                 queue,
                 error = %e,
                 "no thread for the consumer's close either; leaking the handle rather than closing \
-                 it on the runtime thread. The broker drops the member after the session timeout, \
-                 as after a crash"
+                 it on the runtime thread. The leaked consumer keeps heartbeating: its partitions \
+                 stay assigned until max.poll.interval.ms passes without a poll, or until the \
+                 process exits and the session timeout drops the member"
             );
             std::mem::forget(consumer);
         }
@@ -5027,14 +5063,15 @@ impl KafkaConsumer {
     /// What the DLQ drain refuses, after the DLQ check and before it
     /// subscribes: the two group knobs its loop never reads.
     ///
-    /// The drain starts every fresh group at the earliest retained offset,
-    /// so a tail-only join can never skip a dead letter the operator opted
-    /// in to keep, and it commits each dead letter as it settles, so there
-    /// is no interval to set. Neither `with_auto_offset_reset` nor
-    /// `with_commit_interval` would change anything, and a setting that
-    /// changes nothing is refused rather than dropped: the FIFO consumer's
-    /// policy, applied on every path. The message names the entry point,
-    /// as `refuse_broadcast_start` does.
+    /// The drain hard-codes `earliest` for its group, and that policy applies
+    /// only while the group has no usable committed offset: a fresh drain can
+    /// never skip a dead letter the operator opted in to keep, and a restarted
+    /// drain resumes from its commit. It commits each dead letter as it
+    /// settles, so there is no interval to set. Neither
+    /// `with_auto_offset_reset` nor `with_commit_interval` would change
+    /// anything, and a setting that changes nothing is refused rather than
+    /// dropped: the FIFO consumer's policy, applied on every path. The message
+    /// names the entry point, as `refuse_broadcast_start` does.
     fn check_dlq_options(queue: &str, dlq: &str, options: &ConsumerOptions) -> Result<()> {
         if options.kafka_commit_interval.is_some() {
             return Err(ShoveError::Topology(format!(
@@ -5046,9 +5083,9 @@ impl KafkaConsumer {
         if options.kafka_auto_offset_reset.is_some() {
             return Err(ShoveError::Topology(format!(
                 "topic '{queue}': `with_auto_offset_reset` does not apply to the dead-letter \
-                 drain of '{dlq}', which always starts a fresh group at the earliest retained \
-                 offset so it never skips a dead letter; `KafkaConsumer::run_dlq` never reads \
-                 it. Drop `with_auto_offset_reset(..)`."
+                 drain of '{dlq}', which hard-codes `earliest` for a group with no committed \
+                 offset so a fresh drain never skips a dead letter; `KafkaConsumer::run_dlq` \
+                 never reads it. Drop `with_auto_offset_reset(..)`."
             )));
         }
         Ok(())
@@ -7267,9 +7304,10 @@ mod broadcast_option_guard_tests {
         assert!(msg.contains("KafkaConsumer::run_dlq"), "{msg}");
     }
 
-    /// The DLQ drain always starts at the earliest retained offset, so a fresh
-    /// drain never skips a dead letter: `with_auto_offset_reset` is refused
-    /// rather than silently overridden.
+    /// The DLQ drain hard-codes `earliest`, which applies only while its
+    /// group has no usable committed offset, so a fresh drain never skips a
+    /// dead letter: `with_auto_offset_reset` is refused rather than silently
+    /// overridden.
     #[tokio::test]
     async fn run_dlq_rejects_auto_offset_reset() {
         let consumer = consumer().await;
@@ -7372,15 +7410,38 @@ mod final_commit_thread_tests {
 
     type Spawner = Box<dyn FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>>;
 
-    /// Stands in for the consumer: commits succeed, and the drop reports
-    /// the thread it ran on, which for the real handle is where
-    /// `rd_kafka_consumer_close` would run.
+    /// What the probe saw, in the order it happened: each commit with the
+    /// offsets it was given, and the drop, each with the thread that ran it.
+    /// For the real handle the drop is where `rd_kafka_consumer_close` runs.
+    #[derive(Debug, PartialEq)]
+    enum Event {
+        Commit {
+            thread: ThreadId,
+            offsets: Vec<(String, i32, Offset)>,
+        },
+        Drop {
+            thread: ThreadId,
+            name: Option<String>,
+        },
+    }
+
+    /// Stands in for the consumer: a commit succeeds and is recorded with
+    /// its offsets, and the drop reports the thread it ran on.
     struct DropProbe {
-        dropped_on: std_mpsc::Sender<(ThreadId, Option<String>)>,
+        events: std_mpsc::Sender<Event>,
     }
 
     impl FinalCommit for DropProbe {
-        fn commit_sync(&self, _: &TopicPartitionList) -> KafkaResult<()> {
+        fn commit_sync(&self, tpl: &TopicPartitionList) -> KafkaResult<()> {
+            let offsets = tpl
+                .elements()
+                .iter()
+                .map(|e| (e.topic().to_owned(), e.partition(), e.offset()))
+                .collect();
+            let _ = self.events.send(Event::Commit {
+                thread: std::thread::current().id(),
+                offsets,
+            });
             Ok(())
         }
     }
@@ -7388,15 +7449,16 @@ mod final_commit_thread_tests {
     impl Drop for DropProbe {
         fn drop(&mut self) {
             let thread = std::thread::current();
-            let _ = self
-                .dropped_on
-                .send((thread.id(), thread.name().map(str::to_owned)));
+            let _ = self.events.send(Event::Drop {
+                thread: thread.id(),
+                name: thread.name().map(str::to_owned),
+            });
         }
     }
 
-    fn probe() -> (DropProbe, std_mpsc::Receiver<(ThreadId, Option<String>)>) {
-        let (dropped_on, dropped) = std_mpsc::channel();
-        (DropProbe { dropped_on }, dropped)
+    fn probe() -> (DropProbe, std_mpsc::Receiver<Event>) {
+        let (events, seen) = std_mpsc::channel();
+        (DropProbe { events }, seen)
     }
 
     /// `std::thread::Builder`, as production uses it.
@@ -7436,25 +7498,53 @@ mod final_commit_thread_tests {
         tpl
     }
 
-    fn dropped_on(
-        dropped: &std_mpsc::Receiver<(ThreadId, Option<String>)>,
-    ) -> (ThreadId, Option<String>) {
-        dropped
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the consumer is dropped, on some thread, within the deadline")
+    /// Every event up to and including the drop, in order. The drop is the
+    /// probe's last act, so once it has arrived nothing else is pending.
+    fn events_until_the_drop(seen: &std_mpsc::Receiver<Event>) -> Vec<Event> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut events = Vec::new();
+        loop {
+            let event = seen
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("the consumer is dropped, on some thread, within the deadline");
+            let is_drop = matches!(event, Event::Drop { .. });
+            events.push(event);
+            if is_drop {
+                return events;
+            }
+        }
     }
 
-    /// The shape step 4 promised: the commit and the close both run on the
-    /// dedicated thread, never on the runtime thread that awaits them.
+    /// The shape step 4 promised: exactly one commit, of the offsets the
+    /// loop drained, and then the close, both on the dedicated thread and
+    /// never on the runtime thread that awaits them.
     #[tokio::test]
     async fn the_final_commit_thread_commits_and_then_owns_the_close() {
-        let (probe, dropped) = probe();
+        let (probe, seen) = probe();
         let result =
             final_commit_on_thread(probe, Some(one_offset()), "orders", &mut real_spawner()).await;
         assert!(result.is_ok(), "{result:?}");
-        let (thread, name) = dropped_on(&dropped);
+        let events = events_until_the_drop(&seen);
+        let [
+            Event::Commit {
+                thread: committed_on,
+                offsets,
+            },
+            Event::Drop {
+                thread: dropped_on,
+                name,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("one commit, then the drop, and nothing else: {events:?}");
+        };
+        assert_eq!(*offsets, vec![("orders".to_owned(), 0, Offset::Offset(7))]);
+        assert_eq!(
+            committed_on, dropped_on,
+            "the commit and the close run on the same thread"
+        );
         assert_ne!(
-            thread,
+            *dropped_on,
             std::thread::current().id(),
             "the close must not run on the runtime thread"
         );
@@ -7467,7 +7557,7 @@ mod final_commit_thread_tests {
     /// dropped it on failure, and the close ran right here.
     #[tokio::test]
     async fn a_failed_spawn_commits_nothing_and_closes_the_consumer_on_a_second_thread() {
-        let (probe, dropped) = probe();
+        let (probe, seen) = probe();
         let result =
             final_commit_on_thread(probe, Some(one_offset()), "orders", &mut failing_spawner(1))
                 .await;
@@ -7478,24 +7568,32 @@ mod final_commit_thread_tests {
             ),
             "{result:?}"
         );
-        let (thread, name) = dropped_on(&dropped);
+        let events = events_until_the_drop(&seen);
+        let [Event::Drop { thread, name }] = events.as_slice() else {
+            panic!("the drop and no commit: {events:?}");
+        };
         assert_ne!(
-            thread,
+            *thread,
             std::thread::current().id(),
             "a failed spawn must not drop the consumer on the runtime thread"
         );
         assert_eq!(name.as_deref(), Some("shove-kafka-consumer-close orders"));
     }
 
-    /// N1, the last resort: with no thread to be had at all, the handle is
-    /// leaked rather than closed on the runtime thread. `forget` is
-    /// synchronous, so once the call has returned a drop that has not
-    /// happened never will.
+    /// N1, the last resort: with no thread to be had at all, nothing commits
+    /// and the handle is leaked rather than closed on the runtime thread.
+    /// `forget` is synchronous, so once the call has returned a drop that
+    /// has not happened never will.
     #[tokio::test]
     async fn with_no_thread_at_all_the_consumer_is_leaked_and_never_closed_here() {
-        let (probe, dropped) = probe();
-        let result =
-            final_commit_on_thread(probe, None, "orders", &mut failing_spawner(usize::MAX)).await;
+        let (probe, seen) = probe();
+        let result = final_commit_on_thread(
+            probe,
+            Some(one_offset()),
+            "orders",
+            &mut failing_spawner(usize::MAX),
+        )
+        .await;
         assert!(
             matches!(
                 result,
@@ -7503,9 +7601,10 @@ mod final_commit_thread_tests {
             ),
             "{result:?}"
         );
-        assert!(
-            dropped.try_recv().is_err(),
-            "the handle must be leaked, never closed on the runtime thread"
+        assert_eq!(
+            seen.try_recv().ok(),
+            None,
+            "no commit and no close: the handle must be leaked, never closed on the runtime thread"
         );
     }
 }

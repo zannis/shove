@@ -152,7 +152,9 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
   Under `None`, a group with no usable committed offset ends its consumer with a `ShoveError::Topology` naming librdkafka's `AutoOffsetReset` answer.
   A reconnect would only meet the same answer.
   Commit a starting position first, with `reset_consumer_group_offsets` (below), or pick another policy.
-  The DLQ drain (`run_dlq_with_options`) refuses the setting: a drain always starts a fresh group at the earliest retained offset, so it never skips a dead letter.
+  The DLQ drain (`run_dlq_with_options`) refuses the setting because it hard-codes `earliest`.
+  That policy applies only while the drain's group has no usable committed offset.
+  A fresh drain therefore never skips a dead letter, and a restarted drain resumes from its commit.
 - **`with_commit_interval(Duration)`** - how often each consumer commits the offsets its handlers completed.
   The default is `500ms`.
   The interval must be positive and at most one hour; the setter panics otherwise, so an unrepresentable commit deadline is refused at configuration time and never met in the receive loop.
@@ -344,7 +346,9 @@ It then drains the republish queue and commits its final position **synchronousl
 The commit runs on a dedicated thread that also owns the consumer's close.
 The thread is spawned before it is handed the consumer, so a failed spawn never closes the consumer on the runtime thread.
 If no thread can be spawned, nothing commits and the close moves to a second, close-only thread.
-If that thread cannot be spawned either, the handle is leaked and logged, and the broker drops the member after the session timeout, as after a crash.
+If that thread cannot be spawned either, the handle is leaked and logged at error level.
+The leaked consumer keeps heartbeating, so while the process lives its partitions stay assigned until `max.poll.interval.ms` (5 min) passes without a poll.
+Once the process exits, the broker drops the member after the session timeout, as after a crash.
 The consumer waits for that commit for at most 20 s (`SHUTDOWN_COMMIT_DEADLINE` in `kafka::constants`).
 The deadline is chosen against the 30 s termination grace Kubernetes gives a Pod.
 Past the deadline the consumer logs that the batch may be redelivered and returns.
@@ -478,7 +482,8 @@ A frame with any other index is routed to the DLQ with death reason `schema_mess
 The check runs before the schema id is resolved, so a rejected frame costs no registry round trip.
 JSON frames carry no index and the setting is inert on them.
 The setter lives on `ConsumerOptions::<Kafka>`, `BatchConsumerOptions::<Kafka>` and `KafkaConsumerGroupConfig`, next to `accept_schema_subjects`.
-All three panic on an empty or a negative requirement: the parser never yields one, so it could never match, and every protobuf frame would be dead-lettered with nothing at startup pointing at the cause.
+All three panic on an empty or a negative requirement, or on one longer than 1024 indexes: the parser never yields one, so it could never match, and every protobuf frame would be dead-lettered with nothing at startup pointing at the cause.
+A value written to the public `schema_message_index` field past the setter is checked when the options are handed to the consumer.
 
 ### Producer-side encoding
 

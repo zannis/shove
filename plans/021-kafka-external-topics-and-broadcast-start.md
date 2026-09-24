@@ -363,7 +363,9 @@ The final commit moves onto a dedicated thread that owns the consumer:
   The thread is spawned first, waiting on a channel, and receives the consumer and the offsets only once it exists.
   A closure that owned the consumer would be dropped inside a failed `spawn`, on the runtime thread, which is the close this thread exists to keep off it.
   When no thread can be spawned nothing commits, and the close moves to a second, close-only thread.
-  If that spawn fails too the handle is leaked and logged at error level, and the broker drops the member after the session timeout, as after a crash.
+  If that spawn fails too, the handle is leaked and logged at error level.
+  The leaked consumer keeps heartbeating, so its partitions stay assigned until `max.poll.interval.ms` passes without a poll.
+  Once the process exits, the broker drops the member after the session timeout, as after a crash.
   The loop awaits the `oneshot` under `tokio::time::timeout(SHUTDOWN_COMMIT_DEADLINE)`.
 - `SHUTDOWN_COMMIT_DEADLINE` is a new 20 s constant in `constants.rs`, chosen against the 30 s termination grace Kubernetes gives a Pod by default.
 - On a result within the deadline, settle the pending discards as today.
@@ -466,7 +468,9 @@ The Kafka broadcast subscription refuses `with_commit_interval` and `with_auto_o
 Every competing-consumer entry point refuses a set `broadcast_start` through `ConsumerOptionsInner::refuse_broadcast_start`.
 `ConsumerSupervisor::register` and `register_fifo` do so generically, and each backend's direct, FIFO and DLQ paths do so themselves.
 The Kafka DLQ drain also refuses `with_commit_interval` and `with_auto_offset_reset`.
-It commits each dead letter as it settles and always starts a fresh group at the earliest retained offset, so neither knob changes anything.
+It commits each dead letter as it settles, so there is no interval to set.
+It hard-codes `earliest`, which applies only while its group has no usable committed offset, so a fresh drain never skips a dead letter.
+Neither knob would change anything, so both are refused.
 A caller therefore meets the same `Topology` error whichever way it starts a consumer.
 
 Kafka backend:
@@ -713,7 +717,9 @@ pub fn require_schema_message_index(mut self, index: impl Into<Vec<i32>>) -> Sel
 
 `ConsumerOptionsInner` and `BatchConsumerOptionsInner` gain the field, and every literal sets it.
 `spawn_one` copies it like the other registry settings (`consumer_group.rs:784-807`).
-All three setters run one shared check, `validate_message_index` in `wire.rs`, and panic on an empty or negative requirement.
+All three setters run one shared check, `validate_message_index` in `wire.rs`.
+It panics on an empty requirement, a negative index or more than 1024 indexes, the parser's cap.
+`ConsumerOptions::into_inner` runs the same check, so a value written to the public field past the setter is refused too.
 The parser never yields such an index, so the requirement could never match, and the mistake is refused at configuration time.
 
 Decode stage:

@@ -395,11 +395,12 @@ impl KafkaConsumerGroupConfig {
     ///
     /// # Panics
     ///
-    /// Panics if `index` is empty or holds a negative element, the same check
+    /// Panics if `index` is empty, holds a negative element or has more than
+    /// 1024 entries, the wire parser's own cap, the same check
     /// `ConsumerOptions::<Kafka>` and `BatchConsumerOptions::<Kafka>` apply:
-    /// the wire parser never yields such an index, so the requirement could
-    /// never match and every protobuf frame would be dead-lettered with
-    /// nothing at startup pointing at the cause.
+    /// the parser never yields such an index, so the requirement could never
+    /// match and every protobuf frame would be dead-lettered with nothing at
+    /// startup pointing at the cause.
     #[cfg(feature = "kafka-schema-registry")]
     pub fn require_schema_message_index(mut self, index: impl Into<Vec<i32>>) -> Self {
         let index = index.into();
@@ -1960,6 +1961,24 @@ mod tests {
         #[should_panic(expected = "schema_message_index must not contain a negative index")]
         fn require_schema_message_index_rejects_a_negative_index() {
             let _ = KafkaConsumerGroupConfig::new(1..=1).require_schema_message_index([-1]);
+        }
+
+        /// The cap is the parser's: 1024 indexes match a frame at the cap,
+        /// and 1025 can never match, so they are refused like an empty path.
+        #[test]
+        fn require_schema_message_index_accepts_a_path_at_the_parser_cap() {
+            let at_cap =
+                KafkaConsumerGroupConfig::new(1..=1).require_schema_message_index(vec![0; 1024]);
+            assert_eq!(at_cap.schema_message_index.map(|i| i.len()), Some(1024));
+        }
+
+        #[test]
+        #[should_panic(
+            expected = "schema_message_index must not hold more than 1024 indexes, got 1025"
+        )]
+        fn require_schema_message_index_rejects_a_path_past_the_parser_cap() {
+            let _ =
+                KafkaConsumerGroupConfig::new(1..=1).require_schema_message_index(vec![0; 1025]);
         }
     }
 

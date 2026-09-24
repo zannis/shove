@@ -374,6 +374,18 @@ pub mod kafka {
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::fence_probe;
+
+    /// Test-only switch (see the `test-support` feature): refuses the threads
+    /// the shutdown path asks for, so a test can drive the last-resort leak.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::final_commit_spawn_probe;
+
+    /// Test-only seam (see the `test-support` feature): the consumer
+    /// `session.timeout.ms`, for tests that wait past it.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::session_timeout_for_test;
 }
 
 /// Redis Streams backend.

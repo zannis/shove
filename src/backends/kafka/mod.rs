@@ -34,6 +34,19 @@ pub fn shutdown_commit_deadline_for_test() -> std::time::Duration {
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use consumer::fence_probe;
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use consumer::final_commit_spawn_probe;
+
+/// Test-only seam (see the `test-support` feature): the `session.timeout.ms`
+/// every shove consumer is created with, so a test that waits past it asserts
+/// against the constant itself rather than a hand-copied value.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn session_timeout_for_test() -> std::time::Duration {
+    std::time::Duration::from_millis(u64::from(constants::SESSION_TIMEOUT_MS))
+}
 pub use consumer_group::{
     KafkaAutoOffsetReset, KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
 };
