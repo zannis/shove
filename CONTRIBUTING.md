@@ -98,6 +98,11 @@ cargo nextest run --features <kafka-feature-set> --test kafka_integration --test
 
 CI runs on larger hosts and needs neither.
 
+Nextest may print `LEAK` beside a passed Kafka test.
+The runner marks a test leaky when its stdout or stderr pipe is still open 100 ms after the test process exited.
+The Kafka tests start no process of their own, and the mark has appeared only while several test processes were running at once.
+It does not reproduce with `--test-threads 1`, and nextest counts a leaky test as passed.
+
 ## Before opening a PR — the gates CI enforces
 
 ```sh
