@@ -201,8 +201,7 @@ impl KafkaPublisher {
             }
         })?;
         // The publisher always frames with message index [0] (the first message
-        // type) — the only index byte-identical across Confluent's zig-zag and
-        // shove's plain varint encoding, and all the bridge needs.
+        // type), which is all the bridge needs.
         Ok(Bytes::from(build_frame(fmt, id, &[0], &payload)))
     }
 
