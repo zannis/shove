@@ -361,7 +361,8 @@ The final commit moves onto a dedicated thread that owns the consumer:
 - In the shutdown branch at `:3107-3129`, after the permits are collected, move the `Arc<KafkaStreamConsumer>` into a `std::thread::Builder` thread named `shove-kafka-final-commit`.
   The thread runs the `Sync` commit, sends the result on a `oneshot`, and then drops the consumer, so the close also runs off the runtime.
   The thread is spawned first, waiting on a channel, and receives the consumer and the offsets only once it exists.
-  A closure that owned the consumer would be dropped inside a failed `spawn`, on the runtime thread, which is the close this thread exists to keep off it.
+  A closure that owned the consumer would be dropped inside a failed `spawn`, on the runtime thread.
+  That drop is the consumer's close, the very thing this thread exists to keep off the runtime.
   When no thread can be spawned nothing commits, and the close moves to a second, close-only thread.
   If that spawn fails too, the handle is leaked and logged at error level.
   The leaked consumer keeps heartbeating, so its partitions stay assigned until `max.poll.interval.ms` passes without a poll.
