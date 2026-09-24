@@ -149,8 +149,15 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
 - **`with_group_id(impl Into<String>)`** — override the broker-side consumer group ID. Defaults to `"{queue}-consumer"`. Set this when two independent services consume the same topic and must each receive every message (fan-out) — otherwise they share a group and compete for partitions. Prefer `.for_consumer_group(...)` on the topology (below), which sets the group *and* the DLQ/hold-queue names together.
 - **`with_auto_offset_reset(KafkaAutoOffsetReset)`** — `Earliest` (default, replay history), `Latest` (tail-only), or `None` (refuse silent replay/skip on a fresh group).
   The same setting is available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths, which have no group config to carry it.
-  Under `None`, a group with no usable committed offset ends its consumer with a `ShoveError::Topology` naming librdkafka's `AutoOffsetReset` answer.
-  A reconnect would only meet the same answer.
+  Under `None`, a group member with no usable committed offset ends with a `ShoveError::Topology` naming librdkafka's `AutoOffsetReset` answer.
+  A reconnect would only meet the same answer, so the member does not retry.
+  The error ends that member, not the group: the group run keeps waiting for its shutdown signal, and the error count it reports in `SupervisorOutcome` at shutdown grows by one for each member that ended this way.
+  Without autoscaling nothing replaces the member, so the group stays below its configured minimum for the life of the process.
+  With autoscaling enabled, the autoscaler tick respawns the member through the respawn supervisor, and each replacement meets the same answer.
+  The supervisor waits at least 2, 4, 8 and 16 seconds between those rounds, then opens its circuit and spawns one probe member per 300-second cooldown.
+  The circuit never becomes terminal, so a group under `None` with autoscaling on keeps probing until an operator intervenes.
+  Lag-driven scale-up is a second path outside that circuit: a group with no committed offset reports its retained backlog as lag, so while records remain on the topic the autoscaler can add members as well, and each dies the same way.
+  The 300-second cooldown therefore bounds the respawn probes, not every member the group creates.
   Commit a starting position first, with `reset_consumer_group_offsets` (below), or pick another policy.
   The DLQ drain (`run_dlq_with_options`) refuses the setting because it hard-codes `earliest`.
   That policy applies only while the drain's group has no usable committed offset.

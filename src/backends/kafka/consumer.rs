@@ -1612,10 +1612,15 @@ where
 ///
 /// `AutoOffsetReset` is permanent too: librdkafka raises it when a
 /// partition has no committed offset (or the committed one is out of range)
-/// and the reset policy is `none`. Reconnecting rejoins the same group under
-/// the same policy and meets the same answer, so the consumer ends instead
-/// and names the fault; the operator either commits a starting position (see
+/// and the reset policy is `KafkaAutoOffsetReset::None` (`error` on the
+/// wire). Reconnecting rejoins the same group under the same policy and meets
+/// the same answer, so the consumer ends instead and names the fault; the
+/// operator either commits a starting position (see
 /// `reset_consumer_group_offsets`) or picks another `KafkaAutoOffsetReset`.
+/// Ending the consumer ends one group member, not the group: the group's
+/// spawner counts the error, and with autoscaling on its respawn supervision
+/// replaces the member, which meets the same answer again (see the `None`
+/// variant's doc for the schedule).
 fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
     let is_permanent = matches!(
         &e,

@@ -75,6 +75,37 @@ pub enum KafkaAutoOffsetReset {
     /// `smallest`, `earliest`, `beginning`, `largest`, `latest`, `end` and
     /// `error`, and nothing else. The variant keeps the name that describes
     /// the behaviour; only the wire token differs.
+    ///
+    /// # In a consumer group
+    ///
+    /// The error ends the **member**, not the group. A member with no usable
+    /// committed offset receives librdkafka's `AutoOffsetReset` answer instead
+    /// of a first record and exits with a [`ShoveError::Topology`] that names
+    /// it. A reconnect would rejoin the same group under the same policy and
+    /// meet the same answer, so the member does not retry. The group's spawner
+    /// logs that error, adds one to the group's error count and returns, and
+    /// the group run keeps waiting for its shutdown signal. The count reaches
+    /// the caller as [`SupervisorOutcome::errors`] when the run ends.
+    ///
+    /// Without autoscaling nothing replaces the member: the group stays below
+    /// `min_consumers` for the life of the process, with one counted error per
+    /// member that started. With autoscaling enabled, the autoscaler tick tops
+    /// the group back up through the respawn supervisor, and every replacement
+    /// meets the same answer. The supervisor waits at least 2, 4, 8 and 16
+    /// seconds between those rounds, then opens its circuit and spawns one
+    /// probe member per 300-second cooldown. The circuit never becomes
+    /// terminal, so a group under `None` with autoscaling on keeps probing
+    /// until an operator intervenes. Lag-driven scale-up is a second path
+    /// outside that circuit: a group with no committed offset reports its
+    /// retained backlog as lag, so while records remain on the topic the
+    /// autoscaler can add members through `scale_up` as well, and each dies
+    /// the same way. The 300-second cooldown therefore bounds the respawn
+    /// probes, not every member the group creates.
+    ///
+    /// Commit a starting position first, with `reset_consumer_group_offsets`,
+    /// or pick another policy.
+    ///
+    /// [`SupervisorOutcome::errors`]: crate::consumer_supervisor::SupervisorOutcome::errors
     None,
 }
 
