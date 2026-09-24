@@ -19,6 +19,7 @@
 //! `cargo nextest run --features kafka --test kafka_broadcast_integration`
 
 use std::collections::HashSet;
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +45,8 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::kafka::apache::{self, Kafka as KafkaContainer};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+use tracing::subscriber::set_global_default;
+use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct Invalidate {
@@ -70,6 +73,17 @@ define_topic!(
     RetryTopic,
     Invalidate,
     TopologyBuilder::new("kafka-broadcast-retry")
+        .broadcast()
+        .build()
+);
+
+// Only `connected_head_broadcast_reads_a_new_partition_from_its_head` uses
+// this topic: that test reads the subscriber's own log lines back by queue
+// name, so no other test may share the name.
+define_topic!(
+    HeadRefreshTopic,
+    Invalidate,
+    TopologyBuilder::new("kafka-broadcast-head-refresh")
         .broadcast()
         .build()
 );
@@ -130,7 +144,63 @@ macro_rules! recorder_for {
     )+};
 }
 
-recorder_for!(CacheInvalidations, ControlTopic, DeferTopic);
+recorder_for!(
+    CacheInvalidations,
+    ControlTopic,
+    DeferTopic,
+    HeadRefreshTopic
+);
+
+/// A `tracing` writer that stamps each write with the instant it arrived, so
+/// a test can order a subscriber's own log lines against its own actions.
+/// The `fmt` layer writes one event per call, so each entry is one line.
+#[derive(Clone, Default)]
+struct StampedLogs(Arc<std::sync::Mutex<Vec<(Instant, String)>>>);
+
+impl StampedLogs {
+    /// The instants of the lines that contain every one of `needles`, in
+    /// arrival order.
+    fn instants_with(&self, needles: &[&str]) -> Vec<Instant> {
+        self.0
+            .lock()
+            .expect("log buffer mutex poisoned")
+            .iter()
+            .filter(|(_, line)| needles.iter().all(|needle| line.contains(needle)))
+            .map(|(at, _)| *at)
+            .collect()
+    }
+
+    fn contents(&self) -> String {
+        self.0
+            .lock()
+            .expect("log buffer mutex poisoned")
+            .iter()
+            .map(|(_, line)| line.as_str())
+            .collect()
+    }
+}
+
+impl io::Write for StampedLogs {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("log buffer mutex poisoned")
+            .push((Instant::now(), String::from_utf8_lossy(buf).into_owned()));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for StampedLogs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 /// Always returns `Retry`. Counts calls, so a redelivery loop is visible as a
 /// count above one rather than as a hang.
@@ -832,38 +902,49 @@ async fn broadcast_starts_at_a_timestamp() {
 }
 
 /// Under `Head`, a partition added after the subscription is read from its
-/// head: records seeded on it before the subscriber's next assignment refresh
-/// are delivered, where the default `Tail`, which
+/// head: records seeded on it before the subscriber's assignment refresh are
+/// delivered, where the default `Tail`, which
 /// `connected_broadcast_discovers_new_partitions` pins, would skip them.
 ///
-/// The refresh runs on a five-second tick, so the seeds land right after the
-/// expansion, through one producer, well inside that window. Should a tick
-/// fall before the seeds anyway, the new partition is assigned at its then
-/// empty head and the seeds still arrive: such a run passes without proving
-/// the property, and cannot fail for the wrong reason.
+/// An empty partition has one position, so a refresh that assigned the new
+/// partition before the seeds landed would deliver them under any start and
+/// prove nothing. The test therefore reads the subscriber's own `broadcast
+/// subscription extended its partition assignment` line through a stamped
+/// `tracing` writer and requires it to arrive after the seeds' delivery
+/// reports. An attempt where the refresh came first is inconclusive, and the
+/// topic is expanded again, up to three times. A refresh that joined the new
+/// partition at its tail delivers no seed on a conclusive attempt and fails.
 #[tokio::test]
 async fn connected_head_broadcast_reads_a_new_partition_from_its_head() {
+    const TOPIC: &str = "kafka-broadcast-head-refresh";
+    let logs = StampedLogs::default();
+    let subscriber_logs = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    set_global_default(subscriber_logs).expect("no other global subscriber in this test binary");
+
     let tb = TestBroker::start().await;
     let broker = tb.broker().await;
     broker
         .topology()
-        .declare::<CacheInvalidations>()
+        .declare::<HeadRefreshTopic>()
         .await
         .expect("failed to declare broadcast topic");
 
     let recorder = Recorder::default();
     let mut subscriber = broker.broadcast_subscriber();
     subscriber
-        .subscribe::<CacheInvalidations, _>(
+        .subscribe::<HeadRefreshTopic, _>(
             recorder.clone(),
             ConsumerOptions::new().with_broadcast_start(BroadcastStart::Head),
         )
         .expect("failed to subscribe");
     tokio::time::sleep(ASSIGN_SETTLE).await;
 
-    let original_partitions = tb.partition_count("kafka-broadcast-invalidations");
     tb.publish_to_partition(
-        "kafka-broadcast-invalidations",
+        TOPIC,
         0,
         &Invalidate {
             key: "before-expansion".into(),
@@ -873,25 +954,67 @@ async fn connected_head_broadcast_reads_a_new_partition_from_its_head() {
     recorder.wait_for(1, Duration::from_secs(10)).await;
     assert_eq!(recorder.keys().await, vec!["before-expansion"]);
 
-    let added = original_partitions as i32;
-    tb.expand_topic("kafka-broadcast-invalidations", original_partitions + 1)
-        .await;
-    let seeds: Vec<Invalidate> = (0..3)
-        .map(|i| Invalidate {
-            key: format!("seeded-{i}"),
-        })
-        .collect();
-    let records: Vec<(Option<i64>, &Invalidate)> = seeds.iter().map(|m| (None, m)).collect();
-    tb.publish_batch_to_partition("kafka-broadcast-invalidations", added, &records)
-        .await;
-    recorder
-        .wait_for(1 + seeds.len(), Duration::from_secs(30))
-        .await;
+    // The subscriber logs this line once per refresh that added partitions.
+    let extended = [
+        "broadcast subscription extended its partition assignment",
+        TOPIC,
+    ];
+    let mut conclusive = None;
+    for attempt in 0..3 {
+        let partitions = tb.partition_count(TOPIC);
+        let added = partitions as i32;
+        let refreshes_before = logs.instants_with(&extended).len();
+        tb.expand_topic(TOPIC, partitions + 1).await;
+        let seeds: Vec<Invalidate> = (0..3)
+            .map(|i| Invalidate {
+                key: format!("seeded-{attempt}-{i}"),
+            })
+            .collect();
+        let records: Vec<(Option<i64>, &Invalidate)> = seeds.iter().map(|m| (None, m)).collect();
+        tb.publish_batch_to_partition(TOPIC, added, &records).await;
+        let seeded_at = Instant::now();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let extended_at = loop {
+            if let Some(at) = logs.instants_with(&extended).get(refreshes_before) {
+                break *at;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the subscriber never extended its assignment to partition {added}; captured \
+                 output:\n{}",
+                logs.contents()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        if extended_at < seeded_at {
+            // Assigned while still empty: these seeds arrive under any start,
+            // so they prove nothing and are not asserted.
+            eprintln!(
+                "attempt {attempt}: the refresh assigned partition {added} before the seeds \
+                 landed; expanding again"
+            );
+            continue;
+        }
+        conclusive = Some((added, seeds));
+        break;
+    }
+    let (added, seeds) = conclusive
+        .expect("three refreshes in a row assigned the new partition before its seeds landed");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let seen = recorder.keys().await;
+        if seeds.iter().all(|m| seen.contains(&m.key)) || Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Deliver-new continues on both partitions once the assignment covers
     // the new one, and the existing partition keeps its position.
     tb.publish_to_partition(
-        "kafka-broadcast-invalidations",
+        TOPIC,
         added,
         &Invalidate {
             key: "after-refresh".into(),
@@ -899,16 +1022,22 @@ async fn connected_head_broadcast_reads_a_new_partition_from_its_head() {
     )
     .await;
     tb.publish_to_partition(
-        "kafka-broadcast-invalidations",
+        TOPIC,
         0,
         &Invalidate {
             key: "steady".into(),
         },
     )
     .await;
-    recorder
-        .wait_for(1 + seeds.len() + 2, Duration::from_secs(30))
-        .await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let seen = recorder.keys().await;
+        let both = seen.iter().any(|k| k == "after-refresh") && seen.iter().any(|k| k == "steady");
+        if both || Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     let seen = recorder.keys().await;
     let count = |key: &str| seen.iter().filter(|k| k.as_str() == key).count();
