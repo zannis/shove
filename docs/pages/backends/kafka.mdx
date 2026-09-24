@@ -152,11 +152,13 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
   Under `None`, a group with no usable committed offset ends its consumer with a `ShoveError::Topology` naming librdkafka's `AutoOffsetReset` answer.
   A reconnect would only meet the same answer.
   Commit a starting position first, with `reset_consumer_group_offsets` (below), or pick another policy.
+  The DLQ drain (`run_dlq_with_options`) refuses the setting: a drain always starts a fresh group at the earliest retained offset, so it never skips a dead letter.
 - **`with_commit_interval(Duration)`** - how often each consumer commits the offsets its handlers completed.
   The default is `500ms`.
   The interval must be positive and at most one hour; the setter panics otherwise, so an unrepresentable commit deadline is refused at configuration time and never met in the receive loop.
   A longer interval sends fewer OffsetCommit requests and widens the replay window after a crash or rebalance by the same amount.
   Standard groups only: a FIFO consumer commits each message as it settles, so `register_fifo` refuses a config that sets an interval.
+  The DLQ drain commits each dead letter as it settles and refuses the setting on `ConsumerOptions::<Kafka>` for the same reason.
   See [Offset commit semantics](#offset-commit-semantics).
   The same setting is available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths.
 

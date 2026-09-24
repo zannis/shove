@@ -460,6 +460,8 @@ The refusal policy is the FIFO consumer's, applied to every knob an entry point 
 The Kafka broadcast subscription refuses `with_commit_interval` and `with_auto_offset_reset` in `check_options`, because it commits nothing and assigns every partition at an explicit offset.
 Every competing-consumer entry point refuses a set `broadcast_start` through `ConsumerOptionsInner::refuse_broadcast_start`.
 `ConsumerSupervisor::register` and `register_fifo` do so generically, and each backend's direct, FIFO and DLQ paths do so themselves.
+The Kafka DLQ drain also refuses `with_commit_interval` and `with_auto_offset_reset`.
+It commits each dead letter as it settles and always starts a fresh group at the earliest retained offset, so neither knob changes anything.
 A caller therefore meets the same `Topology` error whichever way it starts a consumer.
 
 Kafka backend:

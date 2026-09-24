@@ -4882,6 +4882,36 @@ impl KafkaConsumer {
         drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
     }
 
+    /// What the DLQ drain refuses, after the DLQ check and before it
+    /// subscribes: the two group knobs its loop never reads.
+    ///
+    /// The drain starts every fresh group at the earliest retained offset,
+    /// so a tail-only join can never skip a dead letter the operator opted
+    /// in to keep, and it commits each dead letter as it settles, so there
+    /// is no interval to set. Neither `with_auto_offset_reset` nor
+    /// `with_commit_interval` would change anything, and a setting that
+    /// changes nothing is refused rather than dropped: the FIFO consumer's
+    /// policy, applied on every path. The message names the entry point,
+    /// as `refuse_broadcast_start` does.
+    fn check_dlq_options(queue: &str, dlq: &str, options: &ConsumerOptions) -> Result<()> {
+        if options.kafka_commit_interval.is_some() {
+            return Err(ShoveError::Topology(format!(
+                "topic '{queue}': `with_commit_interval` does not apply to the dead-letter \
+                 drain of '{dlq}', which commits each dead letter as it settles; \
+                 `KafkaConsumer::run_dlq` never reads it. Drop `with_commit_interval(..)`."
+            )));
+        }
+        if options.kafka_auto_offset_reset.is_some() {
+            return Err(ShoveError::Topology(format!(
+                "topic '{queue}': `with_auto_offset_reset` does not apply to the dead-letter \
+                 drain of '{dlq}', which always starts a fresh group at the earliest retained \
+                 offset so it never skips a dead letter; `KafkaConsumer::run_dlq` never reads \
+                 it. Drop `with_auto_offset_reset(..)`."
+            )));
+        }
+        Ok(())
+    }
+
     /// The Kafka half of `BroadcastImpl::check_options`: what a broadcast
     /// subscription refuses at `subscribe()`, before its loop is spawned.
     ///
@@ -5397,6 +5427,7 @@ impl KafkaConsumer {
             ShoveError::Topology("run_dlq requires a DLQ to be configured".into())
         })?;
         options.refuse_broadcast_start(topology.queue(), "KafkaConsumer::run_dlq")?;
+        Self::check_dlq_options(topology.queue(), dlq, &options)?;
 
         // Honor the `group.id` override (set via
         // `ConsumerOptions::<Kafka>::with_group_id`) by rebasing the DLQ group
@@ -7067,6 +7098,75 @@ mod broadcast_option_guard_tests {
             "{msg}"
         );
         assert!(msg.contains("KafkaConsumer::run_dlq"), "{msg}");
+    }
+
+    /// The DLQ drain commits each dead letter as it settles, so a commit
+    /// interval would be read by nothing: refused, the FIFO policy. The
+    /// client's token is cancelled first so a regression fails fast instead
+    /// of reconnecting forever, because the drain's loop passes no attempt
+    /// cap to `run_with_reconnect`.
+    #[tokio::test]
+    async fn run_dlq_rejects_commit_interval() {
+        let consumer = consumer().await;
+        consumer.client.shutdown_token().cancel();
+        let err = consumer
+            .run_dlq_with_options::<WithDlq, _>(
+                NoopHandler,
+                (),
+                crate::ConsumerOptions::<Kafka>::new()
+                    .with_commit_interval(Duration::from_secs(5))
+                    .with_shutdown(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a commit interval must be refused on the DLQ drain");
+        let msg = topology_message(err);
+        assert!(msg.contains("broadcast-option-guard-dlq"), "{msg}");
+        assert!(msg.contains("with_commit_interval"), "{msg}");
+        assert!(msg.contains("KafkaConsumer::run_dlq"), "{msg}");
+    }
+
+    /// The DLQ drain always starts at the earliest retained offset, so a fresh
+    /// drain never skips a dead letter: `with_auto_offset_reset` is refused
+    /// rather than silently overridden.
+    #[tokio::test]
+    async fn run_dlq_rejects_auto_offset_reset() {
+        let consumer = consumer().await;
+        consumer.client.shutdown_token().cancel();
+        let err = consumer
+            .run_dlq_with_options::<WithDlq, _>(
+                NoopHandler,
+                (),
+                crate::ConsumerOptions::<Kafka>::new()
+                    .with_auto_offset_reset(KafkaAutoOffsetReset::Latest)
+                    .with_shutdown(CancellationToken::new()),
+            )
+            .await
+            .expect_err("auto.offset.reset must be refused on the DLQ drain");
+        let msg = topology_message(err);
+        assert!(msg.contains("broadcast-option-guard-dlq"), "{msg}");
+        assert!(msg.contains("with_auto_offset_reset"), "{msg}");
+        assert!(msg.contains("KafkaConsumer::run_dlq"), "{msg}");
+    }
+
+    /// Negative control: the options the drain does read pass its guards,
+    /// so the refusals above are conditional on the knob and not on the
+    /// entry point. With the client's token already cancelled the drain
+    /// returns from its first `select!`, before the missing broker matters.
+    #[tokio::test]
+    async fn run_dlq_admits_the_options_it_reads() {
+        let consumer = consumer().await;
+        consumer.client.shutdown_token().cancel();
+        consumer
+            .run_dlq_with_options::<WithDlq, _>(
+                NoopHandler,
+                (),
+                crate::ConsumerOptions::<Kafka>::new()
+                    .with_group_id("settlement-audit")
+                    .with_max_message_size(64 * 1024)
+                    .with_shutdown(CancellationToken::new()),
+            )
+            .await
+            .expect("the drain reads the group id and the size cap, so both pass its guards");
     }
 
     /// A broadcast subscription commits nothing, so a commit interval would
