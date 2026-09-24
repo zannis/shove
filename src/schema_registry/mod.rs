@@ -57,5 +57,5 @@ pub use error::SchemaRegistryError;
 pub use gate::SchemaEnforcement;
 pub(crate) use gate::default_subject;
 pub use schema::{CachedSchema, SchemaType};
-pub(crate) use wire::build_frame;
 pub use wire::{FrameResult, SchemaId, WireFormat};
+pub(crate) use wire::{build_frame, validate_message_index};

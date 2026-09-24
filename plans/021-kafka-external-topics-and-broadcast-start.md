@@ -708,6 +708,8 @@ pub fn require_schema_message_index(mut self, index: impl Into<Vec<i32>>) -> Sel
 
 `ConsumerOptionsInner` and `BatchConsumerOptionsInner` gain the field, and every literal sets it.
 `spawn_one` copies it like the other registry settings (`consumer_group.rs:784-807`).
+All three setters run one shared check, `validate_message_index` in `wire.rs`, and panic on an empty or negative requirement.
+The parser never yields such an index, so the requirement could never match, and the mistake is refused at configuration time.
 
 Decode stage:
 

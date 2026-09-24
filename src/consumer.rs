@@ -21,7 +21,7 @@ use crate::markers::RabbitMq;
 use crate::markers::Sqs;
 use crate::outcome::Outcome;
 #[cfg(feature = "kafka-schema-registry")]
-use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
+use crate::schema_registry::{SchemaEnforcement, SchemaRegistry, validate_message_index};
 
 /// Default maximum message payload size: 10 MiB.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
@@ -867,8 +867,18 @@ impl ConsumerOptions<Kafka> {
     /// index is routed to the DLQ with reason `schema_message_index_rejected`
     /// before its schema id is resolved. JSON frames carry no index and are
     /// not judged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is empty or holds a negative element, the same check
+    /// `KafkaConsumerGroupConfig` and `BatchConsumerOptions::<Kafka>` apply:
+    /// the wire parser never yields such an index, so the requirement could
+    /// never match and every protobuf frame would be dead-lettered with
+    /// nothing at startup pointing at the cause.
     pub fn require_schema_message_index(mut self, index: impl Into<Vec<i32>>) -> Self {
-        self.schema_message_index = Some(index.into());
+        let index = index.into();
+        validate_message_index(&index);
+        self.schema_message_index = Some(index);
         self
     }
 }
@@ -1469,6 +1479,36 @@ mod tests {
                     .schema_message_index
                     .is_none()
             );
+        }
+
+        /// The two shapes the wire parser yields, the single-byte shorthand
+        /// and a nested path, are accepted: the validator refuses only what
+        /// can never match.
+        #[test]
+        fn require_schema_message_index_accepts_the_shorthand_and_a_nested_path() {
+            let shorthand = ConsumerOptions::<Kafka>::new()
+                .require_schema_message_index([0])
+                .into_inner();
+            assert_eq!(shorthand.schema_message_index, Some(vec![0]));
+            let nested = ConsumerOptions::<Kafka>::new()
+                .require_schema_message_index([1, 0, 3])
+                .into_inner();
+            assert_eq!(nested.schema_message_index, Some(vec![1, 0, 3]));
+        }
+
+        /// `read_message_indexes` never yields an empty array, so an empty
+        /// requirement would send every protobuf frame to the DLQ with
+        /// nothing at startup pointing at the cause: refused at the setter.
+        #[test]
+        #[should_panic(expected = "schema_message_index must not be empty")]
+        fn require_schema_message_index_rejects_an_empty_path() {
+            let _ = ConsumerOptions::<Kafka>::new().require_schema_message_index(Vec::<i32>::new());
+        }
+
+        #[test]
+        #[should_panic(expected = "schema_message_index must not contain a negative index")]
+        fn require_schema_message_index_rejects_a_negative_index() {
+            let _ = ConsumerOptions::<Kafka>::new().require_schema_message_index([0, -1]);
         }
 
         #[test]

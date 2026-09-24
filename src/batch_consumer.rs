@@ -35,7 +35,7 @@ use crate::backends::kafka::KafkaAutoOffsetReset;
 #[cfg(feature = "kafka")]
 use crate::markers::Kafka;
 #[cfg(feature = "kafka-schema-registry")]
-use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
+use crate::schema_registry::{SchemaEnforcement, SchemaRegistry, validate_message_index};
 
 /// Options for [`BatchConsumer::run`], parameterised by backend marker `B`.
 ///
@@ -309,8 +309,18 @@ impl BatchConsumerOptions<Kafka> {
     /// index is routed to the DLQ with reason `schema_message_index_rejected`
     /// before its schema id is resolved. JSON frames carry no index and are
     /// not judged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is empty or holds a negative element, the same check
+    /// `ConsumerOptions::<Kafka>` and `KafkaConsumerGroupConfig` apply: the
+    /// wire parser never yields such an index, so the requirement could never
+    /// match and every protobuf frame would be dead-lettered with nothing at
+    /// startup pointing at the cause.
     pub fn require_schema_message_index(mut self, index: impl Into<Vec<i32>>) -> Self {
-        self.schema_message_index = Some(index.into());
+        let index = index.into();
+        validate_message_index(&index);
+        self.schema_message_index = Some(index);
         self
     }
 }
@@ -387,5 +397,33 @@ mod tests {
                 .schema_message_index
                 .is_none()
         );
+    }
+
+    /// The batch options apply the same check as the other two homes of the
+    /// setter, so a requirement that can never match fails at configuration
+    /// time on every path.
+    #[test]
+    fn require_schema_message_index_accepts_the_shorthand_and_a_nested_path() {
+        let shorthand = BatchConsumerOptions::<Kafka>::new()
+            .require_schema_message_index([0])
+            .into_inner();
+        assert_eq!(shorthand.schema_message_index, Some(vec![0]));
+        let nested = BatchConsumerOptions::<Kafka>::new()
+            .require_schema_message_index([1, 0, 3])
+            .into_inner();
+        assert_eq!(nested.schema_message_index, Some(vec![1, 0, 3]));
+    }
+
+    #[test]
+    #[should_panic(expected = "schema_message_index must not be empty")]
+    fn require_schema_message_index_rejects_an_empty_path() {
+        let _ =
+            BatchConsumerOptions::<Kafka>::new().require_schema_message_index(Vec::<i32>::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "schema_message_index must not contain a negative index")]
+    fn require_schema_message_index_rejects_a_negative_index() {
+        let _ = BatchConsumerOptions::<Kafka>::new().require_schema_message_index([2, -1]);
     }
 }

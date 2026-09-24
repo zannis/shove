@@ -471,6 +471,7 @@ A frame with any other index is routed to the DLQ with death reason `schema_mess
 The check runs before the schema id is resolved, so a rejected frame costs no registry round trip.
 JSON frames carry no index and the setting is inert on them.
 The setter lives on `ConsumerOptions::<Kafka>`, `BatchConsumerOptions::<Kafka>` and `KafkaConsumerGroupConfig`, next to `accept_schema_subjects`.
+All three panic on an empty or a negative requirement: the parser never yields one, so it could never match, and every protobuf frame would be dead-lettered with nothing at startup pointing at the cause.
 
 ### Producer-side encoding
 

@@ -186,6 +186,28 @@ fn read_message_indexes(bytes: &[u8]) -> Option<(Vec<i32>, &[u8])> {
     Some((indexes, &bytes[off..]))
 }
 
+/// The one check every `require_schema_message_index` setter applies, on
+/// `ConsumerOptions::<Kafka>`, `KafkaConsumerGroupConfig` and
+/// `BatchConsumerOptions::<Kafka>`, at the same fail-fast point as
+/// `validate_commit_interval`.
+///
+/// [`read_message_indexes`] only ever yields a non-empty array of
+/// non-negative indexes, so an empty or negative requirement can never equal
+/// a parsed index: every protobuf frame would go to the DLQ as
+/// `schema_message_index_rejected`, and nothing at startup would point at
+/// the cause. Refused at configuration time instead.
+pub(crate) fn validate_message_index(index: &[i32]) {
+    assert!(
+        !index.is_empty(),
+        "schema_message_index must not be empty: a Confluent protobuf frame always carries at \
+         least one index"
+    );
+    assert!(
+        index.iter().all(|i| *i >= 0),
+        "schema_message_index must not contain a negative index, got {index:?}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +481,41 @@ mod tests {
             parse_frame(WireFormat::Protobuf, &frame),
             FrameResult::Unframed(_)
         ));
+    }
+
+    /// The validator admits exactly the shapes the parser yields: the
+    /// shorthand, an explicit array and a nested path.
+    #[test]
+    fn validate_message_index_accepts_what_the_parser_yields() {
+        for index in [vec![0], vec![1], vec![0, 2], vec![2, 1, 3]] {
+            let frame = build_frame(
+                WireFormat::Protobuf,
+                SchemaId(7),
+                &index.iter().map(|i| *i as u32).collect::<Vec<_>>(),
+                &[0xAA],
+            );
+            let FrameResult::Framed { message_index, .. } =
+                parse_frame(WireFormat::Protobuf, &frame)
+            else {
+                panic!("frame must parse");
+            };
+            let parsed = message_index.expect("protobuf frames carry an index");
+            validate_message_index(&parsed);
+            assert_eq!(parsed, index);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "schema_message_index must not be empty")]
+    fn validate_message_index_rejects_an_empty_requirement() {
+        validate_message_index(&[]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "schema_message_index must not contain a negative index, got [0, -1]"
+    )]
+    fn validate_message_index_rejects_a_negative_requirement() {
+        validate_message_index(&[0, -1]);
     }
 }

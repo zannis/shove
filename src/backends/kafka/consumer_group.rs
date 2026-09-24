@@ -22,7 +22,7 @@ use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
 #[cfg(feature = "kafka-schema-registry")]
-use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
+use crate::schema_registry::{SchemaEnforcement, SchemaRegistry, validate_message_index};
 use crate::supervision::RespawnSupervisor;
 use crate::topic::{SequencedTopic, Topic};
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
@@ -392,9 +392,19 @@ impl KafkaConsumerGroupConfig {
     /// index is routed to the DLQ with reason `schema_message_index_rejected`
     /// before its schema id is resolved. JSON frames carry no index and are
     /// not judged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is empty or holds a negative element, the same check
+    /// `ConsumerOptions::<Kafka>` and `BatchConsumerOptions::<Kafka>` apply:
+    /// the wire parser never yields such an index, so the requirement could
+    /// never match and every protobuf frame would be dead-lettered with
+    /// nothing at startup pointing at the cause.
     #[cfg(feature = "kafka-schema-registry")]
     pub fn require_schema_message_index(mut self, index: impl Into<Vec<i32>>) -> Self {
-        self.schema_message_index = Some(index.into());
+        let index = index.into();
+        validate_message_index(&index);
+        self.schema_message_index = Some(index);
         self
     }
 
@@ -1926,6 +1936,30 @@ mod tests {
                     .schema_message_index
                     .is_none()
             );
+        }
+
+        /// The group config applies the same check as `ConsumerOptions`, so
+        /// the registry path fails as fast as the direct one.
+        #[test]
+        fn require_schema_message_index_accepts_the_shorthand_and_a_nested_path() {
+            let shorthand = KafkaConsumerGroupConfig::new(1..=1).require_schema_message_index([0]);
+            assert_eq!(shorthand.schema_message_index, Some(vec![0]));
+            let nested =
+                KafkaConsumerGroupConfig::new(1..=1).require_schema_message_index([1, 0, 3]);
+            assert_eq!(nested.schema_message_index, Some(vec![1, 0, 3]));
+        }
+
+        #[test]
+        #[should_panic(expected = "schema_message_index must not be empty")]
+        fn require_schema_message_index_rejects_an_empty_path() {
+            let _ = KafkaConsumerGroupConfig::new(1..=1)
+                .require_schema_message_index(Vec::<i32>::new());
+        }
+
+        #[test]
+        #[should_panic(expected = "schema_message_index must not contain a negative index")]
+        fn require_schema_message_index_rejects_a_negative_index() {
+            let _ = KafkaConsumerGroupConfig::new(1..=1).require_schema_message_index([-1]);
         }
     }
 
