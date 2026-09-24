@@ -21,7 +21,8 @@ cargo add shove --features kafka
 For TLS and SASL (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512).
 librdkafka implements PLAIN in every build.
 SCRAM and OAUTHBEARER come from its OpenSSL build, which is why shove keeps the whole `KafkaSasl` type behind this feature.
-OAUTHBEARER is compiled in, but shove exposes it only as `KafkaSasl::MskIam` under `kafka-msk-iam` (below); there is no generic token provider.
+OAUTHBEARER is compiled in, but shove exposes it only as `KafkaSasl::MskIam` under `kafka-msk-iam` (below).
+There is no generic token provider.
 For TLS, PLAIN and SCRAM:
 
 ```sh
@@ -576,7 +577,8 @@ The Kafka backend emits `shove_messages_failed_total` with the following `reason
 - **SASL and TLS** require the `kafka-ssl` feature.
   PLAIN, SCRAM-SHA-256 and SCRAM-SHA-512 are supported out of the box.
   librdkafka implements PLAIN itself in every build, and SCRAM and OAUTHBEARER in its OpenSSL build, which `kafka-ssl` selects.
-  Shove exposes OAUTHBEARER only as `KafkaSasl::MskIam` under `kafka-msk-iam`; there is no generic token provider.
+  Shove exposes OAUTHBEARER only as `KafkaSasl::MskIam` under `kafka-msk-iam`.
+  There is no generic token provider.
   GSSAPI/Kerberos needs Cyrus SASL, which the separate `kafka-gssapi` feature links for direct `rdkafka` use.
   `KafkaSasl` exposes no GSSAPI variant, so that feature gates no shove code and shove itself cannot authenticate with Kerberos.
   For AWS MSK IAM, use the `kafka-msk-iam` feature instead.

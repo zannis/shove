@@ -34,7 +34,8 @@ Broadcast is deliberately lossy. Each constraint below exists because the altern
 A subscriber may opt into the head of the retained log or a point in time with `ConsumerOptions::with_broadcast_start`, which takes the backend-neutral `BroadcastStart { Tail, Head, Timestamp(ms) }`.
 Kafka honours all three starts on this version.
 Every other backend starts at the tail only, and refuses `Head` and `Timestamp` at `subscribe()` with a `ShoveError::Topology` instead of subscribing at the tail silently.
-The rule runs both ways: `ConsumerSupervisor` and the direct `run` methods refuse an options value that sets a start, because a competing consumer starts at its committed position and never reads it.
+The rule runs both ways: `ConsumerSupervisor` and the direct `run` methods refuse an options value that sets a start.
+A competing consumer starts at its committed position and never reads a start.
 A `ConsumerGroup` takes a group config that cannot express a start at all.
 Deliver-new stays the default everywhere.
 
