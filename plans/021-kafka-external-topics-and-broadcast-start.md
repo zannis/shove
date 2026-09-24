@@ -341,6 +341,7 @@ Any nonzero interval up to one hour is accepted, above or below 500 ms.
 `MAX_COMMIT_INTERVAL` in `constants.rs` is the upper bound.
 The gate adds the interval to an `Instant`, and the fence threshold grows with four intervals.
 Both setters panic past an hour, at configuration time and never in the receive loop.
+`run_with_inner` checks the interval again before it builds the gate, because `kafka_commit_interval` is a public field a caller can write past the setter.
 `ConsumerOptionsInner` gains `kafka_commit_interval`, and every literal of it sets the field: `src/consumer.rs:537`, `src/backend/options_inner.rs:84`, `src/backend/mod.rs:205`.
 `spawn_one` copies the group value into the options like `auto_offset_reset` at `consumer_group.rs:801`.
 The receive loop builds the gate from `options.kafka_commit_interval.unwrap_or(ASYNC_COMMIT_INTERVAL)` at `consumer.rs:3028`.

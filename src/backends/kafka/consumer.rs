@@ -72,7 +72,7 @@ use super::constants::{
     MAX_POLL_INTERVAL_MS, MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER, ORIGINAL_QUEUE_HEADER,
     RETRY_COUNT_HEADER, SESSION_TIMEOUT_MS, SHUTDOWN_COMMIT_DEADLINE,
 };
-use super::consumer_group::KafkaAutoOffsetReset;
+use super::consumer_group::{KafkaAutoOffsetReset, validate_commit_interval};
 use super::offset_reset::target_from_timestamp_lookup;
 
 // ---------------------------------------------------------------------------
@@ -167,9 +167,10 @@ impl AsyncCommitGate {
     /// to a bounded wake instead.
     ///
     /// Checked: a sum `Instant` cannot represent is treated as due now. The
-    /// setters bound the interval to `MAX_COMMIT_INTERVAL`, so this is a
-    /// second line, not the first; the gate must not be the place a bad
-    /// interval first panics.
+    /// setters bound the interval to `MAX_COMMIT_INTERVAL`, and `run_with_inner`
+    /// checks the field again before it builds the gate, so this is a second
+    /// line, not the first; the gate must not be the place a bad interval
+    /// first panics.
     fn deadline(&self, now: Instant) -> Instant {
         let anchor = self.last.unwrap_or(now);
         anchor.checked_add(self.interval).unwrap_or(now)
@@ -3306,7 +3307,16 @@ impl KafkaConsumer {
             .kafka_auto_offset_reset
             .unwrap_or(KafkaAutoOffsetReset::Earliest);
         // The commit gate's window, and the fence threshold that has to grow
-        // with it - see `fence_threshold`.
+        // with it - see `fence_threshold`. Checked again here although both
+        // setters already check it: `ConsumerOptions::kafka_commit_interval`
+        // is a public field, and a value written past the setter would reach
+        // the gate, where a deadline the `Instant` cannot represent reads as
+        // due now while `due()` still says no, so the wake arm would fire on
+        // every pass with commit work pending. This is the one place the
+        // receive loop reads the field, so it is the one place to refuse it.
+        if let Some(interval) = options.kafka_commit_interval {
+            validate_commit_interval(interval);
+        }
         let commit_interval = options
             .kafka_commit_interval
             .unwrap_or(ASYNC_COMMIT_INTERVAL);
@@ -7220,6 +7230,78 @@ mod broadcast_option_guard_tests {
             KafkaConsumer::check_broadcast_options("cache-invalidations", &inner)
                 .expect("the start and the inert group id are read by the broadcast loop");
         }
+    }
+}
+
+#[cfg(test)]
+mod commit_interval_funnel_tests {
+    use super::*;
+    use crate::topology::TopologyBuilder;
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct Entry;
+
+    struct Plain;
+    impl Topic for Plain {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("commit-interval-funnel").build())
+        }
+    }
+    impl NotSequenced for Plain {}
+
+    struct NoopHandler;
+    impl MessageHandler<Plain> for NoopHandler {
+        type Context = ();
+        async fn handle(&self, _: Entry, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    /// Runs the direct path with `interval` written to the public
+    /// `kafka_commit_interval` field, past the setter and its check. The
+    /// shutdown token is cancelled first: with the funnel's check in place
+    /// the run never gets that far, and without it the receive loop returns
+    /// from its first `select!` instead of reconnecting against the
+    /// unreachable broker on port 1.
+    async fn run_with_field_interval(interval: Duration) {
+        let client = KafkaClient::connect(&super::super::client::KafkaConfig::new("127.0.0.1:1"))
+            .await
+            .expect("client construction is lazy");
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let mut opts = crate::ConsumerOptions::<Kafka>::new().with_shutdown(shutdown);
+        opts.kafka_commit_interval = Some(interval);
+        let _ = KafkaConsumer::new(client)
+            .run::<Plain, _>(NoopHandler, (), opts)
+            .await;
+    }
+
+    /// Zero would make the gate always due; the setter refuses it, and so
+    /// must the one place the receive loop reads the field.
+    #[tokio::test]
+    #[should_panic(expected = "commit_interval must be positive")]
+    async fn run_rejects_a_zero_interval_written_to_the_field() {
+        run_with_field_interval(Duration::ZERO).await;
+    }
+
+    /// `Duration::MAX` makes `deadline` overflow to `now` while `due` stays
+    /// false, so the wake arm would fire on every pass with commit work
+    /// pending: the hot spin the gate's own doc warns about. Refused before
+    /// the gate is built.
+    #[tokio::test]
+    #[should_panic(expected = "commit_interval must be at most")]
+    async fn run_rejects_an_unrepresentable_interval_written_to_the_field() {
+        run_with_field_interval(Duration::MAX).await;
+    }
+
+    /// Control: an interval the setter admits passes the funnel's check too,
+    /// so the funnel refuses exactly what the setter refuses.
+    #[tokio::test]
+    async fn run_admits_a_bounded_interval_written_to_the_field() {
+        run_with_field_interval(Duration::from_secs(5)).await;
     }
 }
 

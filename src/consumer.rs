@@ -290,7 +290,10 @@ pub struct ConsumerOptions<B: Backend> {
 
     /// Kafka-only: how often the concurrent consumer commits the offsets its
     /// handlers completed. `None` (the default) keeps the 500 ms gate. Set via
-    /// [`ConsumerOptions::<Kafka>::with_commit_interval`].
+    /// [`ConsumerOptions::<Kafka>::with_commit_interval`], which bounds it; a
+    /// value written to the field directly is checked against the same bound
+    /// where the consumer starts, and panics there if it is zero or longer
+    /// than one hour.
     #[cfg(feature = "kafka")]
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
     pub kafka_commit_interval: Option<Duration>,

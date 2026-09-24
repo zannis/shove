@@ -174,8 +174,9 @@ pub(super) const SHUTDOWN_COMMIT_DEADLINE: Duration = Duration::from_secs(20);
 /// intervals. An hour is already far past any sane commit cadence: the
 /// interval bounds the replay window after a crash, and a group that
 /// commits once an hour replays up to an hour of records on every restart.
-/// Refused at the setter, so the mistake is a panic at configuration time
-/// and never a fault in the receive loop.
+/// Refused at the setter, and again where the receive loop reads the field
+/// (`ConsumerOptions::kafka_commit_interval` is public), so the mistake is a
+/// panic before any consumer is created and never a fault in the loop.
 pub(super) const MAX_COMMIT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 // ---------------------------------------------------------------------------
