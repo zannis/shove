@@ -5669,11 +5669,15 @@ impl KafkaConsumer {
             #[cfg(feature = "kafka-schema-registry")]
             let schema_message_index = schema_message_index.clone();
             async move {
-                // DLQ consumers always drain from the earliest available
-                // offset — skipping dead messages on a tail-only join would
-                // silently lose audit data the operator explicitly opted in
-                // to. Keep the policy fixed regardless of the user's main
-                // consumer `auto_offset_reset` override.
+                // The drain hard-codes `earliest` for its group, and that
+                // group id is stable across restarts (`dlq_group_id` above).
+                // librdkafka consults the policy only for a group with no
+                // usable committed offset, so a fresh drain starts at the
+                // earliest retained offset and a tail-only join can never
+                // skip a dead letter the operator opted in to keep, while a
+                // restarted drain resumes from its commit. The main
+                // consumer's `auto_offset_reset` override never reaches
+                // here: `check_dlq_options` refuses it for the drain.
                 //
                 // The DLQ loop commits per message via commit_message and
                 // keeps no offset tracker, so rebalance events are irrelevant
