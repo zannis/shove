@@ -333,6 +333,9 @@ That threshold grows with the interval, because the streak can only clear on a d
 The commit position is derived from the offsets the broker actually delivered, never from a run of consecutive integers.
 A hole left by log compaction or by a transactional producer's control records does not hold the position back.
 Compacted and transactional topics therefore commit past such a hole as soon as every delivered record below it has completed.
+That holds for a hole between delivered records.
+A trailing control record is different: with nothing delivered after it, the committed position stays one below the high watermark.
+An idle transactional topic therefore reads a lag of 1 until the next record arrives, and nothing is redelivered.
 
 On shutdown the consumer first waits for its in-flight handlers to finish.
 That wait is bounded by the handler timeout and by any in-place delays.
