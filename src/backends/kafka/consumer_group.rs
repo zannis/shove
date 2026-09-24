@@ -91,16 +91,17 @@ pub enum KafkaAutoOffsetReset {
     /// `min_consumers` for the life of the process, with one counted error per
     /// member that started. With autoscaling enabled, the autoscaler tick tops
     /// the group back up through the respawn supervisor, and every replacement
-    /// meets the same answer. The supervisor waits at least 2, 4, 8 and 16
-    /// seconds between those rounds, then opens its circuit and spawns one
-    /// probe member per 300-second cooldown. The circuit never becomes
-    /// terminal, so a group under `None` with autoscaling on keeps probing
-    /// until an operator intervenes. Lag-driven scale-up is a second path
-    /// outside that circuit: a group with no committed offset reports its
-    /// retained backlog as lag, so while records remain on the topic the
-    /// autoscaler can add members through `scale_up` as well, and each dies
-    /// the same way. The 300-second cooldown therefore bounds the respawn
-    /// probes, not every member the group creates.
+    /// meets the same answer. The supervisor tops the group up in full on each
+    /// of its first five rounds, at least 2, 4, 8 and 16 seconds apart. The
+    /// fifth round opens the circuit and rests for 300 seconds; after that,
+    /// each round spawns one probe member per 300-second cooldown. The circuit
+    /// never becomes terminal, so a group under `None` with autoscaling on
+    /// keeps probing until an operator intervenes. Lag-driven scale-up is a
+    /// second path outside that circuit: a group with no committed offset
+    /// reports its retained backlog as lag, so while records remain on the
+    /// topic the autoscaler can add members through `scale_up`. The 300-second
+    /// cooldown therefore bounds the respawn probes, not every member the
+    /// group creates.
     ///
     /// Commit a starting position first, with `reset_consumer_group_offsets`,
     /// or pick another policy.

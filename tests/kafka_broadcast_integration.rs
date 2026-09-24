@@ -291,6 +291,44 @@ impl TestBroker {
             .await
             .expect("partition-targeted publish failed");
     }
+
+    /// Publish `records` to one partition through one producer, awaiting each
+    /// delivery report in turn, so the batch lands in offset order inside one
+    /// short window. A `Some` timestamp is written as the record's create
+    /// time; `None` leaves the producer's clock in charge.
+    async fn publish_batch_to_partition(
+        &self,
+        topic: &str,
+        partition: i32,
+        records: &[(Option<i64>, &Invalidate)],
+    ) {
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", self.brokers())
+            .create()
+            .expect("failed to create partition-targeted producer");
+        for (timestamp_ms, msg) in records {
+            let payload = serde_json::to_string(msg).expect("serialize partition-targeted message");
+            let mut record = FutureRecord::<str, str>::to(topic)
+                .partition(partition)
+                .payload(&payload);
+            if let Some(ts) = timestamp_ms {
+                record = record.timestamp(*ts);
+            }
+            producer
+                .send(record, Timeout::After(Duration::from_secs(10)))
+                .await
+                .expect("partition-targeted publish failed");
+        }
+    }
+}
+
+/// Milliseconds since the epoch, the unit of Kafka record timestamps and of
+/// `BroadcastStart::Timestamp`.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before the epoch")
+        .as_millis() as i64
 }
 
 /// Wait until a broadcast subscription has certainly assigned its partitions.
@@ -791,6 +829,259 @@ async fn broadcast_starts_at_a_timestamp() {
         .await;
     broker.close().await;
     publisher_broker.close().await;
+}
+
+/// Under `Head`, a partition added after the subscription is read from its
+/// head: records seeded on it before the subscriber's next assignment refresh
+/// are delivered, where the default `Tail`, which
+/// `connected_broadcast_discovers_new_partitions` pins, would skip them.
+///
+/// The refresh runs on a five-second tick, so the seeds land right after the
+/// expansion, through one producer, well inside that window. Should a tick
+/// fall before the seeds anyway, the new partition is assigned at its then
+/// empty head and the seeds still arrive: such a run passes without proving
+/// the property, and cannot fail for the wrong reason.
+#[tokio::test]
+async fn connected_head_broadcast_reads_a_new_partition_from_its_head() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker().await;
+    broker
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("failed to declare broadcast topic");
+
+    let recorder = Recorder::default();
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<CacheInvalidations, _>(
+            recorder.clone(),
+            ConsumerOptions::new().with_broadcast_start(BroadcastStart::Head),
+        )
+        .expect("failed to subscribe");
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    let original_partitions = tb.partition_count("kafka-broadcast-invalidations");
+    tb.publish_to_partition(
+        "kafka-broadcast-invalidations",
+        0,
+        &Invalidate {
+            key: "before-expansion".into(),
+        },
+    )
+    .await;
+    recorder.wait_for(1, Duration::from_secs(10)).await;
+    assert_eq!(recorder.keys().await, vec!["before-expansion"]);
+
+    let added = original_partitions as i32;
+    tb.expand_topic("kafka-broadcast-invalidations", original_partitions + 1)
+        .await;
+    let seeds: Vec<Invalidate> = (0..3)
+        .map(|i| Invalidate {
+            key: format!("seeded-{i}"),
+        })
+        .collect();
+    let records: Vec<(Option<i64>, &Invalidate)> = seeds.iter().map(|m| (None, m)).collect();
+    tb.publish_batch_to_partition("kafka-broadcast-invalidations", added, &records)
+        .await;
+    recorder
+        .wait_for(1 + seeds.len(), Duration::from_secs(30))
+        .await;
+
+    // Deliver-new continues on both partitions once the assignment covers
+    // the new one, and the existing partition keeps its position.
+    tb.publish_to_partition(
+        "kafka-broadcast-invalidations",
+        added,
+        &Invalidate {
+            key: "after-refresh".into(),
+        },
+    )
+    .await;
+    tb.publish_to_partition(
+        "kafka-broadcast-invalidations",
+        0,
+        &Invalidate {
+            key: "steady".into(),
+        },
+    )
+    .await;
+    recorder
+        .wait_for(1 + seeds.len() + 2, Duration::from_secs(30))
+        .await;
+
+    let seen = recorder.keys().await;
+    let count = |key: &str| seen.iter().filter(|k| k.as_str() == key).count();
+    for seed in &seeds {
+        assert_eq!(
+            count(&seed.key),
+            1,
+            "Head must read {} from the new partition's head exactly once; saw {seen:?}",
+            seed.key
+        );
+    }
+    assert_eq!(
+        count("after-refresh"),
+        1,
+        "deliver-new on the new partition: {seen:?}"
+    );
+    assert_eq!(
+        count("before-expansion"),
+        1,
+        "the existing partition was replayed: {seen:?}"
+    );
+    assert_eq!(
+        count("steady"),
+        1,
+        "the existing partition lost or replayed a record: {seen:?}"
+    );
+    let coordinates = recorder.coordinates().await;
+    let on_added = coordinates
+        .iter()
+        .filter(|(partition, _, _)| *partition == Some(added))
+        .count();
+    assert_eq!(
+        on_added,
+        seeds.len() + 1,
+        "the seeds and the later record must all come from partition {added}: {coordinates:?}"
+    );
+
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending(), Duration::from_secs(5))
+        .await;
+    assert!(
+        outcome.is_clean(),
+        "subscriber failed to drain: {outcome:?}"
+    );
+    broker.close().await;
+}
+
+/// Under `Timestamp`, a partition added after the subscription is read from
+/// the first record at or after the instant, resolved through
+/// `offsets_for_times` as the initial assignment is: records seeded on it with
+/// an older create time are skipped, and records at or after the instant are
+/// delivered, both seeded before the subscriber's next assignment refresh.
+///
+/// The refresh runs on a five-second tick. Should a tick fall before the
+/// seeds, the then empty partition resolves to its high watermark and the
+/// stale seeds are delivered too. That attempt is inconclusive rather than a
+/// failure, and the test expands the topic once more. A refresh that ignored
+/// the instant would deliver the stale seeds on every attempt, and one that
+/// joined at the tail would deliver nothing, so either fails.
+#[tokio::test]
+async fn connected_timestamp_broadcast_reads_a_new_partition_from_the_instant() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker().await;
+    broker
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("failed to declare broadcast topic");
+
+    let cut = now_ms();
+    let recorder = Recorder::default();
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<CacheInvalidations, _>(
+            recorder.clone(),
+            ConsumerOptions::new().with_broadcast_start(BroadcastStart::Timestamp(cut)),
+        )
+        .expect("failed to subscribe");
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    tb.publish_to_partition(
+        "kafka-broadcast-invalidations",
+        0,
+        &Invalidate {
+            key: "before-expansion".into(),
+        },
+    )
+    .await;
+    recorder.wait_for(1, Duration::from_secs(10)).await;
+    assert_eq!(recorder.keys().await, vec!["before-expansion"]);
+
+    let mut conclusive = false;
+    for attempt in 0..3 {
+        let partitions = tb.partition_count("kafka-broadcast-invalidations");
+        let added = partitions as i32;
+        tb.expand_topic("kafka-broadcast-invalidations", partitions + 1)
+            .await;
+        let stale: Vec<Invalidate> = (0..2)
+            .map(|i| Invalidate {
+                key: format!("stale-{attempt}-{i}"),
+            })
+            .collect();
+        let fresh: Vec<Invalidate> = (0..2)
+            .map(|i| Invalidate {
+                key: format!("fresh-{attempt}-{i}"),
+            })
+            .collect();
+        // Stale records carry a create time a minute before the instant, and
+        // land first, so the lookup by time resolves to the first fresh one.
+        let records: Vec<(Option<i64>, &Invalidate)> = stale
+            .iter()
+            .map(|m| (Some(cut - 60_000), m))
+            .chain(fresh.iter().map(|m| (Some(now_ms()), m)))
+            .collect();
+        tb.publish_batch_to_partition("kafka-broadcast-invalidations", added, &records)
+            .await;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let seen = recorder.keys().await;
+            if fresh.iter().all(|m| seen.contains(&m.key)) || Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // A stale delivery in flight must have a chance to land before the
+        // attempt is judged.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let seen = recorder.keys().await;
+        let count = |key: &str| seen.iter().filter(|k| k.as_str() == key).count();
+        for m in &fresh {
+            assert_eq!(
+                count(&m.key),
+                1,
+                "the record at or after the instant must arrive exactly once from partition \
+                 {added}; saw {seen:?}"
+            );
+        }
+        let stale_delivered = stale.iter().filter(|m| count(&m.key) > 0).count();
+        if stale_delivered == 0 {
+            conclusive = true;
+            break;
+        }
+        eprintln!(
+            "attempt {attempt}: the refresh assigned partition {added} before the seeds landed \
+             ({stale_delivered} stale record(s) delivered); expanding again"
+        );
+    }
+    let seen = recorder.keys().await;
+    assert!(
+        conclusive,
+        "every attempt delivered the stale seeds, so a new partition is not read from the \
+         configured instant: {seen:?}"
+    );
+    assert_eq!(
+        seen.iter()
+            .filter(|k| k.as_str() == "before-expansion")
+            .count(),
+        1,
+        "the existing partition was replayed: {seen:?}"
+    );
+
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending(), Duration::from_secs(5))
+        .await;
+    assert!(
+        outcome.is_clean(),
+        "subscriber failed to drain: {outcome:?}"
+    );
+    broker.close().await;
 }
 
 /// `with_group_id` names the inert `group.id` the groupless handle carries.
