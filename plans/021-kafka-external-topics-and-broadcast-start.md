@@ -360,6 +360,10 @@ The final commit moves onto a dedicated thread that owns the consumer:
   Dropping the consumer also blocks, because rdkafka polls the consumer close inside `Drop`.
 - In the shutdown branch at `:3107-3129`, after the permits are collected, move the `Arc<KafkaStreamConsumer>` into a `std::thread::Builder` thread named `shove-kafka-final-commit`.
   The thread runs the `Sync` commit, sends the result on a `oneshot`, and then drops the consumer, so the close also runs off the runtime.
+  The thread is spawned first, waiting on a channel, and receives the consumer and the offsets only once it exists.
+  A closure that owned the consumer would be dropped inside a failed `spawn`, on the runtime thread, which is the close this thread exists to keep off it.
+  When no thread can be spawned nothing commits, and the close moves to a second, close-only thread.
+  If that spawn fails too the handle is leaked and logged at error level, and the broker drops the member after the session timeout, as after a crash.
   The loop awaits the `oneshot` under `tokio::time::timeout(SHUTDOWN_COMMIT_DEADLINE)`.
 - `SHUTDOWN_COMMIT_DEADLINE` is a new 20 s constant in `constants.rs`, chosen against the 30 s termination grace Kubernetes gives a Pod by default.
 - On a result within the deadline, settle the pending discards as today.

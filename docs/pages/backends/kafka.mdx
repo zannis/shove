@@ -342,6 +342,9 @@ On shutdown the consumer first waits for its in-flight handlers to finish.
 That wait is bounded by the handler timeout and by any in-place delays.
 It then drains the republish queue and commits its final position **synchronously**.
 The commit runs on a dedicated thread that also owns the consumer's close.
+The thread is spawned before it is handed the consumer, so a failed spawn never closes the consumer on the runtime thread.
+If no thread can be spawned, nothing commits and the close moves to a second, close-only thread.
+If that thread cannot be spawned either, the handle is leaked and logged, and the broker drops the member after the session timeout, as after a crash.
 The consumer waits for that commit for at most 20 s (`SHUTDOWN_COMMIT_DEADLINE` in `kafka::constants`).
 The deadline is chosen against the 30 s termination grace Kubernetes gives a Pod.
 Past the deadline the consumer logs that the batch may be redelivered and returns.

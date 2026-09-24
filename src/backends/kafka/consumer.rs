@@ -2261,18 +2261,68 @@ pub(super) fn reject_fifo_commit_interval(queue: &str) -> ShoveError {
 ///
 /// `consumer` must be the last `Arc` of the handle: the thread drops it after
 /// the commit, which is where `rd_kafka_consumer_close` runs. `None` for
-/// `tpl` means there is nothing to commit and the thread only closes.
+/// `tpl` means there is nothing to commit and the thread only closes. The
+/// thread is spawned before it is handed the consumer, and a spawn failure
+/// disposes of the consumer off the runtime too; see
+/// [`final_commit_on_thread`] and [`close_off_runtime_or_leak`].
 async fn final_commit_off_runtime(
     consumer: Arc<KafkaStreamConsumer>,
     tpl: Option<TopicPartitionList>,
     queue: &str,
 ) -> KafkaResult<()> {
+    final_commit_on_thread(consumer, tpl, queue, &mut |name, body| {
+        std::thread::Builder::new()
+            .name(name)
+            .spawn(body)
+            .map(|_detached| ())
+    })
+    .await
+}
+
+/// What the final-commit thread does with what it owns: the synchronous
+/// commit, then the drop, which for a consumer is where
+/// `rd_kafka_consumer_close` runs. A trait over the concrete handle so the
+/// thread choreography is testable with a drop probe instead of a broker.
+trait FinalCommit: Send + 'static {
+    fn commit_sync(&self, tpl: &TopicPartitionList) -> KafkaResult<()>;
+}
+
+impl FinalCommit for Arc<KafkaStreamConsumer> {
+    fn commit_sync(&self, tpl: &TopicPartitionList) -> KafkaResult<()> {
+        self.commit(tpl, CommitMode::Sync)
+    }
+}
+
+/// `final_commit_off_runtime` over any [`FinalCommit`] and any thread
+/// spawner, which takes the thread's name and its body and answers as
+/// `std::thread::Builder::spawn` does.
+///
+/// The thread is spawned first and handed the consumer only once it exists.
+/// A closure that owned the consumer would be dropped inside a failed
+/// `spawn`, on this thread, and `rd_kafka_consumer_close` would run right
+/// here, which is the one thing this function exists to prevent. When no
+/// thread can be spawned nothing commits: the failure is reported the way a
+/// rejected commit is, so the caller settles its discards as survived, and
+/// the consumer goes to [`close_off_runtime_or_leak`], never to a drop on
+/// this thread.
+async fn final_commit_on_thread<C, S>(
+    consumer: C,
+    tpl: Option<TopicPartitionList>,
+    queue: &str,
+    spawn: &mut S,
+) -> KafkaResult<()>
+where
+    C: FinalCommit,
+    S: FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+{
     let (done_tx, done_rx) = oneshot::channel::<KafkaResult<()>>();
-    let spawned = std::thread::Builder::new()
-        .name(format!("shove-kafka-final-commit {queue}"))
-        .spawn(move || {
+    let handed = hand_to_new_thread(
+        spawn,
+        format!("shove-kafka-final-commit {queue}"),
+        (consumer, tpl),
+        move |(consumer, tpl)| {
             let result = match tpl {
-                Some(tpl) => consumer.commit(&tpl, CommitMode::Sync),
+                Some(tpl) => consumer.commit_sync(&tpl),
                 None => Ok(()),
             };
             // Nobody may be listening any more; that is the deadline case.
@@ -2280,13 +2330,16 @@ async fn final_commit_off_runtime(
             // The last `Arc`: `rd_kafka_consumer_close` runs here, off the
             // runtime, however long the broker takes to answer.
             drop(consumer);
-        });
-    if let Err(e) = spawned {
-        // No thread, so nothing can commit: report it the way a rejected
-        // commit is reported and let the caller settle its discards.
-        return Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail)).inspect_err(
-            |_| tracing::error!(queue, error = %e, "could not spawn the final commit thread"),
+        },
+    );
+    if let Err(((consumer, _tpl), e)) = handed {
+        tracing::error!(
+            queue,
+            error = %e,
+            "could not spawn the final commit thread; nothing commits, the batch may be redelivered"
         );
+        close_off_runtime_or_leak(consumer, queue, spawn);
+        return Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail));
     }
     match tokio::time::timeout(SHUTDOWN_COMMIT_DEADLINE, done_rx).await {
         Ok(Ok(result)) => result,
@@ -2304,6 +2357,85 @@ async fn final_commit_off_runtime(
             Err(KafkaError::ConsumerCommit(
                 RDKafkaErrorCode::RequestTimedOut,
             ))
+        }
+    }
+}
+
+/// Spawn a thread that waits for one `value`, then hand `value` to it.
+///
+/// The thread is created before anything is moved toward it, so a failed
+/// spawn leaves `value` with the caller, returned in the `Err`, rather than
+/// dropped inside `spawn` on the calling thread, which is what happens to
+/// the captures of a closure `Builder::spawn` could not start. `run`
+/// receives `value` on the new thread and drops it there.
+fn hand_to_new_thread<T, S>(
+    spawn: &mut S,
+    name: String,
+    value: T,
+    run: impl FnOnce(T) + Send + 'static,
+) -> std::result::Result<(), (T, std::io::Error)>
+where
+    T: Send + 'static,
+    S: FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+{
+    let (tx, rx) = std_mpsc::channel::<T>();
+    let body = move || {
+        // The sender is dropped without sending only when the caller never
+        // got to send; then there is nothing to own here.
+        if let Ok(value) = rx.recv() {
+            run(value);
+        }
+    };
+    if let Err(e) = spawn(name, Box::new(body)) {
+        return Err((value, e));
+    }
+    // The thread blocks on `recv` until this send, so the send fails only
+    // if the thread died first; even then `value` comes back to the caller
+    // rather than being dropped here.
+    tx.send(value).map_err(|std_mpsc::SendError(value)| {
+        (
+            value,
+            std::io::Error::other("the thread ended before it received its work"),
+        )
+    })
+}
+
+/// Where a consumer goes when its final-commit thread could not be spawned.
+///
+/// The close blocks for as long as librdkafka takes to leave the group, so
+/// it must not run on the runtime thread, which is the one thing
+/// `final_commit_off_runtime` exists to prevent. A second, close-only
+/// thread is tried first: a failed spawn is often a momentary `EAGAIN`. If
+/// that fails too the handle is leaked, deliberately, and logged at error
+/// level: the process has just failed to create two threads and is degraded
+/// already, the broker drops the member after the session timeout exactly
+/// as it does after a crash, which at-least-once delivery already covers,
+/// and the alternative is a runtime thread blocked for as long as a frozen
+/// coordinator keeps librdkafka retrying.
+fn close_off_runtime_or_leak<C, S>(consumer: C, queue: &str, spawn: &mut S)
+where
+    C: Send + 'static,
+    S: FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+{
+    match hand_to_new_thread(
+        spawn,
+        format!("shove-kafka-consumer-close {queue}"),
+        consumer,
+        drop,
+    ) {
+        Ok(()) => tracing::warn!(
+            queue,
+            "the consumer closes on a dedicated thread, without a final commit"
+        ),
+        Err((consumer, e)) => {
+            tracing::error!(
+                queue,
+                error = %e,
+                "no thread for the consumer's close either; leaking the handle rather than closing \
+                 it on the runtime thread. The broker drops the member after the session timeout, \
+                 as after a crash"
+            );
+            std::mem::forget(consumer);
         }
     }
 }
@@ -7230,6 +7362,151 @@ mod broadcast_option_guard_tests {
             KafkaConsumer::check_broadcast_options("cache-invalidations", &inner)
                 .expect("the start and the inert group id are read by the broadcast loop");
         }
+    }
+}
+
+#[cfg(test)]
+mod final_commit_thread_tests {
+    use super::*;
+    use std::thread::ThreadId;
+
+    type Spawner = Box<dyn FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>>;
+
+    /// Stands in for the consumer: commits succeed, and the drop reports
+    /// the thread it ran on, which for the real handle is where
+    /// `rd_kafka_consumer_close` would run.
+    struct DropProbe {
+        dropped_on: std_mpsc::Sender<(ThreadId, Option<String>)>,
+    }
+
+    impl FinalCommit for DropProbe {
+        fn commit_sync(&self, _: &TopicPartitionList) -> KafkaResult<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            let thread = std::thread::current();
+            let _ = self
+                .dropped_on
+                .send((thread.id(), thread.name().map(str::to_owned)));
+        }
+    }
+
+    fn probe() -> (DropProbe, std_mpsc::Receiver<(ThreadId, Option<String>)>) {
+        let (dropped_on, dropped) = std_mpsc::channel();
+        (DropProbe { dropped_on }, dropped)
+    }
+
+    /// `std::thread::Builder`, as production uses it.
+    fn real_spawner() -> Spawner {
+        Box::new(|name, body| {
+            std::thread::Builder::new()
+                .name(name)
+                .spawn(body)
+                .map(|_detached| ())
+        })
+    }
+
+    /// Fails its first `failures` spawns the way an exhausted host does,
+    /// then behaves. `Builder::spawn` drops the body it was given when it
+    /// fails, and so does this, which is the ownership the fix is about.
+    fn failing_spawner(failures: usize) -> Spawner {
+        let mut calls = 0usize;
+        Box::new(move |name, body| {
+            calls += 1;
+            if calls <= failures {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "Resource temporarily unavailable",
+                ));
+            }
+            std::thread::Builder::new()
+                .name(name)
+                .spawn(body)
+                .map(|_detached| ())
+        })
+    }
+
+    fn one_offset() -> TopicPartitionList {
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition_offset("orders", 0, Offset::Offset(7))
+            .expect("a literal partition offset");
+        tpl
+    }
+
+    fn dropped_on(
+        dropped: &std_mpsc::Receiver<(ThreadId, Option<String>)>,
+    ) -> (ThreadId, Option<String>) {
+        dropped
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the consumer is dropped, on some thread, within the deadline")
+    }
+
+    /// The shape step 4 promised: the commit and the close both run on the
+    /// dedicated thread, never on the runtime thread that awaits them.
+    #[tokio::test]
+    async fn the_final_commit_thread_commits_and_then_owns_the_close() {
+        let (probe, dropped) = probe();
+        let result =
+            final_commit_on_thread(probe, Some(one_offset()), "orders", &mut real_spawner()).await;
+        assert!(result.is_ok(), "{result:?}");
+        let (thread, name) = dropped_on(&dropped);
+        assert_ne!(
+            thread,
+            std::thread::current().id(),
+            "the close must not run on the runtime thread"
+        );
+        assert_eq!(name.as_deref(), Some("shove-kafka-final-commit orders"));
+    }
+
+    /// N1: when the thread cannot be spawned, nothing commits, and the
+    /// consumer still closes off the runtime, on a second, close-only
+    /// thread. Before the fix the closure owned the consumer, `spawn`
+    /// dropped it on failure, and the close ran right here.
+    #[tokio::test]
+    async fn a_failed_spawn_commits_nothing_and_closes_the_consumer_on_a_second_thread() {
+        let (probe, dropped) = probe();
+        let result =
+            final_commit_on_thread(probe, Some(one_offset()), "orders", &mut failing_spawner(1))
+                .await;
+        assert!(
+            matches!(
+                result,
+                Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail))
+            ),
+            "{result:?}"
+        );
+        let (thread, name) = dropped_on(&dropped);
+        assert_ne!(
+            thread,
+            std::thread::current().id(),
+            "a failed spawn must not drop the consumer on the runtime thread"
+        );
+        assert_eq!(name.as_deref(), Some("shove-kafka-consumer-close orders"));
+    }
+
+    /// N1, the last resort: with no thread to be had at all, the handle is
+    /// leaked rather than closed on the runtime thread. `forget` is
+    /// synchronous, so once the call has returned a drop that has not
+    /// happened never will.
+    #[tokio::test]
+    async fn with_no_thread_at_all_the_consumer_is_leaked_and_never_closed_here() {
+        let (probe, dropped) = probe();
+        let result =
+            final_commit_on_thread(probe, None, "orders", &mut failing_spawner(usize::MAX)).await;
+        assert!(
+            matches!(
+                result,
+                Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail))
+            ),
+            "{result:?}"
+        );
+        assert!(
+            dropped.try_recv().is_err(),
+            "the handle must be leaked, never closed on the runtime thread"
+        );
     }
 }
 
