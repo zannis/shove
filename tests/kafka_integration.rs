@@ -1367,28 +1367,6 @@ async fn topology_idempotent() {
     broker.close().await;
 }
 
-/// The broker's view of `topic`: `None` when it has no such topic, else the
-/// partition count. Read through a consumer-type client with no `group.id`
-/// and auto-creation disabled, so the probe itself can neither create the
-/// topic nor register a group.
-fn live_partition_count(brokers: &str, topic: &str) -> Option<usize> {
-    use rdkafka::consumer::{BaseConsumer, Consumer as _};
-
-    let probe: BaseConsumer = rdkafka::ClientConfig::new()
-        .set("bootstrap.servers", brokers)
-        .set("allow.auto.create.topics", "false")
-        .create()
-        .expect("failed to create metadata probe");
-    let metadata = probe
-        .fetch_metadata(Some(topic), Duration::from_secs(10))
-        .expect("failed to fetch topic metadata");
-    let candidate = metadata.topics().iter().find(|t| t.name() == topic)?;
-    if candidate.error().is_some() || candidate.partitions().is_empty() {
-        return None;
-    }
-    Some(candidate.partitions().len())
-}
-
 // ===========================================================================
 // Basic publish & consume
 // ===========================================================================
