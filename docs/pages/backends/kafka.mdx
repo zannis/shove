@@ -92,8 +92,8 @@ See [`examples/kafka/msk_iam.rs`](/backends/kafka/examples/msk_iam) for a runnab
 It does not create hold topics.
 Declaration is idempotent, so it is safe to call on every startup.
 
-Declare the topology before the first publish, or provision the topic outside shove.
-For the default missing-topic behavior and the auto-creation switch, see [`KafkaConfig::with_producer_auto_create_topics`](https://docs.rs/shove/latest/shove/kafka/struct.KafkaConfig.html#method.with_producer_auto_create_topics).
+Producer topic auto-creation defaults to off (`allow.auto.create.topics=false`), so declare the topology before the first publish or provision the topic outside shove.
+Set [`KafkaConfig::with_producer_auto_create_topics(true)`](https://docs.rs/shove/latest/shove/kafka/struct.KafkaConfig.html#method.with_producer_auto_create_topics) to allow creation on first publish when the broker enables `auto.create.topics.enable=true`.
 
 ## Publish
 

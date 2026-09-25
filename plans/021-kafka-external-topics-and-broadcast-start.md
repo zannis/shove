@@ -44,8 +44,8 @@
     Step 6 adds the external topology binding.
     Step 10 retries and defers in place instead of republishing into the topology, on Kafka and on an external NATS stream.
     Step 11 waits through a Schema Registry outage instead of discarding the record.
-  - A fourth pull request, from `feat/kafka-producer-no-auto-create`, changes the producer's topic-creation policy.
-    See [Kafka topic provisioning](../docs/pages/backends/kafka.mdx#declare-topology) for the default and switch.
+  - A fourth pull request, from `feat/kafka-producer-no-auto-create`, disables producer topic auto-creation by default (`allow.auto.create.topics=false`).
+    Operators can enable it with `KafkaConfig::with_producer_auto_create_topics(true)`; see [Kafka topic provisioning](../docs/pages/backends/kafka.mdx#declare-topology) for requirements.
     This breaking change belongs to the same minor release.
 
 ## Why this matters
