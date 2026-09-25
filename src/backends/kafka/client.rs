@@ -270,6 +270,9 @@ pub struct KafkaConfig {
     pub(crate) producer_compression: Option<KafkaCompression>,
     pub(crate) producer_linger_ms: Option<u32>,
     pub(crate) producer_batch_size: Option<u32>,
+    /// Producer `allow.auto.create.topics`. Default: `false`, so a publish
+    /// never creates the topic it targets.
+    pub(crate) producer_auto_create_topics: bool,
 }
 
 impl KafkaConfig {
@@ -285,6 +288,7 @@ impl KafkaConfig {
             producer_compression: None,
             producer_linger_ms: None,
             producer_batch_size: None,
+            producer_auto_create_topics: false,
         }
     }
 
@@ -321,6 +325,22 @@ impl KafkaConfig {
     /// 1 MB) is not exposed, so this knob can only lower the cap, not raise it.
     pub fn with_producer_batch_size(mut self, bytes: u32) -> Self {
         self.producer_batch_size = Some(bytes);
+        self
+    }
+
+    /// Producer `allow.auto.create.topics`. Default: `false`, so a publish to
+    /// a topic nobody declared fails once `message.timeout.ms` elapses and the
+    /// topic stays absent; a topic exists because `declare()` created it or
+    /// because infra owns it.
+    ///
+    /// `true` lets the producer ask the broker to create a missing topic on
+    /// the first publish, with broker defaults and outside any topology
+    /// config. The broker must also run `auto.create.topics.enable=true`;
+    /// on a broker that does not, the publish fails as with `false`. Nothing
+    /// else changes: `declare()` still creates the declared topology, and the
+    /// consumer keeps librdkafka's consumer default for this key, `false`.
+    pub fn with_producer_auto_create_topics(mut self, allow: bool) -> Self {
+        self.producer_auto_create_topics = allow;
         self
     }
 
@@ -397,6 +417,10 @@ impl fmt::Debug for KafkaConfig {
         d.field("producer_compression", &self.producer_compression);
         d.field("producer_linger_ms", &self.producer_linger_ms);
         d.field("producer_batch_size", &self.producer_batch_size);
+        d.field(
+            "producer_auto_create_topics",
+            &self.producer_auto_create_topics,
+        );
         d.finish()
     }
 }
@@ -429,14 +453,16 @@ enum KafkaProducerInner {
 /// The producer's client config: the connection settings of `base`, the
 /// pinned correctness settings, and the tuning `config` opts into.
 ///
-/// `allow.auto.create.topics` is pinned to `false`. librdkafka defaults it to
-/// `true` for a producer, so a publish to a topic nobody declared would ask a
-/// broker running `auto.create.topics.enable=true` to create that topic with
-/// broker defaults, outside `declare()` and outside any topology config.
-/// Pinned, the publish fails with an unknown-topic error once
-/// `message.timeout.ms` elapses and the topic stays absent, which is what the
-/// topology model needs: a topic exists because `declare()` created it or
-/// because infra owns it, never because a publisher named it first.
+/// `allow.auto.create.topics` is set explicitly, `false` by default. librdkafka
+/// defaults it to `true` for a producer, so a publish to a topic nobody
+/// declared would ask a broker running `auto.create.topics.enable=true` to
+/// create that topic with broker defaults, outside `declare()` and outside any
+/// topology config. Set to `false`, the publish fails with an unknown-topic
+/// error once `message.timeout.ms` elapses and the topic stays absent, which
+/// is what the topology model needs: a topic exists because `declare()`
+/// created it or because infra owns it, never because a publisher named it
+/// first. [`KafkaConfig::with_producer_auto_create_topics`] opts one producer
+/// back into librdkafka's default.
 fn producer_config(
     base: &ClientConfig,
     client_name: &str,
@@ -448,7 +474,14 @@ fn producer_config(
         .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
         .set("acks", "all")
         .set("enable.idempotence", "true")
-        .set("allow.auto.create.topics", "false");
+        .set(
+            "allow.auto.create.topics",
+            if config.producer_auto_create_topics {
+                "true"
+            } else {
+                "false"
+            },
+        );
     config.apply_producer_tuning(&mut producer_config)?;
     Ok(producer_config)
 }
@@ -1343,12 +1376,13 @@ mod tests {
         assert!(rendered.contains("Zstd"));
         assert!(rendered.contains("producer_linger_ms"));
         assert!(rendered.contains("25"));
+        assert!(rendered.contains("producer_auto_create_topics: false"));
     }
 
-    /// The producer never creates the topic it publishes to, and the pinned
-    /// correctness settings travel with that flag.
+    /// By default the producer never creates the topic it publishes to, and
+    /// the pinned correctness settings travel with that flag.
     #[test]
-    fn producer_config_never_auto_creates_topics() {
+    fn producer_config_never_auto_creates_topics_by_default() {
         let mut base = ClientConfig::new();
         base.set("bootstrap.servers", "broker:9092");
         let cfg = producer_config(&base, "shove-rs-test", &KafkaConfig::new("broker:9092"))
@@ -1358,6 +1392,31 @@ mod tests {
         assert_eq!(cfg.get("acks"), Some("all"));
         assert_eq!(cfg.get("client.id"), Some("shove-rs-test"));
         assert_eq!(cfg.get("bootstrap.servers"), Some("broker:9092"));
+    }
+
+    /// The switch flips only `allow.auto.create.topics`; the pinned
+    /// correctness settings stay.
+    #[test]
+    fn producer_config_auto_creates_topics_when_switched_on() {
+        let mut base = ClientConfig::new();
+        base.set("bootstrap.servers", "broker:9092");
+        let config = KafkaConfig::new("broker:9092").with_producer_auto_create_topics(true);
+        let cfg =
+            producer_config(&base, "shove-rs-test", &config).expect("the default tuning is valid");
+        assert_eq!(cfg.get("allow.auto.create.topics"), Some("true"));
+        assert_eq!(cfg.get("enable.idempotence"), Some("true"));
+        assert_eq!(cfg.get("acks"), Some("all"));
+    }
+
+    /// Passing `false` explicitly is the default, spelled out.
+    #[test]
+    fn producer_config_switched_off_explicitly_matches_the_default() {
+        let mut base = ClientConfig::new();
+        base.set("bootstrap.servers", "broker:9092");
+        let config = KafkaConfig::new("broker:9092").with_producer_auto_create_topics(false);
+        let cfg =
+            producer_config(&base, "shove-rs-test", &config).expect("the default tuning is valid");
+        assert_eq!(cfg.get("allow.auto.create.topics"), Some("false"));
     }
 
     // -- overlay_dynamic_entries: legacy AlterConfigs merge correctness --

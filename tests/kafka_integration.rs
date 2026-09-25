@@ -119,6 +119,14 @@ shove::define_topic!(
     TopologyBuilder::new("kafka-undeclared").build()
 );
 
+// A topic nobody declares, that a producer with topic auto-creation switched
+// on may create on the first publish.
+shove::define_topic!(
+    AutoCreatedTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-auto-created").build()
+);
+
 shove::define_topic!(
     NoDlqTopic,
     SimpleMessage,
@@ -204,7 +212,13 @@ struct TestBroker {
 
 impl TestBroker {
     async fn start() -> Self {
-        Self::start_image(KafkaContainer::default()).await
+        Self::start_with(|config| config).await
+    }
+
+    /// Start a broker and connect with the default `KafkaConfig` for it,
+    /// passed through `configure` first.
+    async fn start_with(configure: impl FnOnce(KafkaConfig) -> KafkaConfig) -> Self {
+        Self::start_image(KafkaContainer::default(), configure).await
     }
 
     /// A single-broker container that can host a transactional producer.
@@ -221,11 +235,12 @@ impl TestBroker {
             KafkaContainer::default()
                 .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
                 .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1"),
+            |config| config,
         )
         .await
     }
 
-    async fn start_image<I>(image: I) -> Self
+    async fn start_image<I>(image: I, configure: impl FnOnce(KafkaConfig) -> KafkaConfig) -> Self
     where
         I: AsyncRunner<KafkaContainer>,
     {
@@ -239,7 +254,8 @@ impl TestBroker {
             .expect("failed to get Kafka port");
         let bootstrap_servers = format!("127.0.0.1:{port}");
 
-        let client = KafkaClient::connect_with_retry(&KafkaConfig::new(&bootstrap_servers), 10)
+        let config = configure(KafkaConfig::new(&bootstrap_servers));
+        let client = KafkaClient::connect_with_retry(&config, 10)
             .await
             .expect("failed to connect to Kafka");
 
@@ -900,6 +916,31 @@ async fn publish_to_an_undeclared_topic_fails_instead_of_creating_it() {
         live_partition_count(tb.client().brokers(), TOPIC),
         None,
         "the publish must leave the topic absent"
+    );
+    broker.close().await;
+}
+
+/// The switch: with `with_producer_auto_create_topics(true)` the same publish
+/// to a topic nobody declared succeeds on the auto-creating test broker, and
+/// the broker has the topic afterwards.
+#[tokio::test]
+async fn publish_to_an_undeclared_topic_creates_it_when_auto_creation_is_switched_on() {
+    const TOPIC: &str = "kafka-auto-created";
+    let tb = TestBroker::start_with(|config| config.with_producer_auto_create_topics(true)).await;
+    let broker = tb.broker();
+    let publisher = broker.publisher().await.unwrap();
+
+    publisher
+        .publish::<AutoCreatedTopic>(&SimpleMessage {
+            id: "first".into(),
+            content: "creates the topic".into(),
+        })
+        .await
+        .expect("a producer with auto-creation switched on may create the topic it targets");
+    assert!(
+        live_partition_count(tb.client().brokers(), TOPIC)
+            .is_some_and(|partitions| partitions >= 1),
+        "the publish must leave the topic present"
     );
     broker.close().await;
 }
