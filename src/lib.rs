@@ -48,8 +48,8 @@
 //! |----------------------------|---------------------------------------------------------------------------------------------|
 //! | `inmemory`                 | In-process broker, publisher, consumer, topology, groups, autoscaler (no external broker)   |
 //! | `kafka`                    | Apache Kafka publisher, consumer, topology, consumer groups, autoscaling (plaintext only)   |
-//! | `kafka-ssl`                | TLS plus the SASL mechanisms librdkafka implements natively (PLAIN, SCRAM, OAUTHBEARER); no Cyrus SASL (implies `kafka`) |
-//! | `kafka-gssapi`             | GSSAPI/Kerberos through Cyrus SASL; links `libsasl2` (implies `kafka-ssl`)                 |
+//! | `kafka-ssl`                | TLS plus the SASL mechanisms librdkafka implements natively, no Cyrus SASL: `KafkaSasl` exposes PLAIN and SCRAM; OAUTHBEARER is compiled in but reachable only as `KafkaSasl::MskIam` under `kafka-msk-iam` (implies `kafka`) |
+//! | `kafka-gssapi`             | Links Cyrus SASL (`libsasl2`) for direct `rdkafka` use when a broker requires GSSAPI/Kerberos; `KafkaSasl` exposes no GSSAPI variant, so this gates no shove code (implies `kafka-ssl`) |
 //! | `kafka-msk-iam`            | AWS MSK IAM OAUTHBEARER auth (implies `kafka-ssl`)                                         |
 //! | `nats`                     | NATS JetStream publisher, consumer, topology, consumer groups, autoscaling                  |
 //! | `rabbitmq`                 | RabbitMQ publisher, consumer, topology, consumer groups, autoscaling                        |

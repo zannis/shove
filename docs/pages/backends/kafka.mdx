@@ -20,17 +20,24 @@ cargo add shove --features kafka
 
 For TLS and SASL (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512).
 librdkafka implements PLAIN in every build.
-SCRAM and OAUTHBEARER come from its OpenSSL build, which is why shove keeps the whole `KafkaSasl` type behind this feature:
+SCRAM and OAUTHBEARER come from its OpenSSL build, which is why shove keeps the whole `KafkaSasl` type behind this feature.
+OAUTHBEARER is compiled in, but shove exposes it only as `KafkaSasl::MskIam` under `kafka-msk-iam` (below).
+There is no generic token provider.
+For TLS, PLAIN and SCRAM:
 
 ```sh
 cargo add shove --features kafka-ssl
 ```
 
-For GSSAPI/Kerberos, which needs Cyrus SASL (`libsasl2`) linked into the build:
+For GSSAPI/Kerberos on an `rdkafka` client you build yourself in the same binary, which needs Cyrus SASL (`libsasl2`) linked into the build:
 
 ```sh
 cargo add shove --features kafka-gssapi
 ```
+
+This feature only links the library.
+`KafkaSasl` exposes no GSSAPI variant and `KafkaConfig` passes no raw client properties, so shove itself cannot authenticate with Kerberos.
+The feature gates no shove code and exists for direct `rdkafka` use.
 
 For AWS MSK with IAM authentication:
 
@@ -229,8 +236,19 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
 - **`with_group_id(impl Into<String>)`** — override the broker-side consumer group ID. Defaults to `"{queue}-consumer"`. Set this when two independent services consume the same topic and must each receive every message (fan-out) — otherwise they share a group and compete for partitions. Prefer `.for_consumer_group(...)` on the topology (below), which sets the group *and* the DLQ/hold-queue names together.
 - **`with_auto_offset_reset(KafkaAutoOffsetReset)`** — `Earliest` (default, replay history), `Latest` (tail-only), or `None` (refuse silent replay/skip on a fresh group).
   The same setting is available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths, which have no group config to carry it.
-  Under `None`, a group with no usable committed offset ends its consumer with a `ShoveError::Topology` naming librdkafka's `AutoOffsetReset` answer.
-  A reconnect would only meet the same answer.
+  Under `None`, a group member with no usable committed offset ends with a `ShoveError::Topology` naming librdkafka's `AutoOffsetReset` answer.
+  A reconnect would only meet the same answer, so the member does not retry.
+  The error ends that member, not the group: the group run keeps waiting for its shutdown signal.
+  The error count the run reports in `SupervisorOutcome` at shutdown grows by one per member.
+  Without autoscaling nothing replaces the member, so the group stays below its configured minimum for the life of the process.
+  With autoscaling enabled, the autoscaler tick respawns the member through the respawn supervisor, and each replacement meets the same answer.
+  The supervisor tops the group up in full on each of its first five rounds, at least 2, 4, 8 and 16 seconds apart.
+  The fifth round opens the circuit and rests for 300 seconds.
+  After that, each round spawns one probe member per 300-second cooldown.
+  The circuit never becomes terminal, so a group under `None` with autoscaling on keeps probing until an operator intervenes.
+  Lag-driven scale-up is a second path outside that circuit.
+  A group with no committed offset reports its retained backlog as lag, so while records remain on the topic the autoscaler can add members.
+  The 300-second cooldown therefore bounds the respawn probes, not every member the group creates.
   Commit a starting position first, with `reset_consumer_group_offsets` (below), or pick another policy.
   The DLQ drain (`run_dlq_with_options`) refuses the setting because it hard-codes `earliest`.
   That policy applies only while the drain's group has no usable committed offset.
@@ -675,7 +693,10 @@ The Kafka backend emits `shove_messages_failed_total` with the following `reason
 - **SASL and TLS** require the `kafka-ssl` feature.
   PLAIN, SCRAM-SHA-256 and SCRAM-SHA-512 are supported out of the box.
   librdkafka implements PLAIN itself in every build, and SCRAM and OAUTHBEARER in its OpenSSL build, which `kafka-ssl` selects.
-  GSSAPI/Kerberos needs Cyrus SASL and is behind the separate `kafka-gssapi` feature.
+  Shove exposes OAUTHBEARER only as `KafkaSasl::MskIam` under `kafka-msk-iam`.
+  There is no generic token provider.
+  GSSAPI/Kerberos needs Cyrus SASL, which the separate `kafka-gssapi` feature links for direct `rdkafka` use.
+  `KafkaSasl` exposes no GSSAPI variant, so that feature gates no shove code and shove itself cannot authenticate with Kerberos.
   For AWS MSK IAM, use the `kafka-msk-iam` feature instead.
 - For publish failures on missing topics, see [Declare topology](#declare-topology).
 - **`librdkafka` system dependencies** on Debian/Ubuntu CI runners: `libsasl2-dev` is required only with `kafka-gssapi`.

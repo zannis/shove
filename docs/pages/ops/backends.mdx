@@ -80,7 +80,10 @@ The **batch consumer** is the exception, and it has no equivalent knob: when not
 `KafkaSasl` configuration supports PLAIN, SCRAM-SHA-256 and SCRAM-SHA-512.
 librdkafka implements PLAIN itself in every build.
 SCRAM and OAUTHBEARER come from its OpenSSL build, which `kafka-ssl` selects.
-GSSAPI/Kerberos needs Cyrus SASL and is behind the separate `kafka-gssapi` feature.
+Shove exposes OAUTHBEARER only as `KafkaSasl::MskIam` under `kafka-msk-iam`.
+There is no generic token provider.
+GSSAPI/Kerberos needs Cyrus SASL, which the separate `kafka-gssapi` feature links for direct `rdkafka` use.
+`KafkaSasl` exposes no GSSAPI variant, so that feature gates no shove code and shove itself cannot authenticate with Kerberos.
 For Amazon MSK with IAM authentication, enable the `kafka-msk-iam` feature instead, and see the [Kafka backend page](/backends/kafka) for setup details.
 
 **`librdkafka` system dependency.** `kafka-ssl` links OpenSSL and nothing else.

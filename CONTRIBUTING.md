@@ -98,6 +98,15 @@ cargo nextest run --features <kafka-feature-set> --test kafka_integration --test
 
 CI runs on larger hosts and needs neither.
 
+Nextest may print `LEAK` beside a passed Kafka test.
+The runner marks a test leaky when its stdout or stderr pipe is still open 100 ms after the test process exited.
+One Kafka test spawns a child process.
+`shutdown_exits_the_process_while_the_broker_is_frozen` in `tests/kafka_integration.rs` runs the test executable again as a child, waits for it to exit, and `kill_on_drop` kills it if that wait fails.
+No other Kafka test starts a process of its own.
+The mark lands on a different test from run to run, on unit tests with no broker as well.
+It appears only while several test processes are starting at once.
+It does not reproduce with `--test-threads 1`, and nextest counts a leaky test as passed.
+
 ## Before opening a PR — the gates CI enforces
 
 ```sh
