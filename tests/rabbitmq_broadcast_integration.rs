@@ -245,6 +245,14 @@ define_topic!(
 );
 
 define_topic!(
+    DeferInPlaceTopic,
+    Invalidate,
+    TopologyBuilder::new("rmq-broadcast-defer-in-place")
+        .broadcast()
+        .build()
+);
+
+define_topic!(
     RetryTopic,
     Invalidate,
     TopologyBuilder::new("rmq-broadcast-retry")
@@ -321,6 +329,27 @@ impl MessageHandler<DeferTopic> for DeferOnce {
         let seen_before = calls.iter().filter(|k| **k == msg.key).count();
         calls.push(msg.key);
         if seen_before == 0 {
+            Outcome::Defer
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+/// Defers the first sighting of `"a"` and acks everything else, recording when
+/// each call started.
+#[derive(Clone, Default)]
+struct DeferFirstTimed {
+    calls: Arc<Mutex<Vec<(String, Instant)>>>,
+}
+
+impl MessageHandler<DeferInPlaceTopic> for DeferFirstTimed {
+    type Context = ();
+    async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _: &()) -> Outcome {
+        let mut calls = self.calls.lock().await;
+        let first_a = msg.key == "a" && calls.iter().all(|(k, _)| k != "a");
+        calls.push((msg.key, Instant::now()));
+        if first_a {
             Outcome::Defer
         } else {
             Outcome::Ack
@@ -593,6 +622,68 @@ async fn defer_redelivers_only_to_the_subscriber_that_deferred() {
         broker.close().await;
     }
     publisher_broker.close().await;
+    ctx.cleanup().await;
+}
+
+/// A deferred broadcast message comes back to the same handler after the
+/// broadcast defer delay, ahead of the message queued behind it — the pacing
+/// and order the Kafka, NATS, Redis and InMemory broadcast loops share.
+#[tokio::test]
+async fn defer_waits_the_defer_delay_and_redelivers_in_place() {
+    // Mirrors the crate-private `BROADCAST_DEFER_DELAY`.
+    const DEFER_DELAY: Duration = Duration::from_secs(1);
+
+    let ctx = TestContext::new().await;
+    let broker = ctx.broker().await;
+    broker
+        .topology()
+        .declare::<DeferInPlaceTopic>()
+        .await
+        .expect("failed to declare broadcast topology");
+
+    let handler = DeferFirstTimed::default();
+    let mut sub = broker.broadcast_subscriber();
+    sub.subscribe::<DeferInPlaceTopic, _>(handler.clone(), ConsumerOptions::new())
+        .expect("failed to subscribe");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while ctx.queue_names().await.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(ctx.queue_names().await.len(), 1);
+
+    let publisher = broker.publisher().await.expect("failed to build publisher");
+    for key in ["a", "b"] {
+        publisher
+            .publish::<DeferInPlaceTopic>(&Invalidate { key: key.into() })
+            .await
+            .expect("broadcast publish failed");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while handler.calls.lock().await.len() < 3 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    sub.cancellation_token().cancel();
+    let _ = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    broker.close().await;
+
+    let calls = handler.calls.lock().await.clone();
+    let keys: Vec<&str> = calls.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["a", "a", "b"],
+        "a deferred broadcast message is retried in place, before the message behind it"
+    );
+    let gap = calls[1].1.duration_since(calls[0].1);
+    assert!(
+        gap >= DEFER_DELAY,
+        "a deferred broadcast message was redelivered after {gap:?}, before the {DEFER_DELAY:?} defer delay"
+    );
+
     ctx.cleanup().await;
 }
 

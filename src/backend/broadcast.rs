@@ -186,9 +186,9 @@ pub(crate) use tail_only::refuse_start_other_than_tail;
 // settles through `router::route_reject` / `nack_requeue` because an AMQP
 // delivery has to be nacked on the channel it arrived on — the router already
 // records the terminal metric there, so going through this helper too would
-// count it twice. InMemory *is* in the cfg list, but only for
-// `BROADCAST_DEFER_DELAY`: its in-place broadcast `Defer` paces on the same
-// constant, so the test substrate redelivers on the schedule production does.
+// count it twice. InMemory and RabbitMQ *are* in the cfg list, but only for
+// `BROADCAST_DEFER_DELAY`: their in-place broadcast `Defer` paces on the same
+// constant, so every backend redelivers on one schedule.
 // The re-exports below are split to match — a name re-exported under a feature
 // that never uses it is an unused import, which `-D warnings` rejects and
 // CI's per-feature clippy legs would catch.
@@ -196,6 +196,7 @@ pub(crate) use tail_only::refuse_start_other_than_tail;
     feature = "inmemory",
     feature = "kafka",
     feature = "nats",
+    feature = "rabbitmq",
     feature = "redis-streams"
 ))]
 mod settling {
@@ -352,6 +353,7 @@ mod settling {
     feature = "inmemory",
     feature = "kafka",
     feature = "nats",
+    feature = "rabbitmq",
     feature = "redis-streams"
 ))]
 pub(crate) use settling::BROADCAST_DEFER_DELAY;
