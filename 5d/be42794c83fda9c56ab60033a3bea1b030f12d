@@ -1,0 +1,21 @@
+src/backends/redis/client.rs
+  s_ce0f5c4353a513::t_13bacbdfbd66fd 378-381
+scripts/bench.sh
+  s_ce0f5c4353a513::t_9202a6c1625759 104-107,113-115,121-122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5dbe42794c83fda9c56ab60033a3bea1b030f12d",
+  "prompts": {},
+  "sessions": {
+    "s_ce0f5c4353a513": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "00633e6c-4406-4207-a8c0-d6a08756bf3d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
