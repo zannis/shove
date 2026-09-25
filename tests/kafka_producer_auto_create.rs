@@ -100,7 +100,9 @@ async fn read_payload(bootstrap: &str, topic: &str) -> Payload {
             .add_partition_offset(topic, partition, Offset::Beginning)
             .expect("set partition offset");
     }
-    consumer.assign(&assignment).expect("assign topic partitions");
+    consumer
+        .assign(&assignment)
+        .expect("assign topic partitions");
     let record = tokio::time::timeout(Duration::from_secs(15), consumer.recv())
         .await
         .expect("published record must arrive")
@@ -118,7 +120,8 @@ async fn read_payload(bootstrap: &str, topic: &str) -> Payload {
 #[tokio::test]
 async fn producer_switch_is_per_client_and_can_be_reset_to_false() {
     let (_container, bootstrap) = start_kafka(true).await;
-    let enabled = connect(KafkaConfig::new(&bootstrap).with_producer_auto_create_topics(true)).await;
+    let enabled =
+        connect(KafkaConfig::new(&bootstrap).with_producer_auto_create_topics(true)).await;
     let disabled = connect(
         KafkaConfig::new(&bootstrap)
             .with_producer_auto_create_topics(true)

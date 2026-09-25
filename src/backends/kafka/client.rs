@@ -331,7 +331,7 @@ impl KafkaConfig {
     ///
     /// Defaults to `false`: publishing cannot create a missing topic.
     /// If the topic stays absent, publishing returns [`ShoveError::Connection`]
-    /// after its retry attempts fail.
+    /// once `message.timeout.ms` elapses.
     ///
     /// Set `true` to let the producer request topic creation on first publish.
     /// The broker must also enable `auto.create.topics.enable=true`.
