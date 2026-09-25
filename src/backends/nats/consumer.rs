@@ -122,15 +122,28 @@ pub(super) fn extract_message_metadata(msg: &Message) -> MessageMetadata {
         .map(|v| v.as_str().to_string())
         .unwrap_or_default();
 
+    // The stream metadata is absent for messages that did not come from a
+    // stream (`info()` errors), which is why every field read from it is
+    // optional rather than defaulted.
+    let info = msg.info().ok();
     // `info.delivered` is JetStream's `num_delivered`: attempts so far including
-    // this one, so the first delivery reports 1. It is absent for messages that
-    // did not come from a stream (`info()` errors), which is why the count is
-    // optional rather than defaulted to 1.
-    let delivery_count = msg
-        .info()
-        .ok()
+    // this one, so the first delivery reports 1.
+    let delivery_count = info
+        .as_ref()
         .map(|info| u32::try_from(info.delivered).unwrap_or(u32::MAX));
     let redelivered = delivery_count.is_some_and(|n| n > 1);
+    // The stream sequence is a log position with no partition, and
+    // `published` is when the server received the message from its publisher;
+    // see the field docs on `MessageMetadata::offset` and `timestamp_ms`.
+    let (offset, timestamp_ms) = info
+        .as_ref()
+        .map(|info| {
+            (
+                sequence_to_offset(info.stream_sequence),
+                published_to_millis(info.published.unix_timestamp_nanos()),
+            )
+        })
+        .unwrap_or((None, None));
 
     let headers = extract_string_headers(&msg.headers);
 
@@ -139,8 +152,27 @@ pub(super) fn extract_message_metadata(msg: &Message) -> MessageMetadata {
         delivery_id,
         redelivered,
         delivery_count,
+        // No partitions on JetStream; the sequence goes in `offset`.
+        partition: None,
+        offset,
+        timestamp_ms,
         headers: Arc::new(headers),
     }
+}
+
+/// A JetStream stream sequence as [`MessageMetadata::offset`]. Checked: the
+/// field is `i64` and the sequence is `u64`, so a value past `i64::MAX` reads
+/// as `None` rather than wrapping.
+fn sequence_to_offset(sequence: u64) -> Option<i64> {
+    i64::try_from(sequence).ok()
+}
+
+/// A stream message's `published` instant, given as nanoseconds since the
+/// Unix epoch, as [`MessageMetadata::timestamp_ms`]. Floor division keeps a
+/// pre-epoch instant on the millisecond it falls in, and the checked
+/// narrowing reads a value outside `i64` as `None`.
+fn published_to_millis(unix_nanos: i128) -> Option<i64> {
+    i64::try_from(unix_nanos.div_euclid(1_000_000)).ok()
 }
 
 /// Extracts dead message metadata from a JetStream message.
@@ -633,6 +665,7 @@ impl NatsConsumer {
     {
         let topology = T::topology();
         let queue = topology.queue();
+        options.refuse_broadcast_start(queue, "NatsConsumer::run")?;
         // All tasks in a consumer group bind to the same durable consumer name;
         // the JetStream server load-balances messages across them. The registry
         // pre-configures this consumer with an aggregate `max_ack_pending` so
@@ -1010,6 +1043,7 @@ impl NatsConsumer {
     {
         let topology = T::topology();
         let queue = topology.queue();
+        options.refuse_broadcast_start(queue, "NatsConsumer::run_fifo")?;
         let seq_config = topology
             .sequencing()
             .expect("run_fifo requires a sequenced topology");
@@ -2277,5 +2311,45 @@ mod reconnect_tests {
 
         assert!(result.is_err(), "expected exhaustion error, got {result:?}");
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod metadata_coordinates_tests {
+    use super::*;
+
+    /// The stream sequence is `u64` and `offset` is `i64`: the whole
+    /// representable range passes through unchanged, and anything past it
+    /// reads as unknown instead of wrapping negative.
+    #[test]
+    fn a_stream_sequence_becomes_a_checked_offset() {
+        assert_eq!(sequence_to_offset(1), Some(1));
+        assert_eq!(sequence_to_offset(i64::MAX as u64), Some(i64::MAX));
+        assert_eq!(sequence_to_offset(i64::MAX as u64 + 1), None);
+        assert_eq!(sequence_to_offset(u64::MAX), None);
+    }
+
+    /// `published` arrives as nanoseconds; the field is milliseconds, floored,
+    /// and checked into an `i64`.
+    #[test]
+    fn a_published_instant_becomes_unix_milliseconds() {
+        assert_eq!(published_to_millis(0), Some(0));
+        assert_eq!(
+            published_to_millis(1_700_000_000_123_456_789),
+            Some(1_700_000_000_123)
+        );
+        assert_eq!(
+            published_to_millis(-1),
+            Some(-1),
+            "floor, not truncation toward zero"
+        );
+        assert_eq!(
+            published_to_millis(i128::from(i64::MAX) * 1_000_000),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            published_to_millis((i128::from(i64::MAX) + 1) * 1_000_000),
+            None
+        );
     }
 }

@@ -166,6 +166,24 @@ Every `handle()` invocation receives a `MessageMetadata` describing the delivery
 - `redelivered: bool` — whether the broker flagged this as a redelivery at the transport layer.
 - `delivery_count: Option<u32>` — how many times the *broker* has delivered this message, including the current delivery. `None` where the backend has no such counter.
 - `headers: HashMap<String, String>` — string-valued headers attached to the delivery.
+- `partition: Option<i32>` - the partition the record was read from, on Kafka only, and `None` on every other backend.
+- `offset: Option<i64>` - the record's position in its log: the offset inside its partition on Kafka, the stream sequence on NATS, and `None` elsewhere.
+- `timestamp_ms: Option<i64>` - when the broker took the message, in milliseconds since the Unix epoch, and `None` where the backend has no such time.
+
+Each field is filled where the backend has the data, and each has its own availability:
+
+| Backend | `partition` | `offset` | `timestamp_ms` |
+|---|---|---|---|
+| Apache Kafka | `Some(p)` | `Some(o)`, the offset inside the partition | `Some(ms)`, the broker timestamp (`LogAppendTime` or `CreateTime` as the topic is configured); `None` when the record carries none |
+| NATS JetStream | `None` | `Some(seq)`, the stream sequence, checked into an `i64` | `Some(ms)`, when the server received the message from its publisher |
+| Redis Streams | `None` | `None` | `Some(ms)`, the time component of the entry id: the instance clock when Redis generated the id. Not a publish time in general: a publisher may supply an explicit id, and after a clock rollback Redis reuses the top entry's time |
+| RabbitMQ | `None` | `None` | `None` on this version; the optional AMQP `timestamp` property is not read |
+| AWS SQS | `None` | `None` | `None` on this version; `SentTimestamp` is not requested |
+| In-process | `None` | `None` | `None` |
+
+The coordinates name a position in a log, which is what an audit trail or a replay request needs.
+They are not an attempt counter: the same record redelivered after a rebalance carries the same coordinates.
+On a dead-letter drain the coordinates are the dead letter's own, the copy's position in the dead-letter topic, while `retry_count` and `delivery_id` describe the original message.
 
 Most handlers ignore all of these fields. They become useful when you need to trace a message (`headers["x-trace-id"]`), implement idempotency checks (`headers["x-message-id"]` on RabbitMQ), or adjust behavior on redelivery. The `retry_count` in particular is more reliable than `redelivered` for detecting retries because `shove` increments it explicitly, whereas `redelivered` reflects the broker's view of the transport.
 

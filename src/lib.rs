@@ -257,7 +257,7 @@ pub use queue_depth::QueueDepthSampler;
 
 // --- v2 generic wrappers (Phase 5) ---
 pub use batch_consumer::{BatchConsumer, BatchConsumerOptions};
-pub use broadcast::BroadcastSubscriber;
+pub use broadcast::{BroadcastStart, BroadcastSubscriber};
 pub use broker::Broker;
 pub use consumer_group::{ConsumerGroup, ConsumerGroupConfig};
 pub use publisher::Publisher;
@@ -362,6 +362,30 @@ pub mod kafka {
     #[cfg(all(feature = "kafka-msk-iam", feature = "test-support"))]
     #[cfg_attr(docsrs, doc(cfg(feature = "test-support")))]
     pub use crate::backends::kafka::prime_admin_oauth_token_for_test;
+
+    /// Test-only seam (see the `test-support` feature): the receive loop's
+    /// shutdown commit deadline, for tests that time a shutdown against it.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::shutdown_commit_deadline_for_test;
+
+    /// Test-only probe (see the `test-support` feature): the fence threshold
+    /// the last concurrent receive loop started with.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::fence_probe;
+
+    /// Test-only switch (see the `test-support` feature): refuses the threads
+    /// the shutdown path asks for, so a test can drive the last-resort leak.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::final_commit_spawn_probe;
+
+    /// Test-only seam (see the `test-support` feature): the consumer
+    /// `session.timeout.ms`, for tests that wait past it.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::session_timeout_for_test;
 }
 
 /// Redis Streams backend.

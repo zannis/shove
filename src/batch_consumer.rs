@@ -35,7 +35,7 @@ use crate::backends::kafka::KafkaAutoOffsetReset;
 #[cfg(feature = "kafka")]
 use crate::markers::Kafka;
 #[cfg(feature = "kafka-schema-registry")]
-use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
+use crate::schema_registry::{SchemaEnforcement, SchemaRegistry, validate_message_index};
 
 /// Options for [`BatchConsumer::run`], parameterised by backend marker `B`.
 ///
@@ -82,6 +82,8 @@ pub struct BatchConsumerOptions<B: Backend> {
     pub(crate) schema_enforcement: SchemaEnforcement,
     #[cfg(feature = "kafka-schema-registry")]
     pub(crate) schema_accepted_subjects: Option<Vec<Arc<str>>>,
+    #[cfg(feature = "kafka-schema-registry")]
+    pub(crate) schema_message_index: Option<Vec<i32>>,
 
     _backend: PhantomData<fn() -> B>,
 }
@@ -115,6 +117,8 @@ impl<B: Backend> BatchConsumerOptions<B> {
             schema_enforcement: SchemaEnforcement::Enforce,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: None,
             _backend: PhantomData,
         }
     }
@@ -239,6 +243,8 @@ impl<B: Backend> BatchConsumerOptions<B> {
             schema_enforcement: self.schema_enforcement,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: self.schema_accepted_subjects,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: self.schema_message_index,
         }
     }
 }
@@ -294,6 +300,30 @@ impl BatchConsumerOptions<Kafka> {
         self.schema_accepted_subjects = Some(subjects.into_iter().map(Into::into).collect());
         self
     }
+
+    /// Accept only protobuf frames whose message index equals `index`, the
+    /// path of `M` inside its schema file: `[0]` is the first top-level
+    /// message, `[1]` the second, `[0, 2]` the third message nested in the
+    /// first. Unset accepts any index, so a `ProtobufCodec<M>` decodes
+    /// whatever message the producer framed as `M`. A frame with another
+    /// index is routed to the DLQ with reason `schema_message_index_rejected`
+    /// before its schema id is resolved. JSON frames carry no index and are
+    /// not judged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is empty, holds a negative element or has more than
+    /// 1024 entries, the wire parser's own cap, the same check
+    /// `ConsumerOptions::<Kafka>` and `KafkaConsumerGroupConfig` apply: the
+    /// parser never yields such an index, so the requirement could never
+    /// match and every protobuf frame would be dead-lettered with nothing at
+    /// startup pointing at the cause.
+    pub fn require_schema_message_index(mut self, index: impl Into<Vec<i32>>) -> Self {
+        let index = index.into();
+        validate_message_index(&index);
+        self.schema_message_index = Some(index);
+        self
+    }
 }
 
 /// Runs batch consumption for one topic. Obtained from
@@ -346,5 +376,73 @@ impl<B: HasBatchConsumption> BatchConsumer<B> {
         self.inner
             .run_batch::<T, H>(handler, ctx, options.into_inner())
             .await
+    }
+}
+
+#[cfg(all(test, feature = "kafka-schema-registry"))]
+mod tests {
+    use super::*;
+    use crate::markers::Kafka;
+
+    /// The message-index requirement reaches the backend through
+    /// `into_inner`, as it does from `ConsumerOptions` and the group config.
+    #[test]
+    fn require_schema_message_index_propagates() {
+        let inner = BatchConsumerOptions::<Kafka>::new()
+            .require_schema_message_index([0, 2])
+            .into_inner();
+        assert_eq!(inner.schema_message_index, Some(vec![0, 2]));
+        assert!(
+            BatchConsumerOptions::<Kafka>::new()
+                .into_inner()
+                .schema_message_index
+                .is_none()
+        );
+    }
+
+    /// The batch options apply the same check as the other two homes of the
+    /// setter, so a requirement that can never match fails at configuration
+    /// time on every path.
+    #[test]
+    fn require_schema_message_index_accepts_the_shorthand_and_a_nested_path() {
+        let shorthand = BatchConsumerOptions::<Kafka>::new()
+            .require_schema_message_index([0])
+            .into_inner();
+        assert_eq!(shorthand.schema_message_index, Some(vec![0]));
+        let nested = BatchConsumerOptions::<Kafka>::new()
+            .require_schema_message_index([1, 0, 3])
+            .into_inner();
+        assert_eq!(nested.schema_message_index, Some(vec![1, 0, 3]));
+    }
+
+    #[test]
+    #[should_panic(expected = "schema_message_index must not be empty")]
+    fn require_schema_message_index_rejects_an_empty_path() {
+        let _ =
+            BatchConsumerOptions::<Kafka>::new().require_schema_message_index(Vec::<i32>::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "schema_message_index must not contain a negative index")]
+    fn require_schema_message_index_rejects_a_negative_index() {
+        let _ = BatchConsumerOptions::<Kafka>::new().require_schema_message_index([2, -1]);
+    }
+
+    /// The cap is the parser's: 1024 indexes match a frame at the cap, and
+    /// 1025 can never match, so they are refused like an empty path.
+    #[test]
+    fn require_schema_message_index_accepts_a_path_at_the_parser_cap() {
+        let at_cap = BatchConsumerOptions::<Kafka>::new()
+            .require_schema_message_index(vec![0; 1024])
+            .into_inner();
+        assert_eq!(at_cap.schema_message_index.map(|i| i.len()), Some(1024));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "schema_message_index must not hold more than 1024 indexes, got 1025"
+    )]
+    fn require_schema_message_index_rejects_a_path_past_the_parser_cap() {
+        let _ = BatchConsumerOptions::<Kafka>::new().require_schema_message_index(vec![0; 1025]);
     }
 }

@@ -193,7 +193,9 @@ All line numbers are at `5bc4979`.
 - Changing any pinned constant value, including `ASYNC_COMMIT_INTERVAL`, `SESSION_TIMEOUT_MS` and `MAX_POLL_INTERVAL_MS`.
 - Committing inside `pre_rebalance` before a revoke, which plan 007 deferred and the Maintenance notes discuss.
 - A start position for NATS, Redis or RabbitMQ broadcast subscriptions.
-- Filling the new metadata fields on any backend other than Kafka, which the Maintenance notes discuss.
+- Filling the new metadata fields on SQS and RabbitMQ.
+  NATS fills `offset` and `timestamp_ms` and Redis fills `timestamp_ms` in step 7.
+  The Maintenance notes list what the other two could fill.
 - The FIFO commit cadence, which commits per message.
 - Moving `commit_batch_end` off `spawn_blocking`, which the Maintenance notes discuss.
 - A partition-count accessor on the public API.
@@ -335,7 +337,11 @@ pub fn with_commit_interval(mut self, interval: Duration) -> Self
 ```
 
 The builders assert `!interval.is_zero()`, copying `RedisConfig::with_trim_interval` at `src/backends/redis/client.rs:151-153`.
-Any nonzero interval is accepted, above or below 500 ms.
+Any nonzero interval up to one hour is accepted, above or below 500 ms.
+`MAX_COMMIT_INTERVAL` in `constants.rs` is the upper bound.
+The gate adds the interval to an `Instant`, and the fence threshold grows with four intervals.
+Both setters panic past an hour, at configuration time and never in the receive loop.
+`run_with_inner` checks the interval again before it builds the gate, because `kafka_commit_interval` is a public field a caller can write past the setter.
 `ConsumerOptionsInner` gains `kafka_commit_interval`, and every literal of it sets the field: `src/consumer.rs:537`, `src/backend/options_inner.rs:84`, `src/backend/mod.rs:205`.
 `spawn_one` copies the group value into the options like `auto_offset_reset` at `consumer_group.rs:801`.
 The receive loop builds the gate from `options.kafka_commit_interval.unwrap_or(ASYNC_COMMIT_INTERVAL)` at `consumer.rs:3028`.
@@ -354,6 +360,13 @@ The final commit moves onto a dedicated thread that owns the consumer:
   Dropping the consumer also blocks, because rdkafka polls the consumer close inside `Drop`.
 - In the shutdown branch at `:3107-3129`, after the permits are collected, move the `Arc<KafkaStreamConsumer>` into a `std::thread::Builder` thread named `shove-kafka-final-commit`.
   The thread runs the `Sync` commit, sends the result on a `oneshot`, and then drops the consumer, so the close also runs off the runtime.
+  The thread is spawned first, waiting on a channel, and receives the consumer and the offsets only once it exists.
+  A closure that owned the consumer would be dropped inside a failed `spawn`, on the runtime thread.
+  That drop is the consumer's close, the very thing this thread exists to keep off the runtime.
+  When no thread can be spawned nothing commits, and the close moves to a second, close-only thread.
+  If that spawn fails too, the handle is leaked and logged at error level.
+  The leaked consumer keeps heartbeating, so its partitions stay assigned until `max.poll.interval.ms` passes without a poll.
+  Once the process exits, the broker drops the member after the session timeout, as after a crash.
   The loop awaits the `oneshot` under `tokio::time::timeout(SHUTDOWN_COMMIT_DEADLINE)`.
 - `SHUTDOWN_COMMIT_DEADLINE` is a new 20 s constant in `constants.rs`, chosen against the 30 s termination grace Kubernetes gives a Pod by default.
 - On a result within the deadline, settle the pending discards as today.
@@ -411,36 +424,69 @@ It now runs on a dedicated thread and gives up after 20 s, where it previously w
 
 Commit: `feat(kafka): let a broadcast subscription start at the head, the tail or a timestamp`.
 
-Public API, the field on the struct and the setter in the Kafka `impl` block:
+Where an ephemeral subscription starts is not a Kafka idea: NATS has `DeliverPolicy::{New, All, ByStartTime}` and a Redis stream id carries its millisecond.
+The maintainer's review of 2026-09-22 therefore asked for a backend-neutral shape in place of the Kafka-typed knob this step first shipped.
+The shape below is the one that landed.
+
+Public API, the type, the field and the setter, scoped to `HasBroadcast` like the rest of the broadcast surface:
 
 ```rust
-// src/consumer.rs, struct ConsumerOptions<B>
-/// Kafka-only: where a broadcast subscription assigns each partition.
-/// `None` (the default) and `Some(Latest)` keep the current tail assignment.
-#[cfg(feature = "kafka")]
-pub kafka_broadcast_start: Option<KafkaOffsetReset>,
+// src/broadcast.rs, re-exported at the crate root
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcastStart {
+    /// Deliver-new, the default on every backend.
+    Tail,
+    /// Every retained message, then the tail.
+    Head,
+    /// The first message at or after this instant, in milliseconds since the Unix epoch.
+    Timestamp(i64),
+}
 
-// src/consumer.rs, impl ConsumerOptions<Kafka>
-pub fn with_broadcast_start(mut self, start: KafkaOffsetReset) -> Self
+// src/consumer.rs, struct ConsumerOptions<B>
+pub broadcast_start: Option<BroadcastStart>,
+
+// src/consumer.rs, impl<B: HasBroadcast> ConsumerOptions<B>
+pub fn with_broadcast_start(mut self, start: BroadcastStart) -> Self
+
+// src/backend/broadcast.rs, trait BroadcastImpl
+fn check_options(queue: &str, options: &ConsumerOptionsInner) -> Result<()>;
 ```
 
-The field carries the `docsrs` attribute like `kafka_group_id` at `:265-271`.
-`ConsumerOptionsInner` gains `kafka_broadcast_start`, and the three literals named in step 4 set it.
-Reuse `KafkaOffsetReset` rather than a new enum.
-Its three variants resolve exactly as a broadcast start must, and its resolvers already exist.
-Broaden the enum's rustdoc from "where to re-anchor a group" to "a position on a topic", and keep the type name.
+`ConsumerOptionsInner` gains `broadcast_start`, and the three literals named in step 4 set it.
+Neither field is feature-gated, because the concept is not.
+`BroadcastSubscriber::subscribe` calls `check_options` before it spawns the loop.
+A backend therefore refuses what it cannot honour synchronously, at the call site, with `ShoveError::Topology`.
+A refused subscribe leaves the handle free to retry.
+Kafka honours all three variants.
+NATS, Redis, RabbitMQ and the in-process broker start at the tail only on this version.
+`None` and `Tail` pass, and `Head` and `Timestamp` are refused through one shared helper, `refuse_start_other_than_tail`.
+Its message names the topic, the variant, the backend and the way out.
+Mapping `Head` and `Timestamp` onto `DeliverPolicy::All`, `DeliverPolicy::ByStartTime` and a Redis id is a later step, and needs a checked conversion for the NATS `OffsetDateTime`.
+The timestamp unit is Unix epoch milliseconds on every backend, the unit `KafkaOffsetReset::Timestamp` already documents.
+`KafkaOffsetReset` stays the type of `reset_consumer_group_offsets` and no longer names the broadcast start.
+The refusal policy is the FIFO consumer's, applied to every knob an entry point never reads.
+The Kafka broadcast subscription refuses `with_commit_interval` and `with_auto_offset_reset` in `check_options`, because it commits nothing and assigns every partition at an explicit offset.
+Every competing-consumer entry point refuses a set `broadcast_start` through `ConsumerOptionsInner::refuse_broadcast_start`.
+`ConsumerSupervisor::register` and `register_fifo` do so generically, and each backend's direct, FIFO and DLQ paths do so themselves.
+The Kafka DLQ drain also refuses `with_commit_interval` and `with_auto_offset_reset`.
+It commits each dead letter as it settles, so there is no interval to set.
+It hard-codes `earliest`, which applies only while its group has no usable committed offset, so a fresh drain never skips a dead letter.
+Neither knob would change anything, so both are refused.
+A caller therefore meets the same `Topology` error whichever way it starts a consumer.
 
 Kafka backend:
 
-- Rename `assign_all_partitions_at_end` to `assign_all_partitions_at(topic, start: Option<KafkaOffsetReset>, timeout)`.
-- `None` and `Some(Latest)` add every partition at `Offset::End`, byte for byte the current behaviour.
-- `Some(Earliest)` adds every partition at `Offset::Beginning`.
+- Rename `assign_all_partitions_at_end` to `assign_all_partitions_at(topic, start: Option<BroadcastStart>, timeout)`.
+- `None` and `Some(Tail)` add every partition at `Offset::End`, byte for byte the current behaviour.
+- `Some(Head)` adds every partition at `Offset::Beginning`.
+- `broadcast_start_positions` is one exhaustive match over the start.
+  A new variant is a compile error there, and no `unreachable!` arm sits on the runtime path.
 - `Some(Timestamp(ms))` fetches every partition's watermarks first, then calls `offsets_for_times`.
   It then resolves each partition through `target_from_timestamp_lookup`, made `pub(super)`.
   The order matters, because a record that lands between the lookup and a later watermark fetch would be skipped.
   `run_reset`'s order at `offset_reset.rs:380` and `:401` is the one to copy.
 - `refresh_broadcast_partitions` resolves a newly discovered partition with the same start.
-  An `Earliest` subscription then does not skip a new partition's first records.
+  A `Head` subscription then does not skip a new partition's first records.
 - `run_broadcast_with_inner` uses `options.kafka_group_id` verbatim as the inert `group.id` when set, else `broadcast_group_id(queue)`.
   The value is inert either way.
   The doc on `broadcast_group_id` says why a caller may want to pick it: a cluster ACL that grants group Describe on one prefix only.
@@ -453,23 +499,30 @@ Kafka backend:
 
 Tests:
 
-- Unit, `offset_reset.rs`: the new resolver maps `None` and `Latest` to `End`, `Earliest` to `Beginning`, and a `Timestamp` through the lookup helper.
+- Unit, `offset_reset.rs`: a `Timestamp` start resolves through the group reset's lookup helper.
+- Unit, `src/backend/broadcast.rs`: the tail-only helper passes `None` and `Tail` and refuses `Head` and `Timestamp`.
+  Its message names the topic, the variant and the way out.
 - Unit, `consumer.rs`: the error classifier ignores `GroupAuthorizationFailed` and passes every other code through.
 - Unit, `src/consumer.rs`: `with_broadcast_start` propagates through `into_inner`, modelled on `kafka_with_group_id_propagates_through_into_inner` (`:1044-1050`).
+- Integration, `tests/inmemory_broadcast.rs`: `broadcast_start_is_refused_by_a_backend_that_cannot_honour_it` asserts the synchronous `Topology` error from `subscribe()` for `Head` and `Timestamp`, and that `Tail` is then accepted on the same handle.
+- Unit, `kafka/consumer.rs`: `run_rejects_broadcast_start` and `run_fifo_rejects_broadcast_start` against a client that never connects.
+  `broadcast_subscribe_rejects_commit_interval` and `broadcast_subscribe_rejects_auto_offset_reset` cover `check_broadcast_options`.
+  A negative control admits every start and the inert group id.
+- Unit, `src/consumer_supervisor.rs`: `supervisor_register_rejects_broadcast_start` and `supervisor_register_fifo_rejects_broadcast_start` on the in-process broker, each proving the topic stays registrable after the refusal.
 - Integration, `tests/kafka_broadcast_integration.rs`, three new tests.
-  `broadcast_starts_from_the_head_when_asked` publishes before subscribing and receives everything.
-  `broadcast_starts_at_a_timestamp` publishes two batches around a captured timestamp and receives only the second.
+  `broadcast_starts_from_the_head_when_asked` publishes before subscribing, subscribes with `Head`, and receives everything.
+  `broadcast_starts_at_a_timestamp` publishes two batches around a captured timestamp, subscribes with `Timestamp`, and receives only the second.
   `broadcast_uses_the_configured_inert_group_id` asserts the group list still shows nothing under the configured name, reusing the control in `broadcast_leaves_no_consumer_group`.
 - The existing `broadcast_fans_out_to_every_instance_from_the_tail` must pass unchanged, which is the byte-for-byte proof for the default.
 
 Docs:
 
-- `docs/pages/concepts/broadcast.mdx:33`: "Deliver-new only" gains one sentence.
-  On Kafka a subscriber may opt into the head or a timestamp, and deliver-new stays the default.
+- `docs/pages/concepts/broadcast.mdx:33`: "Deliver-new only" gains the neutral `BroadcastStart`.
+  Kafka honours all three starts, every other backend refuses `Head` and `Timestamp` at `subscribe()`, and deliver-new stays the default.
 - `broadcast.mdx:116-124`, the Kafka section: describe the three starts and the configurable inert `group.id`.
 - `docs/pages/backends/kafka.mdx`: a new `### Starting a broadcast subscription elsewhere than the tail` after the re-anchoring section (`:164-199`).
   The "See also" broadcast line at `:439` is updated.
-- `src/backend/broadcast.rs:28-30`, `src/backend/capability.rs:75`, `src/broadcast.rs:142-144`: each gains the Kafka exception in one sentence.
+- `src/backend/broadcast.rs:28-30`, `src/backend/capability.rs:75`, `src/broadcast.rs:142-144`: each names the neutral start and which backends honour it.
 
 Migration note for existing users: none, every default is unchanged.
 
@@ -507,9 +560,12 @@ Kafka backend:
   In external mode it verifies the topic exists with one metadata fetch.
   When the topic is absent it returns `ShoveError::Topology` naming the topic, with the fail-fast wording of `src/backends/nats/topology.rs:127-129`.
   It never calls `create_topic`, `ensure_partitions` or `ensure_topic_configs` for the main topic.
-- The verification fetch uses the producer's librdkafka client, as `KafkaClient::ping` does at `client.rs:680-704`.
-  That client has no `group.id` and so provokes no coordinator lookup under a group-scoped ACL.
-  Do not reuse `fetch_topic_partition_count_blocking`, which sets one (`:1009-1013`).
+- The verification fetch uses a one-shot consumer-type metadata client with `allow.auto.create.topics=false` set explicitly and no `group.id`, `probe_external_topic_blocking` in `client.rs`.
+  The producer's own client, the one `KafkaClient::ping` uses, pins that flag to `false` as well, in `producer_config`.
+  That pin is delivered by `feat/kafka-producer-no-auto-create` in the same release, and the probe does not rely on it.
+  Without the pin, librdkafka's producer default of true would create the very topic `external()` promises never to create.
+  Without a `group.id` there is no coordinator lookup, so the probe needs no group permission under a group-scoped ACL.
+  Do not reuse `fetch_topic_partition_count_blocking`, which sets one.
 - The DLQ, when declared, is still created, because shove owns its dead-letter topic in both modes.
   NATS does the same at `nats/topology.rs:152-154`.
 - `register` and `register_fifo` need no change, because the flag travels inside the topology they hand to the declarer.
@@ -555,16 +611,29 @@ pub timestamp_ms: Option<i64>,
 ```
 
 Plus three builder setters, `partition`, `offset` and `timestamp_ms`, each `impl Into<Option<_>>` like `delivery_count` at `:223-226`.
-Add a per-backend availability table to the rustdoc, modelled on the `delivery_count` table at `:79-88`.
-Kafka is `Some` and every other backend is `None`.
+Each field carries its own per-backend availability table in the rustdoc, modelled on the `delivery_count` table at `:79-88`.
+Each is filled where the backend has the data.
+The maintainer's review of 2026-09-22 asked for this in place of the first shape, which documented the three fields as Kafka-only.
+`partition` is the one Kafka-shaped field.
+`offset` is the offset inside the partition on Kafka and the stream sequence on NATS, a log position with no partition.
+The NATS sequence is converted with `i64::try_from`, so a sequence past `i64::MAX` reads as `None`.
+`timestamp_ms` is the broker timestamp on Kafka and the time component of the entry id on Redis.
+On NATS it is the server's receive time, `Info.published`, as Unix milliseconds through a checked conversion.
+The Redis value is worded as the id's time component and never as a publish time.
+Redis fills it with the instance clock only for an id it generated, and a publisher may supply an explicit id.
+After a clock rollback Redis reuses the top entry's time and increments the sequence part.
+SQS (`SentTimestamp`) and RabbitMQ (the optional AMQP `timestamp` property) stay `None` on this version and follow later.
 The struct is `#[non_exhaustive]` since PR 71, so downstream code that reads fields or uses the builder is unaffected.
 
-Construction sites that gain the three fields, all set to `None` except Kafka:
+Construction sites that gain the three fields, filled where the backend has the data and `None` elsewhere:
 
 - `src/metadata.rs:241-249` builder `build`.
 - `src/backends/sns/consumer.rs:101`, `src/backends/redis/consumer.rs:901`, `:1335`, `:2592`, `src/backends/redis/broadcast.rs:292`.
 - `src/backends/rabbitmq/headers.rs:50`, `src/backends/inmemory/consumer.rs:2545`, `src/backends/nats/consumer.rs:137`.
 - Test fixtures at `src/handler.rs:191`, `src/audit.rs:310`, `:406`, `:459`.
+- NATS fills `offset` and `timestamp_ms` from the message's stream metadata through two checked helpers, `sequence_to_offset` and `published_to_millis`.
+- The four Redis sites fill `timestamp_ms` through `stream_id::time_component_ms`, which reuses the existing id parser.
+  A malformed id or a time past `i64::MAX` reads as `None`.
 
 Kafka backend:
 
@@ -573,15 +642,22 @@ Kafka backend:
 - `build_message_metadata` takes it as a third parameter and fills the three fields.
   Call sites: `:3363`, `:3807`, `:4295`, `:4791`, and `build_dead_metadata` at `:539-556` for the DLQ drain.
 - `DeferredDelivery` (`:1226-1229`) carries the coordinates so a deferred broadcast redelivery keeps the original ones.
+- `DeadMessageMetadata::message` documents that on a DLQ drain the coordinates are the dead letter's own, on the DLQ topic.
+  `retry_count` and `delivery_id` come from the original's headers.
+  Source coordinates in the DLQ headers are a later change.
 
 Tests:
 
 - Unit, `src/metadata.rs`: defaults are `None`, setters work, serde round-trips and a JSON without the fields deserializes.
+- Unit, `src/backends/nats/consumer.rs`: the two checked conversions pass the representable range and read the rest as `None`.
+- Unit, `src/backends/redis/stream_id.rs`: the time component is the id's first field, checked.
+- Integration, `tests/nats_integration.rs`: `nats_delivery_fills_offset_and_timestamp_from_stream_info` sees sequence 1 on a fresh stream and a publish time inside the test's wall-clock window.
+- Integration, `tests/redis_integration.rs`: `redis_delivery_fills_timestamp_from_the_entry_id` sees the id's time inside the publish window and no partition or offset.
 - Integration, `tests/kafka_integration.rs`: `handler_sees_partition_offset_and_timestamp`.
   It asserts all three are `Some`, offsets increase per partition, and the timestamp lies inside the test's wall-clock window.
   One assertion each goes into the broadcast suite and into `tests/kafka_batch_integration.rs`.
 
-Docs: `docs/pages/concepts/handlers.mdx:160-170` lists the three fields with their availability.
+Docs: `docs/pages/concepts/handlers.mdx:160-170` lists the three fields with one availability table per backend and field, and the dead-letter provenance sentence.
 
 Migration note: none for readers and builder users.
 A downstream test that destructures without `..` already fails to compile since PR 71.
@@ -642,6 +718,10 @@ pub fn require_schema_message_index(mut self, index: impl Into<Vec<i32>>) -> Sel
 
 `ConsumerOptionsInner` and `BatchConsumerOptionsInner` gain the field, and every literal sets it.
 `spawn_one` copies it like the other registry settings (`consumer_group.rs:784-807`).
+All three setters run one shared check, `validate_message_index` in `wire.rs`.
+It panics on an empty requirement, a negative index or more than 1024 indexes, the parser's cap.
+`ConsumerOptions::into_inner` runs the same check, so a value written to the public field past the setter is refused too.
+The parser never yields such an index, so the requirement could never match, and the mistake is refused at configuration time.
 
 Decode stage:
 
@@ -787,6 +867,41 @@ That is the at-least-once contract the rest of the crate keeps, and the PR body 
 
 **Verify**: registry mock suite, the new outage suite, Kafka integration suite and both schema-registry coverage entries pass.
 
+## Known patterns and alternatives
+
+The maintainer's review of 2026-09-22 asked for backend-neutral shapes in four places.
+This section records, per changed step, the patterns weighed and the one chosen, so the choice stays legible without the review thread.
+
+### Step 7, the metadata fields
+
+- Kafka-only fields with one combined table was the first shape.
+  It hid different capabilities behind one `None` row per backend.
+- Filling each field where the backend has the data is the chosen shape.
+  NATS supplies the stream sequence and the publish time, and Redis supplies the id's time component.
+  Every fill is a checked conversion, because `offset` is `i64` while the NATS sequence is `u64`.
+- Per-field rows with the fill deferred was the alternative, and it keeps the non-Kafka fields empty.
+- The Redis wording is the constraint that survived verification.
+  An entry id carries the instance's millisecond only when Redis generated it.
+  The field therefore exposes the id's time component, never an exact publish time.
+- A namespaced attribute map, the shape of the OpenTelemetry messaging conventions (`messaging.kafka.offset`, `messaging.kafka.partition`), was weighed too.
+  It carries any backend's coordinates without new fields.
+  The price is typed access: a string lookup and a parse where a field gives an `Option<i64>`.
+  The typed fields are kept because a handler reads them on every delivery and the set is small.
+  The attribute map stays the shape for an export layer, not for the handler's argument.
+
+### Step 5, the broadcast start
+
+- A Kafka-typed knob, `with_broadcast_start(KafkaOffsetReset)` on `ConsumerOptions<Kafka>`, was the first shape.
+  It bakes Kafka into a concept every log-shaped broker has, and a later NATS or Redis start would have needed a second knob.
+- A backend-neutral enum on the `HasBroadcast`-scoped options is the chosen shape.
+  NATS has `DeliverPolicy::{All, New, ByStartTime}` and a Redis stream id starts with a millisecond, so head, tail and timestamp map onto both.
+  Each backend refuses at `subscribe()` what it cannot honour, the rule the FIFO consumer already applies to the commit interval.
+- Implementing the NATS and Redis mappings in the same step was set aside for scope.
+  The type and the refusal land now, and the mappings land later, each with its own tests.
+- An absolute position is the pattern the brokers offer as well: async-nats has `DeliverPolicy::ByStartSequence` and RabbitMQ Streams take a numeric offset.
+  It is deferred because a sequence or an offset names a position on one backend's log and means nothing on another.
+  It would be the first backend-specific variant on a neutral enum, and `#[non_exhaustive]` leaves the room for it.
+
 ## Done criteria
 
 - [ ] `cargo fmt -- --check` and the four clippy commands exit 0.
@@ -833,13 +948,16 @@ That is the at-least-once contract the rest of the crate keeps, and the PR body 
   Revisit if a user runs intervals above a few seconds.
 - `commit_batch_end` still runs its `Sync` commit on `spawn_blocking`, which runtime shutdown waits for.
   The dedicated-thread shape of step 4 applies there too, as a follow-up.
-- The three metadata fields are `None` on every backend but Kafka.
-  NATS could fill `offset` from the stream sequence and `timestamp_ms` from the message info, and Redis could fill `offset` from the entry id.
+- The three metadata fields are filled where a backend has the data.
+  Kafka fills all three, and NATS fills `offset` from the stream sequence and `timestamp_ms` from the message info.
+  Redis fills `timestamp_ms` from the entry id's time component.
+  SQS could fill `timestamp_ms` from `SentTimestamp` and RabbitMQ from the AMQP `timestamp` property.
   Do it per backend with its own availability row, as `delivery_count` did.
 - `kafka_external_topic()` refuses `sequenced()` for now.
   Nothing in the Kafka FIFO consumer depends on shove having created the topic, so lifting the guard is additive once a user needs it.
-- `KafkaOffsetReset` now describes a position on a topic for two callers.
-  If a fourth variant is ever needed for one of them only, split the type then, not now.
+- `KafkaOffsetReset` describes a position for `reset_consumer_group_offsets` alone.
+  The broadcast start is the backend-neutral `BroadcastStart`, and `KafkaAutoOffsetReset` is the group's librdkafka policy.
+  The three types share the timestamp unit and nothing else, so a variant added to one does not touch the others.
 - Every new `.set(` on the Kafka client config still has to be checked against plan 011's reserved-key list when that plan lands.
 - `FailReason::SchemaUnavailable` is the first reason that `record_failed` counts and `record_terminal` never does.
   `record_terminal`'s doc in `src/metrics.rs` is the authoritative completeness statement and must stay accurate.

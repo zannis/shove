@@ -237,7 +237,9 @@ impl FailReason {
     #[cfg(feature = "kafka-schema-registry")]
     pub(crate) fn for_schema_reason(reason: &str) -> FailReason {
         match reason {
-            "schema_frame_invalid" | "schema_unsupported_codec" => FailReason::SchemaFrame,
+            "schema_frame_invalid"
+            | "schema_unsupported_codec"
+            | "schema_message_index_rejected" => FailReason::SchemaFrame,
             _ => FailReason::SchemaValidation,
         }
     }
@@ -1014,6 +1016,10 @@ mod tests {
         );
         assert_eq!(
             FailReason::for_schema_reason("schema_unsupported_codec").as_label(),
+            "schema_frame"
+        );
+        assert_eq!(
+            FailReason::for_schema_reason("schema_message_index_rejected").as_label(),
             "schema_frame"
         );
         assert_eq!(

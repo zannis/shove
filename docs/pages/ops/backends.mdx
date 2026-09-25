@@ -95,7 +95,16 @@ On macOS, Homebrew's `cyrus-sasl` satisfies it.
 Only OpenSSL, and Cyrus SASL under `kafka-gssapi`, are linked from the system.
 The `rdkafka` crate's `dynamic-linking` feature is the opt-in exception, and shove does not enable it.
 
-**Consumer offsets are committed asynchronously.** `librdkafka` commits offsets in the background. On clean shutdown, shove flushes pending commits before exiting. On a crash or SIGKILL, expect at-least-once redelivery from the last committed offset when the consumer restarts. Design handlers to be idempotent or use the dedup layer to handle this.
+**Consumer offsets are committed asynchronously, at most once per commit interval.** shove tracks handler completions and commits them asynchronously every 500 ms by default.
+`with_commit_interval` on `KafkaConsumerGroupConfig` or `ConsumerOptions::<Kafka>` changes the cadence, trading coordinator requests for a wider replay window.
+On clean shutdown, shove first waits for the in-flight handlers to finish.
+That wait is bounded by the handler timeout and by any in-place delays on an external topic.
+It then commits the final position synchronously from a dedicated thread and waits at most 20 s for that commit.
+That 20 s bound covers the concurrent consumer's final commit only.
+A synchronous commit already in flight when shutdown fires, the one that retires a discarded record, blocks for as long as librdkafka retries it.
+A FIFO consumer commits a discarded message synchronously and a batch consumer commits every flush synchronously, and those commits block the same way.
+On a crash or SIGKILL, expect at-least-once redelivery from the last committed offset when the consumer restarts.
+Design handlers to be idempotent or use the dedup layer to handle this.
 
 ## Redis / Valkey Streams
 

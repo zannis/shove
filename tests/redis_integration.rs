@@ -26,8 +26,8 @@ use shove::redis::{
     RedisConfig, RedisConsumer, RedisConsumerGroupConfig, RedisMode, RedisQueueStatsProvider,
 };
 use shove::{
-    Broker, ConsumerOptions, JsonCodec, MessageHandler, MessageMetadata, Outcome, Redis,
-    SequenceFailure, SequencedTopic, Topic, TopologyBuilder,
+    BroadcastStart, Broker, ConsumerOptions, JsonCodec, MessageHandler, MessageMetadata, Outcome,
+    Redis, SequenceFailure, SequencedTopic, ShoveError, Topic, TopologyBuilder,
 };
 
 // ---------------------------------------------------------------------------
@@ -180,6 +180,17 @@ async fn connect_with_retry(url: &str, group: &str, budget: Duration) -> Broker<
         "connect to Redis at {url} after {budget:?}: {}",
         last_err.expect("must have at least one error before timeout")
     );
+}
+
+/// Milliseconds since the Unix epoch, the unit of `MessageMetadata::timestamp_ms`.
+fn epoch_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_millis(),
+    )
+    .expect("fits an i64")
 }
 
 async fn poll_until<F: Fn() -> bool>(cond: F, timeout: Duration) -> bool {
@@ -801,6 +812,7 @@ async fn fifo_same_key_in_order() {
         .await
         .expect("declare");
 
+    let before_ms = epoch_ms();
     let publisher = broker.publisher().await.expect("publisher");
     for seq in 0..10u64 {
         publisher
@@ -811,25 +823,36 @@ async fn fifo_same_key_in_order() {
             .await
             .expect("publish");
     }
+    let after_ms = epoch_ms();
 
+    type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
     let received = Arc::new(tokio::sync::Mutex::new(Vec::<u64>::new()));
+    let coordinates = Arc::new(tokio::sync::Mutex::new(Vec::<Coordinates>::new()));
 
     #[derive(Clone)]
-    struct H(Arc<tokio::sync::Mutex<Vec<u64>>>);
+    struct H(
+        Arc<tokio::sync::Mutex<Vec<u64>>>,
+        Arc<tokio::sync::Mutex<Vec<Coordinates>>>,
+    );
     impl MessageHandler<LedgerTopic> for H {
         type Context = ();
-        async fn handle(&self, msg: Event, _: MessageMetadata, _: &()) -> Outcome {
+        async fn handle(&self, msg: Event, meta: MessageMetadata, _: &()) -> Outcome {
             self.0.lock().await.push(msg.seq);
+            self.1
+                .lock()
+                .await
+                .push((meta.partition, meta.offset, meta.timestamp_ms));
             Outcome::Ack
         }
     }
 
     let received_c = received.clone();
+    let coordinates_c = coordinates.clone();
     let mut group = broker.consumer_group();
     group
         .register_fifo::<LedgerTopic, _>(
             ConsumerGroupConfig::new(RedisConsumerGroupConfig::default()),
-            move || H(Arc::clone(&received_c)),
+            move || H(Arc::clone(&received_c), Arc::clone(&coordinates_c)),
         )
         .await
         .expect("register_fifo");
@@ -852,6 +875,23 @@ async fn fifo_same_key_in_order() {
     assert_eq!(seqs.len(), 10, "expected 10 messages, got {}", seqs.len());
     let expected: Vec<u64> = (0..10).collect();
     assert_eq!(*seqs, expected, "messages must arrive in sequence order");
+
+    // The FIFO path fills the same coordinates as the standard path: no
+    // partition and no offset on a stream, and the entry id's time component
+    // as the timestamp. Five minutes of tolerance absorb the container's
+    // clock and still rule out a unit mix-up.
+    let coordinates = coordinates.lock().await;
+    assert_eq!(coordinates.len(), 10, "one set of coordinates per delivery");
+    let tolerance = 5 * 60 * 1000;
+    for (partition, offset, timestamp_ms) in coordinates.iter() {
+        assert_eq!(*partition, None, "Redis Streams have no partitions");
+        assert_eq!(*offset, None, "an entry id is not a log position");
+        let ts = timestamp_ms.expect("an auto-generated entry id carries the instance clock");
+        assert!(
+            ts >= before_ms - tolerance && ts <= after_ms + tolerance,
+            "timestamp_ms {ts} is not within the publish window {before_ms}..{after_ms}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5228,4 +5268,183 @@ mod lease_tests {
              terminal outcome",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The entry id's time component reaches the handler as `timestamp_ms`
+// ---------------------------------------------------------------------------
+
+/// The first field of a stream entry id is the instance clock when Redis
+/// generated the id, and it reaches the handler as `timestamp_ms`: the id's
+/// time component in Unix milliseconds. No partition and no offset, because
+/// an entry id is not a log position.
+#[tokio::test]
+async fn redis_delivery_fills_timestamp_from_the_entry_id() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
+
+    let broker = make_broker("redis-int-coordinates-grp").await;
+    broker
+        .topology()
+        .declare::<HeadersTopic>()
+        .await
+        .expect("declare");
+
+    let millis_now = || {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after the epoch")
+                .as_millis(),
+        )
+        .expect("fits an i64")
+    };
+    let before_ms = millis_now();
+    broker
+        .publisher()
+        .await
+        .expect("publisher")
+        .publish::<HeadersTopic>(&Order { id: 11 })
+        .await
+        .expect("publish");
+    let after_ms = millis_now();
+
+    let captured: Arc<tokio::sync::Mutex<Option<Coordinates>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let call_count = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct H(
+        Arc<tokio::sync::Mutex<Option<Coordinates>>>,
+        Arc<AtomicUsize>,
+    );
+    impl MessageHandler<HeadersTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, meta: MessageMetadata, _: &()) -> Outcome {
+            *self.0.lock().await = Some((meta.partition, meta.offset, meta.timestamp_ms));
+            self.1.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<HeadersTopic, _>(
+            H(captured.clone(), call_count.clone()),
+            ConsumerOptions::<Redis>::new(),
+        )
+        .expect("register");
+
+    let probe = call_count.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 1,
+            Duration::from_secs(15),
+        )
+        .await;
+    };
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    let (partition, offset, timestamp_ms) =
+        captured.lock().await.expect("the delivery was captured");
+    assert_eq!(partition, None, "Redis Streams have no partitions");
+    assert_eq!(offset, None, "an entry id is not a log position");
+    let ts = timestamp_ms.expect("an auto-generated entry id carries the instance clock");
+    // The container's clock and the host's may differ a little; a tolerance
+    // of five minutes still rules out a unit mix-up (seconds or nanoseconds).
+    let tolerance = 5 * 60 * 1000;
+    assert!(
+        ts >= before_ms - tolerance && ts <= after_ms + tolerance,
+        "timestamp_ms {ts} is not within the publish window {before_ms}..{after_ms}"
+    );
+}
+
+/// Acks everything; for the entry points that must refuse before a delivery.
+struct NoopGuardHandler;
+impl MessageHandler<HeadersTopic> for NoopGuardHandler {
+    type Context = ();
+    async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+}
+impl MessageHandler<LedgerTopic> for NoopGuardHandler {
+    type Context = ();
+    async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+}
+
+/// The direct and FIFO entry points refuse a set broadcast start, as the
+/// supervisor and group paths do: `with_broadcast_start` reaches
+/// `RedisConsumer::run` and `run_fifo` as a `Topology` error before any
+/// stream is read, synchronously, which the timeout pins.
+#[tokio::test]
+async fn direct_and_fifo_entry_points_refuse_a_broadcast_start() {
+    let url = redis_url().await;
+    // The same container-init retry as `make_broker`: the first connection
+    // can land while Redis is still starting.
+    let mut client = None;
+    for attempt in 0u32..5 {
+        let cfg = RedisConfig::new(RedisMode::Standalone {
+            url: url.to_owned(),
+        })
+        .with_group("redis-int-broadcast-start-guard");
+        match <Redis as shove::Backend>::connect(cfg).await {
+            Ok(c) => {
+                client = Some(c);
+                break;
+            }
+            Err(_) if attempt < 4 => {
+                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt + 1))).await;
+            }
+            Err(e) => panic!("connect RedisClient after retries: {e}"),
+        }
+    }
+    let client = client.expect("connected within the retry budget");
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        RedisConsumer::new(client.clone()).run::<HeadersTopic, _>(
+            NoopGuardHandler,
+            (),
+            ConsumerOptions::<Redis>::new().with_broadcast_start(BroadcastStart::Head),
+        ),
+    )
+    .await
+    .expect("the refusal is synchronous")
+    .expect_err("a set broadcast start must be refused on the direct path");
+    let ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains(HeadersTopic::topology().queue())
+            && msg.contains("with_broadcast_start(Head)")
+            && msg.contains("RedisConsumer::run"),
+        "the error names the topic, the start and the entry point: {msg}"
+    );
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        RedisConsumer::new(client).run_fifo::<LedgerTopic, _>(
+            NoopGuardHandler,
+            (),
+            ConsumerOptions::<Redis>::new().with_broadcast_start(BroadcastStart::Tail),
+        ),
+    )
+    .await
+    .expect("the refusal is synchronous")
+    .expect_err("a set broadcast start must be refused on the FIFO path");
+    let ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains(LedgerTopic::topology().queue())
+            && msg.contains("with_broadcast_start(Tail)")
+            && msg.contains("RedisConsumer::run_fifo"),
+        "the error names the topic, the start and the entry point: {msg}"
+    );
 }

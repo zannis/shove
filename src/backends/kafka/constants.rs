@@ -81,6 +81,14 @@ pub(super) fn consumer_group_id_fifo_scoped(queue: &str, fan_out_group: Option<&
 /// a per-restart name in every tool that enumerates group ids, which is the
 /// residue this feature exists to avoid. Every instance sharing one inert
 /// string leaves nothing to accumulate.
+///
+/// An explicit `ConsumerOptions::<Kafka>::with_group_id` replaces this
+/// default verbatim. The value stays inert, but librdkafka looks up the
+/// configured group's coordinator even for an assign-only consumer, and a
+/// cluster ACL that grants group Describe on one prefix only answers that
+/// lookup with `GroupAuthorizationFailed` for any other name. The broadcast
+/// loop tolerates that error; picking an id under the granted prefix is how a
+/// deployment avoids provoking it at all.
 pub(super) fn broadcast_group_id(queue: &str) -> String {
     format!("{queue}-broadcast")
 }
@@ -145,6 +153,31 @@ pub(super) const DEFAULT_REPLICATION: i32 = 1;
 /// healthy cluster but short enough that a hung broker cannot stall
 /// shutdown indefinitely.
 pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+
+/// How long the concurrent receive loop waits for its final synchronous
+/// offset commit at shutdown before giving up on the result.
+///
+/// The commit runs on a dedicated thread that also owns the consumer's
+/// close, so a frozen coordinator can hold that thread for as long as
+/// librdkafka retries - minutes - without holding the runtime or the
+/// process. Chosen against the 30 s termination grace Kubernetes gives a
+/// Pod by default, so a consumer that gives up still exits before it is
+/// killed. Past the deadline the loop logs that the batch may be redelivered
+/// and returns; the thread finishes on its own.
+pub(super) const SHUTDOWN_COMMIT_DEADLINE: Duration = Duration::from_secs(20);
+
+/// The longest commit interval `with_commit_interval` admits, on both the
+/// group config and the consumer options.
+///
+/// The gate adds the interval to an `Instant`, so an unbounded value can
+/// make that sum unrepresentable, and the fence threshold grows with four
+/// intervals. An hour is already far past any sane commit cadence: the
+/// interval bounds the replay window after a crash, and a group that
+/// commits once an hour replays up to an hour of records on every restart.
+/// Refused at the setter, and again where the receive loop reads the field
+/// (`ConsumerOptions::kafka_commit_interval` is public), so the mistake is a
+/// panic before any consumer is created and never a fault in the loop.
+pub(super) const MAX_COMMIT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 // ---------------------------------------------------------------------------
 // rdkafka producer / consumer tuning

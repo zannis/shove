@@ -16,11 +16,14 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use shove::inmemory::{InMemoryBroker, InMemoryConsumerGroupConfig};
+use shove::SequencedTopic as _;
+use shove::inmemory::{InMemoryBroker, InMemoryConsumer, InMemoryConsumerGroupConfig};
 use shove::{
-    Broker, ConsumerGroupConfig, ConsumerOptions, InMemory, MessageHandler, MessageMetadata,
-    Outcome, ShoveError, Topic, TopologyBuilder, define_topic,
+    BroadcastStart, Broker, ConsumerGroupConfig, ConsumerOptions, InMemory, MessageHandler,
+    MessageMetadata, Outcome, SequenceFailure, ShoveError, Topic, TopologyBuilder,
+    define_sequenced_topic, define_topic,
 };
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Invalidate {
@@ -42,6 +45,25 @@ define_topic!(
     Invalidate,
     TopologyBuilder::new("plain-orders-bcast").build()
 );
+
+define_sequenced_topic!(
+    KeyedOrders,
+    Invalidate,
+    |m: &Invalidate| m.key.to_string(),
+    TopologyBuilder::new("keyed-orders-bcast")
+        .sequenced(SequenceFailure::Skip)
+        .allow_message_loss()
+        .build()
+);
+
+/// Acks everything; for the entry points that must refuse before a delivery.
+struct Noop;
+impl<T: Topic<Message = Invalidate>> MessageHandler<T> for Noop {
+    type Context = ();
+    async fn handle(&self, _: Invalidate, _: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+}
 
 /// Records every key it is handed, then acks.
 #[derive(Clone)]
@@ -721,4 +743,150 @@ async fn an_ordinary_topology_is_unaffected() {
         0,
         "an ordinary topology creates no broadcast state"
     );
+}
+
+/// The direct and FIFO entry points refuse a set start too, on the in-process
+/// broker as on every backend: a competing consumer's start is its queue's
+/// position, so the setting would be read by nothing. Refused before any
+/// delivery, and synchronously, which the timeout pins.
+#[tokio::test]
+async fn direct_and_fifo_entry_points_refuse_a_broadcast_start() {
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker
+        .topology()
+        .declare::<PlainOrders>()
+        .await
+        .expect("declare plain");
+    broker
+        .topology()
+        .declare::<KeyedOrders>()
+        .await
+        .expect("declare keyed");
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        InMemoryConsumer::new(client.clone()).run::<PlainOrders, _>(
+            Noop,
+            (),
+            ConsumerOptions::new()
+                .with_broadcast_start(BroadcastStart::Head)
+                .with_shutdown(CancellationToken::new()),
+        ),
+    )
+    .await
+    .expect("the refusal is synchronous")
+    .expect_err("a set broadcast start must be refused on the direct path");
+    let ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("plain-orders-bcast")
+            && msg.contains("with_broadcast_start(Head)")
+            && msg.contains("InMemoryConsumer::run"),
+        "the error names the topic, the start and the entry point: {msg}"
+    );
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        InMemoryConsumer::new(client).run_fifo::<KeyedOrders, _>(
+            Noop,
+            (),
+            ConsumerOptions::new()
+                .with_broadcast_start(BroadcastStart::Tail)
+                .with_shutdown(CancellationToken::new()),
+        ),
+    )
+    .await
+    .expect("the refusal is synchronous")
+    .expect_err("a set broadcast start must be refused on the FIFO path");
+    let ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("keyed-orders-bcast")
+            && msg.contains("with_broadcast_start(Tail)")
+            && msg.contains("InMemoryConsumer::run_fifo"),
+        "the error names the topic, the start and the entry point: {msg}"
+    );
+}
+
+/// A timestamp start is milliseconds since the Unix epoch on every backend,
+/// so a negative one names no instant. It is refused at `subscribe()` by the
+/// neutral layer, before the backend's own check, with the value in the
+/// error; a backend that honours `Timestamp` would otherwise hand a negative
+/// sentinel to its broker, and one that refuses it would name the wrong reason.
+#[tokio::test]
+async fn a_negative_timestamp_start_is_refused_before_the_backend_check() {
+    let broker = Broker::<InMemory>::new(Default::default())
+        .await
+        .expect("in-memory broker");
+    let mut subscriber = broker.broadcast_subscriber();
+
+    let err = subscriber
+        .subscribe::<CacheInvalidations, _>(
+            Recorder::new(),
+            ConsumerOptions::new().with_broadcast_start(BroadcastStart::Timestamp(-1)),
+        )
+        .expect_err("a negative timestamp must be refused");
+    let ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("cache-invalidations-bcast")
+            && msg.contains("Timestamp(-1)")
+            && msg.contains("Unix epoch"),
+        "the error names the topic, the value and the unit: {msg}"
+    );
+
+    // The refusal leaves the handle free to retry with a valid start.
+    subscriber
+        .subscribe::<CacheInvalidations, _>(
+            Recorder::new(),
+            ConsumerOptions::new().with_broadcast_start(BroadcastStart::Tail),
+        )
+        .expect("the tail is accepted after the refusal");
+}
+
+/// `with_broadcast_start` is backend-neutral, and a backend that cannot
+/// honour a variant refuses it at `subscribe()`, synchronously, rather than
+/// subscribing at the tail and calling the setting honoured. The in-process
+/// broker's per-subscriber buffer exists only from the subscription on, so
+/// `Head` and `Timestamp` are refused here; `Tail` changes nothing and passes.
+#[tokio::test]
+async fn broadcast_start_is_refused_by_a_backend_that_cannot_honour_it() {
+    let broker = Broker::<InMemory>::new(Default::default())
+        .await
+        .expect("in-memory broker");
+    let mut subscriber = broker.broadcast_subscriber();
+
+    for start in [
+        BroadcastStart::Head,
+        BroadcastStart::Timestamp(1_700_000_000_000),
+    ] {
+        let err = subscriber
+            .subscribe::<CacheInvalidations, _>(
+                Recorder::new(),
+                ConsumerOptions::new().with_broadcast_start(start),
+            )
+            .expect_err("a start the in-process broker cannot honour must be refused");
+        let ShoveError::Topology(msg) = err else {
+            panic!("expected ShoveError::Topology, got {err:?}");
+        };
+        assert!(
+            msg.contains("cache-invalidations-bcast")
+                && msg.contains(&format!("with_broadcast_start({start:?})"))
+                && msg.contains("BroadcastStart::Tail"),
+            "the error names the topic, the refused start and the way out: {msg}"
+        );
+    }
+
+    // A refused subscribe leaves the handle free: the tail is accepted after
+    // the refusals of `Head` and `Timestamp`, on the same topic.
+    subscriber
+        .subscribe::<CacheInvalidations, _>(
+            Recorder::new(),
+            ConsumerOptions::new().with_broadcast_start(BroadcastStart::Tail),
+        )
+        .expect("the tail is every backend's default and is accepted");
 }

@@ -138,7 +138,8 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
     .with_handler_timeout(Duration::from_secs(30))
     .with_concurrent_processing(true)
     .with_group_id("billing-orders-consumer")          // override the default `{queue}-consumer`
-    .with_auto_offset_reset(KafkaAutoOffsetReset::Latest);
+    .with_auto_offset_reset(KafkaAutoOffsetReset::Latest)
+    .with_commit_interval(Duration::from_secs(5));     // commit at most every 5 s (default 500 ms)
 ```
 
 - **`with_prefetch_count(u16)`** — librdkafka in-flight cap per consumer task. Default `10`.
@@ -147,6 +148,22 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
 - **`with_concurrent_processing(bool)`** — dispatch each fetched message to its own tokio task (rejected for sequenced topics). Default `false`.
 - **`with_group_id(impl Into<String>)`** — override the broker-side consumer group ID. Defaults to `"{queue}-consumer"`. Set this when two independent services consume the same topic and must each receive every message (fan-out) — otherwise they share a group and compete for partitions. Prefer `.for_consumer_group(...)` on the topology (below), which sets the group *and* the DLQ/hold-queue names together.
 - **`with_auto_offset_reset(KafkaAutoOffsetReset)`** — `Earliest` (default, replay history), `Latest` (tail-only), or `None` (refuse silent replay/skip on a fresh group).
+  The same setting is available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths, which have no group config to carry it.
+  Under `None`, a group with no usable committed offset ends its consumer with a `ShoveError::Topology` naming librdkafka's `AutoOffsetReset` answer.
+  A reconnect would only meet the same answer.
+  Commit a starting position first, with `reset_consumer_group_offsets` (below), or pick another policy.
+  The DLQ drain (`run_dlq_with_options`) refuses the setting because it hard-codes `earliest`.
+  That policy applies only while the drain's group has no usable committed offset.
+  A fresh drain therefore never skips a dead letter, and a restarted drain resumes from its commit.
+- **`with_commit_interval(Duration)`** - how often each consumer commits the offsets its handlers completed.
+  The default is `500ms`.
+  The interval must be positive and at most one hour; the setter panics otherwise, so an unrepresentable commit deadline is refused at configuration time and never met in the receive loop.
+  The check runs again where the consumer starts, so a value written to the public `kafka_commit_interval` field past the setter is refused there.
+  A longer interval sends fewer OffsetCommit requests and widens the replay window after a crash or rebalance by the same amount.
+  Standard groups only: a FIFO consumer commits each message as it settles, so `register_fifo` refuses a config that sets an interval.
+  The DLQ drain commits each dead letter as it settles and refuses the setting on `ConsumerOptions::<Kafka>` for the same reason.
+  See [Offset commit semantics](#offset-commit-semantics).
+  The same setting is available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths.
 
 ### Fan-out — a second reader on the same topic
 
@@ -206,6 +223,48 @@ The returned `KafkaOffsetResetReport` carries one entry per partition with the p
 
 Kafka is the only backend with this API: it is the only one shove supports where a group's read position is a broker-side committed offset an operator can rewrite. Redis Streams' `XGROUP SETID` is the nearest equivalent and is not yet exposed.
 
+### Starting a broadcast subscription elsewhere than the tail
+
+A [broadcast](/concepts/broadcast) subscription assigns every partition itself and never commits, so it has no stored position to reset.
+Where it starts is a property of the subscription, set on its options:
+
+```rust,no_run
+use shove::BroadcastStart;
+
+let mut subscriber = broker.broadcast_subscriber();
+subscriber.subscribe::<CacheInvalidations, _>(
+    Evict,
+    ConsumerOptions::<Kafka>::new()
+        // Replay everything the topic still retains, then keep tailing.
+        .with_broadcast_start(BroadcastStart::Head)
+        // The inert `group.id` the handle carries; see below.
+        .with_group_id("cache-invalidations-broadcast"),
+)?;
+```
+
+`BroadcastStart` is backend-neutral, and Kafka is the backend that honours all three variants on this version.
+A broadcast subscription refuses `with_commit_interval` and `with_auto_offset_reset` at `subscribe()`: it commits nothing and assigns every partition at an explicit offset, so neither setting would change anything, and a setting that changes nothing is refused rather than dropped.
+The competing-consumer entry points refuse `with_broadcast_start` for the same reason.
+
+- **`BroadcastStart::Tail`**, and no call at all - every partition at its end offset: deliver-new, the broadcast contract.
+- **`BroadcastStart::Head`** - every partition at its beginning, so a fresh instance replays the retained log before it tails.
+  This is the right start for a subscriber that rebuilds an in-memory view from the topic instead of from a separate store.
+- **`BroadcastStart::Timestamp(ms)`** - the first record at or after that point, in milliseconds since the Unix epoch.
+  The lookup is `offsets_for_times`, exactly as [`reset_consumer_group_offsets`](#re-anchoring-a-group-seek-to-tail--head--timestamp) resolves it.
+  A partition with no record at or after the point starts at its tail.
+  A partition the lookup cannot answer for fails the subscription rather than silently starting at the tail.
+
+A partition added while the subscription runs is picked up within a few seconds and assigned at the same start.
+A reconnect after a broker outage re-resolves the start as it stands then.
+A `Head` subscription therefore replays the retained log again, the price of having no stored position.
+
+`with_group_id` names the inert `group.id` the groupless handle is configured with, and the default is `{queue}-broadcast`.
+Nothing joins under it and nothing commits to it either way.
+Set it when the cluster's ACLs grant group Describe on one prefix only.
+librdkafka looks up the configured group's coordinator even for an assign-only handle, and an unauthorised lookup draws a `GroupAuthorizationFailed` on every attempt.
+The subscription tolerates that error: it warns once and keeps fetching, because fetching never goes through the coordinator.
+An id under the granted prefix keeps the logs clean.
+
 ### Replication factor
 
 Auto-created topics get replication factor `1` by default, which is fine for single-broker dev but unsafe in production. Set a cluster-wide default on the registry:
@@ -261,9 +320,51 @@ See the [Basic example](/backends/kafka/examples/basic) for a full runnable walk
 
 ## Offset commit semantics
 
-`Outcome::Ack` commits the offset immediately after the handler returns. `Outcome::Retry` and `Outcome::Defer` defer the offset commit until the delayed republish to the hold topic has been acknowledged by the broker. This closes the publish-then-commit race: a broker crash or process kill between handler return and republish redelivers the message on restart rather than silently dropping it.
+`Outcome::Ack` marks the offset complete as soon as the handler returns.
+`Outcome::Retry` and `Outcome::Defer` mark it complete only once the broker has acknowledged the delayed republish to the hold topic.
+This closes the publish-then-commit race.
+A broker crash or process kill between handler return and republish redelivers the message on restart rather than silently dropping it.
 
-On shutdown the consumer drains the in-flight republish queue before exiting the poll loop, so pending Retry/Defer messages are persisted even if the shutdown signal arrives mid-batch.
+Completions are tracked in memory per partition and committed **asynchronously, at most once per commit interval**.
+The interval is 500 ms by default, configurable with `with_commit_interval` on `KafkaConsumerGroupConfig` or `ConsumerOptions::<Kafka>`.
+The gate keeps the number of in-flight commits O(1) however fast the consumer runs.
+A longer interval trades coordinator requests for a wider replay window.
+A commit the coordinator rejects is re-offered on a later drain.
+A consumer whose commits keep being rejected with no rebalance resolving them is treated as fenced and reconnects.
+That threshold grows with the interval, because the streak can only clear on a drain.
+
+The commit position is derived from the offsets the broker actually delivered, never from a run of consecutive integers.
+A hole left by log compaction or by a transactional producer's control records does not hold the position back.
+Compacted and transactional topics therefore commit past such a hole as soon as every delivered record below it has completed.
+That holds for a hole between delivered records.
+A trailing control record is different: with nothing delivered after it, the committed position stays one below the high watermark.
+An idle transactional topic therefore reads a lag of 1 until the next record arrives, and nothing is redelivered.
+
+On shutdown the consumer first waits for its in-flight handlers to finish.
+That wait is bounded by the handler timeout and by any in-place delays.
+It then drains the republish queue and commits its final position **synchronously**.
+The commit runs on a dedicated thread that also owns the consumer's close.
+The thread is spawned before it is handed the consumer, so a failed spawn never closes the consumer on the runtime thread.
+If no thread can be spawned, nothing commits and the close moves to a second, close-only thread.
+If that thread cannot be spawned either, the handle is leaked and logged at error level.
+The leaked consumer keeps heartbeating, so while the process lives its partitions stay assigned until `max.poll.interval.ms` (5 min) passes without a poll.
+Once the process exits, the broker drops the member after the session timeout, as after a crash.
+The consumer waits for that commit for at most 20 s (`SHUTDOWN_COMMIT_DEADLINE` in `kafka::constants`).
+The deadline is chosen against the 30 s termination grace Kubernetes gives a Pod.
+Past the deadline the consumer logs that the batch may be redelivered and returns.
+The thread finishes on its own and never holds the runtime or the process, so a frozen coordinator cannot turn a deploy into a `SIGKILL`.
+
+What that means for replay:
+
+- After a crash, the records completed since the last accepted commit are redelivered.
+  That is about one interval's worth when commits are accepted and every earlier offset on the partition had completed.
+  A rejected commit that is still being re-offered, or an earlier record whose handler is still running, holds the position and widens that window.
+- After a rebalance, a moved partition replays from its last accepted commit.
+- After a clean shutdown, a record whose handler returned a terminal outcome and whose offset reached the final commit is not redelivered.
+  A record whose handler had not settled when shutdown fired stays uncommitted and is redelivered.
+  So is the last batch when the final commit hits its deadline.
+  An asynchronous commit librdkafka was still retrying can also land after the final one.
+  A coordinator hiccup overlapping the shutdown can therefore replay a few records.
 
 `Outcome::Reject` routes to the DLQ (if configured) and commits the offset; the original is not redelivered. Messages that exhaust `max_retries` follow the same DLQ-then-commit path.
 
@@ -369,6 +470,23 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
 
 `accept_schema_subjects([...])` pins the set of Confluent schema subjects that are accepted for a consumer. When not called, the default is derived from the queue name using the Confluent [TopicNameStrategy](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html#subject-name-strategy): `"{queue}-value"`. For a topic named `orders`, that resolves to `orders-value`.
 
+### Protobuf message index
+
+A Confluent protobuf frame carries a message-index array naming which message of the schema file the bytes encode.
+`[0]` is the file's first top-level message, `[1]` the second, and `[0, 2]` the third message nested in the first.
+shove reads the array as Confluent writes it: zigzag varints, with the single-byte shorthand for `[0]`.
+By default the index is read and ignored, so a `ProtobufCodec<M>` decodes whatever message the producer framed as `M`.
+Two messages with compatible field numbers then decode into each other silently.
+`require_schema_message_index([0])` pins the index a consumer accepts.
+A frame with any other index is routed to the DLQ with death reason `schema_message_index_rejected`, counted under `reason="schema_frame"`.
+The check runs before the schema id is resolved, so a rejected frame costs no registry round trip.
+JSON frames carry no index and the setting is inert on them.
+The setter lives on `ConsumerOptions::<Kafka>`, `BatchConsumerOptions::<Kafka>` and `KafkaConsumerGroupConfig`, next to `accept_schema_subjects`.
+All three panic on an empty requirement, a negative index or more than 1024 indexes.
+The parser never yields such an index, so the requirement could never match.
+Refusing it at configuration time points at the cause at startup.
+A value written to the public `schema_message_index` field past the setter is checked when the options are handed to the consumer.
+
 ### Producer-side encoding
 
 The same feature lets a publisher emit Confluent-framed messages, symmetric with how the consumer is configured. Attach a `SchemaRegistry` to a `KafkaPublisherConfig` and obtain the publisher with `Broker::publisher_with`; the publisher then wraps each codec-encoded payload in the Confluent wire frame using the latest registered schema id for the subject. Like the consumer side, framing is a publisher-layer concern — it is **not** baked into the topic's `Codec`.
@@ -418,8 +536,17 @@ The Kafka backend emits `shove_messages_failed_total` with the following `reason
 - `timeout` — handler exceeded `handler_timeout`; retried.
 - `max_retries_exceeded` — retry budget exhausted; routed to DLQ.
 - `rejected` — handler returned `Outcome::Reject`; routed to DLQ.
-- `schema_validation_failed` — schema subject not in the accepted set under `Enforce` mode; routed to DLQ. Requires `kafka-schema-registry`.
-- `schema_unsupported_codec` — registry decoding requested but the topic uses a codec other than JSON or Protobuf; routed to DLQ. Requires `kafka-schema-registry`.
+- `schema_validation` - the registry answered and ruled the record out.
+  The death reason is `schema_validation_failed` when the subject is not in the accepted set under `Enforce` mode.
+  It is `schema_resolve_failed` when the registry does not know the schema id.
+  Routed to DLQ.
+  Requires `kafka-schema-registry`.
+- `schema_frame` - the Confluent frame cannot be used, so no lookup is made.
+  The death reason is `schema_frame_invalid` for a malformed frame.
+  It is `schema_unsupported_codec` when the topic uses a codec other than JSON or Protobuf.
+  It is `schema_message_index_rejected` when the protobuf message index is not the one `require_schema_message_index` pins.
+  Routed to DLQ.
+  Requires `kafka-schema-registry`.
 
 `shove_backend_errors_total` carries the `backend="kafka"` label for connection drops, produce failures, and consume-stream errors.
 
@@ -449,4 +576,5 @@ The Kafka backend emits `shove_messages_failed_total` with the following `reason
 ## See also
 
 - [Liveness Probes](/guides/liveness) — wire `Broker::ping` into a k8s health endpoint.
-- [Broadcast](/concepts/broadcast) — per-instance fan-out via a groupless `assign()` at the tail, leaving `__consumer_offsets` untouched.
+- [Broadcast](/concepts/broadcast) - per-instance fan-out via a groupless `assign()`, leaving `__consumer_offsets` untouched.
+  It starts at the tail by default, or at the head or a timestamp with `with_broadcast_start`.

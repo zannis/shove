@@ -766,7 +766,8 @@ async fn cp_real_schema_registry_e2e() {
     // =======================================================================
     // Scenario 4 (protobuf feature) — register a real PROTOBUF schema, produce
     // two framed `OrderProto` messages with BOTH message-index encodings
-    // (`[0x00]` optimisation and explicit `[0x01,0x00]`), assert both decode.
+    // (`[0x00]` optimisation and explicit `[0x02,0x00]`, count 1 and index 0
+    // as zigzag varints), assert both decode.
     // cp-SR validates proto syntax, so the registered schema must be a valid
     // `.proto`; the consumer derives the wire format from the topic CODEC name
     // regardless of the registry's declared schemaType.
@@ -798,8 +799,9 @@ async fn cp_real_schema_registry_e2e() {
 
         // Message A: single-byte message-index optimisation [0x00].
         produce_framed_protobuf(&client, queue, schema_id, &[0x00], &msg_a).await;
-        // Message B: explicit encoding [0x01, 0x00] (count=1, index=0).
-        produce_framed_protobuf(&client, queue, schema_id, &[0x01, 0x00], &msg_b).await;
+        // Message B: explicit encoding [0x02, 0x00] (count=1 and index=0 as
+        // the zigzag varints a Confluent serializer writes).
+        produce_framed_protobuf(&client, queue, schema_id, &[0x02, 0x00], &msg_b).await;
 
         let registry = SchemaRegistry::builder(sr_base.clone()).build();
         let handler = CaptureProtoHandler::new();

@@ -10,11 +10,12 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "kafka")]
 use crate::backends::kafka::KafkaAutoOffsetReset;
+use crate::broadcast::BroadcastStart;
 use crate::consumer::{
     DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
     validate_message_size,
 };
-use crate::error::Result;
+use crate::error::{Result, ShoveError};
 use crate::outcome::Outcome;
 #[cfg(feature = "kafka-schema-registry")]
 use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
@@ -51,9 +52,25 @@ pub(crate) struct ConsumerOptionsInner {
 
     /// Kafka-only: rdkafka `auto.offset.reset` override. `None` falls back
     /// to the library default of `earliest`. Propagated from
-    /// `KafkaConsumerGroupConfig::with_auto_offset_reset`.
+    /// `KafkaConsumerGroupConfig::with_auto_offset_reset` on the registry
+    /// path, where the group config wins, and from
+    /// `ConsumerOptions::<Kafka>::with_auto_offset_reset` on the direct and
+    /// supervisor paths.
     #[cfg(feature = "kafka")]
     pub kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
+
+    /// Kafka-only: the concurrent consumer's commit-gate window. `None`
+    /// keeps the 500 ms default. Propagated from
+    /// `KafkaConsumerGroupConfig::with_commit_interval` on the registry path
+    /// and from `ConsumerOptions::<Kafka>::with_commit_interval` otherwise.
+    #[cfg(feature = "kafka")]
+    pub kafka_commit_interval: Option<Duration>,
+
+    /// Where a broadcast subscription starts reading. `None` keeps the tail.
+    /// Propagated from `ConsumerOptions::with_broadcast_start`; read by
+    /// `BroadcastImpl::check_options` and the broadcast loops, and refused by
+    /// every other entry point, which never reads it.
+    pub broadcast_start: Option<BroadcastStart>,
 
     /// Kafka-only: Schema Registry client for decoding Confluent wire-framed
     /// messages. `None` disables registry-based decoding.
@@ -67,6 +84,12 @@ pub(crate) struct ConsumerOptionsInner {
     // Read by the decode stage (Task 7).
     #[cfg(feature = "kafka-schema-registry")]
     pub schema_accepted_subjects: Option<Vec<Arc<str>>>,
+
+    /// Kafka-only: the protobuf message index a frame must carry. `None`
+    /// accepts any index. Propagated from `require_schema_message_index` on
+    /// `ConsumerOptions::<Kafka>` and `KafkaConsumerGroupConfig`.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub schema_message_index: Option<Vec<i32>>,
 
     #[cfg(feature = "rabbitmq-transactional")]
     pub exactly_once: bool,
@@ -99,12 +122,17 @@ impl ConsumerOptionsInner {
             kafka_group_id: None,
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: None,
+            #[cfg(feature = "kafka")]
+            kafka_commit_interval: None,
+            broadcast_start: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_enforcement: SchemaEnforcement::Enforce,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]
@@ -122,6 +150,27 @@ impl ConsumerOptionsInner {
 }
 
 impl ConsumerOptionsInner {
+    /// Refuse a set [`BroadcastStart`] at an entry point that never reads it.
+    ///
+    /// `with_broadcast_start` is read by `BroadcastSubscriber::subscribe`
+    /// alone: a competing consumer starts at its committed position, so the
+    /// direct, FIFO, DLQ and supervisor paths would drop the setting
+    /// silently. They call this first instead, so the mistake is a
+    /// `Topology` error at the call site, the same rule the FIFO consumer
+    /// applies to a commit interval. `entry_point` names the caller in the
+    /// message.
+    pub(crate) fn refuse_broadcast_start(&self, queue: &str, entry_point: &str) -> Result<()> {
+        match self.broadcast_start {
+            None => Ok(()),
+            Some(start) => Err(ShoveError::Topology(format!(
+                "topic '{queue}': `with_broadcast_start({start:?})` applies only to \
+                 `BroadcastSubscriber::subscribe`; `{entry_point}` never reads it, because a \
+                 competing consumer starts at its committed position. Drop the call, or \
+                 subscribe through `broker.broadcast_subscriber()`."
+            ))),
+        }
+    }
+
     /// Returns `Ok(())` if the payload is within the configured
     /// `max_message_size`, or an error if it exceeds the limit. Always
     /// succeeds when no limit is set.

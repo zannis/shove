@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use rdkafka::message::{BorrowedMessage, Header, Headers, Message, OwnedHeaders};
 use rdkafka::metadata::Metadata;
 use rdkafka::types::RDKafkaErrorCode;
 use rdkafka::{ClientConfig, ClientContext, Offset, Statistics, TopicPartitionList};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -31,6 +31,7 @@ use crate::backend::batch_consumer::{
 };
 use crate::backend::broadcast::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_broadcast_outcome};
 use crate::batch_consumer::BatchConsumerOptions as GenericBatchConsumerOptions;
+use crate::broadcast::BroadcastStart;
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::Result;
@@ -69,9 +70,10 @@ use super::client::KafkaClient;
 use super::constants::{
     DEATH_COUNT_HEADER, DEATH_REASON_HEADER, FETCH_MIN_BYTES, FETCH_WAIT_MAX_MS,
     MAX_POLL_INTERVAL_MS, MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER, ORIGINAL_QUEUE_HEADER,
-    RETRY_COUNT_HEADER, SESSION_TIMEOUT_MS,
+    RETRY_COUNT_HEADER, SESSION_TIMEOUT_MS, SHUTDOWN_COMMIT_DEADLINE,
 };
-use super::consumer_group::KafkaAutoOffsetReset;
+use super::consumer_group::{KafkaAutoOffsetReset, validate_commit_interval};
+use super::offset_reset::target_from_timestamp_lookup;
 
 // ---------------------------------------------------------------------------
 // Offset tracking for concurrent consumption
@@ -109,10 +111,13 @@ const QUIET_DRAINS_TO_RESOLVE: u32 = 2;
 /// the in-flight count O(1), so close stays prompt. Two costs, both accepted:
 /// a wider crash-redelivery window (which at-least-once semantics already
 /// promise), matching the spirit of Kafka's own 5 s auto-commit default while
-/// staying 10x tighter; and the tracker's `completed` set now buffers up to
-/// one window of completions between drains — memory bounded by consume rate
-/// × this interval (≈6k offsets at 12k msg/s), where it was bounded by
-/// `prefetch_count` before.
+/// staying 10x tighter; and a wider gap between the committed offset and the
+/// consumed position. That gap costs no memory: the tracker's `in_flight` set
+/// holds each delivered offset only from `track_received` until
+/// `mark_complete` removes it, so it never holds more than `prefetch_count`
+/// entries whatever the interval, and the offsets completed since the last
+/// drain are summed up by `position()` alone. A longer interval widens what a
+/// crash redelivers (about 6k offsets at 12k msg/s), nothing else.
 const ASYNC_COMMIT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Rate gate for the receive loop's offset commits: `due` says whether the
@@ -160,20 +165,37 @@ impl AsyncCommitGate {
     /// resetting the gate), a stale-`now` deadline would make the wake arm
     /// ready on construction forever — a hot spin. `now + interval` degrades
     /// to a bounded wake instead.
+    ///
+    /// Checked: a sum `Instant` cannot represent is treated as due now. The
+    /// setters bound the interval to `MAX_COMMIT_INTERVAL`, and `run_with_inner`
+    /// checks the field again before it builds the gate, so this is a second
+    /// line, not the first; the gate must not be the place a bad interval
+    /// first panics.
     fn deadline(&self, now: Instant) -> Instant {
-        match self.last {
-            None => now + self.interval,
-            Some(last) => last + self.interval,
-        }
+        let anchor = self.last.unwrap_or(now);
+        anchor.checked_add(self.interval).unwrap_or(now)
     }
 }
 
 struct PartitionTracker {
-    /// Next offset to commit (exclusive — Kafka convention).
+    /// Next offset to commit (exclusive - Kafka convention): every offset
+    /// delivered under this assignment below it has completed.
     next_to_commit: i64,
-    /// Offsets that have been processed but not yet committable
-    /// (because earlier offsets are still in-flight).
-    completed: BTreeSet<i64>,
+    /// Offsets delivered under this assignment whose handler has not finished
+    /// yet. Bounded by `prefetch_count`, since every entry holds a permit.
+    ///
+    /// The commit position is derived from what was *delivered*, not from a
+    /// run of consecutive integers: log compaction removes records without
+    /// renumbering the survivors, and a transactional producer leaves a
+    /// control record at the end of every transaction that a consumer never
+    /// receives. Either leaves a hole in the offset sequence, and a tracker
+    /// that waited for the hole to fill stalled the partition for the life of
+    /// the assignment.
+    in_flight: BTreeSet<i64>,
+    /// Highest offset delivered under this assignment. With nothing in flight
+    /// the commit position is one past it, which steps over any hole the
+    /// broker never delivered.
+    highest_delivered: i64,
     /// Set when an async commit that included this partition was rejected
     /// (e.g. during a rebalance). Makes the next `drain_committable` re-offer
     /// the current `next_to_commit` even without new completions, so the
@@ -211,10 +233,13 @@ struct PartitionTracker {
 }
 
 impl PartitionTracker {
+    /// Seeds the tracker from the first offset delivered under this
+    /// assignment, which is also the first in-flight offset.
     fn new(first_offset: i64) -> Self {
         Self {
             next_to_commit: first_offset,
-            completed: BTreeSet::new(),
+            in_flight: BTreeSet::from([first_offset]),
+            highest_delivered: first_offset,
             dirty: false,
             dirty_since: None,
             quiet_drains: 0,
@@ -222,13 +247,41 @@ impl PartitionTracker {
         }
     }
 
-    fn mark_complete(&mut self, offset: i64, discard: Option<TerminalDiscard>) {
-        // Completions below the seed are stale: after a partition is removed
-        // on rebalance and re-seeded by the next delivery, completions of
-        // messages in flight from the previous assignment epoch would
-        // otherwise pile up in `completed` forever (never contiguous with
-        // `next_to_commit`).
+    /// Records a delivery under this assignment.
+    ///
+    /// An offset below `next_to_commit` is not tracked. Within one
+    /// assignment librdkafka delivers a partition in offset order, with one
+    /// exception: when offset validation finds the log truncated by a leader
+    /// change, it seeks the partition back to the new leader's end offset for
+    /// the old epoch (`rd_kafka_offset_validate` in the bundled source, under
+    /// every reset policy but `error`), and offsets this assignment already
+    /// committed past arrive again. The handler still sees them. Their
+    /// offsets stay out of `in_flight`, because `position()` is its lowest
+    /// entry and would otherwise drop below what is committed, and because a
+    /// completion for such an offset would meet the stale check below with
+    /// the entry still in the set.
+    fn track_received(&mut self, offset: i64) {
         if offset < self.next_to_commit {
+            return;
+        }
+        self.in_flight.insert(offset);
+        self.highest_delivered = self.highest_delivered.max(offset);
+    }
+
+    fn mark_complete(&mut self, offset: i64, discard: Option<TerminalDiscard>) {
+        // Taken out first, whatever the stale check decides: an entry left
+        // behind would pin `position()` at its offset for the rest of the
+        // assignment. `track_received` keeps such an entry from existing, and
+        // this keeps one from surviving if it ever did.
+        let known = self.in_flight.remove(&offset);
+        // A completion this assignment never delivered is stale: after a
+        // partition is removed on rebalance and re-seeded by the next
+        // delivery, completions of messages in flight from the previous
+        // assignment epoch still arrive. They sit either below the new seed
+        // or above it but outside `in_flight`; both are the old epoch's, and
+        // the new epoch redelivers those offsets itself. A completion below
+        // `next_to_commit` from a post-truncation redelivery lands here too.
+        if offset < self.next_to_commit || !known {
             // This epoch will never commit that offset, so any retirement
             // riding on it is not ours to claim.
             if let Some(discard) = discard {
@@ -239,7 +292,22 @@ impl PartitionTracker {
         if let Some(discard) = discard {
             self.pending_discards.insert(offset, discard);
         }
-        self.completed.insert(offset);
+    }
+
+    /// The exclusive commit position this assignment can offer right now:
+    /// the lowest offset still in flight, or one past the highest delivered
+    /// offset once nothing is in flight. Never consults offsets the broker
+    /// did not deliver, so a compacted or transactional hole does not hold
+    /// the position back.
+    ///
+    /// Saturating, like every other successor on the commit path: at
+    /// `i64::MAX` the exclusive position does not exist, and an unchecked
+    /// `+ 1` would wrap to a negative offset in a release build.
+    fn position(&self) -> i64 {
+        self.in_flight
+            .first()
+            .copied()
+            .unwrap_or_else(|| self.highest_delivered.saturating_add(1))
     }
 
     /// Flags this partition dirty (see the `dirty` field) because a commit
@@ -286,10 +354,7 @@ impl PartitionTracker {
     /// handed to the caller unsettled, because only the commit's result says
     /// whether the retirement actually happened.
     fn drain_committable(&mut self) -> Option<(i64, Vec<TerminalDiscard>)> {
-        let mut next = self.next_to_commit;
-        while self.completed.remove(&next) {
-            next += 1;
-        }
+        let next = self.position();
         let progressed = next > self.next_to_commit;
         let retry = self.dirty;
         self.dirty = false;
@@ -326,11 +391,11 @@ impl PartitionTracker {
     ///
     /// Read-only twin of `drain_committable`'s `progressed || retry`
     /// condition — the receive loop's wake arm uses it to decide whether the
-    /// commit gate's deadline is worth waking for. Completions that are not
-    /// contiguous with `next_to_commit` (a gap is still in flight) do not
-    /// count, exactly as they would not commit.
+    /// commit gate's deadline is worth waking for. Completions behind an
+    /// offset that is still in flight do not count, exactly as they would
+    /// not commit.
     fn has_committable(&self) -> bool {
-        self.dirty || self.completed.contains(&self.next_to_commit)
+        self.dirty || self.position() > self.next_to_commit
     }
 }
 
@@ -347,9 +412,15 @@ impl OffsetTracker {
         }
     }
 
+    /// Records a delivery: seeds the partition's tracker on its first offset
+    /// under this assignment, and marks every later offset in flight so the
+    /// commit position follows what was actually delivered. An offset below
+    /// the partition's committed position is not marked, see
+    /// `PartitionTracker::track_received`.
     fn track_received(&mut self, partition: i32, offset: i64) {
         self.partitions
             .entry(partition)
+            .and_modify(|tracker| tracker.track_received(offset))
             .or_insert_with(|| PartitionTracker::new(offset));
     }
 
@@ -518,9 +589,32 @@ fn get_retry_count(headers: &HashMap<String, String>) -> u32 {
         .unwrap_or(0)
 }
 
+/// Where a record sits in its topic: the partition, the offset inside it and
+/// the broker timestamp when the record carries one. Read once off the
+/// `BorrowedMessage` and carried to every `MessageMetadata` built for the
+/// delivery, including a deferred broadcast redelivery, which keeps the
+/// original record's coordinates rather than inventing new ones.
+#[derive(Debug, Clone, Copy)]
+struct RecordCoordinates {
+    partition: i32,
+    offset: i64,
+    timestamp_ms: Option<i64>,
+}
+
+impl RecordCoordinates {
+    fn of(msg: &BorrowedMessage<'_>) -> Self {
+        Self {
+            partition: msg.partition(),
+            offset: msg.offset(),
+            timestamp_ms: msg.timestamp().to_millis(),
+        }
+    }
+}
+
 fn build_message_metadata(
     headers: &Arc<HashMap<String, String>>,
     redelivered: bool,
+    coordinates: RecordCoordinates,
 ) -> MessageMetadata {
     let retry_count = get_retry_count(headers);
     let delivery_id = headers.get(MESSAGE_ID_HEADER).cloned().unwrap_or_default();
@@ -533,12 +627,20 @@ fn build_message_metadata(
         // indistinguishable from a first read. Reporting `retry_count + 1` here
         // would silently under-count exactly those cases, so report "unknown".
         delivery_count: None,
+        // What Kafka does have is a position in the log, which is exactly
+        // what an audit trail or a replay request needs.
+        partition: Some(coordinates.partition),
+        offset: Some(coordinates.offset),
+        timestamp_ms: coordinates.timestamp_ms,
         headers: Arc::clone(headers),
     }
 }
 
-fn build_dead_metadata(headers: &Arc<HashMap<String, String>>) -> DeadMessageMetadata {
-    let message = build_message_metadata(headers, false);
+fn build_dead_metadata(
+    headers: &Arc<HashMap<String, String>>,
+    coordinates: RecordCoordinates,
+) -> DeadMessageMetadata {
+    let message = build_message_metadata(headers, false, coordinates);
     let reason = headers.get(DEATH_REASON_HEADER).cloned();
     let original_queue = headers.get(ORIGINAL_QUEUE_HEADER).cloned();
     let death_count = headers
@@ -1210,7 +1312,7 @@ async fn route_outcome(
 // Broadcast — one groupless, assign-only subscription per call
 // ---------------------------------------------------------------------------
 
-/// How long `assign_all_partitions_at_end`'s metadata fetch may block.
+/// How long `assign_all_partitions_at`'s metadata fetch may block.
 ///
 /// Matches the timeout the topology declarer and the offset-reset path already
 /// use for their own metadata round trips.
@@ -1227,6 +1329,24 @@ const BROADCAST_ASSIGN_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 struct DeferredDelivery {
     payload: Vec<u8>,
     headers: Arc<HashMap<String, String>>,
+    coordinates: RecordCoordinates,
+}
+
+/// Whether a `recv` error on the groupless broadcast path is the one error
+/// its inert `group.id` can provoke and nothing else.
+///
+/// librdkafka looks up the coordinator of the configured group even for a
+/// consumer that only ever calls `assign()`. A cluster ACL that grants group
+/// Describe on a prefix the inert id does not match answers that lookup with
+/// `GroupAuthorizationFailed`. Fetching does not go through the coordinator,
+/// so the subscription is unaffected, and a consumer that never joins has no
+/// use for the permission. Every other error keeps its meaning: it ends the
+/// connection and the reconnect loop decides.
+fn is_ignorable_groupless_error(error: &KafkaError) -> bool {
+    matches!(
+        error,
+        KafkaError::MessageConsumption(RDKafkaErrorCode::GroupAuthorizationFailed)
+    )
 }
 
 /// Count a broadcast message that is being dropped before or instead of
@@ -1743,21 +1863,26 @@ impl KafkaStreamConsumer {
         }
     }
 
-    /// Assign every partition of `topic` at its current end offset.
+    /// Assign every partition of `topic` at `start`.
     ///
     /// The groupless half of a broadcast subscription. `assign()` instead of
     /// `subscribe()` means librdkafka never sends JoinGroup, so no group is
-    /// created broker-side and no rebalance is paid at boot; `Offset::End`
-    /// means the subscription starts at the tail, so deliver-new falls out of
-    /// the assignment rather than out of a stored offset.
+    /// created broker-side and no rebalance is paid at boot. `None` and
+    /// `Some(Tail)` assign at `Offset::End`, so deliver-new falls out of the
+    /// assignment rather than out of a stored offset - byte for byte the
+    /// behaviour before a start could be configured. `Head` assigns at
+    /// `Offset::Beginning`, and `Timestamp` resolves each partition through
+    /// the same lookup `reset_consumer_group_offsets` uses; see
+    /// [`broadcast_start_positions`](Self::broadcast_start_positions).
     ///
     /// **Blocking** — `fetch_metadata` is a synchronous librdkafka call. Callers
     /// on an async runtime must wrap this in `spawn_blocking`.
     ///
     /// Returns the number of partitions assigned.
-    pub(super) fn assign_all_partitions_at_end(
+    pub(super) fn assign_all_partitions_at(
         &self,
         topic: &str,
+        start: Option<BroadcastStart>,
         timeout: Duration,
     ) -> Result<usize> {
         let metadata = self
@@ -1787,28 +1912,107 @@ impl KafkaStreamConsumer {
             )));
         }
 
-        let mut tpl = TopicPartitionList::new();
-        for pid in &partitions {
-            tpl.add_partition_offset(topic, *pid, Offset::End)
-                .map_err(|e| {
-                    map_kafka_error(&format!("failed to target the tail of {topic}[{pid}]"), e)
-                })?;
-        }
+        let tpl = self.broadcast_start_positions(topic, &partitions, start, timeout)?;
         self.assign(&tpl)
             .map_err(|e| map_kafka_error(&format!("failed to assign partitions of {topic}"), e))?;
         Ok(partitions.len())
+    }
+
+    /// The offset each of `partitions` is assigned at for `start`.
+    ///
+    /// `None` and `Tail` are `Offset::End`, `Head` is `Offset::Beginning`:
+    /// lazy sentinels librdkafka resolves when the fetcher starts, which is
+    /// what a subscription with no stored position wants. `Timestamp` needs
+    /// the broker: the watermarks are fetched **first**, then
+    /// `offsets_for_times`, and each partition resolves through
+    /// [`target_from_timestamp_lookup`] - the order `run_reset` uses, because
+    /// a record landing between the lookup and a *later* watermark fetch would
+    /// otherwise be skipped by the tail fallback. A partition the lookup did
+    /// not resolve fails the whole assignment rather than silently starting at
+    /// the tail.
+    ///
+    /// One exhaustive match over the start, so adding a variant is a compile
+    /// error here rather than a runtime `unreachable!`.
+    ///
+    /// **Blocking** on the `Timestamp` path; callers must use `spawn_blocking`.
+    fn broadcast_start_positions(
+        &self,
+        topic: &str,
+        partitions: &[i32],
+        start: Option<BroadcastStart>,
+        timeout: Duration,
+    ) -> Result<TopicPartitionList> {
+        let ts_ms = match start {
+            None | Some(BroadcastStart::Tail) => {
+                return lazy_positions(topic, partitions, Offset::End);
+            }
+            Some(BroadcastStart::Head) => {
+                return lazy_positions(topic, partitions, Offset::Beginning);
+            }
+            Some(BroadcastStart::Timestamp(ts_ms)) => ts_ms,
+        };
+
+        let mut tpl = TopicPartitionList::new();
+        let mut watermarks = HashMap::with_capacity(partitions.len());
+        for pid in partitions {
+            let (low, high) = self.fetch_watermarks(topic, *pid, timeout).map_err(|e| {
+                map_kafka_error(&format!("failed to fetch watermarks for {topic}[{pid}]"), e)
+            })?;
+            watermarks.insert(*pid, (low, high));
+        }
+        let mut query = TopicPartitionList::new();
+        for pid in partitions {
+            query
+                .add_partition_offset(topic, *pid, Offset::Offset(ts_ms))
+                .map_err(|e| {
+                    map_kafka_error(
+                        &format!("failed to build the timestamp query for {topic}[{pid}]"),
+                        e,
+                    )
+                })?;
+        }
+        let resolved = self.offsets_for_times(query, timeout).map_err(|e| {
+            map_kafka_error(&format!("offset lookup by timestamp failed for {topic}"), e)
+        })?;
+        for elem in resolved.elements_for_topic(topic) {
+            let pid = elem.partition();
+            elem.error().map_err(|e| {
+                ShoveError::Connection(format!(
+                    "offset lookup by timestamp failed for {topic}[{pid}]: {e}"
+                ))
+            })?;
+            let (low, high) = watermarks.get(&pid).copied().ok_or_else(|| {
+                ShoveError::Connection(format!(
+                    "offset lookup by timestamp answered for {topic}[{pid}], which the \
+                     metadata did not list"
+                ))
+            })?;
+            let target = target_from_timestamp_lookup(elem.offset(), low, high, topic, pid)?;
+            tpl.add_partition_offset(topic, pid, Offset::Offset(target))
+                .map_err(|e| {
+                    map_kafka_error(&format!("failed to target {target} of {topic}[{pid}]"), e)
+                })?;
+        }
+        Ok(tpl)
     }
 
     /// Extend a manual broadcast assignment with partitions added since the
     /// previous metadata snapshot.
     ///
     /// Existing partitions are re-assigned at their current consumer position;
-    /// only newly discovered partitions start at `Offset::End`. This avoids
-    /// both replaying already-delivered records and moving an existing
-    /// partition to the tail.
+    /// only newly discovered partitions are resolved, at the same `start` the
+    /// subscription began with, so a `Head` subscription does not skip a new
+    /// partition's first records and a `Tail` one still joins it at the tail.
+    /// This avoids both replaying already-delivered records and moving an
+    /// existing partition.
     ///
     /// **Blocking** for the metadata fetch; callers must use `spawn_blocking`.
-    fn refresh_broadcast_partitions(&self, topic: &str, timeout: Duration) -> Result<usize> {
+    fn refresh_broadcast_partitions(
+        &self,
+        topic: &str,
+        start: Option<BroadcastStart>,
+        timeout: Duration,
+    ) -> Result<usize> {
         let metadata = self
             .fetch_metadata(Some(topic), timeout)
             .map_err(|e| map_kafka_error(&format!("failed to refresh metadata for {topic}"), e))?;
@@ -1818,7 +2022,7 @@ impl KafkaStreamConsumer {
                 e,
             )
         })?;
-        let partition_ids = metadata
+        let new_partitions: Vec<i32> = metadata
             .topics()
             .iter()
             .find(|candidate| candidate.name() == topic)
@@ -1827,34 +2031,60 @@ impl KafkaStreamConsumer {
                     .partitions()
                     .iter()
                     .map(|partition| partition.id())
+                    .filter(|partition| positions.find_partition(topic, *partition).is_none())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-
-        let mut added = 0;
-        for partition in partition_ids {
-            if positions.find_partition(topic, partition).is_none() {
-                positions
-                    .add_partition_offset(topic, partition, Offset::End)
-                    .map_err(|e| {
-                        map_kafka_error(
-                            &format!("failed to target the tail of {topic}[{partition}]"),
-                            e,
-                        )
-                    })?;
-                added += 1;
-            }
+        if new_partitions.is_empty() {
+            return Ok(0);
         }
 
-        if added > 0 {
-            self.assign(&positions).map_err(|e| {
-                map_kafka_error(
-                    &format!("failed to extend broadcast assignment for {topic}"),
-                    e,
-                )
-            })?;
+        let additions = self.broadcast_start_positions(topic, &new_partitions, start, timeout)?;
+        for elem in additions.elements_for_topic(topic) {
+            positions
+                .add_partition_offset(topic, elem.partition(), elem.offset())
+                .map_err(|e| {
+                    map_kafka_error(
+                        &format!(
+                            "failed to extend the assignment with {topic}[{}]",
+                            elem.partition()
+                        ),
+                        e,
+                    )
+                })?;
         }
-        Ok(added)
+        self.assign(&positions).map_err(|e| {
+            map_kafka_error(
+                &format!("failed to extend broadcast assignment for {topic}"),
+                e,
+            )
+        })?;
+        Ok(new_partitions.len())
+    }
+
+    fn fetch_watermarks(
+        &self,
+        topic: &str,
+        partition: i32,
+        timeout: Duration,
+    ) -> KafkaResult<(i64, i64)> {
+        match self {
+            Self::Default(c) => c.fetch_watermarks(topic, partition, timeout),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.fetch_watermarks(topic, partition, timeout),
+        }
+    }
+
+    fn offsets_for_times(
+        &self,
+        timestamps: TopicPartitionList,
+        timeout: Duration,
+    ) -> KafkaResult<TopicPartitionList> {
+        match self {
+            Self::Default(c) => c.offsets_for_times(timestamps, timeout),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.offsets_for_times(timestamps, timeout),
+        }
     }
 
     fn fetch_metadata(&self, topic: Option<&str>, timeout: Duration) -> KafkaResult<Metadata> {
@@ -1952,7 +2182,299 @@ const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(5);
 /// `OffsetTracker::fenced`). Well above `SESSION_TIMEOUT_MS` so an ordinary
 /// rebalance — which by protocol resolves inside that window — never trips
 /// it; well below the "silent multi-hour wedge" this guards against.
+///
+/// This is the floor. The receive loop uses [`fence_threshold`], which grows
+/// with a configured commit interval, because the streak can only clear on
+/// a drain and drains run once per interval.
 const COMMIT_FENCE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Test-only probe (see the `test-support` feature): the fence threshold the
+/// last concurrent receive loop started with, so a test can prove that a
+/// raised commit interval raised the threshold the loop judges commits by,
+/// and not only the helper the loop calls. nextest runs each test in its
+/// own process, so the value belongs to that test's consumers alone.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod fence_probe {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn record(threshold: Duration) {
+        LAST_MS.store(
+            u64::try_from(threshold.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// The threshold the last receive loop started with, `None` before any.
+    pub fn last_threshold() -> Option<Duration> {
+        match LAST_MS.load(Ordering::SeqCst) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
+    }
+}
+
+/// The fence threshold for a given commit interval.
+///
+/// A rejected commit is re-offered on the next drain, and the dirty streak
+/// clears only after `QUIET_DRAINS_TO_RESOLVE` further quiet drains, so a
+/// healthy recovery takes about three intervals. With the 60 s floor alone,
+/// an interval above 20 s would fence a consumer that merely recovered on
+/// schedule. Four intervals leaves one interval of margin above that, and the
+/// default 500 ms interval keeps the floor exactly as before.
+fn fence_threshold(commit_interval: Duration) -> Duration {
+    COMMIT_FENCE_TIMEOUT.max(commit_interval.saturating_mul(4))
+}
+
+/// Every partition of `topic` at one lazy sentinel offset, the assignment a
+/// `Tail` or `Head` broadcast start resolves to without asking the broker.
+fn lazy_positions(topic: &str, partitions: &[i32], offset: Offset) -> Result<TopicPartitionList> {
+    let mut tpl = TopicPartitionList::new();
+    for pid in partitions {
+        tpl.add_partition_offset(topic, *pid, offset).map_err(|e| {
+            map_kafka_error(&format!("failed to target {offset:?} of {topic}[{pid}]"), e)
+        })?;
+    }
+    Ok(tpl)
+}
+
+/// The error every FIFO entry point returns for options that set a commit
+/// interval: a FIFO consumer commits each message as it settles (see
+/// `commit_fifo_settling`), so the interval would be read by nothing, and a
+/// setting that changes nothing is refused rather than silently dropped.
+/// `spawn_fifo_shards` applies it, so the direct, supervisor and registry
+/// paths all refuse alike; the registry also checks it before it spawns.
+pub(super) fn reject_fifo_commit_interval(queue: &str) -> ShoveError {
+    ShoveError::Topology(format!(
+        "topic '{queue}' is sequenced; `with_commit_interval` does not apply to a FIFO \
+         consumer, which commits each message as it settles. Drop \
+         `with_commit_interval(..)` or use `register` for unsequenced topics."
+    ))
+}
+
+/// Run the receive loop's final `CommitMode::Sync` commit, and the consumer's
+/// close, on a dedicated thread that owns the consumer, waiting at most
+/// `SHUTDOWN_COMMIT_DEADLINE` for the commit's result.
+///
+/// `consumer` must be the last `Arc` of the handle: the thread drops it after
+/// the commit, which is where `rd_kafka_consumer_close` runs. `None` for
+/// `tpl` means there is nothing to commit and the thread only closes. The
+/// thread is spawned before it is handed the consumer, and a spawn failure
+/// disposes of the consumer off the runtime too; see
+/// [`final_commit_on_thread`] and [`close_off_runtime_or_leak`].
+async fn final_commit_off_runtime(
+    consumer: Arc<KafkaStreamConsumer>,
+    tpl: Option<TopicPartitionList>,
+    queue: &str,
+) -> KafkaResult<()> {
+    final_commit_on_thread(consumer, tpl, queue, &mut |name, body| {
+        #[cfg(feature = "test-support")]
+        if final_commit_spawn_probe::refused() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "thread spawn refused by final_commit_spawn_probe",
+            ));
+        }
+        std::thread::Builder::new()
+            .name(name)
+            .spawn(body)
+            .map(|_detached| ())
+    })
+    .await
+}
+
+/// Test-only switch (see the `test-support` feature): refuses every thread
+/// the shutdown path asks for, the way an exhausted host does, so an
+/// integration test can drive the last-resort leak against a real broker and
+/// watch what the leaked member does. nextest runs each test in its own
+/// process, so the switch belongs to that test's consumers alone.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod final_commit_spawn_probe {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static REFUSE: AtomicBool = AtomicBool::new(false);
+
+    /// Refuse, or with `false` allow again, the spawn of the final-commit
+    /// thread and of the close-only thread that follows a failed one.
+    pub fn refuse_threads(refuse: bool) {
+        REFUSE.store(refuse, Ordering::SeqCst);
+    }
+
+    pub(super) fn refused() -> bool {
+        REFUSE.load(Ordering::SeqCst)
+    }
+}
+
+/// What the final-commit thread does with what it owns: the synchronous
+/// commit, then the drop, which for a consumer is where
+/// `rd_kafka_consumer_close` runs. A trait over the concrete handle so the
+/// thread choreography is testable with a drop probe instead of a broker.
+trait FinalCommit: Send + 'static {
+    fn commit_sync(&self, tpl: &TopicPartitionList) -> KafkaResult<()>;
+}
+
+impl FinalCommit for Arc<KafkaStreamConsumer> {
+    fn commit_sync(&self, tpl: &TopicPartitionList) -> KafkaResult<()> {
+        self.commit(tpl, CommitMode::Sync)
+    }
+}
+
+/// `final_commit_off_runtime` over any [`FinalCommit`] and any thread
+/// spawner, which takes the thread's name and its body and answers as
+/// `std::thread::Builder::spawn` does.
+///
+/// The thread is spawned first and handed the consumer only once it exists.
+/// A closure that owned the consumer would be dropped inside a failed
+/// `spawn`, on this thread, and `rd_kafka_consumer_close` would run right
+/// here, which is the one thing this function exists to prevent. When no
+/// thread can be spawned nothing commits: the failure is reported the way a
+/// rejected commit is, so the caller settles its discards as survived, and
+/// the consumer goes to [`close_off_runtime_or_leak`], never to a drop on
+/// this thread.
+async fn final_commit_on_thread<C, S>(
+    consumer: C,
+    tpl: Option<TopicPartitionList>,
+    queue: &str,
+    spawn: &mut S,
+) -> KafkaResult<()>
+where
+    C: FinalCommit,
+    S: FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+{
+    let (done_tx, done_rx) = oneshot::channel::<KafkaResult<()>>();
+    let handed = hand_to_new_thread(
+        spawn,
+        format!("shove-kafka-final-commit {queue}"),
+        (consumer, tpl),
+        move |(consumer, tpl)| {
+            let result = match tpl {
+                Some(tpl) => consumer.commit_sync(&tpl),
+                None => Ok(()),
+            };
+            // Nobody may be listening any more; that is the deadline case.
+            let _ = done_tx.send(result);
+            // The last `Arc`: `rd_kafka_consumer_close` runs here, off the
+            // runtime, however long the broker takes to answer.
+            drop(consumer);
+        },
+    );
+    if let Err(((consumer, _tpl), e)) = handed {
+        tracing::error!(
+            queue,
+            error = %e,
+            "could not spawn the final commit thread; nothing commits, the batch may be redelivered"
+        );
+        close_off_runtime_or_leak(consumer, queue, spawn);
+        return Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail));
+    }
+    match tokio::time::timeout(SHUTDOWN_COMMIT_DEADLINE, done_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_recv)) => {
+            tracing::warn!(queue, "final commit thread ended without a result");
+            Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail))
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                queue,
+                deadline = ?SHUTDOWN_COMMIT_DEADLINE,
+                "final offset commit did not finish within the shutdown deadline; \
+                 giving up on its result, the batch may be redelivered"
+            );
+            Err(KafkaError::ConsumerCommit(
+                RDKafkaErrorCode::RequestTimedOut,
+            ))
+        }
+    }
+}
+
+/// Spawn a thread that waits for one `value`, then hand `value` to it.
+///
+/// The thread is created before anything is moved toward it, so a failed
+/// spawn leaves `value` with the caller, returned in the `Err`, rather than
+/// dropped inside `spawn` on the calling thread, which is what happens to
+/// the captures of a closure `Builder::spawn` could not start. `run`
+/// receives `value` on the new thread and drops it there.
+fn hand_to_new_thread<T, S>(
+    spawn: &mut S,
+    name: String,
+    value: T,
+    run: impl FnOnce(T) + Send + 'static,
+) -> std::result::Result<(), (T, std::io::Error)>
+where
+    T: Send + 'static,
+    S: FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+{
+    let (tx, rx) = std_mpsc::channel::<T>();
+    let body = move || {
+        // The sender is dropped without sending only when the caller never
+        // got to send; then there is nothing to own here.
+        if let Ok(value) = rx.recv() {
+            run(value);
+        }
+    };
+    if let Err(e) = spawn(name, Box::new(body)) {
+        return Err((value, e));
+    }
+    // The thread blocks on `recv` until this send, so the send fails only
+    // if the thread died first; even then `value` comes back to the caller
+    // rather than being dropped here.
+    tx.send(value).map_err(|std_mpsc::SendError(value)| {
+        (
+            value,
+            std::io::Error::other("the thread ended before it received its work"),
+        )
+    })
+}
+
+/// Where a consumer goes when its final-commit thread could not be spawned.
+///
+/// The close blocks for as long as librdkafka takes to leave the group, so
+/// it must not run on the runtime thread, which is the one thing
+/// `final_commit_off_runtime` exists to prevent. A second, close-only
+/// thread is tried first: a failed spawn is often a momentary `EAGAIN`. If
+/// that fails too the handle is leaked, deliberately, and logged at error
+/// level: the process has just failed to create two threads and is degraded
+/// already, and the alternative is a runtime thread blocked for as long as
+/// a frozen coordinator keeps librdkafka retrying.
+///
+/// What the leak costs. The leaked instance keeps heartbeating, so while the
+/// process lives the member holds its partitions until `max.poll.interval.ms`
+/// (five minutes) passes without a poll and librdkafka leaves the group on
+/// its own; the session timeout does not apply to a member that still
+/// heartbeats. Once the process exits the broker drops the member after the
+/// session timeout, as after a crash. At-least-once delivery covers both.
+fn close_off_runtime_or_leak<C, S>(consumer: C, queue: &str, spawn: &mut S)
+where
+    C: Send + 'static,
+    S: FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+{
+    match hand_to_new_thread(
+        spawn,
+        format!("shove-kafka-consumer-close {queue}"),
+        consumer,
+        drop,
+    ) {
+        Ok(()) => tracing::warn!(
+            queue,
+            "the consumer closes on a dedicated thread, without a final commit"
+        ),
+        Err((consumer, e)) => {
+            tracing::error!(
+                queue,
+                error = %e,
+                "no thread for the consumer's close either; leaking the handle rather than closing \
+                 it on the runtime thread. The leaked consumer keeps heartbeating: its partitions \
+                 stay assigned until max.poll.interval.ms passes without a poll, or until the \
+                 process exits and the session timeout drops the member"
+            );
+            std::mem::forget(consumer);
+        }
+    }
+}
 
 /// Timeout for `seek_partitions` when redelivering an un-acked batch.
 ///
@@ -2102,6 +2624,8 @@ struct BatchDecodeCtx<'a> {
     schema_enforcement: SchemaEnforcement,
     #[cfg(feature = "kafka-schema-registry")]
     schema_accepted: &'a [Arc<str>],
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_message_index: Option<&'a [i32]>,
 }
 
 /// Outcome of decoding one message on its way into a batch.
@@ -2147,6 +2671,7 @@ async fn decode_batch_message<T: Topic>(
                     fmt,
                     dec.schema_enforcement,
                     dec.schema_accepted,
+                    dec.schema_message_index,
                     payload_slice,
                 )
                 .await
@@ -2289,10 +2814,12 @@ impl<T: Topic> BatchBuffer<T> {
         self.messages.len() + self.dropped.len()
     }
 
-    /// Extends the offset span to cover `offset` on `partition`.
+    /// Extends the offset span to cover `offset` on `partition`. The
+    /// exclusive end saturates at `i64::MAX`, as `PartitionTracker::position`
+    /// does, so the batch commit path carries no unchecked arithmetic.
     fn extend_span(&mut self, partition: i32, offset: i64) {
         self.start.entry(partition).or_insert(offset);
-        self.end.insert(partition, offset + 1);
+        self.end.insert(partition, offset.saturating_add(1));
     }
 
     fn push(&mut self, message: T::Message, metadata: MessageMetadata, raw: Option<RawMessage>) {
@@ -2931,6 +3458,10 @@ impl KafkaConsumer {
     {
         let topology = T::topology();
         let queue = topology.queue();
+        // The direct and supervisor paths reach this function without the
+        // subscriber's check, so a knob only the broadcast loop reads is
+        // refused here rather than dropped.
+        options.refuse_broadcast_start(queue, "KafkaConsumer::run")?;
         // Precedence: explicit `with_group_id` > the topology's fan-out group
         // (`{queue}-{group}-consumer`) > the topic default `{queue}-consumer`.
         let group_id = options
@@ -2943,6 +3474,23 @@ impl KafkaConsumer {
         let auto_offset_reset = options
             .kafka_auto_offset_reset
             .unwrap_or(KafkaAutoOffsetReset::Earliest);
+        // The commit gate's window, and the fence threshold that has to grow
+        // with it - see `fence_threshold`. Checked again here although both
+        // setters already check it: `ConsumerOptions::kafka_commit_interval`
+        // is a public field, and a value written past the setter would reach
+        // the gate, where a deadline the `Instant` cannot represent reads as
+        // due now while `due()` still says no, so the wake arm would fire on
+        // every pass with commit work pending. This is the one place the
+        // receive loop reads the field, so it is the one place to refuse it.
+        if let Some(interval) = options.kafka_commit_interval {
+            validate_commit_interval(interval);
+        }
+        let commit_interval = options
+            .kafka_commit_interval
+            .unwrap_or(ASYNC_COMMIT_INTERVAL);
+        let fence_timeout = fence_threshold(commit_interval);
+        #[cfg(feature = "test-support")]
+        fence_probe::record(fence_timeout);
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
@@ -2979,6 +3527,9 @@ impl KafkaConsumer {
             .clone()
             .map(Arc::from)
             .unwrap_or_else(|| Arc::from(vec![default_subject(queue)]));
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_message_index: Option<Arc<[i32]>> =
+            options.schema_message_index.clone().map(Arc::from);
 
         run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, || {
             let handler = handler.clone();
@@ -2995,6 +3546,8 @@ impl KafkaConsumer {
             let schema_registry = schema_registry.clone();
             #[cfg(feature = "kafka-schema-registry")]
             let schema_accepted = schema_accepted.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_message_index = schema_message_index.clone();
             async move {
                 // Fresh channel per (re)connect, matching the fresh
                 // OffsetTracker below: rebalance events from a torn-down
@@ -3034,7 +3587,7 @@ impl KafkaConsumer {
                 // reads, and the loop body only runs when a select arm
                 // completes. A no-op when nothing is pending.
                 let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
-                let mut commit_gate = AsyncCommitGate::new(ASYNC_COMMIT_INTERVAL);
+                let mut commit_gate = AsyncCommitGate::new(commit_interval);
 
                 loop {
                     // Drain completed offsets, then apply any partition
@@ -3047,7 +3600,7 @@ impl KafkaConsumer {
                     }
                     let now = Instant::now();
                     tracker.apply_rebalance_events(&rebalance_rx, now);
-                    if let Some(partition) = tracker.fenced(now, COMMIT_FENCE_TIMEOUT) {
+                    if let Some(partition) = tracker.fenced(now, fence_timeout) {
                         metrics::record_backend_error(
                             metrics::BackendLabel::Kafka,
                             metrics::BackendErrorKind::Connection,
@@ -3056,14 +3609,14 @@ impl KafkaConsumer {
                             queue,
                             group_id,
                             partition,
-                            stuck_for = ?COMMIT_FENCE_TIMEOUT,
+                            stuck_for = ?fence_timeout,
                             "consumer appears fenced from its group (offset commits rejected \
                              with no resolving rebalance); forcing a clean reconnect"
                         );
                         return Err(ShoveError::Connection(format!(
                             "consumer on '{queue}' appears fenced from group '{group_id}': \
                              partition {partition} has had offset commits rejected for over \
-                             {COMMIT_FENCE_TIMEOUT:?} with no resolving rebalance"
+                             {fence_timeout:?} with no resolving rebalance"
                         )));
                     }
                     // The gate spaces commits out (see `ASYNC_COMMIT_INTERVAL`):
@@ -3121,18 +3674,33 @@ impl KafkaConsumer {
                                 tracker.mark_complete(completion);
                             }
                             tracker.apply_rebalance_events(&rebalance_rx, Instant::now());
-                            if let Some((tpl, discards)) = tracker.drain_committable() {
-                                match consumer.commit(&tpl, CommitMode::Sync) {
-                                    Ok(()) => {
-                                        for discard in discards {
-                                            discard.confirm();
-                                        }
+                            let (tpl, discards) = match tracker.drain_committable() {
+                                Some((tpl, discards)) => (Some(tpl), discards),
+                                None => (None, Vec::new()),
+                            };
+                            // The commit and the consumer's close both block:
+                            // `CommitMode::Sync` waits for the coordinator, and
+                            // `Drop` runs `rd_kafka_consumer_close`. A frozen
+                            // broker holds either for as long as librdkafka
+                            // retries - minutes - and a blocking task cannot be
+                            // aborted once started, so `spawn_blocking` would
+                            // only move the wait onto a thread the runtime's
+                            // shutdown then waits for. A dedicated thread that
+                            // owns the last `Arc` of the consumer holds neither
+                            // the runtime nor the process: `SHUTDOWN_COMMIT_DEADLINE`
+                            // bounds how long this loop waits for its result, and
+                            // past it the thread finishes on its own.
+                            let committed = final_commit_off_runtime(consumer, tpl, queue).await;
+                            match committed {
+                                Ok(()) => {
+                                    for discard in discards {
+                                        discard.confirm();
                                     }
-                                    Err(e) => {
-                                        tracing::warn!(queue, error = %e, "final offset commit failed during shutdown; batch may be redelivered");
-                                        for discard in discards {
-                                            discard.survived();
-                                        }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(queue, error = %e, "final offset commit failed during shutdown; batch may be redelivered");
+                                    for discard in discards {
+                                        discard.survived();
                                     }
                                 }
                             }
@@ -3249,6 +3817,7 @@ impl KafkaConsumer {
                                         fmt,
                                         schema_enforcement,
                                         &schema_accepted,
+                                        schema_message_index.as_deref(),
                                         payload_slice,
                                     ).await,
                                     None => {
@@ -3369,7 +3938,7 @@ impl KafkaConsumer {
                             // route_outcome (msg goes out of scope after this loop iteration).
                             let payload_bytes = payload_slice.to_vec();
 
-                            let metadata = build_message_metadata(&headers, false);
+                            let metadata = build_message_metadata(&headers, false, RecordCoordinates::of(&msg));
                             let retry_count = metadata.retry_count;
 
                             let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
@@ -3609,6 +4178,9 @@ impl KafkaConsumer {
             .clone()
             .map(Arc::from)
             .unwrap_or_else(|| Arc::from(vec![default_subject(queue)]));
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_message_index: Option<Arc<[i32]>> =
+            options.schema_message_index.clone().map(Arc::from);
 
         tracing::info!(
             queue,
@@ -3631,6 +4203,8 @@ impl KafkaConsumer {
             let schema_registry = schema_registry.clone();
             #[cfg(feature = "kafka-schema-registry")]
             let schema_accepted = schema_accepted.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_message_index = schema_message_index.clone();
             async move {
                 let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
                 // Arc so `commit_batch_end` can hand the consumer to
@@ -3668,6 +4242,8 @@ impl KafkaConsumer {
                     schema_enforcement,
                     #[cfg(feature = "kafka-schema-registry")]
                     schema_accepted: schema_accepted.as_ref(),
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_message_index: schema_message_index.as_deref(),
                 };
 
                 // Retaining each message's wire bytes only pays for itself if
@@ -3813,7 +4389,7 @@ impl KafkaConsumer {
                                         );
                                     }
                                     BatchDecode::Decoded(decoded) => {
-                                        let metadata = build_message_metadata(&headers, false);
+                                        let metadata = build_message_metadata(&headers, false, RecordCoordinates::of(&msg));
                                         let raw = retain_raw.then(|| RawMessage {
                                             payload: Bytes::copy_from_slice(payload_slice),
                                             key,
@@ -3911,6 +4487,14 @@ impl KafkaConsumer {
                 "run_fifo called on {queue} without sequencing config"
             ))
         })?;
+        // The direct and supervisor paths reach this function without the
+        // registry's own check, so the refusals live here: every FIFO entry
+        // point then fails the same way on a setting the FIFO loop would
+        // never read.
+        options.refuse_broadcast_start(&queue, "KafkaConsumer::run_fifo")?;
+        if options.kafka_commit_interval.is_some() {
+            return Err(reject_fifo_commit_interval(&queue));
+        }
         // Kafka has a single FIFO task covering every assigned partition, so
         // one poison set covers every key this consumer sees. It lives outside
         // the reconnect wrapper below: a broker blip must not un-poison a key.
@@ -3963,6 +4547,9 @@ impl KafkaConsumer {
             .clone()
             .map(Arc::from)
             .unwrap_or_else(|| Arc::from(vec![default_subject(&queue)]));
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_message_index: Option<Arc<[i32]>> =
+            options.schema_message_index.clone().map(Arc::from);
 
         tracing::info!(queue, group_id, max_retries, "Kafka FIFO consumer started");
 
@@ -3982,6 +4569,8 @@ impl KafkaConsumer {
                 let schema_registry = schema_registry.clone();
                 #[cfg(feature = "kafka-schema-registry")]
                 let schema_accepted = schema_accepted.clone();
+                #[cfg(feature = "kafka-schema-registry")]
+                let schema_message_index = schema_message_index.clone();
                 let poisoned = poisoned.clone();
                 async move {
                     // FIFO commits per message via commit_message and keeps no
@@ -4177,6 +4766,7 @@ impl KafkaConsumer {
                                             fmt,
                                             schema_enforcement,
                                             &schema_accepted,
+                                            schema_message_index.as_deref(),
                                             payload_bytes,
                                         ).await,
                                         None => {
@@ -4301,7 +4891,7 @@ impl KafkaConsumer {
                                     }
                                 };
 
-                                let metadata = build_message_metadata(&headers, false);
+                                let metadata = build_message_metadata(&headers, false, RecordCoordinates::of(&msg));
                                 let retry_count = metadata.retry_count;
 
                                 processing.store(true, Ordering::Release);
@@ -4470,6 +5060,66 @@ impl KafkaConsumer {
         drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
     }
 
+    /// What the DLQ drain refuses, after the DLQ check and before it
+    /// subscribes: the two group knobs its loop never reads.
+    ///
+    /// The drain hard-codes `earliest` for its group, and that policy applies
+    /// only while the group has no usable committed offset: a fresh drain can
+    /// never skip a dead letter the operator opted in to keep, and a restarted
+    /// drain resumes from its commit. It commits each dead letter as it
+    /// settles, so there is no interval to set. Neither
+    /// `with_auto_offset_reset` nor `with_commit_interval` would change
+    /// anything, and a setting that changes nothing is refused rather than
+    /// dropped: the FIFO consumer's policy, applied on every path. The message
+    /// names the entry point, as `refuse_broadcast_start` does.
+    fn check_dlq_options(queue: &str, dlq: &str, options: &ConsumerOptions) -> Result<()> {
+        if options.kafka_commit_interval.is_some() {
+            return Err(ShoveError::Topology(format!(
+                "topic '{queue}': `with_commit_interval` does not apply to the dead-letter \
+                 drain of '{dlq}', which commits each dead letter as it settles; \
+                 `KafkaConsumer::run_dlq` never reads it. Drop `with_commit_interval(..)`."
+            )));
+        }
+        if options.kafka_auto_offset_reset.is_some() {
+            return Err(ShoveError::Topology(format!(
+                "topic '{queue}': `with_auto_offset_reset` does not apply to the dead-letter \
+                 drain of '{dlq}', which hard-codes `earliest` for a group with no committed \
+                 offset so a fresh drain never skips a dead letter; `KafkaConsumer::run_dlq` \
+                 never reads it. Drop `with_auto_offset_reset(..)`."
+            )));
+        }
+        Ok(())
+    }
+
+    /// The Kafka half of `BroadcastImpl::check_options`: what a broadcast
+    /// subscription refuses at `subscribe()`, before its loop is spawned.
+    ///
+    /// Every [`BroadcastStart`] is honoured here, so none is refused. The
+    /// two group knobs are: the loop commits nothing, so a commit interval
+    /// would be read by nothing, and it assigns every partition at an
+    /// explicit offset, so librdkafka never consults `auto.offset.reset`.
+    /// The FIFO consumer already refuses a commit interval on the same
+    /// ground, and a setting that changes nothing is refused rather than
+    /// dropped.
+    pub(crate) fn check_broadcast_options(queue: &str, options: &ConsumerOptions) -> Result<()> {
+        if options.kafka_commit_interval.is_some() {
+            return Err(ShoveError::Topology(format!(
+                "topic '{queue}' is a broadcast topology; `with_commit_interval` does not \
+                 apply to a broadcast subscription, which commits nothing. Drop \
+                 `with_commit_interval(..)`."
+            )));
+        }
+        if options.kafka_auto_offset_reset.is_some() {
+            return Err(ShoveError::Topology(format!(
+                "topic '{queue}' is a broadcast topology; `with_auto_offset_reset` does not \
+                 apply to a broadcast subscription, which assigns every partition at an \
+                 explicit offset and never consults `auto.offset.reset`. Drop \
+                 `with_auto_offset_reset(..)` and set the start with `with_broadcast_start`."
+            )));
+        }
+        Ok(())
+    }
+
     /// Run this process's own groupless subscription to `T` until shutdown.
     ///
     /// Reached only through
@@ -4479,18 +5129,21 @@ impl KafkaConsumer {
     ///
     /// # What makes it ephemeral
     ///
-    /// The subscription is `assign()` of every partition at the tail, with no
+    /// The subscription is `assign()` of every partition at the configured
+    /// start - the tail unless `with_broadcast_start` says otherwise - with no
     /// `subscribe()` and no commit anywhere in the loop. Nothing is written to
     /// the broker at any point in its life, so there is nothing to tear down
     /// when it ends and nothing to reap when the process dies without ending it
     /// — which is why the teardown here is "drop the consumer handle" and not a
     /// cleanup path that has to be reached. See
     /// [`broadcast_group_id`](super::constants::broadcast_group_id) for why a
-    /// `group.id` string is nonetheless configured, and why it is a fixed one.
+    /// `group.id` string is nonetheless configured, why it is a fixed one, and
+    /// why `with_group_id` may replace it.
     ///
-    /// A reconnect re-assigns at the *then*-current tail. Messages published
-    /// while the connection was down are not replayed — deliver-new applied to
-    /// the reconnect window, the same best-effort contract the subscription has
+    /// A reconnect re-assigns at the configured start as it stands *then*: at
+    /// the then-current tail by default, so messages published while the
+    /// connection was down are not replayed - deliver-new applied to the
+    /// reconnect window, the same best-effort contract the subscription has
     /// everywhere else.
     pub(crate) async fn run_broadcast_with_inner<T, H>(
         &self,
@@ -4511,7 +5164,18 @@ impl KafkaConsumer {
             )));
         }
         let queue = topology.queue();
-        let group_id = super::constants::broadcast_group_id(queue);
+        // An explicit `with_group_id` is honoured verbatim, as on the standard
+        // path. It is inert either way; the override exists for a cluster ACL
+        // that grants group Describe on one prefix only.
+        let group_id = options
+            .kafka_group_id
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| super::constants::broadcast_group_id(queue));
+        let start = options.broadcast_start;
+        // One warning per subscription, not per poll: the error repeats on
+        // every coordinator lookup for the life of the handle.
+        let warned_group_acl = Arc::new(AtomicBool::new(false));
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
@@ -4540,6 +5204,9 @@ impl KafkaConsumer {
             .clone()
             .map(Arc::from)
             .unwrap_or_else(|| Arc::from(vec![default_subject(queue)]));
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_message_index: Option<Arc<[i32]>> =
+            options.schema_message_index.clone().map(Arc::from);
 
         tracing::info!(
             queue,
@@ -4559,10 +5226,13 @@ impl KafkaConsumer {
             let topic = topic.clone();
             let group = group.clone();
             let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
+            let warned_group_acl = warned_group_acl.clone();
             #[cfg(feature = "kafka-schema-registry")]
             let schema_registry = schema_registry.clone();
             #[cfg(feature = "kafka-schema-registry")]
             let schema_accepted = schema_accepted.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_message_index = schema_message_index.clone();
             async move {
                 // A groupless consumer never joins, so the rebalance callbacks
                 // wired into the shared context never fire; the receiver is
@@ -4592,8 +5262,11 @@ impl KafkaConsumer {
                 let assign_consumer = consumer.clone();
                 let assign_topic = queue.to_string();
                 let partitions = tokio::task::spawn_blocking(move || {
-                    assign_consumer
-                        .assign_all_partitions_at_end(&assign_topic, BROADCAST_ASSIGN_TIMEOUT)
+                    assign_consumer.assign_all_partitions_at(
+                        &assign_topic,
+                        start,
+                        BROADCAST_ASSIGN_TIMEOUT,
+                    )
                 })
                 .await
                 .map_err(|e| {
@@ -4603,7 +5276,8 @@ impl KafkaConsumer {
                 tracing::info!(
                     queue,
                     partitions,
-                    "broadcast subscription assigned at the tail"
+                    start = ?start,
+                    "broadcast subscription assigned"
                 );
 
                 // Redelivery for `Defer`, private to this subscription. One slot
@@ -4641,6 +5315,7 @@ impl KafkaConsumer {
                             tokio::task::spawn_blocking(move || {
                                 refresh_consumer.refresh_broadcast_partitions(
                                     &refresh_topic,
+                                    start,
                                     BROADCAST_ASSIGN_TIMEOUT,
                                 )
                             })
@@ -4689,6 +5364,26 @@ impl KafkaConsumer {
                         msg_result = consumer.recv() => {
                             let msg = match msg_result {
                                 Ok(msg) => msg,
+                                Err(e) if is_ignorable_groupless_error(&e) => {
+                                    // librdkafka looks up the inert group's
+                                    // coordinator anyway. A cluster ACL that
+                                    // does not grant Describe on it answers
+                                    // this on every lookup; fetching is
+                                    // unaffected, and a consumer that never
+                                    // joins needs no group permission.
+                                    if !warned_group_acl.swap(true, Ordering::Relaxed) {
+                                        tracing::warn!(
+                                            error = %e,
+                                            queue,
+                                            group_id,
+                                            "coordinator lookup for the inert broadcast \
+                                             group id is not authorized; fetching continues \
+                                             (grant Describe on it, or pick one with \
+                                             `with_group_id`, to silence this)"
+                                        );
+                                    }
+                                    continue;
+                                }
                                 Err(e) => {
                                     tracing::error!(error = %e, queue, "broadcast consumer recv error");
                                     return Err(map_kafka_error(
@@ -4706,11 +5401,16 @@ impl KafkaConsumer {
                             DeferredDelivery {
                                 payload: msg.payload().unwrap_or_default().to_vec(),
                                 headers: extract_string_headers(&msg),
+                                coordinates: RecordCoordinates::of(&msg),
                             }
                         }
                     };
 
-                    let DeferredDelivery { payload, headers } = delivery;
+                    let DeferredDelivery {
+                        payload,
+                        headers,
+                        coordinates,
+                    } = delivery;
                     metrics::record_message_size(&topic, group.as_deref(), payload.len());
 
                     if let Err(e) = validate_message_size(payload.len(), max_message_size) {
@@ -4733,6 +5433,7 @@ impl KafkaConsumer {
                                     fmt,
                                     schema_enforcement,
                                     &schema_accepted,
+                                    schema_message_index.as_deref(),
                                     &payload,
                                 )
                                 .await
@@ -4797,7 +5498,7 @@ impl KafkaConsumer {
                             }
                         };
 
-                    let metadata = build_message_metadata(&headers, false);
+                    let metadata = build_message_metadata(&headers, false, coordinates);
 
                     let permit = semaphore
                         .clone()
@@ -4834,7 +5535,11 @@ impl KafkaConsumer {
                             outcome,
                             &task_topic,
                             task_group.as_deref(),
-                            DeferredDelivery { payload, headers },
+                            DeferredDelivery {
+                                payload,
+                                headers,
+                                coordinates,
+                            },
                             &task_defer_tx,
                             &task_shutdown,
                         )
@@ -4900,6 +5605,8 @@ impl KafkaConsumer {
         let dlq = topology.dlq().ok_or_else(|| {
             ShoveError::Topology("run_dlq requires a DLQ to be configured".into())
         })?;
+        options.refuse_broadcast_start(topology.queue(), "KafkaConsumer::run_dlq")?;
+        Self::check_dlq_options(topology.queue(), dlq, &options)?;
 
         // Honor the `group.id` override (set via
         // `ConsumerOptions::<Kafka>::with_group_id`) by rebasing the DLQ group
@@ -4941,6 +5648,9 @@ impl KafkaConsumer {
             .clone()
             .map(Arc::from)
             .unwrap_or_else(|| Arc::from(vec![default_subject(dlq)]));
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_message_index: Option<Arc<[i32]>> =
+            options.schema_message_index.clone().map(Arc::from);
 
         tracing::info!(dlq, group_id = dlq_group_id, "Kafka DLQ consumer started");
 
@@ -4956,12 +5666,18 @@ impl KafkaConsumer {
             let schema_registry = schema_registry.clone();
             #[cfg(feature = "kafka-schema-registry")]
             let schema_accepted = schema_accepted.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_message_index = schema_message_index.clone();
             async move {
-                // DLQ consumers always drain from the earliest available
-                // offset — skipping dead messages on a tail-only join would
-                // silently lose audit data the operator explicitly opted in
-                // to. Keep the policy fixed regardless of the user's main
-                // consumer `auto_offset_reset` override.
+                // The drain hard-codes `earliest` for its group, and that
+                // group id is stable across restarts (`dlq_group_id` above).
+                // librdkafka consults the policy only for a group with no
+                // usable committed offset, so a fresh drain starts at the
+                // earliest retained offset and a tail-only join can never
+                // skip a dead letter the operator opted in to keep, while a
+                // restarted drain resumes from its commit. The main
+                // consumer's `auto_offset_reset` override never reaches
+                // here: `check_dlq_options` refuses it for the drain.
                 //
                 // The DLQ loop commits per message via commit_message and
                 // keeps no offset tracker, so rebalance events are irrelevant
@@ -5041,6 +5757,7 @@ impl KafkaConsumer {
                                         fmt,
                                         schema_enforcement,
                                         &schema_accepted,
+                                        schema_message_index.as_deref(),
                                         payload_bytes,
                                     ).await,
                                     None => {
@@ -5102,7 +5819,7 @@ impl KafkaConsumer {
                                 }
                             };
 
-                            let metadata = build_dead_metadata(&headers);
+                            let metadata = build_dead_metadata(&headers, RecordCoordinates::of(&msg));
                             handler.handle_dead(payload, metadata, ctx.as_ref()).await;
 
                             if let Err(e) = consumer.commit_message(&msg, CommitMode::Async) {
@@ -5144,22 +5861,167 @@ mod offset_tracker_tests {
         })
     }
 
-    /// Regression: the normal contiguous drain still works — out-of-order
-    /// completions commit only up to the first gap, then advance once the
-    /// gap fills.
+    /// An offset the broker never delivered - a compacted record, or a
+    /// transaction's control record - must not hold the commit position
+    /// back. Delivered 0, 1 and 3, completed all three, the position is 4.
     #[test]
-    fn contiguous_drain_advances_past_gaps_only_when_filled() {
+    fn undelivered_gaps_do_not_block_the_commit_position() {
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
+        tracker.track_received(0, 1);
+        tracker.track_received(0, 3);
+        tracker.mark_complete(Completion::plain(0, 3));
+        tracker.mark_complete(Completion::plain(0, 0));
+        tracker.mark_complete(Completion::plain(0, 1));
+
+        let tpl = drain_tpl(&mut tracker).expect("everything delivered has completed");
+        assert_eq!(
+            committed_offset(&tpl, 0),
+            Some(4),
+            "the hole at 2 was never delivered, so it is not waited for"
+        );
+    }
+
+    /// `position()` is one past the highest delivered offset once nothing
+    /// is in flight. At `i64::MAX` that successor does not exist: an
+    /// unchecked `+ 1` panics in a debug build and wraps to `i64::MIN` in a
+    /// release build, which would offer a negative commit position.
+    /// Saturating keeps the commit path free of unchecked arithmetic.
+    #[test]
+    fn position_saturates_at_the_maximum_offset() {
+        let mut tracker = PartitionTracker::new(i64::MAX);
+        tracker.mark_complete(i64::MAX, None);
+        assert_eq!(tracker.position(), i64::MAX);
+    }
+
+    /// A delivered offset whose handler is still running is a real gap:
+    /// out-of-order completions commit only up to it, then advance once it
+    /// completes.
+    #[test]
+    fn a_delivered_but_unfinished_offset_still_blocks() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        tracker.track_received(0, 1);
+        tracker.track_received(0, 2);
         tracker.mark_complete(Completion::plain(0, 2));
         tracker.mark_complete(Completion::plain(0, 0));
 
         let tpl = drain_tpl(&mut tracker).expect("offset 0 is committable");
-        assert_eq!(committed_offset(&tpl, 0), Some(1), "gap at 1 blocks 2");
+        assert_eq!(
+            committed_offset(&tpl, 0),
+            Some(1),
+            "1 is in flight and blocks 2"
+        );
 
         tracker.mark_complete(Completion::plain(0, 1));
         let tpl = drain_tpl(&mut tracker).expect("gap filled");
         assert_eq!(committed_offset(&tpl, 0), Some(3));
+    }
+
+    /// With nothing in flight the position is one past the highest delivered
+    /// offset, whatever holes the sequence had.
+    #[test]
+    fn nothing_in_flight_commits_highest_delivered_plus_one() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 10);
+        tracker.track_received(0, 14);
+        tracker.mark_complete(Completion::plain(0, 10));
+        tracker.mark_complete(Completion::plain(0, 14));
+
+        let tpl = drain_tpl(&mut tracker).expect("nothing is in flight");
+        assert_eq!(committed_offset(&tpl, 0), Some(15));
+        assert!(
+            drain_tpl(&mut tracker).is_none(),
+            "no new delivery, no new commit"
+        );
+    }
+
+    /// A replayed lower offset - the same record delivered again after the
+    /// partition briefly left and returned - never lowers what the next
+    /// drain commits. Delivered and completed 1 to 4, then 1 once more: the
+    /// position stays at 5 and exactly one commit is offered.
+    #[test]
+    fn a_replayed_lower_offset_never_lowers_the_committed_position() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        for offset in 1..=4 {
+            tracker.track_received(0, offset);
+        }
+        for offset in 1..=4 {
+            tracker.mark_complete(Completion::plain(0, offset));
+        }
+        tracker.mark_complete(Completion::plain(0, 1));
+
+        let tpl = drain_tpl(&mut tracker).expect("1 to 4 have completed");
+        assert_eq!(committed_offset(&tpl, 0), Some(5));
+        assert!(
+            drain_tpl(&mut tracker).is_none(),
+            "the replayed 1 offered nothing, and nothing moved backwards"
+        );
+    }
+
+    /// The fence threshold is the 60 s floor for the default interval and
+    /// four intervals once the interval is long enough that a recovery
+    /// (three drains) would otherwise outlast the floor.
+    #[test]
+    fn fence_threshold_grows_with_the_commit_interval() {
+        assert_eq!(fence_threshold(ASYNC_COMMIT_INTERVAL), COMMIT_FENCE_TIMEOUT);
+        assert_eq!(
+            fence_threshold(Duration::from_secs(15)),
+            COMMIT_FENCE_TIMEOUT,
+            "four intervals of 15 s is exactly the floor"
+        );
+        assert_eq!(
+            fence_threshold(Duration::from_secs(30)),
+            Duration::from_secs(120),
+            "a 30 s interval needs 120 s so three recovery drains fit inside"
+        );
+    }
+
+    // -- broadcast start position --
+
+    /// The groupless path ignores exactly one error, the coordinator lookup
+    /// its inert group id provokes under a restrictive ACL; every other code
+    /// still ends the connection.
+    #[test]
+    fn only_group_authorization_is_ignorable_on_the_groupless_path() {
+        assert!(is_ignorable_groupless_error(
+            &KafkaError::MessageConsumption(RDKafkaErrorCode::GroupAuthorizationFailed)
+        ));
+        for other in [
+            KafkaError::MessageConsumption(RDKafkaErrorCode::BrokerTransportFailure),
+            KafkaError::MessageConsumption(RDKafkaErrorCode::TopicAuthorizationFailed),
+            KafkaError::MessageConsumption(RDKafkaErrorCode::UnknownTopicOrPartition),
+            KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::Fatal),
+            KafkaError::Global(RDKafkaErrorCode::GroupAuthorizationFailed),
+        ] {
+            assert!(
+                !is_ignorable_groupless_error(&other),
+                "{other:?} must keep ending the connection"
+            );
+        }
+    }
+
+    /// A completion for an offset this assignment never delivered belongs to
+    /// a previous epoch and must not become a commit position.
+    #[test]
+    fn a_completion_this_assignment_never_delivered_is_stale() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 105);
+        // The old epoch delivered 108 before the partition moved; its handler
+        // finishes after the re-seed.
+        tracker.mark_complete(Completion::plain(0, 108));
+        assert!(
+            drain_tpl(&mut tracker).is_none(),
+            "105 is still in flight, and 108 was not delivered in this epoch"
+        );
+
+        tracker.mark_complete(Completion::plain(0, 105));
+        let tpl = drain_tpl(&mut tracker).expect("105 completes");
+        assert_eq!(
+            committed_offset(&tpl, 0),
+            Some(106),
+            "the stale 108 did not lift the position past what this epoch handled"
+        );
     }
 
     /// After remove + re-track (a partition revoked and reassigned), the
@@ -5223,6 +6085,7 @@ mod offset_tracker_tests {
     fn terminal_discard_surfaces_only_once_its_offset_is_committable() {
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
+        tracker.track_received(0, 1);
         tracker.mark_complete(terminal(1));
 
         assert!(
@@ -5299,6 +6162,88 @@ mod offset_tracker_tests {
             committed_offset(&tpl, 0),
             Some(11),
             "stale offset 5 must not have corrupted the contiguous run"
+        );
+    }
+
+    /// librdkafka's seek after a detected log truncation delivers offsets
+    /// below the committed position inside the same assignment, with no
+    /// revoke or assign in between. The position must not drop below what
+    /// is committed, and the lower offset must leave no entry behind that
+    /// would pin the position once higher offsets complete.
+    #[test]
+    fn a_lower_offset_inside_one_assignment_never_lowers_the_position() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        for offset in 10..=12 {
+            tracker.track_received(0, offset);
+        }
+        tracker.mark_complete(Completion::plain(0, 10));
+        tracker.mark_complete(Completion::plain(0, 11));
+        let tpl = drain_tpl(&mut tracker).expect("10 and 11 completed");
+        assert_eq!(committed_offset(&tpl, 0), Some(12));
+
+        // The truncation seek: offsets 5 and 6 arrive after 12 was delivered.
+        tracker.track_received(0, 5);
+        tracker.track_received(0, 6);
+        let partition = &tracker.partitions[&0];
+        assert_eq!(partition.position(), 12, "the position never lowers");
+        assert_eq!(
+            partition.in_flight.iter().copied().collect::<Vec<_>>(),
+            vec![12],
+            "offsets below the committed position are not tracked"
+        );
+        assert!(
+            drain_tpl(&mut tracker).is_none(),
+            "nothing below the committed position is ever offered"
+        );
+
+        // Their completions are stale for this epoch and leave nothing behind.
+        tracker.mark_complete(Completion::plain(0, 5));
+        tracker.mark_complete(Completion::plain(0, 6));
+        assert!(drain_tpl(&mut tracker).is_none());
+        let partition = &tracker.partitions[&0];
+        assert_eq!(partition.position(), 12);
+        assert_eq!(partition.in_flight.len(), 1, "no entry leaked");
+
+        tracker.mark_complete(Completion::plain(0, 12));
+        let tpl = drain_tpl(&mut tracker).expect("12 completed");
+        assert_eq!(
+            committed_offset(&tpl, 0),
+            Some(13),
+            "the higher offsets commit as if the lower ones never came"
+        );
+        assert!(tracker.partitions[&0].in_flight.is_empty());
+    }
+
+    /// The belt under the braces: even if an offset below the committed
+    /// position sat in `in_flight`, its completion removes it instead of
+    /// short-circuiting past the removal and pinning the position there.
+    #[test]
+    fn a_stale_completion_removes_its_in_flight_entry() {
+        let mut partition = PartitionTracker::new(10);
+        partition.mark_complete(10, None);
+        assert_eq!(
+            partition.drain_committable().map(|(next, _)| next),
+            Some(11)
+        );
+        partition.track_received(12);
+        partition.in_flight.insert(5);
+        assert_eq!(
+            partition.position(),
+            5,
+            "the leaked entry is what the fix removes"
+        );
+
+        partition.mark_complete(5, None);
+        assert!(!partition.in_flight.contains(&5), "the stale entry is gone");
+        assert_eq!(
+            partition.position(),
+            12,
+            "the position is the real in-flight offset again"
+        );
+        assert_eq!(
+            partition.drain_committable().map(|(next, _)| next),
+            Some(12),
+            "the position the leaked entry held back is offered, and nothing lower"
         );
     }
 
@@ -5453,6 +6398,44 @@ mod offset_tracker_tests {
             tracker.fenced(t2, Duration::from_secs(60)),
             Some(0),
             "partition 0 has been continuously dirty since t0"
+        );
+    }
+
+    /// A configured commit interval raises the threshold the loop asks
+    /// `fenced` about (see `fence_threshold`), and the tracker honours the
+    /// raised value: the streak that trips the 60 s floor is still within
+    /// bounds under a 120 s threshold, and trips it only once 120 s have
+    /// passed.
+    #[test]
+    fn fenced_honours_a_raised_threshold() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        let t0 = Instant::now();
+
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, t0);
+        let _ = drain_tpl(&mut tracker);
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, t0 + Duration::from_secs(30));
+
+        let raised = fence_threshold(Duration::from_secs(30));
+        assert_eq!(raised, Duration::from_secs(120));
+        let past_floor = t0 + Duration::from_secs(61);
+        assert_eq!(
+            tracker.fenced(past_floor, COMMIT_FENCE_TIMEOUT),
+            Some(0),
+            "the floor alone would fence this streak"
+        );
+        assert_eq!(
+            tracker.fenced(past_floor, raised),
+            None,
+            "under the raised threshold the streak is still within bounds"
+        );
+        assert_eq!(
+            tracker.fenced(t0 + Duration::from_secs(121), raised),
+            Some(0),
+            "past four intervals the raised threshold fences it"
         );
     }
 
@@ -5832,6 +6815,36 @@ mod async_commit_gate_tests {
             "past due, the deadline stays anchored rather than chasing `now`"
         );
     }
+
+    /// An interval the public setters no longer admit, but the gate must not
+    /// panic on either: `last + interval` overflows `Instant`, and the checked
+    /// form treats an unrepresentable deadline as already due.
+    #[test]
+    fn commit_gate_deadline_treats_overflow_as_due() {
+        let mut gate = AsyncCommitGate::new(Duration::MAX);
+        let now = Instant::now();
+        assert_eq!(gate.deadline(now), now, "no commit yet: due now");
+        gate.mark(now);
+        assert_eq!(gate.deadline(now), now, "after a commit: due now");
+    }
+
+    /// The gate is built from the configured interval, so a consumer with
+    /// `with_commit_interval(5 s)` commits at most every 5 s - not every
+    /// `ASYNC_COMMIT_INTERVAL`.
+    #[test]
+    fn a_configured_interval_replaces_the_default_window() {
+        let configured = Duration::from_secs(5);
+        let mut gate = AsyncCommitGate::new(configured);
+        let t0 = Instant::now();
+        gate.mark(t0);
+        assert!(
+            !gate.due(t0 + ASYNC_COMMIT_INTERVAL * 4),
+            "the default window has no bearing on a configured gate"
+        );
+        assert!(!gate.due(t0 + configured - Duration::from_millis(1)));
+        assert!(gate.due(t0 + configured));
+        assert_eq!(gate.deadline(t0), t0 + configured);
+    }
 }
 
 /// The batch path's rebalance handling: which events invalidate an in-flight
@@ -5957,7 +6970,15 @@ mod batch_buffer_tests {
     }
 
     fn metadata() -> MessageMetadata {
-        build_message_metadata(&Arc::new(HashMap::new()), false)
+        build_message_metadata(
+            &Arc::new(HashMap::new()),
+            false,
+            RecordCoordinates {
+                partition: 0,
+                offset: 0,
+                timestamp_ms: None,
+            },
+        )
     }
 
     /// A fresh discard-accounting record, same shape `record_terminal` hands
@@ -6041,6 +7062,17 @@ mod batch_buffer_tests {
         assert_eq!(buf.end.get(&0), Some(&8));
         assert_eq!(buf.start.get(&0), Some(&7));
     }
+
+    /// The exclusive end of a span is `offset + 1`, which does not exist at
+    /// `i64::MAX`. The same saturating rule as `PartitionTracker::position`
+    /// keeps the batch commit path free of unchecked arithmetic.
+    #[test]
+    fn extend_span_saturates_at_the_maximum_offset() {
+        let mut buf = buffer();
+        buf.extend_span(1, i64::MAX);
+        assert_eq!(buf.start.get(&1), Some(&i64::MAX));
+        assert_eq!(buf.end.get(&1), Some(&i64::MAX));
+    }
 }
 
 /// [`seek_errors`]: the guard against reading "rewound" off a response that
@@ -6095,6 +7127,561 @@ mod error_classifier_tests {
             map_kafka_error("recv", e),
             ShoveError::Connection(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod broadcast_option_guard_tests {
+    use super::*;
+    use crate::broadcast::BroadcastStart;
+    use crate::topology::{SequenceFailure, TopologyBuilder};
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct Entry {
+        account: String,
+    }
+
+    struct Plain;
+    impl Topic for Plain {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("broadcast-option-guard-plain").build())
+        }
+    }
+    impl NotSequenced for Plain {}
+
+    struct WithDlq;
+    impl Topic for WithDlq {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| {
+                TopologyBuilder::new("broadcast-option-guard-dlq")
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+
+    struct Ledger;
+    impl Topic for Ledger {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| {
+                TopologyBuilder::new("broadcast-option-guard-ledger")
+                    .sequenced(SequenceFailure::FailAll)
+                    .hold_queue(Duration::from_secs(5))
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+    impl SequencedTopic for Ledger {
+        fn sequence_key(msg: &Entry) -> String {
+            msg.account.clone()
+        }
+    }
+
+    struct NoopHandler;
+    impl<T: Topic<Message = Entry>> MessageHandler<T> for NoopHandler {
+        type Context = ();
+        async fn handle(&self, _: Entry, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    async fn consumer() -> KafkaConsumer {
+        // Port 1 is never listening; every guard returns before any I/O, and
+        // the reconnect budget of one bounds the unfixed path to one refused
+        // connection instead of an endless reconnect loop.
+        let client = KafkaClient::connect(&super::super::client::KafkaConfig::new("127.0.0.1:1"))
+            .await
+            .expect("client construction is lazy");
+        KafkaConsumer::new(client)
+    }
+
+    fn topology_message(err: ShoveError) -> String {
+        match err {
+            ShoveError::Topology(msg) => msg,
+            other => panic!("expected ShoveError::Topology, got {other:?}"),
+        }
+    }
+
+    /// `with_broadcast_start` is read by `BroadcastSubscriber::subscribe`
+    /// alone. The direct path refuses it, at the same fail-fast point where
+    /// the FIFO path refuses a commit interval, rather than starting a group
+    /// consumer at its committed offset with the setting silently dropped.
+    #[tokio::test]
+    async fn run_rejects_broadcast_start() {
+        let err = consumer()
+            .await
+            .run::<Plain, _>(
+                NoopHandler,
+                (),
+                crate::ConsumerOptions::<Kafka>::new()
+                    .with_broadcast_start(BroadcastStart::Head)
+                    .with_max_reconnect_attempts(1)
+                    .with_shutdown(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a set broadcast start must be refused on the direct path");
+        let msg = topology_message(err);
+        assert!(msg.contains("broadcast-option-guard-plain"), "{msg}");
+        assert!(msg.contains("with_broadcast_start(Head)"), "{msg}");
+        assert!(msg.contains("KafkaConsumer::run"), "{msg}");
+    }
+
+    /// The FIFO path refuses it too, from `spawn_fifo_shards`, so the direct,
+    /// supervisor and registry FIFO entry points all fail alike.
+    #[tokio::test]
+    async fn run_fifo_rejects_broadcast_start() {
+        let err = consumer()
+            .await
+            .run_fifo::<Ledger, _>(
+                NoopHandler,
+                (),
+                crate::ConsumerOptions::<Kafka>::new()
+                    .with_broadcast_start(BroadcastStart::Tail)
+                    .with_max_reconnect_attempts(1)
+                    .with_shutdown(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a set broadcast start must be refused on the FIFO path");
+        let msg = topology_message(err);
+        assert!(msg.contains("broadcast-option-guard-ledger"), "{msg}");
+        assert!(msg.contains("with_broadcast_start(Tail)"), "{msg}");
+        assert!(msg.contains("KafkaConsumer::run_fifo"), "{msg}");
+    }
+
+    /// The DLQ drain refuses it too, after the DLQ check and before it
+    /// subscribes, so a start set on a drain's options is not dropped.
+    #[tokio::test]
+    async fn run_dlq_rejects_broadcast_start() {
+        let err = consumer()
+            .await
+            .run_dlq_with_options::<WithDlq, _>(
+                NoopHandler,
+                (),
+                crate::ConsumerOptions::<Kafka>::new()
+                    .with_broadcast_start(BroadcastStart::Timestamp(1_700_000_000_000))
+                    .with_max_reconnect_attempts(1)
+                    .with_shutdown(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a set broadcast start must be refused on the DLQ drain");
+        let msg = topology_message(err);
+        assert!(msg.contains("broadcast-option-guard-dlq"), "{msg}");
+        assert!(
+            msg.contains("with_broadcast_start(Timestamp(1700000000000))"),
+            "{msg}"
+        );
+        assert!(msg.contains("KafkaConsumer::run_dlq"), "{msg}");
+    }
+
+    /// The DLQ drain commits each dead letter as it settles, so a commit
+    /// interval would be read by nothing: refused, the FIFO policy. The
+    /// client's token is cancelled first so a regression fails fast instead
+    /// of reconnecting forever, because the drain's loop passes no attempt
+    /// cap to `run_with_reconnect`.
+    #[tokio::test]
+    async fn run_dlq_rejects_commit_interval() {
+        let consumer = consumer().await;
+        consumer.client.shutdown_token().cancel();
+        let err = consumer
+            .run_dlq_with_options::<WithDlq, _>(
+                NoopHandler,
+                (),
+                crate::ConsumerOptions::<Kafka>::new()
+                    .with_commit_interval(Duration::from_secs(5))
+                    .with_shutdown(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a commit interval must be refused on the DLQ drain");
+        let msg = topology_message(err);
+        assert!(msg.contains("broadcast-option-guard-dlq"), "{msg}");
+        assert!(msg.contains("with_commit_interval"), "{msg}");
+        assert!(msg.contains("KafkaConsumer::run_dlq"), "{msg}");
+    }
+
+    /// The DLQ drain hard-codes `earliest`, which applies only while its
+    /// group has no usable committed offset, so a fresh drain never skips a
+    /// dead letter: `with_auto_offset_reset` is refused rather than silently
+    /// overridden.
+    #[tokio::test]
+    async fn run_dlq_rejects_auto_offset_reset() {
+        let consumer = consumer().await;
+        consumer.client.shutdown_token().cancel();
+        let err = consumer
+            .run_dlq_with_options::<WithDlq, _>(
+                NoopHandler,
+                (),
+                crate::ConsumerOptions::<Kafka>::new()
+                    .with_auto_offset_reset(KafkaAutoOffsetReset::Latest)
+                    .with_shutdown(CancellationToken::new()),
+            )
+            .await
+            .expect_err("auto.offset.reset must be refused on the DLQ drain");
+        let msg = topology_message(err);
+        assert!(msg.contains("broadcast-option-guard-dlq"), "{msg}");
+        assert!(msg.contains("with_auto_offset_reset"), "{msg}");
+        assert!(msg.contains("KafkaConsumer::run_dlq"), "{msg}");
+    }
+
+    /// Negative control: the options the drain does read pass its guards,
+    /// so the refusals above are conditional on the knob and not on the
+    /// entry point. With the client's token already cancelled the drain
+    /// returns from its first `select!`, before the missing broker matters.
+    #[tokio::test]
+    async fn run_dlq_admits_the_options_it_reads() {
+        let consumer = consumer().await;
+        consumer.client.shutdown_token().cancel();
+        consumer
+            .run_dlq_with_options::<WithDlq, _>(
+                NoopHandler,
+                (),
+                crate::ConsumerOptions::<Kafka>::new()
+                    .with_group_id("settlement-audit")
+                    .with_max_message_size(64 * 1024)
+                    .with_shutdown(CancellationToken::new()),
+            )
+            .await
+            .expect("the drain reads the group id and the size cap, so both pass its guards");
+    }
+
+    /// A broadcast subscription commits nothing, so a commit interval would
+    /// be read by nothing: refused at `subscribe()`, the FIFO policy.
+    #[test]
+    fn broadcast_subscribe_rejects_commit_interval() {
+        let inner = crate::ConsumerOptions::<Kafka>::new()
+            .with_commit_interval(Duration::from_secs(5))
+            .into_inner();
+        let msg = topology_message(
+            KafkaConsumer::check_broadcast_options("cache-invalidations", &inner)
+                .expect_err("a commit interval must be refused on a broadcast subscription"),
+        );
+        assert!(msg.contains("cache-invalidations"), "{msg}");
+        assert!(msg.contains("with_commit_interval"), "{msg}");
+        assert!(msg.contains("broadcast"), "{msg}");
+    }
+
+    /// Every partition is assigned at an explicit offset, so librdkafka never
+    /// consults `auto.offset.reset`: the setting is refused, and the error
+    /// points at the knob that does decide where the subscription starts.
+    #[test]
+    fn broadcast_subscribe_rejects_auto_offset_reset() {
+        let inner = crate::ConsumerOptions::<Kafka>::new()
+            .with_auto_offset_reset(KafkaAutoOffsetReset::Latest)
+            .into_inner();
+        let msg = topology_message(
+            KafkaConsumer::check_broadcast_options("cache-invalidations", &inner)
+                .expect_err("auto.offset.reset must be refused on a broadcast subscription"),
+        );
+        assert!(msg.contains("cache-invalidations"), "{msg}");
+        assert!(msg.contains("with_auto_offset_reset"), "{msg}");
+        assert!(msg.contains("with_broadcast_start"), "{msg}");
+    }
+
+    /// Negative control: the options a broadcast subscription does read pass,
+    /// every start included, so the refusals of the commit interval and of
+    /// the reset policy are conditional on the knob and not on the check
+    /// itself.
+    #[test]
+    fn broadcast_subscribe_admits_every_start_and_the_group_id() {
+        for start in [
+            BroadcastStart::Tail,
+            BroadcastStart::Head,
+            BroadcastStart::Timestamp(1_700_000_000_000),
+        ] {
+            let inner = crate::ConsumerOptions::<Kafka>::new()
+                .with_broadcast_start(start)
+                .with_group_id("cache-invalidations-broadcast")
+                .into_inner();
+            KafkaConsumer::check_broadcast_options("cache-invalidations", &inner)
+                .expect("the start and the inert group id are read by the broadcast loop");
+        }
+    }
+}
+
+#[cfg(test)]
+mod final_commit_thread_tests {
+    use super::*;
+    use std::thread::ThreadId;
+
+    type Spawner = Box<dyn FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>>;
+
+    /// What the probe saw, in the order it happened: each commit with the
+    /// offsets it was given, and the drop, each with the thread that ran it.
+    /// For the real handle the drop is where `rd_kafka_consumer_close` runs.
+    #[derive(Debug, PartialEq)]
+    enum Event {
+        Commit {
+            thread: ThreadId,
+            offsets: Vec<(String, i32, Offset)>,
+        },
+        Drop {
+            thread: ThreadId,
+            name: Option<String>,
+        },
+    }
+
+    /// Stands in for the consumer: a commit succeeds and is recorded with
+    /// its offsets, and the drop reports the thread it ran on.
+    struct DropProbe {
+        events: std_mpsc::Sender<Event>,
+    }
+
+    impl FinalCommit for DropProbe {
+        fn commit_sync(&self, tpl: &TopicPartitionList) -> KafkaResult<()> {
+            let offsets = tpl
+                .elements()
+                .iter()
+                .map(|e| (e.topic().to_owned(), e.partition(), e.offset()))
+                .collect();
+            let _ = self.events.send(Event::Commit {
+                thread: std::thread::current().id(),
+                offsets,
+            });
+            Ok(())
+        }
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            let thread = std::thread::current();
+            let _ = self.events.send(Event::Drop {
+                thread: thread.id(),
+                name: thread.name().map(str::to_owned),
+            });
+        }
+    }
+
+    fn probe() -> (DropProbe, std_mpsc::Receiver<Event>) {
+        let (events, seen) = std_mpsc::channel();
+        (DropProbe { events }, seen)
+    }
+
+    /// `std::thread::Builder`, as production uses it.
+    fn real_spawner() -> Spawner {
+        Box::new(|name, body| {
+            std::thread::Builder::new()
+                .name(name)
+                .spawn(body)
+                .map(|_detached| ())
+        })
+    }
+
+    /// Fails its first `failures` spawns the way an exhausted host does,
+    /// then behaves. `Builder::spawn` drops the body it was given when it
+    /// fails, and so does this, which is the ownership the fix is about.
+    fn failing_spawner(failures: usize) -> Spawner {
+        let mut calls = 0usize;
+        Box::new(move |name, body| {
+            calls += 1;
+            if calls <= failures {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "Resource temporarily unavailable",
+                ));
+            }
+            std::thread::Builder::new()
+                .name(name)
+                .spawn(body)
+                .map(|_detached| ())
+        })
+    }
+
+    fn one_offset() -> TopicPartitionList {
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition_offset("orders", 0, Offset::Offset(7))
+            .expect("a literal partition offset");
+        tpl
+    }
+
+    /// Every event up to and including the drop, in order. The drop is the
+    /// probe's last act, so once it has arrived nothing else is pending.
+    fn events_until_the_drop(seen: &std_mpsc::Receiver<Event>) -> Vec<Event> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut events = Vec::new();
+        loop {
+            let event = seen
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("the consumer is dropped, on some thread, within the deadline");
+            let is_drop = matches!(event, Event::Drop { .. });
+            events.push(event);
+            if is_drop {
+                return events;
+            }
+        }
+    }
+
+    /// The shape step 4 promised: exactly one commit, of the offsets the
+    /// loop drained, and then the close, both on the dedicated thread and
+    /// never on the runtime thread that awaits them.
+    #[tokio::test]
+    async fn the_final_commit_thread_commits_and_then_owns_the_close() {
+        let (probe, seen) = probe();
+        let result =
+            final_commit_on_thread(probe, Some(one_offset()), "orders", &mut real_spawner()).await;
+        assert!(result.is_ok(), "{result:?}");
+        let events = events_until_the_drop(&seen);
+        let [
+            Event::Commit {
+                thread: committed_on,
+                offsets,
+            },
+            Event::Drop {
+                thread: dropped_on,
+                name,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("one commit, then the drop, and nothing else: {events:?}");
+        };
+        assert_eq!(*offsets, vec![("orders".to_owned(), 0, Offset::Offset(7))]);
+        assert_eq!(
+            committed_on, dropped_on,
+            "the commit and the close run on the same thread"
+        );
+        assert_ne!(
+            *dropped_on,
+            std::thread::current().id(),
+            "the close must not run on the runtime thread"
+        );
+        assert_eq!(name.as_deref(), Some("shove-kafka-final-commit orders"));
+    }
+
+    /// N1: when the thread cannot be spawned, nothing commits, and the
+    /// consumer still closes off the runtime, on a second, close-only
+    /// thread. Before the fix the closure owned the consumer, `spawn`
+    /// dropped it on failure, and the close ran right here.
+    #[tokio::test]
+    async fn a_failed_spawn_commits_nothing_and_closes_the_consumer_on_a_second_thread() {
+        let (probe, seen) = probe();
+        let result =
+            final_commit_on_thread(probe, Some(one_offset()), "orders", &mut failing_spawner(1))
+                .await;
+        assert!(
+            matches!(
+                result,
+                Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail))
+            ),
+            "{result:?}"
+        );
+        let events = events_until_the_drop(&seen);
+        let [Event::Drop { thread, name }] = events.as_slice() else {
+            panic!("the drop and no commit: {events:?}");
+        };
+        assert_ne!(
+            *thread,
+            std::thread::current().id(),
+            "a failed spawn must not drop the consumer on the runtime thread"
+        );
+        assert_eq!(name.as_deref(), Some("shove-kafka-consumer-close orders"));
+    }
+
+    /// N1, the last resort: with no thread to be had at all, nothing commits
+    /// and the handle is leaked rather than closed on the runtime thread.
+    /// `forget` is synchronous, so once the call has returned a drop that
+    /// has not happened never will.
+    #[tokio::test]
+    async fn with_no_thread_at_all_the_consumer_is_leaked_and_never_closed_here() {
+        let (probe, seen) = probe();
+        let result = final_commit_on_thread(
+            probe,
+            Some(one_offset()),
+            "orders",
+            &mut failing_spawner(usize::MAX),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            seen.try_recv().ok(),
+            None,
+            "no commit and no close: the handle must be leaked, never closed on the runtime thread"
+        );
+    }
+}
+
+#[cfg(test)]
+mod commit_interval_funnel_tests {
+    use super::*;
+    use crate::topology::TopologyBuilder;
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct Entry;
+
+    struct Plain;
+    impl Topic for Plain {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("commit-interval-funnel").build())
+        }
+    }
+    impl NotSequenced for Plain {}
+
+    struct NoopHandler;
+    impl MessageHandler<Plain> for NoopHandler {
+        type Context = ();
+        async fn handle(&self, _: Entry, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    /// Runs the direct path with `interval` written to the public
+    /// `kafka_commit_interval` field, past the setter and its check. The
+    /// shutdown token is cancelled first: with the funnel's check in place
+    /// the run never gets that far, and without it the receive loop returns
+    /// from its first `select!` instead of reconnecting against the
+    /// unreachable broker on port 1.
+    async fn run_with_field_interval(interval: Duration) {
+        let client = KafkaClient::connect(&super::super::client::KafkaConfig::new("127.0.0.1:1"))
+            .await
+            .expect("client construction is lazy");
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let mut opts = crate::ConsumerOptions::<Kafka>::new().with_shutdown(shutdown);
+        opts.kafka_commit_interval = Some(interval);
+        let _ = KafkaConsumer::new(client)
+            .run::<Plain, _>(NoopHandler, (), opts)
+            .await;
+    }
+
+    /// Zero would make the gate always due; the setter refuses it, and so
+    /// must the one place the receive loop reads the field.
+    #[tokio::test]
+    #[should_panic(expected = "commit_interval must be positive")]
+    async fn run_rejects_a_zero_interval_written_to_the_field() {
+        run_with_field_interval(Duration::ZERO).await;
+    }
+
+    /// `Duration::MAX` makes `deadline` overflow to `now` while `due` stays
+    /// false, so the wake arm would fire on every pass with commit work
+    /// pending: the hot spin the gate's own doc warns about. Refused before
+    /// the gate is built.
+    #[tokio::test]
+    #[should_panic(expected = "commit_interval must be at most")]
+    async fn run_rejects_an_unrepresentable_interval_written_to_the_field() {
+        run_with_field_interval(Duration::MAX).await;
+    }
+
+    /// Control: an interval the setter admits passes the funnel's check too,
+    /// so the funnel refuses exactly what the setter refuses.
+    #[tokio::test]
+    async fn run_admits_a_bounded_interval_written_to_the_field() {
+        run_with_field_interval(Duration::from_secs(5)).await;
     }
 }
 

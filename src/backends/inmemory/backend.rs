@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::autoscaler::AutoscalerConfig;
+use crate::backend::broadcast::refuse_start_other_than_tail;
 use crate::backend::{
     AutoscalerBackendImpl, Backend, BatchConsumerImpl, BatchConsumerOptionsInner, BroadcastImpl,
     ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
@@ -145,6 +146,15 @@ impl BroadcastImpl for InMemoryConsumer {
         H: MessageHandler<T>,
     {
         InMemoryConsumer::run_broadcast_with_inner::<T, H>(self, handler, ctx, options).await
+    }
+
+    fn check_options(queue: &str, options: &ConsumerOptionsInner) -> Result<()> {
+        refuse_start_other_than_tail(
+            "the in-process broker",
+            queue,
+            options,
+            "a per-subscriber buffer exists only from the subscription on",
+        )
     }
 }
 

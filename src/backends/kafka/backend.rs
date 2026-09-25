@@ -140,6 +140,10 @@ impl BroadcastImpl for KafkaConsumer {
     {
         KafkaConsumer::run_broadcast_with_inner::<T, H>(self, handler, ctx, options).await
     }
+
+    fn check_options(queue: &str, options: &ConsumerOptionsInner) -> Result<()> {
+        KafkaConsumer::check_broadcast_options(queue, options)
+    }
 }
 
 impl HasBatchConsumption for Kafka {

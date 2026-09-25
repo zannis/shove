@@ -219,12 +219,17 @@ mod bounds_smoke {
             kafka_group_id: None,
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: None,
+            #[cfg(feature = "kafka")]
+            kafka_commit_interval: None,
+            broadcast_start: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_enforcement: SchemaEnforcement::Enforce,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]

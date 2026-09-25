@@ -54,6 +54,10 @@ pub(crate) fn extract_message_metadata(delivery: &Delivery) -> MessageMetadata {
         // AMQP 0-9-1 carries a `redelivered` flag and nothing more — there is no
         // per-message delivery counter to report.
         delivery_count: None,
+        // AMQP has no partitions and no log offset either.
+        partition: None,
+        offset: None,
+        timestamp_ms: None,
         headers: Arc::new(headers),
     }
 }

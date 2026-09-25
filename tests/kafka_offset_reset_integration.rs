@@ -11,10 +11,12 @@
 use serde::{Deserialize, Serialize};
 use shove::ShoveError;
 use shove::broker::Broker;
+use shove::consumer::ConsumerOptions;
 use shove::consumer_group::ConsumerGroupConfig;
 use shove::handler::MessageHandler;
 use shove::kafka::{
-    KafkaClient, KafkaConfig, KafkaConsumerGroupConfig, KafkaOffsetReset, KafkaOffsetResetReport,
+    KafkaAutoOffsetReset, KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroupConfig,
+    KafkaOffsetReset, KafkaOffsetResetReport,
 };
 use shove::markers::Kafka;
 use shove::metadata::MessageMetadata;
@@ -50,6 +52,12 @@ shove::define_topic!(
     ActiveGuardTopic,
     Tick,
     TopologyBuilder::new("kafka-offset-reset-active").build()
+);
+
+shove::define_topic!(
+    NoResetTopic,
+    Tick,
+    TopologyBuilder::new("kafka-offset-reset-none").build()
 );
 
 /// Records every message ID it sees.
@@ -93,7 +101,7 @@ macro_rules! recording_handler_for {
     )+};
 }
 
-recording_handler_for!(TickTopic, TimeTravelTopic, ActiveGuardTopic);
+recording_handler_for!(TickTopic, TimeTravelTopic, ActiveGuardTopic, NoResetTopic);
 
 struct TestBroker {
     _container: testcontainers::ContainerAsync<KafkaContainer>,
@@ -628,5 +636,47 @@ async fn reset_is_refused_while_the_group_has_members() {
         "the error should name the group: {msg}"
     );
 
+    broker.close().await;
+}
+
+/// `KafkaAutoOffsetReset::None` on a group with no committed offset is a
+/// configuration fault, not an outage: librdkafka answers every fetch with
+/// `AutoOffsetReset`, and reconnecting rejoins the same group under the same
+/// policy. The consumer ends with a `Topology` error that names the fault
+/// instead of cycling through its reconnect budget.
+#[tokio::test]
+async fn reset_policy_none_on_a_fresh_group_ends_the_consumer() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker().await;
+    broker.topology().declare::<NoResetTopic>().await.unwrap();
+    publish!(&broker, NoResetTopic, ids("seed", 3));
+
+    let client =
+        KafkaClient::connect_with_retry(&KafkaConfig::new(format!("127.0.0.1:{}", tb.port)), 10)
+            .await
+            .expect("failed to connect to Kafka");
+    let started = Instant::now();
+    let result = KafkaConsumer::new(client)
+        .run::<NoResetTopic, _>(
+            RecordingHandler::default(),
+            (),
+            ConsumerOptions::<Kafka>::new().with_auto_offset_reset(KafkaAutoOffsetReset::None),
+        )
+        .await;
+    let elapsed = started.elapsed();
+
+    let err = result.expect_err("a fresh group under `None` has nowhere to start from");
+    assert!(
+        matches!(err, ShoveError::Topology(_)),
+        "the fault is permanent, not a connection error: {err}"
+    );
+    assert!(
+        err.to_string().contains("AutoOffsetReset"),
+        "the error names librdkafka's answer: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "the consumer ends on the first answer instead of reconnecting: {elapsed:?}"
+    );
     broker.close().await;
 }

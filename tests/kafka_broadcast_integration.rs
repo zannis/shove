@@ -29,6 +29,7 @@ use rdkafka::consumer::{BaseConsumer, Consumer as _};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
 use serde::{Deserialize, Serialize};
+use shove::BroadcastStart;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
 use shove::consumer_group::ConsumerGroupConfig;
@@ -85,14 +86,24 @@ define_topic!(
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// The record coordinates a delivery carried: partition, offset and broker
+/// timestamp, each `None` where the backend has none.
+type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
+
 #[derive(Clone, Default)]
 struct Recorder {
     seen: Arc<Mutex<Vec<String>>>,
+    /// The record coordinates each delivery carried, in delivery order.
+    coordinates: Arc<Mutex<Vec<Coordinates>>>,
 }
 
 impl Recorder {
     async fn keys(&self) -> Vec<String> {
         self.seen.lock().await.clone()
+    }
+
+    async fn coordinates(&self) -> Vec<Coordinates> {
+        self.coordinates.lock().await.clone()
     }
 
     async fn wait_for(&self, target: usize, timeout: Duration) {
@@ -107,8 +118,12 @@ macro_rules! recorder_for {
     ($($topic:ty),+ $(,)?) => {$(
         impl MessageHandler<$topic> for Recorder {
             type Context = ();
-            async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _: &()) -> Outcome {
+            async fn handle(&self, msg: Invalidate, meta: MessageMetadata, _: &()) -> Outcome {
                 self.seen.lock().await.push(msg.key);
+                self.coordinates
+                    .lock()
+                    .await
+                    .push((meta.partition, meta.offset, meta.timestamp_ms));
                 Outcome::Ack
             }
         }
@@ -618,6 +633,15 @@ async fn broadcast_fans_out_to_every_instance_from_the_tail() {
             "subscriber {i} saw the wrong set — a fan-out delivers every message to \
              every instance, and replays nothing from before it subscribed"
         );
+        // The groupless path builds its metadata off the same record, so it
+        // reports the same coordinates a group consumer would.
+        for (partition, offset, timestamp_ms) in recorder.coordinates().await {
+            assert!(
+                partition.is_some() && offset.is_some() && timestamp_ms.is_some(),
+                "subscriber {i} saw a delivery without record coordinates: \
+                 {partition:?} {offset:?} {timestamp_ms:?}"
+            );
+        }
     }
 
     for (broker, sub) in running {
@@ -628,6 +652,234 @@ async fn broadcast_fans_out_to_every_instance_from_the_tail() {
         broker.close().await;
     }
     publisher_broker.close().await;
+}
+
+/// `with_broadcast_start(Head)` assigns every partition at the head, so a
+/// subscriber that starts late still receives what was published before it
+/// existed - the opposite of the default, which
+/// `broadcast_fans_out_to_every_instance_from_the_tail` pins.
+#[tokio::test]
+async fn broadcast_starts_from_the_head_when_asked() {
+    let tb = TestBroker::start().await;
+
+    let publisher_broker = tb.broker().await;
+    publisher_broker
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("failed to declare broadcast topic");
+    let pubr = publisher_broker
+        .publisher()
+        .await
+        .expect("failed to build publisher");
+    let before: Vec<Invalidate> = (0..3)
+        .map(|i| Invalidate {
+            key: format!("before:{i}"),
+        })
+        .collect();
+    for msg in &before {
+        pubr.publish::<CacheInvalidations>(msg)
+            .await
+            .expect("publish failed");
+    }
+
+    let broker = tb.broker().await;
+    let recorder = Recorder::default();
+    let mut sub = broker.broadcast_subscriber();
+    sub.subscribe::<CacheInvalidations, _>(
+        recorder.clone(),
+        ConsumerOptions::new().with_broadcast_start(BroadcastStart::Head),
+    )
+    .expect("failed to subscribe");
+    recorder.wait_for(3, Duration::from_secs(30)).await;
+
+    // Deliver-new still holds for what comes after the assignment.
+    pubr.publish::<CacheInvalidations>(&Invalidate {
+        key: "after".into(),
+    })
+    .await
+    .expect("publish failed");
+    recorder.wait_for(4, Duration::from_secs(30)).await;
+
+    let delivered = recorder.keys().await;
+    let mut expected: Vec<String> = before.iter().map(|k| k.key.clone()).collect();
+    expected.push("after".into());
+    let seen: HashSet<String> = delivered.iter().cloned().collect();
+    assert_eq!(
+        delivered.len(),
+        expected.len(),
+        "each retained record exactly once: {delivered:?}"
+    );
+    assert_eq!(seen, expected.into_iter().collect::<HashSet<_>>());
+
+    sub.cancellation_token().cancel();
+    let _ = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    broker.close().await;
+    publisher_broker.close().await;
+}
+
+/// `with_broadcast_start(Timestamp)` assigns at the first record at or after
+/// the instant, resolved through `offsets_for_times` the way
+/// `reset_consumer_group_offsets` resolves it: two batches published around a
+/// captured timestamp, and only the second is delivered.
+#[tokio::test]
+async fn broadcast_starts_at_a_timestamp() {
+    let tb = TestBroker::start().await;
+
+    let publisher_broker = tb.broker().await;
+    publisher_broker
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("failed to declare broadcast topic");
+    let pubr = publisher_broker
+        .publisher()
+        .await
+        .expect("failed to build publisher");
+    for i in 0..3 {
+        pubr.publish::<CacheInvalidations>(&Invalidate {
+            key: format!("old:{i}"),
+        })
+        .await
+        .expect("publish failed");
+    }
+    // Broker timestamps are milliseconds since the epoch; a full second on
+    // each side keeps the two batches unambiguous whatever the clock skew
+    // between this process and the container.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let cut = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before the epoch")
+        .as_millis() as i64;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let after: Vec<Invalidate> = (0..3)
+        .map(|i| Invalidate {
+            key: format!("new:{i}"),
+        })
+        .collect();
+    for msg in &after {
+        pubr.publish::<CacheInvalidations>(msg)
+            .await
+            .expect("publish failed");
+    }
+
+    let broker = tb.broker().await;
+    let recorder = Recorder::default();
+    let mut sub = broker.broadcast_subscriber();
+    sub.subscribe::<CacheInvalidations, _>(
+        recorder.clone(),
+        ConsumerOptions::new().with_broadcast_start(BroadcastStart::Timestamp(cut)),
+    )
+    .expect("failed to subscribe");
+    recorder.wait_for(3, Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let delivered = recorder.keys().await;
+    let expected: HashSet<String> = after.iter().map(|k| k.key.clone()).collect();
+    assert_eq!(
+        delivered.len(),
+        expected.len(),
+        "only the records at or after the timestamp, each once: {delivered:?}"
+    );
+    assert_eq!(delivered.into_iter().collect::<HashSet<_>>(), expected);
+
+    sub.cancellation_token().cancel();
+    let _ = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    broker.close().await;
+    publisher_broker.close().await;
+}
+
+/// `with_group_id` names the inert `group.id` the groupless handle carries.
+/// It stays inert: the configured name must be as absent from the broker's
+/// group list as the default is, while the control group registers.
+#[tokio::test]
+async fn broadcast_uses_the_configured_inert_group_id() {
+    let tb = TestBroker::start().await;
+
+    let setup = tb.broker().await;
+    setup
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("failed to declare broadcast topic");
+    setup
+        .topology()
+        .declare::<ControlTopic>()
+        .await
+        .expect("failed to declare control topic");
+    setup.close().await;
+
+    let broker = tb.broker().await;
+    let recorder = Recorder::default();
+    let mut sub = broker.broadcast_subscriber();
+    sub.subscribe::<CacheInvalidations, _>(
+        recorder.clone(),
+        ConsumerOptions::new().with_group_id("acl-prefix-invalidations"),
+    )
+    .expect("failed to subscribe");
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    // The subscription works under the configured id...
+    let pubr = tb
+        .broker()
+        .await
+        .publisher()
+        .await
+        .expect("failed to build publisher");
+    pubr.publish::<CacheInvalidations>(&Invalidate {
+        key: "under-a-custom-id".into(),
+    })
+    .await
+    .expect("publish failed");
+    recorder.wait_for(1, Duration::from_secs(30)).await;
+    assert_eq!(recorder.keys().await, vec!["under-a-custom-id".to_string()]);
+
+    // ...and the control from `broadcast_leaves_no_consumer_group` shows the
+    // id never became a broker-side group.
+    let control_broker = tb.broker().await;
+    let control_handler = Recorder::default();
+    let h = control_handler.clone();
+    let mut group = control_broker.consumer_group();
+    group
+        .register::<ControlTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            move || h.clone(),
+        )
+        .await
+        .expect("failed to register control group");
+    let token = group.cancellation_token();
+    let running_group = tokio::spawn(async move {
+        group
+            .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+            .await
+    });
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    let groups = tb.consumer_group_names();
+    assert!(
+        groups.contains("kafka-broadcast-control-consumer"),
+        "the control group is missing, so this query proves nothing; saw {groups:?}"
+    );
+    assert!(
+        !groups.contains("acl-prefix-invalidations"),
+        "the configured inert id registered a consumer group: {groups:?}"
+    );
+    assert!(
+        !groups.contains("kafka-broadcast-invalidations-broadcast"),
+        "the default inert id was used although one was configured: {groups:?}"
+    );
+
+    sub.cancellation_token().cancel();
+    let _ = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    broker.close().await;
+    control_broker.close().await;
+    let _ = running_group.await;
 }
 
 /// `Defer` redelivers within the deferring subscription and reaches no other.
@@ -809,4 +1061,209 @@ async fn retry_discards_instead_of_looping_the_fan_out() {
         broker.close().await;
     }
     publisher_broker.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// A broker whose authorizer denies group Describe on one inert group id
+// ---------------------------------------------------------------------------
+
+/// Starts `apache/kafka` with the KRaft `StandardAuthorizer`, every request
+/// allowed unless an ACL says otherwise, and one DENY ACL: `Describe` on the
+/// consumer group `denied_group`, for every principal. The plaintext client
+/// listener authenticates nobody, so every client is `User:ANONYMOUS`, and the
+/// deny reaches the coordinator lookup librdkafka makes for a configured
+/// `group.id` even when the consumer never joins.
+///
+/// Returns the container and the bootstrap address.
+async fn start_kafka_denying_group_describe(
+    denied_group: &str,
+) -> (
+    testcontainers::ContainerAsync<testcontainers::GenericImage>,
+    String,
+) {
+    use testcontainers::core::{ContainerPort, ExecCommand, WaitFor};
+    use testcontainers::{GenericImage, ImageExt};
+
+    const KAFKA_PORT: u16 = 9092;
+    let start_script = "/tmp/tc_start.sh";
+    let image = GenericImage::new("apache/kafka", "3.8.0")
+        .with_exposed_port(ContainerPort::Tcp(KAFKA_PORT))
+        .with_entrypoint("bash")
+        .with_cmd(vec![
+            "-c".to_string(),
+            format!(
+                "while [ ! -f {s} ]; do sleep 0.1; done; chmod 755 {s} && {s}",
+                s = start_script
+            ),
+        ])
+        .with_env_var("CLUSTER_ID", "5L6g3nShT-eMCtK--X86sw")
+        .with_env_var("KAFKA_NODE_ID", "1")
+        .with_env_var("KAFKA_PROCESS_ROLES", "broker,controller")
+        .with_env_var("KAFKA_CONTROLLER_QUORUM_VOTERS", "1@localhost:9094")
+        .with_env_var("KAFKA_CONTROLLER_LISTENER_NAMES", "CONTROLLER")
+        .with_env_var("KAFKA_INTER_BROKER_LISTENER_NAME", "BROKER")
+        .with_env_var(
+            "KAFKA_LISTENERS",
+            format!(
+                "CLIENT://0.0.0.0:{KAFKA_PORT},BROKER://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094"
+            ),
+        )
+        .with_env_var(
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
+            "CLIENT:PLAINTEXT,BROKER:PLAINTEXT,CONTROLLER:PLAINTEXT",
+        )
+        .with_env_var(
+            "KAFKA_AUTHORIZER_CLASS_NAME",
+            "org.apache.kafka.metadata.authorizer.StandardAuthorizer",
+        )
+        .with_env_var("KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND", "true")
+        .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+        .with_env_var("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0");
+
+    let container = image
+        .start()
+        .await
+        .expect("failed to start the ACL Kafka container");
+    let host_port = container
+        .get_host_port_ipv4(ContainerPort::Tcp(KAFKA_PORT))
+        .await
+        .expect("failed to get the mapped Kafka port");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+         export KAFKA_ADVERTISED_LISTENERS='CLIENT://127.0.0.1:{host_port},BROKER://localhost:9093'\n\
+         exec /etc/kafka/docker/run\n"
+    );
+    let write_cmd = ExecCommand::new(vec![
+        "bash".to_string(),
+        "-c".to_string(),
+        format!("cat > {start_script} <<'EOF'\n{script}EOF"),
+    ])
+    .with_container_ready_conditions(vec![WaitFor::message_on_stdout("Kafka Server started")]);
+    container
+        .exec(write_cmd)
+        .await
+        .expect("failed to write the start script");
+
+    let deny = ExecCommand::new(vec![
+        "/opt/kafka/bin/kafka-acls.sh".to_string(),
+        "--bootstrap-server".to_string(),
+        "localhost:9093".to_string(),
+        "--add".to_string(),
+        "--deny-principal".to_string(),
+        "User:*".to_string(),
+        "--operation".to_string(),
+        "Describe".to_string(),
+        "--group".to_string(),
+        denied_group.to_string(),
+    ]);
+    let mut result = container.exec(deny).await.expect("kafka-acls.sh ran");
+    let stdout = result.stdout_to_vec().await.unwrap_or_default();
+    let stderr = result.stderr_to_vec().await.unwrap_or_default();
+    let exit = result.exit_code().await.expect("exit code");
+    assert_eq!(
+        exit,
+        Some(0),
+        "the deny ACL must be created: {}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+
+    (container, format!("127.0.0.1:{host_port}"))
+}
+
+/// Proves the deny ACL is in force: a consumer that joins `group` is refused
+/// at the coordinator with `GroupAuthorizationFailed`, the very answer the
+/// groupless subscription has to tolerate on its inert group id.
+fn assert_group_describe_is_denied(brokers: &str, group: &str, topic: &str) {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+    use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+
+    let joiner: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group)
+        .set("auto.offset.reset", "earliest")
+        .create()
+        .expect("failed to create the joining probe");
+    joiner.subscribe(&[topic]).expect("subscribe");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match joiner.poll(Duration::from_secs(1)) {
+            Some(Err(KafkaError::MessageConsumption(
+                RDKafkaErrorCode::GroupAuthorizationFailed,
+            ))) => {
+                return;
+            }
+            Some(Err(e)) => panic!("unexpected error while proving the denial: {e}"),
+            Some(Ok(_)) => panic!("the denied group must not be able to join and consume"),
+            None => assert!(
+                std::time::Instant::now() < deadline,
+                "the deny ACL on group {group} never answered the join"
+            ),
+        }
+    }
+}
+
+/// A cluster ACL that denies `Describe` on the inert group id answers the
+/// coordinator lookup librdkafka makes anyway with `GroupAuthorizationFailed`.
+/// The groupless subscription ignores that one error, and delivery, which
+/// never goes through the coordinator, is unaffected.
+#[tokio::test]
+async fn broadcast_survives_a_group_describe_denial_on_the_inert_group() {
+    const GROUP: &str = "acl-denied-invalidations";
+    let (_container, brokers) = start_kafka_denying_group_describe(GROUP).await;
+    let client = KafkaClient::connect_with_retry(&KafkaConfig::new(&brokers), 10)
+        .await
+        .expect("failed to connect to the ACL Kafka");
+    let broker = Broker::<Kafka>::from_client(client);
+    broker
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("failed to declare broadcast topic");
+
+    let brokers_for_probe = brokers.clone();
+    tokio::task::spawn_blocking(move || {
+        assert_group_describe_is_denied(&brokers_for_probe, GROUP, "kafka-broadcast-invalidations")
+    })
+    .await
+    .expect("probe task panicked");
+
+    let recorder = Recorder::default();
+    let mut sub = broker.broadcast_subscriber();
+    sub.subscribe::<CacheInvalidations, _>(
+        recorder.clone(),
+        ConsumerOptions::new().with_group_id(GROUP),
+    )
+    .expect("failed to subscribe");
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    let pubr = broker.publisher().await.expect("failed to build publisher");
+    pubr.publish::<CacheInvalidations>(&Invalidate {
+        key: "denied-group-still-delivers".into(),
+    })
+    .await
+    .expect("publish failed");
+    recorder.wait_for(1, Duration::from_secs(30)).await;
+    assert_eq!(
+        recorder.keys().await,
+        vec!["denied-group-still-delivers".to_string()]
+    );
+
+    // The subscription is still alive after the denied lookups: a second
+    // record arrives as well, and the shutdown is clean.
+    pubr.publish::<CacheInvalidations>(&Invalidate {
+        key: "and-again".into(),
+    })
+    .await
+    .expect("publish failed");
+    recorder.wait_for(2, Duration::from_secs(30)).await;
+
+    sub.cancellation_token().cancel();
+    let outcome = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    broker.close().await;
 }

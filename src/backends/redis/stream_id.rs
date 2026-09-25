@@ -13,6 +13,19 @@ pub(super) fn parse(id: &str) -> Option<(u64, u64)> {
     Some((ms.parse().ok()?, seq.parse().ok()?))
 }
 
+/// The millisecond component of a stream id, as `MessageMetadata::timestamp_ms`.
+///
+/// Redis fills it with the instance clock when it generates the id, so for an
+/// auto-generated id this is when the entry was appended. It is not a publish
+/// time in general: a publisher may supply an explicit id, and after a clock
+/// rollback Redis reuses the top entry's time and increments the sequence
+/// part instead. `None` for an id that does not parse or a time past
+/// `i64::MAX`, never a guess.
+pub(super) fn time_component_ms(id: &str) -> Option<i64> {
+    let (ms, _) = parse(id)?;
+    i64::try_from(ms).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,5 +51,21 @@ mod tests {
         assert_eq!(parse("a-b"), None);
         assert_eq!(parse("5-"), None);
         assert_eq!(parse("-5"), None);
+    }
+
+    /// The time component is the id's first field, checked into an `i64`:
+    /// a malformed id or a time past `i64::MAX` reads as unknown.
+    #[test]
+    fn time_component_is_the_ids_first_field_checked() {
+        assert_eq!(
+            time_component_ms("1526919030474-55"),
+            Some(1_526_919_030_474)
+        );
+        assert_eq!(time_component_ms("0-0"), Some(0));
+        assert_eq!(time_component_ms("9223372036854775807-0"), Some(i64::MAX));
+        assert_eq!(time_component_ms("9223372036854775808-0"), None);
+        assert_eq!(time_component_ms("18446744073709551615-1"), None);
+        assert_eq!(time_component_ms("a-b"), None);
+        assert_eq!(time_component_ms(""), None);
     }
 }

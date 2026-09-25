@@ -73,7 +73,7 @@ pub trait HasCoordinatedGroups: Backend {
 /// | Backend | Implements `HasBroadcast` | Ephemeral primitive |
 /// |---|---|---|
 /// | **InMemory** | **yes** | a per-subscriber buffer |
-/// | **Kafka** | **yes** | groupless `assign()` at the latest offset |
+/// | **Kafka** | **yes** | groupless `assign()` at the tail by default; honours every [`BroadcastStart`](crate::BroadcastStart) |
 /// | **NATS** | **yes** | ephemeral pull consumer on an `Interest`-retention stream |
 /// | **RabbitMQ** | **yes** | exclusive auto-delete queue on a fanout exchange |
 /// | **Redis** (`redis-streams`) | **yes** | plain `XREAD` from `$`, no `XGROUP` |
@@ -82,6 +82,13 @@ pub trait HasCoordinatedGroups: Backend {
 /// Every backend except SQS implements it on this version, so there is no
 /// longer a *not yet* row: `broadcast_subscriber()` compiles everywhere but
 /// `Broker<Sqs>`, and that gate is permanent rather than pending.
+///
+/// Where a subscription starts is the backend-neutral
+/// [`BroadcastStart`](crate::BroadcastStart) on `ConsumerOptions`, offered
+/// only on these backends. Kafka honours all three variants; the other four
+/// start at the tail only on this version and refuse `Head` and `Timestamp`
+/// at `subscribe()`, through `BroadcastImpl::check_options`, rather than
+/// subscribing at the tail silently.
 ///
 /// NATS is the one backend where `.broadcast()` changes how the *stream* is
 /// declared: shove's default `WorkQueue` retention rejects both the

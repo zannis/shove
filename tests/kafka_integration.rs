@@ -15,8 +15,8 @@ use shove::consumer::ConsumerOptions;
 use shove::consumer_group::ConsumerGroupConfig;
 use shove::handler::MessageHandler;
 use shove::kafka::{
-    KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroupConfig, KafkaQueueStats,
-    KafkaTopologyDeclarer,
+    KafkaAutoOffsetReset, KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroupConfig,
+    KafkaQueueStats, KafkaTopologyDeclarer,
 };
 use shove::markers::Kafka;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -170,6 +170,21 @@ shove::define_topic!(
         .build()
 );
 
+// Eight default partitions, so the record coordinates a handler sees span
+// more than one partition.
+shove::define_topic!(
+    CoordinatesTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-coordinates").build()
+);
+
+// A topic with history that a fresh supervisor consumer must tail, not replay.
+shove::define_topic!(
+    TailOnlyTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-tail-only").build()
+);
+
 // ---------------------------------------------------------------------------
 // Test harness: shared setup
 // ---------------------------------------------------------------------------
@@ -177,11 +192,37 @@ shove::define_topic!(
 struct TestBroker {
     _container: testcontainers::ContainerAsync<KafkaContainer>,
     client: KafkaClient,
+    bootstrap_servers: String,
 }
 
 impl TestBroker {
     async fn start() -> Self {
-        let container = KafkaContainer::default()
+        Self::start_image(KafkaContainer::default()).await
+    }
+
+    /// A single-broker container that can host a transactional producer.
+    ///
+    /// The module pins the offsets topic to one replica but leaves the
+    /// transaction-state log at Kafka's defaults of three replicas and two
+    /// in-sync, which a lone broker can never satisfy, so `init_transactions`
+    /// hangs until it times out. Only tests that produce transactionally
+    /// need this variant.
+    async fn start_with_transactions() -> Self {
+        use testcontainers::ImageExt;
+
+        Self::start_image(
+            KafkaContainer::default()
+                .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+                .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1"),
+        )
+        .await
+    }
+
+    async fn start_image<I>(image: I) -> Self
+    where
+        I: AsyncRunner<KafkaContainer>,
+    {
+        let container = image
             .start()
             .await
             .expect("failed to start Kafka container");
@@ -198,6 +239,7 @@ impl TestBroker {
         Self {
             _container: container,
             client,
+            bootstrap_servers,
         }
     }
 
@@ -208,9 +250,49 @@ impl TestBroker {
     fn client(&self) -> KafkaClient {
         self.client.clone()
     }
+
+    /// The bootstrap address, for tests that need a raw rdkafka client
+    /// beside the one under test.
+    fn brokers(&self) -> &str {
+        &self.bootstrap_servers
+    }
+
+    /// Freeze the broker process: every request in flight hangs until
+    /// [`unpause`](Self::unpause). The way to observe what a consumer does
+    /// when its coordinator stops answering. Used by the frozen-shutdown
+    /// test, which the `test-support` seam it reads gates.
+    #[cfg(feature = "test-support")]
+    async fn pause(&self) {
+        self._container
+            .pause()
+            .await
+            .expect("failed to pause the Kafka container");
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn unpause(&self) {
+        self._container
+            .unpause()
+            .await
+            .expect("failed to unpause the Kafka container");
+    }
 }
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `(partition, offset, timestamp_ms)` for one delivery.
+type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
+
+/// Milliseconds since the Unix epoch, the unit of `MessageMetadata::timestamp_ms`.
+fn epoch_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_millis(),
+    )
+    .expect("fits an i64")
+}
 
 /// Read a live topic config value straight from the broker via a raw admin
 /// client, bypassing shove.
@@ -233,6 +315,60 @@ async fn live_topic_config(brokers: &str, topic: &str, key: &str) -> Option<Stri
         .expect("no resource returned")
         .expect("describe_configs returned an error for the topic");
     resource.entry_map().get(key).and_then(|e| e.value.clone())
+}
+
+/// Wait until the broker reports `group` as `Stable` with at least one
+/// member, so a record published afterwards lands after the group's
+/// assignment was taken.
+///
+/// A coordinator that is moving or loading while the member joins answers the
+/// probe with an error that means "ask again"; those are retried within the
+/// deadline, as `tests/kafka_offset_reset_integration.rs` retries them, and
+/// the last one is reported if the deadline passes. Any other error is a
+/// broken probe and fails at once.
+async fn wait_for_stable_group(brokers: &str, group: &str, timeout: Duration) {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+    use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+
+    fn is_transient(code: RDKafkaErrorCode) -> bool {
+        matches!(
+            code,
+            RDKafkaErrorCode::NotCoordinator
+                | RDKafkaErrorCode::CoordinatorNotAvailable
+                | RDKafkaErrorCode::CoordinatorLoadInProgress
+                | RDKafkaErrorCode::OperationTimedOut
+        )
+    }
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create group probe");
+    let deadline = Instant::now() + timeout;
+    let mut last_error: Option<KafkaError> = None;
+    loop {
+        match probe.fetch_group_list(Some(group), Duration::from_secs(10)) {
+            Ok(list) => {
+                let stable = list
+                    .groups()
+                    .iter()
+                    .any(|g| g.name() == group && g.state() == "Stable" && !g.members().is_empty());
+                if stable {
+                    return;
+                }
+            }
+            Err(KafkaError::GroupListFetch(code)) if is_transient(code) => {
+                last_error = Some(KafkaError::GroupListFetch(code));
+            }
+            Err(e) => panic!("failed to fetch group list: {e}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "group {group} did not become stable with a member within {timeout:?}; \
+             last coordinator error: {last_error:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// Poll [`live_topic_config`] until the key reads back as `expected` or the
@@ -293,6 +429,57 @@ impl MessageHandler<NoDlqTopic> for CountingHandler {
 impl MessageHandler<DeferNoHoldTopic> for CountingHandler {
     type Context = ();
     async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// Records the id of every message it is handed.
+#[derive(Clone)]
+struct IdRecorder {
+    seen: Arc<Mutex<Vec<String>>>,
+    counter: WaitableCounter,
+}
+
+impl IdRecorder {
+    fn new() -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            counter: WaitableCounter::new(),
+        }
+    }
+}
+
+impl MessageHandler<TailOnlyTopic> for IdRecorder {
+    type Context = ();
+    async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.seen.lock().await.push(msg.id);
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// Keeps every `MessageMetadata` it is handed, for assertions on the record
+/// coordinates Kafka fills in.
+#[derive(Clone)]
+struct MetadataRecorder {
+    seen: Arc<Mutex<Vec<MessageMetadata>>>,
+    counter: WaitableCounter,
+}
+
+impl MetadataRecorder {
+    fn new() -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            counter: WaitableCounter::new(),
+        }
+    }
+}
+
+impl MessageHandler<CoordinatesTopic> for MetadataRecorder {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        self.seen.lock().await.push(meta);
         self.counter.increment();
         Outcome::Ack
     }
@@ -370,12 +557,15 @@ impl MessageHandler<WorkTopic> for SlowHandler {
 #[derive(Clone)]
 struct DlqRecordingHandler {
     counter: WaitableCounter,
+    /// The dead letter's own `(partition, offset, timestamp_ms)`.
+    dead: Arc<Mutex<Vec<Coordinates>>>,
 }
 
 impl DlqRecordingHandler {
     fn new() -> Self {
         Self {
             counter: WaitableCounter::new(),
+            dead: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -386,7 +576,12 @@ impl MessageHandler<WorkTopic> for DlqRecordingHandler {
         Outcome::Ack
     }
 
-    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata, _: &()) {
+    async fn handle_dead(&self, _msg: SimpleMessage, meta: DeadMessageMetadata, _: &()) {
+        self.dead.lock().await.push((
+            meta.message.partition,
+            meta.message.offset,
+            meta.message.timestamp_ms,
+        ));
         self.counter.increment();
     }
 }
@@ -394,6 +589,8 @@ impl MessageHandler<WorkTopic> for DlqRecordingHandler {
 #[derive(Clone)]
 struct OrderRecordingHandler {
     records: Arc<Mutex<Vec<(String, u64)>>>,
+    /// Each delivery's `(partition, offset, timestamp_ms)`, in arrival order.
+    coordinates: Arc<Mutex<Vec<Coordinates>>>,
     counter: WaitableCounter,
 }
 
@@ -401,6 +598,7 @@ impl OrderRecordingHandler {
     fn new() -> Self {
         Self {
             records: Arc::new(Mutex::new(Vec::new())),
+            coordinates: Arc::new(Mutex::new(Vec::new())),
             counter: WaitableCounter::new(),
         }
     }
@@ -412,8 +610,12 @@ impl OrderRecordingHandler {
 
 impl MessageHandler<SeqSkipTopic> for OrderRecordingHandler {
     type Context = ();
-    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+    async fn handle(&self, msg: OrderMessage, meta: MessageMetadata, _: &()) -> Outcome {
         self.records.lock().await.push((msg.order_id, msg.amount));
+        self.coordinates
+            .lock()
+            .await
+            .push((meta.partition, meta.offset, meta.timestamp_ms));
         self.counter.increment();
         Outcome::Ack
     }
@@ -874,6 +1076,7 @@ async fn dlq_consumer_handles_dead_message() {
     let client = tb.client();
     broker.topology().declare::<WorkTopic>().await.unwrap();
 
+    let before = epoch_ms();
     let publisher = broker.publisher().await.unwrap();
     publisher
         .publish::<WorkTopic>(&SimpleMessage {
@@ -913,6 +1116,28 @@ async fn dlq_consumer_handles_dead_message() {
         "DLQ handler should receive 1 dead message"
     );
     assert_eq!(dlq_handler.counter.get(), 1);
+    let after = epoch_ms();
+
+    // The DLQ drain reports the dead letter's own coordinates: the record on
+    // the dead-letter topic, not the original's, so a replay of the dead
+    // letters names a position that exists.
+    let dead = dlq_handler.dead.lock().await.clone();
+    assert_eq!(dead.len(), 1, "one dead letter, one set of coordinates");
+    let (partition, offset, ts) = dead[0];
+    assert!(
+        partition.is_some(),
+        "the dead letter's partition is reported: {dead:?}"
+    );
+    assert_eq!(
+        offset,
+        Some(0),
+        "the first record on a fresh dead-letter partition sits at offset 0"
+    );
+    let ts = ts.expect("the dead letter's broker timestamp is reported");
+    assert!(
+        (before - 1_000..=after + 1_000).contains(&ts),
+        "timestamp {ts} outside the window {before}..={after}"
+    );
 
     broker.close().await;
     h2.await.unwrap().ok();
@@ -1415,6 +1640,7 @@ async fn sequenced_consume_preserves_order() {
     let client = tb.client();
     broker.topology().declare::<SeqSkipTopic>().await.unwrap();
 
+    let before = epoch_ms();
     let publisher = broker.publisher().await.unwrap();
     for i in 0..5u64 {
         publisher
@@ -1451,10 +1677,42 @@ async fn sequenced_consume_preserves_order() {
 
     shutdown.cancel();
     handle.await.unwrap().ok();
+    let after = epoch_ms();
 
     let records = handler.records().await;
     let amounts: Vec<u64> = records.iter().map(|(_, a)| *a).collect();
     assert_eq!(amounts, vec![0, 1, 2, 3, 4], "messages should be in order");
+
+    // The FIFO path fills the same coordinates as the standard path: one key
+    // lands on one partition of a fresh topic, at offsets 0..5 in order,
+    // each with the broker's timestamp.
+    let coordinates = handler.coordinates.lock().await.clone();
+    assert_eq!(coordinates.len(), 5, "one set of coordinates per delivery");
+    let partitions: std::collections::HashSet<i32> = coordinates
+        .iter()
+        .map(|(p, _, _)| p.expect("Kafka reports the partition on the FIFO path"))
+        .collect();
+    assert_eq!(
+        partitions.len(),
+        1,
+        "one key maps to one partition: {coordinates:?}"
+    );
+    let offsets: Vec<i64> = coordinates
+        .iter()
+        .map(|(_, o, _)| o.expect("Kafka reports the offset on the FIFO path"))
+        .collect();
+    assert_eq!(
+        offsets,
+        vec![0, 1, 2, 3, 4],
+        "a fresh partition yields offsets 0..5 in order"
+    );
+    for (_, _, ts) in &coordinates {
+        let ts = ts.expect("Kafka reports the broker timestamp on the FIFO path");
+        assert!(
+            (before - 1_000..=after + 1_000).contains(&ts),
+            "timestamp {ts} outside the window {before}..={after}"
+        );
+    }
     broker.close().await;
 }
 
@@ -1782,6 +2040,200 @@ async fn consumer_group_processes_messages() {
     assert!(outcome.is_clean());
 
     assert_eq!(handler.counter.get(), 5);
+    broker.close().await;
+}
+
+/// Every Kafka delivery carries the record's coordinates: a partition, an
+/// offset that runs contiguously from zero inside each partition of a fresh
+/// topic, and a broker timestamp inside the test's own wall-clock window.
+#[tokio::test]
+async fn handler_sees_partition_offset_and_timestamp() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<CoordinatesTopic>()
+        .await
+        .unwrap();
+
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before the epoch")
+            .as_millis() as i64
+    };
+    let before = now_ms();
+    let publisher = broker.publisher().await.unwrap();
+    let messages: Vec<SimpleMessage> = (1..=12)
+        .map(|i| SimpleMessage {
+            id: format!("coord-{i}"),
+            content: format!("msg {i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<CoordinatesTopic>(&messages)
+        .await
+        .unwrap();
+
+    let handler = MetadataRecorder::new();
+    let handler_clone = handler.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<CoordinatesTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            move || handler_clone.clone(),
+        )
+        .await
+        .unwrap();
+    let token = group.cancellation_token();
+    let counter = handler.counter.clone();
+    let t = token.clone();
+    tokio::spawn(async move {
+        counter.wait_for(12, Duration::from_secs(60)).await;
+        t.cancel();
+    });
+    let outcome = group
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean());
+    let after = now_ms();
+
+    let seen = handler.seen.lock().await.clone();
+    assert_eq!(seen.len(), 12);
+    let mut per_partition: HashMap<i32, Vec<i64>> = HashMap::new();
+    for meta in &seen {
+        let partition = meta.partition.expect("Kafka reports the partition");
+        let offset = meta.offset.expect("Kafka reports the offset");
+        let timestamp = meta
+            .timestamp_ms
+            .expect("Kafka reports the broker timestamp");
+        // A second of margin on each side covers the clock skew between this
+        // process and the broker container.
+        assert!(
+            (before - 1_000..=after + 1_000).contains(&timestamp),
+            "timestamp {timestamp} outside the window {before}..={after}"
+        );
+        per_partition.entry(partition).or_default().push(offset);
+    }
+    for (partition, mut offsets) in per_partition {
+        offsets.sort_unstable();
+        let contiguous: Vec<i64> = (0..offsets.len() as i64).collect();
+        assert_eq!(
+            offsets, contiguous,
+            "partition {partition} of a fresh topic must yield offsets 0..n once each"
+        );
+    }
+    broker.close().await;
+}
+
+/// `ConsumerOptions::<Kafka>::with_auto_offset_reset(Latest)` reaches the
+/// supervisor path: a fresh group on a topic with history starts at the tail
+/// and receives only what is published after its assignment.
+#[tokio::test]
+async fn supervisor_with_auto_offset_reset_latest_skips_history() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<TailOnlyTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    let old: Vec<SimpleMessage> = (1..=3)
+        .map(|i| SimpleMessage {
+            id: format!("old-{i}"),
+            content: String::new(),
+        })
+        .collect();
+    publisher
+        .publish_batch::<TailOnlyTopic>(&old)
+        .await
+        .unwrap();
+
+    let handler = IdRecorder::new();
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<TailOnlyTopic, _>(
+            handler.clone(),
+            ConsumerOptions::<Kafka>::new().with_auto_offset_reset(KafkaAutoOffsetReset::Latest),
+        )
+        .unwrap();
+    let token = supervisor.cancellation_token();
+    let sup_handle =
+        tokio::spawn(supervisor.run_until_timeout(std::future::pending(), Duration::from_secs(10)));
+
+    wait_for_stable_group(tb.brokers(), "kafka-tail-only-consumer", TIMEOUT).await;
+    // A stable group proves the member joined, not that its fetch position
+    // is resolved: a `Latest` member reads the tail when its first fetch
+    // runs, after the assignment. A record published before that fetch
+    // lands below the tail and is skipped as history, so one marker is not
+    // enough on a slow host. The test publishes a marker every half second
+    // until one arrives: each later marker lands after the one before it was
+    // fetched or skipped, and the first delivered marker proves the member
+    // reads the tail. The records it asserts on are published after that.
+    let marker_deadline = Instant::now() + TIMEOUT;
+    let mut markers = 0u32;
+    loop {
+        publisher
+            .publish::<TailOnlyTopic>(&SimpleMessage {
+                id: format!("marker-{markers}"),
+                content: String::new(),
+            })
+            .await
+            .unwrap();
+        markers += 1;
+        if handler
+            .counter
+            .wait_for(1, Duration::from_millis(500))
+            .await
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < marker_deadline,
+            "no readiness marker arrived within {TIMEOUT:?}"
+        );
+    }
+    let new: Vec<SimpleMessage> = (1..=2)
+        .map(|i| SimpleMessage {
+            id: format!("new-{i}"),
+            content: String::new(),
+        })
+        .collect();
+    publisher
+        .publish_batch::<TailOnlyTopic>(&new)
+        .await
+        .unwrap();
+
+    // Wait for the two records by id, not by count: more than one marker
+    // may have arrived.
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let seen = handler.seen.lock().await.clone();
+        if seen.iter().any(|id| id == "new-1") && seen.iter().any(|id| id == "new-2") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the records published after the marker must arrive, seen {seen:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Room for a replayed history record to show up if `Latest` had not
+    // reached the consumer.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let seen = handler.seen.lock().await.clone();
+    let history: Vec<&String> = seen.iter().filter(|id| id.starts_with("old-")).collect();
+    assert!(
+        history.is_empty(),
+        "a fresh group with Latest must skip the history, saw {history:?}"
+    );
+    let markers_seen = seen.iter().filter(|id| id.starts_with("marker-")).count();
+    assert!(
+        markers_seen >= 1 && seen.len() == markers_seen + 2,
+        "only readiness markers and the two new records arrive: {seen:?}"
+    );
+
+    token.cancel();
+    let outcome = sup_handle.await.unwrap();
+    assert!(outcome.is_clean());
     broker.close().await;
 }
 
@@ -2553,6 +3005,567 @@ async fn committed_offsets_advance_while_consumer_is_idle() {
 
     shutdown.cancel();
     handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// A transactional producer leaves a control record at the end of every
+/// transaction, at an offset no consumer ever receives. Log compaction leaves
+/// the same kind of hole. The tracker must commit past such a hole as soon as
+/// every *delivered* record below it has completed, instead of waiting for
+/// an offset that will never arrive.
+///
+/// Every record carries the same key so one partition holds the whole
+/// sequence: data, data, control, data, data, control, data, data, control.
+/// The consumer receives six records; the committed position must reach the
+/// last control record (highest delivered plus one), and a second member of
+/// the same group must then receive only records produced after it.
+#[tokio::test]
+async fn transactional_gaps_do_not_stall_commits() {
+    use rdkafka::ClientConfig;
+    use rdkafka::consumer::{BaseConsumer, Consumer as RdkafkaConsumer};
+    use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+    use rdkafka::util::Timeout;
+    use rdkafka::{Offset, TopicPartitionList};
+
+    shove::define_topic!(
+        TxnGapsTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-txn-gaps").build()
+    );
+
+    impl MessageHandler<TxnGapsTopic> for CountingHandler {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    const TOPIC: &str = "kafka-txn-gaps";
+    const GROUP: &str = "kafka-txn-gaps-consumer";
+    const KEY: &str = "one-partition";
+    let rpc = Timeout::After(Duration::from_secs(10));
+
+    let tb = TestBroker::start_with_transactions().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<TxnGapsTopic>().await.unwrap();
+
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", tb.brokers())
+        .set("transactional.id", "kafka-txn-gaps-producer")
+        .create()
+        .expect("failed to create transactional producer");
+    producer
+        .init_transactions(rpc)
+        .expect("init_transactions failed");
+
+    // Three transactions of two records each: offsets 0,1 | 3,4 | 6,7 are
+    // data and 2, 5, 8 are control records.
+    let mut produced = 0;
+    for txn in 0..3 {
+        producer
+            .begin_transaction()
+            .expect("begin_transaction failed");
+        for i in 0..2 {
+            let payload = serde_json::to_string(&SimpleMessage {
+                id: format!("txn-{txn}-{i}"),
+                content: "gap".into(),
+            })
+            .unwrap();
+            producer
+                .send(
+                    FutureRecord::to(TOPIC).key(KEY).payload(&payload),
+                    Timeout::After(Duration::from_secs(10)),
+                )
+                .await
+                .expect("transactional publish failed");
+            produced += 1;
+        }
+        producer
+            .commit_transaction(rpc)
+            .expect("commit_transaction failed");
+    }
+    assert_eq!(produced, 6);
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<TxnGapsTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10),
+            )
+            .await
+    });
+    assert!(
+        handler.counter.wait_for(6, TIMEOUT).await,
+        "should consume all 6 data records"
+    );
+
+    // Find the one partition the key landed on and its high watermark, then
+    // poll the committed offset until it sits at the trailing control record.
+    let probe: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", tb.brokers())
+        .set("group.id", GROUP)
+        .create()
+        .expect("failed to create committed-offset probe");
+    let metadata = probe
+        .fetch_metadata(Some(TOPIC), Duration::from_secs(10))
+        .expect("metadata");
+    let partitions: Vec<i32> = metadata.topics()[0]
+        .partitions()
+        .iter()
+        .map(|p| p.id())
+        .collect();
+    let (partition, high) = partitions
+        .iter()
+        .map(|&p| {
+            let (_, high) = probe
+                .fetch_watermarks(TOPIC, p, Duration::from_secs(10))
+                .expect("watermarks");
+            (p, high)
+        })
+        .find(|&(_, high)| high > 0)
+        .expect("one partition holds the keyed records");
+    assert_eq!(high, 9, "6 data records plus 3 control records");
+
+    let committed_offset = || {
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition(TOPIC, partition);
+        probe
+            .committed_offsets(tpl, Duration::from_secs(10))
+            .expect("committed_offsets")
+            .find_partition(TOPIC, partition)
+            .and_then(|e| match e.offset() {
+                Offset::Offset(o) => Some(o),
+                _ => None,
+            })
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let committed = committed_offset();
+        if committed == Some(high - 1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "committed offset must reach the trailing control record ({}), got {committed:?}",
+            high - 1
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    // A second member under the same group resumes at the committed position
+    // and must see only what is produced from now on.
+    let handler2 = CountingHandler::new();
+    let hc2 = handler2.clone();
+    let shutdown2 = CancellationToken::new();
+    let sc2 = shutdown2.clone();
+    let consumer2 = KafkaConsumer::new(client.clone());
+    let handle2 = tokio::spawn(async move {
+        consumer2
+            .run::<TxnGapsTopic, _>(hc2, (), ConsumerOptions::<Kafka>::new().with_shutdown(sc2))
+            .await
+    });
+    producer
+        .begin_transaction()
+        .expect("begin_transaction failed");
+    let payload = serde_json::to_string(&SimpleMessage {
+        id: "after-restart".into(),
+        content: "gap".into(),
+    })
+    .unwrap();
+    producer
+        .send(
+            FutureRecord::to(TOPIC).key(KEY).payload(&payload),
+            Timeout::After(Duration::from_secs(10)),
+        )
+        .await
+        .expect("transactional publish failed");
+    producer
+        .commit_transaction(rpc)
+        .expect("commit_transaction failed");
+
+    assert!(
+        handler2.counter.wait_for(1, TIMEOUT).await,
+        "the new record must arrive"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        handler2.counter.get(),
+        1,
+        "nothing below the committed position may be redelivered"
+    );
+
+    shutdown2.cancel();
+    handle2.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// `with_commit_interval` widens the commit gate. With a 5 s interval the
+/// first drain still commits at once (the gate opens due), so the second
+/// batch's completions sit uncommitted for about one interval before the
+/// gate reopens - where the default 500 ms gate would have committed them
+/// within a second.
+#[tokio::test]
+async fn commit_interval_bounds_how_far_committed_offsets_lag() {
+    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
+
+    shove::define_topic!(
+        CommitIntervalTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-commit-interval").build()
+    );
+
+    impl MessageHandler<CommitIntervalTopic> for CountingHandler {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<CommitIntervalTopic>()
+        .await
+        .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    let publish = |i: usize| {
+        let publisher = &publisher;
+        async move {
+            publisher
+                .publish::<CommitIntervalTopic>(&SimpleMessage {
+                    id: format!("interval-{i}"),
+                    content: "gate".into(),
+                })
+                .await
+                .unwrap();
+        }
+    };
+    for i in 0..3 {
+        publish(i).await;
+    }
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<CommitIntervalTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10)
+                    .with_commit_interval(Duration::from_secs(5)),
+            )
+            .await
+    });
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "should consume the first batch"
+    );
+
+    let stats_provider = KafkaLagStatsProvider::new(client.clone());
+    let lag = || async {
+        stats_provider
+            .get_queue_stats(
+                "kafka-commit-interval",
+                "kafka-commit-interval-consumer",
+                KafkaAutoOffsetReset::Earliest,
+            )
+            .await
+            .expect("get_queue_stats should succeed")
+            .messages_pending
+    };
+    // The first drain commits at once: the gate is due until a commit has
+    // been issued, whatever the interval.
+    let deadline = Instant::now() + TIMEOUT;
+    while lag().await != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the first batch must commit on the opening drain"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // The second batch completes inside the 5 s window opened by that commit
+    // and must still be uncommitted one second later.
+    for i in 3..6 {
+        publish(i).await;
+    }
+    assert!(
+        handler.counter.wait_for(6, TIMEOUT).await,
+        "should consume the second batch"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        lag().await,
+        3,
+        "a 5 s gate must hold the second batch's commit for the interval"
+    );
+
+    // ...and commit once the interval elapses.
+    let deadline = Instant::now() + TIMEOUT;
+    while lag().await != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the gate must reopen after the interval and commit the batch"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// The child half of [`shutdown_exits_the_process_while_the_broker_is_frozen`].
+///
+/// Re-invoked by the parent test through `current_exe()` with
+/// `--ignored --exact`, so it is never run on its own. It consumes one
+/// record with a commit gate too wide to ever reopen, reports that it is
+/// ready, consumes a second record whose completion therefore stays
+/// uncommitted, and shuts its consumer down when a line arrives on stdin.
+/// The parent has frozen the broker by then, so the final synchronous commit
+/// blocks: the consumer must give up at `SHUTDOWN_COMMIT_DEADLINE` and this
+/// process must exit while the commit thread is still stuck.
+#[tokio::test]
+#[ignore = "child process of shutdown_exits_the_process_while_the_broker_is_frozen"]
+async fn child_consumes_then_shuts_down_on_stdin() {
+    use std::io::Write as _;
+
+    shove::define_topic!(
+        FrozenShutdownTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-frozen-shutdown").build()
+    );
+
+    impl MessageHandler<FrozenShutdownTopic> for CountingHandler {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    let bootstrap = std::env::var("SHOVE_TEST_KAFKA_BOOTSTRAP")
+        .expect("SHOVE_TEST_KAFKA_BOOTSTRAP is set by the parent test");
+    // The parent asserts on the deadline warning, which needs a subscriber.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let client = KafkaClient::connect_with_retry(&KafkaConfig::new(&bootstrap), 10)
+        .await
+        .expect("child failed to connect to Kafka");
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let run = tokio::spawn(async move {
+        consumer
+            .run::<FrozenShutdownTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    // Wide enough that the second record's completion can only
+                    // be committed by the final commit at shutdown.
+                    .with_commit_interval(Duration::from_secs(3600)),
+            )
+            .await
+    });
+
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "child must receive the first record"
+    );
+    println!("ready");
+    std::io::stdout().flush().unwrap();
+    assert!(
+        handler.counter.wait_for(2, TIMEOUT).await,
+        "child must receive the second record"
+    );
+    println!("handled 2");
+    std::io::stdout().flush().unwrap();
+
+    // The parent writes a line once the broker is paused. EOF counts too.
+    tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    })
+    .await
+    .unwrap();
+
+    let started = Instant::now();
+    shutdown.cancel();
+    run.await.unwrap().expect("run returns Ok after shutdown");
+    println!("run returned after {} ms", started.elapsed().as_millis());
+    std::io::stdout().flush().unwrap();
+    // Return the way a service's `main` does. The commit thread is still
+    // blocked on the frozen broker; that this process nevertheless exits, which
+    // the parent waits for, is what proves the thread holds neither the
+    // runtime nor the process.
+}
+
+/// The final commit and the consumer's close run on a dedicated thread with a
+/// `SHUTDOWN_COMMIT_DEADLINE` bound, so a frozen coordinator cannot hold a
+/// shutting-down process past that deadline. Proven with a real process
+/// exit: a child consumer is driven to have an uncommitted completion, the
+/// broker is paused, the child is told to shut down, and it must exit within
+/// the deadline plus a margin while the broker stays paused. The parent
+/// unpauses only after the exit.
+// `test-support` gates the deadline seam this test reads; the Kafka coverage
+// row enables it, and the schema-registry row, which compiles this binary
+// without it, never runs this suite.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn shutdown_exits_the_process_while_the_broker_is_frozen() {
+    use shove::kafka::shutdown_commit_deadline_for_test;
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    shove::define_topic!(
+        FrozenShutdownParentTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-frozen-shutdown").build()
+    );
+
+    // The receive loop's own shutdown commit deadline, read through the
+    // `test-support` seam so this test cannot drift from the constant it
+    // asserts the child's elapsed time against.
+    let deadline: Duration = shutdown_commit_deadline_for_test();
+    const MARGIN: Duration = Duration::from_secs(15);
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<FrozenShutdownParentTopic>()
+        .await
+        .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    let publish = |id: &'static str| {
+        let publisher = &publisher;
+        async move {
+            publisher
+                .publish::<FrozenShutdownParentTopic>(&SimpleMessage {
+                    id: id.into(),
+                    content: "frozen".into(),
+                })
+                .await
+                .unwrap();
+        }
+    };
+    publish("first").await;
+
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut child = tokio::process::Command::new(exe)
+        .args([
+            "--ignored",
+            "--exact",
+            "child_consumes_then_shuts_down_on_stdin",
+            "--nocapture",
+        ])
+        .env("SHOVE_TEST_KAFKA_BOOTSTRAP", tb.brokers())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn child test process");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("child stdout")).lines();
+    let stderr = child.stderr.take().expect("child stderr");
+
+    async fn wait_for_line(
+        lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+        wanted: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let next = tokio::time::timeout_at(deadline, lines.next_line()).await;
+            match next {
+                Ok(Ok(Some(line))) if line.trim() == wanted => return,
+                Ok(Ok(Some(_))) => continue,
+                other => panic!("child did not print {wanted:?}: {other:?}"),
+            }
+        }
+    }
+
+    wait_for_line(&mut stdout, "ready").await;
+    // The first drain committed offset 1. This completion stays uncommitted
+    // behind the child's hour-long gate, so the final commit has work to do.
+    publish("second").await;
+    wait_for_line(&mut stdout, "handled 2").await;
+
+    tb.pause().await;
+    let exit = async {
+        stdin.write_all(b"\n").await.expect("write shutdown line");
+        stdin.flush().await.expect("flush shutdown line");
+        drop(stdin);
+        let status = tokio::time::timeout(deadline + MARGIN, child.wait()).await;
+        // Drain the pipes after the exit so nothing here waits on a live child.
+        let mut elapsed_ms = None;
+        while let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(5), stdout.next_line()).await
+        {
+            if let Some(ms) = line.strip_prefix("run returned after ") {
+                elapsed_ms = ms.trim_end_matches(" ms").parse::<u128>().ok();
+            }
+        }
+        let mut stderr_text = String::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_string(&mut BufReader::new(stderr), &mut stderr_text),
+        )
+        .await;
+        (status, elapsed_ms, stderr_text)
+    }
+    .await;
+    // Only now may the broker run again: the assertions below are about what
+    // the child managed while it was frozen.
+    tb.unpause().await;
+
+    let (status, elapsed_ms, stderr_text) = exit;
+    let status = status
+        .expect(
+            "child must exit within the shutdown deadline plus margin while the broker is frozen",
+        )
+        .expect("child wait");
+    assert!(
+        status.success(),
+        "child exited with {status}, stderr: {stderr_text}"
+    );
+    let elapsed_ms = elapsed_ms.expect("child reports how long run took to return");
+    assert!(
+        Duration::from_millis(elapsed_ms as u64) >= deadline - Duration::from_secs(1),
+        "run must wait out the deadline while the commit is blocked, took {elapsed_ms} ms"
+    );
+    assert!(
+        stderr_text.contains("did not finish within the shutdown deadline"),
+        "child stderr must carry the deadline warning: {stderr_text}"
+    );
+
     broker.close().await;
 }
 
@@ -3842,4 +4855,198 @@ mod sbe_codec {
         assert_eq!(handler.seen.lock().unwrap().clone(), vec![(250_000, 12, 1)]);
         broker.close().await;
     }
+}
+
+/// The direct FIFO path refuses a commit interval the way `register_fifo`
+/// does: `spawn_fifo_shards` is the one place every FIFO entry point goes
+/// through, so `run_fifo` returns `Topology` before it subscribes, and a
+/// supervisor-registered FIFO consumer fails its task the same way.
+#[tokio::test]
+async fn run_fifo_rejects_a_commit_interval() {
+    let tb = TestBroker::start().await;
+    let consumer = KafkaConsumer::new(tb.client());
+    let err = consumer
+        .run_fifo::<SeqSkipTopic, _>(
+            CountingHandler::new(),
+            (),
+            ConsumerOptions::<Kafka>::new().with_commit_interval(Duration::from_secs(5)),
+        )
+        .await
+        .expect_err("with_commit_interval must be rejected on the direct FIFO path");
+    let shove::ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("kafka-seq-skip")
+            && msg.contains("with_commit_interval")
+            && msg.contains("commits each message as it settles"),
+        "message must name the topic and the refused setting: {msg}"
+    );
+}
+
+/// The receive loop judges rejected commits by a threshold that grows with
+/// the commit interval, `fence_threshold`, and not by the fixed sixty
+/// seconds alone. The probe reads the threshold the loop started with, so
+/// this fails if the loop ever computed it from the constant instead of the
+/// configured interval.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_raised_commit_interval_raises_the_receive_loops_fence_threshold() {
+    use shove::kafka::fence_probe;
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    let client = tb.client();
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_commit_interval(Duration::from_secs(20)),
+            )
+            .await
+    });
+    let deadline = Instant::now() + TIMEOUT;
+    while fence_probe::last_threshold().is_none() {
+        assert!(Instant::now() < deadline, "the receive loop started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        fence_probe::last_threshold(),
+        Some(Duration::from_secs(80)),
+        "four commit intervals of 20 s, above the 60 s floor the default interval keeps"
+    );
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// The last resort of the final-commit thread, N1: when no thread can be
+/// spawned for the commit or for the close, the handle is leaked rather than
+/// closed on the runtime thread. This pins, against a real broker, the cost
+/// the Kafka page and plan 021 step 4 state for that leak: the leaked
+/// instance keeps heartbeating, so the group keeps its member past the
+/// `session.timeout.ms` a crash would have freed it by. The member leaves
+/// only when `max.poll.interval.ms` (five minutes) passes without a poll,
+/// which this test does not wait for, or when the process exits.
+// `test-support` gates the spawn switch and the timeout seam this test reads.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_leaked_consumer_keeps_its_group_member_past_the_session_timeout() {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+    use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+    use shove::kafka::{final_commit_spawn_probe, session_timeout_for_test};
+
+    shove::define_topic!(
+        LeakedCloseTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-leaked-close").build()
+    );
+
+    impl MessageHandler<LeakedCloseTopic> for CountingHandler {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    const GROUP: &str = "kafka-leaked-close-consumer";
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<LeakedCloseTopic>()
+        .await
+        .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<LeakedCloseTopic>(&SimpleMessage {
+            id: "leaked-close".into(),
+            content: "test".into(),
+        })
+        .await
+        .unwrap();
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let run = tokio::spawn(async move {
+        consumer
+            .run::<LeakedCloseTopic, _>(hc, (), ConsumerOptions::<Kafka>::new().with_shutdown(sc))
+            .await
+    });
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the consumer receives the record"
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
+
+    // From here on no thread can be had, for the final commit or for the close.
+    final_commit_spawn_probe::refuse_threads(true);
+    let started = Instant::now();
+    shutdown.cancel();
+    run.await
+        .unwrap()
+        .expect("run returns Ok: the missing commit is settled as a rejected one");
+    // The close blocks for as long as librdkafka takes to leave the group. A
+    // run that returns at once did not run it on the runtime thread.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "shutdown must return without closing the consumer here, took {:?}",
+        started.elapsed()
+    );
+
+    let session_timeout = session_timeout_for_test();
+    tokio::time::sleep(session_timeout + Duration::from_secs(2)).await;
+
+    // A coordinator that is moving or loading answers "ask again"; retried
+    // as `wait_for_stable_group` retries them.
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", tb.brokers())
+        .create()
+        .expect("failed to create group probe");
+    let deadline = Instant::now() + TIMEOUT;
+    let members = loop {
+        match probe.fetch_group_list(Some(GROUP), Duration::from_secs(10)) {
+            Ok(list) => {
+                break list
+                    .groups()
+                    .iter()
+                    .find(|g| g.name() == GROUP)
+                    .map_or(0, |g| g.members().len());
+            }
+            Err(KafkaError::GroupListFetch(
+                RDKafkaErrorCode::NotCoordinator
+                | RDKafkaErrorCode::CoordinatorNotAvailable
+                | RDKafkaErrorCode::CoordinatorLoadInProgress
+                | RDKafkaErrorCode::OperationTimedOut,
+            )) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the coordinator answers the group probe"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("failed to fetch group list: {e}"),
+        }
+    };
+    assert_eq!(
+        members, 1,
+        "the leaked handle keeps heartbeating, so the broker keeps the member past the \
+         {session_timeout:?} session timeout while the process lives"
+    );
+    broker.close().await;
 }

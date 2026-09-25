@@ -240,6 +240,7 @@ where
     T: Topic,
     H: MessageHandler<T>,
 {
+    options.refuse_broadcast_start(T::topology().queue(), "InMemoryConsumer::run")?;
     let queue = broker.lookup(T::topology().queue())?;
     run_concurrent_on::<T, H>(broker, queue, handler, ctx, options, None).await
 }
@@ -592,6 +593,7 @@ where
     H: MessageHandler<T>,
 {
     let topology = T::topology();
+    options.refuse_broadcast_start(topology.queue(), "InMemoryConsumer::run_fifo")?;
     let seq = topology.sequencing().ok_or_else(|| {
         ShoveError::Topology(format!(
             "run_fifo called on topic {} without sequencing config",
@@ -2547,6 +2549,10 @@ fn metadata_from(env: &Envelope) -> MessageMetadata {
         delivery_id,
         redelivered: retry_count > 0,
         delivery_count: Some(env.delivery_count),
+        // The in-process broker models a queue, not a partitioned log.
+        partition: None,
+        offset: None,
+        timestamp_ms: None,
         headers: Arc::new(env.headers.clone()),
     }
 }

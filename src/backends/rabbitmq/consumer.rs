@@ -1882,6 +1882,7 @@ impl RabbitMqConsumer {
         H: MessageHandler<T>,
     {
         let topology = T::topology();
+        options.refuse_broadcast_start(topology.queue(), "RabbitMqConsumer::run")?;
         let consumer = RabbitMqConsumer::new(self.client.clone());
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
@@ -1994,6 +1995,7 @@ impl RabbitMqConsumer {
         H: MessageHandler<T>,
     {
         let topology = T::topology();
+        options.refuse_broadcast_start(topology.queue(), "RabbitMqConsumer::run_fifo")?;
         let seq = topology.sequencing().ok_or_else(|| {
             ShoveError::Topology("run_fifo called on topic without sequencing config".into())
         })?;

@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::kafka::client::KafkaClient;
-use crate::backends::kafka::consumer::KafkaConsumer;
+use crate::backends::kafka::consumer::{KafkaConsumer, reject_fifo_commit_interval};
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_group::reject_fifo_concurrency;
@@ -22,7 +22,7 @@ use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
 #[cfg(feature = "kafka-schema-registry")]
-use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
+use crate::schema_registry::{SchemaEnforcement, SchemaRegistry, validate_message_index};
 use crate::supervision::RespawnSupervisor;
 use crate::topic::{SequencedTopic, Topic};
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
@@ -98,6 +98,19 @@ impl KafkaAutoOffsetReset {
 // KafkaConsumerGroupConfig
 // ---------------------------------------------------------------------------
 
+/// The one commit-interval check both `with_commit_interval` setters apply,
+/// on [`KafkaConsumerGroupConfig`] and on `ConsumerOptions::<Kafka>`, so the
+/// registry, direct and supervisor paths refuse the same values at the same
+/// fail-fast point. Zero would make the gate always due, and anything past
+/// `MAX_COMMIT_INTERVAL` is refused for the reasons on that constant.
+pub(crate) fn validate_commit_interval(interval: Duration) {
+    assert!(!interval.is_zero(), "commit_interval must be positive");
+    assert!(
+        interval <= super::constants::MAX_COMMIT_INTERVAL,
+        "commit_interval must be at most {:?}, got {interval:?}",
+        super::constants::MAX_COMMIT_INTERVAL
+    );
+}
 #[derive(Clone)]
 pub struct KafkaConsumerGroupConfig {
     prefetch_count: u16,
@@ -122,6 +135,10 @@ pub struct KafkaConsumerGroupConfig {
     /// of `Earliest` (replay history). Override to `Latest` for tail-only
     /// consumers or to `None` to refuse silent replay/skip on a fresh group.
     auto_offset_reset: Option<KafkaAutoOffsetReset>,
+    /// How often each consumer commits the offsets its handlers completed.
+    /// `None` keeps the 500 ms default gate. See
+    /// [`with_commit_interval`](Self::with_commit_interval).
+    commit_interval: Option<Duration>,
 
     /// Schema Registry client shared across every consumer spawned by this
     /// group. `None` disables registry-based decoding for the group.
@@ -134,6 +151,9 @@ pub struct KafkaConsumerGroupConfig {
     /// at decode time.
     #[cfg(feature = "kafka-schema-registry")]
     pub(crate) schema_accepted_subjects: Option<Vec<Arc<str>>>,
+    /// The protobuf message index a frame must carry. `None` accepts any.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub(crate) schema_message_index: Option<Vec<i32>>,
 }
 
 impl Default for KafkaConsumerGroupConfig {
@@ -170,12 +190,15 @@ impl KafkaConsumerGroupConfig {
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             group_id: None,
             auto_offset_reset: None,
+            commit_interval: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_enforcement: SchemaEnforcement::Enforce,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: None,
         }
     }
 
@@ -291,6 +314,38 @@ impl KafkaConsumerGroupConfig {
         self.auto_offset_reset
     }
 
+    /// How often each consumer in the group commits the offsets its handlers
+    /// completed. Unset keeps the 500 ms default.
+    ///
+    /// Completions are tracked in memory and committed asynchronously at most
+    /// once per interval, so a longer interval trades coordinator requests
+    /// for a wider replay window after a crash or a rebalance. The final
+    /// commit at shutdown is synchronous whatever the interval. The fenced
+    /// consumer detector's threshold grows with the interval, because the
+    /// streak it watches can only clear on a commit drain.
+    ///
+    /// Standard groups only. A FIFO group commits each message as it
+    /// settles, so it has no interval to set; `register_fifo` refuses a
+    /// config that sets one rather than ignore it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `interval` is zero or longer than one hour. The gate adds
+    /// the interval to an `Instant`, so the bound keeps every deadline
+    /// representable, and an hour is already far past any sane commit
+    /// cadence: the interval is the replay window after a crash.
+    pub fn with_commit_interval(mut self, interval: Duration) -> Self {
+        validate_commit_interval(interval);
+        self.commit_interval = Some(interval);
+        self
+    }
+
+    /// Returns the explicitly configured commit interval, or `None` if the
+    /// 500 ms default should apply.
+    pub fn commit_interval(&self) -> Option<Duration> {
+        self.commit_interval
+    }
+
     /// Set the Schema Registry client for this consumer group.
     ///
     /// Every consumer spawned by the group shares the same `Arc<SchemaRegistry>`,
@@ -326,6 +381,31 @@ impl KafkaConsumerGroupConfig {
         S: Into<Arc<str>>,
     {
         self.schema_accepted_subjects = Some(subjects.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Accept only protobuf frames whose message index equals `index`, the
+    /// path of `M` inside its schema file: `[0]` is the first top-level
+    /// message, `[1]` the second, `[0, 2]` the third message nested in the
+    /// first. Unset accepts any index, so a `ProtobufCodec<M>` decodes
+    /// whatever message the producer framed as `M`. A frame with another
+    /// index is routed to the DLQ with reason `schema_message_index_rejected`
+    /// before its schema id is resolved. JSON frames carry no index and are
+    /// not judged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is empty, holds a negative element or has more than
+    /// 1024 entries, the wire parser's own cap, the same check
+    /// `ConsumerOptions::<Kafka>` and `BatchConsumerOptions::<Kafka>` apply:
+    /// the parser never yields such an index, so the requirement could never
+    /// match and every protobuf frame would be dead-lettered with nothing at
+    /// startup pointing at the cause.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub fn require_schema_message_index(mut self, index: impl Into<Vec<i32>>) -> Self {
+        let index = index.into();
+        validate_message_index(&index);
+        self.schema_message_index = Some(index);
         self
     }
 
@@ -810,11 +890,13 @@ impl KafkaConsumerGroup {
             options.kafka_group_id = Some(Arc::from(gid.as_str()));
         }
         options.kafka_auto_offset_reset = self.config.auto_offset_reset;
+        options.kafka_commit_interval = self.config.commit_interval;
         #[cfg(feature = "kafka-schema-registry")]
         {
             options.schema_registry = self.config.schema_registry.clone();
             options.schema_enforcement = self.config.schema_enforcement;
             options.schema_accepted_subjects = self.config.schema_accepted_subjects.clone();
+            options.schema_message_index = self.config.schema_message_index.clone();
         }
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
@@ -980,6 +1062,9 @@ impl KafkaConsumerGroupRegistry {
     {
         if config.concurrent_processing() {
             return Err(reject_fifo_concurrency(T::topology().queue()));
+        }
+        if config.commit_interval().is_some() {
+            return Err(reject_fifo_commit_interval(T::topology().queue()));
         }
 
         let mut config = config;
@@ -1631,6 +1716,33 @@ mod tests {
     }
 
     #[test]
+    fn commit_interval_defaults_to_none() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1);
+        assert_eq!(cfg.commit_interval(), None);
+    }
+
+    #[test]
+    fn with_commit_interval_stores_override() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1).with_commit_interval(Duration::from_secs(5));
+        assert_eq!(cfg.commit_interval(), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    #[should_panic(expected = "commit_interval must be positive")]
+    fn with_commit_interval_rejects_zero() {
+        let _ = KafkaConsumerGroupConfig::new(1..=1).with_commit_interval(Duration::ZERO);
+    }
+
+    /// `AsyncCommitGate::deadline` adds the interval to an `Instant`, so an
+    /// interval the sum cannot represent must be refused here, at the
+    /// fail-fast point, and not first met as a panic in the receive loop.
+    #[test]
+    #[should_panic(expected = "commit_interval must be at most")]
+    fn with_commit_interval_rejects_an_unrepresentable_interval() {
+        let _ = KafkaConsumerGroupConfig::new(1..=1).with_commit_interval(Duration::MAX);
+    }
+
+    #[test]
     fn auto_offset_reset_rdkafka_strings_are_canonical() {
         assert_eq!(KafkaAutoOffsetReset::Earliest.as_rdkafka_str(), "earliest");
         assert_eq!(KafkaAutoOffsetReset::Latest.as_rdkafka_str(), "latest");
@@ -1815,6 +1927,59 @@ mod tests {
             assert!(subjects.iter().any(|s| s.as_ref() == "orders-value"));
             assert!(subjects.iter().any(|s| s.as_ref() == "orders-dlq-value"));
         }
+
+        #[test]
+        fn require_schema_message_index_stores_the_path() {
+            let cfg = KafkaConsumerGroupConfig::new(1..=1).require_schema_message_index([1]);
+            assert_eq!(cfg.schema_message_index, Some(vec![1]));
+            assert!(
+                KafkaConsumerGroupConfig::new(1..=1)
+                    .schema_message_index
+                    .is_none()
+            );
+        }
+
+        /// The group config applies the same check as `ConsumerOptions`, so
+        /// the registry path fails as fast as the direct one.
+        #[test]
+        fn require_schema_message_index_accepts_the_shorthand_and_a_nested_path() {
+            let shorthand = KafkaConsumerGroupConfig::new(1..=1).require_schema_message_index([0]);
+            assert_eq!(shorthand.schema_message_index, Some(vec![0]));
+            let nested =
+                KafkaConsumerGroupConfig::new(1..=1).require_schema_message_index([1, 0, 3]);
+            assert_eq!(nested.schema_message_index, Some(vec![1, 0, 3]));
+        }
+
+        #[test]
+        #[should_panic(expected = "schema_message_index must not be empty")]
+        fn require_schema_message_index_rejects_an_empty_path() {
+            let _ = KafkaConsumerGroupConfig::new(1..=1)
+                .require_schema_message_index(Vec::<i32>::new());
+        }
+
+        #[test]
+        #[should_panic(expected = "schema_message_index must not contain a negative index")]
+        fn require_schema_message_index_rejects_a_negative_index() {
+            let _ = KafkaConsumerGroupConfig::new(1..=1).require_schema_message_index([-1]);
+        }
+
+        /// The cap is the parser's: 1024 indexes match a frame at the cap,
+        /// and 1025 can never match, so they are refused like an empty path.
+        #[test]
+        fn require_schema_message_index_accepts_a_path_at_the_parser_cap() {
+            let at_cap =
+                KafkaConsumerGroupConfig::new(1..=1).require_schema_message_index(vec![0; 1024]);
+            assert_eq!(at_cap.schema_message_index.map(|i| i.len()), Some(1024));
+        }
+
+        #[test]
+        #[should_panic(
+            expected = "schema_message_index must not hold more than 1024 indexes, got 1025"
+        )]
+        fn require_schema_message_index_rejects_a_path_past_the_parser_cap() {
+            let _ =
+                KafkaConsumerGroupConfig::new(1..=1).require_schema_message_index(vec![0; 1025]);
+        }
     }
 
     // -- FIFO registration rejects `concurrent_processing(true)` --
@@ -1876,6 +2041,31 @@ mod tests {
                     && msg.contains("break per-key ordering")
                     && msg.contains("with_concurrent_processing(true)"),
                 "message must match the shared FIFO-concurrency wording: {msg}"
+            );
+        }
+
+        /// A commit interval is refused the same way: a FIFO consumer commits
+        /// each message as it settles, so the setting would change nothing,
+        /// and a setting that changes nothing must not be accepted silently.
+        #[tokio::test]
+        async fn register_fifo_rejects_commit_interval() {
+            let config =
+                KafkaConsumerGroupConfig::new(1..=4).with_commit_interval(Duration::from_secs(5));
+
+            let err = registry()
+                .register_fifo::<GuardLedger, _>(config, || NoopHandler, ())
+                .await
+                .expect_err("with_commit_interval must be rejected on a FIFO consumer");
+
+            let ShoveError::Topology(msg) = err else {
+                panic!("expected ShoveError::Topology, got {err:?}");
+            };
+            assert!(
+                msg.contains("kafka-fifo-concurrency-guard")
+                    && msg.contains("is sequenced")
+                    && msg.contains("with_commit_interval")
+                    && msg.contains("commits each message as it settles"),
+                "message must name the topic and the refused setting: {msg}"
             );
         }
 

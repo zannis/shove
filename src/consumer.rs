@@ -5,7 +5,11 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::backend::capability::HasBroadcast;
 use crate::backend::{Backend, ConsumerOptionsInner};
+#[cfg(feature = "kafka")]
+use crate::backends::kafka::{KafkaAutoOffsetReset, validate_commit_interval};
+use crate::broadcast::BroadcastStart;
 use crate::error::{Result, ShoveError};
 #[cfg(feature = "kafka")]
 use crate::markers::Kafka;
@@ -17,7 +21,7 @@ use crate::markers::RabbitMq;
 use crate::markers::Sqs;
 use crate::outcome::Outcome;
 #[cfg(feature = "kafka-schema-registry")]
-use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
+use crate::schema_registry::{SchemaEnforcement, SchemaRegistry, validate_message_index};
 
 /// Default maximum message payload size: 10 MiB.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
@@ -263,12 +267,46 @@ pub struct ConsumerOptions<B: Backend> {
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka-schema-registry")))]
     pub schema_accepted_subjects: Option<Vec<Arc<str>>>,
 
+    /// Kafka-only: the protobuf message index a frame must carry. `None`
+    /// accepts any index. Set via
+    /// [`ConsumerOptions::<Kafka>::require_schema_message_index`], which
+    /// refuses a requirement the wire parser can never yield; a value written
+    /// here directly meets the same check when the options are handed to the
+    /// consumer.
+    #[cfg(feature = "kafka-schema-registry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kafka-schema-registry")))]
+    pub schema_message_index: Option<Vec<i32>>,
+
     /// Kafka-only: base consumer `group.id` override. `None` (the default)
     /// keeps the topic-derived ids. Set via
     /// [`ConsumerOptions::<Kafka>::with_group_id`].
     #[cfg(feature = "kafka")]
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
     pub kafka_group_id: Option<Arc<str>>,
+
+    /// Kafka-only: `auto.offset.reset` for a group with no committed offset.
+    /// `None` (the default) keeps librdkafka's `earliest`. Set via
+    /// [`ConsumerOptions::<Kafka>::with_auto_offset_reset`].
+    #[cfg(feature = "kafka")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
+    pub kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
+
+    /// Kafka-only: how often the concurrent consumer commits the offsets its
+    /// handlers completed. `None` (the default) keeps the 500 ms gate. Set via
+    /// [`ConsumerOptions::<Kafka>::with_commit_interval`], which bounds it; a
+    /// value written to the field directly is checked against the same bound
+    /// where the consumer starts, and panics there if it is zero or longer
+    /// than one hour.
+    #[cfg(feature = "kafka")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
+    pub kafka_commit_interval: Option<Duration>,
+
+    /// Where a broadcast subscription starts reading. `None` (the default)
+    /// and `Some(BroadcastStart::Tail)` keep deliver-new. Set via
+    /// [`ConsumerOptions::with_broadcast_start`], which only a backend
+    /// implementing [`HasBroadcast`] offers; see [`BroadcastStart`] for which
+    /// backends honour the other two variants.
+    pub broadcast_start: Option<BroadcastStart>,
 
     // Runtime coordination — crate-private.
     pub(crate) shutdown: Option<CancellationToken>,
@@ -304,8 +342,15 @@ impl<B: Backend> ConsumerOptions<B> {
             schema_enforcement: SchemaEnforcement::Enforce,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: None,
             #[cfg(feature = "kafka")]
             kafka_group_id: None,
+            #[cfg(feature = "kafka")]
+            kafka_auto_offset_reset: None,
+            #[cfg(feature = "kafka")]
+            kafka_commit_interval: None,
+            broadcast_start: None,
             shutdown: None,
             processing: Arc::new(AtomicBool::new(false)),
             consumer_group: None,
@@ -529,6 +574,14 @@ impl<B: Backend> ConsumerOptions<B> {
     /// processes one message at a time — matching the semantic of the
     /// per-backend `ConsumerGroupConfig::with_concurrent_processing`.
     pub(crate) fn into_inner(self) -> ConsumerOptionsInner {
+        // `schema_message_index` is a public field, so a value written past
+        // `require_schema_message_index` arrives here unchecked. Every entry
+        // point (direct, FIFO, DLQ, broadcast, supervisor) passes the options
+        // through this one funnel, so this is the one place to refuse it.
+        #[cfg(feature = "kafka-schema-registry")]
+        if let Some(index) = &self.schema_message_index {
+            validate_message_index(index);
+        }
         let effective_prefetch = if self.concurrent_processing {
             self.prefetch_count.max(1)
         } else {
@@ -550,13 +603,18 @@ impl<B: Backend> ConsumerOptions<B> {
             #[cfg(feature = "kafka")]
             kafka_group_id: self.kafka_group_id,
             #[cfg(feature = "kafka")]
-            kafka_auto_offset_reset: None,
+            kafka_auto_offset_reset: self.kafka_auto_offset_reset,
+            #[cfg(feature = "kafka")]
+            kafka_commit_interval: self.kafka_commit_interval,
+            broadcast_start: self.broadcast_start,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: self.schema_registry,
             #[cfg(feature = "kafka-schema-registry")]
             schema_enforcement: self.schema_enforcement,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: self.schema_accepted_subjects,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: self.schema_message_index,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: self.exactly_once,
             #[cfg(feature = "aws-sns-sqs")]
@@ -598,8 +656,15 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             schema_enforcement: self.schema_enforcement,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: self.schema_accepted_subjects.clone(),
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: self.schema_message_index.clone(),
             #[cfg(feature = "kafka")]
             kafka_group_id: self.kafka_group_id.clone(),
+            #[cfg(feature = "kafka")]
+            kafka_auto_offset_reset: self.kafka_auto_offset_reset,
+            #[cfg(feature = "kafka")]
+            kafka_commit_interval: self.kafka_commit_interval,
+            broadcast_start: self.broadcast_start,
             shutdown: self.shutdown.clone(),
             processing: self.processing.clone(),
             consumer_group: self.consumer_group.clone(),
@@ -694,8 +759,92 @@ impl ConsumerOptions<Kafka> {
     /// override here splits the group but leaves both readers sharing one DLQ.
     /// For the coordinated registry path the equivalent is
     /// [`KafkaConsumerGroupConfig::with_group_id`](crate::kafka::KafkaConsumerGroupConfig::with_group_id).
+    ///
+    /// On a broadcast subscription this names the inert `group.id` the
+    /// groupless handle is configured with, `"{queue}-broadcast"` by default.
+    /// Nothing joins under it and nothing commits to it either way; set it
+    /// when the cluster's ACLs grant group Describe on one prefix only, so the
+    /// coordinator lookup librdkafka performs even for an assign-only handle
+    /// is authorised.
     pub fn with_group_id(mut self, group_id: impl Into<Arc<str>>) -> Self {
         self.kafka_group_id = Some(group_id.into());
+        self
+    }
+
+    /// Where a consumer group with no committed offset starts: rdkafka's
+    /// `auto.offset.reset`. Unset keeps `earliest`, which replays the
+    /// retained history on the first run.
+    ///
+    /// [`KafkaAutoOffsetReset::Latest`] starts a fresh group at the tail,
+    /// which is what a latest-value sink wants on its first deployment
+    /// against a topic with days of history. [`KafkaAutoOffsetReset::None`]
+    /// refuses to guess and ends the connection with an error instead. Once
+    /// the group has committed, the committed offset wins and this setting is
+    /// not consulted again; [`Broker::reset_consumer_group_offsets`](crate::Broker::reset_consumer_group_offsets)
+    /// is the way to move an existing group.
+    ///
+    /// Read by the direct and supervisor paths. For the coordinated registry
+    /// path the equivalent is
+    /// [`KafkaConsumerGroupConfig::with_auto_offset_reset`](crate::kafka::KafkaConsumerGroupConfig::with_auto_offset_reset),
+    /// which wins there exactly as `with_group_id` does. A broadcast
+    /// subscription refuses it at `subscribe()`: it assigns every partition
+    /// at an explicit offset and never consults the policy, and its start is
+    /// [`with_broadcast_start`](Self::with_broadcast_start). The DLQ drain
+    /// (`run_dlq_with_options`) refuses it too: the drain hard-codes
+    /// `earliest`, which applies only while its group has no usable committed
+    /// offset, so a fresh drain never skips a dead letter and a restarted one
+    /// resumes from its commit.
+    pub fn with_auto_offset_reset(mut self, reset: KafkaAutoOffsetReset) -> Self {
+        self.kafka_auto_offset_reset = Some(reset);
+        self
+    }
+
+    /// How often the concurrent consumer commits the offsets its handlers
+    /// completed. Unset keeps the 500 ms default.
+    ///
+    /// Completions are tracked in memory and committed asynchronously at
+    /// most once per interval, so a longer interval trades coordinator
+    /// requests for a wider replay window after a crash or a rebalance. The
+    /// final commit at shutdown is synchronous whatever the interval. For the
+    /// coordinated registry path the equivalent is
+    /// [`KafkaConsumerGroupConfig::with_commit_interval`](crate::kafka::KafkaConsumerGroupConfig::with_commit_interval).
+    /// A FIFO consumer, a broadcast subscription and the DLQ drain refuse it
+    /// at their entry points, because none of them commits on an interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `interval` is zero or longer than one hour, the same bound
+    /// `KafkaConsumerGroupConfig::with_commit_interval` applies: the commit
+    /// gate adds the interval to an `Instant`, so the bound keeps every
+    /// deadline representable.
+    pub fn with_commit_interval(mut self, interval: Duration) -> Self {
+        validate_commit_interval(interval);
+        self.kafka_commit_interval = Some(interval);
+        self
+    }
+}
+
+impl<B: HasBroadcast> ConsumerOptions<B> {
+    /// Where a broadcast subscription starts reading.
+    ///
+    /// Unset, and [`BroadcastStart::Tail`], start at the tail: deliver-new,
+    /// the broadcast contract. [`BroadcastStart::Head`] replays everything
+    /// the broker still retains first, and [`BroadcastStart::Timestamp`]
+    /// starts at the first message at or after that instant, in milliseconds
+    /// since the Unix epoch. A reconnect re-resolves the same start, so a
+    /// `Head` subscription replays retention again after a broker blip.
+    ///
+    /// Read only by
+    /// [`BroadcastSubscriber::subscribe`](crate::BroadcastSubscriber::subscribe).
+    /// Kafka honours all three variants, resolving a timestamp the same way
+    /// [`Broker::reset_consumer_group_offsets`](crate::Broker::reset_consumer_group_offsets)
+    /// does; every other backend starts at the tail only on this version and
+    /// refuses `Head` and `Timestamp` at `subscribe()`. The direct, group,
+    /// FIFO and supervisor entry points refuse a set start too, because a
+    /// group's start is its committed offset and, on Kafka,
+    /// `with_auto_offset_reset`.
+    pub fn with_broadcast_start(mut self, start: BroadcastStart) -> Self {
+        self.broadcast_start = Some(start);
         self
     }
 }
@@ -723,6 +872,32 @@ impl ConsumerOptions<Kafka> {
         S: Into<Arc<str>>,
     {
         self.schema_accepted_subjects = Some(subjects.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Accept only protobuf frames whose message index equals `index`, the
+    /// path of `M` inside its schema file: `[0]` is the first top-level
+    /// message, `[1]` the second, `[0, 2]` the third message nested in the
+    /// first. Unset accepts any index, so a `ProtobufCodec<M>` decodes
+    /// whatever message the producer framed as `M`. A frame with another
+    /// index is routed to the DLQ with reason `schema_message_index_rejected`
+    /// before its schema id is resolved. JSON frames carry no index and are
+    /// not judged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is empty, holds a negative element or has more than
+    /// 1024 entries, the wire parser's own cap; `KafkaConsumerGroupConfig`
+    /// and `BatchConsumerOptions::<Kafka>` apply the same check. The parser
+    /// never yields such an index, so the requirement could never match and
+    /// every protobuf frame would be dead-lettered with nothing at startup
+    /// pointing at the cause. The check runs again when the options are
+    /// handed to the consumer, so a value written to the public
+    /// `schema_message_index` field past this setter is refused there.
+    pub fn require_schema_message_index(mut self, index: impl Into<Vec<i32>>) -> Self {
+        let index = index.into();
+        validate_message_index(&index);
+        self.schema_message_index = Some(index);
         self
     }
 }
@@ -1057,6 +1232,85 @@ mod tests {
         assert_eq!(inner.kafka_group_id, None);
     }
 
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_with_auto_offset_reset_propagates_through_into_inner() {
+        use crate::markers::Kafka;
+        let inner = ConsumerOptions::<Kafka>::new()
+            .with_auto_offset_reset(KafkaAutoOffsetReset::Latest)
+            .into_inner();
+        assert_eq!(
+            inner.kafka_auto_offset_reset,
+            Some(KafkaAutoOffsetReset::Latest)
+        );
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_auto_offset_reset_defaults_to_none() {
+        use crate::markers::Kafka;
+        let inner = ConsumerOptions::<Kafka>::new().into_inner();
+        assert_eq!(inner.kafka_auto_offset_reset, None);
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_with_commit_interval_propagates_through_into_inner() {
+        use crate::markers::Kafka;
+        let inner = ConsumerOptions::<Kafka>::new()
+            .with_commit_interval(Duration::from_secs(5))
+            .into_inner();
+        assert_eq!(inner.kafka_commit_interval, Some(Duration::from_secs(5)));
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_commit_interval_defaults_to_none() {
+        use crate::markers::Kafka;
+        let inner = ConsumerOptions::<Kafka>::new().into_inner();
+        assert_eq!(inner.kafka_commit_interval, None);
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    #[should_panic(expected = "commit_interval must be positive")]
+    fn kafka_with_commit_interval_rejects_zero() {
+        use crate::markers::Kafka;
+        let _ = ConsumerOptions::<Kafka>::new().with_commit_interval(Duration::ZERO);
+    }
+
+    /// The twin of `KafkaConsumerGroupConfig::with_commit_interval` applies
+    /// the same bound, so the direct and supervisor paths fail as fast as the
+    /// registry path does.
+    #[cfg(feature = "kafka")]
+    #[test]
+    #[should_panic(expected = "commit_interval must be at most")]
+    fn kafka_with_commit_interval_rejects_an_unrepresentable_interval() {
+        use crate::markers::Kafka;
+        let _ = ConsumerOptions::<Kafka>::new().with_commit_interval(Duration::MAX);
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn with_broadcast_start_propagates_through_into_inner() {
+        use crate::markers::Kafka;
+        let inner = ConsumerOptions::<Kafka>::new()
+            .with_broadcast_start(BroadcastStart::Timestamp(1_700_000_000_000))
+            .into_inner();
+        assert_eq!(
+            inner.broadcast_start,
+            Some(BroadcastStart::Timestamp(1_700_000_000_000))
+        );
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn broadcast_start_defaults_to_none() {
+        use crate::markers::Kafka;
+        let inner = ConsumerOptions::<Kafka>::new().into_inner();
+        assert_eq!(inner.broadcast_start, None);
+    }
+
     #[cfg(any(
         feature = "inmemory",
         feature = "kafka",
@@ -1230,6 +1484,104 @@ mod tests {
                 inner.schema_accepted_subjects,
                 Some(vec![Arc::from("orders-value"), Arc::from("orders-key")])
             );
+        }
+
+        #[test]
+        fn require_schema_message_index_propagates() {
+            let inner = ConsumerOptions::<Kafka>::new()
+                .require_schema_message_index([0, 2])
+                .into_inner();
+            assert_eq!(inner.schema_message_index, Some(vec![0, 2]));
+            assert!(
+                ConsumerOptions::<Kafka>::new()
+                    .into_inner()
+                    .schema_message_index
+                    .is_none()
+            );
+        }
+
+        /// The two shapes the wire parser yields, the single-byte shorthand
+        /// and a nested path, are accepted: the validator refuses only what
+        /// can never match.
+        #[test]
+        fn require_schema_message_index_accepts_the_shorthand_and_a_nested_path() {
+            let shorthand = ConsumerOptions::<Kafka>::new()
+                .require_schema_message_index([0])
+                .into_inner();
+            assert_eq!(shorthand.schema_message_index, Some(vec![0]));
+            let nested = ConsumerOptions::<Kafka>::new()
+                .require_schema_message_index([1, 0, 3])
+                .into_inner();
+            assert_eq!(nested.schema_message_index, Some(vec![1, 0, 3]));
+        }
+
+        /// `read_message_indexes` never yields an empty array, so an empty
+        /// requirement would send every protobuf frame to the DLQ with
+        /// nothing at startup pointing at the cause: refused at the setter.
+        #[test]
+        #[should_panic(expected = "schema_message_index must not be empty")]
+        fn require_schema_message_index_rejects_an_empty_path() {
+            let _ = ConsumerOptions::<Kafka>::new().require_schema_message_index(Vec::<i32>::new());
+        }
+
+        #[test]
+        #[should_panic(expected = "schema_message_index must not contain a negative index")]
+        fn require_schema_message_index_rejects_a_negative_index() {
+            let _ = ConsumerOptions::<Kafka>::new().require_schema_message_index([0, -1]);
+        }
+
+        /// The cap is the parser's: 1024 indexes match a frame at the cap,
+        /// and 1025 can never match, so they are refused like an empty path.
+        #[test]
+        fn require_schema_message_index_accepts_a_path_at_the_parser_cap() {
+            let at_cap = ConsumerOptions::<Kafka>::new()
+                .require_schema_message_index(vec![0; 1024])
+                .into_inner();
+            assert_eq!(at_cap.schema_message_index.map(|i| i.len()), Some(1024));
+        }
+
+        #[test]
+        #[should_panic(
+            expected = "schema_message_index must not hold more than 1024 indexes, got 1025"
+        )]
+        fn require_schema_message_index_rejects_a_path_past_the_parser_cap() {
+            let _ = ConsumerOptions::<Kafka>::new().require_schema_message_index(vec![0; 1025]);
+        }
+
+        /// `schema_message_index` is a public field, so a value written past
+        /// the setter reaches the consumer through `into_inner`, the one
+        /// funnel every entry point passes the options through. The same
+        /// check runs there: a valid path goes through, and the three shapes
+        /// the setter refuses are refused before any consumer is created.
+        #[test]
+        fn into_inner_admits_a_valid_path_written_to_the_field() {
+            let mut opts = ConsumerOptions::<Kafka>::new();
+            opts.schema_message_index = Some(vec![0, 2]);
+            assert_eq!(opts.into_inner().schema_message_index, Some(vec![0, 2]));
+        }
+
+        #[test]
+        #[should_panic(expected = "schema_message_index must not be empty")]
+        fn into_inner_rejects_an_empty_path_written_to_the_field() {
+            let mut opts = ConsumerOptions::<Kafka>::new();
+            opts.schema_message_index = Some(Vec::new());
+            let _ = opts.into_inner();
+        }
+
+        #[test]
+        #[should_panic(expected = "schema_message_index must not contain a negative index")]
+        fn into_inner_rejects_a_negative_index_written_to_the_field() {
+            let mut opts = ConsumerOptions::<Kafka>::new();
+            opts.schema_message_index = Some(vec![0, -1]);
+            let _ = opts.into_inner();
+        }
+
+        #[test]
+        #[should_panic(expected = "schema_message_index must not hold more than 1024 indexes")]
+        fn into_inner_rejects_a_path_past_the_parser_cap_written_to_the_field() {
+            let mut opts = ConsumerOptions::<Kafka>::new();
+            opts.schema_message_index = Some(vec![0; 1025]);
+            let _ = opts.into_inner();
         }
 
         #[test]
