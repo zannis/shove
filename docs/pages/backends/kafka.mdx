@@ -88,12 +88,12 @@ See [`examples/kafka/msk_iam.rs`](/backends/kafka/examples/msk_iam) for a runnab
 // [!include ~/examples/kafka/basic.rs:declare]
 ```
 
-`topology().declare::<T>()` creates the Kafka topics for the main topic, hold topics, and DLQ. Idempotent — safe to call on every startup.
+`topology().declare::<T>()` creates the main Kafka topic and its configured DLQ.
+It does not create hold topics.
+Declaration is idempotent, so it is safe to call on every startup.
 
-By default a publish never creates a topic.
-The producer runs with `allow.auto.create.topics=false`, so a publish to a topic nobody declared fails with a `Connection` error after the produce timeout, and the topic stays absent.
 Declare the topology before the first publish, or provision the topic outside shove.
-To let a producer create a missing topic on a broker that runs `auto.create.topics.enable=true`, set `KafkaConfig::with_producer_auto_create_topics(true)`; the topic then gets broker defaults, outside any topology config.
+For the default missing-topic behavior and the auto-creation switch, see [`KafkaConfig::with_producer_auto_create_topics`](https://docs.rs/shove/latest/shove/kafka/struct.KafkaConfig.html#method.with_producer_auto_create_topics).
 
 ## Publish
 
@@ -102,7 +102,7 @@ To let a producer create a missing topic on a broker that runs `auto.create.topi
 ```
 
 `publisher().await?` returns a `Publisher<Kafka>`. Messages are produced via `rdkafka`. The message key is derived from the topic's partition-key logic (or from `T::sequence_key()` for sequenced topics).
-By default the producer never creates the topic it publishes to; see [Declare topology](#declare-topology).
+For topic provisioning, see [Declare topology](#declare-topology).
 
 ### Producer tuning
 
@@ -121,7 +121,8 @@ let config = KafkaConfig::new(brokers)
 - **`with_producer_linger_ms(u32)`** — `linger.ms`, how long the producer waits to accumulate a batch. Higher values trade a little latency for materially larger (and better-compressed) batches. Must stay below the pinned `message.timeout.ms` (5000): linger time counts toward the message timeout, so values at or above it would expire every publish. Rejected at connect.
 - **`with_producer_batch_size(u32)`** — `batch.size`, maximum bytes accumulated per batch (`1..=i32::MAX`, checked at connect). librdkafka caps the effective batch at `min(batch.size, message.max.bytes)`, and `message.max.bytes` (default 1 MB) is not exposed — so this knob can lower the cap but not raise it above 1 MB.
 
-Each knob left unset keeps librdkafka's default, so an untuned config behaves exactly as before. `acks`, `enable.idempotence`, and `max.in.flight.requests.per.connection` are deliberately not exposed.
+Unset throughput settings keep librdkafka's defaults.
+`acks`, `enable.idempotence`, and `max.in.flight.requests.per.connection` are deliberately not exposed.
 
 The client holds a single producer, shared by `publisher()` and by the consumer's retry, defer, and DLQ republishes — a long linger also delays those republishes (and the offset commits gated on them for sequenced topics), so keep linger modest when consumers republish on the same client.
 
@@ -273,12 +274,13 @@ An id under the granted prefix keeps the logs clean.
 
 ### Replication factor
 
-Auto-created topics get replication factor `1` by default, which is fine for single-broker dev but unsafe in production. Set a cluster-wide default on the registry:
+Topics created by declaration get replication factor `1` by default, which is fine for single-broker dev but unsafe in production.
+Set a default for topics declared through this registry:
 
 ```rust,no_run
 let mut group = broker
     .consumer_group()
-    .with_default_replication_factor(3);                // applied to every auto-created topic
+    .with_default_replication_factor(3);                // applied to topics created by declaration
 ```
 
 Or set it per-declaration on the topology declarer:
@@ -567,7 +569,7 @@ The Kafka backend emits `shove_messages_failed_total` with the following `reason
   librdkafka implements PLAIN itself in every build, and SCRAM and OAUTHBEARER in its OpenSSL build, which `kafka-ssl` selects.
   GSSAPI/Kerberos needs Cyrus SASL and is behind the separate `kafka-gssapi` feature.
   For AWS MSK IAM, use the `kafka-msk-iam` feature instead.
-- **A publish to an undeclared topic fails by default.** The producer sets `allow.auto.create.topics=false`, so a broker with `auto.create.topics.enable=true` no longer creates a topic with broker defaults on the first publish. Call `topology().declare::<T>()` before the first publish, provision the topic outside shove, or opt back in with `with_producer_auto_create_topics(true)` on `KafkaConfig`. The retry and DLQ publishes of a consumer are unaffected, because `declare` creates those topics.
+- For publish failures on missing topics, see [Declare topology](#declare-topology).
 - **`librdkafka` system dependencies** on Debian/Ubuntu CI runners: `libsasl2-dev` is required only with `kafka-gssapi`.
   `kafka-ssl` alone links OpenSSL and no SASL library, and the shove `ci.yml` asserts that with `cargo tree`.
 

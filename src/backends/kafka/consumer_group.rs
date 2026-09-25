@@ -913,7 +913,7 @@ pub struct KafkaConsumerGroupRegistry {
     pub(crate) groups: HashMap<String, KafkaConsumerGroup>,
     client: Option<KafkaClient>,
     pub(super) default_handler_timeout: Option<Duration>,
-    /// Replication factor applied to every auto-created topic (main + DLQ)
+    /// Replication factor applied to topics created by declaration (main + DLQ)
     /// declared via `register` / `register_fifo`. `None` keeps the topology
     /// declarer default (`1`) — suitable for single-broker dev clusters.
     /// Production clusters must set this via
@@ -956,7 +956,7 @@ impl KafkaConsumerGroupRegistry {
         self
     }
 
-    /// Replication factor applied to every auto-created topic when groups
+    /// Replication factor applied to topics created by declaration when groups
     /// register. Defaults to `1` (single-broker dev) when unset — production
     /// clusters should call this with `≥ 3` (or whatever the cluster's
     /// quorum sizing demands) or pre-create topics out-of-band via

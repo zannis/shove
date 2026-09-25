@@ -138,7 +138,7 @@ pub(super) const PRODUCE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default partition count for standard (non-sequenced) topics.
 pub(super) const DEFAULT_PARTITIONS: i32 = 8;
 
-/// Default replication factor for auto-created topics. `1` keeps the
+/// Default replication factor for topics created by declaration. `1` keeps the
 /// no-config test/dev path working with a single-broker cluster; production
 /// deployments override via `KafkaConsumerGroupRegistry::with_default_replication_factor`
 /// or `KafkaTopologyDeclarer::with_replication_factor`.

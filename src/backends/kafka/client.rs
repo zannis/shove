@@ -270,8 +270,7 @@ pub struct KafkaConfig {
     pub(crate) producer_compression: Option<KafkaCompression>,
     pub(crate) producer_linger_ms: Option<u32>,
     pub(crate) producer_batch_size: Option<u32>,
-    /// Producer `allow.auto.create.topics`. Default: `false`, so a publish
-    /// never creates the topic it targets.
+    /// See [`Self::with_producer_auto_create_topics`].
     pub(crate) producer_auto_create_topics: bool,
 }
 
@@ -328,25 +327,27 @@ impl KafkaConfig {
         self
     }
 
-    /// Producer `allow.auto.create.topics`. Default: `false`, so a publish to
-    /// a topic nobody declared fails once `message.timeout.ms` elapses and the
-    /// topic stays absent; a topic exists because `declare()` created it or
-    /// because infra owns it.
+    /// Control producer topic auto-creation (`allow.auto.create.topics`).
     ///
-    /// `true` lets the producer ask the broker to create a missing topic on
-    /// the first publish, with broker defaults and outside any topology
-    /// config. The broker must also run `auto.create.topics.enable=true`;
-    /// on a broker that does not, the publish fails as with `false`. Nothing
-    /// else changes: `declare()` still creates the declared topology, and the
-    /// consumer keeps librdkafka's consumer default for this key, `false`.
+    /// Defaults to `false`: publishing cannot create a missing topic.
+    /// If the topic stays absent, publishing returns [`ShoveError::Connection`]
+    /// after its retry attempts fail.
+    ///
+    /// Set `true` to let the producer request topic creation on first publish.
+    /// The broker must also enable `auto.create.topics.enable=true`.
+    /// Created topics use broker defaults, outside shove's topology config.
+    ///
+    /// This controls the client's shared producer, including consumer retry,
+    /// defer, and DLQ publishes.
+    /// It does not change `declare()` or consumer topic auto-creation settings.
+    /// Consumers keep librdkafka's default, `false`.
     pub fn with_producer_auto_create_topics(mut self, allow: bool) -> Self {
         self.producer_auto_create_topics = allow;
         self
     }
 
-    /// Validate and apply the configured producer knobs to a producer
-    /// `ClientConfig`. Unset knobs are not touched, so an untuned config
-    /// stays byte-identical to librdkafka's defaults.
+    /// Validate and apply producer throughput settings to a `ClientConfig`.
+    /// Leave unset throughput properties unchanged.
     fn apply_producer_tuning(&self, cfg: &mut ClientConfig) -> Result<()> {
         if let Some(codec) = self.producer_compression {
             cfg.set("compression.type", codec.as_rdkafka_str());
@@ -453,16 +454,9 @@ enum KafkaProducerInner {
 /// The producer's client config: the connection settings of `base`, the
 /// pinned correctness settings, and the tuning `config` opts into.
 ///
-/// `allow.auto.create.topics` is set explicitly, `false` by default. librdkafka
-/// defaults it to `true` for a producer, so a publish to a topic nobody
-/// declared would ask a broker running `auto.create.topics.enable=true` to
-/// create that topic with broker defaults, outside `declare()` and outside any
-/// topology config. Set to `false`, the publish fails with an unknown-topic
-/// error once `message.timeout.ms` elapses and the topic stays absent, which
-/// is what the topology model needs: a topic exists because `declare()`
-/// created it or because infra owns it, never because a publisher named it
-/// first. [`KafkaConfig::with_producer_auto_create_topics`] opts one producer
-/// back into librdkafka's default.
+/// librdkafka enables producer topic auto-creation by default.
+/// Set the option explicitly to preserve shove's topic ownership policy.
+/// See [`KafkaConfig::with_producer_auto_create_topics`] for the public contract.
 fn producer_config(
     base: &ClientConfig,
     client_name: &str,
