@@ -101,37 +101,28 @@ SQS_FIFO_MESSAGES=100
 # 64 GB host and never starts a container, so it is the one backend where the
 # cap can rise without touching the VM.
 #
-# Sized from that run's fastest 64 KiB drain (514 k msg/s, `consumer_group` at
-# two consumers): 32 GiB is 524 288 messages, which puts that cell at ~0.9 s
-# and the other ten at 1.0-5.0 s, so the leg publishes instead of being
-# withheld whole. Resident cost is ~34 GB of the 64 GB host. Clearing the last
-# cell too would need ~40 GiB, and the harness's own floor doc declines to
-# chase a window that hardware speed keeps moving; a cell that lands under the
-# floor is withheld and captioned exactly as today, which loses one bar rather
+# At 32 GiB the 64 KiB leg is 524 288 messages. The published in-process leg
+# carries the cap: all twelve 64 KiB drain rows land in 3.4-9.1 s and publish.
+# Resident cost is ~34 GB of the 64 GB host. A cell that lands under the floor
+# on faster hardware is withheld and captioned, which loses one bar rather
 # than the pass.
 #
 # It moves the 1 KiB leg as well, and that is intended rather than incidental:
 # at 3 GiB that leg is byte-bound at 3 145 728, and 32 GiB puts it back on the
 # pinned count of 6 000 000, where the 64 B leg already sits. So in-process
-# runs two of its three legs on the matrix's own corpus instead of one, and the
-# single 1 KiB cell that drained in 0.97 s clears the floor too. It costs about
-# forty seconds of extra wall clock and 6 GiB rather than 3 GiB resident.
+# runs two of its three legs on the matrix's own corpus instead of one, with
+# no `setup_bound` drain row at either payload. It costs about forty seconds of
+# extra wall clock and 6 GiB rather than 3 GiB resident.
 #
 # `QUEUE_CAPACITY` in examples/inmemory/stress.rs is 8 000 000 and is a bound
 # rather than a preallocation, so it already covers 524 288; the harness's
 # `refused_drain_capacity` gate is what would catch it otherwise.
 #
-# What it does not fix, so the run is not read as fixing it: the two cells in
-# the published document that failed "consumed before assembly" at 64 KiB /
-# 8 consumers. In-process is one of them and this clears it, but the other is
-# RabbitMQ, whose eight-consumer group assembly ran through 46 467 of 49 152
+# What it does not fix: RabbitMQ's "consumed before assembly" failure at
+# 64 KiB / 8 consumers, whose group assembly ran through 46 467 of 49 152
 # messages. Putting that well under half a corpus needs ~196 k messages, which
 # is 12 GiB in an 8 GB VM. That failure is a group-assembly cost, not a corpus
 # size, and it is expected to fail again.
-#
-# The cap is not in the published in-process leg: it landed after that leg was
-# measured, so the committed rows are still the 3 GiB shape (49 152 at 64 KiB,
-# 3 145 728 at 1 KiB). Everything above is what the next in-process pass gets.
 INMEMORY_DRAIN_MAX_BYTES=34359738368
 
 usage() {
