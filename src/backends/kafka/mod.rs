@@ -18,6 +18,12 @@ pub use client::prime_admin_oauth_token_for_test;
 pub use client::{KafkaClient, KafkaCompression, KafkaConfig};
 #[cfg(feature = "kafka-ssl")]
 pub use client::{KafkaSasl, KafkaTls};
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use consumer::completion_probe;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use consumer::put_back_probe;
 pub use consumer::{BatchConsumerOptions, KafkaConsumer};
 pub(crate) use consumer_group::validate_commit_interval;
 

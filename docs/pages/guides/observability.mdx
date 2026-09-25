@@ -89,6 +89,7 @@ shove::metrics::set_prefix("billing_shove");
   | `malformed` | The delivery is not a well-formed `shove` message at all — a Redis stream entry with no payload field. Points at a foreign writer or a non-`shove` publisher, which is a different fix from `deserialize` | Redis |
   | `pending_full` | The in-order routing buffer is full | RabbitMQ |
   | `schema_frame` / `schema_validation` | Schema-registry frame decode / subject-resolve or validation failure | Kafka (`kafka-schema-registry`) |
+  | `schema_unavailable` | The schema registry could not answer for a record's schema id. The record is kept and the lookup retried after a delay, so this counts once per wait and is never a discard | Kafka (`kafka-schema-registry`) |
   | `timeout` | A single handler exceeded `handler_timeout` | all |
   | `max_retries_exceeded` | Retries exhausted, message dead-lettered | all |
   | `rejected` | Handler returned `Reject` | all |

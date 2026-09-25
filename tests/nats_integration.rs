@@ -153,8 +153,21 @@ shove::define_topic!(
     ExternalTopic,
     SimpleMessage,
     TopologyBuilder::new("nats-external")
-        .nats_external_stream()
+        .external()
         .dlq()
+        .build()
+);
+// An infra-owned stream with a retry ladder. On it a `Retry` naks with the
+// tier's delay instead of republishing, so the consumer never writes into the
+// stream, and the count is JetStream's redelivery count.
+shove::define_topic!(
+    ExternalRetryTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-external-retry")
+        .external()
+        .dlq()
+        .hold_queue(Duration::from_millis(200))
+        .hold_queue(Duration::from_millis(400))
         .build()
 );
 // Two topics over the SAME stream name with different (mutable) bounds, to prove
@@ -3589,4 +3602,258 @@ async fn direct_and_fifo_entry_points_refuse_a_broadcast_start() {
             && msg.contains("NatsConsumer::run_fifo"),
         "the error names the topic, the start and the entry point: {msg}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// External streams: a Retry never writes into the stream
+// ---------------------------------------------------------------------------
+
+/// Stands in for the infrastructure that owns `name`: a Limits stream over the
+/// one subject the topic publishes to. Limits retention keeps every record
+/// after its ack, so `state.messages` counts everything ever written.
+async fn provision_limits_stream(client: &NatsClient, name: &str) {
+    client
+        .jetstream()
+        .create_stream(JsStreamConfig {
+            name: name.to_string(),
+            subjects: vec![name.to_string()],
+            retention: RetentionPolicy::Limits,
+            ..Default::default()
+        })
+        .await
+        .expect("infra pre-provisions the stream");
+}
+
+async fn stream_messages(client: &NatsClient, name: &str) -> u64 {
+    let mut stream = client
+        .jetstream()
+        .get_stream(name)
+        .await
+        .expect("the stream exists");
+    stream.info().await.expect("stream info").state.messages
+}
+
+/// Answers from a script of outcomes, the last one repeating, and keeps every
+/// `MessageMetadata` it is handed.
+#[derive(Clone)]
+struct ScriptedHandler {
+    script: Arc<Vec<Outcome>>,
+    seen: Arc<Mutex<Vec<MessageMetadata>>>,
+    counter: WaitableCounter,
+}
+
+impl ScriptedHandler {
+    fn new(script: impl Into<Vec<Outcome>>) -> Self {
+        Self {
+            script: Arc::new(script.into()),
+            seen: Arc::new(Mutex::new(Vec::new())),
+            counter: WaitableCounter::new(),
+        }
+    }
+}
+
+impl MessageHandler<ExternalRetryTopic> for ScriptedHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        let mut seen = self.seen.lock().await;
+        let outcome = self.script[seen.len().min(self.script.len() - 1)].clone();
+        seen.push(meta);
+        drop(seen);
+        self.counter.increment();
+        outcome
+    }
+}
+
+/// Keeps every dead letter it is handed.
+#[derive(Clone)]
+struct DeadLetterRecorder {
+    seen: Arc<Mutex<Vec<DeadMessageMetadata>>>,
+    counter: WaitableCounter,
+}
+
+impl DeadLetterRecorder {
+    fn new() -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            counter: WaitableCounter::new(),
+        }
+    }
+}
+
+impl MessageHandler<ExternalRetryTopic> for DeadLetterRecorder {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+    async fn handle_dead(&self, _msg: SimpleMessage, meta: DeadMessageMetadata, _: &()) {
+        self.seen.lock().await.push(meta);
+        self.counter.increment();
+    }
+}
+
+/// On an external stream a `Retry` is a delayed nak of the same record: the
+/// redelivered record keeps its stream sequence, the retry count climbs with
+/// JetStream's delivery count instead of a header, and the stream holds
+/// exactly the one record the publisher wrote.
+#[tokio::test]
+async fn external_stream_retry_naks_in_place_and_writes_nothing() {
+    const STREAM: &str = "nats-external-retry";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    provision_limits_stream(&client, STREAM).await;
+    broker
+        .topology()
+        .declare::<ExternalRetryTopic>()
+        .await
+        .unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<ExternalRetryTopic>(&SimpleMessage {
+            id: "in-place".into(),
+            content: "retry twice, then ack".into(),
+        })
+        .await
+        .unwrap();
+
+    let handler = ScriptedHandler::new([Outcome::Retry, Outcome::Retry, Outcome::Ack]);
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<ExternalRetryTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(5)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "two retries and an ack are three deliveries"
+    );
+    // Let a stray fourth delivery surface before the assertions.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let seen = handler.seen.lock().await.clone();
+    assert_eq!(seen.len(), 3, "exactly three deliveries");
+    for (i, meta) in seen.iter().enumerate() {
+        let attempt = i as u32;
+        assert_eq!(
+            meta.retry_count, attempt,
+            "delivery {i}: the retry count is the redelivery count"
+        );
+        assert_eq!(
+            meta.delivery_count,
+            Some(attempt + 1),
+            "delivery {i}: JetStream counts the same record again"
+        );
+        assert_eq!(meta.redelivered, i > 0, "delivery {i}");
+        assert_eq!(
+            meta.offset,
+            Some(1),
+            "delivery {i}: the same record at the same stream sequence"
+        );
+        assert_eq!(
+            meta.headers.get("Shove-Retry-Count").map(String::as_str),
+            Some("0"),
+            "delivery {i}: the publisher's count header never climbs, so no copy was republished"
+        );
+    }
+    assert_eq!(
+        stream_messages(&client, STREAM).await,
+        1,
+        "the consumer wrote nothing into the infra-owned stream"
+    );
+
+    shutdown.cancel();
+    broker.close().await;
+    handle.await.unwrap().ok();
+}
+
+/// An exhausted in-place retry dead-letters as before: the record reaches a
+/// DLQ handler after one delivery plus `max_retries` redeliveries, the dead
+/// letter carries that redelivery count as its `retry_count`, and the
+/// external stream still holds only the record the publisher wrote. The DLQ
+/// stream itself is shove's work queue, so its count is not asserted.
+#[tokio::test]
+async fn external_stream_retry_exhaustion_dead_letters_with_the_redelivery_count() {
+    const STREAM: &str = "nats-external-retry";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    provision_limits_stream(&client, STREAM).await;
+    broker
+        .topology()
+        .declare::<ExternalRetryTopic>()
+        .await
+        .unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<ExternalRetryTopic>(&SimpleMessage {
+            id: "exhaust".into(),
+            content: "always retry".into(),
+        })
+        .await
+        .unwrap();
+
+    let handler = ScriptedHandler::new([Outcome::Retry]);
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<ExternalRetryTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(2)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let dead_letters = DeadLetterRecorder::new();
+    let dlc = dead_letters.clone();
+    let dlq_consumer = NatsConsumer::new(client.clone());
+    let dlq_handle =
+        tokio::spawn(async move { dlq_consumer.run_dlq::<ExternalRetryTopic, _>(dlc, ()).await });
+
+    assert!(
+        dead_letters.counter.wait_for(1, TIMEOUT).await,
+        "the exhausted record lands in the DLQ"
+    );
+    // Let a stray fourth delivery surface before the assertions.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        handler.counter.get(),
+        3,
+        "max_retries=2 allows one delivery plus two redeliveries"
+    );
+    let dead = dead_letters.seen.lock().await.clone();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].reason.as_deref(), Some("max_retries_exceeded"));
+    assert_eq!(
+        dead[0].message.retry_count, 2,
+        "the dead letter carries the redelivery count"
+    );
+    assert_eq!(
+        stream_messages(&client, STREAM).await,
+        1,
+        "the consumer wrote nothing into the infra-owned stream"
+    );
+
+    shutdown.cancel();
+    broker.close().await;
+    handle.await.unwrap().ok();
+    dlq_handle.await.unwrap().ok();
 }

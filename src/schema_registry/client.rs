@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -43,9 +44,66 @@ impl fmt::Debug for SchemaRegistryAuth {
 type Result<T> = std::result::Result<T, SchemaRegistryError>;
 type SharedResolve = Shared<BoxFuture<'static, Result<Arc<CachedSchema>>>>;
 
+/// One in-flight fetch and the `resolve` calls waiting on it.
+///
+/// `waiters` changes only under the map's shard lock, through `entry()`, so
+/// two cancellations serialise to one and then zero and the second removes
+/// the entry, while a joiner that arrives between them increments first and
+/// keeps it. `generation` tells a stale guard from a newer fetch for the same
+/// id. `Shared::strong_count` would read the same number, but its own doc
+/// says the count can change between the read and its use, and two dropping
+/// guards could then both see three owners and keep an abandoned fetch.
+struct InflightEntry {
+    shared: SharedResolve,
+    waiters: usize,
+    generation: u64,
+}
+
+/// This `resolve` call's share of an in-flight entry, and the owner of every
+/// removal from `inflight`.
+///
+/// Dropped on every exit of `resolve`: a normal return, a cancellation during
+/// the fetch, and a cancellation during the cache steps after it. Unfinished,
+/// it takes this waiter off the entry and removes the entry when no waiter is
+/// left, which drops the last `Shared` clone and with it the request nobody
+/// waits on. Finished, it removes the entry whatever the count, because the
+/// fetch is complete and every sibling holds its own clone of the result.
+struct InflightGuard<'a> {
+    registry: &'a SchemaRegistry,
+    id: SchemaId,
+    generation: u64,
+    finished: bool,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        use dashmap::mapref::entry::Entry;
+        let Entry::Occupied(mut occupied) = self.registry.inflight.entry(self.id) else {
+            return;
+        };
+        if occupied.get().generation != self.generation {
+            return;
+        }
+        if self.finished {
+            occupied.remove();
+            return;
+        }
+        let entry = occupied.get_mut();
+        entry.waiters = entry.waiters.saturating_sub(1);
+        if entry.waiters == 0 {
+            occupied.remove();
+        }
+    }
+}
+
 /// Cap attacker-controlled misses so arbitrary Confluent schema IDs cannot
 /// grow the process for its entire lifetime.
 const MAX_NEGATIVE_CACHE_ENTRIES: usize = 4096;
+
+/// See [`SchemaRegistry::negative_cache_lock_waits`].
+#[cfg(feature = "test-support")]
+static NEGATIVE_CACHE_LOCK_WAITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Headers whose whole purpose is to carry a credential. Declaring one of these
 /// non-secret is never a true statement about a configuration, so
@@ -73,8 +131,11 @@ pub struct SchemaRegistry {
     negative_cache_ttl: Duration,
     // Tier 1: resolved schemas, immutable by id.
     resolved: DashMap<SchemaId, Arc<CachedSchema>>,
-    // Tier 2: in-flight single-flight futures.
-    inflight: DashMap<SchemaId, SharedResolve>,
+    // Tier 2: in-flight single-flight futures, with their waiter counts.
+    inflight: DashMap<SchemaId, InflightEntry>,
+    // Numbers each fetch, so a guard from an abandoned fetch cannot touch a
+    // newer entry for the same id.
+    fetch_generation: AtomicU64,
     // Negative cache: id -> (instant inserted, error that caused the miss).
     negative: DashMap<SchemaId, (std::time::Instant, SchemaRegistryError)>,
     // Serialises bounded eviction + insertion so concurrent unique misses
@@ -123,22 +184,66 @@ impl SchemaRegistry {
             self.negative.remove(&id);
         }
         // Tier 2: single-flight — collapse concurrent misses into one fetch.
-        let shared = self.shared_fetch(id);
+        // The guard owns the entry's removal, so a caller that stops polling
+        // this future, a consumer shutting down mid-lookup for instance, takes
+        // its waiter off the entry and the last one to leave drops the fetch.
+        let (shared, generation) = self.shared_fetch(id);
+        let mut guard = InflightGuard {
+            registry: self,
+            id,
+            generation,
+            finished: false,
+        };
         let result = shared.await;
+        // The fetch is complete: from here the entry goes whatever the waiter
+        // count, and the guard stays armed so a cancellation while the cache
+        // steps below wait on their mutex removes it too.
+        guard.finished = true;
         match &result {
             Ok(schema) => {
                 self.resolved.insert(id, schema.clone());
-                self.inflight.remove(&id);
                 self.negative.remove(&id);
             }
             Err(e) => {
                 if !e.is_retriable() {
                     self.cache_negative(id, e.clone()).await;
                 }
-                self.inflight.remove(&id);
             }
         }
+        drop(guard);
         result
+    }
+
+    /// Test-only seam (see the `test-support` feature): the mutex that
+    /// serialises negative-cache inserts, so a test can park a `resolve` on
+    /// it and cancel the call while it waits there.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn negative_cache_lock_for_test(&self) -> &tokio::sync::Mutex<()> {
+        &self.negative_insert_lock
+    }
+
+    /// Test-only probe (see the `test-support` feature): how many times a
+    /// `resolve` has gone to wait on the negative-cache insert mutex, process
+    /// wide, so a test knows a call is parked there before it cancels it.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn negative_cache_lock_waits() -> usize {
+        NEGATIVE_CACHE_LOCK_WAITS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Test-only seam (see the `test-support` feature): forget a resolved
+    /// schema id, so the next decode asks the registry again and meets
+    /// whatever the mock answers now. The client caches a resolved id for the
+    /// process's lifetime, which is right in production and makes a later
+    /// registry fault unreachable from a test otherwise.
+    /// The negative entry goes with it, so a test that flips the mock from
+    /// a 404 back to an answer is not held to the negative cache's TTL.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn evict_for_test(&self, id: SchemaId) {
+        self.resolved.remove(&id);
+        self.negative.remove(&id);
     }
 
     /// True when `id` holds a negative entry that has not yet expired.
@@ -161,6 +266,8 @@ impl SchemaRegistry {
         if self.negative_is_fresh(id) {
             return;
         }
+        #[cfg(feature = "test-support")]
+        NEGATIVE_CACHE_LOCK_WAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _guard = self.negative_insert_lock.lock().await;
         // Load-bearing, not defensive padding: the whole burst can clear the
         // check above before any one of them inserts, so this is the
@@ -214,10 +321,17 @@ impl SchemaRegistry {
         Ok(id)
     }
 
-    fn shared_fetch(&self, id: SchemaId) -> SharedResolve {
+    /// Join the in-flight fetch for `id`, or start one, counting this caller
+    /// as a waiter under the shard lock. Returns the future to await and the
+    /// generation the caller's guard checks on drop.
+    fn shared_fetch(&self, id: SchemaId) -> (SharedResolve, u64) {
         use dashmap::mapref::entry::Entry;
         match self.inflight.entry(id) {
-            Entry::Occupied(e) => e.get().clone(),
+            Entry::Occupied(mut e) => {
+                let entry = e.get_mut();
+                entry.waiters += 1;
+                (entry.shared.clone(), entry.generation)
+            }
             Entry::Vacant(e) => {
                 let ctx = FetchCtx {
                     base_url: self.base_url.clone(),
@@ -229,8 +343,13 @@ impl SchemaRegistry {
                 };
                 let fut = async move { ctx.fetch(id).await };
                 let shared: SharedResolve = fut.boxed().shared();
-                e.insert(shared.clone());
-                shared
+                let generation = self.fetch_generation.fetch_add(1, Ordering::Relaxed);
+                e.insert(InflightEntry {
+                    shared: shared.clone(),
+                    waiters: 1,
+                    generation,
+                });
+                (shared, generation)
             }
         }
     }
@@ -315,10 +434,25 @@ impl FetchCtx {
             };
             match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    return resp
-                        .json()
-                        .await
-                        .map_err(|e| SchemaRegistryError::Decode(e.to_string()));
+                    // The status is the registry's answer, but the body has
+                    // still to arrive. A connection that drops mid-body is a
+                    // transport failure like a failed send, not a malformed
+                    // answer, so it is retried the same way and surfaces as
+                    // retriable. Only a body that arrived whole and does not
+                    // parse is `Decode`, the registry's fault.
+                    match resp.bytes().await {
+                        Ok(body) => {
+                            return serde_json::from_slice(&body)
+                                .map_err(|e| SchemaRegistryError::Decode(e.to_string()));
+                        }
+                        Err(e) if attempt >= self.max_retries => {
+                            return Err(SchemaRegistryError::Transport {
+                                retriable: true,
+                                message: format!("response body read failed: {e}"),
+                            });
+                        }
+                        Err(_) => {}
+                    }
                 }
                 Ok(resp) if resp.status().as_u16() == 404 => {
                     return Err(not_found);
@@ -354,11 +488,20 @@ impl FetchCtx {
                         message,
                     });
                 }
-                Ok(resp) if resp.status().is_server_error() => {
+                // A 5xx is the registry failing; 429 is it shedding load and
+                // 408 is it giving up on a slow request. All three are answers
+                // about *now*, not about the deployment, and a client that
+                // repeats the request later gets through. Confluent's registry
+                // documents 429 for rate limiting; a non-retriable reading
+                // would end the consumer on a busy registry.
+                Ok(resp)
+                    if resp.status().is_server_error()
+                        || matches!(resp.status().as_u16(), 408 | 429) =>
+                {
                     if attempt >= self.max_retries {
                         return Err(SchemaRegistryError::Transport {
                             retriable: true,
-                            message: format!("server error {}", resp.status()),
+                            message: format!("retriable status {}", resp.status()),
                         });
                     }
                 }
@@ -639,6 +782,7 @@ impl SchemaRegistryBuilder {
             negative_cache_ttl: self.negative_cache_ttl,
             resolved: DashMap::new(),
             inflight: DashMap::new(),
+            fetch_generation: AtomicU64::new(0),
             negative: DashMap::new(),
             negative_insert_lock: tokio::sync::Mutex::new(()),
             subject_ids: DashMap::new(),

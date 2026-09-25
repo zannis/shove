@@ -125,7 +125,11 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
     /// needs) before returning. Callers do **not** need to call
     /// `broker.topology().declare::<T>()` first; doing so is harmless but
     /// redundant. This guarantee holds across all backends (Redis, InMemory,
-    /// RabbitMQ, NATS, Kafka, SQS).
+    /// RabbitMQ, NATS, Kafka, SQS). An
+    /// [`external()`](crate::TopologyBuilder::external) topology opts its
+    /// main stream or topic out of it: declaration only verifies the
+    /// infra-owned resource, so this call fails fast when it is missing
+    /// instead of creating it.
     ///
     /// Returns an error if:
     /// - `T` has a sequencing config — use [`register_fifo`] instead.
@@ -162,7 +166,9 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
     /// needs) before returning. Callers do **not** need to call
     /// `broker.topology().declare::<T>()` first; doing so is harmless but
     /// redundant. This guarantee holds across all backends (Redis, InMemory,
-    /// RabbitMQ, NATS, Kafka, SQS).
+    /// RabbitMQ, NATS, Kafka, SQS), with no external-bind exception here:
+    /// `build()` refuses `external()` on a sequenced topology, so a FIFO
+    /// topology is always shove-owned.
     ///
     /// Returns an error if:
     /// - `T`'s topology has no sequencing config — use [`register`] instead.

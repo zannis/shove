@@ -4,10 +4,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use axum::response::{IntoResponse as _, Response};
 use axum::{
     Json, Router, extract::Path, extract::State, http::HeaderMap, http::StatusCode, routing::get,
 };
-use shove::schema_registry::{SchemaId, SchemaRegistry, SchemaRegistryAuth};
+use shove::schema_registry::{SchemaId, SchemaRegistry, SchemaRegistryAuth, SchemaRegistryError};
 
 #[derive(Clone)]
 struct MockState {
@@ -28,6 +29,135 @@ async fn status_versions(State(s): State<StatusMockState>, Path(_id): Path<u32>)
 async fn status_schema(State(s): State<StatusMockState>, Path(_id): Path<u32>) -> StatusCode {
     s.calls.fetch_add(1, Ordering::SeqCst);
     StatusCode::from_u16(s.status).unwrap()
+}
+
+/// Answers `status` for the first `failures` requests, then normally.
+#[derive(Clone)]
+struct RecoveringMockState {
+    calls: Arc<AtomicUsize>,
+    failures_left: Arc<AtomicUsize>,
+    status: u16,
+}
+
+impl RecoveringMockState {
+    fn answer(&self, body: serde_json::Value) -> Response {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let failing = self
+            .failures_left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if failing {
+            StatusCode::from_u16(self.status).unwrap().into_response()
+        } else {
+            Json(body).into_response()
+        }
+    }
+}
+
+async fn recovering_versions(
+    State(s): State<RecoveringMockState>,
+    Path(_id): Path<u32>,
+) -> Response {
+    s.answer(serde_json::json!([{ "subject": "orders-value", "version": 3 }]))
+}
+
+async fn recovering_schema(State(s): State<RecoveringMockState>, Path(_id): Path<u32>) -> Response {
+    s.answer(serde_json::json!({ "schema": "{}", "schemaType": "JSON" }))
+}
+
+/// Spawn a mock registry that answers `status` to the first `failures`
+/// requests and normally afterwards, returning (base_url, calls-counter).
+async fn spawn_recovering_mock(status: u16, failures: usize) -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = RecoveringMockState {
+        calls: calls.clone(),
+        failures_left: Arc::new(AtomicUsize::new(failures)),
+        status,
+    };
+    let app = Router::new()
+        .route("/schemas/ids/{id}/versions", get(recovering_versions))
+        .route("/schemas/ids/{id}", get(recovering_schema))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), calls)
+}
+
+/// Holds every `/versions` answer until the test releases it, and counts the
+/// fetches it saw on that endpoint, so a test can cancel a `resolve` while
+/// its request is in flight and then see whether a later call fetches again.
+#[derive(Clone)]
+struct DelayingMockState {
+    fetches: Arc<AtomicUsize>,
+    first_hit: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+}
+
+async fn delaying_versions(
+    State(s): State<DelayingMockState>,
+    Path(_id): Path<u32>,
+) -> Json<serde_json::Value> {
+    s.fetches.fetch_add(1, Ordering::SeqCst);
+    s.first_hit.notify_waiters();
+    loop {
+        let notified = s.release.notified();
+        if s.released.load(Ordering::SeqCst) {
+            break;
+        }
+        notified.await;
+    }
+    Json(serde_json::json!([{ "subject": "orders-value", "version": 3 }]))
+}
+
+async fn delaying_schema(
+    State(_s): State<DelayingMockState>,
+    Path(_id): Path<u32>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "schema": "{}", "schemaType": "JSON" }))
+}
+
+/// Spawn the delaying mock, returning (base_url, state).
+async fn spawn_delaying_mock() -> (String, DelayingMockState) {
+    let state = DelayingMockState {
+        fetches: Arc::new(AtomicUsize::new(0)),
+        first_hit: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+        released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let app = Router::new()
+        .route("/schemas/ids/{id}/versions", get(delaying_versions))
+        .route("/schemas/ids/{id}", get(delaying_schema))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), state)
+}
+
+impl DelayingMockState {
+    /// Wait until the mock has seen its first `/versions` request.
+    async fn wait_for_first_fetch(&self) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let notified = self.first_hit.notified();
+            if self.fetches.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => panic!("the mock was never asked"),
+            }
+        }
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
 }
 
 /// Spawn a mock registry that always returns the given HTTP status, returning (base_url, calls-counter).
@@ -517,6 +647,147 @@ async fn retriable_error_is_not_negative_cached() {
     );
 }
 
+/// A registry that answers `status` once and then normally is resolved on
+/// the client's own retry: the status is an answer about now, not about the
+/// deployment, so it must neither end the consumer nor be negative-cached.
+async fn recovers_after_one(status: u16) {
+    let (url, calls) = spawn_recovering_mock(status, 1).await;
+    let registry = SchemaRegistry::builder(url).max_retries(1).build();
+    let schema = registry
+        .resolve(SchemaId(1))
+        .await
+        .unwrap_or_else(|e| panic!("a {status} followed by a normal answer must resolve: {e}"));
+    assert_eq!(schema.primary_subject(), Some("orders-value"));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "one {status}, its retry, then the schema fetch"
+    );
+}
+
+/// With no retries left the same status surfaces as a retriable transport
+/// error, which the consume loops wait out instead of dead-lettering.
+async fn is_retriable_without_retries(status: u16) {
+    let (url, _) = spawn_status_mock(status).await;
+    let registry = SchemaRegistry::builder(url).max_retries(0).build();
+    let err = registry
+        .resolve(SchemaId(1))
+        .await
+        .expect_err("the status is an error until the registry answers");
+    assert!(
+        matches!(
+            err,
+            SchemaRegistryError::Transport {
+                retriable: true,
+                ..
+            }
+        ),
+        "{status} must be retriable, got {err:?}"
+    );
+}
+
+/// A registry whose connection drops before its declared body length has
+/// arrived: every request gets a `200` with `Content-Length: 200`, a few
+/// body bytes, and then the socket is closed.
+async fn spawn_truncating_mock() -> (String, Arc<AtomicUsize>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = calls.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            served.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                      Content-Length: 200\r\nConnection: close\r\n\r\n\
+                      [{\"subject\": \"orders-value\"",
+                )
+                .await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    (format!("http://{addr}"), calls)
+}
+
+/// A registry that answers `200` with a complete body that is not JSON.
+async fn spawn_malformed_mock() -> String {
+    let app = Router::new()
+        .route("/schemas/ids/{id}/versions", get(|| async { "not json" }))
+        .route("/schemas/ids/{id}", get(|| async { "not json" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// A `200` whose body is cut short is an outage, not the registry's verdict:
+/// the client retries the read like a failed send, and with no retries left
+/// it surfaces as a retriable transport error, which the consume loops wait
+/// out instead of ending the consumer on it.
+#[tokio::test]
+async fn an_interrupted_success_body_is_a_retriable_transport_error() {
+    let (url, calls) = spawn_truncating_mock().await;
+    let registry = SchemaRegistry::builder(url).max_retries(1).build();
+    let err = registry
+        .resolve(SchemaId(1))
+        .await
+        .expect_err("a body cut short cannot resolve");
+    assert!(
+        matches!(
+            err,
+            SchemaRegistryError::Transport {
+                retriable: true,
+                ..
+            }
+        ),
+        "an interrupted body is an outage, not a malformed answer: {err:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the read failure is retried once before it surfaces"
+    );
+}
+
+/// A complete `200` body that does not parse is the registry's fault and
+/// stays `Decode`, which the consume loops treat as a deployment fault.
+#[tokio::test]
+async fn a_malformed_success_body_is_a_decode_error() {
+    let url = spawn_malformed_mock().await;
+    let registry = SchemaRegistry::builder(url).max_retries(0).build();
+    let err = registry
+        .resolve(SchemaId(1))
+        .await
+        .expect_err("a body that is not JSON cannot resolve");
+    assert!(
+        matches!(err, SchemaRegistryError::Decode(_)),
+        "a complete body that does not parse is a decode error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rate_limited_registry_is_retried_and_recovers() {
+    recovers_after_one(429).await;
+    is_retriable_without_retries(429).await;
+}
+
+#[tokio::test]
+async fn a_request_timeout_from_the_registry_is_retried_and_recovers() {
+    recovers_after_one(408).await;
+    is_retriable_without_retries(408).await;
+}
+
+#[tokio::test]
+async fn a_server_error_from_the_registry_is_retried_and_recovers() {
+    recovers_after_one(503).await;
+}
+
 // ---------------------------------------------------------------------------
 // latest_id (producer-side subject -> id lookup)
 // ---------------------------------------------------------------------------
@@ -584,5 +855,149 @@ async fn second_latest_id_is_served_from_cache() {
         calls.load(Ordering::SeqCst),
         after_first,
         "subject -> id must be cached: no second HTTP call"
+    );
+}
+
+/// A `resolve` cancelled while its fetch is in flight must not leave that
+/// fetch behind: the next call for the same id fetches again instead of
+/// attaching to a future nobody drives any more.
+#[tokio::test]
+async fn a_cancelled_resolve_removes_its_abandoned_fetch() {
+    let (url, mock) = spawn_delaying_mock().await;
+    let registry = SchemaRegistry::builder(url).build();
+
+    let first = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.resolve(SchemaId(1)).await })
+    };
+    mock.wait_for_first_fetch().await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    mock.release();
+
+    registry
+        .resolve(SchemaId(1))
+        .await
+        .expect("a fresh fetch after the abandoned one resolves");
+    assert_eq!(
+        mock.fetches.load(Ordering::SeqCst),
+        2,
+        "the abandoned fetch was removed, so the second call fetched again"
+    );
+}
+
+/// A sibling still waiting on the same fetch keeps it alive: cancelling one
+/// waiter removes only that waiter.
+#[tokio::test]
+async fn a_cancelled_resolve_keeps_the_fetch_for_a_sibling_waiter() {
+    let (url, mock) = spawn_delaying_mock().await;
+    let registry = SchemaRegistry::builder(url).build();
+
+    let first = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.resolve(SchemaId(1)).await })
+    };
+    mock.wait_for_first_fetch().await;
+    let second = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.resolve(SchemaId(1)).await })
+    };
+    // The sibling has joined the in-flight entry before the first is cancelled.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    mock.release();
+
+    second
+        .await
+        .expect("sibling task panicked")
+        .expect("the sibling still gets the shared fetch's answer");
+    assert_eq!(
+        mock.fetches.load(Ordering::SeqCst),
+        1,
+        "one fetch served the surviving waiter"
+    );
+}
+
+/// Two waiters cancelled together remove the fetch exactly once: the second
+/// drop is the one that finds no waiter left.
+#[tokio::test]
+async fn two_cancelled_waiters_remove_the_fetch_once() {
+    let (url, mock) = spawn_delaying_mock().await;
+    let registry = SchemaRegistry::builder(url).build();
+
+    let first = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.resolve(SchemaId(1)).await })
+    };
+    mock.wait_for_first_fetch().await;
+    let second = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.resolve(SchemaId(1)).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    first.abort();
+    second.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(second.await.unwrap_err().is_cancelled());
+    mock.release();
+
+    registry
+        .resolve(SchemaId(1))
+        .await
+        .expect("a fresh fetch after both waiters left resolves");
+    assert_eq!(
+        mock.fetches.load(Ordering::SeqCst),
+        2,
+        "the entry was removed once both waiters had gone, so the third call fetched again"
+    );
+}
+
+/// A cancellation after the fetch completed, while `resolve` waits on the
+/// negative-cache insert mutex, leaves no in-flight entry either: the next
+/// call goes to the registry instead of being served the finished fetch's
+/// error from a retained entry.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_cancellation_during_the_negative_cache_step_leaves_no_inflight_entry() {
+    let (url, calls) = spawn_status_mock(401).await;
+    let registry = SchemaRegistry::builder(url).build();
+
+    let waits_before = SchemaRegistry::negative_cache_lock_waits();
+    let held = registry.negative_cache_lock_for_test().lock().await;
+    let parked = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.resolve(SchemaId(1)).await })
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while SchemaRegistry::negative_cache_lock_waits() <= waits_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the call never reached the negative-cache step"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let calls_after_first = calls.load(Ordering::SeqCst);
+    parked.abort();
+    assert!(parked.await.unwrap_err().is_cancelled());
+    drop(held);
+
+    let err = registry
+        .resolve(SchemaId(1))
+        .await
+        .expect_err("a 401 is not retriable and is returned as an error");
+    assert!(
+        matches!(
+            err,
+            SchemaRegistryError::Transport {
+                retriable: false,
+                ..
+            }
+        ),
+        "the same non-retriable error comes back: {err:?}"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) > calls_after_first,
+        "the second call reached the registry rather than a retained entry"
     );
 }

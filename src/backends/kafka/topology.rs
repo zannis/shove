@@ -99,7 +99,9 @@ impl KafkaTopologyDeclarer {
         }
     }
 
-    /// Ensure the main topic has at least `n` partitions.
+    /// Ensure the main topic has at least `n` partitions. Has no effect on an
+    /// `external()` topology, which shove never expands: `declare` then warns
+    /// when the topic has fewer partitions than `n`.
     pub fn with_min_partitions(mut self, n: i32) -> Self {
         self.min_partitions = Some(n);
         self
@@ -174,13 +176,38 @@ impl KafkaTopologyDeclarer {
 
     async fn declare_standard(&self, topology: &QueueTopology) -> Result<()> {
         let queue = topology.queue();
-        let partitions = self.effective_partitions(DEFAULT_PARTITIONS);
         let replication = self.effective_replication();
-        let config = merge_topic_config(&self.topic_config, topology.kafka_topic_config());
-        self.client
-            .create_topic(queue, partitions, replication, &config)
-            .await?;
 
+        if topology.external() {
+            // Bind to an infra-provisioned topic: verify it exists and fail
+            // fast rather than silently creating a differently-configured
+            // fallback. Nothing here touches the main topic: no create, no
+            // partition expansion, no config reconcile.
+            let partitions = self.client.verify_external_topic(queue).await?;
+            if let Some(min) = self.min_partitions
+                && partitions < min
+            {
+                tracing::warn!(
+                    queue,
+                    partitions,
+                    requested = min,
+                    "external Kafka topic has fewer partitions than the consumer group's \
+                     max_consumers; shove never expands an external topic, so the extra \
+                     members will sit idle"
+                );
+            }
+            tracing::debug!(queue, partitions, "bound to external Kafka topic");
+        } else {
+            let partitions = self.effective_partitions(DEFAULT_PARTITIONS);
+            let config = merge_topic_config(&self.topic_config, topology.kafka_topic_config());
+            self.client
+                .create_topic(queue, partitions, replication, &config)
+                .await?;
+        }
+
+        // shove always owns its own dead-letter topic (its dead-letter
+        // mechanism, not the infra-provided source topic), so create it in
+        // both modes.
         if let Some(dlq) = topology.dlq() {
             self.client
                 .create_topic(dlq, DEFAULT_PARTITIONS, replication, &[])
@@ -235,7 +262,11 @@ impl KafkaTopologyDeclarer {
                  hold-queue topics declared"
             );
         }
-        warn_if_under_replicated_for_acks_all(topology.queue(), self.effective_replication());
+        // The nudge is about topics shove auto-creates. An external main topic
+        // is never created, so only a declared DLQ can still earn it there.
+        if !topology.external() || topology.dlq().is_some() {
+            warn_if_under_replicated_for_acks_all(topology.queue(), self.effective_replication());
+        }
         if topology.sequencing().is_some() {
             self.declare_sequenced(topology).await
         } else {

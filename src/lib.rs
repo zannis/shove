@@ -231,7 +231,7 @@ pub use codecs::sbe::{SbeByteOrder, SbeCodec, SbeCodecError, SbeFrame, SbeHeader
 pub use consumer::{
     ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_KAFKA_MAX_BATCH_AGE,
     DEFAULT_KAFKA_MAX_BATCH_SIZE, DEFAULT_MAX_BATCH_AGE, DEFAULT_MAX_BATCH_SIZE,
-    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
+    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, RetryStrategy,
 };
 pub use consumer_supervisor::{ConsumerSupervisor, SupervisorOutcome};
 pub use error::ShoveError;
@@ -362,6 +362,20 @@ pub mod kafka {
     #[cfg(all(feature = "kafka-msk-iam", feature = "test-support"))]
     #[cfg_attr(docsrs, doc(cfg(feature = "test-support")))]
     pub use crate::backends::kafka::prime_admin_oauth_token_for_test;
+
+    /// Test-only probe (see the `test-support` feature) on the concurrent
+    /// consumer's completion channel, for tests that prove a completion sat
+    /// in the channel during a stall.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::completion_probe;
+
+    /// Test-only counters (see the `test-support` feature) on the consumer's
+    /// four `put_back` call sites, for tests that prove a record went back to
+    /// the broker on the path they drive.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::put_back_probe;
 
     /// Test-only seam (see the `test-support` feature): the receive loop's
     /// shutdown commit deadline, for tests that time a shutdown against it.

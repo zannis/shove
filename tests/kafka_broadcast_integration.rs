@@ -151,6 +151,9 @@ impl MessageHandler<RetryTopic> for AlwaysRetry {
 #[derive(Clone, Default)]
 struct DeferOnce {
     calls: Arc<Mutex<Vec<String>>>,
+    /// The coordinates of every delivery, in order, so the test can prove
+    /// that a redelivery is the same record.
+    coordinates: Arc<Mutex<Vec<Coordinates>>>,
 }
 
 impl DeferOnce {
@@ -161,7 +164,11 @@ impl DeferOnce {
 
 impl MessageHandler<DeferTopic> for DeferOnce {
     type Context = ();
-    async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _: &()) -> Outcome {
+    async fn handle(&self, msg: Invalidate, meta: MessageMetadata, _: &()) -> Outcome {
+        self.coordinates
+            .lock()
+            .await
+            .push((meta.partition, meta.offset, meta.timestamp_ms));
         let mut calls = self.calls.lock().await;
         let seen_before = calls.iter().filter(|k| **k == msg.key).count();
         calls.push(msg.key);
@@ -957,6 +964,74 @@ async fn defer_redelivers_only_to_the_subscriber_that_deferred() {
             .await;
         broker.close().await;
     }
+    publisher_broker.close().await;
+}
+
+/// A deferred record is redelivered before any record received after it:
+/// the subscription's single slot is held across the delay, so a second
+/// record published during the wait is handled only once the first has been
+/// deferred and acked. The order is `[1, 1, 2]`, never `[1, 2, 1]`.
+#[tokio::test]
+async fn defer_redelivers_in_place_before_later_records() {
+    let tb = TestBroker::start().await;
+
+    let publisher_broker = tb.broker().await;
+    publisher_broker
+        .topology()
+        .declare::<DeferTopic>()
+        .await
+        .expect("failed to declare broadcast topic");
+    let pubr = publisher_broker
+        .publisher()
+        .await
+        .expect("failed to build publisher");
+
+    let broker = tb.broker().await;
+    let deferring = DeferOnce::default();
+    let mut sub = broker.broadcast_subscriber();
+    sub.subscribe::<DeferTopic, _>(deferring.clone(), ConsumerOptions::new())
+        .expect("failed to subscribe");
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    pubr.publish::<DeferTopic>(&Invalidate { key: "1".into() })
+        .await
+        .expect("publish failed");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while deferring.calls().await.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // "1" is now waiting out its one-second deferral holding the only slot.
+    pubr.publish::<DeferTopic>(&Invalidate { key: "2".into() })
+        .await
+        .expect("publish failed");
+    while deferring.calls().await.len() < 3 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        deferring.calls().await,
+        vec!["1".to_string(), "1".to_string(), "2".to_string()],
+        "the deferred record must come back before the record behind it"
+    );
+    let coordinates = deferring.coordinates.lock().await.clone();
+    assert!(
+        coordinates[0].0.is_some() && coordinates[0].1.is_some() && coordinates[0].2.is_some(),
+        "the first delivery carries partition, offset and timestamp: {coordinates:?}"
+    );
+    assert_eq!(
+        coordinates[1], coordinates[0],
+        "the redelivery keeps the record's partition, offset and timestamp"
+    );
+    assert_ne!(
+        coordinates[2], coordinates[0],
+        "the record behind it has its own coordinates"
+    );
+
+    sub.cancellation_token().cancel();
+    let _ = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    broker.close().await;
     publisher_broker.close().await;
 }
 

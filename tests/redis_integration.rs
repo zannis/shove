@@ -5448,3 +5448,276 @@ async fn direct_and_fifo_entry_points_refuse_a_broadcast_start() {
         "the error names the topic, the start and the entry point: {msg}"
     );
 }
+
+struct ExternalLedgerTopic;
+impl Topic for ExternalLedgerTopic {
+    type Message = Event;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-external")
+                .external()
+                .build()
+        })
+    }
+}
+
+/// `external()` is refused at `declare` on Redis Streams, which verifies no
+/// infra-owned stream yet: `XGROUP CREATE ... MKSTREAM` would create the
+/// stream the flag promises never to touch. The refusal comes before that
+/// command, so the key does not exist afterwards.
+#[tokio::test]
+async fn declaring_an_external_topology_is_refused_before_any_stream_exists() {
+    let broker = make_broker("redis-int-external-grp").await;
+    let err = broker
+        .topology()
+        .declare::<ExternalLedgerTopic>()
+        .await
+        .expect_err("external() must be refused on Redis Streams");
+    let ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("redis-int-external")
+            && msg.contains("external()")
+            && msg.contains("Redis Streams")
+            && msg.contains("EXISTS"),
+        "the error names the topic, the flag, the backend and the missing step: {msg}"
+    );
+
+    let url = redis_url().await;
+    let probe_client = redis::Client::open(url).expect("raw client");
+    let mut probe = probe_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("probe conn");
+    let exists: i64 = redis::cmd("EXISTS")
+        .arg("redis-int-external")
+        .query_async(&mut probe)
+        .await
+        .expect("EXISTS");
+    assert_eq!(exists, 0, "the refused declare created no stream");
+}
+
+// ---------------------------------------------------------------------------
+// External topologies: refused at every consume entry point
+// ---------------------------------------------------------------------------
+
+use shove::{BatchConsumerOptions, BatchMessageHandler};
+
+struct ExternalConsumeTopic;
+impl Topic for ExternalConsumeTopic {
+    type Message = Event;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-external-consume")
+                .external()
+                .dlq()
+                .build()
+        })
+    }
+}
+
+impl shove::NotSequenced for ExternalConsumeTopic {}
+
+struct ExternalFanoutTopic;
+impl Topic for ExternalFanoutTopic {
+    type Message = Event;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-external-fanout")
+                .external()
+                .broadcast()
+                .build()
+        })
+    }
+}
+
+/// Counts every delivery and always asks for a `Retry`, the outcome that
+/// republishes on this backend.
+#[derive(Clone)]
+struct ExternalRetryCounter(Arc<AtomicUsize>);
+
+impl MessageHandler<ExternalConsumeTopic> for ExternalRetryCounter {
+    type Context = ();
+    async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Outcome::Retry
+    }
+}
+
+impl MessageHandler<ExternalFanoutTopic> for ExternalRetryCounter {
+    type Context = ();
+    async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Outcome::Retry
+    }
+}
+
+impl BatchMessageHandler<ExternalConsumeTopic> for ExternalRetryCounter {
+    type Context = ();
+    async fn handle_batch(&self, messages: Vec<(Event, MessageMetadata)>, _: &()) -> Outcome {
+        self.0.fetch_add(messages.len(), Ordering::SeqCst);
+        Outcome::Retry
+    }
+}
+
+async fn stream_len(probe: &mut MultiplexedConnection, stream: &str) -> i64 {
+    redis::cmd("XLEN")
+        .arg(stream)
+        .query_async(probe)
+        .await
+        .expect("XLEN")
+}
+
+fn expect_external_refusal(err: ShoveError, queue: &str, entry_point: &str) {
+    let ShoveError::Topology(msg) = err else {
+        panic!("{entry_point}: expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains(queue)
+            && msg.contains("external()")
+            && msg.contains("Redis Streams")
+            && msg.contains("idle redelivery"),
+        "{entry_point}: the error names the topic, the flag, the backend and the missing \
+         primitive: {msg}"
+    );
+}
+
+/// Infra owns the stream and the group here, so nothing goes through
+/// `declare`, and the consumer is the only thing between a `Retry` and an
+/// `XADD` into the infra-owned stream. Every entry point refuses the
+/// external topology before its first command, and the stream still holds
+/// the one entry infra published.
+#[tokio::test]
+async fn consuming_an_external_topology_is_refused_at_every_entry_point() {
+    const STREAM: &str = "redis-int-external-consume";
+    const GROUP: &str = "redis-int-external-consume-grp";
+    // `make_broker` waits for the container to listen; the raw probe below
+    // connects afterwards, with a short retry of its own for the same reason.
+    let broker = make_broker(GROUP).await;
+    let url = redis_url().await;
+    let raw = redis::Client::open(url).expect("raw client");
+    let mut probe = None;
+    for attempt in 0u32..20 {
+        match raw.get_multiplexed_async_connection().await {
+            Ok(conn) => {
+                probe = Some(conn);
+                break;
+            }
+            Err(e) if attempt < 19 => {
+                let _ = e;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => panic!("probe conn: {e}"),
+        }
+    }
+    let mut probe = probe.expect("probe conn");
+    let _: () = redis::cmd("XGROUP")
+        .arg("CREATE")
+        .arg(STREAM)
+        .arg(GROUP)
+        .arg("$")
+        .arg("MKSTREAM")
+        .query_async(&mut probe)
+        .await
+        .expect("infra creates the stream and the group");
+    let _: String = redis::cmd("XADD")
+        .arg(STREAM)
+        .arg("*")
+        .arg("payload")
+        .arg(r#"{"account":"infra","seq":1}"#)
+        .query_async(&mut probe)
+        .await
+        .expect("infra publishes one entry");
+    let client = <Redis as shove::Backend>::connect(
+        RedisConfig::new(RedisMode::Standalone {
+            url: url.to_owned(),
+        })
+        .with_group(GROUP),
+    )
+    .await
+    .expect("client");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let handler = ExternalRetryCounter(hits.clone());
+
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        RedisConsumer::new(client.clone()).run::<ExternalConsumeTopic, _>(
+            handler.clone(),
+            (),
+            ConsumerOptions::<Redis>::new(),
+        ),
+    )
+    .await
+    {
+        Ok(result) => expect_external_refusal(
+            result.expect_err("run must refuse an external topology"),
+            STREAM,
+            "RedisConsumer::run",
+        ),
+        Err(_) => {
+            let len = stream_len(&mut probe, STREAM).await;
+            panic!(
+                "run did not refuse the external topology and kept consuming; the infra-owned \
+                 stream now holds {len} entries after {} deliveries",
+                hits.load(Ordering::SeqCst)
+            );
+        }
+    }
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        RedisConsumer::new(client.clone()).run_dlq::<ExternalConsumeTopic, _>(handler.clone(), ()),
+    )
+    .await
+    .expect("the DLQ refusal is synchronous")
+    .expect_err("run_dlq must refuse an external topology");
+    expect_external_refusal(err, STREAM, "RedisConsumer::run_dlq");
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        broker.batch_consumer().run::<ExternalConsumeTopic, _>(
+            handler.clone(),
+            (),
+            BatchConsumerOptions::new(),
+        ),
+    )
+    .await
+    .expect("the batch refusal is synchronous")
+    .expect_err("the batch consumer must refuse an external topology");
+    expect_external_refusal(err, STREAM, "BatchConsumer::run");
+
+    let mut subscriber = broker.broadcast_subscriber();
+    let err = subscriber
+        .subscribe::<ExternalFanoutTopic, _>(handler.clone(), ConsumerOptions::new())
+        .expect_err("subscribe must refuse an external topology");
+    expect_external_refusal(
+        err,
+        "redis-int-external-fanout",
+        "BroadcastSubscriber::subscribe",
+    );
+
+    let mut group = broker.consumer_group();
+    let factory_hits = hits.clone();
+    let err = group
+        .register::<ExternalConsumeTopic, _>(
+            ConsumerGroupConfig::new(RedisConsumerGroupConfig::default()),
+            move || ExternalRetryCounter(factory_hits.clone()),
+        )
+        .await
+        .expect_err("register must refuse an external topology");
+    expect_external_refusal(err, STREAM, "ConsumerGroup::register");
+
+    assert_eq!(
+        stream_len(&mut probe, STREAM).await,
+        1,
+        "the consumer wrote nothing into the infra-owned stream"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "no handler ran");
+}

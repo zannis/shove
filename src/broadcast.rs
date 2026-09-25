@@ -269,6 +269,13 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
             self.registered.remove(queue);
             return Err(e);
         }
+        // An external topology is refused here too, on the backends whose
+        // loop would republish into it, so a subscription that can never run
+        // is refused at `subscribe()` and not in its task.
+        if let Err(e) = B::BroadcastImpl::refuse_external(T::topology()) {
+            self.registered.remove(queue);
+            return Err(e);
+        }
         let broadcast = self.broadcast.clone();
         let ctx = self.ctx.clone();
         // A broadcast topology has neither a DLQ nor hold queues, so a retry

@@ -2,8 +2,19 @@ use std::time::Duration;
 
 #[cfg(all(feature = "nats", feature = "env-config"))]
 use crate::env::EnvVars;
-#[cfg(all(feature = "nats", feature = "env-config"))]
+#[cfg(any(
+    all(feature = "nats", feature = "env-config"),
+    feature = "rabbitmq",
+    feature = "pub-aws-sns",
+    feature = "redis-streams"
+))]
 use crate::error::Result;
+#[cfg(any(
+    feature = "rabbitmq",
+    feature = "pub-aws-sns",
+    feature = "redis-streams"
+))]
+use crate::error::ShoveError;
 
 // ---------------------------------------------------------------------------
 // NATS stream config
@@ -32,7 +43,7 @@ pub enum NatsRetention {
 ///
 /// Use this when shove should own the stream but you need it bounded (so a stalled
 /// consumer can't grow the file store without limit) or replicated (R3). Use
-/// [`TopologyBuilder::nats_external_stream`] instead when infra owns the stream.
+/// [`TopologyBuilder::external`] instead when infra owns the stream.
 #[cfg(feature = "nats")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NatsStreamConfig {
@@ -286,12 +297,12 @@ pub struct QueueTopology {
     pub(crate) dlq: Option<String>,
     pub(crate) hold_queues: Vec<HoldQueue>,
     pub(crate) sequencing: Option<SequenceConfig>,
+    /// When true, infra owns the primary queue, stream or topic: shove binds
+    /// to it and verifies it at declare time, and never creates, expands or
+    /// reconfigures it (see [`TopologyBuilder::external`]).
+    pub(crate) external: bool,
     #[cfg(feature = "nats")]
     pub(crate) nats_stream_subjects: Option<Vec<String>>,
-    /// When true, shove binds to an externally-provisioned stream instead of
-    /// creating it (see [`TopologyBuilder::nats_external_stream`]).
-    #[cfg(feature = "nats")]
-    pub(crate) nats_external_stream: bool,
     /// Explicit config for a shove-managed stream (see
     /// [`TopologyBuilder::nats_stream_config`]); `None` keeps the defaults.
     #[cfg(feature = "nats")]
@@ -352,12 +363,73 @@ impl QueueTopology {
         self.nats_stream_subjects.as_deref()
     }
 
-    /// Whether shove binds to an externally-provisioned JetStream stream rather
-    /// than creating it. When true, `declare()` verifies the stream exists and
-    /// fails fast if it doesn't (no silent fallback). NATS-specific.
+    /// Whether infra owns the primary queue, stream or topic, so that
+    /// `declare()` only verifies it exists and fails fast if it does not,
+    /// and never creates, expands or reconfigures it. See
+    /// [`TopologyBuilder::external`] for what each backend verifies.
+    pub fn external(&self) -> bool {
+        self.external
+    }
+
+    /// The NATS-era spelling of [`external`](Self::external).
     #[cfg(feature = "nats")]
+    #[deprecated(
+        since = "0.15.0",
+        note = "use `external()`; this alias goes away in the next release"
+    )]
     pub fn nats_external_stream(&self) -> bool {
-        self.nats_external_stream
+        self.external
+    }
+
+    /// The error a declarer without an external-mode verification step
+    /// returns from `declare()` for an [`external`](TopologyBuilder::external)
+    /// topology, and `Ok(())` for every other topology. Refusing is the safe
+    /// direction: creating the resource would be the write external mode
+    /// promises never to make. `verification` names the check the declarer
+    /// still lacks.
+    #[cfg(any(
+        feature = "rabbitmq",
+        feature = "pub-aws-sns",
+        feature = "redis-streams"
+    ))]
+    pub(crate) fn refuse_external(&self, backend: &str, verification: &str) -> Result<()> {
+        if !self.external {
+            return Ok(());
+        }
+        Err(ShoveError::Topology(format!(
+            "topic '{}' declares `external()`, which {backend} does not support yet: its \
+             declarer has no verification step ({verification}) and would otherwise create \
+             the resource that external mode promises never to touch. Drop `external()` or \
+             provision the topology through shove.",
+            self.queue
+        )))
+    }
+
+    /// The refusal every consume entry point of a backend without an in-place
+    /// retry returns for an external topology, before any I/O.
+    ///
+    /// `declare` refuses the flag on the same backends, see
+    /// [`refuse_external`](Self::refuse_external), but a consumer can run
+    /// without `declare` against a resource infra created, and its `Retry`
+    /// would then republish into that resource: the one write external
+    /// ownership rules out. `primitive` names the broker's own in-place
+    /// redelivery, which the backend adopts before it honours the flag.
+    #[cfg(any(
+        feature = "rabbitmq",
+        feature = "aws-sns-sqs",
+        feature = "redis-streams"
+    ))]
+    pub(crate) fn refuse_external_consume(&self, backend: &str, primitive: &str) -> Result<()> {
+        if !self.external {
+            return Ok(());
+        }
+        Err(ShoveError::Topology(format!(
+            "topic '{}' declares `external()`, which {backend} does not honour yet: a `Retry` \
+             would republish into the resource infra owns, and the in-place redelivery \
+             ({primitive}) is not implemented. Drop `external()` or provision the topology \
+             through shove.",
+            self.queue
+        )))
     }
 
     /// Explicit config for a shove-managed stream, if set via
@@ -449,10 +521,9 @@ pub struct TopologyBuilder {
     hold_queues: Vec<Duration>,
     sequencing: Option<SequenceConfig>,
     allow_message_loss: bool,
+    external: bool,
     #[cfg(feature = "nats")]
     nats_stream_subjects: Option<Vec<String>>,
-    #[cfg(feature = "nats")]
-    nats_external_stream: bool,
     #[cfg(feature = "nats")]
     nats_stream_config: Option<NatsStreamConfig>,
     #[cfg(feature = "kafka")]
@@ -473,10 +544,9 @@ impl TopologyBuilder {
             hold_queues: Vec::new(),
             sequencing: None,
             allow_message_loss: false,
+            external: false,
             #[cfg(feature = "nats")]
             nats_stream_subjects: None,
-            #[cfg(feature = "nats")]
-            nats_external_stream: false,
             #[cfg(feature = "nats")]
             nats_stream_config: None,
             #[cfg(feature = "kafka")]
@@ -629,22 +699,15 @@ impl TopologyBuilder {
         self
     }
 
-    /// Bind to an externally-provisioned JetStream stream instead of creating it.
-    ///
-    /// `declare()` will verify the stream (named after the queue) already exists
-    /// and **fail fast** if it doesn't — it never falls back to creating one. Use
-    /// this when infra owns the stream config (retention bounds, replication)
-    /// that shove can't express; shove then only manages the durable consumer and
-    /// its own DLQ/hold queues.
-    ///
-    /// NATS-specific. Mutually exclusive with [`nats_subjects`](Self::nats_subjects)
-    /// and [`nats_stream_config`](Self::nats_stream_config) (both configure stream
-    /// *creation*, which external mode skips) and with [`sequenced`](Self::sequenced);
-    /// `build()` panics if combined.
+    /// The NATS-era spelling of [`external`](Self::external), kept for one
+    /// release so existing topologies keep compiling. Sets the same flag.
     #[cfg(feature = "nats")]
-    pub fn nats_external_stream(mut self) -> Self {
-        self.nats_external_stream = true;
-        self
+    #[deprecated(
+        since = "0.15.0",
+        note = "use `external()`; this alias goes away in the next release"
+    )]
+    pub fn nats_external_stream(self) -> Self {
+        self.external()
     }
 
     /// Create the shove-managed stream with explicit config (retention, size/age
@@ -652,11 +715,10 @@ impl TopologyBuilder {
     ///
     /// Use this when shove should own the stream but you need it bounded (so a
     /// stalled consumer can't grow the file store without limit) or replicated.
-    /// For an infra-owned stream use [`nats_external_stream`](Self::nats_external_stream)
-    /// instead.
+    /// For an infra-owned stream use [`external`](Self::external) instead.
     ///
-    /// NATS-specific. Mutually exclusive with
-    /// [`nats_external_stream`](Self::nats_external_stream); `build()` panics if both are set.
+    /// NATS-specific. Mutually exclusive with [`external`](Self::external);
+    /// `build()` panics if both are set.
     #[cfg(feature = "nats")]
     pub fn nats_stream_config(mut self, config: NatsStreamConfig) -> Self {
         self.nats_stream_config = Some(config);
@@ -743,6 +805,55 @@ impl TopologyBuilder {
     #[cfg(feature = "kafka")]
     pub fn with_max_message_bytes(self, bytes: u32) -> Self {
         self.with_topic_config("max.message.bytes", bytes.to_string())
+    }
+
+    /// Bind to a queue, stream or topic that infra owns, instead of creating
+    /// it.
+    ///
+    /// One concept on every backend: infra provisions the primary resource
+    /// (a Terraform module, a platform team's job, an operator), and shove
+    /// binds to it and **verifies** it at `declare()`, failing fast with
+    /// `ShoveError::Topology` when it is missing. shove never creates,
+    /// expands or reconfigures an external resource; it still manages its own
+    /// consumer group or durable consumer and its own DLQ. Each declarer
+    /// decides what verification means:
+    ///
+    /// | Backend | `declare()` on an external topology |
+    /// |---|---|
+    /// | Kafka | a metadata probe from a client with no `group.id`, which cannot auto-create the topic; the topic's partitions are never expanded and its config never reconciled |
+    /// | NATS JetStream | `get_stream`; the durable consumer and the DLQ stream are still shove's |
+    /// | RabbitMQ | refused with `ShoveError::Topology` on this version, at `declare` and at every consumer entry point, until the declarer verifies with a passive `queue.declare` and the consumer retries with `basic.nack` and requeue; refusing is the safe direction, because creating the resource is the write this flag promises never to make, and so is a `Retry` republished into it |
+    /// | AWS SNS/SQS | refused with `ShoveError::Topology` on this version; infra owns the topic, the queue, the queue policy, the subscription and the redrive policy, and the declarer will verify them: `GetQueueUrl` proves the queue, and `GetTopicAttributes` with `ListSubscriptionsByTopic` prove the rest best effort; `dlq()` on an external queue is then verify-only or refused, because the dead-letter wiring is the primary's `RedrivePolicy` and infra sets it; a `Retry` there uses the visibility-timeout path the FIFO consumer already has, because the standard path's delete plus `SendMessage` is a write into the queue; none of it changes the API, so adding SQS is additive; until then `declare` and every consumer entry point refuse the flag |
+    /// | Redis Streams | refused with `ShoveError::Topology` on this version, at `declare` and at every consumer entry point, until the declarer verifies with `EXISTS` on the stream key and the consumer leaves a retried entry pending for idle redelivery instead of `XADD` |
+    /// | In-process | a no-op: nothing in-process can be owned by infra, so the queue is created as always |
+    ///
+    /// The per-backend creation options stay refused in external mode, because
+    /// whoever provisions the resource owns its config: `build()` panics when
+    /// this is combined with [`sequenced`](Self::sequenced) on any backend,
+    /// with [`nats_stream_config`](Self::nats_stream_config) or
+    /// [`nats_subjects`](Self::nats_subjects) on NATS, or with any Kafka
+    /// topic-config method ([`with_topic_config`](Self::with_topic_config),
+    /// [`with_retention`](Self::with_retention),
+    /// [`with_retention_forever`](Self::with_retention_forever),
+    /// [`with_retention_bytes`](Self::with_retention_bytes),
+    /// [`with_cleanup_policy`](Self::with_cleanup_policy) and
+    /// [`with_max_message_bytes`](Self::with_max_message_bytes)). `dlq()`,
+    /// `dlq_named()`, `hold_queue()`, `for_consumer_group()` and `broadcast()`
+    /// stay available.
+    ///
+    /// Ownership also binds what a consumer may do with the resource: it
+    /// never writes into an external topology when it settles an outcome, so
+    /// an external topology implies [`RetryStrategy::InPlace`](crate::RetryStrategy)
+    /// on every backend. Kafka and NATS implement it on this version, each
+    /// with its broker's own primitive, and the `RetryStrategy` doc has the
+    /// per-backend table of what the others adopt later.
+    ///
+    /// On Kafka a consumer group's `max_consumers` no longer sets a partition
+    /// floor: members beyond the topic's partition count sit idle, and
+    /// `declare()` logs a warning when that happens.
+    pub fn external(mut self) -> Self {
+        self.external = true;
+        self
     }
 
     /// Enables strict per-key ordered delivery for this topic.
@@ -862,6 +973,10 @@ impl TopologyBuilder {
     /// - [`broadcast`](Self::broadcast) combined with `dlq()`, `dlq_named()`,
     ///   `hold_queue()`, `sequenced()` or `for_consumer_group()`.
     /// - [`dlq_named`](Self::dlq_named) given the queue's own name.
+    /// - [`external`](Self::external) combined with `sequenced()`, with a NATS
+    ///   stream-creation option (`nats_stream_config()`, `nats_subjects()`;
+    ///   `nats` feature), or with a Kafka topic-config method (`kafka`
+    ///   feature).
     pub fn build(mut self) -> QueueTopology {
         if let Some(ref group) = self.consumer_group {
             assert!(
@@ -938,24 +1053,47 @@ impl TopologyBuilder {
             // External mode skips stream creation, so it can't be combined with
             // options that configure how the stream is created.
             assert!(
-                !(self.nats_external_stream && self.nats_stream_config.is_some()),
-                "nats_external_stream() cannot be combined with nats_stream_config() — an external stream's config is owned by whoever provisions it"
+                !(self.external && self.nats_stream_config.is_some()),
+                "external() cannot be combined with nats_stream_config(): an external stream's config is owned by whoever provisions it"
             );
             assert!(
-                !(self.nats_external_stream && self.nats_stream_subjects.is_some()),
-                "nats_external_stream() cannot be combined with nats_subjects() — an external stream's subjects are owned by whoever provisions it"
-            );
-            assert!(
-                !(self.nats_external_stream && self.sequencing.is_some()),
-                "nats_external_stream() cannot be combined with sequenced() — sequencing requires shove to own the stream/subject space"
+                !(self.external && self.nats_stream_subjects.is_some()),
+                "external() cannot be combined with nats_subjects(): an external stream's subjects are owned by whoever provisions it"
             );
         }
         #[cfg(feature = "kafka")]
+        {
+            assert!(
+                self.kafka_topic_config
+                    .iter()
+                    .all(|(k, _)| !k.trim().is_empty()),
+                "with_topic_config() keys must be non-empty"
+            );
+            // External mode skips topic creation and reconciliation, so it
+            // can't be combined with options that configure either.
+            if self.external {
+                assert!(
+                    self.kafka_topic_config.is_empty(),
+                    "external() cannot be combined with with_topic_config() or its sugar \
+                     (with_retention, with_retention_forever, with_retention_bytes, \
+                     with_cleanup_policy, with_max_message_bytes) - an external topic's config \
+                     is owned by whoever provisions it; this topology sets {}",
+                    self.kafka_topic_config
+                        .iter()
+                        .map(|(k, _)| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+        // External mode binds to a primary resource infra owns, so it cannot
+        // be combined with sequencing, which needs shove to own the shard
+        // space: the partition count on Kafka, the per-shard subjects on
+        // NATS, the shard queues elsewhere. One rule on every backend.
         assert!(
-            self.kafka_topic_config
-                .iter()
-                .all(|(k, _)| !k.trim().is_empty()),
-            "with_topic_config() keys must be non-empty"
+            !(self.external && self.sequencing.is_some()),
+            "external() cannot be combined with sequenced() - sequencing requires shove to own \
+             the topic's partitions or the stream's subject space"
         );
         if let Some(ref seq) = self.sequencing {
             assert!(
@@ -1019,10 +1157,9 @@ impl TopologyBuilder {
             dlq,
             hold_queues,
             sequencing: self.sequencing,
+            external: self.external,
             #[cfg(feature = "nats")]
             nats_stream_subjects: self.nats_stream_subjects,
-            #[cfg(feature = "nats")]
-            nats_external_stream: self.nats_external_stream,
             #[cfg(feature = "nats")]
             nats_stream_config: self.nats_stream_config,
             #[cfg(feature = "kafka")]
@@ -1731,17 +1868,27 @@ mod tests {
         #[test]
         fn builder_defaults_are_managed_unbounded() {
             let topology = TopologyBuilder::new("orders").build();
-            assert!(!topology.nats_external_stream());
+            assert!(!topology.external());
             assert!(topology.nats_stream_config().is_none());
         }
 
         #[test]
-        fn builder_external_stream_sets_flag() {
+        fn builder_external_sets_flag() {
+            let topology = TopologyBuilder::new("infra-orders").external().build();
+            assert!(topology.external());
+            assert!(topology.nats_stream_config().is_none());
+        }
+
+        /// The NATS-era spelling stays one release as an alias: it sets the
+        /// same flag, and both accessors read it.
+        #[test]
+        #[allow(deprecated)]
+        fn nats_external_stream_is_a_deprecated_alias_for_external() {
             let topology = TopologyBuilder::new("CLOB_PRICE_CHANGES")
                 .nats_external_stream()
                 .build();
+            assert!(topology.external());
             assert!(topology.nats_external_stream());
-            assert!(topology.nats_stream_config().is_none());
         }
 
         #[test]
@@ -1757,7 +1904,7 @@ mod tests {
                 .nats_stream_config(cfg.clone())
                 .build();
             assert_eq!(topology.nats_stream_config(), Some(&cfg));
-            assert!(!topology.nats_external_stream());
+            assert!(!topology.external());
         }
 
         #[test]
@@ -1771,35 +1918,141 @@ mod tests {
         }
 
         #[test]
-        #[should_panic(
-            expected = "nats_external_stream() cannot be combined with nats_stream_config()"
-        )]
+        #[should_panic(expected = "external() cannot be combined with nats_stream_config()")]
         fn external_with_stream_config_panics() {
             let _ = TopologyBuilder::new("q")
-                .nats_external_stream()
+                .external()
                 .nats_stream_config(NatsStreamConfig::default())
                 .build();
         }
 
         #[test]
-        #[should_panic(expected = "nats_external_stream() cannot be combined with nats_subjects()")]
+        #[should_panic(expected = "external() cannot be combined with nats_subjects()")]
         fn external_with_subjects_panics() {
             let _ = TopologyBuilder::new("q")
-                .nats_external_stream()
+                .external()
                 .nats_subjects(["a.b.>"])
                 .build();
         }
+    }
+
+    // -- external ownership (infra-owned bind), backend-neutral --
+
+    mod external_topology {
+        use super::*;
 
         #[test]
-        #[should_panic(expected = "nats_external_stream() cannot be combined with sequenced()")]
+        fn builder_defaults_to_a_shove_owned_topology() {
+            let topology = TopologyBuilder::new("orders").build();
+            assert!(!topology.external());
+        }
+
+        /// One flag on every feature set, not one spelling per backend.
+        #[test]
+        fn external_is_backend_neutral() {
+            let topology = TopologyBuilder::new("orders").external().build();
+            assert!(topology.external());
+            #[cfg(feature = "kafka")]
+            assert!(topology.kafka_topic_config().is_empty());
+            #[cfg(feature = "nats")]
+            assert!(topology.nats_stream_config().is_none());
+        }
+
+        /// The retry chain and the fan-out shapes stay allowed: shove owns
+        /// its DLQ in both modes, and a group name or a broadcast never
+        /// touches the primary resource itself.
+        #[test]
+        fn external_keeps_dlq_hold_queues_group_and_broadcast() {
+            let topology = TopologyBuilder::new("orders")
+                .external()
+                .for_consumer_group("pricing")
+                .dlq()
+                .hold_queue(Duration::from_secs(5))
+                .build();
+            assert!(topology.external());
+            assert!(topology.dlq().is_some());
+            assert_eq!(topology.hold_queues().len(), 1);
+            assert_eq!(topology.consumer_group(), Some("pricing"));
+
+            let broadcast = TopologyBuilder::new("orders")
+                .external()
+                .broadcast()
+                .build();
+            assert!(broadcast.external());
+            assert!(broadcast.broadcast());
+        }
+
+        /// Sequencing needs shove to own the shard space on every backend, so
+        /// this guard is not feature-gated.
+        #[test]
+        #[should_panic(expected = "external() cannot be combined with sequenced()")]
         fn external_with_sequenced_panics() {
             let _ = TopologyBuilder::new("q")
                 .sequenced(SequenceFailure::Skip)
                 .routing_shards(4)
                 .hold_queue(Duration::from_secs(5))
                 .dlq()
-                .nats_external_stream()
+                .external()
                 .build();
+        }
+
+        #[cfg(feature = "kafka")]
+        mod kafka_topic_config_guards {
+            use super::*;
+
+            #[test]
+            #[should_panic(expected = "external() cannot be combined with with_topic_config()")]
+            fn external_with_topic_config_panics() {
+                let _ = TopologyBuilder::new("q")
+                    .external()
+                    .with_topic_config("retention.ms", "3600000")
+                    .build();
+            }
+
+            #[test]
+            #[should_panic(expected = "this topology sets retention.ms")]
+            fn external_with_retention_panics() {
+                let _ = TopologyBuilder::new("q")
+                    .with_retention(Duration::from_secs(3600))
+                    .external()
+                    .build();
+            }
+
+            #[test]
+            #[should_panic(expected = "this topology sets retention.ms")]
+            fn external_with_retention_forever_panics() {
+                let _ = TopologyBuilder::new("q")
+                    .external()
+                    .with_retention_forever()
+                    .build();
+            }
+
+            #[test]
+            #[should_panic(expected = "this topology sets retention.bytes")]
+            fn external_with_retention_bytes_panics() {
+                let _ = TopologyBuilder::new("q")
+                    .external()
+                    .with_retention_bytes(1_000_000)
+                    .build();
+            }
+
+            #[test]
+            #[should_panic(expected = "this topology sets cleanup.policy")]
+            fn external_with_cleanup_policy_panics() {
+                let _ = TopologyBuilder::new("q")
+                    .external()
+                    .with_cleanup_policy(KafkaCleanupPolicy::Compact)
+                    .build();
+            }
+
+            #[test]
+            #[should_panic(expected = "this topology sets max.message.bytes")]
+            fn external_with_max_message_bytes_panics() {
+                let _ = TopologyBuilder::new("q")
+                    .external()
+                    .with_max_message_bytes(1_048_576)
+                    .build();
+            }
         }
     }
 

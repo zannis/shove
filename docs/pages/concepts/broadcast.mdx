@@ -136,6 +136,10 @@ librdkafka looks up the configured group's coordinator even for an assign-only h
 The subscription tolerates the `GroupAuthorizationFailed` that lookup then draws: it warns once and keeps fetching.
 An id under the granted prefix avoids provoking it.
 
+A deferred record is redelivered to the deferring subscription before any record received after it.
+The subscription's single slot is held across the delay and the same bytes are decoded again.
+The order is therefore the original delivery, the redelivery, then whatever came next.
+
 Because the assignment is taken at the tail, a reconnect re-assigns at the *then*-current tail: messages published while a subscriber was disconnected are not replayed. That is deliver-new applied to the reconnect window rather than a separate caveat.
 With `with_broadcast_start` the reconnect re-resolves the configured start instead, so a `Head` subscription replays the retained log again.
 

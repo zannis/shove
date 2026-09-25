@@ -22,6 +22,9 @@ impl InMemoryTopologyDeclarer {
 
 impl InMemoryTopologyDeclarer {
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+        // `external()` is a no-op here: nothing in-process can be owned by
+        // infra, so the queue is created as always and there is nothing to
+        // verify against.
         if topology.broadcast() {
             // Nothing to declare: a broadcast topic has no shared queue, no DLQ
             // and no hold queues, and each subscriber's buffer is created by

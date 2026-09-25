@@ -177,14 +177,17 @@ All line numbers are at `5bc4979`.
 
 **In scope**:
 
-- `Cargo.toml` features, `.github/workflows/ci.yml`, `CONTRIBUTING.md`, `README.md`, `src/lib.rs` feature table.
-- `src/consumer.rs`, `src/batch_consumer.rs`, `src/backend/options_inner.rs`, `src/backend/batch_consumer.rs`, `src/backend/mod.rs` (the options literal in its test anchor).
-- `src/metadata.rs`, `src/metrics.rs`, `src/handler.rs` and `src/audit.rs` (metadata literals in tests), `src/topology.rs`, `src/broker.rs`, `src/broadcast.rs`, `src/backend/broadcast.rs`, `src/backend/capability.rs` docs, `src/consumer_group.rs` docs.
-- `src/backends/kafka/consumer.rs`, `consumer_group.rs`, `topology.rs`, `client.rs`, `constants.rs`, `offset_reset.rs`, `mod.rs`.
-- `src/schema_registry/decode.rs`, `src/schema_registry/wire.rs`.
-- Every other backend's `MessageMetadata` construction site, for the three new fields only: `src/backends/sns/consumer.rs`, `src/backends/redis/consumer.rs`, `src/backends/redis/broadcast.rs`, `src/backends/rabbitmq/headers.rs`, `src/backends/inmemory/consumer.rs`, `src/backends/nats/consumer.rs`.
-- `tests/kafka_integration.rs`, `tests/kafka_broadcast_integration.rs`, `tests/kafka_batch_integration.rs`, `tests/kafka_schema_registry.rs`, and two new files, `tests/kafka_schema_registry_outage.rs` and `tests/metrics_kafka_external_topic_discard.rs`.
-- `docs/pages/backends/kafka.mdx`, `docs/pages/concepts/broadcast.mdx`, `docs/pages/concepts/handlers.mdx`, `docs/pages/concepts/topics.mdx`, `docs/pages/concepts/outcomes.mdx`, `docs/pages/ops/backends.mdx`, and the metric reference in `docs/pages/guides/observability.mdx`.
+- `Cargo.toml` features and `Cargo.lock`, `.github/workflows/ci.yml`, `.github/workflows/publish.yml`, `CONTRIBUTING.md`, `README.md`, `src/lib.rs` feature table and re-exports.
+- `src/consumer.rs`, `src/consumer_group.rs`, `src/consumer_supervisor.rs`, `src/batch_consumer.rs`, `src/backend/options_inner.rs`, `src/backend/batch_consumer.rs`, `src/backend/mod.rs` (the options literal in its test anchor).
+- `src/metadata.rs`, `src/metrics.rs`, `src/handler.rs` and `src/audit.rs` (metadata literals in tests), `src/topology.rs`, `src/broker.rs`, `src/broadcast.rs`, `src/backend/broadcast.rs`, `src/backend/capability.rs` docs.
+- `src/backends/kafka/backend.rs`, `consumer.rs`, `consumer_group.rs`, `topology.rs`, `client.rs`, `constants.rs`, `offset_reset.rs`, `mod.rs`.
+- `src/schema_registry/client.rs`, `src/schema_registry/decode.rs`, `src/schema_registry/wire.rs`.
+- Every other backend's `MessageMetadata` construction site, for the three new fields: `src/backends/sns/consumer.rs`, `src/backends/redis/consumer.rs`, `src/backends/redis/broadcast.rs`, `src/backends/redis/stream_id.rs`, `src/backends/rabbitmq/headers.rs`, `src/backends/inmemory/consumer.rs`, `src/backends/nats/consumer.rs`.
+- Every other backend's `BroadcastImpl::check_options`, its `refuse_broadcast_start` call sites, and its `external()` verification or refusal.
+  Those are `backend.rs`, `consumer.rs` and `topology.rs` under `src/backends/inmemory`, `nats`, `rabbitmq` and `redis`, plus `src/backends/sns/topology.rs`.
+- `tests/kafka_integration.rs`, `tests/kafka_broadcast_integration.rs`, `tests/kafka_batch_integration.rs`, `tests/kafka_offset_reset_integration.rs`, `tests/kafka_schema_registry.rs`, `tests/kafka_schema_registry_integration.rs`, `tests/kafka_schema_registry_message_index.rs`, and two new files, `tests/kafka_schema_registry_outage.rs` and `tests/metrics_kafka_external_topic_discard.rs`.
+- The other backends' suites, for the neutral shapes' refusals and the metadata fills: `tests/inmemory_broadcast.rs`, `tests/nats_integration.rs`, `tests/rabbitmq_integration.rs`, `tests/redis_integration.rs`, `tests/redis_batch_integration.rs`, `tests/redis_broadcast_integration.rs`.
+- `docs/pages/backends/kafka.mdx`, `docs/pages/backends/nats.mdx`, `docs/pages/concepts/broadcast.mdx`, `docs/pages/concepts/handlers.mdx`, `docs/pages/concepts/topics.mdx`, `docs/pages/concepts/outcomes.mdx`, `docs/pages/ops/backends.mdx`, and the metric reference in `docs/pages/guides/observability.mdx`.
 - `plans/021-kafka-external-topics-and-broadcast-start.md`, this plan document, committed on the first branch.
 
 **Out of scope**:
@@ -528,31 +531,74 @@ Migration note for existing users: none, every default is unchanged.
 
 **Verify**: broadcast integration suite and Kafka unit suite pass.
 
-### Step 6: `kafka_external_topic()`, a topology that shove reads but never creates or alters
+### Step 6: `external()`, a topology that shove reads but never creates or alters
 
-Commit: `feat(topology): kafka_external_topic() binds to an infra-owned topic without declaring it`.
+Commit: `feat(topology): kafka_external_topic() binds to an infra-owned topic without declaring it`, and the review fix `feat(topology): replace the backend-prefixed external flags with external()`.
+
+The first shape was a second backend-prefixed spelling of one concept: `nats_external_stream()` already said "infra owns the primary, shove binds and verifies".
+The maintainer's review of 2026-09-22 asked for one backend-neutral flag, with each declarer deciding what verification means, and that is the shape that landed.
 
 Public API:
 
 ```rust
-// src/topology.rs, struct TopologyBuilder and struct QueueTopology
-#[cfg(feature = "kafka")]
-kafka_external_topic: bool,
+// src/topology.rs, struct TopologyBuilder and struct QueueTopology, not feature-gated
+external: bool,
 
 // src/topology.rs, impl TopologyBuilder
-#[cfg(feature = "kafka")]
-pub fn kafka_external_topic(mut self) -> Self
+pub fn external(mut self) -> Self
+#[deprecated(since = "0.15.0", note = "use `external()`")]
+pub fn nats_external_stream(self) -> Self // alias for one release, sets the same flag
 
 // src/topology.rs, impl QueueTopology
-#[cfg(feature = "kafka")]
-pub fn kafka_external_topic(&self) -> bool
+pub fn external(&self) -> bool
+#[deprecated(since = "0.15.0", note = "use `external()`")]
+pub fn nats_external_stream(&self) -> bool // alias for one release
 ```
 
-`build()` panics when the flag is combined with `sequenced()` or with any of the six Kafka topic-config methods at `src/topology.rs:685-744`.
+The Kafka name never shipped, so it is replaced outright.
+The NATS name is public in 0.14 and stays one release as a deprecated alias.
+`build()` panics when the flag is combined with `sequenced()` on any backend, because sequencing needs shove to own the shard space everywhere.
+It panics with `nats_stream_config()` or `nats_subjects()` under the `nats` feature, and with any of the six Kafka topic-config methods under the `kafka` feature.
 Those are `with_topic_config`, `with_retention`, `with_retention_forever`, `with_retention_bytes`, `with_cleanup_policy` and `with_max_message_bytes`.
-The wording follows the NATS guards at `:923-935`.
+The per-backend config guards keep their wording with `external()` in place of the old names.
 `dlq()`, `dlq_named()`, `hold_queue()`, `for_consumer_group()` and `broadcast()` stay allowed.
-Sequenced topics are refused for now to mirror NATS and keep the test matrix small, see Maintenance notes.
+
+Per declarer, what `declare()` does with an external topology:
+
+- Kafka: the metadata probe below.
+  The topic is never created, expanded or reconciled.
+- NATS: `get_stream`, as before.
+  The durable consumer and the DLQ stream stay shove's.
+- RabbitMQ, SQS and Redis: `declare` refuses the topology with `ShoveError::Topology` through `QueueTopology::refuse_external`, until each declarer gains its verification step.
+  Those steps are a passive `queue.declare` on RabbitMQ and `EXISTS` on the Redis stream key.
+  On SQS, infra owns the topic, the queue, the queue policy, the subscription and the redrive policy, and shove verifies.
+  `GetQueueUrl` proves the queue, and `GetTopicAttributes` with `ListSubscriptionsByTopic` prove the rest best effort.
+  The dead-letter wiring on SQS is the primary's `RedrivePolicy`, which infra sets.
+  So `dlq()` on an external queue is verify-only or refused, and shove never sets it.
+  A `Retry` on an external queue uses the visibility-timeout path the FIFO consumer already has.
+  The standard path's delete plus `SendMessage` with `DelaySeconds` is a write into the queue.
+  None of that changes the API shape: one `external()` flag, a per-backend verification table and build-time refusals.
+  Adding SQS later is therefore additive.
+  Refusing is the safe direction, because creating the resource is the write the flag promises never to make.
+  Their consumers refuse the flag too, at every entry point and before any request, through `QueueTopology::refuse_external_consume`.
+  A consumer can run without `declare` against a resource infra created, and a `Retry` there republished into it on all three backends.
+  The review's Docker probe of 2026-09-23 showed it on Redis: one `Retry` on an infra-owned stream left two entries in it.
+- In-process: a no-op, because nothing in-process can be owned by infra.
+
+Ownership says who creates the resource, and it binds one invariant on every backend.
+A consumer never writes into an external topology when it settles an outcome.
+A `Retry` and a `Defer` on an external topology therefore run in place, with the primitive the broker has for it.
+Every broker has one, and the table states where each backend stands.
+The table is a statement of progress under the one invariant, not an opt-out per backend.
+Step 10 states the Kafka and NATS mechanics.
+
+| Backend | In-place primitive | This version |
+|---|---|---|
+| Kafka | pause the assignment and wait in the handler's task | implemented, step 10 |
+| NATS JetStream | `Nak(Some(delay))`, the count from `num_delivered` | implemented, step 10 |
+| AWS SQS | the visibility timeout, the path the FIFO consumer already uses | later, additive; `declare` and every consumer entry point refuse `external()` |
+| RabbitMQ | `basic.nack` with requeue | later, additive; `declare` and every consumer entry point refuse `external()` |
+| Redis Streams | leave the entry pending for idle redelivery | later, additive; `declare` and every consumer entry point refuse `external()` |
 
 Kafka backend:
 
@@ -574,7 +620,9 @@ Kafka backend:
 
 Tests:
 
-- Unit, `src/topology.rs`: the flag round-trips, and each of the seven forbidden combinations panics with its message.
+- Unit, `src/topology.rs`: `external()` round-trips on every feature set, and `nats_external_stream()` is a deprecated alias for it.
+  Each forbidden combination panics with its message: `sequenced()` un-gated, two NATS creation options, six Kafka topic-config methods.
+- Integration, `tests/nats_integration.rs`: the existing external-stream test binds with `external()`.
 - Integration, `tests/kafka_integration.rs`, two new tests.
   `external_topic_is_never_created_or_expanded` pre-creates a three-partition topic through rdkafka's admin client.
   It then registers a group with `max_consumers` 8 on an external topology, consumes, and asserts the partition count is still three.
@@ -582,10 +630,10 @@ Tests:
 
 Docs:
 
-- `docs/pages/backends/kafka.mdx:77-83`, "Declare topology": add `### Bind to an infra-owned topic`, mirroring `docs/pages/backends/nats.mdx:126-146`.
+- `docs/pages/backends/kafka.mdx:77-83`, "Declare topology": add `### Bind to an infra-owned topic`, mirroring `docs/pages/backends/nats.mdx:126-146`, both on `external()`.
   State the ACLs a reader then needs: Describe and Read on the topic, Describe and Read on the group.
-- `docs/pages/concepts/topics.mdx:158`, "Topology declaration": one sentence pointing at both external flags.
-- `src/consumer_group.rs:123-128` and `:160-165`: the "automatically declares" rustdoc gains the two exceptions.
+- `docs/pages/concepts/topics.mdx:158`, "Topology declaration": describe the one neutral flag, which backends verify, which refuse, and the deprecated alias.
+- `src/consumer_group.rs:123-128` and `:160-165`: the "automatically declares" rustdoc gains the external exception.
 
 Migration note: none, the flag is opt-in.
 
@@ -745,12 +793,52 @@ Migration note: none, unset keeps today's behaviour.
 
 ### Step 10: On an external topic, Retry and Defer never produce into the topic
 
-Commit: `feat(kafka)!: retry and defer in place on an external topic instead of republishing into it`.
+Commit: `feat(kafka)!: retry and defer in place on an external topic instead of republishing into it`, and the review fix `feat(consumer)!: make the retry strategy explicit, implied by external ownership`.
+The maintainer's answers added `feat(nats)!: retry in place on an external stream, the count from the delivery info`.
 
-Rule: an external topic is read-only for shove.
+Rule: shove's consumer never writes into an external topology when it settles an outcome, on every backend.
 A shove-owned DLQ is still a legal publish target, because `dlq()` stays allowed on an external topology.
+Publishing through a `Publisher` is outside the rule.
+The producer's `allow.auto.create.topics` is pinned to `false` in `producer_config`, delivered as its own pull request, `feat/kafka-producer-no-auto-create`, in the same release.
+A publish to a topic that does not exist then fails and leaves it absent, so the guarantee covers declare, consume and publish.
 
-Behaviour when `topology.kafka_external_topic()` is true, on the concurrent path and the FIFO path:
+The maintainer's review of 2026-09-22 observed that the ownership flag was deciding a retry strategy.
+It also observed that a republish into a fan-out topic duplicates the record for every other group on it.
+The strategy is therefore explicit, backend-neutral, and only implied by ownership:
+
+```rust
+// src/consumer.rs, re-exported at the crate root
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryStrategy {
+    /// An incremented copy after the tier's delay: into the hold queue, or on Kafka into the topic. The shove-owned default.
+    Republish,
+    /// The same record again after the tier's delay, with nothing published. Kafka waits in the handler's task and keeps the count in memory. NATS naks with the delay and reads the count from `num_delivered`. Implied by an external topology.
+    InPlace,
+}
+
+// src/consumer.rs, struct ConsumerOptions<B>, not feature-gated
+pub(crate) retry_strategy: Option<RetryStrategy>, // set only through the two Kafka setters below
+
+// src/consumer.rs, impl ConsumerOptions<Kafka>; src/backends/kafka/consumer_group.rs, impl KafkaConsumerGroupConfig
+pub fn with_retry_strategy(mut self, strategy: RetryStrategy) -> Self
+```
+
+`resolve_retry_strategy` in `kafka/consumer.rs` decides at the consumer's start.
+An external topology implies `InPlace` and refuses `Republish` with `ShoveError::Topology`.
+A shove-owned topology defaults to `Republish` and honours an explicit `InPlace`.
+The FIFO consumer refuses `InPlace`, which it does not implement, at `spawn_fifo_shards` and at `register_fifo`.
+The broadcast and DLQ loops refuse a set strategy they never read.
+`external()` implies `InPlace` on every backend, under the one invariant step 6 states.
+Kafka and NATS implement it here, and the other three backends follow with their own primitive, as the step 6 table says.
+The setter lives on the Kafka options for now and reaches each backend as its owned topology gains the opt-in, which is additive.
+The field is crate-private, so no other backend's options can carry a strategy nothing reads.
+The enum is `#[non_exhaustive]`, so a later shape is a new variant rather than a breaking change.
+
+The bullets below are Kafka's primitive from the step 6 table, the wait in the handler's task.
+On an external NATS stream the same strategy is a `Nak` with the tier's delay, and the count is JetStream's `num_delivered`.
+A `Defer` and an `ack_wait` expiry are redeliveries there, so they advance the count too.
+
+Behaviour under `RetryStrategy::InPlace` on Kafka's concurrent path:
 
 - `Outcome::Defer` waits `hold_queues[0].delay()`, or 1 s without hold queues, inside the same task and holding its permit.
   It then decodes the retained raw bytes again and calls the handler with the fresh value.
@@ -777,9 +865,27 @@ The broadcast path gets the same in-place shape:
 - Replace the channel with the in-task wait above, holding the pinned single permit across the delay, so the order becomes `[1, 1, 2]`.
   `DeferredDelivery` and the `defer` channel go away.
 
-When the flag is false, nothing changes on the group paths, so every existing Retry and Defer test stays green.
-Kafka is the only backend where this arises.
-It simulates hold queues by republishing into the consumed topic (`src/backends/kafka/topology.rs:225-236`), while NATS publishes retries into shove-owned hold streams.
+Under `RetryStrategy::Republish` nothing changes on the group paths, so every existing Retry and Defer test stays green.
+Kafka simulates hold queues by republishing into the consumed topic (`src/backends/kafka/topology.rs:225-236`).
+NATS did the same in its own way.
+Its declarer creates no hold streams, and `hold_then_republish` published the incremented copy to `msg.subject`, the subject the external stream captures.
+So a `Retry` on an external NATS stream wrote into the infra stream, with or without hold queues.
+Only `Defer` was in place there, through `Nak(Some(delay))`.
+The first version of this plan repeated the wrong premise that NATS external mode kept shove-owned hold queues.
+
+Behaviour under `RetryStrategy::InPlace` on NATS, implied by an external stream:
+
+- `route_outcome` settles a `Retry` with the same `Nak(Some(delay))` a `Defer` uses, and `hold_then_republish` is never reached on an external stream.
+  `hold_queue()` still selects the delay through `hold_index`, and 1 s applies without hold queues, as before.
+- The count comes from the delivery info instead of the header.
+  `in_place_retry_count` reads `num_delivered - 1` from `MessageMetadata::delivery_count`, the handler sees it as `retry_count`, and `decide_retry` is unchanged.
+  An `ack_wait` expiry and a `Defer` nak are redeliveries too, so on an external stream both consume the retry budget.
+  That is the conflation plan 019 names, accepted here and documented.
+- Exhaustion dead-letters as before.
+  `publish_dead_letter` stamps the dead letter with that count in `Shove-Retry-Count`, so a DLQ handler reads the same `retry_count` a republish would have carried.
+- A shove-owned stream keeps the hold-then-republish path with the header-based count.
+  The batch and broadcast paths already nak in place, and the FIFO path never sees an external stream, because `build()` refuses the combination.
+  The opt-in for an owned stream is plan 019's full scope.
 
 Tests:
 
@@ -791,21 +897,36 @@ Tests:
 - Integration, `tests/kafka_integration.rs`: `external_topic_waiting_handlers_keep_the_member_in_the_group` defers past a shortened test wait and asserts no rebalance in the logs.
   If the pinned 5 min cannot be shortened in a test, record that in NOTES.
 - Integration, `tests/kafka_broadcast_integration.rs`: `defer_redelivers_in_place_before_later_records` asserts `[1, 1, 2]` on a broadcast subscription.
+- Integration, `tests/kafka_integration.rs`: `retry_in_place_on_an_owned_topic_does_not_republish` opts a shove-owned topic's consumer into `InPlace` and asserts `[1, 1, 2]` with the high watermark unchanged.
+- Unit, `kafka/consumer.rs`: `resolve_retry_strategy_lets_ownership_decide`, against a client that never connects.
+  The same module refuses `Republish` on an external topology, `InPlace` on a FIFO consumer and any strategy on the DLQ drain.
+  `register_rejects_republish_on_an_external_topology` and `register_fifo_rejects_in_place_retries` cover the registry.
 - Metrics: a `tests/metrics_kafka_external_topic_discard.rs` twin of `metrics_kafka_failall_no_dlq.rs`.
   It asserts `shove_messages_discarded_total{reason="max_retries_exceeded"}` moves once per exhausted record.
+- Integration, `tests/nats_integration.rs`, two new tests on an infra-provisioned Limits stream with a two-tier retry ladder.
+  `external_stream_retry_naks_in_place_and_writes_nothing` returns `Retry` twice then `Ack`.
+  It asserts three deliveries of stream sequence 1, with `retry_count` 0, 1 and 2 from `delivery_count` 1, 2 and 3.
+  It also asserts that the publisher's count header never climbs and that the stream still holds one record.
+  `external_stream_retry_exhaustion_dead_letters_with_the_redelivery_count` sets `max_retries` 2 and always returns `Retry`.
+  It asserts three deliveries, one dead letter with `retry_count` 2 and reason `max_retries_exceeded`, and one record still in the external stream.
+- Unit, `nats/consumer.rs`: `ownership_decides_the_strategy` and `in_place_count_is_the_redelivery_count`.
 
 Docs:
 
 - `docs/pages/backends/kafka.mdx`, the new external-topic subsection from step 6: a table of the four outcomes in external mode.
 - `docs/pages/concepts/outcomes.mdx:56-60`: one sentence that Kafka external topics retry in place.
 - `docs/pages/concepts/broadcast.mdx:116-124`: the Kafka section states that a deferred record is redelivered before later records.
+- `docs/pages/backends/nats.mdx`, the external-stream section: how a `Retry` settles on an external stream and what consumes the budget.
+- `docs/pages/concepts/outcomes.mdx`, `src/consumer.rs` and `src/topology.rs`: the per-backend table of in-place primitives under the one invariant, with the SQS ownership row.
 
-Migration note: none for existing group topologies.
-The `!` marks two things.
+Migration note: none for existing group topologies on a shove-owned topology.
+The `!` marks three things.
 A handler on an external topology now blocks its slot while deferring, the same contract broadcast already has.
 A Kafka broadcast subscription now delivers a deferred record before later records, which is what `broadcast.mdx` already promised.
+A NATS consumer on an external stream now naks a `Retry` in place and counts attempts from the delivery info.
+A `Defer` or an `ack_wait` expiry therefore consumes the retry budget there.
 
-**Verify**: full Kafka integration suite, the broadcast suite, the new metrics test, and every existing Retry and Defer test unchanged.
+**Verify**: full Kafka integration suite, the broadcast suite, the new metrics test, the NATS integration suite, and every existing Retry and Defer test unchanged.
 
 ### Step 11: A Schema Registry outage waits instead of discarding
 
@@ -872,6 +993,32 @@ That is the at-least-once contract the rest of the crate keeps, and the PR body 
 The maintainer's review of 2026-09-22 asked for backend-neutral shapes in four places.
 This section records, per changed step, the patterns weighed and the one chosen, so the choice stays legible without the review thread.
 
+### Step 6, external ownership
+
+- One backend-prefixed builder per backend, `nats_external_stream()` and then `kafka_external_topic()`, was the first shape.
+  It gave two spellings to one bind-and-verify concept, and a third backend would have added a third.
+- One neutral flag with per-declarer verification is the chosen shape.
+  Kafka probes metadata, NATS calls `get_stream`, and the other clients already expose a passive declare, `GetQueueUrl` and `EXISTS` for later.
+  Two constraints stay visible.
+  NATS hold queues are delays only, its declarer creates no hold streams, and its republish wrote the copy into the consumed subject.
+  An external stream therefore needed the in-place retry of step 10, not an opt-out.
+  SQS external ownership covers the SNS topic, the queue policy, the subscription and the redrive policy, not only the queue.
+- The bounded form landed: Kafka and NATS implement the flag now.
+  Every other declarer refuses it until it verifies the resource, and the in-process broker treats it as a no-op.
+- The refusal is at runtime and per declarer because `TopologyBuilder` is not typed by backend.
+  One `QueueTopology` serves every backend, so a `Has*` capability trait cannot hide `external()` from the backends that do not verify it yet.
+  The declarer that owns the resource is the first place that knows.
+- "Each backend declares what `external()` implies for its retry strategy" was the first wording of the per-backend statement, and it was set aside.
+  The maintainer's answer of 2026-09-22 keeps one invariant: a consumer never writes into an external resource.
+  A per-backend table names the primitive that honours it.
+  No backend can opt out of the invariant.
+  The table only says how far each has come.
+- Spring Cloud Stream's Kafka binder has the same bind-without-create shape.
+  With `autoCreateTopics=false` the binder verifies the topic at startup and fails the application when it is missing.
+  Its check is a partition-count read through the admin client, and it applies to the whole binder rather than per topic.
+  shove verifies per topology, with a consumer-type metadata probe that cannot create the topic.
+  It keeps creating its own DLQ, which the binder's flag would also stop.
+
 ### Step 7, the metadata fields
 
 - Kafka-only fields with one combined table was the first shape.
@@ -901,6 +1048,66 @@ This section records, per changed step, the patterns weighed and the one chosen,
 - An absolute position is the pattern the brokers offer as well: async-nats has `DeliverPolicy::ByStartSequence` and RabbitMQ Streams take a numeric offset.
   It is deferred because a sequence or an offset names a position on one backend's log and means nothing on another.
   It would be the first backend-specific variant on a neutral enum, and `#[non_exhaustive]` leaves the room for it.
+
+### Step 10, the retry strategy
+
+- Republish into the consumed topic after a delay tier is the historical Kafka shape.
+  `hold_queue()` selects the delay by retry count, and no broker-side hold topics are created.
+  Its cost is the duplicate every other reader of the topic receives, and on an infra-owned topic it is the write that ownership rules out.
+- Retry topics per delay tier is the standard pattern elsewhere.
+  A failed record is forwarded to a retry topic with a back-off timestamp, then to the next tier, then to the dead-letter topic.
+  The price is the topic's ordering guarantee.
+  It stays a later option.
+- In-place retry of the same record is the chosen shape for an external topic.
+  Every backend has a native primitive for it.
+  Kafka pauses and waits, NATS naks with a delay, and SQS extends the visibility timeout.
+  RabbitMQ nacks with requeue, and Redis leaves the entry pending.
+  That is why `RetryStrategy::InPlace` is a cross-backend concept and not a Kafka special case.
+- Retry topics owned by shove is the other later option, with no design in the tree yet.
+  Its costs are known from the libraries that ship it.
+  shove would need permission to create topics on the cluster, and the topic count grows by one per delay tier per topic.
+  A record forwarded between tiers leaves its partition's order, the cost the Spring Kafka retry-topic documentation states for its own tiers.
+- The review selected an explicit `RetryStrategy` that names the republish or the in-place shape per consumer.
+  It is implied by ownership and refused where a backend or a path cannot honour it.
+  The strategy lives on the consumer options rather than the topology.
+  It is how one consumer settles an outcome, and two groups on one topic may differ.
+- Refusing retry-capable configurations on an external NATS stream at build time was the maintainer's fallback.
+  It applied if the in-place shape had been too large for this stack.
+  The in-place shape is a `Nak(Some(delay))` the `Defer` arm already used and a count read from `num_delivered`, so the refusal was not needed.
+  It stays the answer for RabbitMQ, SQS and Redis until each implements its own primitive.
+- Seeking the partition back to the record, Kafka's `seek(TopicPartition, offset)`, is the broker's own rewind and was weighed as the redelivery primitive.
+  A seek rewinds every record after the retried one as well, refetches them, and pays the fetch round trip on each attempt.
+  The pause-and-wait keeps the record's bytes in the task and hands them back without a fetch.
+  It still pauses the assignment so the member polls.
+  A seek is kept for the put-back of a record the loop cannot take.
+- Spring Kafka's `DefaultErrorHandler` is the closest prior art.
+  By default it retries the failed record in place with a back-off, by seeking the partition back and re-polling.
+  It recovers the record to a dead-letter topic once the back-off is exhausted.
+  That default blocks the poll loop for the back-off, so it relies on `max.poll.interval.ms` being longer than the sum of the back-offs.
+  With `seekAfterError=false` it retains the remaining records instead of seeking, and hands them to the listener after the back-off.
+  The consumer stays paused in between, so its polls return nothing and keep the membership.
+  Its `ContainerPausingBackOffHandler` pauses the container for a back-off longer than `max.poll.interval.ms`, so the member keeps polling and stays in the group.
+  Both are documented at https://docs.spring.io/spring-kafka/reference/kafka/annotation-error-handling.html.
+  shove keeps polling during the wait and pauses instead, the shape of the pausing handler with retained records.
+- Confluent's Parallel Consumer processes the records of one partition concurrently by key.
+  It retries a failed record in its own worker with a back-off, and commits the highest contiguous offset while holding the rest.
+  It is the model for the per-key concurrency shove does not have.
+  shove keeps one prefetch slot per waiting record, and the partition's order under `concurrent_processing(false)`.
+
+### Step 11, the registry outage
+
+- An unbounded wait on the record in hand is the chosen shape.
+  The record is neither poison nor processed, so it stays uncommitted while the loop polls.
+  It decodes again every `REGISTRY_RETRY_DELAY`, and goes on once the registry answers.
+  Nothing is lost and nothing is reordered, at the price of a stalled partition for the length of the outage.
+- Retained-record retry with a bounded back-off, the shape of Spring Kafka's `DefaultErrorHandler`, was the alternative.
+  It retries the same record a fixed number of times and then recovers it to a dead-letter topic.
+  A registry outage has no fixed length, so a bound turns an outage into dead letters, which is the discard the step removes.
+- Bounded retry followed by tolerance or dead-lettering, Kafka Connect's `errors.tolerance` and `errors.deadletterqueue` of KIP-298, was the other alternative.
+  It is right for a converter that will never succeed and wrong for one that will as soon as the registry is back.
+- The lookup itself is bounded below the member's poll interval.
+  A registry that accepts and never answers therefore cannot cost the group membership.
+  The wait between lookups is what has no bound.
 
 ## Done criteria
 
@@ -953,7 +1160,11 @@ This section records, per changed step, the patterns weighed and the one chosen,
   Redis fills `timestamp_ms` from the entry id's time component.
   SQS could fill `timestamp_ms` from `SentTimestamp` and RabbitMQ from the AMQP `timestamp` property.
   Do it per backend with its own availability row, as `delivery_count` did.
-- `kafka_external_topic()` refuses `sequenced()` for now.
+- On an external NATS stream the retry budget counts every redelivery, `Defer` naks and `ack_wait` expiries included.
+  Plan 019 weighs a split counter for the FIFO case, and an owned stream's opt-in to `InPlace` is its full scope.
+- The SQS external row is a verification table, not code yet.
+  `GetQueueUrl` proves the queue, `GetTopicAttributes` and `ListSubscriptionsByTopic` prove the rest best effort, `dlq()` is verify-only or refused, and a `Retry` takes the visibility-timeout path.
+- `external()` refuses `sequenced()` for now.
   Nothing in the Kafka FIFO consumer depends on shove having created the topic, so lifting the guard is additive once a user needs it.
 - `KafkaOffsetReset` describes a position for `reset_consumer_group_offsets` alone.
   The broadcast start is the backend-neutral `BroadcastStart`, and `KafkaAutoOffsetReset` is the group's librdkafka policy.

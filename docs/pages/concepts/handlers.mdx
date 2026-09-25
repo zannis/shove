@@ -185,13 +185,31 @@ The coordinates name a position in a log, which is what an audit trail or a repl
 They are not an attempt counter: the same record redelivered after a rebalance carries the same coordinates.
 On a dead-letter drain the coordinates are the dead letter's own, the copy's position in the dead-letter topic, while `retry_count` and `delivery_id` describe the original message.
 
-Most handlers ignore all of these fields. They become useful when you need to trace a message (`headers["x-trace-id"]`), implement idempotency checks (`headers["x-message-id"]` on RabbitMQ), or adjust behavior on redelivery. The `retry_count` in particular is more reliable than `redelivered` for detecting retries because `shove` increments it explicitly, whereas `redelivered` reflects the broker's view of the transport.
+Most handlers ignore all of these fields.
+They become useful when you need to trace a message (`headers["x-trace-id"]`), implement idempotency checks (`headers["x-message-id"]` on RabbitMQ), or adjust behavior on redelivery.
+The `retry_count` in particular is more reliable than `redelivered` for detecting retries, because `shove` defines how it advances.
+`redelivered` only reflects the broker's view of the transport.
+Under `RetryStrategy::Republish`, `shove` increments the count itself and carries it in a header on the copy it publishes.
+Under `RetryStrategy::InPlace` no copy is published.
+Kafka then keeps the count in memory for the redelivery.
+An external NATS stream reads it from the JetStream delivery information, which counts every redelivery.
 
 ### `retry_count` vs `delivery_count`
 
 The two counters answer different questions, and neither is a total-attempts-ever number.
 
-`retry_count` is `shove`'s retry budget. It advances only when `Outcome::Retry` routes a message through a hold queue, and it survives that hop because `shove` carries it in a header. It is the field `max_retries` and DLQ routing are measured against.
+`retry_count` is `shove`'s retry budget, the field `max_retries` and DLQ routing are measured against.
+How it advances depends on the retry strategy and the backend.
+Under `RetryStrategy::Republish`, the default on a shove-owned topology, it advances only when `Outcome::Retry` publishes an incremented copy.
+Redis, RabbitMQ, SQS and the in-process broker route the copy through a hold queue for the tier's delay.
+Kafka has no hold queue and republishes the copy into the consumed topic after the delay.
+NATS has no hold stream either.
+It holds the original un-acked for the delay, with progress acknowledgements, then publishes the copy to the same subject and acks the original.
+In every case the count survives the hop because `shove` carries it in a header.
+Under `RetryStrategy::InPlace` on Kafka, implied by an external topology, no copy is published.
+The count advances on each `Retry` the handler's task waits out, and is kept in memory for the redelivery.
+Under `RetryStrategy::InPlace` on an external NATS stream, the count is the number of redeliveries JetStream reports.
+A `Defer` nak and an `ack_wait` expiry are redeliveries there, so they advance it too.
 
 `delivery_count` is the broker's own attempt counter, so it sees deliveries `shove` never initiated — a consumer crash, an ack that never landed, a visibility timeout expiring. It is reported where the backend supplies one:
 
@@ -206,9 +224,14 @@ The two counters answer different questions, and neither is a total-attempts-eve
 
 Treat `None` as "unknown", never as zero. Where it is reported, a first delivery is `Some(1)`.
 
-Because the count belongs to a *broker-level* message, anything that creates a new one restarts it at 1. `Retry` publishes an incremented copy on every backend, so it always resets `delivery_count` — `retry_count` is the field that survives a retry. `Defer` resets it where deferring re-sends the message (SQS) and preserves it where deferring naks in place (NATS, and the in-process broker, which models NATS here).
+Because the count belongs to a *broker-level* message, anything that creates a new one restarts it at 1. Under `RetryStrategy::Republish`, the default on a shove-owned topology, `Retry` publishes an incremented copy and so resets `delivery_count`; `retry_count` is the field that survives a retry. Under `RetryStrategy::InPlace`, Kafka on an external or opted-in topology and NATS on an external stream, no copy is published and the same record comes back: Kafka keeps `retry_count` in memory, and NATS reads it from this very count, which climbs with every redelivery there. `Defer` resets `delivery_count` where deferring re-sends the message (SQS) and preserves it where deferring naks in place (NATS, and the in-process broker, which models NATS here).
 
 That last case is what `delivery_count` is for; see [Bounding a `Defer` loop](/guides/retries#defer-vs-retry).
+
+A consumer running with `RetryStrategy::InPlace` publishes no copy on `Retry` or `Defer`: on Kafka, where an external topology implies it and a shove-owned one may opt into it, the handler's task waits and hands the record back; on an external NATS stream the broker redelivers after a delayed `Nak`.
+The same record comes back in place.
+On Kafka its `retry_count` is kept in memory for the redelivery.
+On an external NATS stream it is read from the JetStream delivery information, which counts every redelivery.
 
 ## Dead-letter handling
 

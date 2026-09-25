@@ -9,6 +9,7 @@
 
 use rdkafka::Message;
 use serde::{Deserialize, Serialize};
+use shove::RetryStrategy;
 use shove::SequencedTopic as _;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
@@ -170,6 +171,17 @@ shove::define_topic!(
         .build()
 );
 
+// An infra-owned topic shove binds to but never creates, expands or alters.
+// The DLQ stays shove-owned in this mode.
+shove::define_topic!(
+    ExternalOwnedTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-owned")
+        .external()
+        .dlq()
+        .build()
+);
+
 // Eight default partitions, so the record coordinates a handler sees span
 // more than one partition.
 shove::define_topic!(
@@ -183,6 +195,129 @@ shove::define_topic!(
     TailOnlyTopic,
     SimpleMessage,
     TopologyBuilder::new("kafka-tail-only").build()
+);
+
+// External topics for the in-place Retry and Defer contract: shove never
+// produces into them, so a wait happens inside the handler's task instead.
+shove::define_topic!(
+    ExternalDeferTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-defer")
+        .external()
+        .hold_queue(Duration::from_millis(300))
+        .allow_message_loss()
+        .build()
+);
+
+shove::define_topic!(
+    ExternalRetryTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-retry")
+        .external()
+        .hold_queue(Duration::from_millis(200))
+        .dlq()
+        .build()
+);
+
+shove::define_topic!(
+    ExternalShutdownTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-shutdown")
+        .external()
+        .hold_queue(Duration::from_secs(10))
+        .allow_message_loss()
+        .build()
+);
+
+shove::define_topic!(
+    ExternalKeepaliveTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-keepalive")
+        .external()
+        .hold_queue(Duration::from_secs(4))
+        .allow_message_loss()
+        .build()
+);
+
+// A long in-place wait, so a lowered `max.poll.interval.ms` passes while a
+// handler waits and a record sits in the receive loop's hand.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    ExternalTransitionTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-transition")
+        .external()
+        .hold_queue(Duration::from_secs(25))
+        .allow_message_loss()
+        .build()
+);
+
+// Two partitions, so a record can arrive from one while a record from the
+// other waits for the only prefetch slot.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    ExternalPermitWaitTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-permit-wait")
+        .external()
+        .hold_queue(Duration::from_millis(300))
+        .allow_message_loss()
+        .build()
+);
+
+/// A message type that derives only `Deserialize`: no `Clone`, no
+/// `Serialize`. An in-place redelivery must work from the retained bytes,
+/// never from a copy of the value.
+#[derive(Debug, Deserialize)]
+struct PlainOnly {
+    id: String,
+}
+
+/// Decode-only codec for [`PlainOnly`]; the test publishes raw JSON bytes
+/// through rdkafka, so encoding is never needed.
+struct DecodeOnlyJson;
+
+impl shove::Codec<PlainOnly> for DecodeOnlyJson {
+    const NAME: &'static str = "json";
+    fn encode(_value: &PlainOnly) -> Result<Vec<u8>, shove::ShoveError> {
+        use serde::ser::Error as _;
+        Err(shove::ShoveError::Serialization(serde_json::Error::custom(
+            "PlainOnly is decode-only in this test",
+        )))
+    }
+    fn decode(bytes: &[u8]) -> Result<PlainOnly, shove::ShoveError> {
+        serde_json::from_slice(bytes).map_err(shove::ShoveError::Serialization)
+    }
+}
+
+shove::define_topic!(
+    ExternalNoCloneTopic,
+    PlainOnly,
+    TopologyBuilder::new("kafka-external-noclone")
+        .external()
+        .hold_queue(Duration::from_millis(300))
+        .allow_message_loss()
+        .build(),
+    codec = DecodeOnlyJson
+);
+
+// A shove-owned topic whose consumer opts into the in-place retry shape.
+shove::define_topic!(
+    OwnedInPlaceTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-owned-inplace")
+        .hold_queue(Duration::from_millis(300))
+        .dlq()
+        .build()
+);
+
+// An external topic nobody provisions: declaring it must fail, not create it.
+shove::define_topic!(
+    ExternalMissingTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-missing")
+        .external()
+        .build()
 );
 
 // ---------------------------------------------------------------------------
@@ -245,6 +380,17 @@ impl TestBroker {
 
     fn broker(&self) -> Broker<Kafka> {
         Broker::<Kafka>::from_client(self.client.clone())
+    }
+
+    /// A broker over a fresh client, for a "restart": a consumer group's
+    /// cancellation token is its client's shutdown token, so a second group
+    /// on the same client would be born cancelled.
+    async fn fresh_broker(&self) -> Broker<Kafka> {
+        let client =
+            KafkaClient::connect_with_retry(&KafkaConfig::new(&self.bootstrap_servers), 10)
+                .await
+                .expect("failed to connect a fresh client");
+        Broker::<Kafka>::from_client(client)
     }
 
     fn client(&self) -> KafkaClient {
@@ -315,6 +461,229 @@ async fn live_topic_config(brokers: &str, topic: &str, key: &str) -> Option<Stri
         .expect("no resource returned")
         .expect("describe_configs returned an error for the topic");
     resource.entry_map().get(key).and_then(|e| e.value.clone())
+}
+
+/// Create `topic` with `partitions` partitions through a raw admin client,
+/// standing in for the infrastructure that owns an external topic, and wait
+/// until the broker's metadata shows it.
+async fn provision_topic(brokers: &str, topic: &str, partitions: i32) {
+    use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+    use rdkafka::client::DefaultClientContext;
+
+    let admin: AdminClient<DefaultClientContext> = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create admin client");
+    let results = admin
+        .create_topics(
+            [&NewTopic::new(
+                topic,
+                partitions,
+                TopicReplication::Fixed(1),
+            )],
+            &AdminOptions::new(),
+        )
+        .await
+        .expect("create_topics failed");
+    assert!(
+        matches!(results.as_slice(), [Ok(name)] if name == topic),
+        "provisioning {topic} failed: {results:?}"
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    while live_partition_count(brokers, topic) != Some(partitions as usize) {
+        assert!(
+            Instant::now() < deadline,
+            "{topic} did not show up in metadata with {partitions} partitions"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The broker's view of `topic`: `None` when it has no such topic, else the
+/// partition count. Read through a consumer-type client with no `group.id`
+/// and auto-creation disabled, so the probe itself can neither create the
+/// topic nor register a group.
+fn live_partition_count(brokers: &str, topic: &str) -> Option<usize> {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("allow.auto.create.topics", "false")
+        .create()
+        .expect("failed to create metadata probe");
+    let metadata = probe
+        .fetch_metadata(Some(topic), Duration::from_secs(10))
+        .expect("failed to fetch topic metadata");
+    let candidate = metadata.topics().iter().find(|t| t.name() == topic)?;
+    if candidate.error().is_some() || candidate.partitions().is_empty() {
+        return None;
+    }
+    Some(candidate.partitions().len())
+}
+
+/// The high watermark of `partition`, read through a plain consumer client:
+/// the number of records the topic holds, which an external topic must keep
+/// while shove retries and defers in place.
+fn high_watermark(brokers: &str, topic: &str, partition: i32) -> i64 {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create watermark probe");
+    let (_, high) = probe
+        .fetch_watermarks(topic, partition, Duration::from_secs(10))
+        .expect("fetch_watermarks failed");
+    high
+}
+
+/// Read up to `expected` raw payloads off `topic` with a fresh group.
+/// Reads `expected` records off `topic` with a throwaway group, returning
+/// each record's payload and its string headers.
+async fn drain_raw_with_headers(
+    brokers: &str,
+    topic: &str,
+    expected: usize,
+    timeout: Duration,
+) -> Vec<(Vec<u8>, HashMap<String, String>)> {
+    use rdkafka::consumer::{Consumer as _, StreamConsumer};
+    use rdkafka::message::Headers as _;
+
+    let consumer: StreamConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", format!("{topic}-raw-drain"))
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("failed to create raw consumer");
+    consumer.subscribe(&[topic]).expect("subscribe should work");
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(timeout, async {
+        while out.len() < expected {
+            if let Ok(msg) = consumer.recv().await {
+                let headers = msg
+                    .headers()
+                    .map(|hs| {
+                        hs.iter()
+                            .filter_map(|h| {
+                                h.value.map(|v| {
+                                    (h.key.to_string(), String::from_utf8_lossy(v).into_owned())
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                out.push((msg.payload().unwrap_or_default().to_vec(), headers));
+            }
+        }
+    })
+    .await;
+    out
+}
+
+/// Publish raw bytes straight through rdkafka, bypassing shove's publisher.
+async fn publish_raw(brokers: &str, topic: &str, payload: &[u8]) {
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+
+    let producer: FutureProducer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create raw producer");
+    producer
+        .send(
+            FutureRecord::to(topic).key("k").payload(payload),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("raw publish should succeed");
+}
+
+/// `publish_raw` onto one partition, for topics with more than one.
+#[cfg(feature = "test-support")]
+async fn publish_raw_to(brokers: &str, topic: &str, partition: i32, payload: &[u8]) {
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+
+    let producer: FutureProducer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create raw producer");
+    producer
+        .send(
+            FutureRecord::to(topic)
+                .partition(partition)
+                .key("k")
+                .payload(payload),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("raw publish should succeed");
+}
+
+/// The group's committed offset on one partition, or `None` when it has
+/// never committed there.
+#[cfg(feature = "test-support")]
+fn committed_offset(brokers: &str, group: &str, topic: &str, partition: i32) -> Option<i64> {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+    use rdkafka::{Offset, TopicPartitionList};
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group)
+        .create()
+        .expect("failed to create committed-offset probe");
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition(topic, partition);
+    probe
+        .committed_offsets(tpl, Duration::from_secs(10))
+        .expect("committed_offsets")
+        .find_partition(topic, partition)
+        .and_then(|e| match e.offset() {
+            Offset::Offset(o) => Some(o),
+            _ => None,
+        })
+}
+
+/// Poll until the group's lag on `topic` reads zero, the broker-side proof
+/// that every consumed offset was committed.
+async fn wait_for_zero_lag(client: &KafkaClient, topic: &str, group: &str, timeout: Duration) {
+    use shove::kafka::{KafkaLagStatsProvider, KafkaQueueStatsProvider};
+
+    let stats_provider = KafkaLagStatsProvider::new(client.clone());
+    let deadline = Instant::now() + timeout;
+    loop {
+        let stats: KafkaQueueStats = stats_provider
+            .get_queue_stats(topic, group, KafkaAutoOffsetReset::Earliest)
+            .await
+            .expect("get_queue_stats should succeed");
+        if stats.messages_pending == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "group {group} still has lag {} on {topic} after {timeout:?}",
+            stats.messages_pending
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// The broker's view of `group` right now: its state and its member count.
+#[cfg(feature = "test-support")]
+fn group_state(brokers: &str, group: &str) -> (String, usize) {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create group probe");
+    let list = probe
+        .fetch_group_list(Some(group), Duration::from_secs(10))
+        .expect("failed to fetch group list");
+    list.groups()
+        .iter()
+        .find(|g| g.name() == group)
+        .map(|g| (g.state().to_string(), g.members().len()))
+        .unwrap_or_else(|| ("<absent>".to_string(), 0))
 }
 
 /// Wait until the broker reports `group` as `Stable` with at least one
@@ -434,6 +803,132 @@ impl MessageHandler<DeferNoHoldTopic> for CountingHandler {
     }
 }
 
+impl MessageHandler<ExternalOwnedTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// Records every delivery as `(id, retry_count, redelivered)` and returns
+/// `Defer` for the very first delivery it sees, then `Ack` for everything.
+#[derive(Clone)]
+struct DeferOnceRecorder {
+    seen: Arc<Mutex<Vec<(String, u32, bool)>>>,
+    /// The coordinates of every delivery, in order, so a test can prove that
+    /// a redelivery is the same record and not a copy.
+    coordinates: Arc<Mutex<Vec<Coordinates>>>,
+    counter: WaitableCounter,
+    /// How long the first delivery runs before it returns `Defer`, so a test
+    /// can hold the handler in its running state for a while.
+    first_runs_for: Duration,
+}
+
+impl DeferOnceRecorder {
+    fn new() -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            coordinates: Arc::new(Mutex::new(Vec::new())),
+            counter: WaitableCounter::new(),
+            first_runs_for: Duration::ZERO,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn running_first_for(mut self, duration: Duration) -> Self {
+        self.first_runs_for = duration;
+        self
+    }
+
+    async fn ids(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .await
+            .iter()
+            .map(|(id, _, _)| id.clone())
+            .collect()
+    }
+
+    async fn record(&self, id: String, meta: &MessageMetadata) -> Outcome {
+        self.coordinates
+            .lock()
+            .await
+            .push((meta.partition, meta.offset, meta.timestamp_ms));
+        let mut seen = self.seen.lock().await;
+        let first = seen.is_empty();
+        seen.push((id, meta.retry_count, meta.redelivered));
+        drop(seen);
+        self.counter.increment();
+        if first {
+            tokio::time::sleep(self.first_runs_for).await;
+            Outcome::Defer
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+macro_rules! defer_once_for {
+    ($($topic:ty),+ $(,)?) => {$(
+        impl MessageHandler<$topic> for DeferOnceRecorder {
+            type Context = ();
+            async fn handle(&self, msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+                self.record(msg.id, &meta).await
+            }
+        }
+    )+};
+}
+
+defer_once_for!(
+    ExternalDeferTopic,
+    ExternalKeepaliveTopic,
+    ExternalShutdownTopic,
+    OwnedInPlaceTopic
+);
+#[cfg(feature = "test-support")]
+defer_once_for!(ExternalTransitionTopic, ExternalPermitWaitTopic);
+
+impl MessageHandler<ExternalNoCloneTopic> for DeferOnceRecorder {
+    type Context = ();
+    async fn handle(&self, msg: PlainOnly, meta: MessageMetadata, _: &()) -> Outcome {
+        self.record(msg.id, &meta).await
+    }
+}
+
+/// Returns a fixed outcome on every delivery and records each one.
+#[derive(Clone)]
+struct AlwaysRecorder {
+    outcome: Outcome,
+    seen: Arc<Mutex<Vec<(String, u32)>>>,
+    counter: WaitableCounter,
+}
+
+impl AlwaysRecorder {
+    fn new(outcome: Outcome) -> Self {
+        Self {
+            outcome,
+            seen: Arc::new(Mutex::new(Vec::new())),
+            counter: WaitableCounter::new(),
+        }
+    }
+}
+
+macro_rules! always_for {
+    ($($topic:ty),+ $(,)?) => {$(
+        impl MessageHandler<$topic> for AlwaysRecorder {
+            type Context = ();
+            async fn handle(&self, msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+                self.seen.lock().await.push((msg.id, meta.retry_count));
+                self.counter.increment();
+                self.outcome.clone()
+            }
+        }
+    )+};
+}
+
+always_for!(ExternalRetryTopic, ExternalShutdownTopic);
+
 /// Records the id of every message it is handed.
 #[derive(Clone)]
 struct IdRecorder {
@@ -480,6 +975,14 @@ impl MessageHandler<CoordinatesTopic> for MetadataRecorder {
     type Context = ();
     async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
         self.seen.lock().await.push(meta);
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<ExternalMissingTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.counter.increment();
         Outcome::Ack
     }
@@ -2043,6 +2546,70 @@ async fn consumer_group_processes_messages() {
     broker.close().await;
 }
 
+/// `external()` binds to a topic infra created. Registering a
+/// group whose `max_consumers` exceeds the partition count consumes through
+/// it and leaves the partition count exactly as infra set it, while the DLQ
+/// is still shove's to create.
+#[tokio::test]
+async fn external_topic_is_never_created_or_expanded() {
+    const TOPIC: &str = "kafka-external-owned";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 3).await;
+
+    let broker = tb.broker();
+    let handler = CountingHandler::new();
+    let handler_clone = handler.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<ExternalOwnedTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=8)),
+            move || handler_clone.clone(),
+        )
+        .await
+        .expect("registering against a provisioned external topic must succeed");
+    assert_eq!(
+        live_partition_count(tb.brokers(), TOPIC),
+        Some(3),
+        "declare must not expand an external topic towards max_consumers"
+    );
+    assert!(
+        live_partition_count(tb.brokers(), "kafka-external-owned-dlq").is_some(),
+        "the DLQ is shove's own topic and is still created"
+    );
+
+    let publisher = broker.publisher().await.unwrap();
+    let messages: Vec<SimpleMessage> = (1..=5)
+        .map(|i| SimpleMessage {
+            id: format!("ext-{i}"),
+            content: format!("msg {i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<ExternalOwnedTopic>(&messages)
+        .await
+        .unwrap();
+
+    let token = group.cancellation_token();
+    let counter = handler.counter.clone();
+    let t = token.clone();
+    tokio::spawn(async move {
+        counter.wait_for(5, Duration::from_secs(60)).await;
+        t.cancel();
+    });
+    let outcome = group
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean());
+    assert_eq!(handler.counter.get(), 5);
+
+    assert_eq!(
+        live_partition_count(tb.brokers(), TOPIC),
+        Some(3),
+        "consuming must not expand the external topic either"
+    );
+    broker.close().await;
+}
+
 /// Every Kafka delivery carries the record's coordinates: a partition, an
 /// offset that runs contiguously from zero inside each partition of a fresh
 /// topic, and a broker timestamp inside the test's own wall-clock window.
@@ -2234,6 +2801,721 @@ async fn supervisor_with_auto_offset_reset_latest_skips_history() {
     token.cancel();
     let outcome = sup_handle.await.unwrap();
     assert!(outcome.is_clean());
+    broker.close().await;
+}
+
+/// On an external topic a `Defer` waits in place and hands the same record
+/// back before any later record, and the topic gains no republished copy:
+/// the handler sees `[1, 1, 2]` and the high watermark stays at two.
+#[tokio::test]
+async fn external_topic_defer_redelivers_in_place_without_producing() {
+    const TOPIC: &str = "kafka-external-defer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    let broker = tb.broker();
+
+    let handler = DeferOnceRecorder::new();
+    let h = handler.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<ExternalDeferTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+    let token = group.cancellation_token();
+    let running = tokio::spawn(
+        group.run_until_timeout(token.clone().cancelled_owned(), Duration::from_secs(15)),
+    );
+    wait_for_stable_group(tb.brokers(), "kafka-external-defer-consumer", TIMEOUT).await;
+
+    let publisher = broker.publisher().await.unwrap();
+    let msg = |id: &str| SimpleMessage {
+        id: id.into(),
+        content: String::new(),
+    };
+    publisher
+        .publish::<ExternalDeferTopic>(&msg("1"))
+        .await
+        .unwrap();
+    assert!(handler.counter.wait_for(1, TIMEOUT).await, "first delivery");
+    // Published while "1" is waiting out its deferral holding the only slot.
+    publisher
+        .publish::<ExternalDeferTopic>(&msg("2"))
+        .await
+        .unwrap();
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "redelivery and the second record"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        handler.ids().await,
+        vec!["1".to_string(), "1".to_string(), "2".to_string()],
+        "the deferred record is redelivered before the record behind it"
+    );
+    let seen = handler.seen.lock().await.clone();
+    assert_eq!(seen[0], ("1".to_string(), 0, false));
+    assert_eq!(
+        seen[1],
+        ("1".to_string(), 0, true),
+        "a Defer keeps the retry count and marks the redelivery"
+    );
+    let coordinates = handler.coordinates.lock().await.clone();
+    assert_eq!(
+        coordinates[0],
+        (Some(0), Some(0), coordinates[0].2),
+        "the first delivery is the first record of the one partition"
+    );
+    assert!(
+        coordinates[0].2.is_some(),
+        "Kafka reports the broker timestamp on the first delivery"
+    );
+    assert_eq!(
+        coordinates[1], coordinates[0],
+        "the redelivery is the same record: partition, offset and timestamp unchanged"
+    );
+    assert_eq!(
+        coordinates[2],
+        (Some(0), Some(1), coordinates[2].2),
+        "the record behind it has the next offset"
+    );
+    assert_eq!(
+        high_watermark(tb.brokers(), TOPIC, 0),
+        2,
+        "nothing was republished into the external topic"
+    );
+
+    token.cancel();
+    let outcome = running.await.unwrap();
+    assert!(outcome.is_clean());
+    broker.close().await;
+}
+
+/// The in-place shape is a retry strategy, not an ownership flag: a consumer
+/// of a shove-owned topic opts into it with `RetryStrategy::InPlace`, and its
+/// `Defer` then waits in place and hands the same record back before any
+/// later record, with no copy republished into the topic.
+#[tokio::test]
+async fn retry_in_place_on_an_owned_topic_does_not_republish() {
+    const TOPIC: &str = "kafka-owned-inplace";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<OwnedInPlaceTopic>()
+        .await
+        .expect("shove declares its own topic");
+
+    let handler = DeferOnceRecorder::new();
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<OwnedInPlaceTopic, _>(
+            handler.clone(),
+            ConsumerOptions::<Kafka>::new()
+                .with_concurrent_processing(false)
+                .with_retry_strategy(RetryStrategy::InPlace),
+        )
+        .expect("register");
+    let token = supervisor.cancellation_token();
+    let running =
+        tokio::spawn(supervisor.run_until_timeout(std::future::pending(), Duration::from_secs(15)));
+    wait_for_stable_group(tb.brokers(), "kafka-owned-inplace-consumer", TIMEOUT).await;
+
+    let publisher = broker.publisher().await.unwrap();
+    let msg = |id: &str| SimpleMessage {
+        id: id.into(),
+        content: String::new(),
+    };
+    publisher
+        .publish::<OwnedInPlaceTopic>(&msg("1"))
+        .await
+        .unwrap();
+    assert!(handler.counter.wait_for(1, TIMEOUT).await, "first delivery");
+    publisher
+        .publish::<OwnedInPlaceTopic>(&msg("2"))
+        .await
+        .unwrap();
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "the in-place redelivery, then the second record"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        handler.ids().await,
+        vec!["1".to_string(), "1".to_string(), "2".to_string()],
+        "the deferred record is redelivered before the record behind it"
+    );
+    // A shove-declared topic has the default partition count, so the proof
+    // that nothing was republished is the sum over every partition.
+    let partitions = live_partition_count(tb.brokers(), TOPIC).expect("the topic exists");
+    let records: i64 = (0..partitions)
+        .map(|p| high_watermark(tb.brokers(), TOPIC, i32::try_from(p).expect("partition id")))
+        .sum();
+    assert_eq!(
+        records, 2,
+        "nothing was republished into the shove-owned topic"
+    );
+
+    token.cancel();
+    assert!(running.await.unwrap().is_clean());
+    broker.close().await;
+}
+
+/// On an external topic a `Retry` waits the tier delay in place and counts
+/// its attempts in memory: `max_retries` 2 gives three handler calls, the
+/// record then goes to the shove-owned DLQ, the topic gains nothing, and the
+/// offset commits.
+#[tokio::test]
+async fn external_topic_retry_exhausts_without_producing() {
+    const TOPIC: &str = "kafka-external-retry";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    let broker = tb.broker();
+
+    let handler = AlwaysRecorder::new(Outcome::Retry);
+    let h = handler.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<ExternalRetryTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1).with_max_retries(2)),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+    let token = group.cancellation_token();
+    let running = tokio::spawn(
+        group.run_until_timeout(token.clone().cancelled_owned(), Duration::from_secs(15)),
+    );
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<ExternalRetryTopic>(&SimpleMessage {
+            id: "poison".into(),
+            content: "x".into(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "initial attempt plus two retries"
+    );
+    let dead = drain_raw_with_headers(tb.brokers(), "kafka-external-retry-dlq", 1, TIMEOUT).await;
+    assert_eq!(dead.len(), 1, "the exhausted record is dead-lettered once");
+    // The retries happened in place, so the count lived only in memory until
+    // the DLQ publish wrote it; a DLQ consumer's `retry_count` reads it back.
+    assert_eq!(
+        dead[0].1.get("Shove-Retry-Count").map(String::as_str),
+        Some("2"),
+        "the dead letter carries the in-memory retry count: {:?}",
+        dead[0].1
+    );
+    assert_eq!(
+        dead[0].1.get("Shove-Death-Count").map(String::as_str),
+        Some("1")
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let seen = handler.seen.lock().await.clone();
+    assert_eq!(
+        seen.iter().map(|(_, n)| *n).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "attempts are counted in memory and shown to the handler"
+    );
+    assert_eq!(seen.len(), 3, "no fourth attempt after the budget is spent");
+    assert_eq!(
+        high_watermark(tb.brokers(), TOPIC, 0),
+        1,
+        "nothing was republished into the external topic"
+    );
+    wait_for_zero_lag(
+        &tb.client(),
+        TOPIC,
+        "kafka-external-retry-consumer",
+        TIMEOUT,
+    )
+    .await;
+
+    token.cancel();
+    let outcome = running.await.unwrap();
+    assert!(outcome.is_clean());
+    broker.close().await;
+}
+
+/// The in-place redelivery works from the retained bytes, so a message type
+/// that derives only `Deserialize`, with neither `Clone` nor `Serialize`, is
+/// deferred and redelivered like any other.
+#[tokio::test]
+async fn external_topic_defer_works_for_a_message_type_without_clone() {
+    const TOPIC: &str = "kafka-external-noclone";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    let broker = tb.broker();
+
+    let handler = DeferOnceRecorder::new();
+    let h = handler.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<ExternalNoCloneTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+    let token = group.cancellation_token();
+    let running = tokio::spawn(
+        group.run_until_timeout(token.clone().cancelled_owned(), Duration::from_secs(15)),
+    );
+
+    publish_raw(tb.brokers(), TOPIC, br#"{"id":"plain"}"#).await;
+    assert!(
+        handler.counter.wait_for(2, TIMEOUT).await,
+        "deferred once, then acked"
+    );
+    assert_eq!(
+        handler.ids().await,
+        vec!["plain".to_string(), "plain".to_string()]
+    );
+    assert_eq!(high_watermark(tb.brokers(), TOPIC, 0), 1);
+
+    token.cancel();
+    let outcome = running.await.unwrap();
+    assert!(outcome.is_clean());
+    broker.close().await;
+}
+
+/// A shutdown during an in-place wait returns promptly, completes nothing,
+/// and leaves the record for the next member of the group.
+#[tokio::test]
+async fn external_topic_shutdown_during_a_wait_leaves_the_record_uncommitted() {
+    const TOPIC: &str = "kafka-external-shutdown";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    let broker = tb.broker();
+
+    let deferring = AlwaysRecorder::new(Outcome::Defer);
+    let h = deferring.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<ExternalShutdownTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+    let token = group.cancellation_token();
+    let running = tokio::spawn(
+        group.run_until_timeout(token.clone().cancelled_owned(), Duration::from_secs(15)),
+    );
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<ExternalShutdownTopic>(&SimpleMessage {
+            id: "held".into(),
+            content: String::new(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        deferring.counter.wait_for(1, TIMEOUT).await,
+        "the record reached the handler"
+    );
+
+    // Cancel in the middle of the ten-second wait.
+    let cancelled_at = Instant::now();
+    token.cancel();
+    let outcome = running.await.unwrap();
+    let took = cancelled_at.elapsed();
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert!(
+        took < Duration::from_secs(5),
+        "shutdown must not wait out the deferral, took {took:?}"
+    );
+
+    // A fresh member of the same group, on a fresh client, is handed the
+    // record again.
+    let restarted = tb.fresh_broker().await;
+    let acking = AlwaysRecorder::new(Outcome::Ack);
+    let h = acking.clone();
+    let mut group = restarted.consumer_group();
+    group
+        .register::<ExternalShutdownTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+    let token = group.cancellation_token();
+    let running = tokio::spawn(
+        group.run_until_timeout(token.clone().cancelled_owned(), Duration::from_secs(15)),
+    );
+    assert!(
+        acking.counter.wait_for(1, TIMEOUT).await,
+        "the uncommitted record must be redelivered after a restart"
+    );
+    assert_eq!(acking.seen.lock().await[0].0, "held");
+    token.cancel();
+    assert!(running.await.unwrap().is_clean());
+    restarted.close().await;
+    broker.close().await;
+}
+
+/// A shutdown that lands during an in-place wait ends the handler task with
+/// nothing completed, and the receive loop's drain then clears the consumer's
+/// busy flag: the flag is what the group's scale-down reads to find an idle
+/// member, so a member that exited cleanly must not read as still working.
+#[tokio::test]
+async fn external_topic_shutdown_during_a_wait_clears_the_processing_flag() {
+    const TOPIC: &str = "kafka-external-shutdown";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    let broker = tb.broker();
+
+    let handler = DeferOnceRecorder::new();
+    let shutdown = CancellationToken::new();
+    let options = ConsumerOptions::<Kafka>::new().with_shutdown(shutdown.clone());
+    let processing = options.processing_handle();
+    let h = handler.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let running = tokio::spawn(async move {
+        consumer
+            .run::<ExternalShutdownTopic, _>(h, (), options)
+            .await
+    });
+    wait_for_stable_group(tb.brokers(), "kafka-external-shutdown-consumer", TIMEOUT).await;
+
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<ExternalShutdownTopic>(&SimpleMessage {
+            id: "held".into(),
+            content: String::new(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the record reached the handler, which is now waiting out its deferral"
+    );
+    assert!(
+        processing.load(Ordering::Acquire),
+        "a waiting handler holds its slot, so the member reads as busy"
+    );
+
+    shutdown.cancel();
+    running
+        .await
+        .expect("consumer task panicked")
+        .expect("the consumer ends cleanly on shutdown");
+    assert!(
+        !processing.load(Ordering::Acquire),
+        "after a clean exit the member must not read as still working"
+    );
+    broker.close().await;
+}
+
+/// While the only prefetch slot is held by a handler waiting in place, the
+/// member stays in its group and the loop keeps polling: the record published
+/// during the wait arrives right after the redelivery, and the group reads
+/// as stable throughout.
+///
+/// This test keeps the pinned five-minute limit and a four-second wait, so
+/// it pins the polling discipline (a paused assignment that keeps calling
+/// `recv()`), not the eviction. The next test lowers the limit through
+/// `with_max_poll_interval_for_test` and pins the eviction.
+#[tokio::test]
+async fn external_topic_waiting_handlers_keep_the_member_in_the_group() {
+    const TOPIC: &str = "kafka-external-keepalive";
+    const GROUP: &str = "kafka-external-keepalive-consumer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    let broker = tb.broker();
+
+    let handler = DeferOnceRecorder::new();
+    let h = handler.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<ExternalKeepaliveTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+    let token = group.cancellation_token();
+    let running = tokio::spawn(
+        group.run_until_timeout(token.clone().cancelled_owned(), Duration::from_secs(15)),
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
+
+    let publisher = broker.publisher().await.unwrap();
+    let msg = |id: &str| SimpleMessage {
+        id: id.into(),
+        content: String::new(),
+    };
+    publisher
+        .publish::<ExternalKeepaliveTopic>(&msg("a"))
+        .await
+        .unwrap();
+    assert!(handler.counter.wait_for(1, TIMEOUT).await, "first delivery");
+    // "a" now waits four seconds holding the only slot; the assignment is
+    // paused and the loop keeps polling.
+    publisher
+        .publish::<ExternalKeepaliveTopic>(&msg("b"))
+        .await
+        .unwrap();
+    // The receive arm puts `b` back because the one slot is held by a waiting
+    // handler; the probe is the signal that this happened, in place of a
+    // sleep that only made it likely.
+    #[cfg(feature = "test-support")]
+    {
+        use shove::kafka::put_back_probe;
+
+        let put_back_deadline = Instant::now() + TIMEOUT;
+        while put_back_probe::paused_receive() == 0 {
+            assert!(
+                Instant::now() < put_back_deadline,
+                "the record received while the slot is held must be put back by the receive arm"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    wait_for_stable_group(tb.brokers(), GROUP, Duration::from_secs(5)).await;
+    assert_eq!(
+        handler.counter.get(),
+        1,
+        "nothing is handled while the slot is held"
+    );
+
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "redelivery, then the record published during the wait"
+    );
+    assert_eq!(
+        handler.ids().await,
+        vec!["a".to_string(), "a".to_string(), "b".to_string()]
+    );
+    assert_eq!(high_watermark(tb.brokers(), TOPIC, 0), 2);
+
+    token.cancel();
+    assert!(running.await.unwrap().is_clean());
+    broker.close().await;
+}
+
+/// The rule the docs state: a record that arrives while every slot is held
+/// by a running handler is decoded and waits for a slot while the loop keeps
+/// polling, and a further record that arrives during that wait is handed
+/// back to the broker and the assignment paused until a slot frees. With one
+/// slot, `a` on partition 0 runs for three seconds, `b` on partition 1
+/// arrives meanwhile and waits for the slot, and `c` on partition 0 arrives
+/// during that wait. `c` must arrive again once the slot frees: the order is
+/// `[a, a, b, c]`, nothing is republished, and both partitions commit.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn external_topic_record_received_during_the_permit_wait_is_put_back_and_redelivered() {
+    use shove::kafka::put_back_probe;
+
+    const TOPIC: &str = "kafka-external-permit-wait";
+    const GROUP: &str = "kafka-external-permit-wait-consumer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 2).await;
+    let broker = tb.broker();
+
+    let handler = DeferOnceRecorder::new().running_first_for(Duration::from_secs(3));
+    let h = handler.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<ExternalPermitWaitTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+    let token = group.cancellation_token();
+    let running = tokio::spawn(
+        group.run_until_timeout(token.clone().cancelled_owned(), Duration::from_secs(15)),
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
+
+    let record = |id: &str| {
+        serde_json::to_vec(&SimpleMessage {
+            id: id.into(),
+            content: String::new(),
+        })
+        .unwrap()
+    };
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record("a")).await;
+    assert!(handler.counter.wait_for(1, TIMEOUT).await, "a is running");
+    // `b` waits for the slot `a` holds; `c` arrives during that wait.
+    publish_raw_to(tb.brokers(), TOPIC, 1, &record("b")).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record("c")).await;
+    // The probe proves that `c` went back to the broker from inside the
+    // permit wait, rather than inferring it from the sleep above.
+    let put_back_deadline = Instant::now() + TIMEOUT;
+    while put_back_probe::permit_wait() == 0 {
+        assert!(
+            Instant::now() < put_back_deadline,
+            "the record received during the permit wait must be put back from that wait"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        handler.counter.wait_for(4, TIMEOUT).await,
+        "a's redelivery, then b, then the put-back c"
+    );
+    assert_eq!(
+        handler.ids().await,
+        vec![
+            "a".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string()
+        ]
+    );
+    assert_eq!(
+        high_watermark(tb.brokers(), TOPIC, 0),
+        2,
+        "nothing was republished"
+    );
+    assert_eq!(high_watermark(tb.brokers(), TOPIC, 1), 1);
+    wait_for_zero_lag(&tb.client(), TOPIC, GROUP, TIMEOUT).await;
+    assert_eq!(committed_offset(tb.brokers(), GROUP, TOPIC, 0), Some(2));
+    assert_eq!(committed_offset(tb.brokers(), GROUP, TOPIC, 1), Some(1));
+
+    token.cancel();
+    assert!(running.await.unwrap().is_clean());
+    broker.close().await;
+}
+
+/// A record queued behind a running handler must not park the receive loop.
+/// With one slot, "a" is still running when "b" arrives, so no handler is
+/// waiting yet and the loop cannot pause up front. Before the permit was
+/// acquired inside a polling `select!`, the loop then waited for it without
+/// calling `recv()`, and when "a" turned into a 25 s in-place wait the member
+/// was evicted at `max.poll.interval.ms`. With that limit lowered to its
+/// 10 s floor through the `test-support` seam, the group must still read as
+/// `Stable` with one member well past the limit, the order must be
+/// `[a, a, b]`, and the topic must gain no republished copy.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn external_topic_queued_record_keeps_the_member_when_a_running_handler_starts_waiting() {
+    const TOPIC: &str = "kafka-external-transition";
+    const GROUP: &str = "kafka-external-transition-consumer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    let broker = tb.broker();
+
+    // Both records sit on the topic before the member joins, so "b" is in
+    // the loop's hand while "a" is still running.
+    let publisher = broker.publisher().await.unwrap();
+    for id in ["a", "b"] {
+        publisher
+            .publish::<ExternalTransitionTopic>(&SimpleMessage {
+                id: id.into(),
+                content: String::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let handler = DeferOnceRecorder::new().running_first_for(Duration::from_secs(3));
+    let h = handler.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<ExternalTransitionTopic, _>(
+            ConsumerGroupConfig::new(
+                KafkaConsumerGroupConfig::new(1..=1)
+                    .with_max_poll_interval_for_test(Duration::from_secs(10)),
+            ),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+    let token = group.cancellation_token();
+    let running = tokio::spawn(
+        group.run_until_timeout(token.clone().cancelled_owned(), Duration::from_secs(15)),
+    );
+
+    assert!(handler.counter.wait_for(1, TIMEOUT).await, "first delivery");
+    // "a" runs for 3 s and then waits 25 s in place; "b" waits for the slot
+    // throughout. Well past the 10 s poll limit the member must still be in
+    // its group, and nothing else may have been handled.
+    tokio::time::sleep(Duration::from_secs(18)).await;
+    assert_eq!(
+        group_state(tb.brokers(), GROUP),
+        ("Stable".to_string(), 1),
+        "the member must stay in the group while it waits for a permit"
+    );
+    assert_eq!(
+        handler.counter.get(),
+        1,
+        "nothing else is handled while the slot is held"
+    );
+
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "the redelivery of a, then b"
+    );
+    assert_eq!(
+        handler.ids().await,
+        vec!["a".to_string(), "a".to_string(), "b".to_string()]
+    );
+    assert_eq!(high_watermark(tb.brokers(), TOPIC, 0), 2);
+
+    token.cancel();
+    assert!(running.await.unwrap().is_clean());
+    broker.close().await;
+}
+
+/// A missing external topic is a startup error, not a silent auto-create:
+/// `declare` returns `Topology`, the registry path surfaces the same error,
+/// and the topic is still absent afterwards, so the verification fetch
+/// itself created nothing.
+#[tokio::test]
+async fn external_topic_missing_fails_fast_at_declare() {
+    const TOPIC: &str = "kafka-external-missing";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+
+    let err = broker
+        .topology()
+        .declare::<ExternalMissingTopic>()
+        .await
+        .expect_err("declare must refuse a topic nobody provisioned");
+    assert!(
+        matches!(err, shove::ShoveError::Topology(_)),
+        "expected Topology, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("external()") && err.to_string().contains("must be provisioned"),
+        "{err}"
+    );
+    assert_eq!(
+        live_partition_count(tb.brokers(), TOPIC),
+        None,
+        "the verification fetch must not auto-create the topic"
+    );
+
+    let mut group = broker.consumer_group();
+    let err = group
+        .register::<ExternalMissingTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            CountingHandler::new,
+        )
+        .await
+        .expect_err("register must refuse a topic nobody provisioned");
+    assert!(
+        matches!(err, shove::ShoveError::Topology(_)),
+        "expected Topology, got {err:?}"
+    );
+    assert_eq!(live_partition_count(tb.brokers(), TOPIC), None);
     broker.close().await;
 }
 

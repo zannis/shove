@@ -184,6 +184,11 @@ impl RabbitMqTopologyDeclarer {
 
 impl RabbitMqTopologyDeclarer {
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+        // No verification step yet for an infra-owned queue, so external mode
+        // is refused rather than declared: a `queue.declare` here would be
+        // the write it promises never to make. The step to add is a passive
+        // `queue.declare`, which only checks that the queue exists.
+        topology.refuse_external("RabbitMQ", "a passive `queue.declare`")?;
         if topology.broadcast() {
             // The exchange, and nothing else. A broadcast topology has no
             // shared queue, no DLQ and no hold queues, and each subscriber

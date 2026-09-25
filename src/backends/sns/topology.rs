@@ -404,6 +404,14 @@ impl SnsTopologyDeclarer {
 
 impl SnsTopologyDeclarer {
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+        // No verification step yet for infra-owned resources, so external
+        // mode is refused rather than declared. The step to add has to cover
+        // more than `GetQueueUrl`: this declarer owns an SNS topic, a queue
+        // policy and a subscription as well as the queue.
+        topology.refuse_external(
+            "AWS SNS/SQS",
+            "`GetQueueUrl` on the queue, plus the SNS topic, its policy and its subscription",
+        )?;
         // If the registry already has an ARN for this queue (pre-configured),
         // validate it exists and skip creation.
         if let Some(arn) = self.topic_registry().get(topology.queue()).await {
@@ -543,5 +551,27 @@ mod tests {
     async fn queue_registry_get_missing() {
         let registry = QueueRegistry::new();
         assert_eq!(registry.get("nonexistent").await, None);
+    }
+
+    /// `external()` is refused before any request is made: this declarer
+    /// owns an SNS topic, a queue policy and a subscription as well as the
+    /// queue, and verifies none of them yet. The mock client reaches no AWS
+    /// endpoint, so a refusal that came after a request would surface as a
+    /// transport error instead of `Topology`.
+    #[cfg(feature = "aws-sns-sqs")]
+    #[tokio::test]
+    async fn declare_refuses_an_external_topology_before_any_request() {
+        let topology = TopologyBuilder::new("infra-orders").external().build();
+        let err = SnsTopologyDeclarer::new(SnsClient::mock())
+            .declare(&topology)
+            .await
+            .expect_err("external() must be refused on AWS SNS/SQS");
+        let ShoveError::Topology(msg) = err else {
+            panic!("expected ShoveError::Topology, got {err:?}");
+        };
+        assert!(msg.contains("infra-orders"), "{msg}");
+        assert!(msg.contains("external()"), "{msg}");
+        assert!(msg.contains("AWS SNS/SQS"), "{msg}");
+        assert!(msg.contains("GetQueueUrl"), "{msg}");
     }
 }

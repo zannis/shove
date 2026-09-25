@@ -59,6 +59,22 @@ One caution: because `Defer` never increments the retry counter, a handler that 
 
 If no hold queues are configured on the topic, `Defer` falls back to broker nack-with-requeue and logs a warning.
 
+How a consumer carries out `Retry` and `Defer` is its `RetryStrategy`: `Republish`, an incremented copy after the tier's delay, or `InPlace`, the same record delivered again after the tier's delay with nothing published.
+`InPlace` says what is not done, a replacement publish; how the record comes back is the broker's own primitive, in the table below: Kafka waits inside the handler's task and hands the record back, NATS lets JetStream redeliver after a delayed `Nak`.
+One invariant binds every backend: a consumer never writes into an external topology when it settles an outcome, so an external topology implies `InPlace` everywhere, and each broker has a native primitive for it.
+
+| Backend | In-place primitive | This version |
+|---|---|---|
+| Apache Kafka | pauses the assignment and waits in the handler's task, the count kept in memory | both strategies; `with_retry_strategy` on `ConsumerOptions::<Kafka>` and `KafkaConsumerGroupConfig` |
+| NATS JetStream | naks with the tier's delay, the count from JetStream's `num_delivered` | `InPlace` on an external stream, `Republish` on a shove-owned one; the setter follows |
+| AWS SQS | extends the visibility timeout, the path the FIFO consumer already uses | later, additive; `declare` and every consumer entry point refuse `external()` |
+| RabbitMQ | `basic.nack` with requeue | later, additive; `declare` and every consumer entry point refuse `external()` |
+| Redis Streams | leaves the entry pending for idle redelivery | later, additive; `declare` and every consumer entry point refuse `external()` |
+
+On Kafka a shove-owned topology runs with `Republish` by default and may opt into `InPlace` with `with_retry_strategy`; an external topology refuses `Republish`.
+Under `InPlace` nothing is republished: Kafka keeps the count in memory, and NATS reads it from the delivery info, so on an external stream a `Defer` and an `ack_wait` expiry consume the retry budget too.
+See [Bind to an infra-owned topic](/backends/kafka#bind-to-an-infra-owned-topic) and [Bind to an externally-provisioned stream](/backends/nats#bind-to-an-externally-provisioned-stream).
+
 `Defer` is not supported on sequenced consumers. If a handler returns `Defer` in that context it is treated as `Retry` and a warning is logged, because deferral would violate ordering guarantees.
 
 ## Handler timeouts and deserialization failures

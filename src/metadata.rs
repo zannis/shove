@@ -48,6 +48,11 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageMetadata {
     /// How many times this message has been retried (0 on first delivery).
+    ///
+    /// A republish carries it in a header of each copy. An in-place retry,
+    /// `RetryStrategy::InPlace`, keeps it in memory on Kafka and reads it
+    /// from the broker's redelivery count on an external NATS stream, where a
+    /// `Defer` and an `ack_wait` expiry therefore count as well.
     pub retry_count: u32,
     /// Opaque delivery identifier (AMQP tag, SQS receipt handle, etc).
     pub delivery_id: String,
@@ -61,12 +66,12 @@ pub struct MessageMetadata {
     /// an ack that never landed, a visibility timeout expiring, and — on NATS —
     /// [`Outcome::Defer`](crate::Outcome::Defer) hops.
     ///
-    /// That last one is the reason this field exists. `Defer` deliberately
-    /// leaves `retry_count` untouched, so a handler that defers forever bounces
-    /// between the main queue and the first hold queue with `retry_count`
-    /// pinned at its original value and nothing to alert on beyond
-    /// [`redelivered`](Self::redelivered), a bare boolean. `delivery_count`
-    /// makes "stuck at N attempts" expressible:
+    /// That last one is the reason this field exists. Under the republish
+    /// strategy `Defer` deliberately leaves `retry_count` untouched, so a
+    /// handler that defers forever bounces between the main queue and the
+    /// first hold queue with `retry_count` pinned at its original value and
+    /// nothing to alert on beyond [`redelivered`](Self::redelivered), a bare
+    /// boolean. `delivery_count` makes "stuck at N attempts" expressible:
     ///
     /// ```ignore
     /// // NATS: Defer naks in place, so this climbs with every deferred hop.
@@ -75,6 +80,10 @@ pub struct MessageMetadata {
     ///     return Outcome::Reject; // to the DLQ instead of deferring again
     /// }
     /// ```
+    ///
+    /// On an external NATS stream the loop above is not needed: `retry_count`
+    /// is derived from this count there, so a `Defer` consumes the retry
+    /// budget and the record reaches the DLQ at `max_retries` on its own.
     ///
     /// ## Per-backend availability
     ///
@@ -94,11 +103,15 @@ pub struct MessageMetadata {
     ///
     /// The count belongs to a *broker-level* message, so anything that creates a
     /// new one starts it over at 1. [`Outcome::Retry`](crate::Outcome::Retry)
-    /// publishes an incremented copy on every backend, so it always resets;
-    /// `retry_count` is the field that survives a retry. `Defer` resets it on
-    /// the backends where deferring re-sends the message (SQS) and preserves it
-    /// on the backends where deferring naks in place (NATS, and the in-process
-    /// broker, which models NATS here).
+    /// publishes an incremented copy on every backend that republishes, so it
+    /// resets there; a consumer running with `RetryStrategy::InPlace`, Kafka
+    /// or NATS on an external stream, hands the same record back instead, so
+    /// the count stays what the broker reported for that one record, and on
+    /// NATS `retry_count` is then derived from it. `retry_count` is the field
+    /// that survives a retry either way. `Defer` resets it on the backends where deferring
+    /// re-sends the message (SQS) and preserves it on the backends where
+    /// deferring naks in place (NATS, and the in-process broker, which models
+    /// NATS here) or waits in place (Kafka under `RetryStrategy::InPlace`).
     ///
     /// So: use `retry_count` to reason about `shove`'s retry budget, and
     /// `delivery_count` to reason about attempts the broker repeated on its own.
@@ -116,8 +129,11 @@ pub struct MessageMetadata {
     /// With [`offset`](Self::offset) this names the record's position in the
     /// log, which is what an audit trail or a replay request needs. It is a
     /// position, not an attempt: the same record redelivered after a
-    /// rebalance carries the same coordinates, and a `Retry` republishes a
-    /// new record with new ones.
+    /// rebalance carries the same coordinates, and a `Retry` that republishes,
+    /// the shove-owned default, produces a new record with new ones. A `Retry`
+    /// carried out in place, `RetryStrategy::InPlace` on Kafka and on an
+    /// external NATS stream, hands the same record back, so the coordinates
+    /// stay the same and `redelivered` is set.
     ///
     /// Each of the three coordinate fields is filled where the backend has
     /// the data, and carries its own availability table; `partition` is the

@@ -77,6 +77,7 @@ impl SqsConsumerGroupRegistry {
         ));
 
         let topology = T::topology();
+        super::consumer::refuse_external(topology)?;
         let name = topology.queue().to_string();
 
         if self.groups.contains_key(&name) {

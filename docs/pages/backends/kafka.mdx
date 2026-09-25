@@ -90,6 +90,78 @@ See [`examples/kafka/msk_iam.rs`](/backends/kafka/examples/msk_iam) for a runnab
 
 `topology().declare::<T>()` creates the Kafka topics for the main topic, hold topics, and DLQ. Idempotent — safe to call on every startup.
 
+### Bind to an infra-owned topic
+
+Sometimes infra owns the topic: a Terraform module, a platform team's provisioning job, or a cluster whose credentials carry no Create or Alter permission.
+Then use `external()`, the backend-neutral flag NATS shares:
+
+```rust,no_run
+use shove::TopologyBuilder;
+
+shove::define_topic!(
+    PriceChanges,
+    PriceChange,
+    // The queue name must match the externally provisioned topic name.
+    TopologyBuilder::new("price-changes")
+        .external()
+        .dlq()
+        .build()
+);
+```
+
+In this mode `declare::<T>()` does **not** create the main topic.
+It verifies that the topic, named after the queue, already exists.
+If it does not, `declare` returns a `ShoveError::Topology`, so a missing or misnamed topic fails fast at startup.
+Nothing falls back to an auto-created topic with default partitions and config.
+The check is a metadata request from a consumer-type client with no `group.id`.
+It therefore needs no group permission and cannot trigger the broker's topic auto-creation.
+shove never expands the topic's partitions and never reconciles its config.
+A consumer group registered with more `max_consumers` than the topic has partitions runs with the extra members idle.
+`declare` logs a warning when that happens.
+shove still creates and owns its DLQ topic, and still manages its consumer group.
+Provision the topic before the consumer starts.
+
+A consumer then needs these ACLs: `Describe` and `Read` on the topic, and `Describe` and `Read` on the consumer group.
+The group is `{queue}-consumer` unless `for_consumer_group` or `with_group_id` names another.
+A publisher additionally needs `Write` on the topic.
+A declared DLQ needs `Create`, `Describe` and `Write` on the DLQ topic, so that shove can create it and route to it.
+
+On an external topic, shove's consumer never writes into the topic when it settles an outcome: a `Retry` or a `Defer` waits in place, and a `Reject` publishes to the shove-owned DLQ.
+That is the guarantee, and it covers declaring and consuming.
+Publishing is outside it: a `Publisher` on this topology writes to the topic.
+Until the producer pins `allow.auto.create.topics=false`, a separate change in the same release, a publish to a topic that does not exist can create it with broker defaults on a broker with `auto.create.topics.enable=true`, so provision the topic before any publisher starts.
+`Ack` and `Reject` behave as everywhere else, because a `Reject` publishes to the shove-owned DLQ and not into the topic.
+How `Retry` and `Defer` are carried out is the consumer's **retry strategy**, `RetryStrategy::Republish` or `RetryStrategy::InPlace`, set with `with_retry_strategy` on `ConsumerOptions::<Kafka>` or `KafkaConsumerGroupConfig`.
+Ownership implies it: an external topology runs with `InPlace` and refuses `Republish`, because the republish would write into a topic infra owns.
+A shove-owned topology runs with `Republish` by default and may opt into `InPlace`, so a consumer that must not duplicate a retried record for the other groups on a fan-out topic can wait in place too.
+A FIFO consumer refuses `InPlace`, which it does not implement.
+
+| Outcome | `RetryStrategy::Republish`, the shove-owned default | `RetryStrategy::InPlace`, implied by an external topology |
+|---|---|---|
+| `Ack` | commits the offset | the same |
+| `Reject` | publishes to the DLQ when one is declared, then commits | the same, the DLQ is shove's own topic |
+| `Retry` | republishes into the topic after the tier's delay, with the retry count in a header | waits the tier's delay inside the handler's task, holding its prefetch slot, then hands the same record back with the retry count kept in memory; an exhausted budget goes to the DLQ as usual, with the in-memory count written to the dead letter's `Shove-Retry-Count` header |
+| `Defer` | republishes into the topic after the first tier's delay | waits the first tier's delay in place, then hands the same record back |
+
+The redelivered `MessageMetadata` carries `redelivered: true` and the in-memory retry count.
+A `Defer` leaves that in-memory budget unchanged, as it does under the republish strategy; on an external NATS stream, by contrast, the count is the broker's redelivery count, so a `Defer` there consumes budget.
+While every prefetch slot is held and at least one holder is a waiting handler, the consumer pauses its assignment and keeps polling.
+A long wait therefore does not evict the member from its group.
+Slots held only by running handlers do not pause the assignment by themselves, because a pause purges the fetch queue and refetches on resume.
+A record that arrives while every slot is held by a running handler is decoded and waits for a slot while the consumer keeps polling.
+A further record that arrives during that wait is handed back to the broker, and the assignment is paused until a slot frees.
+A partition the group assigns to the member during a pause is paused too.
+A record it delivers first is handed back to the broker and arrives again, in order, once a slot frees.
+The pause lasts until a slot frees: the slot that ends the wait serves the record already in hand, so with one slot the assignment stays paused through that record's handler as well.
+A shutdown during a wait completes nothing: the record stays uncommitted and is redelivered on restart.
+A waiting handler holds its slot for the whole delay, the contract a broadcast subscription has always had.
+Size `prefetch_count` for the number of records you accept to have waiting at once.
+
+`external()` is incompatible with `sequenced()` and with every topic-config method.
+Those are `with_topic_config`, `with_retention`, `with_retention_forever`, `with_retention_bytes`, `with_cleanup_policy` and `with_max_message_bytes`.
+They configure topic *creation* and *reconciliation*, which external mode skips, and `build()` panics if they are combined.
+`dlq()`, `dlq_named()`, `hold_queue()`, `for_consumer_group()` and `broadcast()` stay available.
+
 ## Publish
 
 ```rust
@@ -322,6 +394,9 @@ See the [Basic example](/backends/kafka/examples/basic) for a full runnable walk
 
 `Outcome::Ack` marks the offset complete as soon as the handler returns.
 `Outcome::Retry` and `Outcome::Defer` mark it complete only once the broker has acknowledged the delayed republish to the hold topic.
+Under `RetryStrategy::InPlace`, which an external topology implies and a shove-owned one may opt into, there is no republish.
+The offset is marked complete only when the in-place retry or defer ends in a terminal outcome.
+That is an `Ack`, or a `Reject` or an exhausted retry budget that was dead-lettered or discarded.
 This closes the publish-then-commit race.
 A broker crash or process kill between handler return and republish redelivers the message on restart rather than silently dropping it.
 
@@ -513,6 +588,33 @@ Details:
 - **Codecs** — framing applies only to `JsonCodec` and `ProtobufCodec` topics; other codecs are published unframed. For Protobuf the message-index is `[0]` (the first message type).
 - **Opt-in** — a publisher built with the plain `Broker::publisher()` does no framing, so existing publishers are byte-for-byte unchanged.
 
+### When the registry cannot answer
+
+A record whose schema id the registry cannot resolve right now is neither poison nor processed.
+The consumer keeps it, pauses its partition assignment, and asks again every second (`REGISTRY_RETRY_DELAY` in `kafka::constants`).
+Every partition the member holds is paused, healthy ones included, so one stalled record stops that member's delivery until the registry answers.
+It keeps asking until the registry answers or the consumer shuts down.
+The offset stays uncommitted throughout, so a shutdown or a crash mid-wait redelivers the record.
+Each wait counts `shove_messages_failed_total{reason="schema_unavailable"}` once and logs a warning with the schema id.
+Nothing is dead-lettered or discarded, so `shove_messages_discarded_total` does not move.
+"Cannot answer" means a transport failure, or a 5xx, a 408 or a 429 that outlasts the client's own retries.
+The batch consumer flushes the records ahead of the stalled one first.
+Its committed span therefore ends before that record until it decodes.
+If that flush comes back `Retry` or `Defer`, the span is sought back to its start.
+The stalled record is then handed back to the broker as well.
+It arrives again behind the rewound records, so every batch stays in offset order.
+The loop keeps polling while it waits, so the member stays in its group for the whole outage, however long.
+A partition the group assigns to the member during the wait is paused too.
+A record it delivers first is handed back to the broker and arrives again, in order, once the wait ends.
+
+A registry that does answer, but wrongly for the deployment, is not an outage and is not waited on.
+A 401 or 403, a redirect the client cannot follow, another unexpected status, or an undecodable response ends the consumer.
+The error is a `ShoveError::Topology` naming the schema id and the fault.
+On the registry path the group's supervision restarts the member with backoff.
+The fault is therefore visible in the logs and the metrics rather than hidden behind an endless wait.
+A 404 is still the registry's definite answer that the id is unknown.
+Such a record goes to the DLQ with reason `schema_resolve_failed`, as before.
+
 ### Codec requirement
 
 Registry decoding is only supported for topics using a `JsonCodec` or `ProtobufCodec`. A message arriving on a topic whose codec is neither JSON nor Protobuf is routed to the DLQ with reason `schema_unsupported_codec`.
@@ -525,6 +627,8 @@ The Confluent wire format (magic byte + schema id) and REST API endpoints used b
 
 :::warning
 If you enable registry decoding on the consumer that drains the DLQ (`handle_dead` path), any dead message that cannot be resolved or validated against the registry cannot be delivered to `handle_dead`. Such messages are acked-and-dropped — matching the existing behavior for undecodable dead messages. Operators concerned about this should omit the registry on the DLQ consumer, or set `SchemaEnforcement::Permissive` so subject mismatches do not block delivery.
+
+An unavailable registry stalls the drain the same way it stalls a consumer, instead of dropping the dead message.
 :::
 
 ## Metrics
@@ -546,6 +650,9 @@ The Kafka backend emits `shove_messages_failed_total` with the following `reason
   It is `schema_unsupported_codec` when the topic uses a codec other than JSON or Protobuf.
   It is `schema_message_index_rejected` when the protobuf message index is not the one `require_schema_message_index` pins.
   Routed to DLQ.
+  Requires `kafka-schema-registry`.
+- `schema_unavailable` - the registry could not answer for the record's schema id, so the record is kept and the lookup retried.
+  It is never dead-lettered or discarded, and it counts once per wait.
   Requires `kafka-schema-registry`.
 
 `shove_backend_errors_total` carries the `backend="kafka"` label for connection drops, produce failures, and consume-stream errors.

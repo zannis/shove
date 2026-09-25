@@ -9,7 +9,8 @@
 //!
 //! Run with: `cargo test --features rabbitmq,audit --test rabbitmq_integration`
 
-use lapin::options::BasicPublishOptions;
+use lapin::options::{BasicPublishOptions, QueueDeclareOptions};
+use lapin::types::FieldTable;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
 use shove::handler::MessageHandler;
@@ -6395,4 +6396,258 @@ async fn direct_and_fifo_entry_points_refuse_a_broadcast_start() {
             && msg.contains("RabbitMqConsumer::run_fifo"),
         "the error names the topic, the start and the entry point: {msg}"
     );
+}
+
+define_topic!(
+    ExternalWork,
+    SimpleMessage,
+    TopologyBuilder::new("test-external").external().build()
+);
+
+/// `external()` is refused at `declare` on RabbitMQ, which verifies no
+/// infra-owned queue yet: a `queue.declare` would be the write the flag
+/// promises never to make. The refusal comes before that frame, so a passive
+/// declare on a fresh channel afterwards finds no such queue.
+#[tokio::test]
+async fn declaring_an_external_topology_is_refused_before_any_queue_exists() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+
+    let err = b
+        .topology()
+        .declare::<ExternalWork>()
+        .await
+        .expect_err("external() must be refused on RabbitMQ");
+    let ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("test-external")
+            && msg.contains("external()")
+            && msg.contains("RabbitMQ")
+            && msg.contains("passive"),
+        "the error names the topic, the flag, the backend and the missing step: {msg}"
+    );
+
+    // A passive declare only checks that the queue exists; it fails, and
+    // closes the channel, when it does not.
+    let channel = client.create_channel().await.unwrap();
+    let passive = channel
+        .queue_declare(
+            "test-external".into(),
+            QueueDeclareOptions {
+                passive: true,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await;
+    assert!(
+        passive.is_err(),
+        "the refused declare created no queue, so a passive declare must fail: {passive:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// External topologies: refused at every consume entry point
+// ---------------------------------------------------------------------------
+
+define_topic!(
+    ExternalConsumeWork,
+    SimpleMessage,
+    TopologyBuilder::new("test-external-consume")
+        .external()
+        .dlq()
+        .build()
+);
+
+define_topic!(
+    ExternalConsumeFanout,
+    SimpleMessage,
+    TopologyBuilder::new("test-external-fanout")
+        .external()
+        .broadcast()
+        .build()
+);
+
+/// Counts every delivery and always asks for a `Retry`, the outcome the
+/// router carries by publishing into a hold queue.
+#[derive(Clone)]
+struct ExternalRetryCounter(Arc<AtomicUsize>);
+
+impl MessageHandler<ExternalConsumeWork> for ExternalRetryCounter {
+    type Context = ();
+    async fn handle(&self, _: SimpleMessage, _: MessageMetadata, _: &()) -> Outcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Outcome::Retry
+    }
+}
+
+impl MessageHandler<ExternalConsumeFanout> for ExternalRetryCounter {
+    type Context = ();
+    async fn handle(&self, _: SimpleMessage, _: MessageMetadata, _: &()) -> Outcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Outcome::Retry
+    }
+}
+
+impl BatchMessageHandler<ExternalConsumeWork> for ExternalRetryCounter {
+    type Context = ();
+    async fn handle_batch(
+        &self,
+        messages: Vec<(SimpleMessage, MessageMetadata)>,
+        _: &(),
+    ) -> Outcome {
+        self.0.fetch_add(messages.len(), Ordering::SeqCst);
+        Outcome::Retry
+    }
+}
+
+fn expect_external_refusal(err: ShoveError, queue: &str, entry_point: &str) {
+    let ShoveError::Topology(msg) = err else {
+        panic!("{entry_point}: expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains(queue)
+            && msg.contains("external()")
+            && msg.contains("RabbitMQ")
+            && msg.contains("basic.nack"),
+        "{entry_point}: the error names the topic, the flag, the backend and the missing \
+         primitive: {msg}"
+    );
+}
+
+/// Infra owns the queue here, so nothing goes through `declare`, and the
+/// consumer is the only thing between a `Retry` and a publish into a hold
+/// queue shove never declared. Every entry point refuses the external
+/// topology before its first channel operation, and the queue still holds
+/// the one message infra published.
+#[tokio::test]
+async fn consuming_an_external_topology_is_refused_at_every_entry_point() {
+    const QUEUE: &str = "test-external-consume";
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+
+    let channel = client.create_channel().await.unwrap();
+    channel
+        .queue_declare(
+            QUEUE.into(),
+            QueueDeclareOptions {
+                durable: true,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .expect("infra declares the queue");
+    channel
+        .basic_publish(
+            "".into(),
+            QUEUE.into(),
+            BasicPublishOptions::default(),
+            br#"{"body":"infra"}"#,
+            lapin::BasicProperties::default().with_delivery_mode(2),
+        )
+        .await
+        .expect("infra publishes one message")
+        .await
+        .expect("publish confirmed");
+    let message_count = |channel: &lapin::Channel| {
+        let channel = channel.clone();
+        async move {
+            channel
+                .queue_declare(
+                    QUEUE.into(),
+                    QueueDeclareOptions {
+                        passive: true,
+                        ..QueueDeclareOptions::default()
+                    },
+                    FieldTable::default(),
+                )
+                .await
+                .expect("passive declare")
+                .message_count()
+        }
+    };
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let handler = ExternalRetryCounter(hits.clone());
+
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        RabbitMqConsumer::new(client.clone()).run::<ExternalConsumeWork, _>(
+            handler.clone(),
+            (),
+            ConsumerOptions::<RabbitMqMarker>::new(),
+        ),
+    )
+    .await
+    {
+        Ok(result) => expect_external_refusal(
+            result.expect_err("run must refuse an external topology"),
+            QUEUE,
+            "RabbitMqConsumer::run",
+        ),
+        Err(_) => {
+            let count = message_count(&channel).await;
+            panic!(
+                "run did not refuse the external topology and kept consuming; the infra-owned \
+                 queue holds {count} message(s) after {} deliveries",
+                hits.load(Ordering::SeqCst)
+            );
+        }
+    }
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        RabbitMqConsumer::new(client.clone())
+            .run_dlq::<ExternalConsumeWork, _>(handler.clone(), ()),
+    )
+    .await
+    .expect("the DLQ refusal is synchronous")
+    .expect_err("run_dlq must refuse an external topology");
+    expect_external_refusal(err, QUEUE, "RabbitMqConsumer::run_dlq");
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        b.batch_consumer().run::<ExternalConsumeWork, _>(
+            handler.clone(),
+            (),
+            BatchConsumerOptions::new(),
+        ),
+    )
+    .await
+    .expect("the batch refusal is synchronous")
+    .expect_err("the batch consumer must refuse an external topology");
+    expect_external_refusal(err, QUEUE, "BatchConsumer::run");
+
+    let mut subscriber = b.broadcast_subscriber();
+    let err = subscriber
+        .subscribe::<ExternalConsumeFanout, _>(handler.clone(), ConsumerOptions::new())
+        .expect_err("subscribe must refuse an external topology");
+    expect_external_refusal(
+        err,
+        "test-external-fanout",
+        "BroadcastSubscriber::subscribe",
+    );
+
+    let mut group = b.consumer_group();
+    let factory_hits = hits.clone();
+    let err = group
+        .register::<ExternalConsumeWork, _>(
+            ConsumerGroupConfig::new(RabbitMqConsumerGroupConfig::new(1..=1)),
+            move || ExternalRetryCounter(factory_hits.clone()),
+        )
+        .await
+        .expect_err("register must refuse an external topology");
+    expect_external_refusal(err, QUEUE, "ConsumerGroup::register");
+
+    assert_eq!(
+        message_count(&channel).await,
+        1,
+        "the consumer wrote nothing and consumed nothing from the infra-owned queue"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "no handler ran");
 }

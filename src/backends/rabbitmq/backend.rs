@@ -29,6 +29,7 @@ use crate::error::{Result, ShoveError};
 use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::markers::RabbitMq;
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
+use crate::topology::QueueTopology;
 
 use super::autoscaler::RabbitMqAutoscalerBackend;
 use super::client::{RabbitMqClient, RabbitMqConfig};
@@ -234,6 +235,10 @@ impl BroadcastImpl for RabbitMqConsumer {
             options,
             "an exclusive queue bound to the fanout exchange receives only what is published after the binding",
         )
+    }
+
+    fn refuse_external(topology: &QueueTopology) -> Result<()> {
+        super::consumer::refuse_external(topology)
     }
 }
 
