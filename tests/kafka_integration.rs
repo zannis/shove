@@ -113,6 +113,21 @@ shove::define_topic!(
         .build()
 );
 
+// A topic nobody declares: a publish to it must fail, not create it.
+shove::define_topic!(
+    UndeclaredTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-undeclared").build()
+);
+
+// A topic nobody declares, that a producer with topic auto-creation switched
+// on may create on the first publish.
+shove::define_topic!(
+    AutoCreatedTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-auto-created").build()
+);
+
 shove::define_topic!(
     NoDlqTopic,
     SimpleMessage,
@@ -332,7 +347,13 @@ struct TestBroker {
 
 impl TestBroker {
     async fn start() -> Self {
-        Self::start_image(KafkaContainer::default()).await
+        Self::start_with(|config| config).await
+    }
+
+    /// Start a broker and connect with the default `KafkaConfig` for it,
+    /// passed through `configure` first.
+    async fn start_with(configure: impl FnOnce(KafkaConfig) -> KafkaConfig) -> Self {
+        Self::start_image(KafkaContainer::default(), configure).await
     }
 
     /// A single-broker container that can host a transactional producer.
@@ -349,11 +370,12 @@ impl TestBroker {
             KafkaContainer::default()
                 .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
                 .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1"),
+            |config| config,
         )
         .await
     }
 
-    async fn start_image<I>(image: I) -> Self
+    async fn start_image<I>(image: I, configure: impl FnOnce(KafkaConfig) -> KafkaConfig) -> Self
     where
         I: AsyncRunner<KafkaContainer>,
     {
@@ -367,7 +389,8 @@ impl TestBroker {
             .expect("failed to get Kafka port");
         let bootstrap_servers = format!("127.0.0.1:{port}");
 
-        let client = KafkaClient::connect_with_retry(&KafkaConfig::new(&bootstrap_servers), 10)
+        let config = configure(KafkaConfig::new(&bootstrap_servers));
+        let client = KafkaClient::connect_with_retry(&config, 10)
             .await
             .expect("failed to connect to Kafka");
 
@@ -1344,9 +1367,86 @@ async fn topology_idempotent() {
     broker.close().await;
 }
 
+/// The broker's view of `topic`: `None` when it has no such topic, else the
+/// partition count. Read through a consumer-type client with no `group.id`
+/// and auto-creation disabled, so the probe itself can neither create the
+/// topic nor register a group.
+fn live_partition_count(brokers: &str, topic: &str) -> Option<usize> {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("allow.auto.create.topics", "false")
+        .create()
+        .expect("failed to create metadata probe");
+    let metadata = probe
+        .fetch_metadata(Some(topic), Duration::from_secs(10))
+        .expect("failed to fetch topic metadata");
+    let candidate = metadata.topics().iter().find(|t| t.name() == topic)?;
+    if candidate.error().is_some() || candidate.partitions().is_empty() {
+        return None;
+    }
+    Some(candidate.partitions().len())
+}
+
 // ===========================================================================
 // Basic publish & consume
 // ===========================================================================
+
+/// A publish never creates a topic. The test broker auto-creates topics on
+/// first use, as the Apache image does by default, and a publish to a topic
+/// nobody declared still fails after the produce timeout and leaves the
+/// topic absent.
+#[tokio::test]
+async fn publish_to_an_undeclared_topic_fails_instead_of_creating_it() {
+    const TOPIC: &str = "kafka-undeclared";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let publisher = broker.publisher().await.unwrap();
+
+    let err = publisher
+        .publish::<UndeclaredTopic>(&SimpleMessage {
+            id: "orphan".into(),
+            content: "no topic".into(),
+        })
+        .await
+        .expect_err("a publish must not create the topic it targets");
+    assert!(
+        matches!(err, shove::ShoveError::Connection(_)),
+        "expected Connection, got {err:?}"
+    );
+    assert_eq!(
+        live_partition_count(tb.client().brokers(), TOPIC),
+        None,
+        "the publish must leave the topic absent"
+    );
+    broker.close().await;
+}
+
+/// The switch: with `with_producer_auto_create_topics(true)` the same publish
+/// to a topic nobody declared succeeds on the auto-creating test broker, and
+/// the broker has the topic afterwards.
+#[tokio::test]
+async fn publish_to_an_undeclared_topic_creates_it_when_auto_creation_is_switched_on() {
+    const TOPIC: &str = "kafka-auto-created";
+    let tb = TestBroker::start_with(|config| config.with_producer_auto_create_topics(true)).await;
+    let broker = tb.broker();
+    let publisher = broker.publisher().await.unwrap();
+
+    publisher
+        .publish::<AutoCreatedTopic>(&SimpleMessage {
+            id: "first".into(),
+            content: "creates the topic".into(),
+        })
+        .await
+        .expect("a producer with auto-creation switched on may create the topic it targets");
+    assert!(
+        live_partition_count(tb.client().brokers(), TOPIC)
+            .is_some_and(|partitions| partitions >= 1),
+        "the publish must leave the topic present"
+    );
+    broker.close().await;
+}
 
 #[tokio::test]
 async fn publish_and_consume_simple_message() {
@@ -5859,20 +5959,13 @@ async fn broker_consumer_group_exposes_default_replication_factor() {
     let tb = TestBroker::start().await;
     let broker = tb.broker();
 
-    let publisher = broker.publisher().await.unwrap();
-    publisher
-        .publish::<WorkTopic>(&SimpleMessage {
-            id: "cg-rf-1".into(),
-            content: "x".into(),
-        })
-        .await
-        .unwrap();
-
     let handler = CountingHandler::new();
     let handler_clone = handler.clone();
 
     // with_default_replication_factor is reachable on broker.consumer_group()
-    // and applies to the topology auto-declared by register().
+    // and applies to the topology auto-declared by register(). Register
+    // before the first publish: a publish never creates the topic, so it
+    // exists only once register() has declared it.
     let mut group = broker.consumer_group().with_default_replication_factor(1);
     group
         .register::<WorkTopic, _>(
@@ -5881,6 +5974,15 @@ async fn broker_consumer_group_exposes_default_replication_factor() {
         )
         .await
         .expect("register with a default replication factor should succeed");
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "cg-rf-1".into(),
+            content: "x".into(),
+        })
+        .await
+        .unwrap();
 
     let token = group.cancellation_token();
     let counter = handler.counter.clone();

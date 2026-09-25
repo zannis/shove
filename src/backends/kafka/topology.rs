@@ -72,7 +72,7 @@ pub struct KafkaTopologyDeclarer {
     /// will be `max(default, min_partitions)` so that Kafka can distribute
     /// load across all consumers.
     min_partitions: Option<i32>,
-    /// Replication factor applied to every auto-created topic (main, DLQ).
+    /// Replication factor applied to topics created by declaration (main, DLQ).
     /// `None` keeps the default of `1` (single-broker dev). Production
     /// clusters should set `3` (or whatever quorum the cluster sizes for).
     replication_factor: Option<i32>,
@@ -107,7 +107,7 @@ impl KafkaTopologyDeclarer {
         self
     }
 
-    /// Replication factor for auto-created topics. The default is `1` for
+    /// Replication factor for topics created by declaration. The default is `1` for
     /// single-broker development clusters; **set this to ≥ 3 in production**
     /// or pre-create topics out-of-band (Terraform, MSK console, etc.) —
     /// `create_topic` is idempotent and will not lower an existing topic's

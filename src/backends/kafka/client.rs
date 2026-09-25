@@ -270,6 +270,8 @@ pub struct KafkaConfig {
     pub(crate) producer_compression: Option<KafkaCompression>,
     pub(crate) producer_linger_ms: Option<u32>,
     pub(crate) producer_batch_size: Option<u32>,
+    /// See [`Self::with_producer_auto_create_topics`].
+    pub(crate) producer_auto_create_topics: bool,
 }
 
 impl KafkaConfig {
@@ -285,6 +287,7 @@ impl KafkaConfig {
             producer_compression: None,
             producer_linger_ms: None,
             producer_batch_size: None,
+            producer_auto_create_topics: false,
         }
     }
 
@@ -324,9 +327,27 @@ impl KafkaConfig {
         self
     }
 
-    /// Validate and apply the configured producer knobs to a producer
-    /// `ClientConfig`. Unset knobs are not touched, so an untuned config
-    /// stays byte-identical to librdkafka's defaults.
+    /// Control producer topic auto-creation (`allow.auto.create.topics`).
+    ///
+    /// Defaults to `false`: publishing cannot create a missing topic.
+    /// If the topic stays absent, publishing returns [`ShoveError::Connection`]
+    /// once `message.timeout.ms` elapses.
+    ///
+    /// Set `true` to let the producer request topic creation on first publish.
+    /// The broker must also enable `auto.create.topics.enable=true`.
+    /// Created topics use broker defaults, outside shove's topology config.
+    ///
+    /// This controls the client's shared producer, including consumer retry,
+    /// defer, and DLQ publishes.
+    /// It does not change `declare()` or consumer topic auto-creation settings.
+    /// Consumers keep librdkafka's default, `false`.
+    pub fn with_producer_auto_create_topics(mut self, allow: bool) -> Self {
+        self.producer_auto_create_topics = allow;
+        self
+    }
+
+    /// Validate and apply producer throughput settings to a `ClientConfig`.
+    /// Leave unset throughput properties unchanged.
     fn apply_producer_tuning(&self, cfg: &mut ClientConfig) -> Result<()> {
         if let Some(codec) = self.producer_compression {
             cfg.set("compression.type", codec.as_rdkafka_str());
@@ -397,6 +418,10 @@ impl fmt::Debug for KafkaConfig {
         d.field("producer_compression", &self.producer_compression);
         d.field("producer_linger_ms", &self.producer_linger_ms);
         d.field("producer_batch_size", &self.producer_batch_size);
+        d.field(
+            "producer_auto_create_topics",
+            &self.producer_auto_create_topics,
+        );
         d.finish()
     }
 }
@@ -424,6 +449,35 @@ enum KafkaProducerInner {
     Default(FutureProducer<DefaultClientContext>),
     #[cfg(feature = "kafka-msk-iam")]
     MskIam(FutureProducer<MskIamContext>),
+}
+
+/// The producer's client config: the connection settings of `base`, the
+/// pinned correctness settings, and the tuning `config` opts into.
+///
+/// librdkafka enables producer topic auto-creation by default.
+/// Set the option explicitly to preserve shove's topic ownership policy.
+/// See [`KafkaConfig::with_producer_auto_create_topics`] for the public contract.
+fn producer_config(
+    base: &ClientConfig,
+    client_name: &str,
+    config: &KafkaConfig,
+) -> Result<ClientConfig> {
+    let mut producer_config = base.clone();
+    producer_config
+        .set("client.id", client_name)
+        .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
+        .set("acks", "all")
+        .set("enable.idempotence", "true")
+        .set(
+            "allow.auto.create.topics",
+            if config.producer_auto_create_topics {
+                "true"
+            } else {
+                "false"
+            },
+        );
+    config.apply_producer_tuning(&mut producer_config)?;
+    Ok(producer_config)
 }
 
 impl KafkaClient {
@@ -541,13 +595,7 @@ impl KafkaClient {
         // once into exactly-once-on-the-broker semantics. Requires Kafka
         // ≥ 0.11 (universal today) and caps in-flight requests per
         // connection at 5.
-        let mut producer_config = base_config.clone();
-        producer_config
-            .set("client.id", &client_name)
-            .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
-            .set("acks", "all")
-            .set("enable.idempotence", "true");
-        config.apply_producer_tuning(&mut producer_config)?;
+        let producer_config = producer_config(&base_config, &client_name, config)?;
 
         fn create_default_producer(cfg: &ClientConfig) -> Result<KafkaProducerInner> {
             let p: FutureProducer<DefaultClientContext> = cfg.create().map_err(|e| {
@@ -1418,6 +1466,47 @@ mod tests {
         assert!(rendered.contains("Zstd"));
         assert!(rendered.contains("producer_linger_ms"));
         assert!(rendered.contains("25"));
+        assert!(rendered.contains("producer_auto_create_topics: false"));
+    }
+
+    /// By default the producer never creates the topic it publishes to, and
+    /// the pinned correctness settings travel with that flag.
+    #[test]
+    fn producer_config_never_auto_creates_topics_by_default() {
+        let mut base = ClientConfig::new();
+        base.set("bootstrap.servers", "broker:9092");
+        let cfg = producer_config(&base, "shove-rs-test", &KafkaConfig::new("broker:9092"))
+            .expect("the default tuning is valid");
+        assert_eq!(cfg.get("allow.auto.create.topics"), Some("false"));
+        assert_eq!(cfg.get("enable.idempotence"), Some("true"));
+        assert_eq!(cfg.get("acks"), Some("all"));
+        assert_eq!(cfg.get("client.id"), Some("shove-rs-test"));
+        assert_eq!(cfg.get("bootstrap.servers"), Some("broker:9092"));
+    }
+
+    /// The switch flips only `allow.auto.create.topics`; the pinned
+    /// correctness settings stay.
+    #[test]
+    fn producer_config_auto_creates_topics_when_switched_on() {
+        let mut base = ClientConfig::new();
+        base.set("bootstrap.servers", "broker:9092");
+        let config = KafkaConfig::new("broker:9092").with_producer_auto_create_topics(true);
+        let cfg =
+            producer_config(&base, "shove-rs-test", &config).expect("the default tuning is valid");
+        assert_eq!(cfg.get("allow.auto.create.topics"), Some("true"));
+        assert_eq!(cfg.get("enable.idempotence"), Some("true"));
+        assert_eq!(cfg.get("acks"), Some("all"));
+    }
+
+    /// Passing `false` explicitly is the default, spelled out.
+    #[test]
+    fn producer_config_switched_off_explicitly_matches_the_default() {
+        let mut base = ClientConfig::new();
+        base.set("bootstrap.servers", "broker:9092");
+        let config = KafkaConfig::new("broker:9092").with_producer_auto_create_topics(false);
+        let cfg =
+            producer_config(&base, "shove-rs-test", &config).expect("the default tuning is valid");
+        assert_eq!(cfg.get("allow.auto.create.topics"), Some("false"));
     }
 
     // -- overlay_dynamic_entries: legacy AlterConfigs merge correctness --

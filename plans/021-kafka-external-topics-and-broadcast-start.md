@@ -44,8 +44,9 @@
     Step 6 adds the external topology binding.
     Step 10 retries and defers in place instead of republishing into the topology, on Kafka and on an external NATS stream.
     Step 11 waits through a Schema Registry outage instead of discarding the record.
-  - A fourth pull request, from `feat/kafka-producer-no-auto-create`, pins `allow.auto.create.topics=false` on the Kafka producer.
-    A publish then fails on a topic nobody declared instead of creating it, a breaking change of its own in the same minor release.
+  - A fourth pull request, from `feat/kafka-producer-no-auto-create`, disables producer topic auto-creation by default (`allow.auto.create.topics=false`).
+    Operators can enable it with `KafkaConfig::with_producer_auto_create_topics(true)`; see [Kafka topic provisioning](../docs/pages/backends/kafka.mdx#declare-topology) for requirements.
+    This breaking change belongs to the same minor release.
 
 ## Why this matters
 
@@ -607,9 +608,9 @@ Kafka backend:
   When the topic is absent it returns `ShoveError::Topology` naming the topic, with the fail-fast wording of `src/backends/nats/topology.rs:127-129`.
   It never calls `create_topic`, `ensure_partitions` or `ensure_topic_configs` for the main topic.
 - The verification fetch uses a one-shot consumer-type metadata client with `allow.auto.create.topics=false` set explicitly and no `group.id`, `probe_external_topic_blocking` in `client.rs`.
-  The producer's own client, the one `KafkaClient::ping` uses, pins that flag to `false` as well, in `producer_config`.
-  That pin is delivered by `feat/kafka-producer-no-auto-create` in the same release, and the probe does not rely on it.
-  Without the pin, librdkafka's producer default of true would create the very topic `external()` promises never to create.
+  The producer defaults to `allow.auto.create.topics=false`, and `KafkaConfig::with_producer_auto_create_topics(true)` opts one producer back in.
+  See [Declare topology](../docs/pages/backends/kafka.mdx#declare-topology) for the rule.
+  The probe does not rely on the producer setting: librdkafka's producer default of `true` would create the topic `external()` promises never to create.
   Without a `group.id` there is no coordinator lookup, so the probe needs no group permission under a group-scoped ACL.
   Do not reuse `fetch_topic_partition_count_blocking`, which sets one.
 - The DLQ, when declared, is still created, because shove owns its dead-letter topic in both modes.
