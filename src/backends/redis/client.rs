@@ -369,16 +369,16 @@ impl RedisClient {
         &self.group
     }
 
-    /// Identity of this client's shared inner connection state. Clones of one
-    /// client share it; independently-connected clients (possibly to other
-    /// servers) differ. Used by the maintenance registry to scope its
-    /// per-`(client, stream, group)` deduplication.
     /// The configured trim cadence override, if any
     /// ([`RedisConfig::with_trim_interval`]).
     pub(super) fn trim_interval(&self) -> Option<Duration> {
         self.trim_interval
     }
 
+    /// Identity of this client's shared inner connection state. Clones of one
+    /// client share it; independently-connected clients (possibly to other
+    /// servers) differ. Used by the maintenance registry to scope its
+    /// per-`(client, stream, group)` deduplication.
     pub(super) fn instance_id(&self) -> usize {
         Arc::as_ptr(&self.inner) as usize
     }
