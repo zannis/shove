@@ -25,6 +25,7 @@ use crate::backend::batch_consumer::settling::{
 use crate::backend::batch_consumer::{
     BatchConsumerOptionsInner, BatchSettlement, settle_batch_outcome,
 };
+use crate::backend::broadcast::BROADCAST_DEFER_DELAY;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::{
     extract_dead_metadata, extract_message_metadata, get_retry_count,
@@ -1247,6 +1248,7 @@ impl RabbitMqConsumer {
                             &publisher,
                             retry_count,
                             group.as_deref(),
+                            &options.shutdown,
                         )
                         .await?;
                     }
@@ -1264,6 +1266,7 @@ impl RabbitMqConsumer {
                             &publisher,
                             retry_count,
                             group.as_deref(),
+                            &options.shutdown,
                         )
                         .await?;
                     }
@@ -1314,6 +1317,7 @@ impl RabbitMqConsumer {
                             &publisher,
                             retry_count,
                             group.as_deref(),
+                            &options.shutdown,
                         )
                         .await
                         .ok();
@@ -1521,13 +1525,14 @@ async fn route_outcome_for(
     publisher: &ChannelPublisher,
     retry_count: u32,
     group: Option<&str>,
+    shutdown: &CancellationToken,
 ) -> Result<()> {
     match attachment {
         Attachment::Shared(_) => {
             route_outcome(received, outcome, topology, publisher, retry_count, group).await
         }
         Attachment::Broadcast { .. } => {
-            route_broadcast_outcome(received, outcome, topology, publisher, group).await
+            route_broadcast_outcome(received, outcome, topology, publisher, group, shutdown).await
         }
     }
 }
@@ -1542,16 +1547,19 @@ async fn route_outcome_for(
 /// — matching what `decide_retry` yields on the InMemory path at
 /// `max_retries = 0`, so one dashboard reads both backends.
 ///
-/// `Defer` nack-requeues. That is redelivery to *this subscriber only*, which
-/// is the contract rather than an approximation of it: the queue is exclusive,
-/// so it has exactly one consumer and a requeued message can reach no other
-/// instance's copy of the fan-out.
+/// `Defer` waits [`BROADCAST_DEFER_DELAY`], then nack-requeues. That is
+/// redelivery to *this subscriber only*, which is the contract rather than an
+/// approximation of it: the queue is exclusive, so it has exactly one consumer
+/// and a requeued message can reach no other instance's copy of the fan-out.
+/// The wait holds the single delivery slot, so the requeued message is handed
+/// back before anything queued behind it.
 async fn route_broadcast_outcome(
     received: &ReceivedDelivery,
     outcome: Outcome,
     topology: &'static QueueTopology,
     publisher: &ChannelPublisher,
     group: Option<&str>,
+    shutdown: &CancellationToken,
 ) -> Result<()> {
     let delivery = &received.delivery;
     match outcome {
@@ -1581,7 +1589,13 @@ async fn route_broadcast_outcome(
             )
             .await
         }
-        Outcome::Defer => router::nack_requeue(delivery, publisher).await,
+        Outcome::Defer => {
+            tokio::select! {
+                _ = tokio::time::sleep(BROADCAST_DEFER_DELAY) => {}
+                _ = shutdown.cancelled() => {}
+            }
+            router::nack_requeue(delivery, publisher).await
+        }
     }
 }
 

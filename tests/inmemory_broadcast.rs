@@ -707,6 +707,65 @@ async fn a_deferred_message_is_retried_in_place_before_those_behind_it() {
     );
 }
 
+/// Defers the first sighting of key `1` and acks everything else, recording
+/// when each call started.
+#[derive(Clone, Default)]
+struct DeferFirstTimed {
+    calls: Arc<Mutex<Vec<(u64, tokio::time::Instant)>>>,
+}
+
+impl MessageHandler<CacheInvalidations> for DeferFirstTimed {
+    type Context = ();
+    async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _ctx: &()) -> Outcome {
+        let mut calls = self.calls.lock().expect("calls lock");
+        let first = msg.key == 1 && calls.iter().all(|(k, _)| *k != 1);
+        calls.push((msg.key, tokio::time::Instant::now()));
+        if first { Outcome::Defer } else { Outcome::Ack }
+    }
+}
+
+/// A deferred broadcast message waits the broadcast defer delay before it is
+/// handed back, the same pacing the production backends apply.
+#[tokio::test]
+async fn a_deferred_message_waits_the_defer_delay_before_redelivery() {
+    // Mirrors the crate-private `BROADCAST_DEFER_DELAY`.
+    const DEFER_DELAY: Duration = Duration::from_secs(1);
+
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    let publisher = broker.publisher().await.expect("publisher");
+
+    let handler = DeferFirstTimed::default();
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<CacheInvalidations, _>(handler.clone(), ConsumerOptions::new())
+        .expect("subscribe");
+    wait_for_subscribers(&client, "cache-invalidations-bcast", 1).await;
+
+    publisher
+        .publish::<CacheInvalidations>(&Invalidate { key: 1 })
+        .await
+        .expect("publish");
+
+    let calls = Arc::clone(&handler.calls);
+    wait_until("the deferred message is redelivered", || {
+        calls.lock().expect("calls lock").len() == 2
+    })
+    .await;
+
+    subscriber.cancellation_token().cancel();
+    let _ = subscriber
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(2))
+        .await;
+
+    let calls = handler.calls.lock().expect("calls lock").clone();
+    let gap = calls[1].1.duration_since(calls[0].1);
+    assert!(
+        gap >= DEFER_DELAY,
+        "a deferred broadcast message was redelivered after {gap:?}, before the {DEFER_DELAY:?} defer delay"
+    );
+}
+
 /// AC8 at the wire level rather than the name level: an ordinary topology still
 /// behaves exactly as it did, on the same broker, alongside broadcast traffic.
 #[tokio::test]
