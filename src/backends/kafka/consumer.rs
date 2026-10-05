@@ -404,16 +404,78 @@ impl PartitionTracker {
     }
 }
 
+/// The revoke token of every partition the receive loop's tracker has seeded
+/// under its current assignment, shared between the tracker and the
+/// rebalance callback. `OffsetTracker::track_received` creates the token when
+/// it seeds the partition and hands a clone to the handler task, whose
+/// in-place wait selects on it. `RebalanceContext::pre_rebalance` cancels and
+/// removes the token on `Revoke`, synchronously, inside the `recv()` poll that
+/// reported the revoke: with one permit, held by an in-place wait, the loop
+/// is parked in `acquire_permit_while_polling` on a paused assignment and
+/// drains no rebalance events until that wait ends, so the callback is the
+/// one place a revoke can reach the wait from. `OffsetTracker::remove`
+/// cancels as a backstop when the loop drains the event. The mutex is held
+/// for a map operation only, never across an await. Loops that keep no
+/// tracker pass `create_stream_consumer` a map nothing reads.
+type AssignmentTokens = Arc<std::sync::Mutex<HashMap<i32, CancellationToken>>>;
+
+/// Cancel and forget the tokens of `partitions`, so every in-place wait on
+/// them ends with `InPlaceEnd::Revoked`. The lock is released before the
+/// tokens are cancelled.
+fn cancel_assignments(assignments: &AssignmentTokens, partitions: &[i32]) {
+    let revoked: Vec<CancellationToken> = {
+        let mut map = assignments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        partitions
+            .iter()
+            .filter_map(|partition| map.remove(partition))
+            .collect()
+    };
+    for token in revoked {
+        token.cancel();
+    }
+}
+
+/// The assignment a delivery was tracked under: the epoch its completion
+/// carries, which `OffsetTracker::mark_complete` checks against the
+/// partition's current one, and the token a revoke of the partition cancels.
+#[derive(Clone)]
+struct Assignment {
+    epoch: u64,
+    revoked: CancellationToken,
+}
+
 struct OffsetTracker {
     topic: String,
     partitions: HashMap<i32, PartitionTracker>,
+    /// How many assignments of each partition this tracker has seeded, which
+    /// is the epoch of the partition's current one. Only equality between a
+    /// completion's epoch and the current one matters, so the count wraps.
+    /// Never pruned: the count has to outlive the partition's tracker entry,
+    /// or a revoke and a reassign would mint the epoch the old delivery's
+    /// completion still carries.
+    epochs: HashMap<i32, u64>,
+    assignments: AssignmentTokens,
 }
 
 impl OffsetTracker {
+    /// A tracker with a token map of its own, which nothing cancels in. The
+    /// receive loop builds its tracker with `with_assignments`; this is for
+    /// the unit tests below.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(topic: String) -> Self {
+        Self::with_assignments(topic, AssignmentTokens::default())
+    }
+
+    /// A tracker whose revoke tokens live in `assignments`, the map the
+    /// consumer's rebalance callback cancels in; see `AssignmentTokens`.
+    fn with_assignments(topic: String, assignments: AssignmentTokens) -> Self {
         Self {
             topic,
             partitions: HashMap::new(),
+            epochs: HashMap::new(),
+            assignments,
         }
     }
 
@@ -421,26 +483,56 @@ impl OffsetTracker {
     /// under this assignment, and marks every later offset in flight so the
     /// commit position follows what was actually delivered. An offset below
     /// the partition's committed position is not marked, see
-    /// `PartitionTracker::track_received`.
-    fn track_received(&mut self, partition: i32, offset: i64) {
-        self.partitions
+    /// `PartitionTracker::track_received`. Returns the assignment the
+    /// delivery belongs to: the seed begins a new epoch for the partition
+    /// and gives it a fresh revoke token.
+    fn track_received(&mut self, partition: i32, offset: i64) -> Assignment {
+        let seeded = match self.partitions.get_mut(&partition) {
+            Some(tracker) => {
+                tracker.track_received(offset);
+                false
+            }
+            None => {
+                self.partitions
+                    .insert(partition, PartitionTracker::new(offset));
+                true
+            }
+        };
+        let epoch = self.epochs.entry(partition).or_insert(0);
+        if seeded {
+            *epoch = epoch.wrapping_add(1);
+        }
+        let epoch = *epoch;
+        let revoked = self
+            .assignments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(partition)
-            .and_modify(|tracker| tracker.track_received(offset))
-            .or_insert_with(|| PartitionTracker::new(offset));
+            .or_default()
+            .clone();
+        Assignment { epoch, revoked }
     }
 
     fn mark_complete(&mut self, completion: Completion) {
         let Completion {
             partition,
             offset,
+            epoch,
             discard,
         } = completion;
         match self.partitions.get_mut(&partition) {
-            Some(tracker) => tracker.mark_complete(offset, discard),
+            // A completion from the partition's current assignment, the one
+            // its delivery was tracked under.
+            Some(tracker) if self.epochs.get(&partition) == Some(&epoch) => {
+                tracker.mark_complete(offset, discard)
+            }
             // The partition was revoked while this delivery was in flight, so
             // this member will never commit the offset and whoever owns the
-            // partition now will redeliver the message.
-            None => {
+            // partition now will redeliver the message. Or the partition came
+            // back since and this completion is an earlier assignment's: the
+            // current assignment's delivery of the same offset is in flight
+            // and stays so until its own handler finishes.
+            _ => {
                 if let Some(discard) = discard {
                     discard.survived();
                 }
@@ -461,6 +553,9 @@ impl OffsetTracker {
     /// stalling commits on the partition forever.
     fn remove(&mut self, partition: i32) {
         self.partitions.remove(&partition);
+        // The backstop for the rebalance callback's cancel: an in-place wait
+        // on an assignment that is over ends here at the latest.
+        cancel_assignments(&self.assignments, &[partition]);
     }
 
     /// Flags a partition to re-offer its current commit position on the next
@@ -829,12 +924,18 @@ async fn publish_to_dlq(
 /// `None` selects the FIFO path: no async signaling, [`route_outcome`]
 /// instead awaits the republish inline and returns whether the caller may
 /// proceed with `consumer.commit_message`.
-type CompletionHandle = Option<(mpsc::Sender<Completion>, i32, i64)>;
+type CompletionHandle = Option<(mpsc::Sender<Completion>, i32, i64, u64)>;
 
 /// A finished delivery handed back to the offset tracker.
 struct Completion {
     partition: i32,
     offset: i64,
+    /// The epoch of the assignment the delivery was tracked under, see
+    /// `OffsetTracker::track_received`. A completion from an earlier
+    /// assignment of the partition is ignored, so a handler that finishes
+    /// after its partition moved away and came back cannot complete the
+    /// current assignment's delivery of the same offset.
+    epoch: u64,
     /// Discard accounting that must not be counted until this offset is
     /// actually committed, so it rides along with the offset it depends on.
     /// See [`PartitionTracker::pending_discards`].
@@ -851,11 +952,21 @@ impl Completion {
     /// `OffsetTracker`/`PartitionTracker` unit tests below, which need a
     /// completion carrying no discard without reaching for `signal_completion`
     /// itself.
+    ///
+    /// The epoch is the one a fresh tracker gives a partition's first
+    /// assignment, 1, which is what those tests seed; `under` names another.
     #[cfg_attr(not(test), allow(dead_code))]
     fn plain(partition: i32, offset: i64) -> Self {
+        Self::under(1, partition, offset)
+    }
+
+    /// `plain` under an explicit assignment epoch.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn under(epoch: u64, partition: i32, offset: i64) -> Self {
         Self {
             partition,
             offset,
+            epoch,
             discard: None,
         }
     }
@@ -890,7 +1001,7 @@ fn signal_completion(
     // No tracker attached (the FIFO path commits inline): nothing to signal,
     // and nothing holding the delivery back either. FIFO settles its own
     // accounting on the synchronous commit, so it never hands one in here.
-    let Some((tx, partition, offset)) = handle else {
+    let Some((tx, partition, offset, epoch)) = handle else {
         debug_assert!(
             discard.is_none(),
             "FIFO settles terminal accounting on its own commit"
@@ -903,6 +1014,7 @@ fn signal_completion(
     if let Err(e) = tx.try_send(Completion {
         partition,
         offset,
+        epoch,
         discard,
     }) {
         #[cfg(feature = "test-support")]
@@ -987,6 +1099,57 @@ pub mod put_back_probe {
     }
 }
 
+/// Test-only probe (see the `test-support` feature) on the two waits for a
+/// permit: `acquire_permit_while_polling` on the receive loop, and the slot
+/// wait of the broadcast loop. Two counters count the records each loop has
+/// held while it waited, the ones handed a free permit at once included, so
+/// a test that must have a record in that wait before it goes on, as the
+/// stop tests do, reads them instead of sleeping. One hook runs once, in the
+/// instant either loop has a permit in hand and before it reads the stop and
+/// the record's assignment again (see `after_wait`): the one way a test can
+/// land a stop inside that window on cue, which no order of broker events
+/// reaches on its own. nextest runs each test in its own process, so the
+/// counters start at zero and the hook starts empty.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod permit_wait_probe {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub static ENTERED: AtomicUsize = AtomicUsize::new(0);
+    pub static BROADCAST_ENTERED: AtomicUsize = AtomicUsize::new(0);
+    static ON_ACQUIRED: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+    /// Records the receive loop held for a permit so far.
+    pub fn entered() -> usize {
+        ENTERED.load(Ordering::SeqCst)
+    }
+
+    /// Records the broadcast loop held for its slot so far.
+    pub fn broadcast_entered() -> usize {
+        BROADCAST_ENTERED.load(Ordering::SeqCst)
+    }
+
+    /// Install `hook` to run once, the next time a loop has a permit in
+    /// hand for a record and has not yet read the stop again.
+    pub fn on_acquired(hook: impl FnOnce() + Send + 'static) {
+        *ON_ACQUIRED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    /// Runs the installed hook, if any, and uninstalls it.
+    pub(super) fn acquired() {
+        let hook = ON_ACQUIRED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 /// Runs a decode until it answers or `shutdown` fires, whichever comes
 /// first. `None` means shutdown fired.
 ///
@@ -1055,7 +1218,13 @@ impl RegistryStall {
     /// fired during the wait. A fault a handler task reports over `fault_rx`
     /// meanwhile ends the wait with that error: the loop's own fault arm sits
     /// in a `select!` this wait is nested inside, and an outage has no time
-    /// bound, so the wait must read the channel itself.
+    /// bound, so the wait must read the channel itself. The retry is read
+    /// last: a rebalance event librdkafka has queued is applied by the
+    /// `recv()` poll, inside which a revoke of the stalled record's partition
+    /// cancels the record's assignment token, and the concurrent loop reads
+    /// that token before it retries the decode, see `after_wait`. An
+    /// unbiased pick could take the retry first and leave the event for a
+    /// later poll.
     #[allow(clippy::too_many_arguments)]
     async fn wait(
         &mut self,
@@ -1088,7 +1257,8 @@ impl RegistryStall {
         tokio::pin!(fault);
         loop {
             tokio::select! {
-                _ = &mut retry => return Ok(true),
+                // Read in this order, the retry last; see the doc above.
+                biased;
                 _ = shutdown.cancelled() => return Ok(false),
                 e = &mut fault => return Err(e),
                 received = consumer.recv() => {
@@ -1115,6 +1285,7 @@ impl RegistryStall {
                         "record from a partition assigned during a schema registry wait put back; pause widened"
                     );
                 }
+                _ = &mut retry => return Ok(true),
             }
         }
     }
@@ -1142,6 +1313,11 @@ enum Staged<M> {
     /// Shutdown fired during a registry wait. The record is untouched and
     /// uncommitted; the loop's shutdown arm takes over.
     Stop,
+    /// The record's partition was revoked during a registry wait, which only
+    /// the concurrent loop can tell, through the record's assignment token.
+    /// The record is untouched and left to the partition's next owner; the
+    /// loop's next pass drains the revoke.
+    Revoked,
 }
 
 /// Count and settle a message dropped before the handler on the concurrent
@@ -1164,6 +1340,7 @@ async fn discard_pre_handler(
     completion_tx: &mpsc::Sender<Completion>,
     partition: i32,
     offset: i64,
+    epoch: u64,
 ) {
     let has_dlq = topology.dlq().is_some();
     let pending = metrics::record_terminal(topic, group, fail_reason, has_dlq);
@@ -1198,7 +1375,7 @@ async fn discard_pre_handler(
         }
     };
     signal_completion(
-        Some((completion_tx.clone(), partition, offset)),
+        Some((completion_tx.clone(), partition, offset, epoch)),
         topic,
         discard,
     );
@@ -1648,6 +1825,10 @@ enum InPlaceEnd {
     /// Shutdown fired during a wait. Nothing was completed, so the record is
     /// redelivered on restart.
     Cancelled,
+    /// The record's partition was revoked during a wait. Nothing was
+    /// completed: the partition's next owner, or this member under a fresh
+    /// assignment, is handed the record again from the committed offset.
+    Revoked,
     /// The schema registry answered with a deployment fault while the record
     /// was being decoded again. Nothing is completed: the record stays
     /// uncommitted, and the task reports the fault over the receive loop's
@@ -1687,7 +1868,18 @@ impl<'a> InPlaceWait<'a> {
 
 impl Drop for InPlaceWait<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        // Underflow-checking: every count has exactly one uncount, so a zero
+        // here is a broken invariant. It is reported, not wrapped round to
+        // `usize::MAX`, which would read as waiting handlers for good and
+        // pause the assignment. Reported only: this runs on every in-place
+        // exit path, and a runtime path never panics, in a debug build too.
+        if self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_err()
+        {
+            tracing::error!("in-place waiter count underflow: a wait ended that was never counted");
+        }
     }
 }
 
@@ -1705,7 +1897,12 @@ impl Drop for InPlaceWait<'_> {
 /// decision leaves this loop, so `route_outcome` then runs its Ack or DLQ arm
 /// and never a Hold arm. Every wait selects on `shutdown`, as
 /// `run_delayed_republish` does: a cancelled wait completes nothing and the
-/// record is redelivered on restart.
+/// record is redelivered on restart. Every wait selects on `revoked` too, the
+/// token of the record's partition assignment (see `AssignmentTokens`): a
+/// revoke ends the wait as `InPlaceEnd::Revoked`, nothing completed, and the
+/// partition's next owner is handed the record from the committed offset.
+/// Without it the old owner held its permit for the whole delay and then
+/// handled the record again, beside the new owner.
 #[allow(clippy::too_many_arguments)]
 async fn redeliver_in_place<T, H>(
     handler: &Arc<H>,
@@ -1723,6 +1920,7 @@ async fn redeliver_in_place<T, H>(
     topic: &str,
     group: Option<&str>,
     shutdown: &CancellationToken,
+    revoked: &CancellationToken,
     waiters: &AtomicUsize,
 ) -> InPlaceEnd
 where
@@ -1747,7 +1945,10 @@ where
         let message = {
             let _waiting = InPlaceWait::begin(waiters);
             tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
+                // The stop and the revoke are read before the sleep: a
+                // sleep that won a tie cost one more pass before the next
+                // check read the token.
+                biased;
                 _ = shutdown.cancelled() => {
                     tracing::debug!(
                         queue = topic,
@@ -1756,22 +1957,54 @@ where
                     );
                     return InPlaceEnd::Cancelled;
                 }
+                _ = revoked.cancelled() => {
+                    tracing::debug!(
+                        queue = topic,
+                        partition = coordinates.partition,
+                        offset = coordinates.offset,
+                        "partition revoked during an in-place wait; the record is left to its next owner"
+                    );
+                    return InPlaceEnd::Revoked;
+                }
+                _ = tokio::time::sleep(delay) => {}
             }
             if increment {
-                attempts += 1;
+                attempts = attempts.saturating_add(1);
             }
             // Loops only through the registry wait arm, which the
             // `kafka-schema-registry` feature adds.
             #[allow(clippy::never_loop)]
             loop {
-                let Some(decoded) =
-                    decode_or_shutdown(decode_batch_message::<T>(decode, payload), shutdown).await
-                else {
+                let decoded = tokio::select! {
+                    biased;
+                    _ = revoked.cancelled() => return InPlaceEnd::Revoked,
+                    decoded = decode_or_shutdown(
+                        decode_batch_message::<T>(decode, payload),
+                        shutdown,
+                    ) => decoded,
+                };
+                let Some(decoded) = decoded else {
                     return InPlaceEnd::Cancelled;
                 };
                 match decoded {
                     BatchDecode::Decoded(m) => break m,
                     BatchDecode::Dlq { reason, fail } => {
+                        // The decode's own poll can complete in the instant a
+                        // revoke lands, after the select around it read the
+                        // token. Read it again before the bytes are condemned:
+                        // on `Undecodable` the caller publishes a dead letter
+                        // from this member, and the partition's next owner
+                        // would publish a second one for the same bytes.
+                        if revoked.is_cancelled() {
+                            tracing::debug!(
+                                queue = topic,
+                                partition = coordinates.partition,
+                                offset = coordinates.offset,
+                                "partition revoked during an in-place redelivery's decode; \
+                                 the record is left to its next owner"
+                            );
+                            return InPlaceEnd::Revoked;
+                        }
                         return InPlaceEnd::Undecodable {
                             reason,
                             fail,
@@ -1795,8 +2028,10 @@ where
                             metrics::FailReason::SchemaUnavailable,
                         );
                         tokio::select! {
-                            _ = tokio::time::sleep(REGISTRY_RETRY_DELAY) => {}
+                            biased;
                             _ = shutdown.cancelled() => return InPlaceEnd::Cancelled,
+                            _ = revoked.cancelled() => return InPlaceEnd::Revoked,
+                            _ = tokio::time::sleep(REGISTRY_RETRY_DELAY) => {}
                         }
                     }
                     #[cfg(feature = "kafka-schema-registry")]
@@ -1804,6 +2039,14 @@ where
                 }
             }
         };
+        // The decode's own poll can complete in the instant a revoke lands,
+        // after the select around it read the token: read it once more
+        // before the handler runs, or the record would be handled on the
+        // old owner beside the new one. The `Dlq` arm above makes the same
+        // read before the bytes are dead-lettered.
+        if revoked.is_cancelled() {
+            return InPlaceEnd::Revoked;
+        }
         let mut metadata = build_message_metadata(headers, true, coordinates);
         metadata.retry_count = attempts;
         let handler = Arc::clone(handler);
@@ -2071,6 +2314,9 @@ pub(super) struct RebalanceContext<C: ClientContext> {
     /// assignment change happened on in the logs.
     client_id: String,
     tx: std_mpsc::Sender<RebalanceEvent>,
+    /// The revoke tokens of the receive loop's tracker, cancelled on
+    /// `Revoke`; see `AssignmentTokens`.
+    assignments: AssignmentTokens,
 }
 
 impl<C: ClientContext> RebalanceContext<C> {
@@ -2148,6 +2394,13 @@ impl<C: ClientContext> ConsumerContext for RebalanceContext<C> {
                     ?partitions,
                     "rebalance: partitions revoked"
                 );
+                // Ends every in-place wait on these partitions now, inside
+                // the poll that reported the revoke, rather than when the
+                // receive loop next drains its events: with one permit held
+                // by such a wait the loop is parked in
+                // `acquire_permit_while_polling` and drains nothing until the
+                // wait ends. See `AssignmentTokens`.
+                cancel_assignments(&self.assignments, &partitions);
                 RebalanceEvent::Revoke(partitions)
             }
             Rebalance::Error(e) => {
@@ -2564,6 +2817,7 @@ fn registry_lookup_bound(max_poll_interval_ms: u32) -> Duration {
     Duration::from_millis(u64::from(max_poll_interval_ms) / 3).max(Duration::from_secs(1))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_stream_consumer(
     mut base: ClientConfig,
     group_id: &str,
@@ -2571,6 +2825,7 @@ fn create_stream_consumer(
     max_poll_interval_ms: u32,
     topic: &str,
     rebalance_tx: std_mpsc::Sender<RebalanceEvent>,
+    assignments: AssignmentTokens,
     #[cfg(feature = "kafka-msk-iam")] msk_context: Option<MskIamContext>,
 ) -> Result<KafkaStreamConsumer> {
     // Each consumer task within a group gets a distinct `client.id` so
@@ -2602,6 +2857,7 @@ fn create_stream_consumer(
             topic: topic.to_string(),
             client_id,
             tx: rebalance_tx,
+            assignments,
         };
         let consumer: StreamConsumer<RebalanceContext<MskIamContext>> = base
             .create_with_context(ctx)
@@ -2614,6 +2870,7 @@ fn create_stream_consumer(
         topic: topic.to_string(),
         client_id,
         tx: rebalance_tx,
+        assignments,
     };
     let consumer: StreamConsumer<RebalanceContext<DefaultClientContext>> = base
         .create_with_context(ctx)
@@ -3997,6 +4254,39 @@ fn put_back(
     settle_put_back_seek(queue, partition, offset, errors, still_assigned.as_ref())
 }
 
+/// What the receive loop does with a record it holds once a wait it polled
+/// `recv()` through has ended: the wait for a prefetch permit, or a schema
+/// registry stall. The stop and the record's assignment are read again then,
+/// with the wait over, because either can have moved during it and the
+/// record must not reach a handler after that. A stop from another thread
+/// can land between the wait's poll of the token and its poll of the permit,
+/// and the permit it then frees, from a cancelled in-place wait, is the one
+/// just taken. A revoke of the record's partition is applied inside the
+/// `recv()` poll, which cancels the token, and the record is the next
+/// owner's. `revoked` is `None` on the broadcast loop, which has no
+/// assignment to lose.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterWait {
+    /// Neither moved: the record goes on to its handler.
+    Dispatch,
+    /// Shutdown fired. The record is left uncommitted for the restart, which
+    /// delivers it behind the record that was waiting.
+    Stop,
+    /// The record's partition was revoked. The record is left to its next
+    /// owner, which is handed it from the committed offset.
+    Revoked,
+}
+
+fn after_wait(shutdown: &CancellationToken, revoked: Option<&CancellationToken>) -> AfterWait {
+    if shutdown.is_cancelled() {
+        AfterWait::Stop
+    } else if revoked.is_some_and(CancellationToken::is_cancelled) {
+        AfterWait::Revoked
+    } else {
+        AfterWait::Dispatch
+    }
+}
+
 /// The fault a handler task reported over the receive loop's channel, or a
 /// future that never resolves: a loop without such a channel passes `None`,
 /// and a channel whose senders are all gone has nothing more to report.
@@ -4023,10 +4313,12 @@ async fn handler_fault(rx: Option<&mut mpsc::Receiver<ShoveError>>) -> ShoveErro
 /// yields meanwhile comes from a partition that is not paused; it is put back
 /// (see [`put_back`]) and the assignment is paused, so it arrives again, in
 /// order, once a permit frees and the loop resumes. `Ok(None)` means shutdown
-/// fired first. A fault a handler task reports over `fault_rx` meanwhile ends
-/// the wait with that error, for the reason `RegistryStall::wait` gives: the
-/// loop's fault arm is not polled while this wait runs, and a permit may
-/// never free if the holder is the task that faulted.
+/// fired first: it is read before the permit, and the caller reads it once
+/// more with the permit in hand, see the receive arm. A fault a handler task
+/// reports over `fault_rx` meanwhile ends the wait with that error, for the
+/// reason `RegistryStall::wait` gives: the loop's fault arm is not polled
+/// while this wait runs, and a permit may never free if the holder is the
+/// task that faulted.
 async fn acquire_permit_while_polling(
     semaphore: &Arc<tokio::sync::Semaphore>,
     consumer: &KafkaStreamConsumer,
@@ -4035,15 +4327,20 @@ async fn acquire_permit_while_polling(
     queue: &str,
     paused: &mut bool,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    #[cfg(feature = "test-support")]
+    permit_wait_probe::ENTERED.fetch_add(1, Ordering::SeqCst);
     let fault = handler_fault(fault_rx);
     tokio::pin!(fault);
     loop {
         tokio::select! {
             biased;
-            // The fault is read before the permit: a task that reports one
-            // ends and frees its permit in the same instant, and taking that
-            // permit first would hand the record in hand to a handler on a
-            // consumer that is about to return.
+            // Shutdown and the fault are read before the permit. An in-place
+            // wait that either one ends frees its permit in the same
+            // instant, and taking that permit first would hand the record in
+            // hand to a handler on a consumer that is about to return:
+            // handled ahead of the record that was waiting, and handled
+            // again after the restart.
+            _ = shutdown.cancelled() => return Ok(None),
             e = &mut fault => return Err(e),
             permit = semaphore.clone().acquire_owned() => {
                 let permit = permit.map_err(|_| {
@@ -4051,7 +4348,6 @@ async fn acquire_permit_while_polling(
                 })?;
                 return Ok(Some(permit));
             }
-            _ = shutdown.cancelled() => return Ok(None),
             received = consumer.recv() => {
                 let msg = received.map_err(|e| {
                     tracing::error!(error = %e, queue, "consumer recv error");
@@ -4311,6 +4607,9 @@ impl KafkaConsumer {
                 // OffsetTracker below: rebalance events from a torn-down
                 // consumer must not leak into the next connection's tracker.
                 let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
+                // The map the rebalance callback cancels revoked partitions'
+                // tokens in; the tracker below shares it. See `AssignmentTokens`.
+                let assignments = AssignmentTokens::default();
                 let consumer = create_stream_consumer(
                     client.base_config(),
                     &group_id,
@@ -4318,6 +4617,7 @@ impl KafkaConsumer {
                     max_poll_interval_ms,
                     queue,
                     rebalance_tx,
+                    assignments.clone(),
                     #[cfg(feature = "kafka-msk-iam")]
                     client.msk_context(),
                 )?;
@@ -4330,7 +4630,7 @@ impl KafkaConsumer {
                 // completions arrive via completion_tx/_rx. Drop the Mutex so the loop
                 // owns the tracker directly — saves two async-lock acquisitions per
                 // message (drain at top + track_received in the message branch).
-                let mut tracker = OffsetTracker::new(queue_owned.clone());
+                let mut tracker = OffsetTracker::with_assignments(queue_owned.clone(), assignments);
                 let consumer = Arc::new(consumer);
                 // One slot per sender that can hold a completion while this
                 // loop is not draining. The `prefetch_count` permit holders
@@ -4501,6 +4801,14 @@ impl KafkaConsumer {
                     }
 
                     tokio::select! {
+                        // Read in this order, the stop first. A permit the
+                        // stop itself freed, from a cancelled in-place wait,
+                        // readies the resume arm below in the same instant,
+                        // and an unbiased pick could take it, and on the
+                        // next pass the record behind the waiting one, before
+                        // the stop is seen. A record `recv()` has ready is
+                        // read last for the same reason.
+                        biased;
                         _ = shutdown.cancelled() => {
                             tracing::info!(queue, "shutdown signal received, draining in-flight tasks");
                             // A spare permit would otherwise deadlock the drain below.
@@ -4681,7 +4989,7 @@ impl KafkaConsumer {
                                 );
                                 continue;
                             }
-                            tracker.track_received(partition, offset);
+                            let assignment = tracker.track_received(partition, offset);
 
                             metrics::record_message_size(&topic, group.as_deref(), payload_slice.len());
 
@@ -4705,6 +5013,7 @@ impl KafkaConsumer {
                                     &completion_tx,
                                     partition,
                                     offset,
+                                    assignment.epoch,
                                 )
                                 .await;
                                 continue;
@@ -4754,6 +5063,16 @@ impl KafkaConsumer {
                                                     {
                                                         break Staged::Stop;
                                                     }
+                                                    // The wait polled `recv()`, inside which a
+                                                    // revoke of this record's partition cancels
+                                                    // its token: read before the decode is
+                                                    // retried, or the record would reach the
+                                                    // handler as the old owner's.
+                                                    match after_wait(&shutdown, Some(&assignment.revoked)) {
+                                                        AfterWait::Dispatch => {}
+                                                        AfterWait::Stop => break Staged::Stop,
+                                                        AfterWait::Revoked => break Staged::Revoked,
+                                                    }
                                                 }
                                                 // A deployment fault, not an outage: stop
                                                 // instead of waiting on it.
@@ -4802,6 +5121,7 @@ impl KafkaConsumer {
                                             &completion_tx,
                                             partition,
                                             offset,
+                                            assignment.epoch,
                                         )
                                         .await;
                                         continue;
@@ -4810,6 +5130,18 @@ impl KafkaConsumer {
                                     // `shutdown.cancelled()` arm drains and commits
                                     // the rest on its next pass.
                                     Staged::Stop => continue,
+                                    // Untouched here too: the partition's next
+                                    // owner is handed the record, and the next
+                                    // pass drains the revoke.
+                                    Staged::Revoked => {
+                                        tracing::debug!(
+                                            queue,
+                                            partition,
+                                            offset,
+                                            "partition revoked during a schema registry wait; the record is left to its next owner"
+                                        );
+                                        continue;
+                                    }
                                 }
                             } else {
                                 match <T::Codec as crate::Codec<T::Message>>::decode(payload_slice) {
@@ -4833,6 +5165,7 @@ impl KafkaConsumer {
                                             &completion_tx,
                                             partition,
                                             offset,
+                                            assignment.epoch,
                                         )
                                         .await;
                                         continue;
@@ -4866,6 +5199,7 @@ impl KafkaConsumer {
                                         &completion_tx,
                                         partition,
                                         offset,
+                                        assignment.epoch,
                                     )
                                     .await;
                                     continue;
@@ -4911,6 +5245,45 @@ impl KafkaConsumer {
                                     ShoveError::Connection("semaphore closed".to_string())
                                 })?,
                             };
+                            #[cfg(feature = "test-support")]
+                            permit_wait_probe::acquired();
+                            // Read again with the permit in hand, see
+                            // `after_wait`. A record left here is tracked and
+                            // never completed, so the position stays below it:
+                            // a restart delivers it behind the record that
+                            // was waiting, and the partition's next owner is
+                            // handed it from the committed offset.
+                            match after_wait(&shutdown, Some(&assignment.revoked)) {
+                                AfterWait::Dispatch => {}
+                                AfterWait::Stop => {
+                                    drop(permit);
+                                    tracing::debug!(
+                                        queue,
+                                        partition,
+                                        offset,
+                                        "shutdown fired while this record waited for a permit; left uncommitted for the restart"
+                                    );
+                                    continue;
+                                }
+                                // The tracker entry goes with the queued
+                                // revoke event on the next pass. The busy flag
+                                // is cleared here when no task holds a permit:
+                                // the ended wait's task cleared it only if its
+                                // permit was still free when it looked.
+                                AfterWait::Revoked => {
+                                    drop(permit);
+                                    if semaphore.available_permits() == prefetch_count as usize {
+                                        processing.store(false, Ordering::Release);
+                                    }
+                                    tracing::debug!(
+                                        queue,
+                                        partition,
+                                        offset,
+                                        "partition revoked while this record waited for a permit; left to its next owner"
+                                    );
+                                    continue;
+                                }
+                            }
 
                             let task_client = client.clone();
                             let task_processing = processing.clone();
@@ -4992,6 +5365,7 @@ impl KafkaConsumer {
                                         &task_topic,
                                         task_group.as_deref(),
                                         &task_shutdown,
+                                        &assignment.revoked,
                                         &task_waiters,
                                     )
                                     .await
@@ -5021,6 +5395,7 @@ impl KafkaConsumer {
                                                 &task_tx,
                                                 partition,
                                                 offset,
+                                                assignment.epoch,
                                             )
                                             .await;
                                             drop(permit);
@@ -5036,6 +5411,18 @@ impl KafkaConsumer {
                                             // clears the busy flag itself once the
                                             // drain proves every task has ended.
                                             drop(permit);
+                                            return;
+                                        }
+                                        InPlaceEnd::Revoked => {
+                                            // Nothing is completed: the partition's
+                                            // next owner is handed the record from
+                                            // the committed offset. The loop runs on,
+                                            // so the busy flag is cleared here when no
+                                            // other task holds a permit.
+                                            drop(permit);
+                                            if task_semaphore.available_permits() == task_prefetch as usize {
+                                                task_processing.store(false, Ordering::Release);
+                                            }
                                             return;
                                         }
                                         #[cfg(feature = "kafka-schema-registry")]
@@ -5086,7 +5473,7 @@ impl KafkaConsumer {
                                     max_retries,
                                     hold_queues,
                                     Some(permit),
-                                    Some((task_tx, partition, offset)),
+                                    Some((task_tx, partition, offset, assignment.epoch)),
                                     task_shutdown,
                                 )
                                 .await;
@@ -5319,6 +5706,7 @@ impl KafkaConsumer {
                     MAX_POLL_INTERVAL_MS,
                     queue,
                     rebalance_tx,
+                    AssignmentTokens::default(),
                     #[cfg(feature = "kafka-msk-iam")]
                     client.msk_context(),
                 )?);
@@ -5819,6 +6207,7 @@ impl KafkaConsumer {
                         max_poll_interval_ms,
                         queue.as_str(),
                         rebalance_tx,
+                        AssignmentTokens::default(),
                         #[cfg(feature = "kafka-msk-iam")]
                         client.msk_context(),
                     )?;
@@ -6080,7 +6469,7 @@ impl KafkaConsumer {
                                             .await;
                                             continue;
                                         }
-                                        Staged::Stop => continue,
+                                        Staged::Stop | Staged::Revoked => continue,
                                     }
                                 } else {
                                     match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
@@ -6512,6 +6901,7 @@ impl KafkaConsumer {
                     MAX_POLL_INTERVAL_MS,
                     queue,
                     rebalance_tx,
+                    AssignmentTokens::default(),
                     #[cfg(feature = "kafka-msk-iam")]
                     client.msk_context(),
                 )?);
@@ -6781,7 +7171,7 @@ impl KafkaConsumer {
                             }
                             // Shutdown fired during a registry wait; the loop's
                             // `shutdown.cancelled()` arm ends it on its next pass.
-                            Staged::Stop => continue,
+                            Staged::Stop | Staged::Revoked => continue,
                         }
                     };
 
@@ -6806,11 +7196,42 @@ impl KafkaConsumer {
 
                     let metadata = build_message_metadata(&headers, false, coordinates);
 
-                    let permit = semaphore
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| ShoveError::Connection("semaphore closed".to_string()))?;
+                    // The stop is read before the slot, and once more with
+                    // the slot in hand. A deferred redelivery the stop cancels
+                    // frees the slot in the same instant, and taking that slot
+                    // would hand this record to a handler during the drain,
+                    // ahead of the record that was waiting. The record is
+                    // dropped instead, and the loop's own shutdown arm drains
+                    // on the next pass.
+                    #[cfg(feature = "test-support")]
+                    permit_wait_probe::BROADCAST_ENTERED.fetch_add(1, Ordering::SeqCst);
+                    let permit = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => {
+                            tracing::debug!(
+                                queue,
+                                partition = coordinates.partition,
+                                offset = coordinates.offset,
+                                "shutdown fired while this record waited for a slot; dropped"
+                            );
+                            continue;
+                        }
+                        permit = semaphore.clone().acquire_owned() => permit
+                            .map_err(|_| ShoveError::Connection("semaphore closed".to_string()))?,
+                    };
+                    #[cfg(feature = "test-support")]
+                    permit_wait_probe::acquired();
+                    // Read again with the slot in hand, see `after_wait`.
+                    if after_wait(&shutdown, None) == AfterWait::Stop {
+                        drop(permit);
+                        tracing::debug!(
+                            queue,
+                            partition = coordinates.partition,
+                            offset = coordinates.offset,
+                            "shutdown fired while this record waited for a slot; dropped"
+                        );
+                        continue;
+                    }
 
                     let task_processing = processing.clone();
                     let task_topic = topic.clone();
@@ -6883,7 +7304,9 @@ impl KafkaConsumer {
                                 BroadcastAction::Redeliver => {}
                             }
                             tokio::select! {
-                                _ = tokio::time::sleep(BROADCAST_DEFER_DELAY) => {}
+                                // The stop is read before the sleep, so a
+                                // tie never costs a redelivery.
+                                biased;
                                 // A deferral outliving shutdown would hold the
                                 // drain open for the length of the delay to
                                 // redeliver a message the loop is about to stop
@@ -6896,6 +7319,7 @@ impl KafkaConsumer {
                                     );
                                     break;
                                 }
+                                _ = tokio::time::sleep(BROADCAST_DEFER_DELAY) => {}
                             }
                             // Loops only through the registry wait arm, which
                             // the `kafka-schema-registry` feature adds.
@@ -7111,6 +7535,7 @@ impl KafkaConsumer {
                     MAX_POLL_INTERVAL_MS,
                     dlq,
                     rebalance_tx,
+                    AssignmentTokens::default(),
                     #[cfg(feature = "kafka-msk-iam")]
                     client_clone.msk_context(),
                 )?;
@@ -7247,7 +7672,7 @@ impl KafkaConsumer {
                                         consumer.commit_message(&msg, CommitMode::Async).ok();
                                         continue;
                                     }
-                                    Staged::Stop => continue,
+                                    Staged::Stop | Staged::Revoked => continue,
                                 }
                             } else {
                                 match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
@@ -7495,9 +7920,11 @@ mod offset_tracker_tests {
         assert_eq!(committed_offset(&tpl, 0), Some(6));
 
         // Partition moves away (another member commits 6..99), then returns.
+        // The re-seed begins a new assignment epoch, which the completion
+        // of a record delivered under it carries.
         tracker.remove(0);
-        tracker.track_received(0, 100);
-        tracker.mark_complete(Completion::plain(0, 100));
+        let reseeded = tracker.track_received(0, 100);
+        tracker.mark_complete(Completion::under(reseeded.epoch, 0, 100));
         let tpl = drain_tpl(&mut tracker)
             .expect("re-seeded partition must commit without waiting for 6..100");
         assert_eq!(committed_offset(&tpl, 0), Some(101));
@@ -7529,6 +7956,7 @@ mod offset_tracker_tests {
         Completion {
             partition: 0,
             offset,
+            epoch: 1,
             discard: Some(TerminalDiscard::Retired(metrics::record_terminal(
                 "q",
                 None,
@@ -7798,6 +8226,87 @@ mod offset_tracker_tests {
         assert_eq!(committed_offset(&tpl, 0), None, "revoked: removed");
         assert_eq!(committed_offset(&tpl, 1), None, "reassigned: removed");
         assert_eq!(committed_offset(&tpl, 2), Some(10), "untouched partition");
+    }
+
+    // -- assignment epochs and revoke tokens --
+
+    /// A completion carries the epoch of the assignment its delivery was
+    /// tracked under, and one from an earlier assignment of the partition
+    /// cannot complete the current assignment's delivery of the same offset.
+    /// Proved with an injected completion: the broker-backed shape needs the
+    /// old handler's completion to land after the partition came back and
+    /// its first record was tracked again, and before that record's own
+    /// handler finished, an interleaving a real group cannot be made to
+    /// stage on cue.
+    #[test]
+    fn a_completion_from_an_earlier_assignment_cannot_complete_a_later_delivery() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut tracker = OffsetTracker::new("q".to_string());
+        let first = tracker.track_received(0, 7);
+
+        // The partition moves away with offset 7 in flight and comes back;
+        // the first record under the new assignment is offset 7 again.
+        tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
+        tx.send(RebalanceEvent::Assign(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, Instant::now());
+        let second = tracker.track_received(0, 7);
+        assert_ne!(first.epoch, second.epoch, "a reassign begins a new epoch");
+
+        tracker.mark_complete(Completion::under(first.epoch, 0, 7));
+        assert!(
+            drain_tpl(&mut tracker).is_none(),
+            "the old handler's completion must not move the commit past a record whose handler still runs"
+        );
+
+        tracker.mark_complete(Completion::under(second.epoch, 0, 7));
+        let tpl = drain_tpl(&mut tracker).expect("the current delivery's own completion commits");
+        assert_eq!(committed_offset(&tpl, 0), Some(8));
+    }
+
+    /// A revoke cancels the token every in-place wait on the partition
+    /// selects on, through the map the rebalance callback cancels in and
+    /// through the tracker's own removal as the backstop. A retained
+    /// partition keeps its token, and a reassign gets a fresh one under a
+    /// new epoch.
+    #[test]
+    fn a_revoke_cancels_the_assignment_token_and_a_reassign_gets_a_fresh_one() {
+        let (tx, rx) = std_mpsc::channel();
+        let assignments = AssignmentTokens::default();
+        let mut tracker = OffsetTracker::with_assignments("q".to_string(), assignments.clone());
+        let first = tracker.track_received(0, 0);
+        let other = tracker.track_received(1, 0);
+        assert!(!first.revoked.is_cancelled());
+
+        // The callback's path, inside the poll that reported the revoke.
+        cancel_assignments(&assignments, &[0]);
+        assert!(
+            first.revoked.is_cancelled(),
+            "the revoked partition's token is cancelled"
+        );
+        assert!(
+            !other.revoked.is_cancelled(),
+            "the retained partition's token is not"
+        );
+
+        // The loop drains the same revoke next, and the reassign seeds the
+        // partition again.
+        tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
+        tx.send(RebalanceEvent::Assign(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, Instant::now());
+        let again = tracker.track_received(0, 0);
+        assert!(
+            !again.revoked.is_cancelled(),
+            "the reassign gets a fresh token"
+        );
+        assert_ne!(again.epoch, first.epoch, "under a new epoch");
+
+        // The tracker's own path, the backstop, when it drains a revoke.
+        tx.send(RebalanceEvent::Revoke(vec![1])).unwrap();
+        tracker.apply_rebalance_events(&rx, Instant::now());
+        assert!(
+            other.revoked.is_cancelled(),
+            "the tracker cancels as the backstop"
+        );
     }
 
     // -- fenced-member detection (CAF-25 / uc04) --
@@ -8693,6 +9202,7 @@ mod in_place_wait_accounting_tests {
                 let handler = Arc::new(Noop);
                 let ctx = Arc::new(());
                 let headers = Arc::new(HashMap::new());
+                let never_revoked = CancellationToken::new();
                 let end = redeliver_in_place::<Notes, Noop>(
                     &handler,
                     &ctx,
@@ -8713,6 +9223,7 @@ mod in_place_wait_accounting_tests {
                     "in-place-wait-accounting",
                     None,
                     &shutdown,
+                    &never_revoked,
                     &waiters,
                 )
                 .await;
@@ -8745,6 +9256,528 @@ mod in_place_wait_accounting_tests {
             waiters.load(Ordering::SeqCst),
             0,
             "the count is released on exit"
+        );
+    }
+
+    /// A revoke during the registry retry wait of a redelivery ends it as
+    /// `Revoked` at once: that wait selects on the record's assignment token
+    /// too. The mock has answered the lookup and its one retry once it has
+    /// been asked twice, so the task is in the retry wait, or about to enter
+    /// it from a lookup the token ends the same way. The exit is bounded by
+    /// half the retry delay: a wait that selected on the sleep alone would
+    /// end only when the delay ran out and the next check read the token,
+    /// about a second later, while the revoke arm ends it within
+    /// milliseconds. The waiter is uncounted.
+    #[tokio::test]
+    async fn a_revoke_during_the_registry_retry_wait_ends_the_redelivery() {
+        let (registry, hits) = unavailable_registry().await;
+        let waiters = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        let revoked = CancellationToken::new();
+
+        let task = {
+            let registry = registry.clone();
+            let waiters = waiters.clone();
+            let shutdown = shutdown.clone();
+            let revoked = revoked.clone();
+            tokio::spawn(async move {
+                let hold = [HoldQueue {
+                    name: "in-place-wait-accounting-hold-10ms".into(),
+                    delay: Duration::from_millis(10),
+                }];
+                let mut payload = vec![0u8];
+                payload.extend_from_slice(&9u32.to_be_bytes());
+                payload.extend_from_slice(br#"{"id":1}"#);
+                let accepted: [Arc<str>; 1] = [Arc::from("in-place-wait-accounting-value")];
+                let decode = BatchDecodeCtx {
+                    queue: "in-place-wait-accounting",
+                    schema_registry: Some(&registry),
+                    schema_enforcement: SchemaEnforcement::Enforce,
+                    schema_accepted: &accepted,
+                    schema_message_index: None,
+                    registry_lookup_bound: Duration::from_secs(60),
+                };
+                let handler = Arc::new(Noop);
+                let ctx = Arc::new(());
+                let headers = Arc::new(HashMap::new());
+                let end = redeliver_in_place::<Notes, Noop>(
+                    &handler,
+                    &ctx,
+                    &decode,
+                    &payload,
+                    &headers,
+                    RecordCoordinates {
+                        partition: 0,
+                        offset: 0,
+                        timestamp_ms: None,
+                    },
+                    Outcome::Defer,
+                    0,
+                    10,
+                    &hold,
+                    None,
+                    None,
+                    "in-place-wait-accounting",
+                    None,
+                    &shutdown,
+                    &revoked,
+                    &waiters,
+                )
+                .await;
+                matches!(end, InPlaceEnd::Revoked)
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while hits.load(Ordering::SeqCst) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the mock registry was not asked twice"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(waiters.load(Ordering::SeqCst), 1);
+
+        let cancelled_at = Instant::now();
+        revoked.cancel();
+        assert!(
+            task.await.expect("redelivery task panicked"),
+            "a revoke during the registry retry wait ends the redelivery as Revoked"
+        );
+        let took = cancelled_at.elapsed();
+        assert!(
+            took < REGISTRY_RETRY_DELAY / 2,
+            "the revoke ends the retry wait at once, not when the delay runs out; took {took:?}"
+        );
+        assert_eq!(waiters.load(Ordering::SeqCst), 0);
+        assert!(!shutdown.is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod in_place_wait_guard_tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    /// A guard counts one waiter for as long as it lives, and the drop
+    /// uncounts it. A drop that finds nothing to uncount is a broken
+    /// invariant: it is reported and the count stays at zero, neither
+    /// wrapped round to `usize::MAX`, which would pause the assignment for
+    /// good, nor turned into a panic, which a drop on a runtime path never
+    /// raises, in a debug build included.
+    #[test]
+    fn a_drop_without_a_count_is_reported_and_leaves_the_count_at_zero() {
+        let waiters = AtomicUsize::new(0);
+        {
+            let _waiting = InPlaceWait::begin(&waiters);
+            assert_eq!(waiters.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(
+            waiters.load(Ordering::SeqCst),
+            0,
+            "the drop uncounts the wait"
+        );
+
+        drop(InPlaceWait(&waiters));
+        assert_eq!(
+            waiters.load(Ordering::SeqCst),
+            0,
+            "an uncount with nothing to uncount leaves zero in place"
+        );
+    }
+}
+
+#[cfg(test)]
+mod in_place_revoke_tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+    use crate::topology::TopologyBuilder;
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct Note {
+        id: u32,
+    }
+
+    struct Notes;
+    impl Topic for Notes {
+        type Message = Note;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("in-place-revoke").build())
+        }
+    }
+
+    /// A JSON codec that cancels the token left for it as it decodes, so a
+    /// test can land a revoke inside a successful decode.
+    struct RevokingCodec;
+
+    static REVOKE_ON_DECODE: std::sync::Mutex<Option<CancellationToken>> =
+        std::sync::Mutex::new(None);
+
+    impl crate::Codec<Note> for RevokingCodec {
+        const NAME: &'static str = "revoking-json";
+
+        fn encode(value: &Note) -> Result<Vec<u8>> {
+            Ok(serde_json::to_vec(value)?)
+        }
+
+        fn decode(bytes: &[u8]) -> Result<Note> {
+            if let Some(token) = REVOKE_ON_DECODE.lock().unwrap().take() {
+                token.cancel();
+            }
+            Ok(serde_json::from_slice(bytes)?)
+        }
+    }
+
+    struct RevokedNotes;
+    impl Topic for RevokedNotes {
+        type Message = Note;
+        type Codec = RevokingCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("in-place-revoke-decode").build())
+        }
+    }
+
+    /// A codec that cancels the token left for it and then fails to decode,
+    /// so a test can land a revoke inside a decode that condemns the bytes.
+    /// Its own token slot, so the test it serves and the one above can run
+    /// in one process side by side.
+    struct RevokingUndecodableCodec;
+
+    static REVOKE_ON_UNDECODABLE: std::sync::Mutex<Option<CancellationToken>> =
+        std::sync::Mutex::new(None);
+
+    impl crate::Codec<Note> for RevokingUndecodableCodec {
+        const NAME: &'static str = "revoking-undecodable-json";
+
+        fn encode(value: &Note) -> Result<Vec<u8>> {
+            Ok(serde_json::to_vec(value)?)
+        }
+
+        fn decode(bytes: &[u8]) -> Result<Note> {
+            if let Some(token) = REVOKE_ON_UNDECODABLE.lock().unwrap().take() {
+                token.cancel();
+            }
+            Ok(serde_json::from_slice(bytes)?)
+        }
+    }
+
+    struct RevokedUndecodableNotes;
+    impl Topic for RevokedUndecodableNotes {
+        type Message = Note;
+        type Codec = RevokingUndecodableCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("in-place-revoke-undecodable").build())
+        }
+    }
+
+    /// Counts its calls and acks.
+    struct Counting(AtomicUsize);
+    impl MessageHandler<Notes> for Counting {
+        type Context = ();
+        async fn handle(&self, _: Note, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Outcome::Ack
+        }
+    }
+    impl MessageHandler<RevokedNotes> for Counting {
+        type Context = ();
+        async fn handle(&self, _: Note, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Outcome::Ack
+        }
+    }
+    impl MessageHandler<RevokedUndecodableNotes> for Counting {
+        type Context = ();
+        async fn handle(&self, _: Note, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Outcome::Ack
+        }
+    }
+
+    /// A revoke that lands inside the decode of the redelivery, after the
+    /// select around the decode read the token and before the decode's own
+    /// poll completed, ends the wait as `Revoked` before the handler runs.
+    /// The codec cancels the token as it decodes; the handler must not see
+    /// the record, and the waiter is uncounted.
+    #[tokio::test]
+    async fn a_revoke_inside_the_decode_ends_the_wait_before_the_handler() {
+        let waiters = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        let revoked = CancellationToken::new();
+        *REVOKE_ON_DECODE.lock().unwrap() = Some(revoked.clone());
+        let handler = Arc::new(Counting(AtomicUsize::new(0)));
+        let hold = [HoldQueue {
+            name: "in-place-revoke-decode-hold-10ms".into(),
+            delay: Duration::from_millis(10),
+        }];
+        let decode = BatchDecodeCtx {
+            queue: "in-place-revoke-decode",
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_registry: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_enforcement: SchemaEnforcement::Enforce,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_accepted: &[],
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            registry_lookup_bound: Duration::from_secs(1),
+        };
+        let ctx = Arc::new(());
+        let headers = Arc::new(HashMap::new());
+        let end = redeliver_in_place::<RevokedNotes, Counting>(
+            &handler,
+            &ctx,
+            &decode,
+            br#"{"id":1}"#,
+            &headers,
+            RecordCoordinates {
+                partition: 3,
+                offset: 9,
+                timestamp_ms: None,
+            },
+            Outcome::Defer,
+            0,
+            10,
+            &hold,
+            None,
+            None,
+            "in-place-revoke-decode",
+            None,
+            &shutdown,
+            &revoked,
+            &waiters,
+        )
+        .await;
+        assert!(
+            revoked.is_cancelled(),
+            "the codec cancelled the token during the decode"
+        );
+        assert!(
+            matches!(end, InPlaceEnd::Revoked),
+            "a revoke inside the decode ends the redelivery as Revoked"
+        );
+        assert_eq!(
+            handler.0.load(Ordering::SeqCst),
+            0,
+            "the record was not handed to the handler"
+        );
+        assert_eq!(waiters.load(Ordering::SeqCst), 0);
+    }
+
+    /// A revoke that lands inside a decode which then condemns the bytes
+    /// ends the wait as `Revoked`, not `Undecodable`. `Undecodable` is the
+    /// end the caller dead-letters on, from this member; the partition's
+    /// next owner dead-letters the same bytes once it is handed them from
+    /// the committed offset. One dead letter for the record, not two. The
+    /// codec cancels the token and then fails on the bytes; the handler
+    /// must not see the record, and the waiter is uncounted.
+    #[tokio::test]
+    async fn a_revoke_inside_an_undecodable_decode_leaves_the_dead_letter_to_the_next_owner() {
+        let waiters = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        let revoked = CancellationToken::new();
+        *REVOKE_ON_UNDECODABLE.lock().unwrap() = Some(revoked.clone());
+        let handler = Arc::new(Counting(AtomicUsize::new(0)));
+        let hold = [HoldQueue {
+            name: "in-place-revoke-undecodable-hold-10ms".into(),
+            delay: Duration::from_millis(10),
+        }];
+        let decode = BatchDecodeCtx {
+            queue: "in-place-revoke-undecodable",
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_registry: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_enforcement: SchemaEnforcement::Enforce,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_accepted: &[],
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            registry_lookup_bound: Duration::from_secs(1),
+        };
+        let ctx = Arc::new(());
+        let headers = Arc::new(HashMap::new());
+        let end = redeliver_in_place::<RevokedUndecodableNotes, Counting>(
+            &handler,
+            &ctx,
+            &decode,
+            b"not json",
+            &headers,
+            RecordCoordinates {
+                partition: 3,
+                offset: 9,
+                timestamp_ms: None,
+            },
+            Outcome::Defer,
+            0,
+            10,
+            &hold,
+            None,
+            None,
+            "in-place-revoke-undecodable",
+            None,
+            &shutdown,
+            &revoked,
+            &waiters,
+        )
+        .await;
+        assert!(
+            revoked.is_cancelled(),
+            "the codec cancelled the token during the decode"
+        );
+        assert!(
+            !matches!(end, InPlaceEnd::Undecodable { .. }),
+            "a revoke inside the decode must not end the redelivery as Undecodable, \
+             the end the caller dead-letters on"
+        );
+        assert!(
+            matches!(end, InPlaceEnd::Revoked),
+            "a revoke inside an undecodable decode ends the redelivery as Revoked"
+        );
+        assert_eq!(
+            handler.0.load(Ordering::SeqCst),
+            0,
+            "the record was not handed to the handler"
+        );
+        assert_eq!(waiters.load(Ordering::SeqCst), 0);
+        assert!(!shutdown.is_cancelled());
+    }
+
+    /// A revoke of the record's partition during the delay ends the wait as
+    /// `Revoked`: the handler is not called again, the waiter is uncounted,
+    /// and shutdown is untouched. The delay is a minute, so only the revoke
+    /// can end the wait within the test.
+    #[tokio::test]
+    async fn a_revoke_during_the_delay_ends_the_wait_without_a_redelivery() {
+        let waiters = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        let revoked = CancellationToken::new();
+        let handler = Arc::new(Counting(AtomicUsize::new(0)));
+        let task = {
+            let waiters = waiters.clone();
+            let shutdown = shutdown.clone();
+            let revoked = revoked.clone();
+            let handler = handler.clone();
+            tokio::spawn(async move {
+                let hold = [HoldQueue {
+                    name: "in-place-revoke-hold-60s".into(),
+                    delay: Duration::from_secs(60),
+                }];
+                let decode = BatchDecodeCtx {
+                    queue: "in-place-revoke",
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_registry: None,
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_enforcement: SchemaEnforcement::Enforce,
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_accepted: &[],
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_message_index: None,
+                    #[cfg(feature = "kafka-schema-registry")]
+                    registry_lookup_bound: Duration::from_secs(1),
+                };
+                let ctx = Arc::new(());
+                let headers = Arc::new(HashMap::new());
+                let end = redeliver_in_place::<Notes, Counting>(
+                    &handler,
+                    &ctx,
+                    &decode,
+                    br#"{"id":1}"#,
+                    &headers,
+                    RecordCoordinates {
+                        partition: 3,
+                        offset: 9,
+                        timestamp_ms: None,
+                    },
+                    Outcome::Defer,
+                    0,
+                    10,
+                    &hold,
+                    None,
+                    None,
+                    "in-place-revoke",
+                    None,
+                    &shutdown,
+                    &revoked,
+                    &waiters,
+                )
+                .await;
+                matches!(end, InPlaceEnd::Revoked)
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while waiters.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the redelivery never began its wait"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        revoked.cancel();
+        assert!(
+            task.await.expect("redelivery task panicked"),
+            "a revoke during the delay ends the redelivery as Revoked"
+        );
+        assert_eq!(
+            handler.0.load(Ordering::SeqCst),
+            0,
+            "the record was not handed back to the handler"
+        );
+        assert_eq!(
+            waiters.load(Ordering::SeqCst),
+            0,
+            "the waiter is uncounted on exit"
+        );
+        assert!(!shutdown.is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod after_wait_tests {
+    use super::*;
+
+    /// The cases of the check the receive loop makes once a wait it polled
+    /// through has ended, pinned here because the broker tests reach the
+    /// stop case only through a race the stop usually wins earlier, and the
+    /// revoke case only when the coordinator moves the partition whose
+    /// record is in the loop's hand.
+    #[test]
+    fn the_stop_is_read_first_then_the_assignment() {
+        let live = CancellationToken::new();
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        let revoked = CancellationToken::new();
+        revoked.cancel();
+
+        assert_eq!(after_wait(&live, Some(&live)), AfterWait::Dispatch);
+        assert_eq!(
+            after_wait(&live, None),
+            AfterWait::Dispatch,
+            "the broadcast loop has no assignment to lose"
+        );
+        assert_eq!(
+            after_wait(&stopped, Some(&live)),
+            AfterWait::Stop,
+            "a stop that landed after the wait's own poll of the token"
+        );
+        assert_eq!(after_wait(&stopped, None), AfterWait::Stop);
+        assert_eq!(
+            after_wait(&live, Some(&revoked)),
+            AfterWait::Revoked,
+            "a revoke applied inside the wait's recv poll"
+        );
+        assert_eq!(
+            after_wait(&stopped, Some(&revoked)),
+            AfterWait::Stop,
+            "the stop is read first"
         );
     }
 }

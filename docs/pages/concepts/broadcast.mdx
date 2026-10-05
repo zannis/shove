@@ -141,6 +141,8 @@ An id under the granted prefix avoids provoking it.
 A deferred record is redelivered to the deferring subscription before any record received after it.
 The subscription's single slot is held across the delay and the same bytes are decoded again.
 The order is therefore the original delivery, the redelivery, then whatever came next.
+A stop during the delay hands nothing over: the deferred record is dropped with nothing completed.
+A record the subscription had read while it waited for its slot is dropped too, not handled during the drain.
 
 Because the assignment is taken at the tail, a reconnect re-assigns at the *then*-current tail: messages published while a subscriber was disconnected are not replayed. That is deliver-new applied to the reconnect window rather than a separate caveat.
 With `with_broadcast_start` the reconnect re-resolves the configured start instead, so a `Head` subscription replays the retained log again.
