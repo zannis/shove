@@ -194,7 +194,7 @@ shove::define_topic!(
 );
 
 // An infra-owned topic shove binds to but never creates, expands or alters.
-// The DLQ stays shove-owned in this mode.
+// Its DLQ is infra's too: verified, never created or expanded.
 shove::define_topic!(
     ExternalOwnedTopic,
     SimpleMessage,
@@ -361,6 +361,26 @@ shove::define_topic!(
     TopologyBuilder::new("kafka-owned-inplace")
         .hold_queue(Duration::from_millis(300))
         .dlq()
+        .build()
+);
+
+// External topologies whose dead-letter topic infra provisioned: one under the
+// default `{queue}-dlq` name, one under a name of infra's choosing.
+shove::define_topic!(
+    ExternalDlqDefaultTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-dlq-default")
+        .external()
+        .dlq()
+        .build()
+);
+
+shove::define_topic!(
+    ExternalDlqNamedTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-dlq-named")
+        .external()
+        .dlq_named("kafka-infra-dead-letters")
         .build()
 );
 
@@ -1379,6 +1399,14 @@ impl MessageHandler<CoordinatesTopic> for MetadataRecorder {
 }
 
 impl MessageHandler<ExternalMissingTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<ExternalDlqDefaultTopic> for CountingHandler {
     type Context = ();
     async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.counter.increment();
@@ -3001,13 +3029,15 @@ async fn consumer_group_processes_messages() {
 
 /// `external()` binds to a topic infra created. Registering a
 /// group whose `max_consumers` exceeds the partition count consumes through
-/// it and leaves the partition count exactly as infra set it, while the DLQ
-/// is still shove's to create.
+/// it and leaves the partition count exactly as infra set it, and so does
+/// the DLQ infra provisioned beside it.
 #[tokio::test]
 async fn external_topic_is_never_created_or_expanded() {
     const TOPIC: &str = "kafka-external-owned";
+    const DLQ: &str = "kafka-external-owned-dlq";
     let tb = TestBroker::start().await;
     provision_topic(tb.brokers(), TOPIC, 3).await;
+    provision_topic(tb.brokers(), DLQ, 2).await;
 
     let broker = tb.broker();
     let handler = CountingHandler::new();
@@ -3025,9 +3055,10 @@ async fn external_topic_is_never_created_or_expanded() {
         Some(3),
         "declare must not expand an external topic towards max_consumers"
     );
-    assert!(
-        live_partition_count(tb.brokers(), "kafka-external-owned-dlq").is_some(),
-        "the DLQ is shove's own topic and is still created"
+    assert_eq!(
+        live_partition_count(tb.brokers(), DLQ),
+        Some(2),
+        "declare must not expand an external topology's DLQ towards the default"
     );
 
     let publisher = broker.publisher().await.unwrap();
@@ -3060,6 +3091,91 @@ async fn external_topic_is_never_created_or_expanded() {
         Some(3),
         "consuming must not expand the external topic either"
     );
+    assert_eq!(live_partition_count(tb.brokers(), DLQ), Some(2));
+    broker.close().await;
+}
+
+/// The DLQ of an external topology is infra's: `declare` verifies it exists
+/// and leaves it exactly as provisioned, one partition where shove's own
+/// default would be eight, under the default name and under a `dlq_named`
+/// one alike.
+#[tokio::test]
+async fn external_dead_letter_topic_is_never_expanded_at_declare() {
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), "kafka-external-dlq-default", 3).await;
+    provision_topic(tb.brokers(), "kafka-external-dlq-default-dlq", 1).await;
+    provision_topic(tb.brokers(), "kafka-external-dlq-named", 3).await;
+    provision_topic(tb.brokers(), "kafka-infra-dead-letters", 1).await;
+
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<ExternalDlqDefaultTopic>()
+        .await
+        .expect("declare against a provisioned external topology must succeed");
+    broker
+        .topology()
+        .declare::<ExternalDlqNamedTopic>()
+        .await
+        .expect("declare against a provisioned external topology must succeed");
+
+    assert_eq!(
+        live_partition_count(tb.brokers(), "kafka-external-dlq-default-dlq"),
+        Some(1),
+        "declare must not expand an external topology's DLQ"
+    );
+    assert_eq!(
+        live_partition_count(tb.brokers(), "kafka-infra-dead-letters"),
+        Some(1),
+        "declare must not expand a named DLQ infra owns"
+    );
+    broker.close().await;
+}
+
+/// A missing DLQ on an external topology is a startup error, as a missing
+/// main topic is: `declare` and the registry path return `Topology`, and the
+/// DLQ is still absent afterwards.
+#[tokio::test]
+async fn external_dead_letter_topic_missing_fails_fast_at_declare() {
+    const DLQ: &str = "kafka-external-dlq-default-dlq";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), "kafka-external-dlq-default", 3).await;
+    let broker = tb.broker();
+
+    let err = broker
+        .topology()
+        .declare::<ExternalDlqDefaultTopic>()
+        .await
+        .expect_err("declare must refuse a DLQ nobody provisioned");
+    assert!(
+        matches!(err, shove::ShoveError::Topology(_)),
+        "expected Topology, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("external()")
+            && err.to_string().contains("must be provisioned")
+            && err.to_string().contains(DLQ),
+        "{err}"
+    );
+    assert_eq!(
+        live_partition_count(tb.brokers(), DLQ),
+        None,
+        "declare must not create an external topology's DLQ"
+    );
+
+    let mut group = broker.consumer_group();
+    let err = group
+        .register::<ExternalDlqDefaultTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            CountingHandler::new,
+        )
+        .await
+        .expect_err("register must refuse a DLQ nobody provisioned");
+    assert!(
+        matches!(err, shove::ShoveError::Topology(_)),
+        "expected Topology, got {err:?}"
+    );
+    assert_eq!(live_partition_count(tb.brokers(), DLQ), None);
     broker.close().await;
 }
 
@@ -3427,6 +3543,7 @@ async fn external_topic_retry_exhausts_without_producing() {
     const TOPIC: &str = "kafka-external-retry";
     let tb = TestBroker::start().await;
     provision_topic(tb.brokers(), TOPIC, 1).await;
+    provision_topic(tb.brokers(), "kafka-external-retry-dlq", 1).await;
     let broker = tb.broker();
 
     let handler = AlwaysRecorder::new(Outcome::Retry);

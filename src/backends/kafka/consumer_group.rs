@@ -717,7 +717,7 @@ impl KafkaConsumerGroup {
             let ctx = ctx.clone();
 
             tokio::spawn(async move {
-                let result = consumer.run_with_inner::<T, H>(handler, ctx, options).await;
+                let result = consumer.run_declared::<T, H>(handler, ctx, options).await;
                 if let Err(e) = result {
                     ec.fetch_add(1, Ordering::Relaxed);
                     tracing::error!("consumer task exited with error: {e}");

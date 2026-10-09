@@ -221,7 +221,7 @@ impl ConsumerImpl for KafkaConsumer {
         T: SequencedTopic,
         H: MessageHandler<T>,
     {
-        KafkaConsumer::spawn_fifo_shards::<T, H>(self, handler, ctx, options)
+        KafkaConsumer::spawn_fifo_shards_checked::<T, H>(self, handler, ctx, options).await
     }
 }
 

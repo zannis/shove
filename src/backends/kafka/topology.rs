@@ -183,7 +183,7 @@ impl KafkaTopologyDeclarer {
             // fast rather than silently creating a differently-configured
             // fallback. Nothing here touches the main topic: no create, no
             // partition expansion, no config reconcile.
-            let partitions = self.client.verify_external_topic(queue).await?;
+            let partitions = self.client.verify_external_topic(queue, "topic").await?;
             if let Some(min) = self.min_partitions
                 && partitions < min
             {
@@ -205,13 +205,21 @@ impl KafkaTopologyDeclarer {
                 .await?;
         }
 
-        // shove always owns its own dead-letter topic (its dead-letter
-        // mechanism, not the infra-provided source topic), so create it in
-        // both modes.
         if let Some(dlq) = topology.dlq() {
-            self.client
-                .create_topic(dlq, DEFAULT_PARTITIONS, replication, &[])
-                .await?;
+            if topology.external() {
+                // Infra owns the dead-letter topic of an external topology
+                // as it owns the main one: verified, never created, and
+                // never expanded.
+                let partitions = self
+                    .client
+                    .verify_external_topic(dlq, "dead-letter topic")
+                    .await?;
+                tracing::debug!(dlq, partitions, "bound to external Kafka dead-letter topic");
+            } else {
+                self.client
+                    .create_topic(dlq, DEFAULT_PARTITIONS, replication, &[])
+                    .await?;
+            }
         }
 
         Ok(())
@@ -262,9 +270,9 @@ impl KafkaTopologyDeclarer {
                  hold-queue topics declared"
             );
         }
-        // The nudge is about topics shove auto-creates. An external main topic
-        // is never created, so only a declared DLQ can still earn it there.
-        if !topology.external() || topology.dlq().is_some() {
+        // The nudge is about topics shove auto-creates, and an external
+        // topology creates none.
+        if !topology.external() {
             warn_if_under_replicated_for_acks_all(topology.queue(), self.effective_replication());
         }
         if topology.sequencing().is_some() {

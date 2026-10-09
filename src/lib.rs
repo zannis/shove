@@ -377,6 +377,13 @@ pub mod kafka {
     #[doc(hidden)]
     pub use crate::backends::kafka::put_back_probe;
 
+    /// Test-only counter (see the `test-support` feature) of the topics the
+    /// consumers' startup check has probed, for tests that prove a path did
+    /// or did not run it.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::startup_probe;
+
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::housekeeping_interval_for_test;

@@ -281,3 +281,65 @@ async fn a_client_closed_before_any_publish_builds_no_producer() {
         "a client closed before any publish requested a producer id"
     );
 }
+
+shove::define_topic!(
+    MissingTopic,
+    Order,
+    TopologyBuilder::new("kafka-consume-only-missing")
+        .external()
+        .build()
+);
+
+impl MessageHandler<MissingTopic> for Acking {
+    type Context = ();
+    async fn handle(&self, msg: Order, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.seen
+            .lock()
+            .expect("handler mutex poisoned")
+            .push(msg.id);
+        Outcome::Ack
+    }
+}
+
+/// The startup topic check is a metadata probe: a consumer that refuses a
+/// missing external topic, and one that probes a present one before it runs,
+/// request no producer id.
+#[tokio::test]
+async fn the_startup_topic_check_builds_no_producer() {
+    let mock = Mock::start();
+    mock.track_requests();
+    let bootstrap = mock.bootstrap();
+
+    let err = tokio::time::timeout(
+        DELIVERY_TIMEOUT,
+        KafkaConsumer::new(connect(&bootstrap).await).run::<MissingTopic, _>(
+            Acking::default(),
+            (),
+            ConsumerOptions::<Kafka>::new(),
+        ),
+    )
+    .await
+    .expect("the refusal comes at startup, not after a retry loop")
+    .expect_err("a topic nobody provisioned is refused at startup");
+    assert!(matches!(err, ShoveError::Topology(_)), "{err:?}");
+
+    let shutdown = CancellationToken::new();
+    let options = ConsumerOptions::<Kafka>::new().with_shutdown(shutdown.clone());
+    let client = connect(&bootstrap).await;
+    let run = tokio::spawn(async move {
+        KafkaConsumer::new(client)
+            .run::<OrdersTopic, _>(Acking::default(), (), options)
+            .await
+    });
+    let probed_at = Instant::now();
+    tokio::time::sleep_until(probed_at + PRODUCER_ID_TIMER_MARGIN).await;
+    shutdown.cancel();
+    run.await
+        .expect("consumer task joins")
+        .expect("consumer stops clean");
+    assert_eq!(
+        mock.producer_id_requests(),
+        0,
+        "the startup topic check requested a producer id"
+    );
+}
