@@ -12,13 +12,15 @@ use rdkafka::admin::{
     TopicReplication,
 };
 use rdkafka::client::{ClientContext, DefaultClientContext};
-use rdkafka::error::RDKafkaErrorCode;
+use rdkafka::consumer::{BaseConsumer, Consumer as _};
+use rdkafka::error::{KafkaResult, RDKafkaErrorCode};
 use rdkafka::message::OwnedHeaders;
 use rdkafka::metadata::Metadata;
 use rdkafka::producer::{FutureProducer, Producer};
 
 use super::constants::{MESSAGE_TIMEOUT_MS, SHUTDOWN_GRACE};
 use super::publisher::publish_with_retry as publisher_publish_with_retry;
+use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "kafka-msk-iam")]
@@ -438,7 +440,13 @@ pub struct KafkaClient {
     /// handle — is a refcount bump instead of a multi-KB copy of the inner
     /// HashMap (which can include large PEM blobs when TLS is configured).
     base_config: Arc<ClientConfig>,
-    producer: KafkaProducerInner,
+    /// Validated at `connect`; the producer is built from it at the first
+    /// publish, see [`Self::producer`].
+    producer_config: Arc<ClientConfig>,
+    /// The one producer every clone shares, built at the first publish.
+    producer: Arc<OnceCell<KafkaProducerInner>>,
+    /// The consumer-type client `ping` probes with, built at `connect`.
+    metadata: Arc<MetadataConsumer>,
     #[cfg(feature = "kafka-msk-iam")]
     msk_context: Option<MskIamContext>,
     shutdown_token: CancellationToken,
@@ -451,8 +459,32 @@ enum KafkaProducerInner {
     MskIam(FutureProducer<MskIamContext>),
 }
 
+/// librdkafka's constructor is synchronous and may block on TLS material, so
+/// the caller runs this on a blocking thread.
+fn build_producer(
+    config: &ClientConfig,
+    #[cfg(feature = "kafka-msk-iam")] msk_context: Option<MskIamContext>,
+) -> Result<KafkaProducerInner> {
+    #[cfg(feature = "kafka-msk-iam")]
+    if let Some(ctx) = msk_context {
+        let p: FutureProducer<MskIamContext> = config
+            .create_with_context(ctx)
+            .map_err(|e| ShoveError::Topology(format!("failed to create MSK IAM producer: {e}")))?;
+        return Ok(KafkaProducerInner::MskIam(p));
+    }
+    let p: FutureProducer<DefaultClientContext> = config
+        .create()
+        .map_err(|e| ShoveError::Topology(format!("failed to create Kafka producer: {e}")))?;
+    Ok(KafkaProducerInner::Default(p))
+}
+
 /// The producer's client config: the connection settings of `base`, the
 /// pinned correctness settings, and the tuning `config` opts into.
+///
+/// `enable.idempotence=true` because `publish_with_retry` retries a timed-out
+/// send, and the broker then deduplicates by producer id and sequence instead
+/// of storing the record twice. It needs Kafka 0.11 or later and caps
+/// in-flight requests per connection at five.
 ///
 /// librdkafka enables producer topic auto-creation by default.
 /// Set the option explicitly to preserve shove's topic ownership policy.
@@ -586,46 +618,51 @@ impl KafkaClient {
             base_config.set("sasl.mechanism", "OAUTHBEARER");
         }
 
-        // Phase C — build the producer with whichever context applies.
-        // sec-K-10: enable idempotent producer. The publisher.rs retry loop
-        // (publish_with_retry) retries on timeouts; without idempotence a
-        // timeout-then-retry can produce duplicates at the broker even if
-        // the first send actually succeeded. enable.idempotence=true makes
-        // the broker dedupe by producer id + sequence, restoring at-least-
-        // once into exactly-once-on-the-broker semantics. Requires Kafka
-        // ≥ 0.11 (universal today) and caps in-flight requests per
-        // connection at 5.
+        // Phase C: validate the producer's config, and build the client
+        // `ping` probes with. The producer itself is built at the first
+        // publish, see `Self::producer`.
         let producer_config = producer_config(&base_config, &client_name, config)?;
-
-        fn create_default_producer(cfg: &ClientConfig) -> Result<KafkaProducerInner> {
-            let p: FutureProducer<DefaultClientContext> = cfg.create().map_err(|e| {
-                ShoveError::Topology(format!("failed to create Kafka producer: {e}"))
-            })?;
-            Ok(KafkaProducerInner::Default(p))
-        }
-
-        #[cfg(feature = "kafka-msk-iam")]
-        let producer = if let Some(ctx) = msk_context.clone() {
-            let p: FutureProducer<MskIamContext> =
-                producer_config.create_with_context(ctx).map_err(|e| {
-                    ShoveError::Topology(format!("failed to create MSK IAM producer: {e}"))
-                })?;
-            KafkaProducerInner::MskIam(p)
-        } else {
-            create_default_producer(&producer_config)?
-        };
-
-        #[cfg(not(feature = "kafka-msk-iam"))]
-        let producer = create_default_producer(&producer_config)?;
+        let metadata = MetadataConsumer::create(
+            base_config.clone(),
+            #[cfg(feature = "kafka-msk-iam")]
+            msk_context.clone(),
+        )?;
 
         Ok(Self {
             brokers: config.brokers.clone(),
             base_config: Arc::new(base_config),
-            producer,
+            producer_config: Arc::new(producer_config),
+            producer: Arc::new(OnceCell::new()),
+            metadata: Arc::new(metadata),
             #[cfg(feature = "kafka-msk-iam")]
             msk_context,
             shutdown_token: CancellationToken::new(),
         })
+    }
+
+    /// The client's one producer, built on the first call and shared by
+    /// every clone. A client that never publishes never builds it, and so
+    /// never requests a producer id. After `shutdown` the build is refused.
+    async fn producer(&self) -> Result<&KafkaProducerInner> {
+        self.producer
+            .get_or_try_init(|| async {
+                if self.shutdown_token.is_cancelled() {
+                    return Err(ShoveError::Connection("client is shut down".into()));
+                }
+                let config = Arc::clone(&self.producer_config);
+                #[cfg(feature = "kafka-msk-iam")]
+                let msk_context = self.msk_context.clone();
+                tokio::task::spawn_blocking(move || {
+                    build_producer(
+                        &config,
+                        #[cfg(feature = "kafka-msk-iam")]
+                        msk_context,
+                    )
+                })
+                .await
+                .map_err(|e| ShoveError::Topology(format!("producer build task failed: {e}")))?
+            })
+            .await
     }
 
     pub async fn connect_with_retry(config: &KafkaConfig, max_attempts: u32) -> Result<Self> {
@@ -665,7 +702,7 @@ impl KafkaClient {
         max_attempts: u32,
         label: &str,
     ) -> Result<()> {
-        match &self.producer {
+        match self.producer().await? {
             KafkaProducerInner::Default(p) => {
                 publisher_publish_with_retry(p, topic, key, headers, payload, max_attempts, label)
                     .await
@@ -725,9 +762,9 @@ impl KafkaClient {
         self.shutdown_token.clone()
     }
 
-    /// Liveness check. Issues a single `fetch_metadata(None, timeout)` against
-    /// the cluster via the producer's existing librdkafka client. No new
-    /// socket, no consumer-group churn, no side effects.
+    /// Liveness check. Issues a single `fetch_metadata(None, timeout)` on the
+    /// metadata consumer `connect` built. No new socket, no consumer-group
+    /// churn, no side effects, and no producer.
     ///
     /// Returns `Err(ShoveError::Connection)` if the client is shut down, the
     /// metadata fetch fails, or `spawn_blocking` itself fails.
@@ -735,11 +772,16 @@ impl KafkaClient {
         if self.shutdown_token.is_cancelled() {
             return Err(ShoveError::Connection("client is shut down".into()));
         }
-        let producer = self.producer.clone();
-        let join = tokio::task::spawn_blocking(move || match &producer {
-            KafkaProducerInner::Default(p) => p.client().fetch_metadata(None, timeout),
-            #[cfg(feature = "kafka-msk-iam")]
-            KafkaProducerInner::MskIam(p) => p.client().fetch_metadata(None, timeout),
+        let consumer = Arc::clone(&self.metadata);
+        #[cfg(feature = "kafka-msk-iam")]
+        let shutdown = self.shutdown_token();
+        let join = tokio::task::spawn_blocking(move || {
+            consumer.fetch(
+                None,
+                timeout,
+                #[cfg(feature = "kafka-msk-iam")]
+                &shutdown,
+            )
         });
 
         let metadata_result = tokio::time::timeout(timeout, join)
@@ -753,8 +795,7 @@ impl KafkaClient {
     }
 
     /// Confirm an infra-owned topic exists and return its partition count,
-    /// creating nothing. The check is deliberately not the producer's
-    /// metadata fetch `ping` uses; see `probe_external_topic_blocking`.
+    /// creating nothing; see `probe_external_topic_blocking`.
     pub(super) async fn verify_external_topic(&self, name: &str) -> Result<i32> {
         let base = (*self.base_config).clone();
         let topic_name = name.to_string();
@@ -1029,14 +1070,22 @@ impl KafkaClient {
     pub async fn shutdown(&self) {
         self.shutdown_token.cancel();
         tokio::time::sleep(SHUTDOWN_GRACE).await;
-        match &self.producer {
-            KafkaProducerInner::Default(p) => {
+        // A failing initializer waits for a build in flight and starts none,
+        // and the cancelled token refuses every build from here on.
+        let built = self
+            .producer
+            .get_or_try_init(|| async { Err::<KafkaProducerInner, ()>(()) })
+            .await
+            .ok();
+        match built {
+            Some(KafkaProducerInner::Default(p)) => {
                 p.flush(Duration::from_secs(5)).ok();
             }
             #[cfg(feature = "kafka-msk-iam")]
-            KafkaProducerInner::MskIam(p) => {
+            Some(KafkaProducerInner::MskIam(p)) => {
                 p.flush(Duration::from_secs(5)).ok();
             }
+            None => {}
         }
     }
 
@@ -1152,7 +1201,69 @@ fn probe_external_topic_blocking(
     }
 }
 
-/// Build a one-shot metadata `BaseConsumer` from `cfg` and fetch one topic's
+/// A consumer-type librdkafka client with no `group.id`, used for metadata
+/// requests only: no coordinator lookup, so no group permission, and no
+/// producer id.
+enum MetadataConsumer {
+    Default(BaseConsumer),
+    #[cfg(feature = "kafka-msk-iam")]
+    MskIam(BaseConsumer<MskIamContext>),
+}
+
+impl MetadataConsumer {
+    fn create(
+        cfg: ClientConfig,
+        #[cfg(feature = "kafka-msk-iam")] msk_ctx: Option<MskIamContext>,
+    ) -> Result<Self> {
+        #[cfg(feature = "kafka-msk-iam")]
+        if let Some(ctx) = msk_ctx {
+            let consumer: BaseConsumer<MskIamContext> =
+                cfg.create_with_context(ctx).map_err(|e| {
+                    ShoveError::Topology(format!("failed to create MSK metadata consumer: {e}"))
+                })?;
+            return Ok(Self::MskIam(consumer));
+        }
+        let consumer: BaseConsumer = cfg.create().map_err(|e| {
+            ShoveError::Topology(format!("failed to create metadata consumer: {e}"))
+        })?;
+        Ok(Self::Default(consumer))
+    }
+
+    /// Fetch the metadata of one topic, or of the whole cluster for `None`.
+    /// Blocking: the caller runs this inside `spawn_blocking`.
+    fn fetch(
+        &self,
+        topic_name: Option<&str>,
+        timeout: Duration,
+        #[cfg(feature = "kafka-msk-iam")] shutdown: &CancellationToken,
+    ) -> KafkaResult<Metadata> {
+        match self {
+            Self::Default(consumer) => consumer.fetch_metadata(topic_name, timeout),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(consumer) => {
+                // A metadata consumer never polls, so nothing would deliver
+                // the OAUTHBEARER token (rdkafka services it via the event
+                // queue, which fetch_metadata does not pump). Pump it on a
+                // scoped thread for the duration of the blocking fetch; the
+                // thread is joined before this block returns.
+                use std::sync::atomic::{AtomicBool, Ordering};
+                let done = AtomicBool::new(false);
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        while !done.load(Ordering::Relaxed) && !shutdown.is_cancelled() {
+                            let _ = consumer.poll(Duration::from_millis(100));
+                        }
+                    });
+                    let md = consumer.fetch_metadata(topic_name, timeout);
+                    done.store(true, Ordering::Relaxed);
+                    md
+                })
+            }
+        }
+    }
+}
+
+/// Build a one-shot [`MetadataConsumer`] from `cfg` and fetch one topic's
 /// metadata synchronously. Runs inside `spawn_blocking` because librdkafka's
 /// `fetch_metadata` is blocking; owns all the cfg-gated context selection.
 fn fetch_topic_metadata_blocking(
@@ -1161,44 +1272,17 @@ fn fetch_topic_metadata_blocking(
     #[cfg(feature = "kafka-msk-iam")] msk_ctx: Option<MskIamContext>,
     #[cfg(feature = "kafka-msk-iam")] shutdown: CancellationToken,
 ) -> Result<Metadata> {
-    use rdkafka::consumer::{BaseConsumer, Consumer as _};
-
-    #[cfg(feature = "kafka-msk-iam")]
-    let metadata = if let Some(ctx) = msk_ctx {
-        let consumer: BaseConsumer<MskIamContext> = cfg.create_with_context(ctx).map_err(|e| {
-            ShoveError::Topology(format!("failed to create MSK metadata consumer: {e}"))
-        })?;
-        // A one-shot metadata consumer never polls, so nothing would deliver
-        // the initial OAUTHBEARER token (rdkafka services it via the event
-        // queue, which fetch_metadata does not pump). Pump it on a scoped
-        // thread for the duration of the blocking fetch; the thread is joined
-        // before this block returns.
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let done = AtomicBool::new(false);
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                while !done.load(Ordering::Relaxed) && !shutdown.is_cancelled() {
-                    let _ = consumer.poll(Duration::from_millis(100));
-                }
-            });
-            let md = consumer.fetch_metadata(Some(topic_name), Duration::from_secs(10));
-            done.store(true, Ordering::Relaxed);
-            md
-        })
-    } else {
-        let consumer: BaseConsumer = cfg.create().map_err(|e| {
-            ShoveError::Topology(format!("failed to create metadata consumer: {e}"))
-        })?;
-        consumer.fetch_metadata(Some(topic_name), Duration::from_secs(10))
-    };
-
-    #[cfg(not(feature = "kafka-msk-iam"))]
-    let metadata = {
-        let consumer: BaseConsumer = cfg.create().map_err(|e| {
-            ShoveError::Topology(format!("failed to create metadata consumer: {e}"))
-        })?;
-        consumer.fetch_metadata(Some(topic_name), Duration::from_secs(10))
-    };
+    let consumer = MetadataConsumer::create(
+        cfg,
+        #[cfg(feature = "kafka-msk-iam")]
+        msk_ctx,
+    )?;
+    let metadata = consumer.fetch(
+        Some(topic_name),
+        Duration::from_secs(10),
+        #[cfg(feature = "kafka-msk-iam")]
+        &shutdown,
+    );
 
     metadata.map_err(|e| {
         ShoveError::Connection(format!("failed to fetch metadata for {topic_name}: {e}"))
@@ -1609,6 +1693,229 @@ mod tests {
         assert!(
             msg.contains("TLS") || msg.contains("plaintext") || msg.contains("credentials"),
             "error message should describe the plaintext-credentials risk, got: {msg}"
+        );
+    }
+    // -- the producer is built at the first publish, on a blocking thread --
+
+    /// A client against a port nothing listens on. librdkafka connects
+    /// lazily, so nothing here needs a broker.
+    async fn client() -> KafkaClient {
+        KafkaClient::connect(&KafkaConfig::new("127.0.0.1:1"))
+            .await
+            .expect("connect needs no broker")
+    }
+
+    /// `client()` with producer properties replaced after `connect`, so the
+    /// producer build fails or stalls where the metadata consumer did not.
+    async fn client_whose_producer_config_sets(entries: &[(&str, &str)]) -> KafkaClient {
+        let mut client = client().await;
+        let mut producer_config = (*client.producer_config).clone();
+        for (key, value) in entries {
+            producer_config.set(*key, *value);
+        }
+        client.producer_config = Arc::new(producer_config);
+        client
+    }
+
+    /// `connect` leaves the cell empty, and concurrent first publishes from
+    /// four clones end with one producer: tokio's `OnceCell` runs one
+    /// initializer at a time.
+    #[tokio::test]
+    async fn connect_builds_no_producer_and_concurrent_clones_share_one() {
+        use futures_util::future::join_all;
+
+        let client = client().await;
+        assert!(client.producer.get().is_none(), "connect built a producer");
+        let clones: Vec<KafkaClient> = (0..4).map(|_| client.clone()).collect();
+        let built = join_all(clones.iter().map(|c| c.producer())).await;
+        let first: &KafkaProducerInner = built[0].as_ref().expect("the first clone builds");
+        for producer in &built {
+            let producer: &KafkaProducerInner = producer.as_ref().expect("every clone gets it");
+            assert!(
+                std::ptr::eq(first, producer),
+                "two clones hold two producers"
+            );
+        }
+        assert!(
+            client.producer.get().is_some(),
+            "the cell is empty after the builds"
+        );
+    }
+
+    /// After `shutdown` a publish that finds no producer is refused and
+    /// builds none, so nothing is left unflushed behind the close.
+    #[tokio::test]
+    async fn a_publish_after_shutdown_builds_no_producer() {
+        let client = client().await;
+        client.shutdown().await;
+        let err = client
+            .publish_with_retry("orders", None, OwnedHeaders::new(), b"{}", 1, "test")
+            .await
+            .expect_err("a publish after shutdown is refused");
+        assert!(matches!(err, ShoveError::Connection(_)), "got {err:?}");
+        assert!(
+            client.producer.get().is_none(),
+            "the refused publish built a producer"
+        );
+    }
+
+    /// A producer build librdkafka refuses fails the publish with the error
+    /// `connect` used to return, and leaves the cell empty, so the next
+    /// publish builds again instead of finding a poisoned cell.
+    #[tokio::test]
+    async fn a_failed_producer_build_leaves_the_cell_empty_for_the_next_publish() {
+        let client = client_whose_producer_config_sets(&[("no.such.property", "1")]).await;
+        for attempt in 1..=2 {
+            let err = client
+                .publish_with_retry("orders", None, OwnedHeaders::new(), b"{}", 1, "test")
+                .await
+                .expect_err("librdkafka refuses an unknown property");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("failed to create Kafka producer"),
+                "attempt {attempt}: {msg}"
+            );
+            assert!(
+                matches!(err, ShoveError::Topology(_)),
+                "attempt {attempt}: {err:?}"
+            );
+            assert!(
+                client.producer.get().is_none(),
+                "attempt {attempt}: the cell is not empty"
+            );
+        }
+    }
+
+    /// TLS material librdkafka rejects fails `connect`, which builds the
+    /// metadata consumer from the connection settings the producer would use.
+    #[cfg(feature = "kafka-ssl")]
+    #[tokio::test]
+    async fn rejected_tls_material_fails_connect() {
+        let cfg = KafkaConfig::new("127.0.0.1:1").with_tls(KafkaTls {
+            ca_pem: Some("not a certificate".into()),
+            ..KafkaTls::default()
+        });
+        let err = KafkaClient::connect(&cfg)
+            .await
+            .err()
+            .expect("librdkafka rejects the CA");
+        let msg = err.to_string();
+        assert!(msg.contains("failed to create metadata consumer"), "{msg}");
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+    }
+
+    /// The one-shot probe reports a configuration librdkafka refuses as
+    /// `Topology`, as `connect` does.
+    #[test]
+    fn a_probe_reports_a_refused_configuration() {
+        let mut cfg = ClientConfig::new();
+        cfg.set("no.such.property", "1");
+        let err = fetch_topic_metadata_blocking(
+            cfg,
+            "orders",
+            #[cfg(feature = "kafka-msk-iam")]
+            None,
+            #[cfg(feature = "kafka-msk-iam")]
+            CancellationToken::new(),
+        )
+        .expect_err("librdkafka refuses an unknown property");
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+    }
+
+    /// A client whose producer reads its CA file from a FIFO in a fresh temp
+    /// dir. Opening the FIFO for writing blocks until librdkafka's
+    /// constructor opens it for reading, so the writer wakes exactly when
+    /// the build is inside the native call, holds it there for `hold`, then
+    /// hands it bytes OpenSSL rejects. Returns the temp dir to remove and the
+    /// writer to join once the build has returned.
+    #[cfg(all(feature = "kafka-ssl", unix))]
+    async fn client_whose_producer_build_stalls(
+        hold: Duration,
+    ) -> (KafkaClient, std::path::PathBuf, std::thread::JoinHandle<()>) {
+        use std::io::Write as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "shove-client-fifo-{}-{}",
+            process::id(),
+            hold.as_millis()
+        ));
+        std::fs::create_dir_all(&dir).expect("create the temp dir");
+        let fifo = dir.join("ca.pem");
+        let ca = fifo.to_str().expect("utf-8 path").to_string();
+        let path = std::ffi::CString::new(ca.as_str()).expect("no NUL");
+        let created = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(created, 0, "mkfifo failed");
+        let writer = std::thread::spawn(move || {
+            let mut fifo = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fifo)
+                .expect("open the FIFO for writing");
+            std::thread::sleep(hold);
+            fifo.write_all(b"not a certificate\n")
+                .expect("write the FIFO");
+        });
+        let client = client_whose_producer_config_sets(&[
+            ("security.protocol", "ssl"),
+            ("ssl.ca.location", ca.as_str()),
+        ])
+        .await;
+        (client, dir, writer)
+    }
+
+    /// librdkafka's constructor blocks while it reads the CA file, so the
+    /// build must run off the runtime: a 10 ms timer on the same
+    /// current-thread runtime fires while the constructor is held on the
+    /// FIFO for 300 ms.
+    #[cfg(all(feature = "kafka-ssl", unix))]
+    #[tokio::test]
+    async fn a_producer_build_blocked_in_librdkafka_leaves_the_runtime_free() {
+        let (client, dir, writer) =
+            client_whose_producer_build_stalls(Duration::from_millis(300)).await;
+        let started = tokio::time::Instant::now();
+        let tick = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            started.elapsed()
+        };
+        let (built, ticked) = tokio::join!(client.producer(), tick);
+        writer.join().expect("the FIFO writer thread");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let free = ticked < Duration::from_millis(150);
+        assert!(free, "a 10 ms timer waited {ticked:?}");
+        let err = built.err().expect("the FIFO bytes are not a certificate");
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+    }
+
+    /// `shutdown` waits for a producer build in flight instead of returning
+    /// while librdkafka is still inside its constructor: with the build held
+    /// on the FIFO for 1 s, a shutdown that only slept its 500 ms grace
+    /// would return first. Nothing is built in the end, because the FIFO
+    /// bytes are not a certificate.
+    #[cfg(all(feature = "kafka-ssl", unix))]
+    #[tokio::test]
+    async fn shutdown_waits_for_a_producer_build_in_flight() {
+        let (client, dir, writer) =
+            client_whose_producer_build_stalls(Duration::from_secs(1)).await;
+        let started = tokio::time::Instant::now();
+        let build = async { client.producer().await.err() };
+        let close = async {
+            // Let the build take the cell first, so the shutdown finds it in
+            // flight rather than an empty cell.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client.shutdown().await;
+            started.elapsed()
+        };
+        let (build_err, closed_after) = tokio::join!(build, close);
+        writer.join().expect("the FIFO writer thread");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let waited = closed_after >= Duration::from_millis(900);
+        assert!(waited, "shutdown returned at {closed_after:?}");
+        let refused = matches!(build_err, Some(ShoveError::Topology(_)));
+        assert!(refused, "got {build_err:?}");
+        assert!(
+            client.producer.get().is_none(),
+            "a failed build left a producer behind"
         );
     }
 }
