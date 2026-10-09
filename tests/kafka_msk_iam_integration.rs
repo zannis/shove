@@ -7,7 +7,8 @@
 //! 2. `KafkaClient::connect(&cfg)` — enters the `MskIam` arm, calls
 //!    `MskIamTokenProvider::new` which loads `aws_config` defaults and resolves
 //!    credentials from environment variables (static credential chain, no network).
-//!    Then constructs `MskIamContext` and creates `FutureProducer<MskIamContext>`.
+//!    Then constructs `MskIamContext` and creates the `BaseConsumer<MskIamContext>`
+//!    that `ping` uses; the `FutureProducer<MskIamContext>` waits for the first publish.
 //! 3. `MskIamContext::generate_oauth_token` invocation path — rdkafka fires
 //!    `RD_KAFKA_EVENT_OAUTHBEARER_TOKEN_REFRESH` on its internal poll thread when
 //!    a produce attempt triggers the SASL handshake. The second test observes this
@@ -45,9 +46,12 @@
 
 #![cfg(feature = "kafka-msk-iam")]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use shove::ShoveError;
+use shove::broker::Broker;
 use shove::kafka::{KafkaClient, KafkaConfig, KafkaSasl, KafkaTls};
+use shove::markers::Kafka;
 
 const AWS_REGION: &str = "us-east-1";
 
@@ -86,13 +90,14 @@ fn set_dummy_aws_env() {
 /// This exercises the full Rust-side wiring:
 /// - `MskIamTokenProvider::new` resolves the AWS credential chain (env vars → done).
 /// - `MskIamContext` wraps the provider.
-/// - `FutureProducer<MskIamContext>` is created via `create_with_context`.
+/// - `BaseConsumer<MskIamContext>`, the metadata client `ping` uses, is created
+///   via `create_with_context`; the producer waits for the first publish.
 ///
 /// We deliberately use a non-existent broker address so rdkafka never opens a
 /// TCP connection — the test stays fast and offline. The `connect` call itself
-/// does not perform any I/O; producer and admin client connections are lazy.
+/// does not perform any I/O; client connections are lazy.
 #[tokio::test]
-async fn msk_iam_connect_resolves_credentials_and_builds_producer() {
+async fn msk_iam_connect_resolves_credentials_and_builds_the_metadata_client() {
     set_dummy_aws_env();
 
     // Non-routable address — the test must not attempt real network I/O.
@@ -178,6 +183,63 @@ async fn msk_iam_generate_oauth_token_does_not_panic() {
             // Also fine: rdkafka is still polling; we just verify it didn't panic.
         }
     }
+
+    // The publish built the producer; the close flushes it.
+    client.shutdown().await;
+}
+
+/// Verifies that `connect` still fails at startup when librdkafka refuses the
+/// connection settings: the metadata client it builds loads the TLS material
+/// the producer would use.
+#[tokio::test]
+async fn msk_iam_connect_rejects_tls_material_librdkafka_refuses() {
+    set_dummy_aws_env();
+
+    let cfg = KafkaConfig::new("192.0.2.1:9098")
+        .with_tls(KafkaTls {
+            ca_pem: Some("not a certificate".into()),
+            ..KafkaTls::default()
+        })
+        .with_sasl(KafkaSasl::msk_iam(AWS_REGION));
+
+    let err = KafkaClient::connect(&cfg)
+        .await
+        .err()
+        .expect("librdkafka rejects the CA material");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("failed to create MSK metadata consumer"),
+        "{msg}"
+    );
+}
+
+/// Verifies that a health check on an MSK IAM client runs on the metadata
+/// client `connect` built: the OAUTHBEARER refresh is served while the probe
+/// waits, and a probe against a non-routable broker ends with a `Connection`
+/// error at its timeout instead of a panic or a hang.
+#[tokio::test]
+async fn msk_iam_ping_times_out_against_a_non_routable_broker() {
+    set_dummy_aws_env();
+
+    let cfg = KafkaConfig::new("192.0.2.1:9098")
+        .with_tls(KafkaTls {
+            skip_hostname_verification: true,
+            ..KafkaTls::default()
+        })
+        .with_sasl(KafkaSasl::msk_iam(AWS_REGION));
+    let client = KafkaClient::connect(&cfg).await.expect("connect");
+    let broker = Broker::<Kafka>::from_client(client);
+
+    let started = Instant::now();
+    let err = broker
+        .ping_with_timeout(Duration::from_millis(300))
+        .await
+        .expect_err("no broker answers at 192.0.2.1");
+    assert!(matches!(err, ShoveError::Connection(_)), "got {err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the probe hung past its timeout"
+    );
 }
 
 /// Verifies that the protocol overlay in `connect()` actually sets

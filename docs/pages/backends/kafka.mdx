@@ -137,12 +137,21 @@ Provision the topic before the consumer starts.
 A consumer then needs these ACLs: `Describe` and `Read` on the topic, and `Describe` and `Read` on the consumer group.
 The group is `{queue}-consumer` unless `for_consumer_group` or `with_group_id` names another.
 A publisher additionally needs `Write` on the topic.
+shove's producer is idempotent.
+librdkafka requests its producer id 500 ms after the producer is created, before any publish, with an `InitProducerId` request.
+A broker authorizes that request as `IdempotentWrite` on the cluster, or since Kafka 2.8 (KIP-679) as `Write` on a topic, and a consumer holds neither.
+The client builds that producer at the first publish, not at connect.
+The first publish may come from `publisher()` or from a consumer's retry, defer or DLQ republish.
+A service that never publishes, through `publisher()` or a republish, therefore never builds a producer and needs no permission beyond the consumer's.
+`connect` still builds the consumer-type client that `ping` uses, so a connection setting librdkafka refuses fails at connect as before.
 A declared DLQ needs `Create`, `Describe` and `Write` on the DLQ topic, so that shove can create it and route to it.
 
 On an external topic, shove's consumer never writes into the topic when it settles an outcome: a `Retry` or a `Defer` waits in place, and a `Reject` publishes to the shove-owned DLQ.
 That is the guarantee, and it covers declaring and consuming.
 Publishing is outside it: a `Publisher` on this topology writes to the topic.
-Until the producer pins `allow.auto.create.topics=false`, a separate change in the same release, a publish to a topic that does not exist can create it with broker defaults on a broker with `auto.create.topics.enable=true`, so provision the topic before any publisher starts.
+The producer pins `allow.auto.create.topics=false`, so a publish to a topic that does not exist fails after the produce timeout and creates nothing.
+Only `with_producer_auto_create_topics(true)` lets a publish create a topic, with broker defaults, on a broker running `auto.create.topics.enable=true`.
+Provision the topic before any publisher starts.
 `Ack` and `Reject` behave as everywhere else, because a `Reject` publishes to the shove-owned DLQ and not into the topic.
 How `Retry` and `Defer` are carried out is the consumer's **retry strategy**, `RetryStrategy::Republish` or `RetryStrategy::InPlace`, set with `with_retry_strategy` on `ConsumerOptions::<Kafka>` or `KafkaConsumerGroupConfig`.
 Ownership implies it: an external topology runs with `InPlace` and refuses `Republish`, because the republish would write into a topic infra owns.
@@ -211,7 +220,10 @@ let config = KafkaConfig::new(brokers)
 Unset throughput settings keep librdkafka's defaults.
 `acks`, `enable.idempotence`, and `max.in.flight.requests.per.connection` are deliberately not exposed.
 
-The client holds a single producer, shared by `publisher()` and by the consumer's retry, defer, and DLQ republishes — a long linger also delays those republishes (and the offset commits gated on them for sequenced topics), so keep linger modest when consumers republish on the same client.
+The client holds a single producer, built at the first publish.
+`publisher()` and the consumer's retry, defer, and DLQ republishes share it.
+A long linger also delays those republishes, and the offset commits gated on them for sequenced topics.
+Keep linger modest when consumers republish on the same client.
 
 ## Consume
 
