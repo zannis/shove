@@ -79,6 +79,7 @@ use super::constants::{
 };
 use super::consumer_group::{CommitPolicy, KafkaAutoOffsetReset};
 use super::offset_reset::target_from_timestamp_lookup;
+use super::startup;
 
 // ---------------------------------------------------------------------------
 // Offset tracking for concurrent consumption
@@ -3251,6 +3252,20 @@ fn lazy_positions(topic: &str, partitions: &[i32], offset: Offset) -> Result<Top
     Ok(tpl)
 }
 
+/// The FIFO entry points reach the spawn without the registry's own check,
+/// so the refusals live here: every FIFO entry point then fails the same way
+/// on a setting the FIFO loop would never read.
+fn check_fifo_options(queue: &str, options: &ConsumerOptions) -> Result<()> {
+    options.refuse_broadcast_start(queue, "KafkaConsumer::run_fifo")?;
+    if options.kafka_commit_policy.is_some() {
+        return Err(reject_fifo_commit_policy(queue));
+    }
+    if options.retry_strategy == Some(RetryStrategy::InPlace) {
+        return Err(reject_fifo_in_place(queue));
+    }
+    Ok(())
+}
+
 /// The error every FIFO entry point returns for options that set a commit
 /// policy, through `with_commit_policy` or its shorthand
 /// `with_commit_interval`: a FIFO consumer commits each message as it
@@ -3875,7 +3890,7 @@ async fn commit_confirmed(
 /// failed and every redelivery would escalate to a reconnect.
 const SEEK_TIMEOUT: Duration = Duration::from_secs(5);
 
-async fn run_with_reconnect<F, Fut>(
+pub(super) async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
     label: &str,
     max_reconnect_attempts: Option<u32>,
@@ -3902,7 +3917,7 @@ where
                 if shutdown.is_cancelled() {
                     return Ok(());
                 }
-                attempts += 1;
+                attempts = attempts.saturating_add(1);
                 if let Some(max) = max_reconnect_attempts
                     && attempts >= max
                 {
@@ -3916,7 +3931,9 @@ where
                         "consumer on '{label}' exhausted {max} reconnect attempt(s): {e}"
                     )));
                 }
-                let delay = backoff.next().expect("backoff is infinite");
+                let Some(delay) = backoff.next() else {
+                    return Err(e);
+                };
                 tracing::warn!(
                     label,
                     attempt = attempts,
@@ -5116,6 +5133,37 @@ impl KafkaConsumer {
         T: Topic,
         H: MessageHandler<T>,
     {
+        self.run_consumer::<T, H>(handler, ctx, options, true).await
+    }
+
+    /// [`run_with_inner`](Self::run_with_inner) for a member of a registry
+    /// group, which declared its topology before it spawned the member and
+    /// so skips the startup topic check.
+    pub(crate) async fn run_declared<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        self.run_consumer::<T, H>(handler, ctx, options, false)
+            .await
+    }
+
+    async fn run_consumer<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+        check_topics: bool,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
         let queue = topology.queue();
         // The direct and supervisor paths reach this function without the
@@ -5189,6 +5237,17 @@ impl KafkaConsumer {
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
         let client = self.client.clone();
+
+        if check_topics {
+            startup::verify(
+                &client,
+                topology,
+                startup::Path::Publishing,
+                &shutdown,
+                options.max_reconnect_attempts,
+            )
+            .await?;
+        }
 
         tracing::info!(
             queue,
@@ -6610,6 +6669,15 @@ impl KafkaConsumer {
         let schema_message_index: Option<Arc<[i32]>> =
             options.schema_message_index.clone().map(Arc::from);
 
+        startup::verify(
+            &client,
+            topology,
+            startup::Path::Publishing,
+            &shutdown,
+            options.max_reconnect_attempts,
+        )
+        .await?;
+
         tracing::info!(
             queue,
             group_id,
@@ -6989,7 +7057,9 @@ impl KafkaConsumer {
         T: SequencedTopic,
         H: MessageHandler<T>,
     {
-        let handles = self.spawn_fifo_shards::<T, H>(handler, ctx, options)?;
+        let handles = self
+            .spawn_fifo_shards_checked::<T, H>(handler, ctx, options)
+            .await?;
         // Kafka has exactly one FIFO task per call (single consumer, partition ordering).
         for handle in handles {
             match handle.await {
@@ -6999,6 +7069,36 @@ impl KafkaConsumer {
             }
         }
         Ok(())
+    }
+
+    /// [`spawn_fifo_shards`](Self::spawn_fifo_shards) after the startup topic
+    /// check, which needs the broker and so cannot run in the sync spawn.
+    ///
+    /// Run here and not in the spawned task: a task's error is logged by
+    /// `run_fifo_with_inner` and not returned, so a check there would end the
+    /// start without telling its caller. The options are refused first, as
+    /// the spawn refuses them, so a bad option never waits on the broker.
+    pub(crate) async fn spawn_fifo_shards_checked<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+    ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        let topology = T::topology();
+        check_fifo_options(topology.queue(), &options)?;
+        startup::verify(
+            &self.client,
+            topology,
+            startup::Path::Publishing,
+            &options.shutdown,
+            options.max_reconnect_attempts,
+        )
+        .await?;
+        self.spawn_fifo_shards::<T, H>(handler, ctx, options)
     }
 
     /// Spawn the Kafka FIFO consumer task and return its join handle.
@@ -7030,17 +7130,7 @@ impl KafkaConsumer {
                 "run_fifo called on {queue} without sequencing config"
             ))
         })?;
-        // The direct and supervisor paths reach this function without the
-        // registry's own check, so the refusals live here: every FIFO entry
-        // point then fails the same way on a setting the FIFO loop would
-        // never read.
-        options.refuse_broadcast_start(&queue, "KafkaConsumer::run_fifo")?;
-        if options.kafka_commit_policy.is_some() {
-            return Err(reject_fifo_commit_policy(&queue));
-        }
-        if options.retry_strategy == Some(RetryStrategy::InPlace) {
-            return Err(reject_fifo_in_place(&queue));
-        }
+        check_fifo_options(&queue, &options)?;
         // Kafka has a single FIFO task covering every assigned partition, so
         // one poison set covers every key this consumer sees. It lives outside
         // the reconnect wrapper below: a broker blip must not un-poison a key.
@@ -7632,7 +7722,10 @@ impl KafkaConsumer {
         S: Future<Output = ()> + Send + 'static,
     {
         let shutdown = options.shutdown.clone();
-        let handles = match self.spawn_fifo_shards::<T, H>(handler, ctx, options) {
+        let handles = match self
+            .spawn_fifo_shards_checked::<T, H>(handler, ctx, options)
+            .await
+        {
             Ok(h) => h,
             Err(e) => {
                 tracing::error!(error = %e, "run_fifo_until_timeout: shard spawn failed");
@@ -7802,6 +7895,15 @@ impl KafkaConsumer {
         #[cfg(feature = "kafka-schema-registry")]
         let schema_message_index: Option<Arc<[i32]>> =
             options.schema_message_index.clone().map(Arc::from);
+
+        startup::verify(
+            &client,
+            topology,
+            startup::Path::Broadcast,
+            &shutdown,
+            options.max_reconnect_attempts,
+        )
+        .await?;
 
         tracing::info!(
             queue,
@@ -8438,6 +8540,15 @@ impl KafkaConsumer {
         #[cfg(feature = "kafka-schema-registry")]
         let schema_message_index: Option<Arc<[i32]>> =
             options.schema_message_index.clone().map(Arc::from);
+
+        startup::verify(
+            &client,
+            topology,
+            startup::Path::DeadLetterDrain,
+            &shutdown,
+            None,
+        )
+        .await?;
 
         tracing::info!(dlq, group_id = dlq_group_id, "Kafka DLQ consumer started");
 

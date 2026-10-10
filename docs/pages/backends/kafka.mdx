@@ -131,8 +131,23 @@ It therefore needs no group permission and cannot trigger the broker's topic aut
 shove never expands the topic's partitions and never reconciles its config.
 A consumer group registered with more `max_consumers` than the topic has partitions runs with the extra members idle.
 `declare` logs a warning when that happens.
-shove still creates and owns its DLQ topic, and still manages its consumer group.
-Provision the topic before the consumer starts.
+The DLQ topic of an external topology is infra's as well, under its default `{queue}-dlq` name or the one `dlq_named` gives it.
+`declare` probes it exactly like the main topic and returns `ShoveError::Topology` when it is missing; shove never creates it and never expands its partitions.
+On a topology that is not external, `declare` creates its DLQ with eight partitions and expands an existing one to that.
+shove still manages its consumer group.
+Provision the topic and its DLQ before the consumer starts.
+
+The registry path is the only one that runs `declare` for you.
+A consumer that starts without it, through `KafkaConsumer::run`, a `ConsumerSupervisor`, `run_batch`, `run_fifo`, a broadcast subscription or `run_dlq`, runs the same metadata probe once at startup, before its reconnect loop and before it consumes a record.
+It probes the main topic when the topology is external, and the DLQ topic wherever the path publishes to it, owned or external: the standard, batch and FIFO consumers.
+A broadcast subscription publishes no dead letters, so it probes the external main topic only.
+`run_dlq` reads from the DLQ and publishes nowhere. On an external topology it probes the main topic and the DLQ topic, both infra's; on a shove-owned one it probes nothing and waits for the DLQ topic, as a consumer waits for an owned main topic.
+A missing topic is `ShoveError::Topology` naming it, returned before any record is consumed.
+A broker that cannot be reached, or does not answer in time, says nothing about the topic and is not a `Topology` error: the probe retries under the consumer's usual backoff and `max_reconnect_attempts`, and a stop ends it.
+A shove-owned main topic is never probed, because another process may still declare it.
+With `with_producer_auto_create_topics(true)` a missing shove-owned DLQ is not probed either, because the first dead-letter publish creates it.
+An external topology with a DLQ is refused outright on a client with `with_producer_auto_create_topics(true)`, at `register` and at every consumer start that publishes dead letters (a publish-only `declare` is not refused, since it never writes a dead letter): a dead-letter publish after that topic disappeared would recreate the infra-owned topic with broker defaults. Consume it through a client without producer auto-creation.
+The probe is a metadata request, so it builds no producer and needs no permission beyond `Describe` on the topic.
 
 A consumer then needs these ACLs: `Describe` and `Read` on the topic, and `Describe` and `Read` on the consumer group.
 The group is `{queue}-consumer` unless `for_consumer_group` or `with_group_id` names another.
@@ -145,14 +160,15 @@ The first publish may come from `publisher()` or from a consumer's retry, defer 
 A service that never publishes, through `publisher()` or a republish, therefore never builds a producer and needs no permission beyond the consumer's.
 `connect` still builds the consumer-type client that `ping` uses, so a connection setting librdkafka refuses fails at connect as before.
 A declared DLQ needs `Create`, `Describe` and `Write` on the DLQ topic, so that shove can create it and route to it.
+On an external topology infra creates the DLQ, so shove needs only `Describe` and `Write` on it.
 
-On an external topic, shove's consumer never writes into the topic when it settles an outcome: a `Retry` or a `Defer` waits in place, and a `Reject` publishes to the shove-owned DLQ.
+On an external topic, shove's consumer never writes into the topic when it settles an outcome: a `Retry` or a `Defer` waits in place, and a `Reject` publishes to the DLQ.
 That is the guarantee, and it covers declaring and consuming.
 Publishing is outside it: a `Publisher` on this topology writes to the topic.
 The producer pins `allow.auto.create.topics=false`, so a publish to a topic that does not exist fails after the produce timeout and creates nothing.
 Only `with_producer_auto_create_topics(true)` lets a publish create a topic, with broker defaults, on a broker running `auto.create.topics.enable=true`.
 Provision the topic before any publisher starts.
-`Ack` and `Reject` behave as everywhere else, because a `Reject` publishes to the shove-owned DLQ and not into the topic.
+`Ack` and `Reject` behave as everywhere else, because a `Reject` publishes to the DLQ and not into the topic.
 How `Retry` and `Defer` are carried out is the consumer's **retry strategy**, `RetryStrategy::Republish` or `RetryStrategy::InPlace`, set with `with_retry_strategy` on `ConsumerOptions::<Kafka>` or `KafkaConsumerGroupConfig`.
 Ownership implies it: an external topology runs with `InPlace` and refuses `Republish`, because the republish would write into a topic infra owns.
 A shove-owned topology runs with `Republish` by default and may opt into `InPlace`, so a consumer that must not duplicate a retried record for the other groups on a fan-out topic can wait in place too.
@@ -161,7 +177,7 @@ A FIFO consumer refuses `InPlace`, which it does not implement.
 | Outcome | `RetryStrategy::Republish`, the shove-owned default | `RetryStrategy::InPlace`, implied by an external topology |
 |---|---|---|
 | `Ack` | commits the offset | the same |
-| `Reject` | publishes to the DLQ when one is declared, then commits | the same, the DLQ is shove's own topic |
+| `Reject` | publishes to the DLQ when one is declared, then commits | the same, to the DLQ topic infra provisioned |
 | `Retry` | republishes into the topic after the tier's delay, with the retry count in a header | waits the tier's delay inside the handler's task, holding its prefetch slot, then hands the same record back with the retry count kept in memory; an exhausted budget goes to the DLQ as usual, with the in-memory count written to the dead letter's `Shove-Retry-Count` header |
 | `Defer` | republishes into the topic after the first tier's delay | waits the first tier's delay in place, then hands the same record back |
 

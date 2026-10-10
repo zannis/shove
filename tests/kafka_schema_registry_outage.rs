@@ -945,6 +945,7 @@ async fn an_unavailable_registry_stalls_the_record_and_resumes() {
 
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
+    create_single_partition_topic(&tb.brokers, &format!("{TOPIC}-dlq")).await;
     let (registry, status, _) = mock_registry("kafka-sr-outage-stall-value", 503).await;
     let client = tb.client().await;
     let body = serde_json::to_vec(&Event { id: 1 }).unwrap();
@@ -1048,6 +1049,7 @@ async fn a_per_record_stall_leaves_the_resume_to_the_commit() {
 
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
+    create_single_partition_topic(&tb.brokers, &format!("{TOPIC}-dlq")).await;
     let (registry, status, hits) =
         mock_registry("kafka-sr-outage-per-record-stall-value", 503).await;
     let client = tb.client().await;
@@ -1129,6 +1131,7 @@ async fn a_batch_flushes_before_the_parked_record_and_resumes() {
     const GROUP: &str = "kafka-sr-outage-batch-consumer";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
+    create_single_partition_topic(&tb.brokers, &format!("{TOPIC}-dlq")).await;
     let (registry, status, _) = mock_registry("kafka-sr-outage-batch-value", 503).await;
     let client = tb.client().await;
     for (schema_id, id) in [(HEALTHY_ID, 1u32), (HEALTHY_ID, 2), (FLAKY_ID, 3)] {
@@ -1279,6 +1282,7 @@ async fn a_retry_before_a_registry_stall_redelivers_the_rewound_span_in_order() 
     const GROUP: &str = "kafka-sr-outage-batch-retry-consumer";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
+    create_single_partition_topic(&tb.brokers, &format!("{TOPIC}-dlq")).await;
     let (registry, status, _) = mock_registry("kafka-sr-outage-batch-retry-value", 503).await;
     let client = tb.client().await;
     for (schema_id, id) in [(HEALTHY_ID, 1u32), (HEALTHY_ID, 2), (FLAKY_ID, 3)] {
@@ -1349,6 +1353,7 @@ async fn shutdown_during_a_registry_wait_leaves_the_record_uncommitted() {
     const GROUP: &str = "kafka-sr-outage-shutdown-consumer";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
+    create_single_partition_topic(&tb.brokers, &format!("{TOPIC}-dlq")).await;
     let (registry, status, _) = mock_registry("kafka-sr-outage-shutdown-value", 503).await;
     let client = tb.client().await;
     let body = serde_json::to_vec(&Event { id: 7 }).unwrap();
@@ -1432,6 +1437,7 @@ async fn an_authentication_failure_ends_the_consumer() {
     const GROUP: &str = "kafka-sr-outage-auth-consumer";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
+    create_single_partition_topic(&tb.brokers, &format!("{TOPIC}-dlq")).await;
     let (registry, _status, _) = mock_registry("kafka-sr-outage-auth-value", 401).await;
     let client = tb.client().await;
     let body = serde_json::to_vec(&Event { id: 4 }).unwrap();
@@ -1483,6 +1489,7 @@ async fn a_fifo_consumer_stalls_and_resumes() {
     const GROUP: &str = "kafka-sr-outage-fifo-fifo";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
+    create_single_partition_topic(&tb.brokers, &format!("{TOPIC}-dlq")).await;
     let (registry, status, _) = mock_registry("kafka-sr-outage-fifo-value", 503).await;
     let client = tb.client().await;
     for (schema_id, id) in [(FLAKY_ID, 1u32), (HEALTHY_ID, 2)] {
@@ -2000,6 +2007,7 @@ async fn shutdown_during_a_registry_lookup_returns_promptly() {
     const TOPIC: &str = "kafka-sr-outage-silent";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
+    create_single_partition_topic(&tb.brokers, &format!("{TOPIC}-dlq")).await;
 
     // A registry that accepts the connection and never answers.
     let accepted = Arc::new(Notify::new());
@@ -2087,6 +2095,7 @@ async fn shutdown_during_a_batch_registry_lookup_returns_promptly() {
     const GROUP: &str = "kafka-sr-outage-batch-silent-consumer";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
+    create_single_partition_topic(&tb.brokers, &format!("{TOPIC}-dlq")).await;
     let (registry, _status, hits) =
         mock_registry("kafka-sr-outage-batch-silent-value", HANG_STATUS).await;
     let client = tb.client().await;
@@ -2144,6 +2153,7 @@ async fn shutdown_during_a_fifo_registry_lookup_returns_promptly() {
     const GROUP: &str = "kafka-sr-outage-fifo-silent-fifo";
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
+    create_single_partition_topic(&tb.brokers, &format!("{TOPIC}-dlq")).await;
     let (registry, _status, hits) =
         mock_registry("kafka-sr-outage-fifo-silent-value", HANG_STATUS).await;
     let client = tb.client().await;
@@ -2426,6 +2436,7 @@ async fn a_partition_assigned_during_a_registry_stall_is_put_back_and_delivered_
     const GROUP: &str = "kafka-sr-outage-assign-consumer";
     let tb = TestBroker::start().await;
     create_topic(&tb.brokers, TOPIC, 2).await;
+    create_single_partition_topic(&tb.brokers, &format!("{TOPIC}-dlq")).await;
     let (registry, status, hits) = mock_registry("kafka-sr-outage-assign-value", 200).await;
     let client = tb.client().await;
     let body = |id: u32| serde_json::to_vec(&Event { id }).unwrap();
@@ -2539,6 +2550,7 @@ async fn a_stalled_record_on_another_partition_is_put_back_behind_a_rewound_span
     const GROUP: &str = "kafka-sr-outage-batch-rewind-putback-consumer";
     let tb = TestBroker::start().await;
     create_topic(&tb.brokers, TOPIC, 2).await;
+    create_single_partition_topic(&tb.brokers, &format!("{TOPIC}-dlq")).await;
     let (registry, status, hits) =
         mock_registry("kafka-sr-outage-batch-rewind-putback-value", 503).await;
     let client = tb.client().await;
@@ -3035,9 +3047,9 @@ async fn an_undecodable_in_place_redelivery_is_dead_lettered_with_the_in_memory_
 
     let tb = TestBroker::start().await;
     create_single_partition_topic(&tb.brokers, TOPIC).await;
-    // The topology is external and never declared, so the shove-owned
-    // dead-letter topic `declare` would create is created here: a publish never
-    // creates a topic, and a dead letter to an absent topic is a discard.
+    // The topology is external and never declared, so the dead-letter topic
+    // infra would provision is created here: the consumer refuses to start
+    // without it.
     create_single_partition_topic(&tb.brokers, "kafka-sr-outage-inplace-undecodable-dlq").await;
     let (registry, status, _) =
         mock_registry("kafka-sr-outage-inplace-undecodable-value", 200).await;

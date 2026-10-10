@@ -794,17 +794,18 @@ impl KafkaClient {
             .map_err(|e| ShoveError::Connection(format!("kafka ping failed: {e}")))
     }
 
-    /// Confirm an infra-owned topic exists and return its partition count,
-    /// creating nothing; see `probe_external_topic_blocking`.
-    pub(super) async fn verify_external_topic(&self, name: &str) -> Result<i32> {
+    /// What the broker says of one topic, creating nothing; see
+    /// `probe_topic_blocking`. `Err` is a metadata fetch that failed, so
+    /// nothing was learned about the topic.
+    pub(super) async fn probe_topic(&self, name: &str) -> Result<TopicProbe> {
         let base = (*self.base_config).clone();
         let topic_name = name.to_string();
         #[cfg(feature = "kafka-msk-iam")]
         let msk_ctx = self.msk_context();
         #[cfg(feature = "kafka-msk-iam")]
         let shutdown = self.shutdown_token();
-        let probed = tokio::task::spawn_blocking(move || {
-            probe_external_topic_blocking(
+        tokio::task::spawn_blocking(move || {
+            probe_topic_blocking(
                 base,
                 &topic_name,
                 #[cfg(feature = "kafka-msk-iam")]
@@ -814,18 +815,27 @@ impl KafkaClient {
             )
         })
         .await
-        .map_err(|e| ShoveError::Topology(format!("metadata task failed: {e}")))??;
-        probed.ok_or_else(|| {
-            metrics::record_backend_error(
-                metrics::BackendLabel::Kafka,
-                metrics::BackendErrorKind::Topology,
-            );
-            ShoveError::Topology(format!(
-                "external(): topic `{name}` must be provisioned before the consumer starts, \
-                 but the broker has no topic by that name; shove never creates or alters an \
-                 external topic"
-            ))
-        })
+        .map_err(|e| ShoveError::Topology(format!("metadata task failed: {e}")))?
+    }
+
+    /// Whether the producer would create a topic it publishes to.
+    pub(super) fn producer_creates_topics(&self) -> bool {
+        self.producer_config
+            .config_map()
+            .get("allow.auto.create.topics")
+            .is_some_and(|v| *v == "true")
+    }
+
+    /// Confirm an infra-owned topic exists and return its partition count,
+    /// creating nothing. `what` names the topic's role in the refusal.
+    pub(super) async fn verify_external_topic(&self, name: &str, what: &str) -> Result<i32> {
+        match self.probe_topic(name).await? {
+            TopicProbe::Present(partitions) => Ok(partitions),
+            TopicProbe::Missing => Err(external_topic_missing(what, name)),
+            TopicProbe::Failed(code) => Err(ShoveError::Topology(format!(
+                "metadata for topic {name} returned {code:?}"
+            ))),
+        }
     }
 
     pub(super) async fn create_admin_default(&self) -> Result<AdminClient<DefaultClientContext>> {
@@ -1159,9 +1169,35 @@ fn fetch_topic_partition_count_blocking(
     Ok(topic.partitions().len() as i32)
 }
 
-/// Whether an infra-owned topic exists, and with how many partitions,
-/// without creating it. `Ok(None)` is the broker's answer that no such topic
-/// exists.
+/// What the broker's metadata says of one topic.
+pub(super) enum TopicProbe {
+    /// The broker has no topic by that name.
+    Missing,
+    /// The topic exists, with this many partitions.
+    Present(i32),
+    /// The broker answered, but with an error for the topic that is not
+    /// "unknown topic": nothing says whether it exists.
+    Failed(RDKafkaRespErr),
+}
+
+/// The `Topology` refusal for an external topic the broker does not have.
+/// `what` is the topic's role: "topic" or "dead-letter topic".
+pub(super) fn external_topic_missing(what: &str, name: &str) -> ShoveError {
+    metrics::record_backend_error(
+        metrics::BackendLabel::Kafka,
+        metrics::BackendErrorKind::Topology,
+    );
+    ShoveError::Topology(format!(
+        "external(): {what} `{name}` must be provisioned before the consumer starts, \
+         but the broker has no topic by that name; shove never creates or alters an \
+         external topic"
+    ))
+}
+
+/// What the broker says of a topic, without creating it. `Err` is a metadata
+/// fetch that failed (`Connection`: the broker is unreachable or timed out),
+/// which says nothing about the topic; `TopicProbe::Missing` is the broker's
+/// answer that no such topic exists.
 ///
 /// The probe is a consumer-type client with no `group.id`, and both halves
 /// matter. librdkafka defaults `allow.auto.create.topics` to true for a
@@ -1172,12 +1208,12 @@ fn fetch_topic_partition_count_blocking(
 /// consumer-type client defaults it to false, and it is set explicitly here
 /// anyway. Without a `group.id` there is no coordinator lookup, so the probe
 /// needs no group permission under a group-scoped ACL.
-fn probe_external_topic_blocking(
+fn probe_topic_blocking(
     base: ClientConfig,
     topic_name: &str,
     #[cfg(feature = "kafka-msk-iam")] msk_ctx: Option<MskIamContext>,
     #[cfg(feature = "kafka-msk-iam")] shutdown: CancellationToken,
-) -> Result<Option<i32>> {
+) -> Result<TopicProbe> {
     let mut cfg = base;
     cfg.set("allow.auto.create.topics", "false");
     let md = fetch_topic_metadata_blocking(
@@ -1189,16 +1225,16 @@ fn probe_external_topic_blocking(
         shutdown,
     )?;
     let Some(topic) = md.topics().iter().find(|t| t.name() == topic_name) else {
-        return Ok(None);
+        return Ok(TopicProbe::Missing);
     };
-    match topic.error() {
-        Some(RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART) => Ok(None),
-        Some(other) => Err(ShoveError::Topology(format!(
-            "metadata for topic {topic_name} returned {other:?}"
-        ))),
-        None if topic.partitions().is_empty() => Ok(None),
-        None => Ok(Some(topic.partitions().len() as i32)),
-    }
+    Ok(match topic.error() {
+        Some(RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART) => TopicProbe::Missing,
+        Some(other) => TopicProbe::Failed(other),
+        None if topic.partitions().is_empty() => TopicProbe::Missing,
+        None => TopicProbe::Present(i32::try_from(topic.partitions().len()).map_err(|_| {
+            ShoveError::Topology(format!("topic {topic_name} reports too many partitions"))
+        })?),
+    })
 }
 
 /// A consumer-type librdkafka client with no `group.id`, used for metadata
