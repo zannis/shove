@@ -207,6 +207,10 @@ impl KafkaTopologyDeclarer {
 
         if let Some(dlq) = topology.dlq() {
             if topology.external() {
+                super::startup::refuse_auto_created_external_dlq(
+                    topology,
+                    self.client.producer_creates_topics(),
+                )?;
                 // Infra owns the dead-letter topic of an external topology
                 // as it owns the main one: verified, never created, and
                 // never expanded.

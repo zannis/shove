@@ -139,6 +139,31 @@ async fn check(client: &KafkaClient, required: &[Required<'_>], queue: &str) -> 
     Ok(())
 }
 
+/// Refuse an `external()` topology with a dead-letter topic on a client whose
+/// producer creates topics: a dead-letter publish after that topic vanished
+/// would recreate an infra-owned topic with broker defaults.
+pub(super) fn refuse_auto_created_external_dlq(
+    topology: &QueueTopology,
+    producer_creates: bool,
+) -> Result<()> {
+    match topology.dlq() {
+        Some(dlq) if topology.external() && producer_creates => {
+            metrics::record_backend_error(
+                metrics::BackendLabel::Kafka,
+                metrics::BackendErrorKind::Topology,
+            );
+            Err(ShoveError::Topology(format!(
+                "topic `{}` is external() with dead-letter topic `{dlq}`, but this client's \
+                 producer creates topics (`KafkaConfig::with_producer_auto_create_topics(true)`), \
+                 so a dead-letter publish could recreate the infra-owned topic: use a client \
+                 without producer auto-creation for this topology",
+                topology.queue()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Probe what `path` needs of `topology`, once.
 ///
 /// A missing topic is `ShoveError::Topology` naming it. A probe that cannot
@@ -152,7 +177,11 @@ pub(super) async fn verify(
     max_reconnect_attempts: Option<u32>,
 ) -> Result<()> {
     let queue = topology.queue();
-    let required = required_topics(topology, path, client.producer_creates_topics());
+    let producer_creates = client.producer_creates_topics();
+    if path == Path::Publishing {
+        refuse_auto_created_external_dlq(topology, producer_creates)?;
+    }
+    let required = required_topics(topology, path, producer_creates);
     if required.is_empty() {
         return Ok(());
     }
@@ -187,6 +216,20 @@ mod tests {
 
     fn names<'a>(required: &[Required<'a>]) -> Vec<(&'a str, Role)> {
         required.iter().map(|r| (r.name, r.role)).collect()
+    }
+
+    #[test]
+    fn auto_create_is_refused_only_for_an_external_topology_with_a_dlq() {
+        let external_dlq = TopologyBuilder::new("orders").external().dlq().build();
+        assert!(matches!(
+            refuse_auto_created_external_dlq(&external_dlq, true),
+            Err(ShoveError::Topology(_))
+        ));
+        assert!(refuse_auto_created_external_dlq(&external_dlq, false).is_ok());
+        let external = TopologyBuilder::new("orders").external().build();
+        assert!(refuse_auto_created_external_dlq(&external, true).is_ok());
+        let owned_dlq = TopologyBuilder::new("orders").dlq().build();
+        assert!(refuse_auto_created_external_dlq(&owned_dlq, true).is_ok());
     }
 
     #[test]

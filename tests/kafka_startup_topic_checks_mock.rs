@@ -511,3 +511,92 @@ async fn registry_members_do_not_probe_again() {
         "a direct run probes its topic and its dead-letter topic once"
     );
 }
+
+/// Asserts `err` is the refusal of an external dead-letter topic on a client
+/// whose producer creates topics.
+fn assert_auto_create_refusal(err: ShoveError, dlq: &str) {
+    match err {
+        ShoveError::Topology(message) => assert!(
+            message.contains(dlq) && message.contains("with_producer_auto_create_topics"),
+            "the refusal must name `{dlq}` and the auto-create setting: {message}"
+        ),
+        other => panic!("expected a Topology error naming `{dlq}`, got {other:?}"),
+    }
+}
+
+/// A producer that creates topics could recreate an infra-owned dead-letter
+/// topic that disappeared after startup, so a client with auto-create on
+/// refuses to consume an external topology with a DLQ, even when every topic
+/// is provisioned.
+#[tokio::test]
+async fn direct_run_refuses_an_external_dead_letter_topic_when_the_producer_creates_topics() {
+    let mock = mock_with(&[
+        "startup-external-dlq-missing",
+        "startup-external-dlq-missing-dlq",
+    ]);
+    let client = connect_with(
+        KafkaConfig::new(mock.bootstrap_servers()).with_producer_auto_create_topics(true),
+    )
+    .await;
+    let ended = tokio::time::timeout(
+        STARTUP_BOUND,
+        KafkaConsumer::new(client).run::<ExternalDlqMissing, _>(
+            Noop,
+            (),
+            ConsumerOptions::<Kafka>::new(),
+        ),
+    )
+    .await
+    .expect("the consumer refuses at startup instead of running");
+    assert_auto_create_refusal(
+        ended.expect_err("auto-create with an external DLQ must be refused"),
+        "startup-external-dlq-missing-dlq",
+    );
+}
+
+/// The registry path refuses the same combination at register, through the
+/// declare it runs.
+#[tokio::test]
+async fn registry_refuses_an_external_dead_letter_topic_when_the_producer_creates_topics() {
+    let mock = mock_with(&[
+        "startup-external-dlq-missing",
+        "startup-external-dlq-missing-dlq",
+    ]);
+    let broker = Broker::<Kafka>::from_client(
+        connect_with(
+            KafkaConfig::new(mock.bootstrap_servers()).with_producer_auto_create_topics(true),
+        )
+        .await,
+    );
+    let mut group = broker.consumer_group();
+    let err = group
+        .register::<ExternalDlqMissing, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            || Noop,
+        )
+        .await
+        .expect_err("auto-create with an external DLQ must be refused at register");
+    assert_auto_create_refusal(err, "startup-external-dlq-missing-dlq");
+}
+
+/// An external topology without a DLQ publishes nowhere, so auto-create on
+/// the client is no risk to it and the consumer starts.
+#[tokio::test]
+async fn direct_run_accepts_an_external_topic_without_a_dlq_when_the_producer_creates_topics() {
+    let mock = mock_with(&["startup-external-missing"]);
+    let client = connect_with(
+        KafkaConfig::new(mock.bootstrap_servers()).with_producer_auto_create_topics(true),
+    )
+    .await;
+    let shutdown = CancellationToken::new();
+    let options = ConsumerOptions::<Kafka>::new().with_shutdown(shutdown.clone());
+    keeps_running_until_shutdown(
+        async move {
+            KafkaConsumer::new(client)
+                .run::<ExternalMissing, _>(Noop, (), options)
+                .await
+        },
+        shutdown,
+    )
+    .await;
+}

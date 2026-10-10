@@ -146,6 +146,7 @@ A missing topic is `ShoveError::Topology` naming it, returned before any record 
 A broker that cannot be reached, or does not answer in time, says nothing about the topic and is not a `Topology` error: the probe retries under the consumer's usual backoff and `max_reconnect_attempts`, and a stop ends it.
 A shove-owned main topic is never probed, because another process may still declare it.
 With `with_producer_auto_create_topics(true)` a missing shove-owned DLQ is not probed either, because the first dead-letter publish creates it.
+An external topology with a DLQ is refused outright on a client with `with_producer_auto_create_topics(true)`, at `declare` and at every consumer start that publishes dead letters: a dead-letter publish after that topic disappeared would recreate the infra-owned topic with broker defaults. Consume it through a client without producer auto-creation.
 The probe is a metadata request, so it builds no producer and needs no permission beyond `Describe` on the topic.
 
 A consumer then needs these ACLs: `Describe` and `Read` on the topic, and `Describe` and `Read` on the consumer group.
