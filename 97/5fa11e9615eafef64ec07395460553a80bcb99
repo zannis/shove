@@ -1,0 +1,19 @@
+tests/kafka_startup_topic_checks_mock.rs
+  s_97e8c3e60a0051::t_ac114423067007 603-630
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "975fa11e9615eafef64ec07395460553a80bcb99",
+  "prompts": {},
+  "sessions": {
+    "s_97e8c3e60a0051": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "70a08f32-2544-4750-a6e5-85db8cf09289",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
