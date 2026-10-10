@@ -12,7 +12,8 @@
 //! as is the dead-letter topic of an `external()` topology. A shove-owned main
 //! topic is not probed: another process may still declare it, and the consumer
 //! waits for it. The dead-letter topic is probed wherever the path publishes
-//! to it, owned or not.
+//! to it, owned or not, and a dead-letter drain of an external topology
+//! probes both of its topics.
 //!
 //! The registry declares its topology before it spawns a member and calls the
 //! consumer through `run_declared`, which skips this check, so it runs once
@@ -111,6 +112,7 @@ fn required_topics<'a>(
         }
         (Path::DeadLetterDrain, Some(name)) => {
             if external {
+                required.push(main);
                 required.push(dead_letter(name));
             }
         }
@@ -295,11 +297,11 @@ mod tests {
     }
 
     #[test]
-    fn the_drain_needs_the_dlq_only_when_infra_owns_it() {
+    fn the_drain_needs_both_topics_only_when_infra_owns_them() {
         let external = TopologyBuilder::new("orders").external().dlq().build();
         assert_eq!(
             names(&required_topics(&external, Path::DeadLetterDrain, false)),
-            [("orders-dlq", Role::DeadLetter)]
+            [("orders", Role::Main), ("orders-dlq", Role::DeadLetter)]
         );
         let owned = TopologyBuilder::new("orders").dlq().build();
         assert!(required_topics(&owned, Path::DeadLetterDrain, false).is_empty());

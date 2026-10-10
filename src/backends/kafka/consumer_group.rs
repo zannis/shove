@@ -1240,6 +1240,11 @@ impl KafkaConsumerGroupRegistry {
             ShoveError::Topology("registry has no client (test-only registry)".into())
         })?;
 
+        super::startup::refuse_auto_created_external_dlq(
+            topology,
+            client.producer_creates_topics(),
+        )?;
+
         let mut declarer = KafkaTopologyDeclarer::new(client.clone())
             .with_min_partitions(config.max_consumers as i32);
         if let Some(rf) = self.default_replication_factor {

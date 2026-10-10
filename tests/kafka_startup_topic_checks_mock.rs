@@ -628,3 +628,38 @@ async fn batch_run_refuses_an_external_dead_letter_topic_when_the_producer_creat
         "startup-external-dlq-missing-dlq",
     );
 }
+
+/// A service that only publishes never writes a dead letter, so its declare
+/// of an external topology with a DLQ is not refused for producer
+/// auto-creation; only a consumer is.
+#[tokio::test]
+async fn declare_accepts_an_external_dead_letter_topic_when_the_producer_creates_topics() {
+    let mock = mock_with(&[
+        "startup-external-dlq-missing",
+        "startup-external-dlq-missing-dlq",
+    ]);
+    let broker = Broker::<Kafka>::from_client(
+        connect_with(
+            KafkaConfig::new(mock.bootstrap_servers()).with_producer_auto_create_topics(true),
+        )
+        .await,
+    );
+    broker
+        .topology()
+        .declare::<ExternalDlqMissing>()
+        .await
+        .expect("a publish-only declare is not a dead-letter publisher");
+}
+
+/// The drain binds the topology as a whole, so a missing external main topic
+/// is refused there too, even with the DLQ provisioned.
+#[tokio::test]
+async fn dead_letter_drain_refuses_a_missing_external_topic() {
+    let mock = mock_with(&["startup-external-dlq-missing-dlq"]);
+    let client = connect(&mock.bootstrap_servers()).await;
+    refused_at_startup(
+        KafkaConsumer::new(client).run_dlq::<ExternalDlqMissing, _>(Noop, ()),
+        "startup-external-dlq-missing",
+    )
+    .await;
+}

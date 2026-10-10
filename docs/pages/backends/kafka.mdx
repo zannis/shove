@@ -141,12 +141,12 @@ The registry path is the only one that runs `declare` for you.
 A consumer that starts without it, through `KafkaConsumer::run`, a `ConsumerSupervisor`, `run_batch`, `run_fifo`, a broadcast subscription or `run_dlq`, runs the same metadata probe once at startup, before its reconnect loop and before it consumes a record.
 It probes the main topic when the topology is external, and the DLQ topic wherever the path publishes to it, owned or external: the standard, batch and FIFO consumers.
 A broadcast subscription publishes no dead letters, so it probes the external main topic only.
-`run_dlq` reads from the DLQ and publishes nowhere, so it probes the DLQ topic when the topology is external, where infra owns it, and waits for it when shove owns it, as a consumer waits for an owned main topic.
+`run_dlq` reads from the DLQ and publishes nowhere. On an external topology it probes the main topic and the DLQ topic, both infra's; on a shove-owned one it probes nothing and waits for the DLQ topic, as a consumer waits for an owned main topic.
 A missing topic is `ShoveError::Topology` naming it, returned before any record is consumed.
 A broker that cannot be reached, or does not answer in time, says nothing about the topic and is not a `Topology` error: the probe retries under the consumer's usual backoff and `max_reconnect_attempts`, and a stop ends it.
 A shove-owned main topic is never probed, because another process may still declare it.
 With `with_producer_auto_create_topics(true)` a missing shove-owned DLQ is not probed either, because the first dead-letter publish creates it.
-An external topology with a DLQ is refused outright on a client with `with_producer_auto_create_topics(true)`, at `declare` and at every consumer start that publishes dead letters: a dead-letter publish after that topic disappeared would recreate the infra-owned topic with broker defaults. Consume it through a client without producer auto-creation.
+An external topology with a DLQ is refused outright on a client with `with_producer_auto_create_topics(true)`, at `register` and at every consumer start that publishes dead letters (a publish-only `declare` is not refused, since it never writes a dead letter): a dead-letter publish after that topic disappeared would recreate the infra-owned topic with broker defaults. Consume it through a client without producer auto-creation.
 The probe is a metadata request, so it builds no producer and needs no permission beyond `Describe` on the topic.
 
 A consumer then needs these ACLs: `Describe` and `Read` on the topic, and `Describe` and `Read` on the consumer group.
