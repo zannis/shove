@@ -600,3 +600,31 @@ async fn direct_run_accepts_an_external_topic_without_a_dlq_when_the_producer_cr
     )
     .await;
 }
+
+/// The batch consumer publishes dead letters too, so it refuses the same
+/// combination at startup.
+#[tokio::test]
+async fn batch_run_refuses_an_external_dead_letter_topic_when_the_producer_creates_topics() {
+    let mock = mock_with(&[
+        "startup-external-dlq-missing",
+        "startup-external-dlq-missing-dlq",
+    ]);
+    let client = connect_with(
+        KafkaConfig::new(mock.bootstrap_servers()).with_producer_auto_create_topics(true),
+    )
+    .await;
+    let ended = tokio::time::timeout(
+        STARTUP_BOUND,
+        KafkaConsumer::new(client).run_batch::<ExternalDlqMissing, _>(
+            Noop,
+            (),
+            BatchConsumerOptions::new(),
+        ),
+    )
+    .await
+    .expect("the batch consumer refuses at startup instead of running");
+    assert_auto_create_refusal(
+        ended.expect_err("auto-create with an external DLQ must be refused"),
+        "startup-external-dlq-missing-dlq",
+    );
+}
