@@ -1,0 +1,27 @@
+src/backends/kafka/topology.rs
+  s_97e8c3e60a0051::t_fc63edd321634a 210-213
+src/backends/kafka/startup.rs
+  s_97e8c3e60a0051::t_9b15416e6cb702 180-184,227
+  s_97e8c3e60a0051::t_4ea43f05aa691d 142-166,226
+  s_97e8c3e60a0051::t_9cfcdf05fbc66f 221-225,228-234
+docs/pages/backends/kafka.mdx
+  s_97e8c3e60a0051::t_c66c62d80df1c0 149
+tests/kafka_startup_topic_checks_mock.rs
+  s_97e8c3e60a0051::t_5fa95a8546caa2 514-602
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5956ae11e1fe2f0282e0227f68a56b441befa7c6",
+  "prompts": {},
+  "sessions": {
+    "s_97e8c3e60a0051": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "70a08f32-2544-4750-a6e5-85db8cf09289",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
