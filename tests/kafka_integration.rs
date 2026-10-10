@@ -3179,6 +3179,33 @@ async fn external_dead_letter_topic_missing_fails_fast_at_declare() {
     broker.close().await;
 }
 
+/// The startup probe of a direct run refuses a missing external topic on a
+/// real broker that auto-creates topics, and creates neither it nor its DLQ:
+/// the probe asks for metadata without auto-creation.
+#[tokio::test]
+async fn direct_run_on_a_missing_external_topic_creates_nothing() {
+    const TOPIC: &str = "kafka-external-dlq-default";
+    const DLQ: &str = "kafka-external-dlq-default-dlq";
+    let tb = TestBroker::start().await;
+    let consumer = KafkaConsumer::new(tb.client());
+    let ended = tokio::time::timeout(
+        Duration::from_secs(30),
+        consumer.run::<ExternalDlqDefaultTopic, _>(
+            CountingHandler::new(),
+            (),
+            ConsumerOptions::<Kafka>::new(),
+        ),
+    )
+    .await
+    .expect("the run refuses at startup instead of retrying");
+    match ended {
+        Err(ShoveError::Topology(message)) => assert!(message.contains(TOPIC), "{message}"),
+        other => panic!("expected a Topology error naming {TOPIC}, got {other:?}"),
+    }
+    assert_eq!(live_partition_count(tb.brokers(), TOPIC), None);
+    assert_eq!(live_partition_count(tb.brokers(), DLQ), None);
+}
+
 /// Every Kafka delivery carries the record's coordinates: a partition, an
 /// offset that runs contiguously from zero inside each partition of a fresh
 /// topic, and a broker timestamp inside the test's own wall-clock window.
