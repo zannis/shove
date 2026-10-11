@@ -8,6 +8,7 @@ mod consumer_group;
 mod msk_iam;
 mod offset_reset;
 mod publisher;
+mod startup;
 mod topology;
 
 pub use autoscaler::{
@@ -29,6 +30,9 @@ pub use consumer::permit_wait_probe;
 pub use consumer::put_back_probe;
 pub use consumer::{BatchConsumerOptions, KafkaConsumer};
 pub(crate) use consumer_group::validate_commit_policy;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use startup::startup_probe;
 
 /// Test-only seam (see the `test-support` feature): the deadline the
 /// concurrent receive loop gives its final synchronous commit at shutdown,

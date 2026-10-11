@@ -815,12 +815,13 @@ impl TopologyBuilder {
     /// binds to it and **verifies** it at `declare()`, failing fast with
     /// `ShoveError::Topology` when it is missing. shove never creates,
     /// expands or reconfigures an external resource; it still manages its own
-    /// consumer group or durable consumer and its own DLQ. Each declarer
-    /// decides what verification means:
+    /// consumer group or durable consumer. Whose the DLQ is, and so whether
+    /// `declare()` verifies or creates it, is the backend's call, and the
+    /// table has it. Each declarer decides what verification means:
     ///
     /// | Backend | `declare()` on an external topology |
     /// |---|---|
-    /// | Kafka | a metadata probe from a client with no `group.id`, which cannot auto-create the topic; the topic's partitions are never expanded and its config never reconciled |
+    /// | Kafka | a metadata probe from a client with no `group.id`, which cannot auto-create the topic; the topic's partitions are never expanded and its config never reconciled; the DLQ, under its default or its `dlq_named` name, is infra's too and gets the same probe, so a missing one is a `ShoveError::Topology` and shove never creates or expands it |
     /// | NATS JetStream | `get_stream`; the durable consumer and the DLQ stream are still shove's |
     /// | RabbitMQ | refused with `ShoveError::Topology` on this version, at `declare` and at every consumer entry point, until the declarer verifies with a passive `queue.declare` and the consumer retries with `basic.nack` and requeue; refusing is the safe direction, because creating the resource is the write this flag promises never to make, and so is a `Retry` republished into it |
     /// | AWS SNS/SQS | refused with `ShoveError::Topology` on this version; infra owns the topic, the queue, the queue policy, the subscription and the redrive policy, and the declarer will verify them: `GetQueueUrl` proves the queue, and `GetTopicAttributes` with `ListSubscriptionsByTopic` prove the rest best effort; `dlq()` on an external queue is then verify-only or refused, because the dead-letter wiring is the primary's `RedrivePolicy` and infra sets it; a `Retry` there uses the visibility-timeout path the FIFO consumer already has, because the standard path's delete plus `SendMessage` is a write into the queue; none of it changes the API, so adding SQS is additive; until then `declare` and every consumer entry point refuse the flag |
@@ -850,7 +851,10 @@ impl TopologyBuilder {
     ///
     /// On Kafka a consumer group's `max_consumers` no longer sets a partition
     /// floor: members beyond the topic's partition count sit idle, and
-    /// `declare()` logs a warning when that happens.
+    /// `declare()` logs a warning when that happens. A Kafka consumer that
+    /// starts without `declare()` runs the same probe once at startup on the
+    /// topic and, where it publishes dead letters, on the DLQ, so a missing
+    /// one is a `ShoveError::Topology` rather than an endless reconnect.
     pub fn external(mut self) -> Self {
         self.external = true;
         self
