@@ -9,7 +9,7 @@
 //!
 //! Run with: `cargo test --features rabbitmq,audit --test rabbitmq_integration`
 
-use lapin::options::{BasicPublishOptions, QueueDeclareOptions};
+use lapin::options::{BasicPublishOptions, ConfirmSelectOptions, QueueDeclareOptions};
 use lapin::types::FieldTable;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
@@ -6542,6 +6542,10 @@ async fn consuming_an_external_topology_is_refused_at_every_entry_point() {
         )
         .await
         .expect("infra declares the queue");
+    channel
+        .confirm_select(ConfirmSelectOptions::default())
+        .await
+        .expect("confirm mode");
     channel
         .basic_publish(
             "".into(),
