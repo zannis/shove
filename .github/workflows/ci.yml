@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
     # Code paths only. `benches/**` is spelled out so the results document
     # and the bench README stay out, and the committed charts are absent on
     # purpose: a chart-only or results-only change is checked by
