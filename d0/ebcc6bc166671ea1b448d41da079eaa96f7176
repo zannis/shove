@@ -1,0 +1,19 @@
+.github/workflows/ci.yml
+  s_426b227b3d7950::t_4bd1a73c917d8f 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d0ebcc6bc166671ea1b448d41da079eaa96f7176",
+  "prompts": {},
+  "sessions": {
+    "s_426b227b3d7950": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4a3f487b-3cb3-48e3-84b6-7596206d2afb",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
