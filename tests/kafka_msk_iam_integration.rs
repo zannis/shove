@@ -419,9 +419,14 @@ mod token_callback {
     async fn token_generation_inside_multi_thread_runtime() {
         let callback = connected_token_callback().await;
 
-        let token = callback
-            .generate_oauth_token(None)
-            .expect("the callback mints a token on a runtime worker");
+        let token = tokio::spawn(async move {
+            callback
+                .generate_oauth_token(None)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .expect("the worker task")
+        .expect("the callback mints a token on a runtime worker");
 
         assert_signed(&token);
     }
