@@ -5,24 +5,27 @@
 //! 1. `KafkaConfig::new(...).with_tls(...).with_sasl(KafkaSasl::msk_iam(...))` — config
 //!    construction via the public builder API.
 //! 2. `KafkaClient::connect(&cfg)` — enters the `MskIam` arm, calls
-//!    `MskIamTokenProvider::new` which loads `aws_config` defaults and resolves
-//!    credentials from environment variables (static credential chain, no network).
-//!    Then constructs `MskIamContext` and creates the `BaseConsumer<MskIamContext>`
-//!    that `ping` uses; the `FutureProducer<MskIamContext>` waits for the first publish.
+//!    `MskIamTokenProvider::new` which loads `aws_config` defaults, resolved here
+//!    from environment variables (static credential chain, no network), and
+//!    starts the signer thread. Then constructs `MskIamContext` and creates the
+//!    `BaseConsumer<MskIamContext>` that `ping` uses; the
+//!    `FutureProducer<MskIamContext>` waits for the first publish.
 //! 3. `MskIamContext::generate_oauth_token` invocation path — rdkafka fires
-//!    `RD_KAFKA_EVENT_OAUTHBEARER_TOKEN_REFRESH` on its internal poll thread when
-//!    a produce attempt triggers the SASL handshake. The second test observes this
-//!    by driving a publish to a non-routable broker and verifying the test process
-//!    does not crash.
+//!    `RD_KAFKA_EVENT_OAUTHBEARER_TOKEN_REFRESH` on the producer's polling thread
+//!    when a produce attempt triggers the SASL handshake. The second test observes
+//!    this by driving a publish to a non-routable broker and verifying the test
+//!    process does not crash.
+//! 4. The callback on each kind of thread librdkafka runs it on (the
+//!    `token_callback` tests, behind `test-support`).
 //!
-//! # Bug found and fixed by this test suite
+//! # Where the token callback runs
 //!
-//! During development, `MskIamContext::generate_oauth_token` called
-//! `tokio::runtime::Handle::current()`, which panics on librdkafka's internal
-//! C polling thread (no Tokio runtime is attached there). The fix captures the
-//! handle in `MskIamTokenProvider::new` — while still inside an async context —
-//! and stores it for later use by `generate_oauth_token`. This test now confirms
-//! that the callback executes without panicking.
+//! librdkafka serves the OAUTHBEARER refresh inline on whichever thread polls
+//! the client: the producer's polling thread, a consumer's `recv()` on a Tokio
+//! worker, or a producer flush inside `async fn shutdown`. `MskIamContext`
+//! mints each token on a dedicated signer thread that drives its own runtime,
+//! and the `token_callback` tests call it from a multi-thread worker, from the
+//! only thread of a `current_thread` runtime, and from a plain thread.
 //!
 //! # What this test does NOT exercise
 //!
@@ -41,7 +44,7 @@
 //!
 //! ```
 //! dotenvx run -- cargo nextest run \
-//!     --features kafka-msk-iam --test kafka_msk_iam_integration --no-capture
+//!     --features kafka-msk-iam,test-support --test kafka_msk_iam_integration --no-capture
 //! ```
 
 #![cfg(feature = "kafka-msk-iam")]
@@ -298,4 +301,97 @@ async fn msk_iam_connect_with_retry_succeeds_on_first_attempt() {
         .expect("connect_with_retry must succeed on first attempt with valid MSK IAM config");
 
     assert!(!client.shutdown_token().is_cancelled());
+}
+
+// ---------------------------------------------------------------------------
+// The token callback, on each kind of thread librdkafka calls it from
+// ---------------------------------------------------------------------------
+
+/// librdkafka runs the OAUTHBEARER callback inline on whichever thread polls
+/// the client: a consumer's `recv()` on a Tokio worker, a producer flush
+/// inside `async fn shutdown`, or the producer's own polling thread.
+#[cfg(feature = "test-support")]
+mod token_callback {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use rdkafka::client::{ClientContext, OAuthToken};
+    use shove::kafka::{KafkaClient, KafkaConfig, KafkaSasl, KafkaTls, msk_iam_context_for_test};
+
+    use super::{AWS_REGION, set_dummy_aws_env};
+
+    /// The token callback `connect` installs on the librdkafka clients of an
+    /// MSK IAM `KafkaClient`.
+    async fn connected_token_callback() -> impl ClientContext {
+        set_dummy_aws_env();
+        let cfg = KafkaConfig::new("192.0.2.1:9098")
+            .with_tls(KafkaTls {
+                skip_hostname_verification: true,
+                ..KafkaTls::default()
+            })
+            .with_sasl(KafkaSasl::msk_iam(AWS_REGION));
+        let client = KafkaClient::connect(&cfg).await.expect("connect");
+        msk_iam_context_for_test(&client).expect("an MSK IAM client carries a token callback")
+    }
+
+    /// A token the signer minted: non-empty, expiring in the future and no
+    /// later than the signer's fifteen-minute expiry.
+    fn assert_signed(token: &OAuthToken) {
+        let now_ms = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after the epoch")
+                .as_millis(),
+        )
+        .expect("epoch millis fit an i64");
+        assert!(!token.token.is_empty(), "the token is empty");
+        assert!(
+            token.lifetime_ms > now_ms,
+            "the token expired at {}, now is {now_ms}",
+            token.lifetime_ms
+        );
+        assert!(
+            token.lifetime_ms <= now_ms + 15 * 60 * 1000,
+            "the token outlives the signer's expiry: {}, now is {now_ms}",
+            token.lifetime_ms
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_generation_inside_multi_thread_runtime() {
+        let callback = connected_token_callback().await;
+
+        let token = callback
+            .generate_oauth_token(None)
+            .expect("the callback mints a token on a runtime worker");
+
+        assert_signed(&token);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn token_generation_inside_current_thread_runtime() {
+        let callback = connected_token_callback().await;
+
+        let token = callback
+            .generate_oauth_token(None)
+            .expect("the callback mints a token on the runtime's only thread");
+
+        assert_signed(&token);
+    }
+
+    #[test]
+    fn token_generation_from_plain_thread() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let callback = runtime.block_on(connected_token_callback());
+
+        let token = std::thread::spawn(move || {
+            callback
+                .generate_oauth_token(None)
+                .map_err(|e| e.to_string())
+        })
+        .join()
+        .expect("the polling thread")
+        .expect("the callback mints a token off any runtime");
+
+        assert_signed(&token);
+    }
 }

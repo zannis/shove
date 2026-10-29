@@ -30,6 +30,9 @@ pub use consumer::permit_wait_probe;
 pub use consumer::put_back_probe;
 pub use consumer::{BatchConsumerOptions, KafkaConsumer};
 pub(crate) use consumer_group::validate_commit_policy;
+#[cfg(all(feature = "kafka-msk-iam", feature = "test-support"))]
+#[doc(hidden)]
+pub use msk_iam::msk_iam_context_for_test;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use startup::startup_probe;
