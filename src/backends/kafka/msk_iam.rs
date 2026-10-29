@@ -11,10 +11,15 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use crate::ShoveError;
 use crate::error::Result;
 
-/// How long the token callback waits for the signer before it fails the
-/// refresh; librdkafka keeps any token it still holds and retries ten
-/// seconds later. The AWS SDK gives loading an identity the same budget.
+/// How long the signer gives one token before it cancels the attempt and
+/// fails the refresh; librdkafka keeps any token it still holds and retries
+/// ten seconds later. The AWS SDK gives loading an identity the same budget.
 const SIGN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the token callback waits for the signer's answer: a second past
+/// the signer's own deadline, so only a signer thread that stopped answering
+/// runs it out.
+const ANSWER_TIMEOUT: Duration = SIGN_TIMEOUT.saturating_add(Duration::from_secs(1));
 
 /// A presigned token and its expiry in epoch milliseconds.
 type Signed = Result<(String, i64)>;
@@ -26,11 +31,12 @@ type Signed = Result<(String, i64)>;
 /// polls the client: the producer's polling thread, a consumer's `recv()`
 /// on a Tokio worker, or a producer flush inside `async fn shutdown`. The
 /// signer is async, so it runs on a dedicated thread that drives its own
-/// current-thread runtime and signs each request on a task of its own. The
-/// callback hands that thread a request and blocks until the reply arrives
-/// or [`SIGN_TIMEOUT`] passes. Nothing it waits on needs the caller's
-/// runtime, so it works on a multi-thread worker, on the only thread of a
-/// `current_thread` runtime, and on a thread with no runtime at all.
+/// current-thread runtime and signs each request on a task of its own,
+/// cancelling an attempt that outlives [`SIGN_TIMEOUT`]. The callback hands
+/// that thread a request and blocks until the answer arrives, for at most
+/// [`ANSWER_TIMEOUT`]. Nothing it waits on needs the caller's runtime, so it
+/// works on a multi-thread worker, on the only thread of a `current_thread`
+/// runtime, and on a thread with no runtime at all.
 ///
 /// The thread exits once the last handle to the provider is dropped.
 pub(super) struct MskIamTokenProvider {
@@ -48,6 +54,14 @@ impl MskIamTokenProvider {
         let credentials = cfg.credentials_provider().ok_or_else(|| {
             ShoveError::Connection("no AWS credentials provider available for MSK IAM auth".into())
         })?;
+        Self::start(region, credentials).await
+    }
+
+    /// Start the signer thread for `credentials` in `region`.
+    async fn start(
+        region: aws_config::Region,
+        credentials: SharedCredentialsProvider,
+    ) -> Result<Self> {
         let (requests, pending) = tokio_mpsc::unbounded_channel();
         let (started_tx, started) = oneshot::channel();
         std::thread::Builder::new()
@@ -68,16 +82,16 @@ impl MskIamTokenProvider {
     }
 
     /// Mint one token on the signer thread, blocking the calling thread until
-    /// the signer answers or [`SIGN_TIMEOUT`] passes.
+    /// the signer answers or [`ANSWER_TIMEOUT`] passes.
     fn sign(&self) -> Signed {
         let (reply, answer) = mpsc::channel();
         self.requests
             .send(reply)
             .map_err(|_| ShoveError::Connection("the MSK IAM signer thread has stopped".into()))?;
-        match answer.recv_timeout(SIGN_TIMEOUT) {
+        match answer.recv_timeout(ANSWER_TIMEOUT) {
             Ok(signed) => signed,
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ShoveError::Connection(format!(
-                "MSK IAM token signing did not finish within {SIGN_TIMEOUT:?}"
+                "the MSK IAM signer did not answer within {ANSWER_TIMEOUT:?}"
             ))),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(ShoveError::Connection(
                 "the MSK IAM signer dropped the request".into(),
@@ -112,11 +126,20 @@ fn run_signer(
             let region = region.clone();
             let credentials = credentials.clone();
             tokio::spawn(async move {
-                let signed = generate_auth_token_from_credentials_provider(region, credentials)
-                    .await
-                    .map_err(|e| {
-                        ShoveError::Connection(format!("failed to sign an MSK IAM token: {e}"))
-                    });
+                let signed = match tokio::time::timeout(
+                    SIGN_TIMEOUT,
+                    generate_auth_token_from_credentials_provider(region, credentials),
+                )
+                .await
+                {
+                    Ok(Ok(token)) => Ok(token),
+                    Ok(Err(e)) => Err(ShoveError::Connection(format!(
+                        "failed to sign an MSK IAM token: {e}"
+                    ))),
+                    Err(_elapsed) => Err(ShoveError::Connection(format!(
+                        "MSK IAM token signing was cancelled after {SIGN_TIMEOUT:?}"
+                    ))),
+                };
                 // The callback may have stopped waiting.
                 let _ = reply.send(signed);
             });
@@ -166,4 +189,64 @@ pub fn msk_iam_context_for_test(
     client: &super::client::KafkaClient,
 ) -> Option<impl ClientContext + use<>> {
     client.msk_context()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use aws_credential_types::provider::{ProvideCredentials, future};
+
+    use super::*;
+
+    /// Raises its flag when dropped.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A credential source that never answers, and raises its flag when the
+    /// attempt waiting on it is dropped.
+    #[derive(Debug)]
+    struct NeverAnswers(Arc<AtomicBool>);
+
+    impl ProvideCredentials for NeverAnswers {
+        fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            let dropped = DropFlag(Arc::clone(&self.0));
+            future::ProvideCredentials::new(async move {
+                let _dropped = dropped;
+                std::future::pending().await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sign_past_its_deadline_is_cancelled_and_answered() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let provider = MskIamTokenProvider::start(
+            aws_config::Region::new("us-east-1"),
+            SharedCredentialsProvider::new(NeverAnswers(Arc::clone(&dropped))),
+        )
+        .await
+        .expect("the signer starts");
+
+        let err = provider
+            .sign()
+            .expect_err("a credential source that never answers signs nothing");
+
+        assert!(
+            matches!(&err, ShoveError::Connection(msg) if msg.contains("was cancelled after")),
+            "{err}"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the abandoned sign is still waiting on its credential source"
+        );
+    }
 }
