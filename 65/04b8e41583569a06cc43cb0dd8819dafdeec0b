@@ -1,0 +1,19 @@
+docs/pages/backends/kafka/examples/msk_iam.mdx
+  s_1001dc3147e1e5::t_3c0ba70d3cd9db 89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6504b8e41583569a06cc43cb0dd8819dafdeec0b",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
