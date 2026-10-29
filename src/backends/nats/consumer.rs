@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_nats::HeaderMap;
-use async_nats::header::NATS_MESSAGE_ID;
+use async_nats::header::{HeaderName, HeaderValue, NATS_MESSAGE_ID, NATS_MESSAGE_TTL, NATS_ROLLUP};
 use async_nats::jetstream::Message;
 use async_nats::jetstream::consumer::AckPolicy;
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
@@ -45,7 +45,7 @@ use super::constants::{
     DEATH_COUNT_HEADER, DEATH_REASON_HEADER, ORIGINAL_QUEUE_HEADER, RETRY_COUNT_HEADER,
     SEQUENCE_KEY_HEADER,
 };
-use super::publisher::publish_with_retry;
+use super::publisher::{header_value, publish_with_retry};
 
 // ---------------------------------------------------------------------------
 // ack_wait derivation
@@ -252,6 +252,55 @@ fn adjust_outcome_for_fifo(outcome: Outcome) -> Outcome {
     }
 }
 
+/// Header-name prefix of JetStream's optimistic-concurrency publish checks.
+const EXPECTED_HEADER_PREFIX: &str = "Nats-Expected-";
+
+/// Whether `name` is a JetStream publish directive: an instruction to the
+/// server about the publish that carries it, which a copy must not replay. A
+/// `Nats-Expected-*` check fails against another stream or a later sequence,
+/// and a stream that does not allow `Nats-Rollup` or `Nats-TTL` refuses the
+/// publish; one that does would purge the copy's subject or expire the copy.
+fn is_publish_directive(name: &HeaderName) -> bool {
+    *name == NATS_ROLLUP
+        || *name == NATS_MESSAGE_TTL
+        || AsRef::<str>::as_ref(name).starts_with(EXPECTED_HEADER_PREFIX)
+}
+
+/// The original's headers less its publish directives: what every retry and
+/// dead-letter copy starts from. Every value of a repeated header is kept.
+fn copy_headers(original: Option<&HeaderMap>) -> HeaderMap {
+    let mut copy = HeaderMap::new();
+    for (name, values) in original.into_iter().flat_map(HeaderMap::iter) {
+        if is_publish_directive(name) {
+            continue;
+        }
+        for value in values {
+            copy.append(name.clone(), value.clone());
+        }
+    }
+    copy
+}
+
+/// The `Nats-Msg-Id` of a copy of `msg`: the original delivery's
+/// `{stream}.{stream_sequence}`, then `-{suffix}`.
+///
+/// The stream position is what makes the id right for JetStream's duplicate
+/// window. A redelivery of the same record, after a crash between the copy's
+/// publish and the original's ack, rebuilds the same id, so the window keeps
+/// one copy. Two different records never share an id, whether or not their
+/// producer gave them a `Nats-Msg-Id` of their own.
+fn copy_message_id(msg: &Message, suffix: &str) -> Result<HeaderValue> {
+    let info = msg.info().map_err(|e| {
+        ShoveError::Validation(format!(
+            "a copy's id needs the delivery's stream position: {e}"
+        ))
+    })?;
+    header_value(
+        "Nats-Msg-Id",
+        &format!("{}.{}-{suffix}", info.stream, info.stream_sequence),
+    )
+}
+
 /// Publishes a message to the DLQ stream with death headers, the message's
 /// own `Shove-Retry-Count` header kept as it is.
 async fn publish_to_dlq(
@@ -264,6 +313,10 @@ async fn publish_to_dlq(
 }
 
 /// Publishes a message to the DLQ stream with death headers.
+///
+/// `reason` is written to `Shove-Death-Reason` as given. A codec error can
+/// quote the payload, line breaks included, so a decode failure passes the
+/// fixed `deserialization_error` and leaves the error itself to the log.
 ///
 /// `retry_count` is `Some` on the in-place path, where the count lives in the
 /// delivery info and not in a header: the dead letter is stamped with it, so a
@@ -287,11 +340,17 @@ async fn publish_dead_letter(
         }
     };
 
-    let mut headers = msg.headers.clone().unwrap_or_default();
-    headers.insert(DEATH_REASON_HEADER, reason);
-    headers.insert(ORIGINAL_QUEUE_HEADER, topology.queue());
+    let mut headers = copy_headers(msg.headers.as_ref());
+    headers.insert(
+        DEATH_REASON_HEADER,
+        header_value(DEATH_REASON_HEADER, reason)?,
+    );
+    headers.insert(
+        ORIGINAL_QUEUE_HEADER,
+        header_value(ORIGINAL_QUEUE_HEADER, topology.queue())?,
+    );
     if let Some(count) = retry_count {
-        headers.insert(RETRY_COUNT_HEADER, count.to_string().as_str());
+        headers.insert(RETRY_COUNT_HEADER, HeaderValue::from(count));
     }
 
     let current_death_count = msg
@@ -302,17 +361,9 @@ async fn publish_dead_letter(
         .unwrap_or(0);
     headers.insert(
         DEATH_COUNT_HEADER,
-        (current_death_count + 1).to_string().as_str(),
+        HeaderValue::from(current_death_count.saturating_add(1)),
     );
-
-    // Generate a new message ID for the DLQ publish to avoid dedup rejection
-    let original_id = msg
-        .headers
-        .as_ref()
-        .and_then(|hm| hm.get(NATS_MESSAGE_ID))
-        .map(|v| v.as_str().to_string())
-        .unwrap_or_default();
-    headers.insert(NATS_MESSAGE_ID, format!("{original_id}-dlq").as_str());
+    headers.insert(NATS_MESSAGE_ID, copy_message_id(msg, "dlq")?);
 
     publish_with_retry(
         client.jetstream(),
@@ -359,13 +410,13 @@ async fn hold_then_republish(
         (ack_wait / 2).max(Duration::from_secs(1))
     };
 
-    let deadline = tokio::time::Instant::now() + delay;
+    let started = tokio::time::Instant::now();
     loop {
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
+        let remaining = delay.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
             break;
         }
-        let tick = (deadline - now).min(heartbeat);
+        let tick = remaining.min(heartbeat);
         tokio::select! {
             _ = tokio::time::sleep(tick) => {}
             _ = shutdown.cancelled() => {
@@ -373,41 +424,30 @@ async fn hold_then_republish(
                 return;
             }
         }
-        if tokio::time::Instant::now() < deadline
+        if started.elapsed() < delay
             && let Err(e) = msg.ack_with(AckKind::Progress).await
         {
             tracing::warn!(error = %e, "failed to send progress ack during retry hold");
         }
     }
 
-    let mut hdrs = msg.headers.clone().unwrap_or_default();
-    hdrs.insert(RETRY_COUNT_HEADER, new_count.to_string().as_str());
-
-    // New message ID so JetStream dedup doesn't reject the republished copy.
-    // Our publisher always sets a UUID message ID, so `original_id` is normally
-    // present; the empty fallback only applies to externally-published messages
-    // and at worst weakens dedup within the short dedup window.
-    let original_id = hdrs
-        .get(NATS_MESSAGE_ID)
-        .map(|v| v.as_str().to_string())
-        .unwrap_or_default();
-    hdrs.insert(
-        NATS_MESSAGE_ID,
-        format!("{original_id}-r{new_count}").as_str(),
-    );
-
     // Publish the copy durably BEFORE acking the original: a failure leaves the
     // original for redelivery instead of silently dropping the message.
-    match publish_with_retry(
-        client.jetstream(),
-        msg.subject.to_string(),
-        hdrs,
-        msg.payload.clone(),
-        3,
-        "retry republish",
-    )
-    .await
-    {
+    let republished = match retry_copy_headers(msg, new_count) {
+        Ok(headers) => {
+            publish_with_retry(
+                client.jetstream(),
+                msg.subject.to_string(),
+                headers,
+                msg.payload.clone(),
+                3,
+                "retry republish",
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    match republished {
         Ok(()) => {
             if let Err(e) = msg.ack().await {
                 tracing::error!(error = %e, "failed to ack after retry republish");
@@ -420,6 +460,18 @@ async fn hold_then_republish(
             }
         }
     }
+}
+
+/// A retry copy's headers: the original's less its publish directives, with
+/// the incremented count and an id taken from the original's stream position.
+fn retry_copy_headers(msg: &Message, new_count: u32) -> Result<HeaderMap> {
+    let mut headers = copy_headers(msg.headers.as_ref());
+    headers.insert(RETRY_COUNT_HEADER, HeaderValue::from(new_count));
+    headers.insert(
+        NATS_MESSAGE_ID,
+        copy_message_id(msg, &format!("r{new_count}"))?,
+    );
+    Ok(headers)
 }
 
 /// Dispatches message routing based on the handler's outcome.
@@ -927,7 +979,7 @@ impl NatsConsumer {
                                         &client,
                                         topology,
                                         &msg,
-                                        &format!("deserialization_error: {e}"),
+                                        "deserialization_error",
                                     ).await {
                                         tracing::error!(
                                             error = %dlq_err,
@@ -1383,7 +1435,7 @@ impl NatsConsumer {
                                                 &shard_client,
                                                 topology,
                                                 &msg,
-                                                &format!("deserialization_error: {e}"),
+                                                "deserialization_error",
                                             ).await {
                                                 tracing::error!(
                                                     error = %dlq_err,
@@ -1726,7 +1778,7 @@ async fn ingest_batch_message<T: Topic>(
                     "failed to deserialize message, dropped from the batch and sent to DLQ"
                 );
                 metrics::record_failed(ctx.topic, ctx.group, metrics::FailReason::Deserialize);
-                settle_poison(ctx, &msg, &format!("deserialization_error: {e}")).await;
+                settle_poison(ctx, &msg, "deserialization_error").await;
                 return None;
             }
         };
@@ -2470,5 +2522,59 @@ mod metadata_coordinates_tests {
             published_to_millis((i128::from(i64::MAX) + 1) * 1_000_000),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod copy_header_tests {
+    use super::*;
+
+    fn values<'a>(headers: &'a HeaderMap, name: &str) -> Vec<&'a str> {
+        headers.get_all(name).map(HeaderValue::as_str).collect()
+    }
+
+    /// A copy replays none of the JetStream directives aimed at the
+    /// original's own publish, and keeps every other header, every value of a
+    /// repeated one included.
+    #[test]
+    fn a_copy_drops_publish_directives_and_keeps_the_rest() {
+        let mut original = HeaderMap::new();
+        original.insert("Nats-Expected-Stream", "orders");
+        original.insert("Nats-Expected-Last-Sequence", "7");
+        original.insert("Nats-Expected-Last-Subject-Sequence", "3");
+        original.insert("Nats-Expected-Last-Msg-Id", "previous");
+        original.insert("Nats-Rollup", "sub");
+        original.insert("Nats-TTL", "1s");
+        original.insert(NATS_MESSAGE_ID, "original");
+        original.insert(RETRY_COUNT_HEADER, "2");
+        original.insert("x-trace-id", "trace-1");
+        original.append("x-multi", "one");
+        original.append("x-multi", "two");
+
+        let copy = copy_headers(Some(&original));
+
+        for directive in [
+            "Nats-Expected-Stream",
+            "Nats-Expected-Last-Sequence",
+            "Nats-Expected-Last-Subject-Sequence",
+            "Nats-Expected-Last-Msg-Id",
+            "Nats-Rollup",
+            "Nats-TTL",
+        ] {
+            assert!(
+                copy.get(directive).is_none(),
+                "{directive} is a directive for the original's publish"
+            );
+        }
+        assert_eq!(values(&copy, "Nats-Msg-Id"), ["original"]);
+        assert_eq!(values(&copy, RETRY_COUNT_HEADER), ["2"]);
+        assert_eq!(values(&copy, "x-trace-id"), ["trace-1"]);
+        assert_eq!(values(&copy, "x-multi"), ["one", "two"]);
+        assert_eq!(copy.len(), 4);
+    }
+
+    #[test]
+    fn a_message_without_headers_copies_to_none() {
+        assert!(copy_headers(None).is_empty());
     }
 }

@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::time::Duration;
 
 use async_nats::HeaderMap;
-use async_nats::header::NATS_MESSAGE_ID;
+use async_nats::header::{HeaderName, HeaderValue, NATS_MESSAGE_ID};
 use async_nats::jetstream;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -25,6 +26,10 @@ const MAX_PUBLISH_ATTEMPTS: u32 = 3;
 
 /// Publish a message to JetStream with retry on transient failures.
 /// Shared by both the publisher and consumer (for DLQ publishes).
+///
+/// A PubAck that JetStream marks `duplicate` is a success: the stream already
+/// holds a message with this `Nats-Msg-Id`. A `max_attempts` of zero is a
+/// `Validation` error, since there is no attempt to make.
 pub(super) async fn publish_with_retry(
     js: &jetstream::Context,
     subject: String,
@@ -33,9 +38,15 @@ pub(super) async fn publish_with_retry(
     max_attempts: u32,
     label: &str,
 ) -> Result<()> {
+    if max_attempts == 0 {
+        return Err(ShoveError::Validation(format!(
+            "{label} needs at least one attempt"
+        )));
+    }
     let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
 
-    for attempt in 1..=max_attempts {
+    let mut attempt: u32 = 1;
+    loop {
         match js
             .publish_with_headers(subject.clone(), headers.clone(), payload.clone())
             .await
@@ -43,7 +54,7 @@ pub(super) async fn publish_with_retry(
             Ok(ack_future) => match ack_future.await {
                 Ok(_) => return Ok(()),
                 Err(e) => {
-                    if attempt == max_attempts {
+                    if attempt >= max_attempts {
                         metrics::record_backend_error(
                             metrics::BackendLabel::Nats,
                             metrics::BackendErrorKind::Publish,
@@ -58,7 +69,7 @@ pub(super) async fn publish_with_retry(
                 }
             },
             Err(e) => {
-                if attempt == max_attempts {
+                if attempt >= max_attempts {
                     metrics::record_backend_error(
                         metrics::BackendLabel::Nats,
                         metrics::BackendErrorKind::Publish,
@@ -72,9 +83,24 @@ pub(super) async fn publish_with_retry(
                 tokio::time::sleep(delay).await;
             }
         }
+        attempt = attempt.saturating_add(1);
     }
+}
 
-    unreachable!()
+/// `value` as a NATS header value, or a `Validation` error naming `header`
+/// when it holds a CR or LF, which the client's own conversion panics on.
+pub(super) fn header_value(header: &str, value: &str) -> Result<HeaderValue> {
+    HeaderValue::from_str(value).map_err(|e| {
+        ShoveError::Validation(format!("header {header:?} cannot carry this value: {e}"))
+    })
+}
+
+/// `name` as a NATS header name, or a `Validation` error when it holds a
+/// colon, whitespace, a control or a non-ASCII character, which the client's
+/// own conversion panics on.
+fn header_name(name: &str) -> Result<HeaderName> {
+    HeaderName::from_str(name)
+        .map_err(|e| ShoveError::Validation(format!("{name:?} cannot be a header name: {e}")))
 }
 
 #[derive(Clone)]
@@ -106,14 +132,22 @@ impl NatsPublisher {
         (topology.queue().to_string(), None)
     }
 
-    fn build_headers(extra: Option<&HashMap<String, String>>, seq_key: Option<&str>) -> HeaderMap {
+    /// The headers a publish carries. A user header or sequence key NATS
+    /// cannot carry is a `Validation` error, raised before anything is sent.
+    fn build_headers(
+        extra: Option<&HashMap<String, String>>,
+        seq_key: Option<&str>,
+    ) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        headers.insert(NATS_MESSAGE_ID, Uuid::new_v4().to_string().as_str());
-        headers.insert(RETRY_COUNT_HEADER, "0");
+        headers.insert(
+            NATS_MESSAGE_ID,
+            header_value("Nats-Msg-Id", &Uuid::new_v4().to_string())?,
+        );
+        headers.insert(RETRY_COUNT_HEADER, HeaderValue::from(0u32));
 
         if let Some(extra) = extra {
             for (k, v) in extra {
-                headers.insert(k.as_str(), v.as_str());
+                headers.insert(header_name(k)?, header_value(k, v)?);
             }
         }
 
@@ -122,10 +156,10 @@ impl NatsPublisher {
         // the `x-` internal names shared with the other backends, but not the
         // `Shove-` names this backend uses.)
         if let Some(key) = seq_key {
-            headers.insert(SEQUENCE_KEY_HEADER, key);
+            headers.insert(SEQUENCE_KEY_HEADER, header_value(SEQUENCE_KEY_HEADER, key)?);
         }
 
-        headers
+        Ok(headers)
     }
 
     async fn publish_raw(&self, subject: String, headers: HeaderMap, payload: Bytes) -> Result<()> {
@@ -146,7 +180,7 @@ impl NatsPublisher {
         let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
         let (subject, seq_key) = Self::resolve_subject_and_key::<T>(topology, message);
-        let headers = Self::build_headers(None, seq_key.as_deref());
+        let headers = Self::build_headers(None, seq_key.as_deref())?;
         self.publish_raw(subject, headers, payload).await
     }
 
@@ -159,7 +193,7 @@ impl NatsPublisher {
         let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
         let (subject, seq_key) = Self::resolve_subject_and_key::<T>(topology, message);
-        let headers = Self::build_headers(Some(&extra_headers), seq_key.as_deref());
+        let headers = Self::build_headers(Some(&extra_headers), seq_key.as_deref())?;
         self.publish_raw(subject, headers, payload).await
     }
 
@@ -182,7 +216,7 @@ impl NatsPublisher {
             .map(|msg| {
                 let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(msg)?;
                 let (subject, seq_key) = Self::resolve_subject_and_key::<T>(topology, msg);
-                let headers = Self::build_headers(None, seq_key.as_deref());
+                let headers = Self::build_headers(None, seq_key.as_deref())?;
                 Ok((subject, headers, payload))
             })
             .collect();
@@ -455,6 +489,33 @@ mod tests {
                 "{kind:?} is the server saying no"
             );
         }
+    }
+
+    /// A zero attempt budget is a caller's mistake, answered before anything
+    /// reaches the wire. The client never connects: nothing here needs it to.
+    #[tokio::test]
+    async fn zero_attempts_is_a_validation_error() {
+        let client = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .connect("nats://127.0.0.1:1")
+            .await
+            .expect("a lazily connecting client is built without a server");
+        let js = jetstream::new(client);
+
+        let result = publish_with_retry(
+            &js,
+            "subject".to_string(),
+            HeaderMap::new(),
+            Bytes::new(),
+            0,
+            "publish",
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ShoveError::Validation(_))),
+            "got {result:?}"
+        );
     }
 
     /// Nothing on the submission side can be an explicit rejection:
