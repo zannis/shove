@@ -1,0 +1,19 @@
+src/backends/kafka/consumer.rs
+  s_6b103bfb5790a2::t_7c0f5c7dddedb3 1-8773
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3310952603307e29b4104e2f4fa74f3545a4905b",
+  "prompts": {},
+  "sessions": {
+    "s_6b103bfb5790a2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1440ea0e-6354-4883-af84-36b67d5cab3f",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
