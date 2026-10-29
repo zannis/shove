@@ -1,0 +1,51 @@
+src/backends/nats/consumer.rs
+  s_1001dc3147e1e5::t_9636fde8737761 2528
+  s_1001dc3147e1e5::t_92e1b31a8509ac 255-258,263-303
+  s_1001dc3147e1e5::t_e6e1a57a49ca18 343-351,353,364,366
+  s_1001dc3147e1e5::t_9e9d0fa32aaa52 8
+  s_1001dc3147e1e5::t_956c0f2f0fa155 259-262
+  s_1001dc3147e1e5::t_4057bab457d7b8 48
+  s_1001dc3147e1e5::t_6312385fa7cbdc 413,415-416,419,427,436-450
+  s_1001dc3147e1e5::t_0ba5c0a70f5c1a 1438
+  s_1001dc3147e1e5::t_1ab4e31723a502 317-320
+  s_1001dc3147e1e5::t_e5cbe90f10b211 465-476
+  s_1001dc3147e1e5::t_d7ec0ae2f8a0d0 2527,2529-2580
+  s_1001dc3147e1e5::t_89831d330e1a0e 982
+  s_1001dc3147e1e5::t_59f08bb9f90c1a 1781
+tests/nats_integration.rs
+  s_1001dc3147e1e5::t_a4e8b5cad59f55 3861-3862,3864-4383
+  s_1001dc3147e1e5::t_ec5dd3329b6341 3863
+  s_1001dc3147e1e5::t_1e87506df9dc1b 10-11
+docs/pages/backends/nats.mdx
+  s_1001dc3147e1e5::t_d0e60ce5f57d16 164-165
+  s_1001dc3147e1e5::t_e5f58539347132 206
+src/backends/nats/publisher.rs
+  s_1001dc3147e1e5::t_6fb91b26f94e50 135-140,142-146,150,159,162
+  s_1001dc3147e1e5::t_bea0b0b35c76a1 219
+  s_1001dc3147e1e5::t_7113e3dd40e6f8 494-520
+  s_1001dc3147e1e5::t_7b84dec4d286c3 183
+  s_1001dc3147e1e5::t_57088e5ef58a9f 72,86,88,90-103
+  s_1001dc3147e1e5::t_ed775c9feb4878 196
+  s_1001dc3147e1e5::t_3b5b39e2dc7422 29-32,41-45,48-49,57
+  s_1001dc3147e1e5::t_78c96c51a48854 2,6
+tests/nats_batch_integration.rs
+  s_1001dc3147e1e5::t_cd8d026ca735cd 155-168
+  s_1001dc3147e1e5::t_aec593857bb167 1479
+  s_1001dc3147e1e5::t_1e225c473dbf4e 1618-1721
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a55be76c06c935704ecb6b42162bdfc3b6db5e91",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
