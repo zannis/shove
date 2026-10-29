@@ -181,6 +181,13 @@ pub struct MessageMetadata {
     pub timestamp_ms: Option<i64>,
     /// String-valued headers attached to the delivery (e.g. `x-trace-id`).
     ///
+    /// On Kafka a header key and value are bytes, and a record may repeat a
+    /// key. The map holds the headers whose key and value are both valid
+    /// UTF-8, a repeated key keeping its last value, and leaves the rest out.
+    /// A copy the consumer publishes, a retry or defer republish or a dead
+    /// letter, still carries every header of the record byte for byte and in
+    /// order.
+    ///
     /// ## Deduplication (`x-message-id`, RabbitMQ)
     ///
     /// For RabbitMQ, the `x-message-id` header (see [`shove::rabbitmq::MESSAGE_ID_KEY`]) is a

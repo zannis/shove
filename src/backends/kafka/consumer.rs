@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::CStr;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -6,6 +7,7 @@ use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use rdkafka::bindings::{rd_kafka_header_cnt, rd_kafka_header_get_all, rd_kafka_header_remove};
 use rdkafka::client::{DefaultClientContext, OAuthToken};
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{
@@ -13,13 +15,15 @@ use rdkafka::consumer::{
     StreamConsumer,
 };
 use rdkafka::error::{KafkaError, KafkaResult};
-use rdkafka::message::{BorrowedMessage, Header, Headers, Message, OwnedHeaders};
+use rdkafka::message::{BorrowedHeaders, BorrowedMessage, Header, Message, OwnedHeaders};
 use rdkafka::metadata::Metadata;
-use rdkafka::types::RDKafkaErrorCode;
+use rdkafka::types::{RDKafkaErrorCode, RDKafkaHeaders, RDKafkaRespErr};
 use rdkafka::{ClientConfig, ClientContext, Offset, Statistics, TopicPartitionList};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backend::batch_consumer::settling::{
@@ -73,9 +77,10 @@ use super::client::KafkaClient;
 #[cfg(feature = "kafka-schema-registry")]
 use super::constants::REGISTRY_RETRY_DELAY;
 use super::constants::{
-    DEATH_COUNT_HEADER, DEATH_REASON_HEADER, FETCH_MIN_BYTES, FETCH_WAIT_MAX_MS,
-    MAX_POLL_INTERVAL_MS, MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER, ORIGINAL_QUEUE_HEADER,
-    PENDING_COMMIT_BUDGET, RETRY_COUNT_HEADER, SESSION_TIMEOUT_MS, SHUTDOWN_COMMIT_DEADLINE,
+    DEATH_COUNT_HEADER, DEATH_COUNT_KEY, DEATH_REASON_HEADER, DEATH_REASON_KEY, FETCH_MIN_BYTES,
+    FETCH_WAIT_MAX_MS, MAX_POLL_INTERVAL_MS, MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER,
+    MESSAGE_ID_KEY, ORIGINAL_QUEUE_HEADER, ORIGINAL_QUEUE_KEY, PENDING_COMMIT_BUDGET,
+    RETRY_COUNT_HEADER, RETRY_COUNT_KEY, SESSION_TIMEOUT_MS, SHUTDOWN_COMMIT_DEADLINE,
 };
 use super::consumer_group::{CommitPolicy, KafkaAutoOffsetReset};
 use super::offset_reset::target_from_timestamp_lookup;
@@ -850,19 +855,105 @@ impl CoveredDiscard {
 // Metadata extraction functions
 // ---------------------------------------------------------------------------
 
+/// The record's headers whose key and value are both valid UTF-8, a repeated
+/// key keeping its last value: the map `MessageMetadata::headers` hands a
+/// handler.
+///
+/// Read through librdkafka's C API: rdkafka's `Headers` accessors unwrap
+/// every key as UTF-8, and the protocol lets a producer send any bytes there.
 fn extract_string_headers(msg: &BorrowedMessage<'_>) -> Arc<HashMap<String, String>> {
     let mut out = HashMap::new();
-    if let Some(headers) = msg.headers() {
-        for idx in 0..headers.count() {
-            let header = headers.get(idx);
-            if let Some(value) = header.value
-                && let Ok(s) = std::str::from_utf8(value)
+    if let Some(list) = msg.headers().map(native_headers) {
+        // SAFETY: `list` is `msg`'s own header list, which lives as long as
+        // `msg` and is only read here.
+        let count = unsafe { rd_kafka_header_cnt(list) };
+        for idx in 0..count {
+            let mut name = std::ptr::null();
+            let mut value = std::ptr::null();
+            let mut size = 0;
+            // SAFETY: as above, with `idx` below the list's count.
+            let err =
+                unsafe { rd_kafka_header_get_all(list, idx, &mut name, &mut value, &mut size) };
+            if err != RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR
+                || name.is_null()
+                || value.is_null()
             {
-                out.insert(header.key.to_string(), s.to_string());
+                continue;
+            }
+            // SAFETY: librdkafka keeps every name NUL-terminated and a value
+            // as `size` bytes, both inside the list `msg` owns.
+            let (key, value) = unsafe {
+                (
+                    CStr::from_ptr(name),
+                    std::slice::from_raw_parts(value.cast::<u8>(), size),
+                )
+            };
+            if let (Ok(key), Ok(value)) = (key.to_str(), std::str::from_utf8(value)) {
+                out.insert(key.to_owned(), value.to_owned());
             }
         }
     }
     Arc::new(out)
+}
+
+/// The librdkafka list behind `headers`. rdkafka hands a header list out as a
+/// reference to the zero-sized `BorrowedHeaders` at the list's own address,
+/// and its accessors cast that reference back the same way.
+fn native_headers(headers: &BorrowedHeaders) -> *mut RDKafkaHeaders {
+    std::ptr::from_ref(headers).cast_mut().cast()
+}
+
+// `native_headers` relies on this: a reference to a zero-sized type is only an address.
+const _: () = assert!(size_of::<BorrowedHeaders>() == 0);
+
+/// A record's headers, read once at receive.
+///
+/// `strings` is the map a handler sees, see [`extract_string_headers`].
+/// `wire` is the record's own header list, copied out of librdkafka byte for
+/// byte: a republished or dead-lettered copy is built from it, so the copy
+/// keeps every header the record carried, in order, binary and null values,
+/// repeated keys and keys that are not UTF-8 included. `None` when the record
+/// carries no headers.
+#[derive(Clone)]
+struct RecordHeaders {
+    strings: Arc<HashMap<String, String>>,
+    wire: Option<OwnedHeaders>,
+}
+
+impl RecordHeaders {
+    fn read(msg: &BorrowedMessage<'_>) -> Self {
+        Self::with_strings(msg, extract_string_headers(msg))
+    }
+
+    /// For a caller that has read `strings` off `msg` already.
+    fn with_strings(msg: &BorrowedMessage<'_>, strings: Arc<HashMap<String, String>>) -> Self {
+        Self {
+            strings,
+            wire: msg.headers().map(BorrowedHeaders::detach),
+        }
+    }
+
+    /// The record's `Shove-Message-Id`, empty when it carries none.
+    fn message_id(&self) -> &str {
+        self.strings
+            .get(MESSAGE_ID_HEADER)
+            .map_or("", String::as_str)
+    }
+
+    /// Every header of the record minus each `rewritten` key: the headers of
+    /// a copy shove publishes on the record's behalf, before the copy sets
+    /// those keys afresh.
+    fn copy_without(&self, rewritten: &[&CStr]) -> OwnedHeaders {
+        let copy = self.wire.clone().unwrap_or_default();
+        let list = native_headers(copy.as_borrowed());
+        for key in rewritten {
+            // SAFETY: `copy` is this call's own list, which nothing else reads
+            // while librdkafka edits it, and `key` is NUL-terminated. A key
+            // the list lacks answers `__NOENT`: there is nothing to drop.
+            unsafe { rd_kafka_header_remove(list, key.as_ptr()) };
+        }
+        copy
+    }
 }
 
 fn get_retry_count(headers: &HashMap<String, String>) -> u32 {
@@ -943,39 +1034,82 @@ fn build_dead_metadata(
 // Header building helpers
 // ---------------------------------------------------------------------------
 
-fn headers_with_retry_count(
-    original: &HashMap<String, String>,
-    retry_count: u32,
-    message_id_suffix: &str,
-) -> OwnedHeaders {
-    // perf-K-8: original.len() bounds the carried-over headers; +2 for the
-    // RETRY_COUNT_HEADER and MESSAGE_ID_HEADER we always re-insert.
-    let mut headers = OwnedHeaders::new_with_capacity(original.len() + 2);
-    for (k, v) in original {
-        if k == RETRY_COUNT_HEADER || k == MESSAGE_ID_HEADER {
-            continue;
-        }
-        headers = headers.insert(Header {
-            key: k.as_str(),
-            value: Some(v.as_bytes()),
-        });
-    }
-    headers = headers.insert(Header {
-        key: RETRY_COUNT_HEADER,
-        value: Some(retry_count.to_string().as_bytes()),
-    });
+const RETRY_ID_SUFFIX: &str = "-r";
+const DEFER_ID_SUFFIX: &str = "-d";
+const DEAD_LETTER_ID_SUFFIX: &str = "-dlq";
+/// `DEFER_ID_SUFFIX` and the hyphenated UUID after it.
+const DEFER_ID_SUFFIX_LEN: usize = DEFER_ID_SUFFIX.len() + Hyphenated::LENGTH;
 
-    let original_id = original.get(MESSAGE_ID_HEADER).cloned().unwrap_or_default();
-    let new_id = format!("{original_id}{message_id_suffix}");
-    headers = headers.insert(Header {
-        key: MESSAGE_ID_HEADER,
-        value: Some(new_id.as_bytes()),
-    });
-    headers
+/// The id of the copy a `Retry` republishes as `attempt`: the same for the
+/// same attempt, so a republish repeated for one attempt carries one id.
+fn retry_message_id(original: &str, attempt: u32) -> String {
+    format!("{}{RETRY_ID_SUFFIX}{attempt}", base_message_id(original))
 }
 
-/// The headers a dead-lettered record carries: the original's, minus the
-/// ones rewritten here.
+/// The id of the copy a `Defer` republishes: a defer spends no attempt, so a
+/// fresh UUID tells its hops apart.
+fn defer_message_id(original: &str) -> String {
+    let mut buf = Uuid::encode_buffer();
+    let uuid = Uuid::new_v4().hyphenated().encode_lower(&mut buf);
+    format!("{}{DEFER_ID_SUFFIX}{uuid}", base_message_id(original))
+}
+
+fn dead_letter_message_id(original: &str) -> String {
+    format!("{}{DEAD_LETTER_ID_SUFFIX}", base_message_id(original))
+}
+
+/// `id` without the one suffix a copy adds, or `id` itself when it carries
+/// none.
+///
+/// A copy's `Shove-Message-Id` is the id the record was first published
+/// under, its base, plus one suffix for the hop the copy makes. A copy of a
+/// copy replaces the suffix instead of adding one, so the id stays one suffix
+/// longer than its base however many hops the record makes.
+fn base_message_id(id: &str) -> &str {
+    if let Some(base) = id.strip_suffix(DEAD_LETTER_ID_SUFFIX) {
+        return base;
+    }
+    if let Some((base, attempt)) = id.rsplit_once(RETRY_ID_SUFFIX)
+        && !attempt.is_empty()
+        && attempt.bytes().all(|b| b.is_ascii_digit())
+    {
+        return base;
+    }
+    if let Some((base, hop)) = id
+        .len()
+        .checked_sub(DEFER_ID_SUFFIX_LEN)
+        .and_then(|at| id.split_at_checked(at))
+        && hop
+            .strip_prefix(DEFER_ID_SUFFIX)
+            .is_some_and(|uuid| Uuid::try_parse(uuid).is_ok())
+    {
+        return base;
+    }
+    id
+}
+
+/// The headers of a `Retry` or `Defer` republish of `original`: every header
+/// the record carried, byte for byte and in order, with shove's retry count
+/// and message id rewritten.
+fn headers_with_retry_count(
+    original: &RecordHeaders,
+    retry_count: u32,
+    message_id: &str,
+) -> OwnedHeaders {
+    original
+        .copy_without(&[RETRY_COUNT_KEY, MESSAGE_ID_KEY])
+        .insert(Header {
+            key: RETRY_COUNT_HEADER,
+            value: Some(retry_count.to_string().as_bytes()),
+        })
+        .insert(Header {
+            key: MESSAGE_ID_HEADER,
+            value: Some(message_id.as_bytes()),
+        })
+}
+
+/// The headers a dead-lettered record carries: every header of the
+/// original, byte for byte and in order, with shove's own rewritten.
 ///
 /// `retry_count` is the number of retries the record had used when it died.
 /// On a shove-owned topic every retry republished the record with the count
@@ -984,57 +1118,45 @@ fn headers_with_retry_count(
 /// so writing it here is what lets a DLQ consumer's `retry_count` report the
 /// attempts that were actually made.
 fn headers_for_dlq(
-    original: &HashMap<String, String>,
+    original: &RecordHeaders,
     reason: &str,
     original_queue: &str,
     retry_count: u32,
 ) -> OwnedHeaders {
-    // perf-K-8: original.len() bounds the carried-over headers; +5 for the
-    // DEATH_REASON / ORIGINAL_QUEUE / DEATH_COUNT / MESSAGE_ID / RETRY_COUNT
-    // we re-insert.
-    let mut headers = OwnedHeaders::new_with_capacity(original.len() + 5);
-    for (k, v) in original {
-        if k == DEATH_REASON_HEADER
-            || k == ORIGINAL_QUEUE_HEADER
-            || k == DEATH_COUNT_HEADER
-            || k == MESSAGE_ID_HEADER
-            || k == RETRY_COUNT_HEADER
-        {
-            continue;
-        }
-        headers = headers.insert(Header {
-            key: k.as_str(),
-            value: Some(v.as_bytes()),
-        });
-    }
-    headers = headers.insert(Header {
-        key: RETRY_COUNT_HEADER,
-        value: Some(retry_count.to_string().as_bytes()),
-    });
-    headers = headers.insert(Header {
-        key: DEATH_REASON_HEADER,
-        value: Some(reason.as_bytes()),
-    });
-    headers = headers.insert(Header {
-        key: ORIGINAL_QUEUE_HEADER,
-        value: Some(original_queue.as_bytes()),
-    });
-
-    let current_death_count = original
+    let death_count = original
+        .strings
         .get(DEATH_COUNT_HEADER)
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(0);
-    headers = headers.insert(Header {
-        key: DEATH_COUNT_HEADER,
-        value: Some((current_death_count + 1).to_string().as_bytes()),
-    });
-
-    let original_id = original.get(MESSAGE_ID_HEADER).cloned().unwrap_or_default();
-    headers = headers.insert(Header {
-        key: MESSAGE_ID_HEADER,
-        value: Some(format!("{original_id}-dlq").as_bytes()),
-    });
-    headers
+        .unwrap_or(0)
+        .saturating_add(1);
+    original
+        .copy_without(&[
+            DEATH_REASON_KEY,
+            ORIGINAL_QUEUE_KEY,
+            DEATH_COUNT_KEY,
+            MESSAGE_ID_KEY,
+            RETRY_COUNT_KEY,
+        ])
+        .insert(Header {
+            key: RETRY_COUNT_HEADER,
+            value: Some(retry_count.to_string().as_bytes()),
+        })
+        .insert(Header {
+            key: DEATH_REASON_HEADER,
+            value: Some(reason.as_bytes()),
+        })
+        .insert(Header {
+            key: ORIGINAL_QUEUE_HEADER,
+            value: Some(original_queue.as_bytes()),
+        })
+        .insert(Header {
+            key: DEATH_COUNT_HEADER,
+            value: Some(death_count.to_string().as_bytes()),
+        })
+        .insert(Header {
+            key: MESSAGE_ID_HEADER,
+            value: Some(dead_letter_message_id(original.message_id()).as_bytes()),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,7 +1189,7 @@ async fn publish_to_dlq(
     topology: &QueueTopology,
     payload: &[u8],
     key: Option<&[u8]>,
-    headers: &HashMap<String, String>,
+    headers: &RecordHeaders,
     reason: &str,
     retry_count: u32,
 ) -> Result<()> {
@@ -1545,7 +1667,7 @@ async fn discard_pre_handler(
     dlq_reason: &str,
     payload: &[u8],
     key: Option<&[u8]>,
-    headers: &HashMap<String, String>,
+    headers: &RecordHeaders,
     completion_tx: &mpsc::Sender<Completion>,
     partition: i32,
     offset: i64,
@@ -1553,7 +1675,7 @@ async fn discard_pre_handler(
 ) {
     let has_dlq = topology.dlq().is_some();
     let pending = metrics::record_terminal(topic, group, fail_reason, has_dlq);
-    let retry_count = get_retry_count(headers);
+    let retry_count = get_retry_count(&headers.strings);
     let discard = match publish_to_dlq(
         client,
         topology,
@@ -1745,12 +1867,12 @@ async fn discard_pre_handler_fifo(
     dlq_reason: &str,
     payload: &[u8],
     key: Option<&[u8]>,
-    headers: &HashMap<String, String>,
+    headers: &RecordHeaders,
     parked: &mut FifoParkedDiscards,
 ) {
     let has_dlq = topology.dlq().is_some();
     let pending = metrics::record_terminal(topic, group, fail_reason, has_dlq);
-    let retry_count = get_retry_count(headers);
+    let retry_count = get_retry_count(&headers.strings);
     let discard = match publish_to_dlq(
         client,
         topology,
@@ -1800,7 +1922,7 @@ async fn route_outcome(
     // once, so we move it instead of cloning. The receive loop's Bytes
     // refcount machinery makes any further sharing a refcount bump.
     key: Option<Bytes>,
-    headers: &HashMap<String, String>,
+    headers: &RecordHeaders,
     outcome: Outcome,
     topology: &'static QueueTopology,
     retry_count: u32,
@@ -1912,7 +2034,7 @@ async fn route_outcome(
             }
         }
         RetryDecision::Hold { increment: true } => {
-            let new_count = retry_count + 1;
+            let new_count = retry_count.saturating_add(1);
             let delay = if hold_queues.is_empty() {
                 Duration::from_secs(1)
             } else {
@@ -1920,8 +2042,11 @@ async fn route_outcome(
                 hold_queues[idx].delay()
             };
 
-            let retry_headers =
-                headers_with_retry_count(headers, new_count, &format!("-r{new_count}"));
+            let retry_headers = headers_with_retry_count(
+                headers,
+                new_count,
+                &retry_message_id(headers.message_id(), new_count),
+            );
 
             (
                 run_delayed_republish(
@@ -1952,7 +2077,7 @@ async fn route_outcome(
             let defer_headers = headers_with_retry_count(
                 headers,
                 retry_count,
-                &format!("-d{}", uuid::Uuid::new_v4()),
+                &defer_message_id(headers.message_id()),
             );
 
             (
@@ -4172,7 +4297,7 @@ async fn decode_batch_message<T: Topic>(
 struct RawMessage {
     payload: Bytes,
     key: Option<Bytes>,
-    headers: Arc<HashMap<String, String>>,
+    headers: RecordHeaders,
 }
 
 /// A message parked for the DLQ, published once the batch it belongs to
@@ -4344,7 +4469,7 @@ async fn dlq_batch_message(
         raw.key.as_deref(),
         &raw.headers,
         reason,
-        get_retry_count(&raw.headers),
+        get_retry_count(&raw.headers.strings),
     )
     .await
     {
@@ -5883,7 +6008,7 @@ impl KafkaConsumer {
                             // only because the handler runs in a spawned task that outlives
                             // this loop iteration.
                             let payload_slice = msg.payload().unwrap_or_default();
-                            let headers = extract_string_headers(&msg);
+                            let headers = RecordHeaders::read(&msg);
                             let partition = msg.partition();
                             let offset = msg.offset();
                             // perf-K-9: store key as bytes::Bytes — cloning into spawned
@@ -6203,7 +6328,7 @@ impl KafkaConsumer {
                             let payload_bytes = payload_slice.to_vec();
 
                             let coordinates = RecordCoordinates::of(&msg);
-                            let metadata = build_message_metadata(&headers, false, coordinates);
+                            let metadata = build_message_metadata(&headers.strings, false, coordinates);
                             let retry_count = metadata.retry_count;
 
                             let permit = match spare_permit.take() {
@@ -6350,7 +6475,7 @@ impl KafkaConsumer {
                                         &task_ctx,
                                         &decode,
                                         &payload_bytes,
-                                        &headers,
+                                        &headers.strings,
                                         coordinates,
                                         outcome,
                                         retry_count,
@@ -6376,8 +6501,9 @@ impl KafkaConsumer {
                                             // The dead letter carries the attempts made in memory, as an
                                             // exhausted in-place retry does, not the count the record
                                             // arrived with.
-                                            let mut dead_headers: HashMap<String, String> = (*headers).clone();
-                                            dead_headers.insert(RETRY_COUNT_HEADER.to_string(), attempts.to_string());
+                                            let mut dead_headers = headers;
+                                            Arc::make_mut(&mut dead_headers.strings)
+                                                .insert(RETRY_COUNT_HEADER.to_string(), attempts.to_string());
                                             discard_pre_handler(
                                                 &task_client,
                                                 topology,
@@ -6865,7 +6991,7 @@ impl KafkaConsumer {
                                     retain_raw.then(|| RawMessage {
                                         payload: Bytes::copy_from_slice(payload_slice),
                                         key,
-                                        headers,
+                                        headers: RecordHeaders::with_strings(&msg, headers),
                                     }),
                                     e.to_string(),
                                     pending,
@@ -6993,7 +7119,7 @@ impl KafkaConsumer {
                                             retain_raw.then(|| RawMessage {
                                                 payload: Bytes::copy_from_slice(payload_slice),
                                                 key,
-                                                headers,
+                                                headers: RecordHeaders::with_strings(&msg, headers),
                                             }),
                                             reason.to_string(),
                                             pending,
@@ -7004,7 +7130,7 @@ impl KafkaConsumer {
                                         let raw = retain_raw.then(|| RawMessage {
                                             payload: Bytes::copy_from_slice(payload_slice),
                                             key,
-                                            headers: headers.clone(),
+                                            headers: RecordHeaders::with_strings(&msg, headers),
                                         });
                                         buffer.push(decoded, metadata, raw);
                                     }
@@ -7271,7 +7397,7 @@ impl KafkaConsumer {
                                 // iteration (commit_message at the end), so use msg.payload()
                                 // directly instead of allocating a Vec<u8> copy.
                                 let payload_bytes = msg.payload().unwrap_or_default();
-                                let headers = extract_string_headers(&msg);
+                                let headers = RecordHeaders::read(&msg);
                                 // perf-K-9: Bytes for cheap refcount-clone semantics.
                                 let key = msg.key().map(Bytes::copy_from_slice);
                                 // The Kafka message key *is* the sequence key —
@@ -7311,7 +7437,7 @@ impl KafkaConsumer {
                                         key.as_deref(),
                                         &headers,
                                         "rejected",
-                                        get_retry_count(&headers),
+                                        get_retry_count(&headers.strings),
                                     ).await {
                                         // Leave the offset uncommitted so the
                                         // message is redelivered rather than
@@ -7564,7 +7690,7 @@ impl KafkaConsumer {
                                     }
                                 };
 
-                                let metadata = build_message_metadata(&headers, false, RecordCoordinates::of(&msg));
+                                let metadata = build_message_metadata(&headers.strings, false, RecordCoordinates::of(&msg));
                                 let retry_count = metadata.retry_count;
 
                                 processing.store(true, Ordering::Release);
@@ -10359,7 +10485,10 @@ mod batch_buffer_tests {
         RawMessage {
             payload: Bytes::from_static(b"poison"),
             key: None,
-            headers: Arc::new(HashMap::new()),
+            headers: RecordHeaders {
+                strings: Arc::new(HashMap::new()),
+                wire: None,
+            },
         }
     }
 
@@ -12733,5 +12862,54 @@ mod reconnect_tests {
 
         assert!(result.is_err(), "expected exhaustion error, got {result:?}");
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+    }
+}
+
+/// A copy's `Shove-Message-Id`: its base plus one suffix, whatever hops came
+/// before it.
+#[cfg(test)]
+mod message_id_tests {
+    use super::*;
+
+    const BASE: &str = "0b9c0d5e-5d2a-4a59-8c1e-3f7a6f1e2d4c";
+
+    #[test]
+    fn every_copy_replaces_the_suffix_of_the_copy_before_it() {
+        for original in [
+            BASE.to_string(),
+            retry_message_id(BASE, 1),
+            defer_message_id(BASE),
+            dead_letter_message_id(BASE),
+        ] {
+            assert_eq!(base_message_id(&original), BASE, "{original}");
+            assert_eq!(retry_message_id(&original, 2), format!("{BASE}-r2"));
+            assert_eq!(dead_letter_message_id(&original), format!("{BASE}-dlq"));
+            let deferred = defer_message_id(&original);
+            assert_eq!(base_message_id(&deferred), BASE, "{deferred}");
+            assert_eq!(deferred.len(), BASE.len() + DEFER_ID_SUFFIX_LEN);
+        }
+    }
+
+    #[test]
+    fn a_defer_copy_id_is_new_on_every_hop() {
+        assert_ne!(defer_message_id(BASE), defer_message_id(BASE));
+    }
+
+    #[test]
+    fn an_id_without_a_copy_suffix_is_its_own_base() {
+        // The last one's 38th byte from the end falls inside the `é`.
+        let split_inside_a_char = format!("é{}", "x".repeat(37));
+        for id in [
+            "",
+            "-r",
+            "order-r",
+            "order-r1x",
+            "order-d",
+            "order-dlqx",
+            "é-r",
+            split_inside_a_char.as_str(),
+        ] {
+            assert_eq!(base_message_id(id), id);
+        }
     }
 }

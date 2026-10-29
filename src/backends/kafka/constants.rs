@@ -10,6 +10,7 @@
 //! `src/consumer.rs`, because the stress harness must cite them from builds
 //! that do not enable the `kafka` feature. Do not re-add them here.
 
+use std::ffi::CStr;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -21,6 +22,15 @@ pub(super) const DEATH_REASON_HEADER: &str = "Shove-Death-Reason";
 pub(super) const ORIGINAL_QUEUE_HEADER: &str = "Shove-Original-Queue";
 pub(super) const DEATH_COUNT_HEADER: &str = "Shove-Death-Count";
 pub(super) const MESSAGE_ID_HEADER: &str = "Shove-Message-Id";
+
+/// The keys above NUL-terminated, the form librdkafka's
+/// `rd_kafka_header_remove` takes. `c_header_keys_match_their_str_twins`
+/// keeps each spelled like its twin.
+pub(super) const RETRY_COUNT_KEY: &CStr = c"Shove-Retry-Count";
+pub(super) const DEATH_REASON_KEY: &CStr = c"Shove-Death-Reason";
+pub(super) const ORIGINAL_QUEUE_KEY: &CStr = c"Shove-Original-Queue";
+pub(super) const DEATH_COUNT_KEY: &CStr = c"Shove-Death-Count";
+pub(super) const MESSAGE_ID_KEY: &CStr = c"Shove-Message-Id";
 
 // ---------------------------------------------------------------------------
 // Group ID derivations
@@ -297,5 +307,18 @@ mod tests {
         // suffix so a custom group cannot re-collide on the auxiliary groups.
         assert_eq!(fifo_group_id_from_base("price-sink"), "price-sink-fifo");
         assert_eq!(dlq_group_id_from_base("price-sink"), "price-sink-dlq");
+    }
+
+    #[test]
+    fn c_header_keys_match_their_str_twins() {
+        for (c_key, key) in [
+            (RETRY_COUNT_KEY, RETRY_COUNT_HEADER),
+            (DEATH_REASON_KEY, DEATH_REASON_HEADER),
+            (ORIGINAL_QUEUE_KEY, ORIGINAL_QUEUE_HEADER),
+            (DEATH_COUNT_KEY, DEATH_COUNT_HEADER),
+            (MESSAGE_ID_KEY, MESSAGE_ID_HEADER),
+        ] {
+            assert_eq!(c_key.to_bytes(), key.as_bytes());
+        }
     }
 }
