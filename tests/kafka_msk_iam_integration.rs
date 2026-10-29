@@ -312,25 +312,84 @@ async fn msk_iam_connect_with_retry_succeeds_on_first_attempt() {
 /// inside `async fn shutdown`, or the producer's own polling thread.
 #[cfg(feature = "test-support")]
 mod token_callback {
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rdkafka::client::{ClientContext, OAuthToken};
+    use shove::ShoveError;
     use shove::kafka::{KafkaClient, KafkaConfig, KafkaSasl, KafkaTls, msk_iam_context_for_test};
 
     use super::{AWS_REGION, set_dummy_aws_env};
 
-    /// The token callback `connect` installs on the librdkafka clients of an
-    /// MSK IAM `KafkaClient`.
-    async fn connected_token_callback() -> impl ClientContext {
-        set_dummy_aws_env();
+    /// The token callback `connect` installs on the librdkafka clients of a
+    /// `KafkaClient` that authenticates with `sasl`.
+    async fn token_callback_for(sasl: KafkaSasl) -> impl ClientContext {
         let cfg = KafkaConfig::new("192.0.2.1:9098")
             .with_tls(KafkaTls {
                 skip_hostname_verification: true,
                 ..KafkaTls::default()
             })
-            .with_sasl(KafkaSasl::msk_iam(AWS_REGION));
+            .with_sasl(sasl);
         let client = KafkaClient::connect(&cfg).await.expect("connect");
         msk_iam_context_for_test(&client).expect("an MSK IAM client carries a token callback")
+    }
+
+    /// The token callback of an MSK IAM client that signs with the dummy
+    /// environment credentials.
+    async fn connected_token_callback() -> impl ClientContext {
+        set_dummy_aws_env();
+        token_callback_for(KafkaSasl::msk_iam(AWS_REGION)).await
+    }
+
+    /// The profile files [`only_profile`] wrote; dropping this removes them.
+    struct ProfileFiles([PathBuf; 2]);
+
+    impl Drop for ProfileFiles {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Leave the AWS credential chain one place to find credentials: a config
+    /// file holding `profile` with `settings`. The environment holds no keys,
+    /// the credentials file is empty, and IMDS is off.
+    fn only_profile(profile: &str, settings: &str) -> ProfileFiles {
+        let pid = std::process::id();
+        let config = std::env::temp_dir().join(format!("shove-msk-iam-{pid}.config"));
+        let credentials = std::env::temp_dir().join(format!("shove-msk-iam-{pid}.credentials"));
+        std::fs::write(&config, format!("[profile {profile}]\n{settings}\n"))
+            .expect("write the config file");
+        std::fs::write(&credentials, "").expect("write the credentials file");
+        // SAFETY: nextest runs each test in its own process, and nothing in
+        // this one reads the environment while it changes.
+        unsafe {
+            for key in [
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_PROFILE",
+            ] {
+                std::env::remove_var(key);
+            }
+            std::env::set_var("AWS_CONFIG_FILE", &config);
+            std::env::set_var("AWS_SHARED_CREDENTIALS_FILE", &credentials);
+            std::env::set_var("AWS_REGION", AWS_REGION);
+            std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+        }
+        ProfileFiles([config, credentials])
+    }
+
+    /// The message of the `ShoveError::Connection` the callback failed with.
+    fn connection_error(err: Box<dyn std::error::Error>) -> String {
+        match *err
+            .downcast::<ShoveError>()
+            .expect("the callback fails with a ShoveError")
+        {
+            ShoveError::Connection(msg) => msg,
+            other => panic!("expected a connection error, got {other:?}"),
+        }
     }
 
     /// A token the signer minted: non-empty, expiring in the future and no
@@ -393,5 +452,22 @@ mod token_callback {
         .expect("the callback mints a token off any runtime");
 
         assert_signed(&token);
+    }
+
+    /// The chain stops at the profile, which names a key id without a secret
+    /// key: the refresh fails with an error, and nothing panics.
+    #[tokio::test]
+    async fn token_generation_fails_when_the_credentials_do_not_resolve() {
+        let _files = only_profile("broken", "aws_access_key_id = AKIAIOSFODNN7EXAMPLE");
+        let callback =
+            token_callback_for(KafkaSasl::msk_iam_with_profile(AWS_REGION, "broken")).await;
+
+        let err = callback
+            .generate_oauth_token(None)
+            .err()
+            .expect("a profile without a secret key signs nothing");
+
+        let msg = connection_error(err);
+        assert!(msg.contains("failed to provide credentials"), "{msg}");
     }
 }

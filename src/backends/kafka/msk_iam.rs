@@ -16,9 +16,8 @@ use crate::error::Result;
 /// seconds later. The AWS SDK gives loading an identity the same budget.
 const SIGN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A presigned token and its expiry in epoch milliseconds, or why signing
-/// failed.
-type Signed = std::result::Result<(String, i64), String>;
+/// A presigned token and its expiry in epoch milliseconds.
+type Signed = Result<(String, i64)>;
 
 /// Signs short-lived presigned URLs against `kafka-cluster:Connect` using
 /// the AWS credential chain.
@@ -74,15 +73,15 @@ impl MskIamTokenProvider {
         let (reply, answer) = mpsc::channel();
         self.requests
             .send(reply)
-            .map_err(|_| "the MSK IAM signer thread has stopped".to_string())?;
+            .map_err(|_| ShoveError::Connection("the MSK IAM signer thread has stopped".into()))?;
         match answer.recv_timeout(SIGN_TIMEOUT) {
             Ok(signed) => signed,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ShoveError::Connection(format!(
                 "MSK IAM token signing did not finish within {SIGN_TIMEOUT:?}"
+            ))),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ShoveError::Connection(
+                "the MSK IAM signer dropped the request".into(),
             )),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err("the MSK IAM signer dropped the request".to_string())
-            }
         }
     }
 }
@@ -115,7 +114,9 @@ fn run_signer(
             tokio::spawn(async move {
                 let signed = generate_auth_token_from_credentials_provider(region, credentials)
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e| {
+                        ShoveError::Connection(format!("failed to sign an MSK IAM token: {e}"))
+                    });
                 // The callback may have stopped waiting.
                 let _ = reply.send(signed);
             });
