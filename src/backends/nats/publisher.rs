@@ -5,6 +5,7 @@ use std::time::Duration;
 use async_nats::HeaderMap;
 use async_nats::header::{HeaderName, HeaderValue, NATS_MESSAGE_ID};
 use async_nats::jetstream;
+use async_nats::jetstream::publish::PublishAck;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -20,21 +21,27 @@ use crate::topic::Topic;
 use crate::{QueueTopology, ShoveError};
 
 use super::client::NatsClient;
-use super::constants::{RETRY_COUNT_HEADER, SEQUENCE_KEY_HEADER};
+use super::constants::{COPY_OF_HEADER, RETRY_COUNT_HEADER, SEQUENCE_KEY_HEADER};
 
 const MAX_PUBLISH_ATTEMPTS: u32 = 3;
 
 /// Publish a message to JetStream with retry on transient failures.
 /// Shared by both the publisher and consumer (for DLQ publishes).
 ///
-/// A PubAck that JetStream marks `duplicate` is a success: the stream already
-/// holds a message with this `Nats-Msg-Id`. A `max_attempts` of zero is a
-/// `Validation` error, since there is no attempt to make.
+/// `copy_origin` is `Some` for a retry copy or a dead letter, naming the
+/// delivery it was made from. A copy's id can be predicted, so a message that
+/// someone else stored under it first would make the copy's publish come back
+/// as a duplicate PubAck. For a copy that PubAck counts only once the stored
+/// message proves to be the same copy ([`is_same_copy`]); otherwise it is a
+/// failed attempt. For a user's publish (`None`) a duplicate is a success:
+/// the stream already holds a message with the caller's id. A `max_attempts`
+/// of zero is a `Validation` error, since there is no attempt to make.
 pub(super) async fn publish_with_retry(
     js: &jetstream::Context,
     subject: String,
     headers: HeaderMap,
     payload: Bytes,
+    copy_origin: Option<&str>,
     max_attempts: u32,
     label: &str,
 ) -> Result<()> {
@@ -52,7 +59,21 @@ pub(super) async fn publish_with_retry(
             .await
         {
             Ok(ack_future) => match ack_future.await {
-                Ok(_) => return Ok(()),
+                Ok(ack) => match confirm_ack(js, &ack, copy_origin, &payload).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if attempt >= max_attempts {
+                            metrics::record_backend_error(
+                                metrics::BackendLabel::Nats,
+                                metrics::BackendErrorKind::Publish,
+                            );
+                            return Err(e);
+                        }
+                        let delay = backoff.next().unwrap_or(Duration::from_secs(2));
+                        tracing::warn!(attempt, error = %e, "{label} was not confirmed, retrying");
+                        tokio::time::sleep(delay).await;
+                    }
+                },
                 Err(e) => {
                     if attempt >= max_attempts {
                         metrics::record_backend_error(
@@ -85,6 +106,55 @@ pub(super) async fn publish_with_retry(
         }
         attempt = attempt.saturating_add(1);
     }
+}
+
+/// `Ok` when a PubAck can be trusted: always for a fresh store or a user's
+/// publish, and for a copy's duplicate only when the message JetStream
+/// already stores under the copy's id is that same copy.
+async fn confirm_ack(
+    js: &jetstream::Context,
+    ack: &PublishAck,
+    copy_origin: Option<&str>,
+    payload: &[u8],
+) -> Result<()> {
+    let Some(origin) = copy_origin else {
+        return Ok(());
+    };
+    if !ack.duplicate {
+        return Ok(());
+    }
+    let stored = js
+        .get_stream_no_info(&ack.stream)
+        .await
+        .map_err(|e| ShoveError::Connection(format!("reading back stream {}: {e}", ack.stream)))?
+        .get_raw_message(ack.sequence)
+        .await
+        .map_err(|e| {
+            ShoveError::Connection(format!(
+                "reading back sequence {} of stream {} to confirm a duplicate copy: {e}",
+                ack.sequence, ack.stream
+            ))
+        })?;
+    if is_same_copy(&stored.headers, &stored.payload, origin, payload) {
+        Ok(())
+    } else {
+        Err(ShoveError::Validation(format!(
+            "stream {} holds another message at sequence {} under this copy's id",
+            ack.stream, ack.sequence
+        )))
+    }
+}
+
+/// Whether a message stored under a copy's id is that copy: it names the same
+/// origin in `Shove-Copy-Of` and carries the same payload.
+fn is_same_copy(
+    stored_headers: &HeaderMap,
+    stored_payload: &[u8],
+    origin: &str,
+    payload: &[u8],
+) -> bool {
+    stored_headers.get(COPY_OF_HEADER).map(HeaderValue::as_str) == Some(origin)
+        && stored_payload == payload
 }
 
 /// `value` as a NATS header value, or a `Validation` error naming `header`
@@ -168,6 +238,7 @@ impl NatsPublisher {
             subject,
             headers,
             payload,
+            None,
             MAX_PUBLISH_ATTEMPTS,
             "publish",
         )
@@ -491,6 +562,29 @@ mod tests {
         }
     }
 
+    /// A duplicate PubAck for a copy is trusted only when the message stored
+    /// under the copy's id names the same origin and carries the same payload.
+    #[test]
+    fn a_stored_message_is_the_copy_only_with_its_origin_and_payload() {
+        let origin = "orders.billing-consumer.7";
+        let mut stored = HeaderMap::new();
+        stored.insert(COPY_OF_HEADER, origin);
+
+        assert!(is_same_copy(&stored, b"payload", origin, b"payload"));
+        assert!(
+            !is_same_copy(&stored, b"payload", "orders.audit-consumer.7", b"payload"),
+            "another consumer's dead letter of the same record in a shared DLQ"
+        );
+        assert!(
+            !is_same_copy(&stored, b"impostor", origin, b"payload"),
+            "a different payload under the same id"
+        );
+        assert!(
+            !is_same_copy(&HeaderMap::new(), b"payload", origin, b"payload"),
+            "a message that names no origin"
+        );
+    }
+
     /// A zero attempt budget is a caller's mistake, answered before anything
     /// reaches the wire. The client never connects: nothing here needs it to.
     #[tokio::test]
@@ -507,6 +601,7 @@ mod tests {
             "subject".to_string(),
             HeaderMap::new(),
             Bytes::new(),
+            None,
             0,
             "publish",
         )

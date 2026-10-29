@@ -9,7 +9,7 @@
 
 use async_nats::header::{NATS_EXPECTED_STREAM, NATS_MESSAGE_ID};
 use async_nats::jetstream::Message as JsMessage;
-use async_nats::jetstream::stream::{Config as JsStreamConfig, RetentionPolicy};
+use async_nats::jetstream::stream::{Config as JsStreamConfig, RetentionPolicy, Source};
 use serde::{Deserialize, Serialize};
 use shove::SequencedTopic as _;
 use shove::broker::Broker;
@@ -4101,9 +4101,9 @@ async fn fifo_decode_error_with_newline_dead_letters_without_panic() {
     broker.close().await;
 }
 
-/// A dead letter's id comes from its record's stream position, so records
-/// published without a `Nats-Msg-Id` of their own get distinct dead letters:
-/// five rejected inside one duplicate window are five dead letters.
+/// A record without a `Nats-Msg-Id` of its own gets a dead-letter id from its
+/// delivery: stream, consumer and stream sequence. Five such records rejected
+/// inside one duplicate window are five dead letters.
 #[tokio::test]
 async fn messages_without_msg_id_all_reach_the_dlq() {
     let tb = TestBroker::start().await;
@@ -4144,13 +4144,13 @@ async fn messages_without_msg_id_all_reach_the_dlq() {
     assert_eq!(
         ids,
         [
-            "nats-work.1-dlq",
-            "nats-work.2-dlq",
-            "nats-work.3-dlq",
-            "nats-work.4-dlq",
-            "nats-work.5-dlq",
+            "nats-work.nats-work-consumer.1-dlq",
+            "nats-work.nats-work-consumer.2-dlq",
+            "nats-work.nats-work-consumer.3-dlq",
+            "nats-work.nats-work-consumer.4-dlq",
+            "nats-work.nats-work-consumer.5-dlq",
         ],
-        "each dead letter is named after its record's stream sequence"
+        "each dead letter is named after the delivery it was made from"
     );
 
     shutdown.cancel();
@@ -4158,9 +4158,9 @@ async fn messages_without_msg_id_all_reach_the_dlq() {
     broker.close().await;
 }
 
-/// A retry copy's id comes from its record's stream position too: five
-/// records without a `Nats-Msg-Id`, each retried once inside one duplicate
-/// window, come back as five copies, each named after the record it copies.
+/// A retry copy's id comes from the delivery too: five records without a
+/// `Nats-Msg-Id`, each retried once inside one duplicate window, come back as
+/// five copies, each named after the delivery it copies.
 #[tokio::test]
 async fn retry_copies_without_msg_id_are_distinct() {
     #[derive(Clone)]
@@ -4225,11 +4225,16 @@ async fn retry_copies_without_msg_id_are_distinct() {
         copies.len()
     );
     let expected: Vec<(String, String)> = (1..=5)
-        .map(|i| (format!("no-id-{i}"), format!("nats-work.{i}-r1")))
+        .map(|i| {
+            (
+                format!("no-id-{i}"),
+                format!("nats-work.nats-work-consumer.{i}-r1"),
+            )
+        })
         .collect();
     assert_eq!(
         copies, expected,
-        "each copy is named after the stream sequence of the record it copies"
+        "each copy is named after the delivery it copies"
     );
 
     shutdown.cancel();
@@ -4379,5 +4384,302 @@ async fn death_count_saturates() {
 
     shutdown.cancel();
     handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// A copy of a message that carries a `Nats-Msg-Id` builds its own id on that
+/// one, so `delivery_id` keeps the lineage a handler may deduplicate on: the
+/// retry copy of `lineage-1` is `lineage-1-r1`, and its dead letter
+/// `lineage-1-r1-dlq`. Every copy names the delivery it was made from in
+/// `Shove-Copy-Of`.
+#[tokio::test]
+async fn copies_of_a_message_with_an_id_keep_its_lineage() {
+    #[derive(Clone)]
+    struct RetryThenReject {
+        seen: Arc<Mutex<Vec<MessageMetadata>>>,
+    }
+
+    impl MessageHandler<WorkTopic> for RetryThenReject {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+            let first = meta.retry_count == 0;
+            self.seen.lock().await.push(meta);
+            if first {
+                Outcome::Retry
+            } else {
+                Outcome::Reject
+            }
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert(NATS_MESSAGE_ID, "lineage-1");
+    raw_publish(&client, "nats-work", headers, &simple_payload("lineage-1")).await;
+
+    let handler = RetryThenReject {
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(3)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let dead = take_dead_letters(&client, "nats-work-dlq", 1).await;
+    let seen = handler.seen.lock().await.clone();
+    assert_eq!(seen.len(), 2, "the original and its retry copy");
+    assert_eq!(seen[0].delivery_id, "lineage-1");
+    assert_eq!(seen[1].delivery_id, "lineage-1-r1");
+    assert_eq!(
+        seen[1].headers.get("Shove-Copy-Of").map(String::as_str),
+        Some("nats-work.nats-work-consumer.1"),
+        "the retry copy was made from stream sequence 1"
+    );
+    assert_eq!(header(&dead[0], "Nats-Msg-Id"), Some("lineage-1-r1-dlq"));
+    assert_eq!(
+        header(&dead[0], "Shove-Copy-Of"),
+        Some("nats-work.nats-work-consumer.2"),
+        "the dead letter was made from the retry copy, stream sequence 2"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// Shortens `stream`'s duplicate window, so a test can wait out an id that
+/// another message holds.
+async fn shrink_duplicate_window(client: &NatsClient, stream: &str, window: Duration) {
+    let mut config = client
+        .jetstream()
+        .get_stream(stream)
+        .await
+        .expect("the stream exists")
+        .cached_info()
+        .config
+        .clone();
+    config.duplicate_window = window;
+    client
+        .jetstream()
+        .update_stream(config)
+        .await
+        .expect("the duplicate window is mutable");
+}
+
+/// A dead letter's id can be predicted, so anyone able to publish to the DLQ
+/// subject can store a message under it first. JetStream then answers the
+/// real dead letter with a duplicate PubAck, which counts only once the stored
+/// message proves to be the same copy. The impostor is not, so the original
+/// stays un-acked while it holds the id, and dead-letters once the duplicate
+/// window lets the real copy through.
+#[tokio::test]
+async fn impostor_under_a_dead_letter_id_does_not_retire_the_original() {
+    struct CountingReject(WaitableCounter);
+
+    impl MessageHandler<WorkTopic> for CountingReject {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.0.increment();
+            Outcome::Reject
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    shrink_duplicate_window(&client, "nats-work-dlq", Duration::from_secs(5)).await;
+
+    let mut impostor = async_nats::HeaderMap::new();
+    impostor.insert(NATS_MESSAGE_ID, "nats-work.nats-work-consumer.1-dlq");
+    raw_publish(&client, "nats-work-dlq", impostor, b"impostor").await;
+    let payload = simple_payload("held-off");
+    raw_publish(&client, "nats-work", async_nats::HeaderMap::new(), &payload).await;
+
+    let rejects = WaitableCounter::new();
+    let handler = CountingReject(rejects.clone());
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    assert!(
+        rejects.wait_for(2, TIMEOUT).await,
+        "the original is redelivered after its dead letter was refused"
+    );
+    assert_eq!(
+        stream_messages(&client, "nats-work").await,
+        1,
+        "the original is not acked while the impostor holds its dead letter's id"
+    );
+    assert_eq!(
+        stream_messages(&client, "nats-work-dlq").await,
+        1,
+        "only the impostor is stored so far"
+    );
+
+    let dead = take_dead_letters(&client, "nats-work-dlq", 2).await;
+    let real = dead
+        .iter()
+        .find(|msg| msg.payload.as_ref() != b"impostor")
+        .expect("the real dead letter lands once the window has passed");
+    assert_eq!(real.payload.as_ref(), payload.as_slice());
+    assert_eq!(
+        header(real, "Nats-Msg-Id"),
+        Some("nats-work.nats-work-consumer.1-dlq")
+    );
+    assert_eq!(
+        header(real, "Shove-Copy-Of"),
+        Some("nats-work.nats-work-consumer.1")
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+shove::define_topic!(
+    FanTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-fan")
+        .external()
+        .dlq_named("nats-fan-dlq")
+        .build()
+);
+
+// The same records through a mirror of `nats-fan`, which keeps their stream
+// sequences and headers: a second reader of each message, sharing the first
+// reader's DLQ.
+shove::define_topic!(
+    FanMirrorTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-fan-mirror")
+        .external()
+        .dlq_named("nats-fan-dlq")
+        .build()
+);
+
+struct RejectAll;
+
+impl MessageHandler<FanTopic> for RejectAll {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Reject
+    }
+}
+
+impl MessageHandler<FanMirrorTopic> for RejectAll {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Reject
+    }
+}
+
+/// Two readers of one record, a stream and its mirror, reject it into a shared
+/// DLQ. The record carries a `Nats-Msg-Id`, so both dead letters get the same
+/// id, and the second publish comes back as a duplicate of the first. Its
+/// different `Shove-Copy-Of` keeps it from being taken for the first: its
+/// original is redelivered until the duplicate window has passed, and then
+/// both dead letters are in the DLQ.
+#[tokio::test]
+async fn two_readers_sharing_a_dlq_both_dead_letter_one_record() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    provision_limits_stream(&client, "nats-fan").await;
+    client
+        .jetstream()
+        .create_stream(JsStreamConfig {
+            name: "nats-fan-mirror".to_string(),
+            mirror: Some(Source {
+                name: "nats-fan".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("infra provisions the mirror");
+    broker.topology().declare::<FanTopic>().await.unwrap();
+    broker.topology().declare::<FanMirrorTopic>().await.unwrap();
+    shrink_duplicate_window(&client, "nats-fan-dlq", Duration::from_secs(3)).await;
+
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert(NATS_MESSAGE_ID, "shared-1");
+    raw_publish(&client, "nats-fan", headers, &simple_payload("shared-1")).await;
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let first = tokio::spawn(async move {
+        consumer
+            .run::<FanTopic, _>(
+                RejectAll,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let second = tokio::spawn(async move {
+        consumer
+            .run::<FanMirrorTopic, _>(
+                RejectAll,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let dead = take_dead_letters(&client, "nats-fan-dlq", 2).await;
+    for msg in &dead {
+        assert_eq!(header(msg, "Nats-Msg-Id"), Some("shared-1-dlq"));
+    }
+    let mut origins: Vec<&str> = dead
+        .iter()
+        .map(|msg| header(msg, "Shove-Copy-Of").expect("every dead letter names its origin"))
+        .collect();
+    origins.sort_unstable();
+    assert_eq!(
+        origins,
+        [
+            "nats-fan-mirror.nats-fan-mirror-consumer.1",
+            "nats-fan.nats-fan-consumer.1",
+        ],
+        "one dead letter per reader"
+    );
+
+    shutdown.cancel();
+    first.await.unwrap().ok();
+    second.await.unwrap().ok();
     broker.close().await;
 }

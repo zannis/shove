@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_nats::HeaderMap;
-use async_nats::header::{HeaderName, HeaderValue, NATS_MESSAGE_ID, NATS_MESSAGE_TTL, NATS_ROLLUP};
+use async_nats::header::{HeaderName, HeaderValue, NATS_MESSAGE_ID};
 use async_nats::jetstream::Message;
 use async_nats::jetstream::consumer::AckPolicy;
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
@@ -42,8 +42,8 @@ use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Nats, ShoveError};
 
 use super::client::NatsClient;
 use super::constants::{
-    DEATH_COUNT_HEADER, DEATH_REASON_HEADER, ORIGINAL_QUEUE_HEADER, RETRY_COUNT_HEADER,
-    SEQUENCE_KEY_HEADER,
+    COPY_OF_HEADER, DEATH_COUNT_HEADER, DEATH_REASON_HEADER, ORIGINAL_QUEUE_HEADER,
+    RETRY_COUNT_HEADER, SEQUENCE_KEY_HEADER,
 };
 use super::publisher::{header_value, publish_with_retry};
 
@@ -252,18 +252,27 @@ fn adjust_outcome_for_fifo(outcome: Outcome) -> Outcome {
     }
 }
 
-/// Header-name prefix of JetStream's optimistic-concurrency publish checks.
-const EXPECTED_HEADER_PREFIX: &str = "Nats-Expected-";
+/// Header-name prefixes of the JetStream publish directives a copy never
+/// replays. Each instructs the server about the publish that carries it, and
+/// none describes the copy: a `Nats-Expected-*` check fails against another
+/// stream or a later sequence, and a stream that does not enable rollups,
+/// per-message TTLs, atomic batches or schedules refuses the copy, while one
+/// that does would roll it up, expire it, batch it or schedule it.
+const PUBLISH_DIRECTIVE_PREFIXES: &[&str] = &[
+    "Nats-Expected-",
+    "Nats-Rollup",
+    "Nats-TTL",
+    "Nats-Batch-",
+    "Nats-Schedule",
+    "Nats-Required-Api-Level",
+];
 
-/// Whether `name` is a JetStream publish directive: an instruction to the
-/// server about the publish that carries it, which a copy must not replay. A
-/// `Nats-Expected-*` check fails against another stream or a later sequence,
-/// and a stream that does not allow `Nats-Rollup` or `Nats-TTL` refuses the
-/// publish; one that does would purge the copy's subject or expire the copy.
+/// Whether `name` starts with one of the [`PUBLISH_DIRECTIVE_PREFIXES`].
 fn is_publish_directive(name: &HeaderName) -> bool {
-    *name == NATS_ROLLUP
-        || *name == NATS_MESSAGE_TTL
-        || AsRef::<str>::as_ref(name).starts_with(EXPECTED_HEADER_PREFIX)
+    let name: &str = name.as_ref();
+    PUBLISH_DIRECTIVE_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 /// The original's headers less its publish directives: what every retry and
@@ -281,24 +290,53 @@ fn copy_headers(original: Option<&HeaderMap>) -> HeaderMap {
     copy
 }
 
-/// The `Nats-Msg-Id` of a copy of `msg`: the original delivery's
-/// `{stream}.{stream_sequence}`, then `-{suffix}`.
-///
-/// The stream position is what makes the id right for JetStream's duplicate
-/// window. A redelivery of the same record, after a crash between the copy's
-/// publish and the original's ack, rebuilds the same id, so the window keeps
-/// one copy. Two different records never share an id, whether or not their
-/// producer gave them a `Nats-Msg-Id` of their own.
-fn copy_message_id(msg: &Message, suffix: &str) -> Result<HeaderValue> {
+/// The delivery a copy is made from, `{stream}.{consumer}.{stream_sequence}`:
+/// stamped on every copy as `Shove-Copy-Of`, and the root of the id of a copy
+/// whose original carries no `Nats-Msg-Id`. The consumer is part of it, so two
+/// consumers copying one record into a shared DLQ never pass for each other.
+fn copy_origin_of(stream: &str, consumer: &str, stream_sequence: u64) -> String {
+    format!("{stream}.{consumer}.{stream_sequence}")
+}
+
+/// The [`copy_origin_of`] the delivery `msg` arrived on.
+fn copy_origin(msg: &Message) -> Result<String> {
     let info = msg.info().map_err(|e| {
-        ShoveError::Validation(format!(
-            "a copy's id needs the delivery's stream position: {e}"
-        ))
+        ShoveError::Validation(format!("a copy needs the delivery's stream position: {e}"))
     })?;
-    header_value(
-        "Nats-Msg-Id",
-        &format!("{}.{}-{suffix}", info.stream, info.stream_sequence),
-    )
+    Ok(copy_origin_of(
+        info.stream,
+        info.consumer,
+        info.stream_sequence,
+    ))
+}
+
+/// The `Nats-Msg-Id` of a copy: the original's own id when it has one, so a
+/// handler deduplicating on `delivery_id` keeps the lineage, or else the
+/// copy's origin; then `-{suffix}`.
+///
+/// Either way the id can be predicted, which is why a duplicate PubAck for a
+/// copy is trusted only once the stored message proves to be the same copy
+/// (`publish_with_retry`). A redelivery of the same record, after a crash
+/// between the copy's publish and the original's ack, rebuilds the same id and
+/// passes that check, so the duplicate window still keeps one copy.
+fn copy_message_id(original_id: Option<&str>, origin: &str, suffix: &str) -> String {
+    let root = original_id.filter(|id| !id.is_empty()).unwrap_or(origin);
+    format!("{root}-{suffix}")
+}
+
+/// Stamps a copy of `msg` with its origin and its id.
+fn stamp_copy(headers: &mut HeaderMap, msg: &Message, origin: &str, suffix: &str) -> Result<()> {
+    let original_id = msg
+        .headers
+        .as_ref()
+        .and_then(|hm| hm.get(NATS_MESSAGE_ID))
+        .map(HeaderValue::as_str);
+    headers.insert(COPY_OF_HEADER, header_value(COPY_OF_HEADER, origin)?);
+    headers.insert(
+        NATS_MESSAGE_ID,
+        header_value("Nats-Msg-Id", &copy_message_id(original_id, origin, suffix))?,
+    );
+    Ok(())
 }
 
 /// Publishes a message to the DLQ stream with death headers, the message's
@@ -340,6 +378,7 @@ async fn publish_dead_letter(
         }
     };
 
+    let origin = copy_origin(msg)?;
     let mut headers = copy_headers(msg.headers.as_ref());
     headers.insert(
         DEATH_REASON_HEADER,
@@ -363,13 +402,14 @@ async fn publish_dead_letter(
         DEATH_COUNT_HEADER,
         HeaderValue::from(current_death_count.saturating_add(1)),
     );
-    headers.insert(NATS_MESSAGE_ID, copy_message_id(msg, "dlq")?);
+    stamp_copy(&mut headers, msg, &origin, "dlq")?;
 
     publish_with_retry(
         client.jetstream(),
         dlq_subject,
         headers,
         msg.payload.clone(),
+        Some(&origin),
         3,
         "DLQ publish",
     )
@@ -433,21 +473,7 @@ async fn hold_then_republish(
 
     // Publish the copy durably BEFORE acking the original: a failure leaves the
     // original for redelivery instead of silently dropping the message.
-    let republished = match retry_copy_headers(msg, new_count) {
-        Ok(headers) => {
-            publish_with_retry(
-                client.jetstream(),
-                msg.subject.to_string(),
-                headers,
-                msg.payload.clone(),
-                3,
-                "retry republish",
-            )
-            .await
-        }
-        Err(e) => Err(e),
-    };
-    match republished {
+    match publish_retry_copy(client, msg, new_count).await {
         Ok(()) => {
             if let Err(e) = msg.ack().await {
                 tracing::error!(error = %e, "failed to ack after retry republish");
@@ -462,16 +488,23 @@ async fn hold_then_republish(
     }
 }
 
-/// A retry copy's headers: the original's less its publish directives, with
-/// the incremented count and an id taken from the original's stream position.
-fn retry_copy_headers(msg: &Message, new_count: u32) -> Result<HeaderMap> {
+/// Publishes the retry copy of `msg`: the original's headers less its publish
+/// directives, with the incremented count, its origin and its id.
+async fn publish_retry_copy(client: &NatsClient, msg: &Message, new_count: u32) -> Result<()> {
+    let origin = copy_origin(msg)?;
     let mut headers = copy_headers(msg.headers.as_ref());
     headers.insert(RETRY_COUNT_HEADER, HeaderValue::from(new_count));
-    headers.insert(
-        NATS_MESSAGE_ID,
-        copy_message_id(msg, &format!("r{new_count}"))?,
-    );
-    Ok(headers)
+    stamp_copy(&mut headers, msg, &origin, &format!("r{new_count}"))?;
+    publish_with_retry(
+        client.jetstream(),
+        msg.subject.to_string(),
+        headers,
+        msg.payload.clone(),
+        Some(&origin),
+        3,
+        "retry republish",
+    )
+    .await
 }
 
 /// Dispatches message routing based on the handler's outcome.
@@ -2545,6 +2578,13 @@ mod copy_header_tests {
         original.insert("Nats-Expected-Last-Msg-Id", "previous");
         original.insert("Nats-Rollup", "sub");
         original.insert("Nats-TTL", "1s");
+        original.insert("Nats-Batch-Id", "batch-1");
+        original.insert("Nats-Batch-Sequence", "1");
+        original.insert("Nats-Batch-Commit", "1");
+        original.insert("Nats-Schedule", "@hourly");
+        original.insert("Nats-Schedule-Target", "orders");
+        original.insert("Nats-Scheduler", "orders.schedule");
+        original.insert("Nats-Required-Api-Level", "2");
         original.insert(NATS_MESSAGE_ID, "original");
         original.insert(RETRY_COUNT_HEADER, "2");
         original.insert("x-trace-id", "trace-1");
@@ -2560,6 +2600,13 @@ mod copy_header_tests {
             "Nats-Expected-Last-Msg-Id",
             "Nats-Rollup",
             "Nats-TTL",
+            "Nats-Batch-Id",
+            "Nats-Batch-Sequence",
+            "Nats-Batch-Commit",
+            "Nats-Schedule",
+            "Nats-Schedule-Target",
+            "Nats-Scheduler",
+            "Nats-Required-Api-Level",
         ] {
             assert!(
                 copy.get(directive).is_none(),
@@ -2576,5 +2623,54 @@ mod copy_header_tests {
     #[test]
     fn a_message_without_headers_copies_to_none() {
         assert!(copy_headers(None).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod copy_id_tests {
+    use super::*;
+
+    /// A copy of a message with a `Nats-Msg-Id` builds on that id, so
+    /// `delivery_id` keeps its lineage.
+    #[test]
+    fn a_copy_extends_the_original_id() {
+        let origin = copy_origin_of("orders", "orders-consumer", 7);
+        assert_eq!(copy_message_id(Some("abc"), &origin, "dlq"), "abc-dlq");
+        assert_eq!(copy_message_id(Some("abc"), &origin, "r2"), "abc-r2");
+    }
+
+    /// Without an id of its own a copy is named after the delivery it was
+    /// made from, and an empty id counts as none.
+    #[test]
+    fn a_copy_of_a_message_without_an_id_is_named_after_its_delivery() {
+        let origin = copy_origin_of("orders", "orders-consumer", 7);
+        assert_eq!(origin, "orders.orders-consumer.7");
+        assert_eq!(
+            copy_message_id(None, &origin, "dlq"),
+            "orders.orders-consumer.7-dlq"
+        );
+        assert_eq!(
+            copy_message_id(Some(""), &origin, "r1"),
+            "orders.orders-consumer.7-r1"
+        );
+    }
+
+    /// Two consumers dead-lettering one record into a shared DLQ. Without an
+    /// original id their dead letters get different ids. With one they share
+    /// the id, and their different origins are what stop the second from
+    /// being taken for the first when JetStream reports it a duplicate.
+    #[test]
+    fn two_consumers_of_one_record_make_distinct_copies() {
+        let billing = copy_origin_of("orders", "billing-consumer", 7);
+        let audit = copy_origin_of("orders", "audit-consumer", 7);
+        assert_ne!(
+            copy_message_id(None, &billing, "dlq"),
+            copy_message_id(None, &audit, "dlq")
+        );
+        assert_eq!(
+            copy_message_id(Some("abc"), &billing, "dlq"),
+            copy_message_id(Some("abc"), &audit, "dlq")
+        );
+        assert_ne!(billing, audit);
     }
 }
