@@ -5,7 +5,15 @@
 use std::time::Duration;
 
 #[cfg(feature = "test-support")]
+use rdkafka::ClientConfig;
+#[cfg(feature = "test-support")]
+use rdkafka::consumer::{BaseConsumer, Consumer as _};
+#[cfg(feature = "test-support")]
 use rdkafka::mocking::MockCluster;
+#[cfg(feature = "test-support")]
+use rdkafka::types::RDKafkaRespErr;
+#[cfg(feature = "test-support")]
+use shove::kafka::ping_probe_topic_for_test;
 use shove::kafka::{KafkaClient, KafkaConfig};
 use shove::{Broker, Kafka, ShoveError};
 use testcontainers::runners::AsyncRunner;
@@ -58,8 +66,90 @@ async fn ping_does_not_fetch_all_topics() {
         .expect("the mock broker answers a ping");
 
     assert!(
-        listed.len() <= 1 && listed.iter().all(|topic| !TOPICS.contains(&topic.as_str())),
+        listed.len() <= 1
+            && listed
+                .iter()
+                .all(|(topic, _)| !TOPICS.contains(&topic.as_str())),
         "the ping asked for the cluster's topics and was told about {listed:?}"
+    );
+}
+
+/// A probe repeated for the life of the process must leave nothing behind. A
+/// mock cluster creates any topic a metadata request allows it to create, so
+/// a ping that allowed creation would find its probe topic created, and the
+/// answer to it, and the cluster's topic list after it, would show that.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn ping_never_creates_its_probe_topic() {
+    let mock = MockCluster::new(1).expect("mock cluster");
+    mock.create_topic("ping-orders", 1, 1).expect("mock topic");
+    let client = KafkaClient::connect(&KafkaConfig::new(mock.bootstrap_servers()))
+        .await
+        .expect("connect to the mock cluster");
+    let probe = ping_probe_topic_for_test();
+
+    let listed = client
+        .ping_topics_for_test(Duration::from_secs(5))
+        .await
+        .expect("the mock broker answers a ping");
+
+    let (_, error) = listed
+        .iter()
+        .find(|(topic, _)| topic == probe)
+        .expect("the answer names the probe topic");
+    assert_eq!(
+        *error,
+        Some(RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART),
+        "the broker did not report the probe topic as unknown, so the ping may have created it"
+    );
+    let observer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", mock.bootstrap_servers())
+        .set("allow.auto.create.topics", "false")
+        .create()
+        .expect("an observer client");
+    let cluster = observer
+        .fetch_metadata(None, Duration::from_secs(5))
+        .expect("the observer lists the cluster's topics");
+    assert!(
+        cluster.topics().iter().all(|topic| topic.name() != probe),
+        "the cluster has the probe topic after a ping: {:?}",
+        cluster.topics()
+    );
+}
+
+/// Any answer from a broker shows it is alive, so a broker that refuses the
+/// principal `Describe` on the probe topic still gets a successful ping.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn ping_succeeds_when_the_broker_refuses_the_probe_topic() {
+    let mock = MockCluster::new(1).expect("mock cluster");
+    let probe = ping_probe_topic_for_test();
+    mock.topic_error(
+        probe,
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+    )
+    .expect("refuse the probe topic");
+    let client = KafkaClient::connect(&KafkaConfig::new(mock.bootstrap_servers()))
+        .await
+        .expect("connect to the mock cluster");
+
+    Broker::<Kafka>::from_client(client.clone())
+        .ping()
+        .await
+        .expect("a refusal for the probe topic is still an answer");
+
+    let listed = client
+        .ping_topics_for_test(Duration::from_secs(5))
+        .await
+        .expect("the mock broker answers a ping");
+    let (_, error) = listed
+        .iter()
+        .find(|(topic, _)| topic == probe)
+        .expect("the answer names the probe topic");
+    assert_eq!(
+        *error,
+        Some(RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED),
+        "the refusal never reached the ping"
     );
 }
 
