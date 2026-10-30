@@ -171,6 +171,12 @@ shove::define_topic!(
 );
 
 shove::define_topic!(
+    RenewReadAheadTopic,
+    BatchMessage,
+    TopologyBuilder::new("nats-batch-renew-read-ahead").build()
+);
+
+shove::define_topic!(
     AbortFlushTopic,
     BatchMessage,
     TopologyBuilder::new("nats-batch-abort-flush").build()
@@ -2192,6 +2198,133 @@ async fn a_stop_during_a_flush_hands_the_batch_read_ahead_back() {
     let mut taken = second.seen();
     taken.sort_unstable();
     assert_eq!(taken, (100..200).collect::<Vec<_>>());
+    broker.close().await;
+}
+
+/// Holds each flush for the next of its scripted times, yielding meanwhile,
+/// and acks every flush. The seqs of every flush are recorded as it starts.
+#[derive(Clone)]
+struct PacedFlushHandler {
+    batches: Arc<Mutex<Vec<Vec<u32>>>>,
+    holds: Arc<Mutex<VecDeque<Duration>>>,
+    started: Arc<Notify>,
+}
+
+impl PacedFlushHandler {
+    fn new(holds: impl IntoIterator<Item = Duration>) -> Self {
+        Self {
+            batches: Arc::new(Mutex::new(Vec::new())),
+            holds: Arc::new(Mutex::new(holds.into_iter().collect())),
+            started: Arc::new(Notify::new()),
+        }
+    }
+
+    fn batches(&self) -> Vec<Vec<u32>> {
+        self.batches.lock().unwrap().clone()
+    }
+}
+
+impl BatchMessageHandler<RenewReadAheadTopic> for PacedFlushHandler {
+    type Context = ();
+    async fn handle_batch(
+        &self,
+        messages: Vec<(BatchMessage, MessageMetadata)>,
+        _: &(),
+    ) -> Outcome {
+        self.batches
+            .lock()
+            .unwrap()
+            .push(messages.iter().map(|(m, _)| m.seq).collect());
+        self.started.notify_one();
+        let hold = self.holds.lock().unwrap().pop_front();
+        if let Some(hold) = hold {
+            tokio::time::sleep(hold).await;
+        }
+        Outcome::Ack
+    }
+}
+
+/// The batch read ahead waits out the flush in progress before its own flush
+/// starts, and its `ack_wait` is renewed while it waits, so a batch held for
+/// longer than the durable's `ack_wait` is not redelivered. Against an
+/// `ack_wait` of 9 s, the first flush takes 7 s and the second 4 s, so the
+/// batch read ahead is held for 11 s.
+#[tokio::test]
+async fn a_batch_read_ahead_held_past_its_ack_wait_is_not_redelivered() {
+    const STREAM: &str = "nats-batch-renew-read-ahead";
+    const DURABLE: &str = "nats-batch-renew-read-ahead-consumer";
+    const ACK_WAIT: Duration = Duration::from_secs(9);
+    const FIRST_FLUSH: Duration = Duration::from_secs(7);
+    const SECOND_FLUSH: Duration = Duration::from_secs(4);
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<RenewReadAheadTopic>()
+        .await
+        .unwrap();
+    client
+        .jetstream()
+        .get_stream(STREAM)
+        .await
+        .unwrap()
+        .create_consumer(PullConsumerConfig {
+            durable_name: Some(DURABLE.to_string()),
+            ack_policy: AckPolicy::Explicit,
+            max_ack_pending: -1,
+            ack_wait: ACK_WAIT,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    publish_seq::<RenewReadAheadTopic>(&broker, 0..10).await;
+
+    let handler = PacedFlushHandler::new([FIRST_FLUSH, SECOND_FLUSH]);
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<RenewReadAheadTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(5)
+                    .with_max_batch_age(Duration::from_millis(300))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    tokio::time::timeout(TIMEOUT, handler.started.notified())
+        .await
+        .expect("the first flush starts");
+    let flush_started = Instant::now();
+    assert_eq!(
+        wait_for_ack_pending(&client, STREAM, DURABLE, 10).await,
+        10,
+        "the batch read ahead is delivered while the first flush runs"
+    );
+
+    // A redelivery would land during the second flush and be flushed after it.
+    tokio::time::sleep_until(flush_started + FIRST_FLUSH + SECOND_FLUSH + Duration::from_secs(2))
+        .await;
+    assert_eq!(
+        handler.batches(),
+        vec![(0..5).collect::<Vec<_>>(), (5..10).collect()],
+        "each batch reaches the handler once"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    assert_eq!(
+        durable_state(&client, STREAM, DURABLE).await,
+        (0, 0, 0),
+        "everything is acked and nothing was redelivered"
+    );
     broker.close().await;
 }
 

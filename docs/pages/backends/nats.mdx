@@ -215,8 +215,10 @@ The consumer keeps one pull outstanding.
 The request for the next batch goes out as the previous batch starts to flush, so the next batch is delivered and decoded while the flush runs, and a full one is waiting when the flush ends.
 A worker holds at most two batches, the one flushing and the one read ahead, and the request after that waits until the batch read ahead has started its own flush.
 The flush runs in a task of its own, so on a multi-threaded runtime a handler that holds its thread does not keep the consumer from reading the pull.
-A message of the batch read ahead waits out the flush ahead of it before its own begins, so the clock of its `ack_wait` has to cover the window and two flushes.
-The durable a batch consumer creates gets an `ack_wait` of `max_batch_age` plus two margins, each three times the handler timeout and at least 30 s, and with no handler timeout the default one stands in.
+A message of the batch read ahead waits out the flush ahead of it before its own begins: the handler, the dead-letter publishes of a rejected batch, or the pause before a batch handed back is redelivered.
+While it waits, the consumer renews its `ack_wait` with a progress acknowledgement every third of the durable's `ack_wait`, so a flush ahead that outlasts the `ack_wait` does not get the batch read ahead redelivered.
+The clock of a message's `ack_wait` then has to cover the window and the message's own flush.
+The durable a batch consumer creates gets an `ack_wait` of `max_batch_age` plus a margin of three times the handler timeout, at least 30 s, and with no handler timeout the default one stands in.
 A durable that something else created keeps its own `ack_wait`, and the consumer logs a warning when it is below that figure, since a slow flush then risks a redelivery.
 
 A stop finishes the flush in progress and hands the batch read ahead back to the server with a nak, so another consumer takes it at once and the stop does not wait for a second flush.

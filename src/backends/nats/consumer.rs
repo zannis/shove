@@ -1356,9 +1356,10 @@ enum Step {
     Event(PullEvent),
 }
 
-/// Waits out the pause before a worker's next pull, never ready without one.
-async fn pause_over(pause: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
-    match pause {
+/// Waits out `sleep`, such as the pause before a consumer's next pull, never
+/// ready without one.
+async fn sleep_over(sleep: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
+    match sleep {
         Some(sleep) => sleep.as_mut().await,
         None => std::future::pending().await,
     }
@@ -1551,7 +1552,7 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                 biased;
                 _ = self.shutdown.cancelled() => Step::Stop,
                 changed = connected.changed(), if watching => Step::Connected(changed.is_ok()),
-                () = pause_over(&mut pause), if pause.is_some() => Step::Resume,
+                () = sleep_over(&mut pause), if pause.is_some() => Step::Resume,
                 reserved = reserve_free_slots(&self.slots), if may_pull => Step::Reserved(reserved),
                 event = next_event(&mut pulls), if !pulls.is_empty() => Step::Event(event),
             };
@@ -2624,13 +2625,20 @@ impl NatsConsumer {
 /// `ack_wait` for the batch consumer's fallback-created durable, and the
 /// threshold the pre-declared-consumer warning compares against.
 ///
-/// The consumer reads the next batch while it flushes the previous one. A
-/// message of the batch read ahead can be delivered at the very start of its
-/// window, then wait out the window or the flush in progress, whichever lasts
-/// longer, before its own flush even begins. The single-path derivation
-/// ([`derive_ack_wait`]: 3x the handler timeout, floored at the JetStream
-/// default) covers one flush, so this adds the window and a second such margin
-/// for the flush ahead of it.
+/// A message can be delivered at the very start of a pull window and then
+/// wait the whole `max_batch_age` before its flush even begins, so the
+/// single-path derivation ([`derive_ack_wait`]: 3x the handler timeout,
+/// floored at the JetStream default) under-covers a batch: the pull window is
+/// added on top.
+///
+/// The batch read ahead also waits out the flush in progress: its handler,
+/// the dead-letter publishes of a rejected batch, or the pause before a batch
+/// handed back is redelivered. While it waits, the consumer renews the
+/// `ack_wait` of each of its messages with a progress ack every
+/// [`progress_interval`], so that wait needs no margin of its own. A message
+/// read ahead goes without a renewal for at most the longer of the window and
+/// one interval, a third of the `ack_wait`, before its own flush starts, and
+/// the margin covers that flush.
 ///
 /// `handler_timeout: None`
 /// ([`BatchConsumerOptions::without_handler_timeout`](crate::BatchConsumerOptions::without_handler_timeout))
@@ -2643,8 +2651,9 @@ pub(super) fn derive_batch_ack_wait(
     max_batch_age: Duration,
     handler_timeout: Option<Duration>,
 ) -> Duration {
-    let margin = derive_ack_wait(handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT));
-    max_batch_age.saturating_add(margin.saturating_mul(2))
+    max_batch_age.saturating_add(derive_ack_wait(
+        handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT),
+    ))
 }
 
 /// How much consecutive zero-message pull time the batch loop rides out
@@ -2885,6 +2894,8 @@ enum IntakeEvent {
     Connected(bool),
     /// The pause after a refused pull is over.
     Resume,
+    /// The batch read ahead is due a renewal of its `ack_wait`.
+    Renew,
     /// A slot for the first of the poison messages that wait for one.
     Permit(std::result::Result<OwnedSemaphorePermit, AcquireError>),
     /// A message, the status the server ended the pull with, or the end of
@@ -2931,8 +2942,9 @@ async fn flush_end(
 /// a reconnect and a pull the server ends with a status.
 ///
 /// The intake never waits on a flush, which runs in a task of its own, so it
-/// goes on reading while one runs. It never waits on a settlement either, so
-/// the pull is read as fast as it delivers.
+/// goes on reading while one runs, and renews the `ack_wait` of the batch it
+/// reads ahead meanwhile. It never waits on a settlement either, so the pull
+/// is read as fast as it delivers.
 struct BatchIntake<T: Topic> {
     consumer: PullConsumer,
     ctx: Arc<NatsBatchCtx>,
@@ -2957,6 +2969,9 @@ struct BatchIntake<T: Topic> {
     waiting: VecDeque<Poison>,
     pause: Option<Pin<Box<tokio::time::Sleep>>>,
     pause_backoff: Backoff,
+    /// When the batch read ahead is next renewed. Set while a flush is in
+    /// progress.
+    renew: Option<Pin<Box<tokio::time::Sleep>>>,
     empty_windows: u32,
     stopping: bool,
     failure: Option<ShoveError>,
@@ -3042,8 +3057,11 @@ impl<T: Topic> BatchIntake<T> {
             changed = self.connected.changed(), if self.watching && !halted => {
                 IntakeEvent::Connected(changed.is_ok())
             }
-            () = pause_over(&mut self.pause), if self.pause.is_some() && !halted => {
+            () = sleep_over(&mut self.pause), if self.pause.is_some() && !halted => {
                 IntakeEvent::Resume
+            }
+            () = sleep_over(&mut self.renew), if self.renew.is_some() && !halted => {
+                IntakeEvent::Renew
             }
             permit = wait_for_slot(&self.poison_slots), if !self.waiting.is_empty() => {
                 IntakeEvent::Permit(permit)
@@ -3062,6 +3080,7 @@ impl<T: Topic> BatchIntake<T> {
             IntakeEvent::Connected(false) => self.watching = false,
             IntakeEvent::Connected(true) => self.on_reconnect().await,
             IntakeEvent::Resume => self.pause = None,
+            IntakeEvent::Renew => self.renew_read_ahead().await,
             IntakeEvent::Permit(Ok(slot)) => {
                 if let Some(Poison { msg, reason }) = self.waiting.pop_front() {
                     self.settle_in_background(msg, reason, slot);
@@ -3118,6 +3137,32 @@ impl<T: Topic> BatchIntake<T> {
             settle_poison(&ctx, &msg, &reason).await;
             drop((slot, busy));
         });
+    }
+
+    /// Schedules the next renewal of the batch read ahead a
+    /// [`progress_interval`] from now. Called as a flush starts.
+    fn renew_later(&mut self) {
+        let interval = progress_interval(self.ctx.ack_wait);
+        self.renew = Some(Box::pin(tokio::time::sleep(interval)));
+    }
+
+    /// Renews, with a progress ack, the `ack_wait` of every message of the
+    /// batch read ahead, which waits out the flush in progress before its own
+    /// flush, then schedules the next renewal.
+    async fn renew_read_ahead(&mut self) {
+        let renewals = async {
+            for msg in &self.forming.acks {
+                if let Err(e) = msg.ack_with(AckKind::Progress).await {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to renew the ack_wait of a message read ahead"
+                    );
+                }
+            }
+        };
+        // A publish can block while the client reconnects.
+        self.unless_stopped(renewals).await;
+        self.renew_later();
     }
 
     /// The pull is over: it filled, or its window expired.
@@ -3383,10 +3428,9 @@ impl<T: NotSequenced, H: BatchMessageHandler<T>> BatchRun<T, H> {
                 queue,
                 ?ack_wait,
                 required = ?self.batch_ack_wait,
-                "consumer ack_wait is below the batch window plus two flush \
-                 margins; a message read ahead waits out the flush ahead of \
-                 it, so a slow flush risks mid-flight redelivery (duplicates, \
-                 never loss)"
+                "consumer ack_wait is below the batch window plus the \
+                 handler-timeout margin; a slow flush risks mid-flight \
+                 redelivery (duplicates, never loss)"
             );
         }
         Ok((pull_consumer, effective_batch_size, ack_wait))
@@ -3425,6 +3469,7 @@ impl<T: NotSequenced, H: BatchMessageHandler<T>> BatchRun<T, H> {
             waiting: VecDeque::new(),
             pause: None,
             pause_backoff: ended_pull_backoff(),
+            renew: None,
             empty_windows: 0,
             stopping: false,
             failure: None,
@@ -3467,6 +3512,7 @@ impl<T: NotSequenced, H: BatchMessageHandler<T>> BatchRun<T, H> {
                     _abort: AbortOnDrop(task.abort_handle()),
                     task,
                 });
+                intake.renew_later();
             }
             if intake.wants_pull() {
                 intake.open_pull().await;
@@ -3478,6 +3524,7 @@ impl<T: NotSequenced, H: BatchMessageHandler<T>> BatchRun<T, H> {
                 biased;
                 ended = flush_end(&mut flush), if flush.is_some() => {
                     flush = None;
+                    intake.renew = None;
                     match ended {
                         Ok(backoff) => redelivery_backoff = backoff,
                         Err(e) => {
@@ -3602,8 +3649,10 @@ impl NatsConsumer {
     /// waiting when it ends. The request after that waits for the batch read
     /// ahead to start its own flush, so a worker holds at most two batches:
     /// the one flushing and the one read ahead. A message of the second waits
-    /// out the first flush before its own, which [`derive_batch_ack_wait`]
-    /// covers.
+    /// out the first flush before its own, and its `ack_wait` is renewed with
+    /// a progress ack every third of it meanwhile, so a flush that outlasts
+    /// the `ack_wait` does not get the batch read ahead redelivered (see
+    /// [`derive_batch_ack_wait`]).
     ///
     /// A stop finishes the flush in progress, hands the batch read ahead back
     /// to the server with a nak, and flushes the batch in hand only when no
@@ -3666,7 +3715,7 @@ impl NatsConsumer {
     /// <stream> <durable> --max-pending=-1`, or size it at two batches per
     /// worker. Editing keeps the durable's position in the stream, which a
     /// recreated durable does not. A further warning fires when the durable's
-    /// `ack_wait` is below the batch window plus two handler-timeout margins,
+    /// `ack_wait` is below the batch window plus the handler-timeout margin,
     /// where a slow flush risks mid-flight redelivery (duplicates, never
     /// loss).
     ///
@@ -4239,24 +4288,24 @@ mod either_token_tests {
 mod batch_derivation_tests {
     use super::*;
 
-    /// A message of the batch read ahead waits out the batch window or the
-    /// flush in progress, then its own flush: the window plus two of the
-    /// single-path margins.
+    /// A message can wait out the window before its own flush, and the wait
+    /// for a flush ahead of it is renewed, so the window is added to the
+    /// single-path margin once.
     #[test]
-    fn batch_ack_wait_adds_the_window_to_two_flush_margins() {
+    fn batch_ack_wait_adds_the_window_to_the_single_path_margin() {
         assert_eq!(
             derive_batch_ack_wait(Duration::from_secs(2), Some(Duration::from_secs(30))),
-            Duration::from_secs(182)
+            Duration::from_secs(92)
         );
     }
 
     /// A short handler timeout still floors at the server default before the
     /// window is added — same floor as the single path.
     #[test]
-    fn batch_ack_wait_floors_each_margin_at_the_server_default() {
+    fn batch_ack_wait_floors_the_margin_at_the_server_default() {
         assert_eq!(
             derive_batch_ack_wait(Duration::from_millis(250), Some(Duration::from_secs(1))),
-            Duration::from_millis(60_250)
+            Duration::from_millis(30_250)
         );
     }
 
@@ -4266,7 +4315,7 @@ mod batch_derivation_tests {
     fn no_handler_timeout_derives_from_the_default() {
         assert_eq!(
             derive_batch_ack_wait(Duration::from_secs(1), None),
-            Duration::from_secs(1) + derive_ack_wait(DEFAULT_HANDLER_TIMEOUT) * 2
+            Duration::from_secs(1) + derive_ack_wait(DEFAULT_HANDLER_TIMEOUT)
         );
     }
 
