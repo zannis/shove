@@ -1452,8 +1452,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_drain_leaves_a_saturated_tally_saturated() {
-        // The consumer counts one error and one panic as it stops and then
-        // panics itself, so every addition a drain makes has something to add.
+        // Every addition the drain makes has a positive amount to add.
         let errors = Arc::new(AtomicUsize::new(0));
         let panics = Arc::new(AtomicUsize::new(0));
         let (ec, pc) = (errors.clone(), panics.clone());
@@ -1508,8 +1507,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_saturated_panic_count_still_reads_as_a_dirty_shutdown() {
-        // Both groups hold saturated counts, and one of them harvests one more
-        // panic into its own on top. The registry adds the two together.
+        // Both groups are saturated, and one harvests one more panic on top.
         let panicking: Spawner = Arc::new(|_options: ConsumerOptions| {
             tokio::spawn(async { panic!("the consumer task panics on purpose") })
         });
