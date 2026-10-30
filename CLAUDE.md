@@ -79,6 +79,12 @@ there rather than restating the table in a third place.
   Two backends split the mechanics out into a helper module the routing calls
   into — `src/backends/rabbitmq/router.rs` and `src/backends/sns/router.rs` —
   so a routing change there means both files, not just `consumer.rs`.
+- **Kafka sequenced (FIFO) settling** — `src/backends/kafka/consumer.rs`:
+  `FifoLoop::handle` retries in place and `FifoLoop::dead_letter` publishes
+  the dead letter and settles its discard, with the commits in
+  `FifoState::settle` / `FifoState::commit_due`. It does **not** go through
+  `route_outcome`, so a retry/DLQ fix applied to Kafka's `route_outcome`
+  still misses the sequenced loop.
 - **Broadcast outcome settling** — `src/backend/broadcast.rs::settle_broadcast_outcome`,
   shared by the Kafka, NATS and Redis broadcast loops. It does **not** go
   through `route_outcome`, so a retry/discard fix applied to every backend's
@@ -91,8 +97,9 @@ there rather than restating the table in a third place.
   `HasBatchConsumption` backend. Kafka's *single-message* async-commit reject
   path also imports this module's deferred-settlement machinery
   (`TerminalDiscard`, `RejectSettlement`, `reject_settlement`) — not only its
-  batch path — so a cleanup narrowing that trio's gate must check the
-  single-message caller first, per the module's own doc comment.
+  batch path — and so does its sequenced loop's `FifoLoop::dead_letter`, so a
+  cleanup narrowing that trio's gate must check both of those callers first,
+  per the module's own doc comment.
 
 ## Build / test / lint commands
 
@@ -147,9 +154,10 @@ there rather than restating the table in a third place.
   `route_outcome`, not just one. The git history shows recurring
   "cross-backend consistency" commits because a fix landed in one backend and
   was missed in the others. When you touch retry/DLQ logic, check every backend
-  — and the two settling paths above that bypass `route_outcome`: broadcast
-  (`settle_broadcast_outcome`) and batch (`settle_batch_outcome` plus each
-  backend's own batch-flush arms).
+  — and the three settling paths above that bypass `route_outcome`: broadcast
+  (`settle_broadcast_outcome`), batch (`settle_batch_outcome` plus each
+  backend's own batch-flush arms) and Kafka FIFO (`FifoLoop::handle` /
+  `FifoLoop::dead_letter`).
 - **Pre-handler drops count toward `messages_discarded_total`**: a message
   dropped before the handler (oversize, undecodable, batch-accumulation drop)
   settles a discard under the same rules as a post-handler terminal outcome —
