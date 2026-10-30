@@ -1366,7 +1366,7 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
 
     /// Pulls and starts messages on `consumer` until shutdown, which releases
     /// what the worker pulled and never started ([`release_pulled`]) and waits
-    /// for its tasks, or until a pull fails.
+    /// for its tasks, or until the connection to the server fails.
     async fn pull_until_stopped(
         self: &Arc<Self>,
         consumer: &PullConsumer,
