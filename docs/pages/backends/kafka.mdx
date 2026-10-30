@@ -324,7 +324,7 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
 
 ### Broker outages
 
-A broker that goes away and comes back does not end a consumer.
+A broker that goes away and comes back does not end a consumer, unless the bounce comes soon after an assignment change, see below.
 librdkafka reports a broker connection that failed or could not be made, a broker name that did not resolve, and every broker being down at once as consumer errors, and reconnects on its own.
 The consumer logs each of them at warn level and keeps polling on the same client.
 An outage shorter than `session.timeout.ms`, 10 s, therefore costs the member nothing but the wait: it keeps its place in its group, and nothing is rebalanced.
@@ -335,8 +335,19 @@ That covers a fatal error, a missing committed offset under `KafkaAutoOffsetRese
 librdkafka does not recover from those on its own: a committed-offset fetch the coordinator refused, for one, leaves its partitions unfetched until the assignment changes.
 A retryable one reconnects, which rejoins the group and fetches the committed offsets again, and a permanent one ends the member.
 That holds for a group member, `KafkaConsumer::run`, `run_batch`, `run_fifo`, a broadcast subscription and `run_dlq`, and for every wait in them that polls.
-A committed-offset fetch whose request failed after the assignment changed under it reports the same code as a failed broker connection.
-The consumer rides that one out as well, because the code alone cannot tell the two apart.
+
+A committed-offset fetch can fail with the code a failed broker connection reports.
+librdkafka retries the fetch through failed connections for as long as the assignment it was sent for stands, so that error reaches the consumer only once an assign or revoke has changed the assignment under the fetch.
+The fetch's partitions then stay unfetched, and so does every partition assigned to the member after them, until they are revoked.
+The member keeps heartbeating meanwhile, so the group never moves them.
+The code alone cannot tell that error from a broker failure, so a failed connection that may be one ends the member's connection instead of being ridden out.
+That is a failed connection within `socket.timeout.ms` of an assign or revoke that itself landed within `socket.timeout.ms` of an earlier assign, or of a failed connection the consumer rode out: a fetch may have been pending when that change landed.
+shove leaves `socket.timeout.ms` at librdkafka's default, 60 s.
+The reconnect rejoins the group and fetches the committed offsets again.
+A bounce that lands on a member with no such change behind it is ridden out as above.
+One case stays out of sight: a coordinator that holds a fetch unanswered for longer than `socket.timeout.ms` while the consumer is handed no error.
+An assignment change after that bound, and a connection the coordinator drops after it, leave the fetch's partitions unfetched with the error ridden out.
+They stay so until those partitions are revoked or the member restarts.
 
 ### Pauses and rebalances
 
@@ -692,7 +703,7 @@ The thread finishes on its own and never holds the runtime or the process, so a 
 
 A member that ends on an error closes its consumer on a thread of its own too, with nothing committed, before it reconnects or returns the error.
 That holds for the standard and the sequenced consumer, a fenced consumer and a failed subscribe included.
-A receive error librdkafka recovers from on its own ends nothing, see [Broker outages](#broker-outages).
+A receive error the consumer rides out ends nothing, see [Broker outages](#broker-outages).
 It waits for the close for at most the same 20 s, and returns without waiting when no thread can be spawned to run it.
 The close sends the member's LeaveGroup and waits for the coordinator's answer, so the member has left its group when the error reaches the caller.
 A process that exits on the error therefore does not cut the LeaveGroup short, and its group does not wait out `session.timeout.ms` for the member.

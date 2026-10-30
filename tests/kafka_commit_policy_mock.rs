@@ -4297,16 +4297,22 @@ async fn broker_bounce_does_not_rejoin() {
 /// member reconnects on a fresh client. The rebalance may have changed the
 /// assignment while a committed-offset fetch was pending, and librdkafka's
 /// only trace of a fetch that change stranded is a `__TRANSPORT`, the code a
-/// refused reconnect reports too (bundled librdkafka 2.12.1,
-/// `rdkafka_assignment.c:281-298`). Member A takes both partitions of the
+/// failed reconnect reports too (bundled librdkafka 2.12.1,
+/// `rdkafka_assignment.c:283-298`). Member A takes both partitions of the
 /// return topic, and B joins straight after, so the cooperative rebalance
-/// revokes one of A's partitions within seconds of A's assign; the bounce
-/// follows within seconds as well, inside the default `socket.timeout.ms`,
-/// 60 s. Red while every `__TRANSPORT` was ridden out, whatever the
-/// rebalance callback had served.
+/// revokes one of A's partitions within seconds of A's assign.
+///
+/// The broker then stays down until a member has reconnected. A member's
+/// first reconnect to it fails at once where the host refuses the
+/// connection, and once the connect times out where the host lets it hang,
+/// after about 8 s on macOS; either way inside the default
+/// `socket.timeout.ms`, 60 s, of the rebalance. A 3 s bounce on macOS
+/// surfaces no `__TRANSPORT` at all, only every broker being down. The
+/// close that ends the member's loop waits out the shutdown deadline against
+/// the down broker, and the member reconnects after it. Red while every
+/// `__TRANSPORT` was ridden out, whatever the rebalance callback had served.
 #[tokio::test]
 async fn broker_bounce_soon_after_a_rebalance_reconnects() {
-    const BOUNCE: Duration = Duration::from_secs(3);
     /// The bound for a wait that spans a rebalance: the mock coordinator
     /// waits up to `session.timeout.ms` for its members to rejoin.
     const REBALANCE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -4354,17 +4360,15 @@ async fn broker_bounce_soon_after_a_rebalance_reconnects() {
     mock.api()
         .broker_down(BROKER_ID)
         .expect("take the mock broker down");
-    tokio::time::sleep(BOUNCE).await;
-    mock.api()
-        .broker_up(BROKER_ID)
-        .expect("bring the mock broker back");
-
     wait_until(
         || client_id_probe::created().len() > before.len(),
         DELIVERY_TIMEOUT,
-        "a member reconnecting on a fresh client after the bounce",
+        "a member reconnecting on a fresh client while the broker is down",
     )
     .await;
+    mock.api()
+        .broker_up(BROKER_ID)
+        .expect("bring the mock broker back");
 
     // The reconnect rebalances the group, so a final commit may be refused.
     token_a.cancel();
