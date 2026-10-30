@@ -7790,7 +7790,10 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
 mod tests {
     use super::*;
     use clap::Parser;
-    use shove::inmemory::{InMemoryConfig, InMemoryConsumer, InMemoryConsumerGroupConfig};
+    use shove::inmemory::{
+        BrokerStatsProvider, InMemoryConfig, InMemoryConsumer, InMemoryConsumerGroupConfig,
+        InMemoryQueueStatsProvider,
+    };
 
     fn cli(tier: &str, handler: &str) -> Cli {
         Cli::parse_from(["stress", "--tier", tier, "--handler", handler])
@@ -13042,8 +13045,10 @@ mod tests {
         validate_run(&run).expect("the row the driver wrote validates");
     }
 
-    /// A corpus a no-op consumer empties before the barrier can pass is not
-    /// measured: the diagnostic names the count and the remedy.
+    /// A corpus the group empties before the barrier passes is not measured:
+    /// the diagnostic names the count and the remedy. The readiness probe holds
+    /// the barrier until the queue is drained, so the condition is forced
+    /// instead of raced against a no-op consumer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_drain_mostly_consumed_before_the_barrier_is_refused() {
         let corpus = 200;
@@ -13056,7 +13061,31 @@ mod tests {
             }),
             ..scenario_for(Flow::ConsumerGroup, HandlerProfile::Zero)
         };
-        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
+        let client = <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+            .await
+            .expect("connect InMemory");
+        let probed = client.clone();
+        let hold_until_drained: ReadinessProbeFn = Box::new(move |queue, _sentinel| {
+            let stats = BrokerStatsProvider::new(probed.clone());
+            Box::pin(async move {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        let queue_stats = stats
+                            .get_queue_stats(queue)
+                            .await
+                            .map_err(|e| format!("queue stats: {e}"))?;
+                        if queue_stats.messages_ready == 0 && queue_stats.messages_in_flight == 0 {
+                            return Ok(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .map_err(|_| "the group did not drain the queue within 30s".to_string())?
+            })
+        });
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory")
+            .with_readiness_probe(hold_until_drained);
         let cancel = CancellationToken::new();
         let err = run_scenario_group(
             &hcfg,
@@ -13066,16 +13095,18 @@ mod tests {
                 InMemoryConsumerGroupConfig::new(consumers..=consumers)
                     .with_prefetch_count(prefetch)
             },
-            &|| async {
-                <shove::InMemory as Backend>::connect(InMemoryConfig::default())
-                    .await
-                    .expect("connect InMemory")
+            &|| {
+                let client = client.clone();
+                async move { client }
             },
         )
         .await
         .err()
         .expect("a drain emptied during the barrier is not a measurement");
-        assert!(err.contains("already consumed"), "{err}");
+        assert!(
+            err.contains("200 of 200 messages were already consumed"),
+            "{err}"
+        );
         assert!(err.contains("--drain-messages"), "{err}");
     }
 
