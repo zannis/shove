@@ -543,7 +543,7 @@ impl PendingDiscard {
     /// still exists — in the DLQ — so nothing is counted.
     ///
     /// Call this only against a broker-acknowledged retirement — a
-    /// server-confirmed ack (NATS `double_ack`), an `XACK` that reported
+    /// server-confirmed ack (NATS `confirmed_ack`), an `XACK` that reported
     /// actually acknowledging the entry, or a synchronous commit that returned
     /// `Ok`. Handing a message off to something that will retire it later does
     /// not qualify: Kafka's concurrent consumer therefore carries the pending

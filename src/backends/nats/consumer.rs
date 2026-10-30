@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 
-use async_nats::HeaderMap;
 use async_nats::header::{HeaderName, HeaderValue, NATS_MESSAGE_ID};
 use async_nats::jetstream::Message;
 use async_nats::jetstream::consumer::pull::{Batch, Config as PullConsumerConfig};
@@ -18,6 +17,8 @@ use async_nats::jetstream::context::{
     ConsumerInfoError, ConsumerInfoErrorKind, GetStreamError, GetStreamErrorKind,
 };
 use async_nats::jetstream::message::AckKind;
+use async_nats::{HeaderMap, Request};
+use bytes::Bytes;
 use futures_util::FutureExt;
 use futures_util::stream::{self, StreamExt};
 use tokio::sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore, SemaphorePermit, watch};
@@ -600,6 +601,39 @@ async fn ack_dead_letter(msg: &Message, dlq: &str) {
     }
 }
 
+/// How long [`confirmed_ack`] waits for the server to answer an ack.
+const ACK_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Acks `msg` and waits for the server to say it applied the ack.
+///
+/// The consumer that takes an ack carrying a reply subject answers with an
+/// empty message. When no consumer takes it, because its stream or durable is
+/// gone, the server answers in its place with a status, a `503` for no
+/// responders. async-nats's `double_ack` takes any reply for the confirmation,
+/// so an ack that reached nothing would pass for a retirement. This one
+/// confirms only a reply without a status, which is the only reply that lets a
+/// discard count.
+async fn confirmed_ack(msg: &Message) -> Result<()> {
+    let reply = msg.reply.clone().ok_or_else(|| {
+        ShoveError::Connection("a message with no reply subject cannot be acked".to_string())
+    })?;
+    let ack = Request::new()
+        .payload(Bytes::from(AckKind::Ack))
+        .timeout(Some(ACK_CONFIRMATION_TIMEOUT));
+    let answer = msg
+        .context
+        .client()
+        .send_request(reply, ack)
+        .await
+        .map_err(|e| ShoveError::Connection(format!("the server did not answer the ack: {e}")))?;
+    match answer.status {
+        None => Ok(()),
+        Some(status) => Err(ShoveError::Connection(format!(
+            "the server answered the ack with status {status}, so no consumer took it"
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sequenced settlement
 // ---------------------------------------------------------------------------
@@ -757,7 +791,7 @@ async fn dead_letter_unhandled<H, C>(
 /// Dead-letters a record whose outcome is terminal, a `Reject` or an exhausted
 /// `Retry`, stamped with the count it was settled at, and with the accounting
 /// of `route_outcome`'s DLQ arm: the failure counts at once, the discard only
-/// once `double_ack` confirms the record is retired.
+/// once [`confirmed_ack`] confirms the record is retired.
 async fn dead_letter_terminal<H, C>(
     shard: &FifoShard<'_, H, C>,
     msg: &Message,
@@ -773,7 +807,7 @@ async fn dead_letter_terminal<H, C>(
     match dead_letter_in_place(shard, msg, reason, Some(retry_count)).await {
         DeadLetter::Landed => {
             // Only a server-confirmed ack proves the record is retired.
-            match msg.double_ack().await {
+            match confirmed_ack(msg).await {
                 Ok(()) => pending.confirm(),
                 Err(e) => {
                     tracing::error!(error = %e, "failed to ack after DLQ publish");
@@ -839,7 +873,7 @@ where
         if has_dlq {
             // The message is in the DLQ, so it exists whatever the ack does
             // and `confirm` could never count it. Settling now keeps the
-            // dead-lettered cascade off the `double_ack` round trip the live
+            // dead-lettered cascade off the `confirmed_ack` round trip the live
             // pending record below needs — and a poisoned key drains its whole
             // backlog through this branch, so that tax is per message.
             pending.survived();
@@ -849,11 +883,11 @@ where
             return ShardStep::Settled;
         }
         // No DLQ, so this ack is what drops the message and it decides the
-        // discard accounting. `double_ack` rather than `ack`: `ack` returns as
+        // discard accounting. `confirmed_ack` rather than `ack`: `ack` returns as
         // soon as `+ACK` is written to the connection, so a connection lost
         // before JetStream applies it would redeliver a message already
         // counted gone. Same reasoning as `route_outcome`'s Dlq arm.
-        match msg.double_ack().await {
+        match confirmed_ack(msg).await {
             Ok(()) => pending.confirm(),
             Err(e) => {
                 tracing::error!(
@@ -1937,18 +1971,20 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                         // JetStream still owns the delivery and will redeliver
                         // on ack-wait expiry, so a failed ack is not a discard.
                         //
-                        // `double_ack` rather than `ack` because this is the
+                        // `confirmed_ack` rather than `ack` because this is the
                         // arm that decides whether a discard actually
                         // happened. `ack` only publishes `+ACK` to the client
                         // connection and returns as soon as it is written; a
                         // connection lost before JetStream applies it
                         // redelivers the message while `confirm` has already
-                        // counted it gone. `double_ack` waits for the server's
-                        // reply, so `Ok` means the stream really did retire
-                        // the delivery. The extra round trip is paid only on
-                        // terminal outcomes (rejected or retries exhausted),
-                        // not on the happy path above.
-                        match msg.double_ack().await {
+                        // counted it gone. `confirmed_ack` waits for the
+                        // consumer's reply, so `Ok` means the stream really did
+                        // retire the delivery, and a status from the server in
+                        // its place is an ack that reached no consumer. The
+                        // extra round trip is paid only on terminal outcomes
+                        // (rejected or retries exhausted), not on the happy
+                        // path above.
+                        match confirmed_ack(msg).await {
                             Ok(()) => pending.confirm(),
                             Err(e) => {
                                 tracing::error!(error = %e, "failed to ack after DLQ publish");
@@ -2940,7 +2976,7 @@ async fn ack_batch(acks: &[Message]) {
 }
 
 /// `Reject`: per message, the exact terminal contract of the single-message
-/// path's DLQ arm — `record_terminal`, publish to the DLQ, then `double_ack`
+/// path's DLQ arm — `record_terminal`, publish to the DLQ, then `confirmed_ack`
 /// (the server-confirmed ack is what decides whether a discard really
 /// happened, so `confirm` waits for it and a failed ack `survived`s instead).
 /// A failed DLQ publish leaves the message un-acked and Naks it for
@@ -2963,7 +2999,7 @@ async fn settle_reject_batch(ctx: &NatsBatchCtx, acks: &[Message]) {
                 metrics::record_terminal(&ctx.topic, group, metrics::FailReason::Rejected, has_dlq);
             let dead_letter = publish_to_dlq(&ctx.client, ctx.topology, msg, "rejected");
             match renewing(msg, ctx.ack_wait, dead_letter).await {
-                Ok(()) => match msg.double_ack().await {
+                Ok(()) => match confirmed_ack(msg).await {
                     Ok(()) => pending.confirm(),
                     Err(e) => {
                         tracing::error!(

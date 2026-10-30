@@ -58,7 +58,7 @@
 //! `DeadLetter` arm (the `XACK`/DLQ route completes before the batch
 //! clears), RabbitMQ on a confirm-mode channel (never transactional), where
 //! an accepted `basic.nack` retires the delivery with no later commit to wait
-//! on, NATS at the server-confirmed `double_ack` (see
+//! on, NATS at the server-confirmed `confirmed_ack` (see
 //! `backends::nats::consumer::settle_reject_batch`), and SQS in
 //! `backends::sns::router::route_reject_batch`, which is a single
 //! `ChangeMessageVisibilityBatch(0)` — shove never publishes to a DLQ there

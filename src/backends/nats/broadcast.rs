@@ -37,20 +37,26 @@
 //!    survives the future resolving — the [`BroadcastImpl`] contract's wording.
 //! 2. [`BROADCAST_INACTIVE_THRESHOLD`] as the backstop for the paths where no
 //!    code of ours gets to run to completion: `JoinSet::abort_all` after a
-//!    drain timeout, and the process dying outright. A live-but-idle subscriber
-//!    is not at risk from it, because `messages()` keeps issuing pull requests
-//!    and those count as activity.
+//!    drain timeout, and the process dying outright. A live subscriber is not
+//!    at risk from it, because `messages()` keeps issuing pull requests and
+//!    those count as activity. That holds while a handler runs as well: the
+//!    delivery loop goes on reading the stream behind the message it is
+//!    handling ([`Intake::reading_during`]), so a slow handler or a `Defer`
+//!    that keeps the loop for minutes still leaves the consumer pulling.
 //!
 //! [`NatsTopologyDeclarer::declare_pull_consumer`]: super::topology::NatsTopologyDeclarer
 //! [`RetentionPolicy::WorkQueue`]: async_nats::jetstream::stream::RetentionPolicy::WorkQueue
 //! [`RetentionPolicy::Interest`]: async_nats::jetstream::stream::RetentionPolicy::Interest
 
+use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_nats::jetstream::Message;
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+use async_nats::jetstream::consumer::pull::Stream as PullStream;
 use async_nats::jetstream::consumer::{AckPolicy, Consumer, DeliverPolicy};
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -74,12 +80,17 @@ use super::consumer::{
 /// How long the server keeps an abandoned ephemeral broadcast consumer.
 ///
 /// Only ever reached when the awaited `delete_consumer` did not run: an
-/// `abort_all()` after a drain timeout, or the process dying. Long enough that
-/// a subscriber stalled behind a slow handler is never GC'd out from under
-/// itself, short enough that a pod killed hard does not leave a visible
-/// consumer around for long. A live subscriber is unaffected regardless — its
-/// pull requests count as activity.
+/// `abort_all()` after a drain timeout, or the process dying. Short enough
+/// that a pod killed hard does not leave a visible consumer around for long. A
+/// live subscriber is unaffected regardless: its pull requests count as
+/// activity, and it keeps issuing them while a handler runs.
 const BROADCAST_INACTIVE_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// How many messages the delivery loop sets aside while a handler runs. The
+/// loop reads the stream behind the message it handles so the consumer keeps
+/// pulling, and it stops at this many: from then on the consumer pulls again
+/// only once the handler is done, as it does with no read-ahead at all.
+const MAX_READ_AHEAD: usize = 1_024;
 
 /// How many times the awaited teardown asks the server to delete the consumer
 /// before leaving it to the guard and `BROADCAST_INACTIVE_THRESHOLD`.
@@ -346,6 +357,80 @@ where
     .await
 }
 
+/// A subscription's pull stream, read ahead of its handler.
+///
+/// The delivery loop handles one message at a time, and a consumer that nobody
+/// reads stops pulling: its last pull request expires after 30 s, and the
+/// server drops the consumer, and everything the stream held for it, once
+/// [`BROADCAST_INACTIVE_THRESHOLD`] passes with no request. So while a handler
+/// runs, or a `Defer` waits, the loop goes on reading the stream and sets the
+/// messages aside, up to [`MAX_READ_AHEAD`], for the loop to handle in order
+/// afterwards.
+struct Intake {
+    messages: PullStream,
+    topic: Arc<str>,
+    /// Taken off the stream while a handler ran, oldest first.
+    ahead: VecDeque<Message>,
+    /// How the stream ended while a handler ran, reported once `ahead` is
+    /// handled.
+    ended: Option<ShoveError>,
+}
+
+impl Intake {
+    fn new(messages: PullStream, topic: Arc<str>) -> Self {
+        Self {
+            messages,
+            topic,
+            ahead: VecDeque::new(),
+            ended: None,
+        }
+    }
+
+    /// The next message in arrival order: one set aside during a handler, or
+    /// the next off the stream. The error is how the stream ended.
+    async fn next(&mut self) -> Result<Message> {
+        if let Some(msg) = self.ahead.pop_front() {
+            return Ok(msg);
+        }
+        if let Some(ended) = self.ended.take() {
+            return Err(ended);
+        }
+        self.read().await
+    }
+
+    /// One message off the stream, or the error that ends the subscription.
+    async fn read(&mut self) -> Result<Message> {
+        let ended = match self.messages.next().await {
+            Some(Ok(msg)) => return Ok(msg),
+            Some(Err(e)) => format!("broadcast stream error on {}: {e}", self.topic),
+            None => format!("broadcast stream closed for {}", self.topic),
+        };
+        metrics::record_backend_error(
+            metrics::BackendLabel::Nats,
+            metrics::BackendErrorKind::Consume,
+        );
+        Err(ShoveError::Connection(ended))
+    }
+
+    /// Runs `work`, reading the stream meanwhile so the consumer keeps pulling
+    /// for as long as it runs. Stops reading when [`MAX_READ_AHEAD`] messages
+    /// are set aside or the stream has ended, and finishes `work` all the same.
+    async fn reading_during<F: Future>(&mut self, work: F) -> F::Output {
+        let mut work = std::pin::pin!(work);
+        while self.ended.is_none() && self.ahead.len() < MAX_READ_AHEAD {
+            tokio::select! {
+                biased;
+                output = &mut work => return output,
+                read = self.read() => match read {
+                    Ok(msg) => self.ahead.push_back(msg),
+                    Err(ended) => self.ended = Some(ended),
+                },
+            }
+        }
+        work.await
+    }
+}
+
 async fn broadcast_loop<T, H>(
     consumer: Consumer<PullConsumerConfig>,
     handler: Arc<H>,
@@ -358,10 +443,11 @@ where
     T: Topic,
     H: MessageHandler<T>,
 {
-    let mut messages = consumer
+    let messages = consumer
         .messages()
         .await
         .map_err(|e| ShoveError::Connection(format!("failed to get message stream: {e}")))?;
+    let mut intake = Intake::new(messages, Arc::clone(&topic));
 
     // Broadcast is one delivery loop, and messages are handled inline rather
     // than spawned. A fan-out subscriber is reading a signal stream, so
@@ -375,27 +461,7 @@ where
                 tracing::info!(topic = %topic, "broadcast subscription cancelled");
                 return Ok(());
             }
-            item = messages.next() => match item {
-                Some(Ok(msg)) => msg,
-                Some(Err(e)) => {
-                    metrics::record_backend_error(
-                        metrics::BackendLabel::Nats,
-                        metrics::BackendErrorKind::Consume,
-                    );
-                    return Err(ShoveError::Connection(format!(
-                        "broadcast stream error on {topic}: {e}"
-                    )));
-                }
-                None => {
-                    metrics::record_backend_error(
-                        metrics::BackendLabel::Nats,
-                        metrics::BackendErrorKind::Consume,
-                    );
-                    return Err(ShoveError::Connection(format!(
-                        "broadcast stream closed for {topic}"
-                    )));
-                }
-            },
+            next = intake.next() => next?,
         };
 
         metrics::record_message_size(&topic, options.consumer_group.as_deref(), msg.payload.len());
@@ -421,7 +487,11 @@ where
         }
 
         options.processing.store(true, Ordering::Release);
-        deliver_until_settled::<T, H>(&handler, &ctx, &msg, &options, &topic, &shutdown).await;
+        intake
+            .reading_during(deliver_until_settled::<T, H>(
+                &handler, &ctx, &msg, &options, &topic, &shutdown,
+            ))
+            .await;
         options.processing.store(false, Ordering::Release);
     }
 }

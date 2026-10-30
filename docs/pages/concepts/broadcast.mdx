@@ -106,6 +106,8 @@ Two consequences:
 
 Teardown deletes the ephemeral consumer explicitly when the delivery loop ends. An ephemeral consumer is **not** removed by the client disconnecting, so the server's inactivity threshold (30s) is only the backstop for a process that dies without draining.
 
+A long handler or a `Defer` that holds the delivery loop does not trip that threshold either. The server drops an ephemeral consumer, and everything the stream held for it, once no pull request has reached it for the threshold, so while a handler runs the loop keeps reading the stream behind the message it holds. It sets up to 1,024 of those messages aside and handles them in order once the held message settles. Past 1,024 it stops reading, and a handler that holds the loop for another minute or so loses the subscription's consumer to the server; the subscription then reconnects, and what was published meanwhile is a gap, as after any outage.
+
 ### Redis: bound the stream
 
 Broadcast reads with `XREAD`, which never acknowledges and never trims. Nothing about a broadcast subscriber causes the stream to shrink. Declare the stream with a `MAXLEN` bound, or publish with `XADD ... MAXLEN ~ N`; otherwise it grows without limit and the memory cost is eventually the whole retention. Note that `MAXLEN ~` trims at radix-node granularity, so the stream can sit somewhat above the bound — it is a cap on growth, not an exact length.
