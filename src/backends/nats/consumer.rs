@@ -1867,9 +1867,25 @@ impl NatsConsumer {
                         }
                     };
 
+                    let config = &pull_consumer.cached_info().config;
                     // Effective server-side ack_wait, used to pace the progress acks
                     // that keep a waiting message from being redelivered.
-                    let ack_wait = pull_consumer.cached_info().config.ack_wait;
+                    let ack_wait = config.ack_wait;
+                    // The fallback only ever creates the durable, so a budget an
+                    // earlier version gave it stays until it is changed.
+                    let in_force = config.max_ack_pending;
+                    if in_force > 0 && max_ack_pending == UNBOUNDED_ACK_PENDING {
+                        tracing::warn!(
+                            queue,
+                            consumer = consumer_name,
+                            max_ack_pending = in_force,
+                            "the durable caps the un-acked messages of every worker attached \
+                             to it at its max_ack_pending, a budget this consumer did not ask \
+                             for, such as one an earlier version created the durable with; \
+                             lift it in place with `nats consumer edit {queue} {consumer_name} \
+                             --max-pending=-1`"
+                        );
+                    }
 
                     worker.pull_until_stopped(&pull_consumer, ack_wait).await
                 }

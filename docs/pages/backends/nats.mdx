@@ -186,7 +186,8 @@ After such a pull, or one the server cut short with nothing delivered, the worke
 The durable a group or a consumer creates therefore has no ack budget of its own: `max_ack_pending` is `-1` unless `with_max_ack_pending` sets a cap.
 Workers attached to one durable, from any number of processes, each keep up to their own prefetch in flight, and a cap is shared by all of them.
 A group's registration upserts its durable on every start, so the budget follows the config.
-A consumer started directly or through a supervisor creates the durable only when none exists, so a durable an earlier version created keeps the budget it was created with until it is recreated.
+A consumer started directly or through a supervisor creates the durable only when none exists, so a durable an earlier version created keeps the budget it was created with, and the consumer logs a warning naming it.
+Lift it in place with `nats consumer edit <stream> <durable> --max-pending=-1` rather than recreating the durable: a recreated durable replays a Limits-retention stream from its start, and deleting the old one drops the messages an Interest-retention stream keeps only for it.
 
 A `Retry` on a shove-owned stream is held un-acked for its delay and gives up its slot for the hold, so the worker goes on with other messages meanwhile.
 Holds are bounded on their own, at the same count: a retry that finds every hold taken waits for one and keeps its slot.
