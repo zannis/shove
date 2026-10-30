@@ -94,12 +94,12 @@ there rather than restating the table in a third place.
 - **Batch consumption / settlement** — `src/backend/batch_consumer.rs`: the
   classifier every backend's batch flush routes an `Outcome` through, plus the
   panic/timeout invariant surface (`invoke_batch_handler`) shared by every
-  `HasBatchConsumption` backend. Kafka's *single-message* async-commit reject
-  path also imports this module's deferred-settlement machinery
-  (`TerminalDiscard`, `RejectSettlement`, `reject_settlement`) — not only its
-  batch path — and so does its sequenced loop's `FifoLoop::dead_letter`, so a
-  cleanup narrowing that trio's gate must check both of those callers first,
-  per the module's own doc comment.
+  `HasBatchConsumption` backend. Kafka's *single-message* reject path, whose
+  commit runs synchronously on its own thread, also imports this module's
+  deferred-settlement machinery (`TerminalDiscard`, `RejectSettlement`,
+  `reject_settlement`) — not only its batch path — and so does its sequenced
+  loop's `FifoLoop::dead_letter`, so a cleanup narrowing that trio's gate must
+  check both of those callers first, per the module's own doc comment.
 
 ## Build / test / lint commands
 
