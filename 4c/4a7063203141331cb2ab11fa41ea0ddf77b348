@@ -1,0 +1,30 @@
+docs/pages/guides/retries.mdx
+  s_1001dc3147e1e5::t_98d9e1c3551439 93
+docs/pages/backends/sqs/examples/audited.mdx
+  s_1001dc3147e1e5::t_090413302018fc 57
+docs/pages/backends/nats/examples/audited.mdx
+  s_1001dc3147e1e5::t_d0b066b1ca538f 58,60
+docs/pages/backends/kafka/examples/audited.mdx
+  s_1001dc3147e1e5::t_a73d6ff3b6a798 58,60
+docs/pages/guides/observability.mdx
+  s_1001dc3147e1e5::t_70469af0095e34 261
+  s_1001dc3147e1e5::t_e7269246995e4b 279,281-288
+src/publisher.rs
+  s_1001dc3147e1e5::t_cc61e70f0be8d8 34-39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4c4a7063203141331cb2ab11fa41ea0ddf77b348",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
