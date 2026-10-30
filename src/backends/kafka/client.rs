@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 #[cfg(feature = "kafka-ssl")]
 use std::path::PathBuf;
 use std::process;
@@ -1052,7 +1053,7 @@ impl KafkaClient {
             if let Err((topic, code)) = result {
                 // Lost the expansion race: the broker refuses a count the topic already has.
                 if code == RDKafkaErrorCode::InvalidPartitions
-                    && self.live_partition_count(name).await? >= desired
+                    && self.partition_count_reaching(name, desired).await? >= desired
                 {
                     tracing::debug!(topic, desired, "another declarer expanded the topic first");
                     return Ok(None);
@@ -1074,47 +1075,14 @@ impl KafkaClient {
     }
 
     /// The partition count the broker reports for a topic that `CreateTopics`
-    /// said exists. A topic whose metadata is `UNKNOWN_TOPIC_OR_PART` (the
-    /// broker metadata comes from is behind the one that created it) or
-    /// `LEADER_NOT_AVAILABLE` (its leaders are still being elected) is read
-    /// again, a bounded number of times; any other topic-level error is final.
+    /// said exists, read as `read_partition_count` reads it.
     async fn live_partition_count(&self, name: &str) -> Result<i32> {
-        let mut waits = Backoff::new(
-            PARTITION_METADATA_RETRY_INITIAL,
-            PARTITION_METADATA_RETRY_MAX,
-        );
-        let mut last = "no metadata";
-        for attempt in 1..=PARTITION_METADATA_ATTEMPTS {
-            match self.probe_topic(name).await? {
-                TopicProbe::Present(partitions) => return Ok(partitions),
-                TopicProbe::Missing => last = "no such topic",
-                TopicProbe::Failed(RDKafkaRespErr::RD_KAFKA_RESP_ERR_LEADER_NOT_AVAILABLE) => {
-                    last = "no leaders"
-                }
-                TopicProbe::Failed(code) => {
-                    metrics::record_backend_error(
-                        metrics::BackendLabel::Kafka,
-                        metrics::BackendErrorKind::Topology,
-                    );
-                    return Err(ShoveError::Topology(format!(
-                        "metadata for topic {name} returned {code:?}"
-                    )));
-                }
-            }
-            if attempt < PARTITION_METADATA_ATTEMPTS
-                && let Some(wait) = waits.next()
-            {
-                tokio::time::sleep(wait).await;
-            }
-        }
-        metrics::record_backend_error(
-            metrics::BackendLabel::Kafka,
-            metrics::BackendErrorKind::Topology,
-        );
-        Err(ShoveError::Topology(format!(
-            "topic {name} exists, but its metadata still shows {last} after \
-             {PARTITION_METADATA_ATTEMPTS} reads"
-        )))
+        self.partition_count_reaching(name, 0).await
+    }
+
+    /// The partition count of a topic, read until it is at least `at_least`.
+    async fn partition_count_reaching(&self, name: &str, at_least: i32) -> Result<i32> {
+        read_partition_count(name, at_least, || self.probe_topic(name)).await
     }
 
     /// If any declared config entry differs from the topic's live value,
@@ -1260,6 +1228,66 @@ fn overlay_dynamic_entries<'a>(
         merged.insert(k.as_str(), v.as_str());
     }
     merged
+}
+
+/// Reads a topic's partition count through `probe` until it is at least
+/// `at_least`, and returns the last count read.
+///
+/// A topic whose metadata is `UNKNOWN_TOPIC_OR_PART` (the broker metadata comes
+/// from is behind the one that created it) or `LEADER_NOT_AVAILABLE` (its
+/// leaders are still being elected) is read again, a bounded number of times.
+/// So is a count below `at_least`; the last such count is returned once the
+/// reads run out, for the caller to judge. Any other topic-level error is final.
+async fn read_partition_count<F, Fut>(name: &str, at_least: i32, mut probe: F) -> Result<i32>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<TopicProbe>>,
+{
+    let mut waits = Backoff::new(
+        PARTITION_METADATA_RETRY_INITIAL,
+        PARTITION_METADATA_RETRY_MAX,
+    );
+    let mut last = "no metadata";
+    let mut behind = None;
+    for attempt in 1..=PARTITION_METADATA_ATTEMPTS {
+        match probe().await? {
+            TopicProbe::Present(partitions) if partitions >= at_least => return Ok(partitions),
+            TopicProbe::Present(partitions) => behind = Some(partitions),
+            TopicProbe::Missing => {
+                behind = None;
+                last = "no such topic";
+            }
+            TopicProbe::Failed(RDKafkaRespErr::RD_KAFKA_RESP_ERR_LEADER_NOT_AVAILABLE) => {
+                behind = None;
+                last = "no leaders";
+            }
+            TopicProbe::Failed(code) => {
+                metrics::record_backend_error(
+                    metrics::BackendLabel::Kafka,
+                    metrics::BackendErrorKind::Topology,
+                );
+                return Err(ShoveError::Topology(format!(
+                    "metadata for topic {name} returned {code:?}"
+                )));
+            }
+        }
+        if attempt < PARTITION_METADATA_ATTEMPTS
+            && let Some(wait) = waits.next()
+        {
+            tokio::time::sleep(wait).await;
+        }
+    }
+    if let Some(partitions) = behind {
+        return Ok(partitions);
+    }
+    metrics::record_backend_error(
+        metrics::BackendLabel::Kafka,
+        metrics::BackendErrorKind::Topology,
+    );
+    Err(ShoveError::Topology(format!(
+        "topic {name} exists, but its metadata still shows {last} after \
+         {PARTITION_METADATA_ATTEMPTS} reads"
+    )))
 }
 
 /// What `create_topic` does when the topic it is asked to create exists.
@@ -1573,6 +1601,10 @@ mod tests {
     use super::*;
     use rdkafka::mocking::MockCluster;
     use rdkafka::producer::DefaultProducerContext;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::future::{Ready, ready};
+    use std::rc::Rc;
 
     #[test]
     fn default_config_is_localhost() {
@@ -2445,6 +2477,128 @@ mod tests {
         });
 
         settled.expect("a topic that shows up is ready");
+    }
+
+    // -- the bounded read of a topic's partition count --
+
+    /// A probe that answers from `script`, one answer per read, and the count
+    /// of reads it has been asked for. A read past the end of the script
+    /// panics, which fails a test whose reads are not bounded.
+    fn scripted(
+        script: Vec<TopicProbe>,
+    ) -> (impl FnMut() -> Ready<Result<TopicProbe>>, Rc<Cell<u32>>) {
+        let reads = Rc::new(Cell::new(0));
+        let counted = Rc::clone(&reads);
+        let mut script: VecDeque<TopicProbe> = script.into();
+        let probe = move || {
+            counted.set(counted.get() + 1);
+            ready(Ok(script.pop_front().expect("a read past the script")))
+        };
+        (probe, reads)
+    }
+
+    /// The broker that answers a metadata read can still report the count from
+    /// before an expansion the controller has accepted: reads continue until
+    /// the target count shows.
+    #[tokio::test(start_paused = true)]
+    async fn partition_count_behind_the_target_is_read_again_until_it_catches_up() {
+        let (probe, reads) = scripted(vec![
+            TopicProbe::Present(2),
+            TopicProbe::Present(2),
+            TopicProbe::Present(4),
+        ]);
+
+        let count = read_partition_count("orders", 4, probe)
+            .await
+            .expect("the third read shows the new count");
+
+        assert_eq!((count, reads.get()), (4, 3));
+    }
+
+    /// A count that never catches up ends the reads at their bound and is
+    /// returned for the caller to judge.
+    #[tokio::test(start_paused = true)]
+    async fn partition_count_that_stays_behind_the_target_is_returned_after_the_bounded_reads() {
+        let (probe, reads) = scripted(
+            (0..PARTITION_METADATA_ATTEMPTS)
+                .map(|_| TopicProbe::Present(2))
+                .collect(),
+        );
+
+        let count = read_partition_count("orders", 4, probe)
+            .await
+            .expect("a count that stays behind is still an answer");
+
+        assert_eq!((count, reads.get()), (2, PARTITION_METADATA_ATTEMPTS));
+    }
+
+    /// A missing topic, an election in progress and a stale count are all
+    /// transient, and one run of reads waits out the three of them.
+    #[tokio::test(start_paused = true)]
+    async fn partition_count_reads_wait_out_stale_and_transient_answers_together() {
+        let (probe, reads) = scripted(vec![
+            TopicProbe::Missing,
+            TopicProbe::Failed(RDKafkaRespErr::RD_KAFKA_RESP_ERR_LEADER_NOT_AVAILABLE),
+            TopicProbe::Present(2),
+            TopicProbe::Present(4),
+        ]);
+
+        let count = read_partition_count("orders", 4, probe)
+            .await
+            .expect("the fourth read shows the new count");
+
+        assert_eq!((count, reads.get()), (4, 4));
+    }
+
+    /// Any other topic-level error is final: one read, then the error.
+    #[tokio::test(start_paused = true)]
+    async fn partition_count_with_a_final_topic_error_ends_the_reads_at_once() {
+        let (probe, reads) = scripted(vec![TopicProbe::Failed(
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+        )]);
+
+        let err = read_partition_count("orders", 4, probe)
+            .await
+            .expect_err("an authorization error is final");
+
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("TOPIC_AUTHORIZATION_FAILED"),
+            "{err}"
+        );
+        assert_eq!(reads.get(), 1);
+    }
+
+    /// With no target the first count is the answer, as for a caller that
+    /// only wants to know how many partitions the topic has.
+    #[tokio::test(start_paused = true)]
+    async fn partition_count_with_no_target_answers_on_the_first_read() {
+        let (probe, reads) = scripted(vec![TopicProbe::Present(2)]);
+
+        let count = read_partition_count("orders", 0, probe)
+            .await
+            .expect("the first read answers");
+
+        assert_eq!((count, reads.get()), (2, 1));
+    }
+
+    /// A topic that never shows up fails after the bounded reads, naming what
+    /// the last read showed.
+    #[tokio::test(start_paused = true)]
+    async fn partition_count_of_a_topic_that_never_shows_up_fails_after_the_bounded_reads() {
+        let (probe, reads) = scripted(
+            (0..PARTITION_METADATA_ATTEMPTS)
+                .map(|_| TopicProbe::Missing)
+                .collect(),
+        );
+
+        let err = read_partition_count("orders", 4, probe)
+            .await
+            .expect_err("a missing topic is not a count");
+
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+        assert!(err.to_string().contains("no such topic"), "{err}");
+        assert_eq!(reads.get(), PARTITION_METADATA_ATTEMPTS);
     }
 
     // -- the admin OAUTHBEARER token error carries one prefix --
