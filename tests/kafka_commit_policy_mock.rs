@@ -4059,12 +4059,11 @@ struct Logged(Arc<Mutex<Vec<String>>>);
 
 impl Logged {
     fn install() -> Self {
+        use tracing::subscriber::set_global_default;
         use tracing_subscriber::layer::SubscriberExt;
         let logged = Self::default();
-        tracing::subscriber::set_global_default(
-            tracing_subscriber::registry().with(logged.clone()),
-        )
-        .expect("install the log capture");
+        set_global_default(tracing_subscriber::registry().with(logged.clone()))
+            .expect("install the log capture");
         logged
     }
 
@@ -4075,12 +4074,11 @@ impl Logged {
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Logged {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        use tracing::field::Field;
         let mut line = String::new();
-        event.record(
-            &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
-                line.push_str(&format!("{}={value:?} ", field.name()));
-            },
-        );
+        event.record(&mut |field: &Field, value: &dyn std::fmt::Debug| {
+            line.push_str(&format!("{}={value:?} ", field.name()));
+        });
         self.0.lock().expect("log mutex poisoned").push(line);
     }
 }
