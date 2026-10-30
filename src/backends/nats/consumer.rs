@@ -2969,8 +2969,6 @@ struct Poison {
 // Never stored, so boxing would only add an allocation per message.
 #[allow(clippy::large_enum_variant)]
 enum IntakeEvent {
-    /// The consumer was told to stop.
-    Stop,
     /// The client's connection changed.
     Connected,
     /// The pause after a refused pull is over.
@@ -3084,6 +3082,12 @@ impl<T: Topic> BatchIntake<T> {
         self.halted() && self.forming.is_empty() && self.waiting.is_empty()
     }
 
+    /// Whether the consumer was told to stop and the intake has not stopped
+    /// yet.
+    fn stop_pending(&self) -> bool {
+        !self.stopping && self.shutdown.is_cancelled()
+    }
+
     fn take_batch(&mut self) -> (Vec<(T::Message, MessageMetadata)>, Vec<Message>) {
         let next = Forming::with_capacity(self.size.min(PREALLOC_CAP));
         let batch = std::mem::replace(&mut self.forming, next);
@@ -3117,13 +3121,13 @@ impl<T: Topic> BatchIntake<T> {
         }
     }
 
-    /// The next thing to react to. Cancel-safe: whatever it drops by being
-    /// dropped is still there to read.
+    /// The next thing to react to other than a stop, which the caller
+    /// watches for. Cancel-safe: whatever it drops by being dropped is still
+    /// there to read.
     async fn next_event(&mut self) -> IntakeEvent {
         let halted = self.halted();
         tokio::select! {
             biased;
-            () = self.shutdown.cancelled(), if !self.stopping => IntakeEvent::Stop,
             () = self.reconnects.next_change(), if !halted => IntakeEvent::Connected,
             () = sleep_over(&mut self.pause), if self.pause.is_some() && !halted => {
                 IntakeEvent::Resume
@@ -3141,10 +3145,9 @@ impl<T: Topic> BatchIntake<T> {
         }
     }
 
-    /// Reacts to `event`. `flushing` is whether a flush is in progress.
-    async fn on_event(&mut self, event: IntakeEvent, flushing: bool) {
+    /// Reacts to `event`.
+    async fn on_event(&mut self, event: IntakeEvent) {
         match event {
-            IntakeEvent::Stop => self.stop(flushing).await,
             IntakeEvent::Connected => self.on_reconnect().await,
             IntakeEvent::Resume => self.pause = None,
             IntakeEvent::Renew => self.renew_read_ahead().await,
@@ -3303,26 +3306,32 @@ impl<T: Topic> BatchIntake<T> {
 
     /// Stops reading. The batch in hand is left to flush, unless a flush is in
     /// progress, which would delay the stop by a second one: then it is handed
-    /// back with the rest.
+    /// back with the rest ([`release_pulled`]). The durable's waiting list is
+    /// swept whatever the intake still holds, as a concurrent worker's stop
+    /// sweeps it, so no pull request the intake sent outlives the stop there.
     async fn stop(&mut self, flushing: bool) {
         self.stopping = true;
-        self.release(flushing).await;
+        let unstarted = self.take_unstarted(flushing);
+        release_pulled(&self.consumer, &unstarted).await;
     }
 
     /// Stops reading and keeps the first failure. What the intake holds goes
-    /// back to the server.
+    /// back to the server ([`release_pulled`]), which sweeps the waiting list
+    /// when there was a pull to drop.
     async fn fail(&mut self, failure: ShoveError) {
         self.failure.get_or_insert(failure);
-        self.release(true).await;
+        let had_pull = self.pull.is_some();
+        let unstarted = self.take_unstarted(true);
+        if had_pull || !unstarted.is_empty() {
+            release_pulled(&self.consumer, &unstarted).await;
+        }
     }
 
-    /// Hands back to the server, with a nak and no delay, what the intake has
-    /// not started: what its pull delivered and nobody read, the poison
+    /// Takes what the intake has not started, to hand back to the server with
+    /// a nak and no delay: what its pull delivered and nobody read, the poison
     /// messages waiting for a slot, and, with `with_batch`, the batch in hand.
-    /// The pull is dropped, and the server is made to sweep its request off
-    /// the durable's waiting list ([`release_pulled`]).
-    async fn release(&mut self, with_batch: bool) {
-        let had_pull = self.pull.is_some();
+    /// The pull is dropped.
+    fn take_unstarted(&mut self, with_batch: bool) -> Vec<Message> {
         let mut unstarted = Vec::new();
         if let Some(mut pull) = self.pull.take() {
             while let Some(Some(Ok(msg))) = pull.next().now_or_never() {
@@ -3334,9 +3343,7 @@ impl<T: Topic> BatchIntake<T> {
             unstarted.append(&mut self.forming.acks);
             self.forming.messages.clear();
         }
-        if had_pull || !unstarted.is_empty() {
-            release_pulled(&self.consumer, &unstarted).await;
-        }
+        unstarted
     }
 }
 
@@ -3540,12 +3547,16 @@ impl<T: NotSequenced, H: BatchMessageHandler<T>> BatchRun<T, H> {
     ///
     /// A failure of the intake ends the attach only once the flush in
     /// progress has settled its batch.
+    ///
+    /// A stop is handled before anything else: no flush starts while one is
+    /// pending, and a stop seen together with the end of a flush counts as
+    /// landing during that flush, so the batch read ahead is handed back.
     async fn drive(self: &Arc<Self>, intake: &mut BatchIntake<T>) -> Result<()> {
         let queue = self.topology.queue();
         let mut redelivery_backoff = batch_redelivery_backoff();
         let mut flush: Option<Flushing> = None;
         loop {
-            if flush.is_none() && intake.batch_ready() {
+            if flush.is_none() && intake.batch_ready() && !intake.stop_pending() {
                 let (messages, acks) = intake.take_batch();
                 let ctx = Arc::clone(&intake.ctx);
                 let run = Arc::clone(self);
@@ -3567,6 +3578,9 @@ impl<T: NotSequenced, H: BatchMessageHandler<T>> BatchRun<T, H> {
             }
             tokio::select! {
                 biased;
+                () = self.shutdown.cancelled(), if !intake.stopping => {
+                    intake.stop(flush.is_some()).await;
+                }
                 ended = flush_end(&mut flush), if flush.is_some() => {
                     flush = None;
                     intake.renew = None;
@@ -3582,7 +3596,7 @@ impl<T: NotSequenced, H: BatchMessageHandler<T>> BatchRun<T, H> {
                         }
                     }
                 }
-                event = intake.next_event() => intake.on_event(event, flush.is_some()).await,
+                event = intake.next_event() => intake.on_event(event).await,
             }
         }
         match intake.failure.take() {
