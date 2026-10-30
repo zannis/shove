@@ -56,7 +56,8 @@ pub trait KafkaQueueStatsProvider: Send + Sync {
     /// Fails with [`ShoveError::Topology`] when the broker has no topic
     /// `queue`, describes it with an error such as `TOPIC_AUTHORIZATION_FAILED`,
     /// or lists no partitions for it, and with [`ShoveError::Connection`] when
-    /// an offset query fails. A snapshot built from any of those answers would
+    /// an offset query fails or the broker answers a partition's committed
+    /// offset with an error. A snapshot built from any of those answers would
     /// read as an empty backlog and let the autoscaler shrink a group that has
     /// work to do, so none of them yields a lag of zero.
     fn get_queue_stats(
@@ -153,6 +154,39 @@ fn queue_partitions<'a>(
         )));
     }
     Ok(topic.partitions)
+}
+
+/// The committed offset of each of `partitions`, in the same order, from the
+/// group's OffsetFetch answer: `None` for a partition the group has never
+/// committed to, which the broker reports as an invalid offset, and for one the
+/// answer leaves out.
+///
+/// A partition the broker answered with an error carries an invalid offset
+/// too, but says nothing about the group's position. Read as a gap it would
+/// count the whole retained log as lag under `earliest` and none of it under
+/// `latest`, so it is an error here.
+fn committed_by_partition(
+    committed: &TopicPartitionList,
+    topic: &str,
+    partitions: &[i32],
+) -> Result<Vec<Option<i64>>> {
+    partitions
+        .iter()
+        .map(|&partition| {
+            let Some(element) = committed.find_partition(topic, partition) else {
+                return Ok(None);
+            };
+            element.error().map_err(|e| {
+                ShoveError::Connection(format!(
+                    "failed to get the committed offset of {topic}/{partition}: {e}"
+                ))
+            })?;
+            Ok(match element.offset() {
+                Offset::Offset(offset) => Some(offset),
+                _ => None,
+            })
+        })
+        .collect()
 }
 
 /// The offsets the broker reports for `partitions` at `at`, one per partition
@@ -499,26 +533,17 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
             }
         };
 
+        let committed_offsets = committed_by_partition(&committed, &queue, &partitions)?;
+
         let total_lag: u64 = {
             let c = Arc::clone(&consumer);
             let q = queue.clone();
             tokio::task::spawn_blocking(move || -> Result<u64> {
                 let watermarks = batched_watermarks(&c, &q, &partitions, Duration::from_secs(5))?;
-                let per_partition = partitions
-                    .iter()
+                let per_partition = committed_offsets
+                    .into_iter()
                     .zip(watermarks)
-                    .map(|(&pid, (low, high))| {
-                        // Both a partition absent from the committed TPL and an
-                        // `Offset::Invalid` entry mean "the group has never
-                        // committed here" — map both to `None`.
-                        let committed_offset = committed.find_partition(&q, pid).and_then(|elem| {
-                            match elem.offset() {
-                                Offset::Offset(o) => Some(o),
-                                _ => None,
-                            }
-                        });
-                        (committed_offset, low, high)
-                    });
+                    .map(|(committed, (low, high))| (committed, low, high));
                 Ok(aggregate_lag(per_partition, reset))
             })
             .await
@@ -1060,14 +1085,23 @@ mod tests {
         .expect("stats consumer")
     }
 
+    /// [`mock_holding`] for a test whose broker calls block, so it cannot run
+    /// inside the test's own runtime.
+    fn blocking_mock_holding(
+        topic: &str,
+        counts: &[usize],
+    ) -> MockCluster<'static, DefaultProducerContext> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(mock_holding(topic, counts))
+    }
+
     #[test]
     fn batched_watermarks_match_per_partition_watermarks() {
         let counts = [0usize, 3, 1, 0, 7, 2, 0, 5, 4, 0, 9, 1];
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let mock = rt.block_on(mock_holding("watermarks", &counts));
+        let mock = blocking_mock_holding("watermarks", &counts);
         let partitions: Vec<i32> = (0..).take(counts.len()).collect();
 
         let batched = batched_watermarks(
@@ -1096,6 +1130,51 @@ mod tests {
         let highs: Vec<i64> = batched.iter().map(|&(_, high)| high).collect();
         let produced: Vec<i64> = counts.iter().map(|&c| c as i64).collect();
         assert_eq!(highs, produced, "the high watermark is the record count");
+    }
+
+    // -- the group's committed offsets --
+
+    #[test]
+    fn committed_by_partition_reads_commits_and_gaps() {
+        let mut answer = TopicPartitionList::new();
+        answer
+            .add_partition_offset("orders", 0, Offset::Offset(5))
+            .expect("a committed offset");
+        answer
+            .add_partition_offset("orders", 1, Offset::Invalid)
+            .expect("the marker of a partition never committed to");
+
+        let committed = committed_by_partition(&answer, "orders", &[0, 1, 2])
+            .expect("an answer without errors");
+
+        assert_eq!(committed, vec![Some(5), None, None]);
+    }
+
+    /// A broker answers a partition it will not report on, here one the topic
+    /// does not have, with an error inside an otherwise healthy OffsetFetch
+    /// answer, beside an invalid offset. Read as a gap, that partition would
+    /// count the whole retained log as lag under `earliest` and none of it
+    /// under `latest`.
+    #[test]
+    fn a_partition_the_broker_errored_on_refuses_the_committed_offsets() {
+        let mock = blocking_mock_holding("committed", &[2, 3]);
+        let consumer = stats_consumer_on(mock.bootstrap_servers());
+        let mut asked = TopicPartitionList::new();
+        for partition in [0, 1, 7] {
+            asked.add_partition("committed", partition);
+        }
+        let answer = consumer
+            .committed_offsets(asked, MOCK_TIMEOUT)
+            .expect("the request itself succeeds");
+
+        let healthy = committed_by_partition(&answer, "committed", &[0, 1])
+            .expect("partitions the broker answers cleanly");
+        assert_eq!(healthy, vec![None, None]);
+
+        let err = committed_by_partition(&answer, "committed", &[0, 1, 7])
+            .expect_err("an errored partition has no committed offset to read");
+        assert!(matches!(err, ShoveError::Connection(_)), "got {err:?}");
+        assert!(err.to_string().contains("committed/7"), "{err}");
     }
 
     type TestSpawner = Arc<dyn Fn(ConsumerOptions) -> tokio::task::JoinHandle<()> + Send + Sync>;

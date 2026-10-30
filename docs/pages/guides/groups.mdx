@@ -74,7 +74,7 @@ The autoscaler uses a `ThresholdStrategy` by default, wrapped in `Stabilized` to
 
 Every backend's autoscaler reports `permits` this way, so the same backlog scales a sequential group at the same point on all of them. A sequenced group always runs one consumer, so its capacity never changes a scaling outcome.
 
-If a backend cannot read the backlog, the poll fails and the group keeps its consumer count for that cycle. Apache Kafka fails the poll when the topic does not exist, when the broker answers the topic's metadata with an error such as `TOPIC_AUTHORIZATION_FAILED`, or when an offset request fails. The error is logged as `failed to fetch metrics for <group>`.
+If a backend cannot read the backlog, the poll fails and the group keeps its consumer count for that cycle. Apache Kafka fails the poll when the topic does not exist, when the broker answers the topic's metadata with an error such as `TOPIC_AUTHORIZATION_FAILED`, or when an offset request fails or comes back with an error for any partition's committed offset. The error is logged as `failed to fetch metrics for <group>`.
 
 ## AutoscalerConfig
 

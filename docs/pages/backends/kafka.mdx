@@ -522,7 +522,7 @@ group
 The autoscaler measures consumer lag (the offset gap between the latest produced message and the latest committed offset) and adjusts the number of active consumers within the `min..=max` range.
 
 A lag poll asks the broker for the start offsets and then the end offsets of every partition in two batched rounds, each sending one request per partition leader, so the cost of a poll follows the number of leaders and stays flat as the partition count grows.
-The poll fails, and the group keeps its member count for that cycle, when the topic does not exist, when the broker answers the topic's metadata with an error such as `TOPIC_AUTHORIZATION_FAILED`, or when an offset request fails.
+The poll fails, and the group keeps its member count for that cycle, when the topic does not exist, when the broker answers the topic's metadata with an error such as `TOPIC_AUTHORIZATION_FAILED`, or when an offset request fails or comes back with an error for any partition's committed offset.
 None of those answers is read as a lag of zero.
 The autoscaler logs the failure as `failed to fetch metrics for <group>`.
 
