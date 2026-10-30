@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::time::Duration;
 
 use async_nats::HeaderMap;
-use async_nats::header::NATS_MESSAGE_ID;
+use async_nats::header::{HeaderName, HeaderValue, NATS_MESSAGE_ID};
 use async_nats::jetstream;
+use async_nats::jetstream::publish::PublishAck;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -19,38 +21,116 @@ use crate::topic::Topic;
 use crate::{QueueTopology, ShoveError};
 
 use super::client::NatsClient;
-use super::constants::{RETRY_COUNT_HEADER, SEQUENCE_KEY_HEADER};
+use super::constants::{COPY_OF_HEADER, RETRY_COUNT_HEADER, SEQUENCE_KEY_HEADER};
 
 const MAX_PUBLISH_ATTEMPTS: u32 = 3;
 
+/// How long the original of a copy waits before it is redelivered when the
+/// copy's publish ended on a duplicate that could not be confirmed. The id
+/// stays held until JetStream's duplicate window lets it go, so an immediate
+/// redelivery would only run the handler again to find it held.
+const UNCONFIRMED_COPY_REDELIVERY: Duration = Duration::from_secs(1);
+
+/// Why [`publish_with_retry`] failed.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum PublishFailure {
+    /// The publish or its ack failed, or the message could not be built.
+    #[error(transparent)]
+    Failed(#[from] ShoveError),
+    /// JetStream answered a copy's publish with a duplicate that could not be
+    /// confirmed as that copy: another message holds its id, or the stored
+    /// copy could not be read back.
+    #[error(transparent)]
+    Unconfirmed(ShoveError),
+}
+
+/// What [`publish_with_retry`] returns.
+pub(super) type PublishResult = std::result::Result<(), PublishFailure>;
+
+impl PublishFailure {
+    /// The redelivery delay for the original whose copy failed: `None` for an
+    /// immediate redelivery, which is what every other failure gets.
+    pub(super) fn redelivery_delay(&self) -> Option<Duration> {
+        match self {
+            Self::Failed(_) => None,
+            Self::Unconfirmed(_) => Some(UNCONFIRMED_COPY_REDELIVERY),
+        }
+    }
+
+    fn into_error(self) -> ShoveError {
+        match self {
+            Self::Failed(e) | Self::Unconfirmed(e) => e,
+        }
+    }
+}
+
 /// Publish a message to JetStream with retry on transient failures.
 /// Shared by both the publisher and consumer (for DLQ publishes).
+///
+/// `copy_origin` is `Some` for a retry copy or a dead letter, naming the
+/// delivery it was made from. A copy's id can be predicted, so a message that
+/// someone else stored under it first would make the copy's publish come back
+/// as a duplicate PubAck. For a copy that PubAck counts only once the stored
+/// message proves to be the same copy ([`is_same_copy`]), which costs one
+/// stream read per duplicate, bounded by the client's request timeout;
+/// otherwise it is a failed attempt, and the last one ends in
+/// [`PublishFailure::Unconfirmed`]. For a user's publish (`None`) a duplicate
+/// is a success: the stream already holds a message with the caller's id. A
+/// `max_attempts` of zero is a `Validation` error, since there is no attempt
+/// to make.
 pub(super) async fn publish_with_retry(
     js: &jetstream::Context,
     subject: String,
     headers: HeaderMap,
     payload: Bytes,
+    copy_origin: Option<&str>,
     max_attempts: u32,
     label: &str,
-) -> Result<()> {
+) -> PublishResult {
+    if max_attempts == 0 {
+        return Err(ShoveError::Validation(format!("{label} needs at least one attempt")).into());
+    }
     let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
 
-    for attempt in 1..=max_attempts {
+    let mut attempt: u32 = 1;
+    loop {
         match js
             .publish_with_headers(subject.clone(), headers.clone(), payload.clone())
             .await
         {
             Ok(ack_future) => match ack_future.await {
-                Ok(_) => return Ok(()),
+                Ok(ack) => {
+                    let copy = copy_origin.map(|origin| SentCopy {
+                        subject: &subject,
+                        origin,
+                        payload: &payload,
+                    });
+                    match confirm_ack(js, &ack, copy).await {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            if attempt >= max_attempts {
+                                metrics::record_backend_error(
+                                    metrics::BackendLabel::Nats,
+                                    metrics::BackendErrorKind::Publish,
+                                );
+                                return Err(PublishFailure::Unconfirmed(e));
+                            }
+                            let delay = backoff.next().unwrap_or(Duration::from_secs(2));
+                            tracing::warn!(attempt, error = %e, "{label} was not confirmed, retrying");
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                }
                 Err(e) => {
-                    if attempt == max_attempts {
+                    if attempt >= max_attempts {
                         metrics::record_backend_error(
                             metrics::BackendLabel::Nats,
                             metrics::BackendErrorKind::Publish,
                         );
                         return Err(ShoveError::Connection(format!(
                             "{label} ack failed after {max_attempts} attempts: {e}"
-                        )));
+                        ))
+                        .into());
                     }
                     let delay = backoff.next().unwrap_or(Duration::from_secs(2));
                     tracing::warn!(attempt, error = %e, "{label} ack failed, retrying");
@@ -58,23 +138,108 @@ pub(super) async fn publish_with_retry(
                 }
             },
             Err(e) => {
-                if attempt == max_attempts {
+                if attempt >= max_attempts {
                     metrics::record_backend_error(
                         metrics::BackendLabel::Nats,
                         metrics::BackendErrorKind::Publish,
                     );
                     return Err(ShoveError::Connection(format!(
                         "{label} failed after {max_attempts} attempts: {e}"
-                    )));
+                    ))
+                    .into());
                 }
                 let delay = backoff.next().unwrap_or(Duration::from_secs(2));
                 tracing::warn!(attempt, error = %e, "{label} failed, retrying");
                 tokio::time::sleep(delay).await;
             }
         }
+        attempt = attempt.saturating_add(1);
     }
+}
 
-    unreachable!()
+/// A copy as its publish sent it.
+#[derive(Clone, Copy)]
+struct SentCopy<'a> {
+    subject: &'a str,
+    /// The delivery it was made from, as stamped in `Shove-Copy-Of`.
+    origin: &'a str,
+    payload: &'a [u8],
+}
+
+/// A message as JetStream returns it from the stream.
+#[derive(Clone, Copy)]
+struct StoredMessage<'a> {
+    subject: &'a str,
+    headers: &'a HeaderMap,
+    payload: &'a [u8],
+}
+
+/// `Ok` when a PubAck can be trusted: always for a fresh store or a user's
+/// publish (`copy` is `None`), and for a copy's duplicate only when the
+/// message JetStream already stores under the copy's id is that same copy.
+async fn confirm_ack(
+    js: &jetstream::Context,
+    ack: &PublishAck,
+    copy: Option<SentCopy<'_>>,
+) -> Result<()> {
+    let Some(copy) = copy else {
+        return Ok(());
+    };
+    if !ack.duplicate {
+        return Ok(());
+    }
+    let stored = js
+        .get_stream_no_info(&ack.stream)
+        .await
+        .map_err(|e| ShoveError::Connection(format!("reading back stream {}: {e}", ack.stream)))?
+        .get_raw_message(ack.sequence)
+        .await
+        .map_err(|e| {
+            ShoveError::Connection(format!(
+                "reading back sequence {} of stream {} to confirm a duplicate copy: {e}",
+                ack.sequence, ack.stream
+            ))
+        })?;
+    let stored = StoredMessage {
+        subject: stored.subject.as_str(),
+        headers: &stored.headers,
+        payload: &stored.payload,
+    };
+    if is_same_copy(&stored, &copy) {
+        Ok(())
+    } else {
+        Err(ShoveError::Validation(format!(
+            "stream {} holds another message at sequence {} under this copy's id",
+            ack.stream, ack.sequence
+        )))
+    }
+}
+
+/// Whether a message stored under a copy's id is that copy: it went to the
+/// same subject, names the same origin in `Shove-Copy-Of` and carries the same
+/// payload. The subject matters because a stream can capture several: a copy
+/// on another shard subject or `nats_subjects` subject would reach another
+/// key's order or another subject-filtered reader.
+fn is_same_copy(stored: &StoredMessage<'_>, sent: &SentCopy<'_>) -> bool {
+    stored.subject == sent.subject
+        && stored.headers.get(COPY_OF_HEADER).map(HeaderValue::as_str) == Some(sent.origin)
+        && stored.payload == sent.payload
+}
+
+/// `value` as a NATS header value, or a `Validation` error naming `header`
+/// when it holds a CR or LF, which the client's own conversion panics on.
+pub(super) fn header_value(header: &str, value: &str) -> Result<HeaderValue> {
+    HeaderValue::from_str(value).map_err(|e| {
+        ShoveError::Validation(format!("header {header:?} cannot carry this value: {e}"))
+    })
+}
+
+/// `name` as a NATS header name, or a `Validation` error when it holds a
+/// colon, whitespace, a control or a non-ASCII character, which the client's
+/// own conversion panics on.
+fn header_name(name: &str) -> Result<HeaderName> {
+    HeaderName::from_str(name)
+        .map_err(|e| ShoveError::Validation(format!("{name:?} cannot be a header name: {e}")))
 }
 
 #[derive(Clone)]
@@ -106,14 +271,22 @@ impl NatsPublisher {
         (topology.queue().to_string(), None)
     }
 
-    fn build_headers(extra: Option<&HashMap<String, String>>, seq_key: Option<&str>) -> HeaderMap {
+    /// The headers a publish carries. A user header or sequence key NATS
+    /// cannot carry is a `Validation` error, raised before anything is sent.
+    fn build_headers(
+        extra: Option<&HashMap<String, String>>,
+        seq_key: Option<&str>,
+    ) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        headers.insert(NATS_MESSAGE_ID, Uuid::new_v4().to_string().as_str());
-        headers.insert(RETRY_COUNT_HEADER, "0");
+        headers.insert(
+            NATS_MESSAGE_ID,
+            header_value("Nats-Msg-Id", &Uuid::new_v4().to_string())?,
+        );
+        headers.insert(RETRY_COUNT_HEADER, HeaderValue::from(0u32));
 
         if let Some(extra) = extra {
             for (k, v) in extra {
-                headers.insert(k.as_str(), v.as_str());
+                headers.insert(header_name(k)?, header_value(k, v)?);
             }
         }
 
@@ -122,10 +295,10 @@ impl NatsPublisher {
         // the `x-` internal names shared with the other backends, but not the
         // `Shove-` names this backend uses.)
         if let Some(key) = seq_key {
-            headers.insert(SEQUENCE_KEY_HEADER, key);
+            headers.insert(SEQUENCE_KEY_HEADER, header_value(SEQUENCE_KEY_HEADER, key)?);
         }
 
-        headers
+        Ok(headers)
     }
 
     async fn publish_raw(&self, subject: String, headers: HeaderMap, payload: Bytes) -> Result<()> {
@@ -134,10 +307,12 @@ impl NatsPublisher {
             subject,
             headers,
             payload,
+            None,
             MAX_PUBLISH_ATTEMPTS,
             "publish",
         )
         .await
+        .map_err(PublishFailure::into_error)
     }
 }
 
@@ -146,7 +321,7 @@ impl NatsPublisher {
         let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
         let (subject, seq_key) = Self::resolve_subject_and_key::<T>(topology, message);
-        let headers = Self::build_headers(None, seq_key.as_deref());
+        let headers = Self::build_headers(None, seq_key.as_deref())?;
         self.publish_raw(subject, headers, payload).await
     }
 
@@ -159,7 +334,7 @@ impl NatsPublisher {
         let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
         let (subject, seq_key) = Self::resolve_subject_and_key::<T>(topology, message);
-        let headers = Self::build_headers(Some(&extra_headers), seq_key.as_deref());
+        let headers = Self::build_headers(Some(&extra_headers), seq_key.as_deref())?;
         self.publish_raw(subject, headers, payload).await
     }
 
@@ -182,7 +357,7 @@ impl NatsPublisher {
             .map(|msg| {
                 let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(msg)?;
                 let (subject, seq_key) = Self::resolve_subject_and_key::<T>(topology, msg);
-                let headers = Self::build_headers(None, seq_key.as_deref());
+                let headers = Self::build_headers(None, seq_key.as_deref())?;
                 Ok((subject, headers, payload))
             })
             .collect();
@@ -455,6 +630,101 @@ mod tests {
                 "{kind:?} is the server saying no"
             );
         }
+    }
+
+    /// A duplicate PubAck for a copy is trusted only when the message stored
+    /// under the copy's id went to the same subject, names the same origin and
+    /// carries the same payload.
+    #[test]
+    fn a_stored_message_is_the_copy_only_with_its_subject_origin_and_payload() {
+        let subject = "orders.shard.0";
+        let origin = "orders.billing-consumer.7";
+        let mut headers = HeaderMap::new();
+        headers.insert(COPY_OF_HEADER, origin);
+        let no_origin = HeaderMap::new();
+        let sent = SentCopy {
+            subject,
+            origin,
+            payload: b"payload",
+        };
+        let ours = StoredMessage {
+            subject,
+            headers: &headers,
+            payload: b"payload",
+        };
+
+        assert!(is_same_copy(&ours, &sent));
+        assert!(
+            !is_same_copy(
+                &StoredMessage {
+                    subject: "orders.shard.1",
+                    ..ours
+                },
+                &sent
+            ),
+            "the same copy on another subject the stream captures"
+        );
+        assert!(
+            !is_same_copy(
+                &ours,
+                &SentCopy {
+                    origin: "orders.audit-consumer.7",
+                    ..sent
+                }
+            ),
+            "another consumer's dead letter of the same record in a shared DLQ"
+        );
+        assert!(
+            !is_same_copy(
+                &StoredMessage {
+                    payload: b"impostor",
+                    ..ours
+                },
+                &sent
+            ),
+            "a different payload under the same id"
+        );
+        assert!(
+            !is_same_copy(
+                &StoredMessage {
+                    headers: &no_origin,
+                    ..ours
+                },
+                &sent
+            ),
+            "a message that names no origin"
+        );
+    }
+
+    /// A zero attempt budget is a caller's mistake, answered before anything
+    /// reaches the wire. The client never connects: nothing here needs it to.
+    #[tokio::test]
+    async fn zero_attempts_is_a_validation_error() {
+        let client = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .connect("nats://127.0.0.1:1")
+            .await
+            .expect("a lazily connecting client is built without a server");
+        let js = jetstream::new(client);
+
+        let result = publish_with_retry(
+            &js,
+            "subject".to_string(),
+            HeaderMap::new(),
+            Bytes::new(),
+            None,
+            0,
+            "publish",
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(PublishFailure::Failed(ShoveError::Validation(_)))
+            ),
+            "got {result:?}"
+        );
     }
 
     /// Nothing on the submission side can be an explicit rejection:

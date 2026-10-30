@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_nats::HeaderMap;
-use async_nats::header::NATS_MESSAGE_ID;
+use async_nats::header::{HeaderName, HeaderValue, NATS_MESSAGE_ID};
 use async_nats::jetstream::Message;
 use async_nats::jetstream::consumer::AckPolicy;
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
@@ -42,10 +42,10 @@ use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Nats, ShoveError};
 
 use super::client::NatsClient;
 use super::constants::{
-    DEATH_COUNT_HEADER, DEATH_REASON_HEADER, ORIGINAL_QUEUE_HEADER, RETRY_COUNT_HEADER,
-    SEQUENCE_KEY_HEADER,
+    COPY_OF_HEADER, DEATH_COUNT_HEADER, DEATH_REASON_HEADER, ORIGINAL_QUEUE_HEADER,
+    RETRY_COUNT_HEADER, SEQUENCE_KEY_HEADER,
 };
-use super::publisher::publish_with_retry;
+use super::publisher::{PublishResult, header_value, publish_with_retry};
 
 // ---------------------------------------------------------------------------
 // ack_wait derivation
@@ -252,6 +252,97 @@ fn adjust_outcome_for_fifo(outcome: Outcome) -> Outcome {
     }
 }
 
+/// Header-name prefixes of the JetStream publish directives a copy never
+/// replays. Each instructs the server about the publish that carries it, and
+/// none describes the copy: a `Nats-Expected-*` check fails against another
+/// stream or a later sequence, and a stream that does not enable rollups,
+/// per-message TTLs, atomic batches or schedules refuses the copy, while one
+/// that does would roll it up, expire it, batch it or schedule it.
+const PUBLISH_DIRECTIVE_PREFIXES: &[&str] = &[
+    "Nats-Expected-",
+    "Nats-Rollup",
+    "Nats-TTL",
+    "Nats-Batch-",
+    "Nats-Schedule",
+    "Nats-Required-Api-Level",
+];
+
+/// Whether `name` starts with one of the [`PUBLISH_DIRECTIVE_PREFIXES`], in
+/// any letter case: dropping a `nats-*` header that is no directive costs a
+/// copy nothing, and replaying one that is blocks it for good.
+fn is_publish_directive(name: &HeaderName) -> bool {
+    let name: &str = name.as_ref();
+    PUBLISH_DIRECTIVE_PREFIXES.iter().any(|prefix| {
+        name.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
+/// The original's headers less its publish directives: what every retry and
+/// dead-letter copy starts from. Every value of a repeated header is kept.
+fn copy_headers(original: Option<&HeaderMap>) -> HeaderMap {
+    let mut copy = HeaderMap::new();
+    for (name, values) in original.into_iter().flat_map(HeaderMap::iter) {
+        if is_publish_directive(name) {
+            continue;
+        }
+        for value in values {
+            copy.append(name.clone(), value.clone());
+        }
+    }
+    copy
+}
+
+/// The delivery a copy is made from, `{stream}.{consumer}.{stream_sequence}`:
+/// stamped on every copy as `Shove-Copy-Of`, and the root of the id of a copy
+/// whose original carries no `Nats-Msg-Id`. The consumer is part of it, so two
+/// consumers copying one record into a shared DLQ never pass for each other.
+fn copy_origin_of(stream: &str, consumer: &str, stream_sequence: u64) -> String {
+    format!("{stream}.{consumer}.{stream_sequence}")
+}
+
+/// The [`copy_origin_of`] the delivery `msg` arrived on.
+fn copy_origin(msg: &Message) -> Result<String> {
+    let info = msg.info().map_err(|e| {
+        ShoveError::Validation(format!("a copy needs the delivery's stream position: {e}"))
+    })?;
+    Ok(copy_origin_of(
+        info.stream,
+        info.consumer,
+        info.stream_sequence,
+    ))
+}
+
+/// The `Nats-Msg-Id` of a copy: the original's own id when it has one, so a
+/// handler deduplicating on `delivery_id` keeps the lineage, or else the
+/// copy's origin; then `-{suffix}`.
+///
+/// Either way the id can be predicted, which is why a duplicate PubAck for a
+/// copy is trusted only once the stored message proves to be the same copy
+/// (`publish_with_retry`). A redelivery of the same record, after a crash
+/// between the copy's publish and the original's ack, rebuilds the same id and
+/// passes that check while the copy is still stored, so the duplicate window
+/// still keeps one copy.
+fn copy_message_id(original_id: Option<&str>, origin: &str, suffix: &str) -> String {
+    let root = original_id.filter(|id| !id.is_empty()).unwrap_or(origin);
+    format!("{root}-{suffix}")
+}
+
+/// Stamps a copy of `msg` with its origin and its id.
+fn stamp_copy(headers: &mut HeaderMap, msg: &Message, origin: &str, suffix: &str) -> Result<()> {
+    let original_id = msg
+        .headers
+        .as_ref()
+        .and_then(|hm| hm.get(NATS_MESSAGE_ID))
+        .map(HeaderValue::as_str);
+    headers.insert(COPY_OF_HEADER, header_value(COPY_OF_HEADER, origin)?);
+    headers.insert(
+        NATS_MESSAGE_ID,
+        header_value("Nats-Msg-Id", &copy_message_id(original_id, origin, suffix))?,
+    );
+    Ok(())
+}
+
 /// Publishes a message to the DLQ stream with death headers, the message's
 /// own `Shove-Retry-Count` header kept as it is.
 async fn publish_to_dlq(
@@ -259,11 +350,15 @@ async fn publish_to_dlq(
     topology: &QueueTopology,
     msg: &Message,
     reason: &str,
-) -> Result<()> {
+) -> PublishResult {
     publish_dead_letter(client, topology, msg, reason, None).await
 }
 
 /// Publishes a message to the DLQ stream with death headers.
+///
+/// `reason` is written to `Shove-Death-Reason` as given. A codec error can
+/// quote the payload, line breaks included, so a decode failure passes the
+/// fixed `deserialization_error` and leaves the error itself to the log.
 ///
 /// `retry_count` is `Some` on the in-place path, where the count lives in the
 /// delivery info and not in a header: the dead letter is stamped with it, so a
@@ -275,7 +370,7 @@ async fn publish_dead_letter(
     msg: &Message,
     reason: &str,
     retry_count: Option<u32>,
-) -> Result<()> {
+) -> PublishResult {
     let dlq_subject = match topology.dlq() {
         Some(dlq) => dlq.to_string(),
         None => {
@@ -287,11 +382,18 @@ async fn publish_dead_letter(
         }
     };
 
-    let mut headers = msg.headers.clone().unwrap_or_default();
-    headers.insert(DEATH_REASON_HEADER, reason);
-    headers.insert(ORIGINAL_QUEUE_HEADER, topology.queue());
+    let origin = copy_origin(msg)?;
+    let mut headers = copy_headers(msg.headers.as_ref());
+    headers.insert(
+        DEATH_REASON_HEADER,
+        header_value(DEATH_REASON_HEADER, reason)?,
+    );
+    headers.insert(
+        ORIGINAL_QUEUE_HEADER,
+        header_value(ORIGINAL_QUEUE_HEADER, topology.queue())?,
+    );
     if let Some(count) = retry_count {
-        headers.insert(RETRY_COUNT_HEADER, count.to_string().as_str());
+        headers.insert(RETRY_COUNT_HEADER, HeaderValue::from(count));
     }
 
     let current_death_count = msg
@@ -302,23 +404,16 @@ async fn publish_dead_letter(
         .unwrap_or(0);
     headers.insert(
         DEATH_COUNT_HEADER,
-        (current_death_count + 1).to_string().as_str(),
+        HeaderValue::from(current_death_count.saturating_add(1)),
     );
-
-    // Generate a new message ID for the DLQ publish to avoid dedup rejection
-    let original_id = msg
-        .headers
-        .as_ref()
-        .and_then(|hm| hm.get(NATS_MESSAGE_ID))
-        .map(|v| v.as_str().to_string())
-        .unwrap_or_default();
-    headers.insert(NATS_MESSAGE_ID, format!("{original_id}-dlq").as_str());
+    stamp_copy(&mut headers, msg, &origin, "dlq")?;
 
     publish_with_retry(
         client.jetstream(),
         dlq_subject,
         headers,
         msg.payload.clone(),
+        Some(&origin),
         3,
         "DLQ publish",
     )
@@ -336,7 +431,8 @@ async fn publish_dead_letter(
 /// incremented copy is published durably (the PubAck is awaited) and only then
 /// is the original acked. On shutdown the hold is abandoned with the message
 /// still un-acked so it is redelivered on restart; on republish failure the
-/// original is nak'd for immediate redelivery.
+/// original is nak'd for redelivery, at once or, when the copy's id is held by
+/// a message that is not this copy, after a second.
 ///
 /// Retry counting stays header-based — the republished copy carries an
 /// incremented `RETRY_COUNT_HEADER` — so, unlike a `Nak`-driven redelivery, a
@@ -359,13 +455,13 @@ async fn hold_then_republish(
         (ack_wait / 2).max(Duration::from_secs(1))
     };
 
-    let deadline = tokio::time::Instant::now() + delay;
+    let started = tokio::time::Instant::now();
     loop {
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
+        let remaining = delay.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
             break;
         }
-        let tick = (deadline - now).min(heartbeat);
+        let tick = remaining.min(heartbeat);
         tokio::select! {
             _ = tokio::time::sleep(tick) => {}
             _ = shutdown.cancelled() => {
@@ -373,41 +469,16 @@ async fn hold_then_republish(
                 return;
             }
         }
-        if tokio::time::Instant::now() < deadline
+        if started.elapsed() < delay
             && let Err(e) = msg.ack_with(AckKind::Progress).await
         {
             tracing::warn!(error = %e, "failed to send progress ack during retry hold");
         }
     }
 
-    let mut hdrs = msg.headers.clone().unwrap_or_default();
-    hdrs.insert(RETRY_COUNT_HEADER, new_count.to_string().as_str());
-
-    // New message ID so JetStream dedup doesn't reject the republished copy.
-    // Our publisher always sets a UUID message ID, so `original_id` is normally
-    // present; the empty fallback only applies to externally-published messages
-    // and at worst weakens dedup within the short dedup window.
-    let original_id = hdrs
-        .get(NATS_MESSAGE_ID)
-        .map(|v| v.as_str().to_string())
-        .unwrap_or_default();
-    hdrs.insert(
-        NATS_MESSAGE_ID,
-        format!("{original_id}-r{new_count}").as_str(),
-    );
-
     // Publish the copy durably BEFORE acking the original: a failure leaves the
     // original for redelivery instead of silently dropping the message.
-    match publish_with_retry(
-        client.jetstream(),
-        msg.subject.to_string(),
-        hdrs,
-        msg.payload.clone(),
-        3,
-        "retry republish",
-    )
-    .await
-    {
+    match publish_retry_copy(client, msg, new_count).await {
         Ok(()) => {
             if let Err(e) = msg.ack().await {
                 tracing::error!(error = %e, "failed to ack after retry republish");
@@ -415,11 +486,30 @@ async fn hold_then_republish(
         }
         Err(e) => {
             tracing::error!(error = %e, "retry republish failed, nak-ing original for redelivery");
-            if let Err(nak_err) = msg.ack_with(AckKind::Nak(None)).await {
+            if let Err(nak_err) = msg.ack_with(AckKind::Nak(e.redelivery_delay())).await {
                 tracing::error!(error = %nak_err, "failed to nak after retry republish failure");
             }
         }
     }
+}
+
+/// Publishes the retry copy of `msg`: the original's headers less its publish
+/// directives, with the incremented count, its origin and its id.
+async fn publish_retry_copy(client: &NatsClient, msg: &Message, new_count: u32) -> PublishResult {
+    let origin = copy_origin(msg)?;
+    let mut headers = copy_headers(msg.headers.as_ref());
+    headers.insert(RETRY_COUNT_HEADER, HeaderValue::from(new_count));
+    stamp_copy(&mut headers, msg, &origin, &format!("r{new_count}"))?;
+    publish_with_retry(
+        client.jetstream(),
+        msg.subject.to_string(),
+        headers,
+        msg.payload.clone(),
+        Some(&origin),
+        3,
+        "retry republish",
+    )
+    .await
 }
 
 /// Dispatches message routing based on the handler's outcome.
@@ -441,7 +531,7 @@ async fn route_outcome(
     shutdown: &CancellationToken,
 ) {
     let in_place = retry_strategy == RetryStrategy::InPlace;
-    let result: Result<()> = match decide_retry(&outcome, retry_count, max_retries) {
+    let result: PublishResult = match decide_retry(&outcome, retry_count, max_retries) {
         RetryDecision::Ack => {
             if let Err(e) = msg.ack().await {
                 tracing::error!(error = %e, "failed to ack message");
@@ -535,7 +625,7 @@ async fn route_outcome(
     // If we reach here, a routing operation failed — nak the message for redelivery.
     if let Err(e) = result {
         tracing::error!(error = %e, "routing failed, nak-ing message for redelivery");
-        if let Err(nak_err) = msg.ack_with(AckKind::Nak(None)).await {
+        if let Err(nak_err) = msg.ack_with(AckKind::Nak(e.redelivery_delay())).await {
             tracing::error!(error = %nak_err, "failed to nak message after routing failure");
         }
     }
@@ -902,7 +992,7 @@ impl NatsConsumer {
                                         error = %dlq_err,
                                         "failed to publish oversized message to DLQ, nak-ing"
                                     );
-                                    let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                    let _ = msg.ack_with(AckKind::Nak(dlq_err.redelivery_delay())).await;
                                     continue;
                                 }
                                 let _ = msg.ack().await;
@@ -927,13 +1017,13 @@ impl NatsConsumer {
                                         &client,
                                         topology,
                                         &msg,
-                                        &format!("deserialization_error: {e}"),
+                                        "deserialization_error",
                                     ).await {
                                         tracing::error!(
                                             error = %dlq_err,
                                             "failed to publish bad message to DLQ, nak-ing"
                                         );
-                                        let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                        let _ = msg.ack_with(AckKind::Nak(dlq_err.redelivery_delay())).await;
                                         continue;
                                     }
                                     let _ = msg.ack().await;
@@ -1292,7 +1382,7 @@ impl NatsConsumer {
                                                 error = %dlq_err,
                                                 "failed to publish poisoned-key message to DLQ, nak-ing"
                                             );
-                                            let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                            let _ = msg.ack_with(AckKind::Nak(dlq_err.redelivery_delay())).await;
                                             // Nak-ed, so JetStream redelivers.
                                             pending.survived();
                                             continue;
@@ -1357,7 +1447,7 @@ impl NatsConsumer {
                                                 error = %dlq_err,
                                                 "failed to publish oversized message to DLQ, nak-ing"
                                             );
-                                            let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                            let _ = msg.ack_with(AckKind::Nak(dlq_err.redelivery_delay())).await;
                                             continue;
                                         }
                                         let _ = msg.ack().await;
@@ -1383,13 +1473,13 @@ impl NatsConsumer {
                                                 &shard_client,
                                                 topology,
                                                 &msg,
-                                                &format!("deserialization_error: {e}"),
+                                                "deserialization_error",
                                             ).await {
                                                 tracing::error!(
                                                     error = %dlq_err,
                                                     "failed to publish bad message to DLQ, nak-ing"
                                                 );
-                                                let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                                let _ = msg.ack_with(AckKind::Nak(dlq_err.redelivery_delay())).await;
                                                 continue;
                                             }
                                             let _ = msg.ack().await;
@@ -1726,7 +1816,7 @@ async fn ingest_batch_message<T: Topic>(
                     "failed to deserialize message, dropped from the batch and sent to DLQ"
                 );
                 metrics::record_failed(ctx.topic, ctx.group, metrics::FailReason::Deserialize);
-                settle_poison(ctx, &msg, &format!("deserialization_error: {e}")).await;
+                settle_poison(ctx, &msg, "deserialization_error").await;
                 return None;
             }
         };
@@ -1746,7 +1836,7 @@ async fn settle_poison(ctx: &NatsBatchCtx<'_>, msg: &Message, reason: &str) {
             error = %dlq_err,
             "failed to publish poison batch message to DLQ, nak-ing"
         );
-        if let Err(e) = msg.ack_with(AckKind::Nak(None)).await {
+        if let Err(e) = msg.ack_with(AckKind::Nak(dlq_err.redelivery_delay())).await {
             tracing::error!(error = %e, "failed to nak poison batch message");
         }
         return;
@@ -1771,8 +1861,10 @@ async fn ack_batch(acks: &[Message]) {
 /// path's DLQ arm — `record_terminal`, publish to the DLQ, then `double_ack`
 /// (the server-confirmed ack is what decides whether a discard really
 /// happened, so `confirm` waits for it and a failed ack `survived`s instead).
-/// A failed DLQ publish leaves the message un-acked and Naks it for immediate
-/// redelivery, so nothing is ever discarded without a copy landing first.
+/// A failed DLQ publish leaves the message un-acked and Naks it for
+/// redelivery, at once or, when the dead letter's id is held by a message
+/// that is not this copy, after a second; nothing is ever discarded without a
+/// copy landing first.
 ///
 /// Each message settles independently: a flush interrupted partway leaves the
 /// remainder un-acked, and JetStream redelivers them on `ack_wait` expiry —
@@ -1807,7 +1899,7 @@ async fn settle_reject_batch(ctx: &NatsBatchCtx<'_>, acks: &[Message]) {
                         error = %e,
                         "DLQ publish failed for rejected batch message, nak-ing"
                     );
-                    if let Err(nak_err) = msg.ack_with(AckKind::Nak(None)).await {
+                    if let Err(nak_err) = msg.ack_with(AckKind::Nak(e.redelivery_delay())).await {
                         tracing::error!(
                             error = %nak_err,
                             "failed to nak rejected batch message"
@@ -2470,5 +2562,128 @@ mod metadata_coordinates_tests {
             published_to_millis((i128::from(i64::MAX) + 1) * 1_000_000),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod copy_header_tests {
+    use super::*;
+
+    fn values<'a>(headers: &'a HeaderMap, name: &str) -> Vec<&'a str> {
+        headers.get_all(name).map(HeaderValue::as_str).collect()
+    }
+
+    /// A copy replays none of the JetStream directives aimed at the
+    /// original's own publish, and keeps every other header, every value of a
+    /// repeated one included.
+    #[test]
+    fn a_copy_drops_publish_directives_and_keeps_the_rest() {
+        let mut original = HeaderMap::new();
+        original.insert("Nats-Expected-Stream", "orders");
+        original.insert("Nats-Expected-Last-Sequence", "7");
+        original.insert("Nats-Expected-Last-Subject-Sequence", "3");
+        original.insert("Nats-Expected-Last-Msg-Id", "previous");
+        original.insert("Nats-Rollup", "sub");
+        original.insert("Nats-TTL", "1s");
+        original.insert("Nats-Batch-Id", "batch-1");
+        original.insert("Nats-Batch-Sequence", "1");
+        original.insert("Nats-Batch-Commit", "1");
+        original.insert("Nats-Schedule", "@hourly");
+        original.insert("Nats-Schedule-Target", "orders");
+        original.insert("Nats-Scheduler", "orders.schedule");
+        original.insert("Nats-Required-Api-Level", "2");
+        original.insert("nats-expected-stream", "orders");
+        original.insert("NATS-ROLLUP", "sub");
+        original.insert("nats-ttl", "1s");
+        original.insert(NATS_MESSAGE_ID, "original");
+        original.insert(RETRY_COUNT_HEADER, "2");
+        original.insert("x-trace-id", "trace-1");
+        original.append("x-multi", "one");
+        original.append("x-multi", "two");
+
+        let copy = copy_headers(Some(&original));
+
+        for directive in [
+            "Nats-Expected-Stream",
+            "Nats-Expected-Last-Sequence",
+            "Nats-Expected-Last-Subject-Sequence",
+            "Nats-Expected-Last-Msg-Id",
+            "Nats-Rollup",
+            "Nats-TTL",
+            "Nats-Batch-Id",
+            "Nats-Batch-Sequence",
+            "Nats-Batch-Commit",
+            "Nats-Schedule",
+            "Nats-Schedule-Target",
+            "Nats-Scheduler",
+            "Nats-Required-Api-Level",
+            "nats-expected-stream",
+            "NATS-ROLLUP",
+            "nats-ttl",
+        ] {
+            assert!(
+                copy.get(directive).is_none(),
+                "{directive} is a directive for the original's publish"
+            );
+        }
+        assert_eq!(values(&copy, "Nats-Msg-Id"), ["original"]);
+        assert_eq!(values(&copy, RETRY_COUNT_HEADER), ["2"]);
+        assert_eq!(values(&copy, "x-trace-id"), ["trace-1"]);
+        assert_eq!(values(&copy, "x-multi"), ["one", "two"]);
+        assert_eq!(copy.len(), 4);
+    }
+
+    #[test]
+    fn a_message_without_headers_copies_to_none() {
+        assert!(copy_headers(None).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod copy_id_tests {
+    use super::*;
+
+    /// A copy of a message with a `Nats-Msg-Id` builds on that id, so
+    /// `delivery_id` keeps its lineage.
+    #[test]
+    fn a_copy_extends_the_original_id() {
+        let origin = copy_origin_of("orders", "orders-consumer", 7);
+        assert_eq!(copy_message_id(Some("abc"), &origin, "dlq"), "abc-dlq");
+        assert_eq!(copy_message_id(Some("abc"), &origin, "r2"), "abc-r2");
+    }
+
+    /// Without an id of its own a copy is named after the delivery it was
+    /// made from, and an empty id counts as none.
+    #[test]
+    fn a_copy_of_a_message_without_an_id_is_named_after_its_delivery() {
+        let origin = copy_origin_of("orders", "orders-consumer", 7);
+        assert_eq!(origin, "orders.orders-consumer.7");
+        assert_eq!(
+            copy_message_id(None, &origin, "dlq"),
+            "orders.orders-consumer.7-dlq"
+        );
+        assert_eq!(
+            copy_message_id(Some(""), &origin, "r1"),
+            "orders.orders-consumer.7-r1"
+        );
+    }
+
+    /// Two consumers dead-lettering one record into a shared DLQ. Without an
+    /// original id their dead letters get different ids. With one they share
+    /// the id, and their different origins are what stop the second from
+    /// being taken for the first when JetStream reports it a duplicate.
+    #[test]
+    fn two_consumers_of_one_record_make_distinct_copies() {
+        let billing = copy_origin_of("orders", "billing-consumer", 7);
+        let audit = copy_origin_of("orders", "audit-consumer", 7);
+        assert_ne!(
+            copy_message_id(None, &billing, "dlq"),
+            copy_message_id(None, &audit, "dlq")
+        );
+        assert_eq!(
+            copy_message_id(Some("abc"), &billing, "dlq"),
+            copy_message_id(Some("abc"), &audit, "dlq")
+        );
+        assert_ne!(billing, audit);
     }
 }

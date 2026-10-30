@@ -7,8 +7,9 @@
 
 #![cfg(feature = "nats")]
 
-use async_nats::header::NATS_MESSAGE_ID;
-use async_nats::jetstream::stream::{Config as JsStreamConfig, RetentionPolicy};
+use async_nats::header::{NATS_EXPECTED_STREAM, NATS_MESSAGE_ID};
+use async_nats::jetstream::Message as JsMessage;
+use async_nats::jetstream::stream::{Config as JsStreamConfig, RetentionPolicy, Source};
 use serde::{Deserialize, Serialize};
 use shove::SequencedTopic as _;
 use shove::broker::Broker;
@@ -3856,4 +3857,1044 @@ async fn external_stream_retry_exhaustion_dead_letters_with_the_redelivery_count
     broker.close().await;
     handle.await.unwrap().ok();
     dlq_handle.await.unwrap().ok();
+}
+
+// ---------------------------------------------------------------------------
+// Header data: the copies a consumer publishes, and publish validation
+// ---------------------------------------------------------------------------
+
+/// A message that is only an enum. A payload naming a variant it does not have
+/// fails to decode, and serde quotes that variant in its error verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+enum Shape {
+    Circle,
+    Square,
+}
+
+/// The JSON string `"a\nb"`: an unknown [`Shape`] variant with a line break in
+/// it, so the decode error text carries a raw newline.
+const UNKNOWN_VARIANT_WITH_NEWLINE: &[u8] = br#""a\nb""#;
+
+shove::define_topic!(
+    ShapeTopic,
+    Shape,
+    TopologyBuilder::new("nats-shape").dlq().build()
+);
+
+shove::define_sequenced_topic!(
+    SeqShapeTopic,
+    Shape,
+    |shape: &Shape| format!("{shape:?}"),
+    TopologyBuilder::new("nats-seq-shape")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_millis(200))
+        .dlq()
+        .build()
+);
+
+impl MessageHandler<ShapeTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: Shape, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<SeqShapeTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: Shape, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// Publishes `payload` to `subject` straight through JetStream with exactly
+/// `headers`, so the record carries no `Nats-Msg-Id` unless `headers` does.
+async fn raw_publish(
+    client: &NatsClient,
+    subject: &str,
+    headers: async_nats::HeaderMap,
+    payload: &[u8],
+) {
+    client
+        .jetstream()
+        .publish_with_headers(
+            subject.to_string(),
+            headers,
+            bytes::Bytes::copy_from_slice(payload),
+        )
+        .await
+        .expect("the raw publish is submitted")
+        .await
+        .expect("the raw publish is acked");
+}
+
+/// A `SimpleMessage` as the JSON shove's codec would have written.
+fn simple_payload(id: &str) -> Vec<u8> {
+    serde_json::to_vec(&SimpleMessage {
+        id: id.into(),
+        content: "published without shove".into(),
+    })
+    .expect("a SimpleMessage encodes")
+}
+
+/// Pulls `count` dead letters off the DLQ stream `dlq` and acks them, failing
+/// the test when they have not all arrived within `TIMEOUT`.
+async fn take_dead_letters(client: &NatsClient, dlq: &str, count: usize) -> Vec<JsMessage> {
+    use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+    use futures_util::StreamExt;
+
+    let stream = client
+        .jetstream()
+        .get_stream(dlq)
+        .await
+        .expect("the DLQ stream exists");
+    let reader = stream
+        .get_or_create_consumer(
+            "test-dead-letter-reader",
+            PullConsumerConfig {
+                durable_name: Some("test-dead-letter-reader".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the DLQ reader is created");
+    let mut messages = reader.messages().await.expect("the DLQ reader pulls");
+    let deadline = Instant::now() + TIMEOUT;
+    let mut dead = Vec::with_capacity(count);
+    while dead.len() < count {
+        let msg = tokio::time::timeout_at(deadline, messages.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "only {} of {count} dead letters reached {dlq} within {TIMEOUT:?}",
+                    dead.len()
+                )
+            })
+            .expect("the DLQ reader stream stays open")
+            .expect("a dead letter is readable");
+        msg.ack().await.expect("the dead letter is acked");
+        dead.push(msg);
+    }
+    dead
+}
+
+/// The first value of header `name` on `msg`.
+fn header<'a>(msg: &'a JsMessage, name: &str) -> Option<&'a str> {
+    msg.headers.as_ref()?.get(name).map(|v| v.as_str())
+}
+
+/// serde quotes an unknown variant verbatim, so `"a\nb"` fails to decode with
+/// a raw newline in the error text. The dead letter carries the fixed reason
+/// instead of that text, and the consumer is still there for the next message.
+#[tokio::test]
+async fn decode_error_with_newline_dead_letters_without_panic() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<ShapeTopic>().await.unwrap();
+    raw_publish(
+        &client,
+        "nats-shape",
+        async_nats::HeaderMap::new(),
+        UNKNOWN_VARIANT_WITH_NEWLINE,
+    )
+    .await;
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<ShapeTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let dead = take_dead_letters(&client, "nats-shape-dlq", 1).await;
+    assert_eq!(
+        header(&dead[0], "Shove-Death-Reason"),
+        Some("deserialization_error")
+    );
+    assert_eq!(dead[0].payload.as_ref(), UNKNOWN_VARIANT_WITH_NEWLINE);
+
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<ShapeTopic>(&Shape::Circle)
+        .await
+        .unwrap();
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the consumer outlives the poison message and handles the next one"
+    );
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("the consumer task does not panic")
+        .expect("the consumer stops cleanly");
+    broker.close().await;
+}
+
+/// The FIFO shard loop decodes on its own path: the same poison payload on a
+/// shard subject dead-letters under the fixed reason, and the shard goes on
+/// to handle the next message.
+#[tokio::test]
+async fn fifo_decode_error_with_newline_dead_letters_without_panic() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqShapeTopic>().await.unwrap();
+    raw_publish(
+        &client,
+        "nats-seq-shape.shard.0",
+        async_nats::HeaderMap::new(),
+        UNKNOWN_VARIANT_WITH_NEWLINE,
+    )
+    .await;
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqShapeTopic, _>(hc, (), ConsumerOptions::<Nats>::new().with_shutdown(sc))
+            .await
+    });
+
+    let dead = take_dead_letters(&client, "nats-seq-shape-dlq", 1).await;
+    assert_eq!(
+        header(&dead[0], "Shove-Death-Reason"),
+        Some("deserialization_error")
+    );
+
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<SeqShapeTopic>(&Shape::Square)
+        .await
+        .unwrap();
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the shard outlives the poison message and handles the next one"
+    );
+    assert!(!handle.is_finished(), "no shard task ended");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("the FIFO consumer task does not panic")
+        .expect("the FIFO consumer stops cleanly");
+    broker.close().await;
+}
+
+/// A record without a `Nats-Msg-Id` of its own gets a dead-letter id from its
+/// delivery: stream, consumer and stream sequence. Five such records rejected
+/// inside one duplicate window are five dead letters.
+#[tokio::test]
+async fn messages_without_msg_id_all_reach_the_dlq() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    for i in 1..=5 {
+        raw_publish(
+            &client,
+            "nats-work",
+            async_nats::HeaderMap::new(),
+            &simple_payload(&format!("no-id-{i}")),
+        )
+        .await;
+    }
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                FixedOutcomeHandler(Outcome::Reject),
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let dead = take_dead_letters(&client, "nats-work-dlq", 5).await;
+    let mut ids: Vec<&str> = dead
+        .iter()
+        .map(|msg| header(msg, "Nats-Msg-Id").expect("every dead letter has an id"))
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [
+            "nats-work.nats-work-consumer.1-dlq",
+            "nats-work.nats-work-consumer.2-dlq",
+            "nats-work.nats-work-consumer.3-dlq",
+            "nats-work.nats-work-consumer.4-dlq",
+            "nats-work.nats-work-consumer.5-dlq",
+        ],
+        "each dead letter is named after the delivery it was made from"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// A retry copy's id comes from the delivery too: five records without a
+/// `Nats-Msg-Id`, each retried once inside one duplicate window, come back as
+/// five copies, each named after the delivery it copies.
+#[tokio::test]
+async fn retry_copies_without_msg_id_are_distinct() {
+    #[derive(Clone)]
+    struct RetryOnceThenRecord {
+        copies: Arc<Mutex<Vec<(String, String)>>>,
+        counter: WaitableCounter,
+    }
+
+    impl MessageHandler<WorkTopic> for RetryOnceThenRecord {
+        type Context = ();
+        async fn handle(&self, msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+            if meta.retry_count == 0 {
+                return Outcome::Retry;
+            }
+            self.copies.lock().await.push((msg.id, meta.delivery_id));
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    for i in 1..=5 {
+        raw_publish(
+            &client,
+            "nats-work",
+            async_nats::HeaderMap::new(),
+            &simple_payload(&format!("no-id-{i}")),
+        )
+        .await;
+    }
+
+    let handler = RetryOnceThenRecord {
+        copies: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(3)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let all_arrived = handler.counter.wait_for(5, TIMEOUT).await;
+    let mut copies = handler.copies.lock().await.clone();
+    copies.sort_unstable();
+    assert!(
+        all_arrived,
+        "only {} of 5 retry copies arrived: {copies:?}",
+        copies.len()
+    );
+    let expected: Vec<(String, String)> = (1..=5)
+        .map(|i| {
+            (
+                format!("no-id-{i}"),
+                format!("nats-work.nats-work-consumer.{i}-r1"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        copies, expected,
+        "each copy is named after the delivery it copies"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// A header NATS cannot carry is refused as a `Validation` error before
+/// anything is sent: a name with a colon or a space, a value with a line
+/// break, and a sequence key with one on every publish call.
+#[tokio::test]
+async fn invalid_user_headers_are_validation_errors() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
+    let publisher = broker.publisher().await.unwrap();
+
+    let msg = SimpleMessage {
+        id: "bad-header".into(),
+        content: "refused".into(),
+    };
+    for (name, value) in [("a:b", "fine"), ("bad name", "fine"), ("x-fine", "x\ny")] {
+        let headers = HashMap::from([(name.to_string(), value.to_string())]);
+        let err = publisher
+            .publish_with_headers::<WorkTopic>(&msg, headers)
+            .await
+            .expect_err("a header NATS cannot carry is refused");
+        assert!(
+            matches!(err, shove::ShoveError::Validation(_)),
+            "{name:?}: {value:?} should be a validation error, got {err:?}"
+        );
+    }
+
+    let order = OrderMessage {
+        order_id: "line\nbreak".into(),
+        amount: 1,
+    };
+    let refusals = [
+        publisher
+            .publish_with_headers::<SeqSkipTopic>(&order, HashMap::new())
+            .await,
+        publisher.publish::<SeqSkipTopic>(&order).await,
+        publisher
+            .publish_batch::<SeqSkipTopic>(std::slice::from_ref(&order))
+            .await,
+    ];
+    for result in refusals {
+        assert!(
+            matches!(result, Err(shove::ShoveError::Validation(_))),
+            "a sequence key with a line break should be a validation error, got {result:?}"
+        );
+    }
+
+    assert_eq!(stream_messages(&client, "nats-work").await, 0);
+    assert_eq!(stream_messages(&client, "nats-seq-skip").await, 0);
+    broker.close().await;
+}
+
+/// `Nats-Expected-Stream` checks the original's own publish. A dead letter
+/// goes to another stream, so a copy that kept the header would be refused by
+/// the server on every attempt and the record would cycle forever; the copy
+/// drops it and lands.
+#[tokio::test]
+async fn expected_stream_header_does_not_block_dead_lettering() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert(NATS_EXPECTED_STREAM, "nats-work");
+    headers.insert(NATS_MESSAGE_ID, "expected-stream-1");
+    raw_publish(
+        &client,
+        "nats-work",
+        headers,
+        &simple_payload("expected-stream-1"),
+    )
+    .await;
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                FixedOutcomeHandler(Outcome::Reject),
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let dead = take_dead_letters(&client, "nats-work-dlq", 1).await;
+    assert_eq!(header(&dead[0], "Shove-Death-Reason"), Some("rejected"));
+    assert_eq!(
+        header(&dead[0], "Nats-Expected-Stream"),
+        None,
+        "the copy does not replay the original's publish check"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// `Shove-Death-Count` is text any producer can write. A dead letter whose
+/// count is already `u32::MAX` stays there instead of overflowing.
+#[tokio::test]
+async fn death_count_saturates() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    let max = u32::MAX.to_string();
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert("Shove-Death-Count", max.as_str());
+    headers.insert(NATS_MESSAGE_ID, "death-count-max");
+    raw_publish(
+        &client,
+        "nats-work",
+        headers,
+        &simple_payload("death-count-max"),
+    )
+    .await;
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                FixedOutcomeHandler(Outcome::Reject),
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let dead = take_dead_letters(&client, "nats-work-dlq", 1).await;
+    assert_eq!(header(&dead[0], "Shove-Death-Count"), Some(max.as_str()));
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// A copy of a message that carries a `Nats-Msg-Id` builds its own id on that
+/// one, so `delivery_id` keeps the lineage a handler may deduplicate on: the
+/// retry copy of `lineage-1` is `lineage-1-r1`, and its dead letter
+/// `lineage-1-r1-dlq`. Every copy names the delivery it was made from in
+/// `Shove-Copy-Of`.
+#[tokio::test]
+async fn copies_of_a_message_with_an_id_keep_its_lineage() {
+    #[derive(Clone)]
+    struct RetryThenReject {
+        seen: Arc<Mutex<Vec<MessageMetadata>>>,
+    }
+
+    impl MessageHandler<WorkTopic> for RetryThenReject {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+            let first = meta.retry_count == 0;
+            self.seen.lock().await.push(meta);
+            if first {
+                Outcome::Retry
+            } else {
+                Outcome::Reject
+            }
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert(NATS_MESSAGE_ID, "lineage-1");
+    raw_publish(&client, "nats-work", headers, &simple_payload("lineage-1")).await;
+
+    let handler = RetryThenReject {
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(3)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let dead = take_dead_letters(&client, "nats-work-dlq", 1).await;
+    let seen = handler.seen.lock().await.clone();
+    assert_eq!(seen.len(), 2, "the original and its retry copy");
+    assert_eq!(seen[0].delivery_id, "lineage-1");
+    assert_eq!(seen[1].delivery_id, "lineage-1-r1");
+    assert_eq!(
+        seen[1].headers.get("Shove-Copy-Of").map(String::as_str),
+        Some("nats-work.nats-work-consumer.1"),
+        "the retry copy was made from stream sequence 1"
+    );
+    assert_eq!(header(&dead[0], "Nats-Msg-Id"), Some("lineage-1-r1-dlq"));
+    assert_eq!(
+        header(&dead[0], "Shove-Copy-Of"),
+        Some("nats-work.nats-work-consumer.2"),
+        "the dead letter was made from the retry copy, stream sequence 2"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// Shortens `stream`'s duplicate window, so a test can wait out an id that
+/// another message holds.
+async fn shrink_duplicate_window(client: &NatsClient, stream: &str, window: Duration) {
+    let mut config = client
+        .jetstream()
+        .get_stream(stream)
+        .await
+        .expect("the stream exists")
+        .cached_info()
+        .config
+        .clone();
+    config.duplicate_window = window;
+    client
+        .jetstream()
+        .update_stream(config)
+        .await
+        .expect("the duplicate window is mutable");
+}
+
+/// Waits until the durable `consumer` exists on `stream`, so a test can start
+/// a clock only once the consumer is ready to take deliveries.
+async fn wait_for_durable(client: &NatsClient, stream: &str, consumer: &str) {
+    let stream = client
+        .jetstream()
+        .get_stream(stream)
+        .await
+        .expect("the stream exists");
+    let deadline = Instant::now() + TIMEOUT;
+    while stream.consumer_info(consumer).await.is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the durable {consumer} was never created"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Polls `stream`'s message count until it is `expected` or `TIMEOUT` passes,
+/// and returns the last count seen.
+async fn settle_stream_messages(client: &NatsClient, stream: &str, expected: u64) -> u64 {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let messages = stream_messages(client, stream).await;
+        if messages == expected || Instant::now() >= deadline {
+            return messages;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The sequence of the last message `stream` ever stored.
+async fn stream_last_sequence(client: &NatsClient, stream: &str) -> u64 {
+    let mut stream = client
+        .jetstream()
+        .get_stream(stream)
+        .await
+        .expect("the stream exists");
+    stream
+        .info()
+        .await
+        .expect("stream info")
+        .state
+        .last_sequence
+}
+
+/// Rejects every message and counts how often it was asked.
+struct CountingReject(WaitableCounter);
+
+impl MessageHandler<WorkTopic> for CountingReject {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.0.increment();
+        Outcome::Reject
+    }
+}
+
+/// A dead letter's id can be predicted, so anyone able to publish to the DLQ
+/// subject can store a message under it first. JetStream then answers the
+/// real dead letter with a duplicate PubAck, which counts only once the stored
+/// message proves to be the same copy. The impostor is not, so the original
+/// stays un-acked while it holds the id, is redelivered a second apart rather
+/// than at once, and dead-letters once the duplicate window lets the real copy
+/// through.
+#[tokio::test]
+async fn impostor_under_a_dead_letter_id_does_not_retire_the_original() {
+    const WINDOW: Duration = Duration::from_secs(6);
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    shrink_duplicate_window(&client, "nats-work-dlq", WINDOW).await;
+
+    let rejects = WaitableCounter::new();
+    let handler = CountingReject(rejects.clone());
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+    // The window starts with the impostor's publish, so the consumer is up first.
+    wait_for_durable(&client, "nats-work", "nats-work-consumer").await;
+
+    let mut impostor = async_nats::HeaderMap::new();
+    impostor.insert(NATS_MESSAGE_ID, "nats-work.nats-work-consumer.1-dlq");
+    raw_publish(&client, "nats-work-dlq", impostor, b"impostor").await;
+    let payload = simple_payload("held-off");
+    raw_publish(&client, "nats-work", async_nats::HeaderMap::new(), &payload).await;
+
+    assert!(
+        rejects.wait_for(2, TIMEOUT).await,
+        "the original is redelivered after its dead letter was refused"
+    );
+    assert_eq!(
+        stream_messages(&client, "nats-work").await,
+        1,
+        "the original is not acked while the impostor holds its dead letter's id"
+    );
+    assert_eq!(
+        stream_messages(&client, "nats-work-dlq").await,
+        1,
+        "only the impostor is stored so far"
+    );
+
+    let dead = take_dead_letters(&client, "nats-work-dlq", 2).await;
+    let real = dead
+        .iter()
+        .find(|msg| msg.payload.as_ref() != b"impostor")
+        .expect("the real dead letter lands once the window has passed");
+    assert_eq!(real.payload.as_ref(), payload.as_slice());
+    assert_eq!(
+        header(real, "Nats-Msg-Id"),
+        Some("nats-work.nats-work-consumer.1-dlq")
+    );
+    assert_eq!(
+        header(real, "Shove-Copy-Of"),
+        Some("nats-work.nats-work-consumer.1")
+    );
+    // Each refused attempt waits a second before its redelivery, so the
+    // window holds at most one delivery per second plus the final one.
+    let runs = rejects.get();
+    assert!(
+        runs <= 8,
+        "the held original ran {runs} times in a {WINDOW:?} window: it is redelivered at once"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// The other side of the read-back check: a crash between a dead letter's
+/// publish and its original's ack leaves the dead letter stored, and the
+/// redelivered original's publish comes back as a duplicate of it. That
+/// stored copy is the one this delivery would publish, so it is confirmed:
+/// the original is acked after one delivery and the DLQ keeps a single copy.
+#[tokio::test]
+async fn a_stored_dead_letter_of_the_same_delivery_retires_the_original() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    let payload = simple_payload("already-dead");
+    let mut copy = async_nats::HeaderMap::new();
+    copy.insert("Shove-Death-Reason", "rejected");
+    copy.insert("Shove-Original-Queue", "nats-work");
+    copy.insert("Shove-Death-Count", "1");
+    copy.insert("Shove-Copy-Of", "nats-work.nats-work-consumer.1");
+    copy.insert(NATS_MESSAGE_ID, "nats-work.nats-work-consumer.1-dlq");
+    raw_publish(&client, "nats-work-dlq", copy, &payload).await;
+    raw_publish(&client, "nats-work", async_nats::HeaderMap::new(), &payload).await;
+
+    let rejects = WaitableCounter::new();
+    let handler = CountingReject(rejects.clone());
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    assert_eq!(
+        settle_stream_messages(&client, "nats-work", 0).await,
+        0,
+        "the original is acked once its stored dead letter is confirmed"
+    );
+    assert_eq!(rejects.get(), 1, "the original is handled once");
+    assert_eq!(
+        stream_messages(&client, "nats-work-dlq").await,
+        1,
+        "the DLQ keeps a single copy"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+shove::define_topic!(
+    HoldTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-hold")
+        .hold_queue(Duration::from_secs(3))
+        .dlq()
+        .build()
+);
+
+/// The hold path's side of the read-back check: the retry copy this delivery
+/// would publish is already stored, as after a crash between the copy's
+/// publish and the original's ack. The copy's publish comes back as a
+/// duplicate of it, the read-back confirms it, and the original is acked
+/// without a second copy.
+#[tokio::test]
+async fn a_stored_retry_copy_of_the_same_delivery_retires_the_original() {
+    #[derive(Clone)]
+    struct RetryOnceThenAck {
+        seen: Arc<Mutex<Vec<(u32, String)>>>,
+        counter: WaitableCounter,
+    }
+
+    impl MessageHandler<HoldTopic> for RetryOnceThenAck {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+            let first = meta.retry_count == 0;
+            self.seen
+                .lock()
+                .await
+                .push((meta.retry_count, meta.delivery_id));
+            self.counter.increment();
+            if first { Outcome::Retry } else { Outcome::Ack }
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<HoldTopic>().await.unwrap();
+    let payload = simple_payload("already-copied");
+    raw_publish(&client, "nats-hold", async_nats::HeaderMap::new(), &payload).await;
+
+    let handler = RetryOnceThenAck {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<HoldTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(3)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the original is retried"
+    );
+    // The original is now held for 3 s. Store its copy first, as a publish
+    // whose ack was lost would have.
+    let mut copy = async_nats::HeaderMap::new();
+    copy.insert("Shove-Retry-Count", "1");
+    copy.insert("Shove-Copy-Of", "nats-hold.nats-hold-consumer.1");
+    copy.insert(NATS_MESSAGE_ID, "nats-hold.nats-hold-consumer.1-r1");
+    raw_publish(&client, "nats-hold", copy, &payload).await;
+
+    assert_eq!(
+        settle_stream_messages(&client, "nats-hold", 0).await,
+        0,
+        "the original and its copy are both acked"
+    );
+    let seen = handler.seen.lock().await.clone();
+    assert_eq!(
+        seen,
+        [
+            (0, String::new()),
+            (1, "nats-hold.nats-hold-consumer.1-r1".to_string()),
+        ],
+        "the original once, then its single copy"
+    );
+    assert_eq!(
+        stream_last_sequence(&client, "nats-hold").await,
+        2,
+        "the copy's own publish stored nothing new"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+shove::define_topic!(
+    FanTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-fan")
+        .external()
+        .dlq_named("nats-fan-dlq")
+        .build()
+);
+
+// The same records through a mirror of `nats-fan`, which keeps their stream
+// sequences and headers: a second reader of each message, sharing the first
+// reader's DLQ.
+shove::define_topic!(
+    FanMirrorTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-fan-mirror")
+        .external()
+        .dlq_named("nats-fan-dlq")
+        .build()
+);
+
+struct RejectAll;
+
+impl MessageHandler<FanTopic> for RejectAll {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Reject
+    }
+}
+
+impl MessageHandler<FanMirrorTopic> for RejectAll {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Reject
+    }
+}
+
+/// Two readers of one record, a stream and its mirror, reject it into a shared
+/// DLQ. The record carries a `Nats-Msg-Id`, so both dead letters get the same
+/// id, and the second publish comes back as a duplicate of the first. Its
+/// different `Shove-Copy-Of` keeps it from being taken for the first: its
+/// original is redelivered until the duplicate window has passed, and then
+/// both dead letters are in the DLQ.
+#[tokio::test]
+async fn two_readers_sharing_a_dlq_both_dead_letter_one_record() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    provision_limits_stream(&client, "nats-fan").await;
+    client
+        .jetstream()
+        .create_stream(JsStreamConfig {
+            name: "nats-fan-mirror".to_string(),
+            mirror: Some(Source {
+                name: "nats-fan".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("infra provisions the mirror");
+    broker.topology().declare::<FanTopic>().await.unwrap();
+    broker.topology().declare::<FanMirrorTopic>().await.unwrap();
+    shrink_duplicate_window(&client, "nats-fan-dlq", Duration::from_secs(3)).await;
+
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert(NATS_MESSAGE_ID, "shared-1");
+    raw_publish(&client, "nats-fan", headers, &simple_payload("shared-1")).await;
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let first = tokio::spawn(async move {
+        consumer
+            .run::<FanTopic, _>(
+                RejectAll,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let second = tokio::spawn(async move {
+        consumer
+            .run::<FanMirrorTopic, _>(
+                RejectAll,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let dead = take_dead_letters(&client, "nats-fan-dlq", 2).await;
+    for msg in &dead {
+        assert_eq!(header(msg, "Nats-Msg-Id"), Some("shared-1-dlq"));
+    }
+    let mut origins: Vec<&str> = dead
+        .iter()
+        .map(|msg| header(msg, "Shove-Copy-Of").expect("every dead letter names its origin"))
+        .collect();
+    origins.sort_unstable();
+    assert_eq!(
+        origins,
+        [
+            "nats-fan-mirror.nats-fan-mirror-consumer.1",
+            "nats-fan.nats-fan-consumer.1",
+        ],
+        "one dead letter per reader"
+    );
+
+    shutdown.cancel();
+    first.await.unwrap().ok();
+    second.await.unwrap().ok();
+    broker.close().await;
 }
