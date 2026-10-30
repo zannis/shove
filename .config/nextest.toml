@@ -22,6 +22,13 @@ slow-timeout = { period = "90s" }
 filter = 'binary_id(shove::metrics_sqs_sequenced)'
 threads-required = 'num-test-threads'
 
+[[profile.default.overrides]]
+# This test forgets its consumer handle on purpose, as no thread can be spawned
+# for the close, and under load nextest has flagged it leaky at the default
+# 100 ms leak timeout.
+filter = 'binary_id(shove::kafka_integration) & test(=a_consumer_with_nothing_to_commit_ends_clean_when_no_thread_can_be_spawned)'
+leak-timeout = "1s"
+
 [[profile.default.scripts]]
 # The `metrics_rabbitmq_*` binaries share the container rather than starting
 # their own: each carves out a private vhost per run, so they cannot collide
