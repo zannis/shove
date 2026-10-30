@@ -1,0 +1,24 @@
+tests/metrics_nats_unconfirmed_ack.rs
+  s_1001dc3147e1e5::t_3792a0f318387a 13-14
+  s_1001dc3147e1e5::t_f5c08d00630990 295-296
+tests/metrics_nats_batch.rs
+  s_1001dc3147e1e5::t_7c4825d4701394 11,16,19,342,377,454
+tests/metrics_nats_failall_no_dlq.rs
+  s_1001dc3147e1e5::t_e3e8c4e39bd28d 20,373
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "eb577d4f6b09dda9126ee5571d914d611f1a653b",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
