@@ -1,0 +1,19 @@
+src/backends/kafka/autoscaler.rs
+  s_1001dc3147e1e5::t_ffecc62147efd1 56-58,461-467
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f528d749a7bbf4c305ef1a316865ea82aa63c3a1",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
