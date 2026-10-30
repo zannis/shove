@@ -16,7 +16,7 @@ use async_nats::jetstream::context::{
 use async_nats::jetstream::message::AckKind;
 use futures_util::FutureExt;
 use futures_util::stream::{self, StreamExt};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
@@ -1120,6 +1120,7 @@ type Deliveries = stream::Zip<Batch, stream::Iter<std::vec::IntoIter<OwnedSemaph
 struct BusyTasks {
     count: Mutex<usize>,
     processing: Arc<AtomicBool>,
+    finished: Notify,
 }
 
 impl BusyTasks {
@@ -1127,6 +1128,7 @@ impl BusyTasks {
         Arc::new(Self {
             count: Mutex::new(0),
             processing,
+            finished: Notify::new(),
         })
     }
 
@@ -1136,6 +1138,24 @@ impl BusyTasks {
         *count = count.saturating_add(1);
         self.processing.store(true, Ordering::Release);
         BusyTask(Arc::clone(self))
+    }
+
+    fn running(&self) -> usize {
+        *self.count.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits until no counted task is running.
+    async fn idle(&self) {
+        loop {
+            // Registered before the count is read, so the last task's
+            // notification cannot slip in between.
+            let mut finished = std::pin::pin!(self.finished.notified());
+            finished.as_mut().enable();
+            if self.running() == 0 {
+                return;
+            }
+            finished.await;
+        }
     }
 }
 
@@ -1148,6 +1168,7 @@ impl Drop for BusyTask {
         *count = count.saturating_sub(1);
         if *count == 0 {
             self.0.processing.store(false, Ordering::Release);
+            self.0.finished.notify_waiters();
         }
     }
 }
@@ -1201,7 +1222,6 @@ struct Worker<T: Topic, H: MessageHandler<T>> {
     handler: H,
     ctx: H::Context,
     group: Option<Arc<str>>,
-    prefetch: u16,
     max_retries: u32,
     retry_strategy: RetryStrategy,
     max_message_size: Option<usize>,
@@ -1253,32 +1273,36 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
             let pull = pull.map_err(|e| {
                 ShoveError::Connection(format!("pull request on {queue} failed: {e}"))
             })?;
-            let mut deliveries: Deliveries = pull.zip(stream::iter(reserved));
-            let mut delivered = false;
-            loop {
-                let Some(item) = self.unless_stopped(deliveries.next()).await else {
-                    let unstarted = take_ready(&mut deliveries);
-                    drop(deliveries);
-                    return self.stop(consumer, &unstarted).await;
-                };
-                match item {
-                    None => break,
-                    Some((Ok(msg), slot)) => {
-                        delivered = true;
-                        self.start(msg, slot, ack_wait);
-                    }
-                    Some((Err(e), _)) => {
-                        tracing::error!(error = %e, queue, "consumer stream error");
-                        metrics::record_backend_error(
-                            metrics::BackendLabel::Nats,
-                            metrics::BackendErrorKind::Consume,
-                        );
-                        return Err(ShoveError::Connection(format!(
-                            "consumer stream error on {queue}: {e}"
-                        )));
+            // Scoped, so the slots the pull reserved and did not fill go back
+            // before anything below waits.
+            let delivered = {
+                let mut deliveries: Deliveries = pull.zip(stream::iter(reserved));
+                let mut delivered = false;
+                loop {
+                    let Some(item) = self.unless_stopped(deliveries.next()).await else {
+                        let unstarted = take_ready(&mut deliveries);
+                        drop(deliveries);
+                        return self.stop(consumer, &unstarted).await;
+                    };
+                    match item {
+                        None => break delivered,
+                        Some((Ok(msg), slot)) => {
+                            delivered = true;
+                            self.start(msg, slot, ack_wait);
+                        }
+                        Some((Err(e), _)) => {
+                            tracing::error!(error = %e, queue, "consumer stream error");
+                            metrics::record_backend_error(
+                                metrics::BackendLabel::Nats,
+                                metrics::BackendErrorKind::Consume,
+                            );
+                            return Err(ShoveError::Connection(format!(
+                                "consumer stream error on {queue}: {e}"
+                            )));
+                        }
                     }
                 }
-            }
+            };
             if delivered {
                 empty_windows = 0;
                 continue;
@@ -1319,15 +1343,14 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
     }
 
     /// Waits until every task the worker started has finished, held retries
-    /// included.
+    /// included. It waits on the tasks themselves, so a slot the caller still
+    /// holds cannot hold it up.
     async fn drain(&self) {
         tracing::info!(
             queue = self.topology.queue(),
             "shutdown signal received, draining in-flight tasks"
         );
-        let all = u32::from(self.prefetch);
-        let _ = self.slots.acquire_many(all).await;
-        let _ = self.holds.acquire_many(all).await;
+        self.busy.idle().await;
     }
 
     /// Size-checks and decodes `msg`, runs the handler on it and settles its
@@ -1625,7 +1648,6 @@ impl NatsConsumer {
             handler,
             ctx,
             group: options.consumer_group.clone(),
-            prefetch,
             max_retries: options.max_retries,
             retry_strategy,
             max_message_size: options.max_message_size,
@@ -2977,6 +2999,25 @@ mod worker_flow_tests {
         );
         drop(third);
         assert!(!processing.load(Ordering::Acquire));
+    }
+
+    /// A drain waits on the tasks themselves, so it ends once the last one
+    /// finishes whatever slots are still held elsewhere.
+    #[tokio::test]
+    async fn idle_waits_for_the_last_task() {
+        let busy = BusyTasks::new(Arc::new(AtomicBool::new(false)));
+        assert!(busy.idle().now_or_never().is_some(), "nothing is running");
+        let first = busy.enter();
+        let second = busy.enter();
+        let mut idle = std::pin::pin!(busy.idle());
+        assert!(idle.as_mut().now_or_never().is_none());
+        drop(first);
+        assert!(
+            idle.as_mut().now_or_never().is_none(),
+            "one task is still running"
+        );
+        drop(second);
+        assert!(idle.as_mut().now_or_never().is_some());
     }
 }
 
