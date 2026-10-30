@@ -1,6 +1,6 @@
 # SQS — Audited Consumer
 
-Use this to see the `Audited` wrapper on SQS. The handler returns `Outcome::Retry` on the first delivery, so the message is delivered twice and each delivery emits an audit record. The example publishes with `publish`, which sets no `x-trace-id` attribute, so the two records carry different `trace_id` values. Correlating retries in a payment audit log or compliance record takes an `x-trace-id` set at publish time, as [Trace ID propagation](#trace-id-propagation) describes. The `AuditHandler` API is identical across backends.
+Use this to see the `Audited` wrapper on SQS. The handler returns `Outcome::Retry` on the first delivery, so the message is delivered twice and each delivery emits an audit record. The example publishes with `publish`, which sets no `x-trace-id` attribute, so the two records carry different `trace_id` values. Correlating retries in a payment audit log or compliance record takes an `x-trace-id` set at publish time, as [Trace ID propagation](/guides/audit#trace-id-propagation) describes. The `AuditHandler` API is identical across backends.
 
 ## Prerequisites
 
