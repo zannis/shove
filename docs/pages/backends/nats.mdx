@@ -175,7 +175,21 @@ A header NATS cannot carry is refused with `ShoveError::Validation` before anyth
 
 Messages for the same key stay in order. NATS uses subject-based shard routing: the publisher derives a subject suffix from `T::sequence_key()` and routes to a dedicated shard subject. Each shard consumer is configured with `max_ack_pending: 1`, meaning at most one message per shard is in-flight at a time. Messages for the same key are never processed concurrently.
 
-Different keys map to different shards and are entirely independent — one stuck key does not block others.
+Keys on different shards are independent. Keys that hash to the same shard share its one in-flight slot, so a message held for a retry delays them as well.
+
+A `Retry` keeps the message at its position on the shard.
+The shard holds it un-acked for the attempt's delay, with `hold_queue()` selecting the delay by attempt and 1 s applying without hold queues, then hands it back to the handler in process.
+`Defer`, a handler timeout and a handler panic retry the same way.
+Through the wait the shard sends a JetStream progress acknowledgement at least every third of the durable's `ack_wait`, so a delay longer than `ack_wait` does not get the message redelivered.
+Nothing is republished: the retry count is kept in memory, and an exhausted message is dead-lettered from the original with that count.
+Each delivery seeds the count with the message's `Shove-Retry-Count` header plus one for every earlier JetStream delivery, so every hand-off to a new delivery spends a retry.
+A stop during a wait hands the message off with a nak, so the next consumer of the shard takes it before anything behind it.
+A crash hands it off too: JetStream redelivers the message once its `ack_wait` expires.
+So does an `ack_wait` expiry while the progress acknowledgements cannot reach the server.
+A message that keeps failing is therefore dead-lettered on delivery `max_retries + 1` at the latest, however often it changes hands.
+Until then it holds its shard: every message behind it, other keys included, waits through each hold delay and through the `ack_wait` a crash costs.
+A dead letter whose publish fails keeps the message un-acked, and the publish is retried until it lands.
+The delay before each attempt doubles from about a second up to a 30 s ceiling and is jittered by up to half either way, so attempts at the ceiling come 15 to 45 s apart.
 
 See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced example](/backends/nats/examples/sequenced) for a runnable walkthrough.
 

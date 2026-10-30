@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_nats::HeaderMap;
 use async_nats::header::{HeaderName, HeaderValue, NATS_MESSAGE_ID};
 use async_nats::jetstream::Message;
-use async_nats::jetstream::consumer::AckPolicy;
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+use async_nats::jetstream::consumer::{AckPolicy, PullConsumer};
 use async_nats::jetstream::context::{
     ConsumerInfoError, ConsumerInfoErrorKind, GetStreamError, GetStreamErrorKind,
 };
@@ -34,7 +34,7 @@ use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::routing::{
-    PoisonedKeys, RetryDecision, decide_retry, handler_timeout_outcome, hold_index,
+    PoisonedKeys, RetryDecision, decide_retry, handler_timeout_outcome, hold_delay,
 };
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::QueueTopology;
@@ -539,14 +539,10 @@ async fn route_outcome(
             return;
         }
         RetryDecision::Dlq { reason } => {
-            let fail_reason = match reason {
-                "rejected" => metrics::FailReason::Rejected,
-                _ => metrics::FailReason::MaxRetriesExceeded,
-            };
             let pending = metrics::record_terminal(
                 topology.queue(),
                 group,
-                fail_reason,
+                dlq_fail_reason(reason),
                 topology.dlq().is_some(),
             );
             let stamped = in_place.then_some(retry_count);
@@ -583,13 +579,8 @@ async fn route_outcome(
             }
         }
         RetryDecision::Hold { increment: true } => {
-            let new_count = retry_count + 1;
-            let delay = if hold_queues.is_empty() {
-                Duration::from_secs(1)
-            } else {
-                let idx = hold_index(retry_count, hold_queues.len());
-                hold_queues[idx].delay()
-            };
+            let new_count = retry_count.saturating_add(1);
+            let delay = hold_delay(hold_queues, retry_count);
 
             if in_place {
                 // An external stream is never written by its consumer: the
@@ -610,11 +601,7 @@ async fn route_outcome(
             return;
         }
         RetryDecision::Hold { increment: false } => {
-            let delay = if hold_queues.is_empty() {
-                Duration::from_secs(1)
-            } else {
-                hold_queues[0].delay()
-            };
+            let delay = hold_delay(hold_queues, 0);
             if let Err(e) = msg.ack_with(AckKind::Nak(Some(delay))).await {
                 tracing::error!(error = %e, "failed to nak-with-delay for defer");
             }
@@ -628,6 +615,411 @@ async fn route_outcome(
         if let Err(nak_err) = msg.ack_with(AckKind::Nak(e.redelivery_delay())).await {
             tracing::error!(error = %nak_err, "failed to nak message after routing failure");
         }
+    }
+}
+
+/// The failure a dead letter is counted under, from the reason
+/// [`decide_retry`] gave it.
+fn dlq_fail_reason(reason: &str) -> metrics::FailReason {
+    match reason {
+        "rejected" => metrics::FailReason::Rejected,
+        _ => metrics::FailReason::MaxRetriesExceeded,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sequenced settlement
+// ---------------------------------------------------------------------------
+
+/// The `ack_wait` JetStream applies to a consumer whose config leaves it at
+/// zero.
+const JETSTREAM_DEFAULT_ACK_WAIT: Duration = Duration::from_secs(30);
+
+/// The count a sequenced record first reaches its handler with: its
+/// `Shove-Retry-Count` plus one for every earlier JetStream delivery, so each
+/// hand-off to a new delivery spends a retry, whether a stop, a crash or an
+/// `ack_wait` expiry made it.
+fn sequenced_retry_count(metadata: &MessageMetadata) -> u32 {
+    metadata
+        .retry_count
+        .saturating_add(in_place_retry_count(metadata))
+}
+
+/// How often a held record renews its `ack_wait` with a progress ack: a third
+/// of it, so one renewal can be lost and the next still lands in time. Zero
+/// stands for JetStream's default.
+fn progress_interval(ack_wait: Duration) -> Duration {
+    let ack_wait = if ack_wait.is_zero() {
+        JETSTREAM_DEFAULT_ACK_WAIT
+    } else {
+        ack_wait
+    };
+    ack_wait / 3
+}
+
+/// Holds `msg` un-acked for `delay`, renewing its `ack_wait` with a progress
+/// ack every [`progress_interval`] and once more as the wait ends, so the
+/// record goes back to the handler with a whole `ack_wait` ahead of it.
+/// `false` when shutdown fired first, the record still un-acked.
+async fn hold_with_progress(
+    msg: &Message,
+    delay: Duration,
+    ack_wait: Duration,
+    shutdown: &CancellationToken,
+) -> bool {
+    let interval = progress_interval(ack_wait);
+    let started = tokio::time::Instant::now();
+    loop {
+        let remaining = delay.saturating_sub(started.elapsed());
+        // A publish can block while the client reconnects.
+        let renewed = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return false,
+            renewed = async {
+                tokio::time::sleep(remaining.min(interval)).await;
+                msg.ack_with(AckKind::Progress).await
+            } => renewed,
+        };
+        if let Err(e) = renewed {
+            tracing::warn!(error = %e, "failed to renew the ack_wait of a held sequenced message");
+        }
+        if remaining <= interval {
+            return true;
+        }
+    }
+}
+
+/// What a FIFO shard settles each of its records with.
+struct FifoShard<'a, H, C> {
+    client: &'a NatsClient,
+    topology: &'static QueueTopology,
+    handler: &'a Arc<H>,
+    ctx: &'a Arc<C>,
+    poisoned: &'a PoisonedKeys,
+    processing: &'a AtomicBool,
+    topic: &'a str,
+    group: Option<&'a str>,
+    shard: u16,
+    max_retries: u32,
+    max_message_size: Option<usize>,
+    handler_timeout: Option<Duration>,
+    timeout_outcome: &'a Option<Outcome>,
+    ack_wait: Duration,
+    shutdown: &'a CancellationToken,
+}
+
+/// How a FIFO shard left the record it was handed.
+enum ShardStep {
+    /// Acked or dead-lettered: the shard takes its next record.
+    Settled,
+    /// Shutdown fired while the record was held. It is still un-acked, and the
+    /// shard releases it with this redelivery delay once its pull
+    /// subscription is gone ([`release_held`]).
+    Stopped { redelivery: Option<Duration> },
+}
+
+/// How [`dead_letter_in_place`] left the record.
+enum DeadLetter {
+    /// The dead letter is stored, or the topology has no DLQ to store it in.
+    Landed,
+    /// Shutdown fired between two attempts. The record is still un-acked, and
+    /// `redelivery` is the delay the last failed publish asks for.
+    Stopped { redelivery: Option<Duration> },
+}
+
+/// Publishes the dead letter of a record a FIFO shard holds. A failed publish
+/// keeps the record un-acked, its `ack_wait` renewed, and is retried in place
+/// after a capped exponential backoff for as long as it fails, so nothing
+/// behind the record on its shard is delivered before the copy lands.
+async fn dead_letter_in_place<H, C>(
+    shard: &FifoShard<'_, H, C>,
+    msg: &Message,
+    reason: &str,
+    retry_count: Option<u32>,
+) -> DeadLetter {
+    let mut backoff = Backoff::default();
+    loop {
+        let failure =
+            match publish_dead_letter(shard.client, shard.topology, msg, reason, retry_count).await
+            {
+                Ok(()) => return DeadLetter::Landed,
+                Err(e) => e,
+            };
+        let delay = next_redelivery_delay(&mut backoff);
+        tracing::error!(
+            error = %failure,
+            shard = shard.shard,
+            retry_in = ?delay,
+            "DLQ publish failed, keeping the sequenced message and retrying"
+        );
+        if !hold_with_progress(msg, delay, shard.ack_wait, shard.shutdown).await {
+            return DeadLetter::Stopped {
+                redelivery: failure.redelivery_delay(),
+            };
+        }
+    }
+}
+
+/// Dead-letters a record the handler never saw, oversized or undecodable,
+/// then acks it. Like the other NATS pre-handler drops it counts only the
+/// failure the caller already recorded, no discard.
+async fn dead_letter_unhandled<H, C>(
+    shard: &FifoShard<'_, H, C>,
+    msg: &Message,
+    reason: &str,
+    retry_count: Option<u32>,
+) -> ShardStep {
+    match dead_letter_in_place(shard, msg, reason, retry_count).await {
+        DeadLetter::Landed => {
+            if let Err(e) = msg.ack().await {
+                tracing::error!(error = %e, "failed to ack message after DLQ publish");
+            }
+            ShardStep::Settled
+        }
+        DeadLetter::Stopped { redelivery } => ShardStep::Stopped { redelivery },
+    }
+}
+
+/// Dead-letters a record whose outcome is terminal, a `Reject` or an exhausted
+/// `Retry`, stamped with the count it was settled at, and with the accounting
+/// of `route_outcome`'s DLQ arm: the failure counts at once, the discard only
+/// once `double_ack` confirms the record is retired.
+async fn dead_letter_terminal<H, C>(
+    shard: &FifoShard<'_, H, C>,
+    msg: &Message,
+    reason: &'static str,
+    retry_count: u32,
+) -> ShardStep {
+    let pending = metrics::record_terminal(
+        shard.topic,
+        shard.group,
+        dlq_fail_reason(reason),
+        shard.topology.dlq().is_some(),
+    );
+    match dead_letter_in_place(shard, msg, reason, Some(retry_count)).await {
+        DeadLetter::Landed => {
+            // Only a server-confirmed ack proves the record is retired.
+            match msg.double_ack().await {
+                Ok(()) => pending.confirm(),
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to ack after DLQ publish");
+                    pending.survived();
+                }
+            }
+            ShardStep::Settled
+        }
+        DeadLetter::Stopped { redelivery } => {
+            pending.survived();
+            ShardStep::Stopped { redelivery }
+        }
+    }
+}
+
+/// Settles one record a FIFO shard was handed, keeping it at its position on
+/// the shard until it is acked or dead-lettered.
+///
+/// A `Retry`, which on a sequenced consumer also covers a `Defer`, a handler
+/// timeout and a handler panic, holds the record un-acked through the
+/// attempt's hold delay ([`hold_with_progress`]) and then hands it back to the
+/// handler in process, decoded afresh from its bytes. The retry count lives in
+/// memory, seeded by [`sequenced_retry_count`], and nothing is republished.
+/// The shard durable's `max_ack_pending: 1` keeps every later record on the
+/// shard undelivered meanwhile. A `Reject` or an exhausted retry budget
+/// dead-letters the record under the topic's `SequenceFailure`, with the
+/// count it was settled at, and a failed dead-letter publish is retried in
+/// place ([`dead_letter_in_place`]).
+async fn settle_sequenced<T, H>(shard: &FifoShard<'_, H, H::Context>, msg: &Message) -> ShardStep
+where
+    T: SequencedTopic,
+    H: MessageHandler<T>,
+{
+    let topology = shard.topology;
+    let queue = topology.queue();
+
+    // ── FailAll: skip poisoned keys ──
+    // Inert unless this topic is configured `SequenceFailure::FailAll`.
+    let seq_key = get_sequence_key(&msg.headers);
+    if shard.poisoned.is_poisoned(&seq_key) {
+        tracing::warn!(
+            shard = shard.shard,
+            sequence_key = %seq_key,
+            "sequence key poisoned (FailAll) — sending to DLQ without invoking handler"
+        );
+        // Collateral of an already-counted failure, so the failure half is
+        // deliberately not counted again — see `metrics::FailReason`. The
+        // discard half still applies: a cascaded message dropped with no DLQ
+        // is just as gone as any other.
+        let has_dlq = topology.dlq().is_some();
+        let pending = metrics::pending_discard(
+            shard.topic,
+            shard.group,
+            metrics::FailReason::Rejected,
+            has_dlq,
+        );
+        if let DeadLetter::Stopped { redelivery } =
+            dead_letter_in_place(shard, msg, "rejected", None).await
+        {
+            pending.survived();
+            return ShardStep::Stopped { redelivery };
+        }
+        if has_dlq {
+            // The message is in the DLQ, so it exists whatever the ack does
+            // and `confirm` could never count it. Settling now keeps the
+            // dead-lettered cascade off the `double_ack` round trip the live
+            // pending record below needs — and a poisoned key drains its whole
+            // backlog through this branch, so that tax is per message.
+            pending.survived();
+            if let Err(e) = msg.ack().await {
+                tracing::error!(error = %e, "failed to ack poisoned-key message after DLQ publish");
+            }
+            return ShardStep::Settled;
+        }
+        // No DLQ, so this ack is what drops the message and it decides the
+        // discard accounting. `double_ack` rather than `ack`: `ack` returns as
+        // soon as `+ACK` is written to the connection, so a connection lost
+        // before JetStream applies it would redeliver a message already
+        // counted gone. Same reasoning as `route_outcome`'s Dlq arm.
+        match msg.double_ack().await {
+            Ok(()) => pending.confirm(),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to ack poisoned-key message after DLQ publish"
+                );
+                pending.survived();
+            }
+        }
+        return ShardStep::Settled;
+    }
+
+    if let Err(e) = validate_message_size(msg.payload.len(), shard.max_message_size) {
+        tracing::warn!(error = %e, shard = shard.shard, "rejecting oversized message to DLQ");
+        metrics::record_failed(shard.topic, shard.group, metrics::FailReason::Oversize);
+        poison_key(shard.poisoned, &seq_key, queue);
+        return dead_letter_unhandled(shard, msg, &e.to_string(), None).await;
+    }
+
+    let mut metadata = extract_message_metadata(msg);
+    metadata.retry_count = sequenced_retry_count(&metadata);
+    loop {
+        let payload: T::Message =
+            match <T::Codec as crate::Codec<T::Message>>::decode_owned(msg.payload.clone()) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        shard = shard.shard,
+                        "failed to deserialize message, sending to DLQ"
+                    );
+                    metrics::record_failed(
+                        shard.topic,
+                        shard.group,
+                        metrics::FailReason::Deserialize,
+                    );
+                    poison_key(shard.poisoned, &seq_key, queue);
+                    let count = Some(metadata.retry_count);
+                    return dead_letter_unhandled(shard, msg, "deserialization_error", count).await;
+                }
+            };
+
+        shard.processing.store(true, Ordering::Release);
+        let retry_count = metadata.retry_count;
+        let handler = Arc::clone(shard.handler);
+        let ctx = Arc::clone(shard.ctx);
+        let attempt = metadata.clone();
+        let outcome = invoke_handler(
+            async move { handler.handle(payload, attempt, ctx.as_ref()).await },
+            shard.handler_timeout,
+            shard.timeout_outcome.clone(),
+            shard.topic,
+            shard.group,
+        )
+        .await;
+
+        match decide_retry(
+            &adjust_outcome_for_fifo(outcome),
+            retry_count,
+            shard.max_retries,
+        ) {
+            RetryDecision::Ack => {
+                if let Err(e) = msg.ack().await {
+                    tracing::error!(error = %e, "failed to ack message");
+                }
+                return ShardStep::Settled;
+            }
+            RetryDecision::Dlq { reason } => {
+                // FailAll: a DLQ-terminal outcome poisons the key, so every
+                // later message for it is dead-lettered instead of handled.
+                poison_key(shard.poisoned, &seq_key, queue);
+                return dead_letter_terminal(shard, msg, reason, retry_count).await;
+            }
+            RetryDecision::Hold { increment } => {
+                let delay = hold_delay(topology.hold_queues(), retry_count);
+                if !hold_with_progress(msg, delay, shard.ack_wait, shard.shutdown).await {
+                    return ShardStep::Stopped { redelivery: None };
+                }
+                if increment {
+                    metadata.retry_count = retry_count.saturating_add(1);
+                }
+                metadata.redelivered = true;
+            }
+        }
+    }
+}
+
+/// How long a stopping shard spends releasing the record it holds. A release
+/// that cannot finish in time, on a connection that is down, leaves the
+/// record to be redelivered once its `ack_wait` expires.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How much of [`RELEASE_TIMEOUT`] the consumer-info sweep in
+/// [`release_held`] may take, so a sweep that times out still leaves time for
+/// the nak.
+const SWEEP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Naks the record a stopping shard still holds, so the server can hand it to
+/// the next consumer of the shard at once, ahead of every record behind it.
+///
+/// Best effort: whatever does not happen within [`RELEASE_TIMEOUT`], and every
+/// release the server spends elsewhere, leaves the record to be redelivered
+/// once its `ack_wait` expires. Nothing is lost either way, and nothing behind
+/// the record is delivered first.
+///
+/// Called once the shard's pull subscription is dropped. The server keeps
+/// that subscription's pull request on the durable's waiting list until it
+/// next sweeps the list, and a nak processed before then is spent on the dead
+/// request: the redelivery goes to an inbox nobody reads, or, on
+/// nats-server 2.10.14, is dropped. A consumer-info request sweeps the list,
+/// so it goes first. The sweep only finds the request dead once the
+/// subscription's UNSUB has reached the server, and that UNSUB is sent from a
+/// task the subscription's drop spawned: the yield gives that task its turn,
+/// with no guarantee that it has sent the UNSUB by then.
+async fn release_held(consumer: &PullConsumer, msg: &Message, redelivery: Option<Duration>) {
+    let release = async {
+        tokio::task::yield_now().await;
+        match tokio::time::timeout(SWEEP_TIMEOUT, consumer.get_info()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(
+                error = %e,
+                "failed to clear the stopped shard's pull request before releasing its held message"
+            ),
+            Err(_) => tracing::warn!(
+                timeout = ?SWEEP_TIMEOUT,
+                "timed out clearing the stopped shard's pull request before releasing its held message"
+            ),
+        }
+        msg.ack_with(AckKind::Nak(redelivery)).await
+    };
+    match tokio::time::timeout(RELEASE_TIMEOUT, release).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(
+            error = %e,
+            "failed to release a held sequenced message; it is redelivered once ack_wait expires"
+        ),
+        Err(_) => tracing::error!(
+            timeout = ?RELEASE_TIMEOUT,
+            "timed out releasing a held sequenced message; it is redelivered once ack_wait expires"
+        ),
     }
 }
 
@@ -1216,14 +1608,6 @@ impl NatsConsumer {
         let handler_timeout = options.handler_timeout;
         let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let max_message_size = options.max_message_size;
-        let hold_queues = topology.hold_queues();
-        // `build()` refuses `external()` with `sequenced()`, so a FIFO consumer
-        // always runs the republish path.
-        debug_assert!(
-            !topology.external(),
-            "external() is refused on a sequenced topology at build()"
-        );
-        let retry_strategy = RetryStrategy::Republish;
         let topic: Arc<str> = Arc::from(queue);
         let group: Option<Arc<str>> = options.consumer_group.clone();
         let derived_ack_wait = derive_ack_wait(handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT));
@@ -1312,238 +1696,74 @@ impl NatsConsumer {
                             ))
                         })?;
 
+                        let fifo_shard = FifoShard {
+                            client: &shard_client,
+                            topology,
+                            handler: &shard_handler,
+                            ctx: &shard_ctx,
+                            poisoned: &shard_poisoned,
+                            processing: &shard_processing,
+                            topic: &shard_topic,
+                            group: shard_group.as_deref(),
+                            shard,
+                            max_retries,
+                            max_message_size,
+                            handler_timeout,
+                            timeout_outcome: &handler_timeout_outcome_cfg,
+                            ack_wait,
+                            shutdown: &shard_shutdown,
+                        };
+
                         loop {
-                            tokio::select! {
+                            // Biased, so no record is taken once shutdown fired.
+                            let item = tokio::select! {
+                                biased;
                                 _ = shard_shutdown.cancelled() => {
                                     tracing::info!(shard, "shutdown signal received, stopping shard consumer");
                                     return Ok(());
                                 }
-                                item = messages.next() => {
-                                    let msg = match item {
-                                        Some(Ok(msg)) => msg,
-                                        Some(Err(e)) => {
-                                            tracing::error!(error = %e, shard, "shard consumer stream error");
-                                            metrics::record_backend_error(
-                                                metrics::BackendLabel::Nats,
-                                                metrics::BackendErrorKind::Consume,
-                                            );
-                                            return Err(ShoveError::Connection(
-                                                format!("shard {shard} stream error: {e}"),
-                                            ));
-                                        }
-                                        None => {
-                                            tracing::warn!(shard, "shard consumer stream closed");
-                                            metrics::record_backend_error(
-                                                metrics::BackendLabel::Nats,
-                                                metrics::BackendErrorKind::Consume,
-                                            );
-                                            return Err(ShoveError::Connection(
-                                                format!("shard {shard} stream closed"),
-                                            ));
-                                        }
-                                    };
-
-                                    metrics::record_message_size(
-                                        &shard_topic,
-                                        shard_group.as_deref(),
-                                        msg.payload.len(),
+                                item = messages.next() => item,
+                            };
+                            let msg = match item {
+                                Some(Ok(msg)) => msg,
+                                Some(Err(e)) => {
+                                    tracing::error!(error = %e, shard, "shard consumer stream error");
+                                    metrics::record_backend_error(
+                                        metrics::BackendLabel::Nats,
+                                        metrics::BackendErrorKind::Consume,
                                     );
-
-                                    // ── FailAll: skip poisoned keys ──
-                                    // Inert unless this topic is configured
-                                    // `SequenceFailure::FailAll`.
-                                    let seq_key = get_sequence_key(&msg.headers);
-                                    if shard_poisoned.is_poisoned(&seq_key) {
-                                        tracing::warn!(
-                                            shard,
-                                            sequence_key = %seq_key,
-                                            "sequence key poisoned (FailAll) — sending to DLQ without invoking handler"
-                                        );
-                                        // Collateral of an already-counted
-                                        // failure, so the failure half is
-                                        // deliberately not counted again — see
-                                        // `metrics::FailReason`. The discard
-                                        // half still applies: a cascaded
-                                        // message dropped with no DLQ is just
-                                        // as gone as any other.
-                                        let pending = metrics::pending_discard(
-                                            &shard_topic,
-                                            shard_group.as_deref(),
-                                            metrics::FailReason::Rejected,
-                                            topology.dlq().is_some(),
-                                        );
-                                        if let Err(dlq_err) = publish_to_dlq(
-                                            &shard_client,
-                                            topology,
-                                            &msg,
-                                            "rejected",
-                                        ).await {
-                                            tracing::error!(
-                                                error = %dlq_err,
-                                                "failed to publish poisoned-key message to DLQ, nak-ing"
-                                            );
-                                            let _ = msg.ack_with(AckKind::Nak(dlq_err.redelivery_delay())).await;
-                                            // Nak-ed, so JetStream redelivers.
-                                            pending.survived();
-                                            continue;
-                                        }
-                                        if topology.dlq().is_some() {
-                                            // The message is in the DLQ, so it
-                                            // exists whatever the ack does and
-                                            // `confirm` could never count it.
-                                            // Settling now keeps the
-                                            // dead-lettered cascade off the
-                                            // `double_ack` round trip the live
-                                            // pending record below needs — and
-                                            // a poisoned key drains its whole
-                                            // backlog through this branch, so
-                                            // that tax is per message.
-                                            pending.survived();
-                                            let _ = msg.ack().await;
-                                            continue;
-                                        }
-                                        // No DLQ, so this ack is what drops the
-                                        // message and it decides the discard
-                                        // accounting. `double_ack` rather than
-                                        // `ack`: `ack` returns as soon as
-                                        // `+ACK` is written to the connection,
-                                        // so a connection lost before JetStream
-                                        // applies it would redeliver a message
-                                        // already counted gone. Same reasoning
-                                        // as `route_outcome`'s Dlq arm.
-                                        match msg.double_ack().await {
-                                            Ok(()) => pending.confirm(),
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    error = %e,
-                                                    "failed to ack poisoned-key message after DLQ publish"
-                                                );
-                                                pending.survived();
-                                            }
-                                        }
-                                        continue;
-                                    }
-
-                                    // Reject oversized messages before deserialization
-                                    if let Err(e) = validate_message_size(msg.payload.len(), max_message_size) {
-                                        tracing::warn!(
-                                            error = %e,
-                                            shard,
-                                            "rejecting oversized message to DLQ"
-                                        );
-                                        metrics::record_failed(
-                                            &shard_topic,
-                                            shard_group.as_deref(),
-                                            metrics::FailReason::Oversize,
-                                        );
-                                        poison_key(&shard_poisoned, &seq_key, queue);
-                                        if let Err(dlq_err) = publish_to_dlq(
-                                            &shard_client,
-                                            topology,
-                                            &msg,
-                                            &e.to_string(),
-                                        ).await {
-                                            tracing::error!(
-                                                error = %dlq_err,
-                                                "failed to publish oversized message to DLQ, nak-ing"
-                                            );
-                                            let _ = msg.ack_with(AckKind::Nak(dlq_err.redelivery_delay())).await;
-                                            continue;
-                                        }
-                                        let _ = msg.ack().await;
-                                        continue;
-                                    }
-
-                                    // Deserialize payload; reject to DLQ on failure
-                                    let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode_owned(msg.payload.clone()) {
-                                        Ok(m) => m,
-                                        Err(e) => {
-                                            tracing::error!(
-                                                error = %e,
-                                                shard,
-                                                "failed to deserialize message, sending to DLQ"
-                                            );
-                                            metrics::record_failed(
-                                                &shard_topic,
-                                                shard_group.as_deref(),
-                                                metrics::FailReason::Deserialize,
-                                            );
-                                            poison_key(&shard_poisoned, &seq_key, queue);
-                                            if let Err(dlq_err) = publish_to_dlq(
-                                                &shard_client,
-                                                topology,
-                                                &msg,
-                                                "deserialization_error",
-                                            ).await {
-                                                tracing::error!(
-                                                    error = %dlq_err,
-                                                    "failed to publish bad message to DLQ, nak-ing"
-                                                );
-                                                let _ = msg.ack_with(AckKind::Nak(dlq_err.redelivery_delay())).await;
-                                                continue;
-                                            }
-                                            let _ = msg.ack().await;
-                                            continue;
-                                        }
-                                    };
-
-                                    // `build()` refuses `external()` with `sequenced()`, so the
-                                    // strategy here is always the republish and the count is the
-                                    // header's; see `retry_strategy` above.
-                                    let metadata = extract_message_metadata(&msg);
-                                    let retry_count = metadata.retry_count;
-
-                                    shard_processing.store(true, Ordering::Release);
-
-                                    let outcome = {
-                                        let (tx, rx) = tokio::sync::oneshot::channel();
-                                        let h = shard_handler.clone();
-                                        let c = shard_ctx.clone();
-                                        let spawn_topic = shard_topic.clone();
-                                        let spawn_group = shard_group.clone();
-                                        let spawn_timeout_outcome = handler_timeout_outcome_cfg.clone();
-                                        tokio::spawn(async move {
-                                            let o = invoke_handler(
-                                                async move { h.handle(payload, metadata, c.as_ref()).await },
-                                                handler_timeout,
-                                                spawn_timeout_outcome,
-                                                &spawn_topic,
-                                                spawn_group.as_deref(),
-                                            ).await;
-                                            let _ = tx.send(o);
-                                        });
-                                        rx.await.unwrap_or_else(|_| {
-                                            tracing::warn!(shard, "handler task panicked, retrying message");
-                                            Outcome::Retry
-                                        })
-                                    };
-                                    let outcome = adjust_outcome_for_fifo(outcome);
-
-                                    // FailAll: a DLQ-terminal outcome poisons
-                                    // the key, so every later message for it is
-                                    // dead-lettered instead of handled.
-                                    if matches!(
-                                        decide_retry(&outcome, retry_count, max_retries),
-                                        RetryDecision::Dlq { .. }
-                                    ) {
-                                        poison_key(&shard_poisoned, &seq_key, queue);
-                                    }
-
-                                    route_outcome(
-                                        &shard_client,
-                                        shard_group.as_deref(),
-                                        &msg,
-                                        outcome,
-                                        topology,
-                                        retry_count,
-                                        max_retries,
-                                        retry_strategy,
-                                        hold_queues,
-                                        ack_wait,
-                                        &shard_shutdown,
-                                    )
-                                    .await;
+                                    return Err(ShoveError::Connection(format!(
+                                        "shard {shard} stream error: {e}"
+                                    )));
                                 }
+                                None => {
+                                    tracing::warn!(shard, "shard consumer stream closed");
+                                    metrics::record_backend_error(
+                                        metrics::BackendLabel::Nats,
+                                        metrics::BackendErrorKind::Consume,
+                                    );
+                                    return Err(ShoveError::Connection(format!(
+                                        "shard {shard} stream closed"
+                                    )));
+                                }
+                            };
+
+                            metrics::record_message_size(
+                                &shard_topic,
+                                shard_group.as_deref(),
+                                msg.payload.len(),
+                            );
+
+                            if let ShardStep::Stopped { redelivery } =
+                                settle_sequenced::<T, H>(&fifo_shard, &msg).await
+                            {
+                                tracing::info!(
+                                    shard,
+                                    "shutdown signal received while a message was held, releasing it"
+                                );
+                                drop(messages);
+                                release_held(&pull_consumer, &msg, redelivery).await;
+                                return Ok(());
                             }
                         }
                     }
@@ -2387,6 +2607,35 @@ mod retry_strategy_tests {
             u32::MAX - 1
         );
     }
+
+    fn sequenced(header_count: u32, delivery_count: Option<u32>) -> u32 {
+        let mut metadata = metadata(delivery_count);
+        metadata.retry_count = header_count;
+        sequenced_retry_count(&metadata)
+    }
+
+    #[test]
+    fn a_sequenced_count_spends_a_retry_per_earlier_delivery() {
+        assert_eq!(
+            sequenced(0, Some(1)),
+            0,
+            "a first delivery keeps the header's count"
+        );
+        assert_eq!(sequenced(2, Some(1)), 2);
+        assert_eq!(sequenced(0, Some(3)), 2, "two hand-offs spend two retries");
+        assert_eq!(sequenced(2, Some(4)), 5);
+        assert_eq!(
+            sequenced(3, None),
+            3,
+            "no delivery info keeps the header's count"
+        );
+    }
+
+    #[test]
+    fn a_sequenced_count_saturates() {
+        assert_eq!(sequenced(u32::MAX, Some(5)), u32::MAX);
+        assert_eq!(sequenced(1, Some(u32::MAX)), u32::MAX);
+    }
 }
 
 #[cfg(test)]
@@ -2415,6 +2664,30 @@ mod ack_wait_tests {
             derive_ack_wait(Duration::from_secs(120)),
             Duration::from_secs(360)
         );
+    }
+}
+
+/// [`progress_interval`]: how often a held sequenced record renews its
+/// `ack_wait`.
+#[cfg(test)]
+mod sequenced_hold_tests {
+    use super::*;
+
+    #[test]
+    fn a_held_record_is_renewed_three_times_per_ack_wait() {
+        assert_eq!(
+            progress_interval(Duration::from_secs(30)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            progress_interval(Duration::from_secs(90)),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn a_zero_ack_wait_is_the_server_default() {
+        assert_eq!(progress_interval(Duration::ZERO), Duration::from_secs(10));
     }
 }
 

@@ -140,6 +140,8 @@ For RabbitMQ, the consistent-hash exchange name is derived from the queue name a
 
 For AWS SNS+SQS FIFO topics, `shove` sets the `MessageGroupId` to the sequence key returned by `SequencedTopic::sequence_key`. The broker enforces ordering natively.
 
+For NATS, a `Retry` keeps the message at its position on its shard. The shard holds it un-acked for the attempt's hold delay, 1 s without hold queues, renewing its `ack_wait` with progress acknowledgements, and then hands it back to the handler in process, so nothing behind it for the key is handled until it is acked or dead-lettered. `Defer`, a handler timeout and a handler panic retry the same way. No copy is published: `retry_count` is kept in memory, seeded from the message's `Shove-Retry-Count` header plus one for every earlier JetStream delivery. A stop, a crash or an `ack_wait` expiry that hands the message to a new delivery therefore spends a retry, and a message that keeps failing reaches the DLQ on delivery `max_retries + 1` at the latest. Until it is settled, the message holds its whole shard: keys that hash to the same shard wait as well, through every hold delay and through the `ack_wait` a crash costs before the message is redelivered. [Sequenced delivery](/backends/nats#sequenced-delivery) has the details.
+
 ## Routing shards
 
 Call `.routing_shards(N)` on the `TopologyBuilder` (before `.build()`, after `.sequenced()`) to override the default shard count of **8**. It panics if called before `.sequenced()`.
