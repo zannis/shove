@@ -274,6 +274,12 @@ publisher.publish_with_headers::<Orders>(&msg, headers).await?;
 
 The consumer surfaces this via `metadata.headers.get("x-trace-id")` in the handler. The audit wrapper reads it automatically.
 
+### Reserved header names
+
+`publish_with_headers` refuses a header whose name starts with `shove-`, in any letter case. On every backend it returns `ShoveError::Validation` naming the header, and nothing is published. `shove` stamps headers under that prefix itself, among them the retry count, the message id, the dead-letter reason and the original queue, and a caller-supplied header with one of those names could override the value `shove` stamps. Names that start with `x-retry-count`, `x-message-id`, `x-death` or `x-sequence-key` are refused the same way.
+
+This is a behaviour change for callers that set such a name. Earlier versions accepted a `shove-` name and sent it. A caller that still sets one now gets the error, so rename the header to a name outside the reserved prefixes, such as `x-source`.
+
 ## Connecting to OpenTelemetry
 
 Use the `tracing-opentelemetry` bridge to route `shove`'s structured events into your OTel pipeline:
