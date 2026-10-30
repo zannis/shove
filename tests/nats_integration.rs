@@ -855,6 +855,118 @@ async fn publish_and_consume_with_headers() {
     broker.close().await;
 }
 
+/// Records the id and metadata of every call, and retries the first one.
+#[derive(Clone)]
+struct IdRecorder {
+    calls: Arc<Mutex<Vec<(String, MessageMetadata)>>>,
+    counter: WaitableCounter,
+}
+
+impl MessageHandler<WorkTopic> for IdRecorder {
+    type Context = ();
+    async fn handle(&self, msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        let first = {
+            let mut calls = self.calls.lock().await;
+            calls.push((msg.id, meta));
+            calls.len() == 1
+        };
+        self.counter.increment();
+        if first { Outcome::Retry } else { Outcome::Ack }
+    }
+}
+
+/// The id of a fresh publish is a per-process prefix and a counter, no
+/// delivery of it carries a `Shove-Retry-Count` until a retry copy is
+/// published, and that copy extends the id with `-r1`.
+#[tokio::test]
+async fn a_fresh_publish_carries_a_counter_id_and_no_retry_count() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    for id in ["first", "second"] {
+        publisher
+            .publish::<WorkTopic>(&SimpleMessage {
+                id: id.into(),
+                content: String::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let handler = IdRecorder {
+        calls: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let hc = handler.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(5)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "two messages and the retry copy of the first reach the handler"
+    );
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let calls = handler.calls.lock().await.clone();
+    let delivery = |id: &str, nth: usize| {
+        calls
+            .iter()
+            .filter(|(message, _)| message == id)
+            .nth(nth)
+            .map(|(_, meta)| meta.clone())
+            .unwrap_or_else(|| panic!("no delivery {nth} of {id}"))
+    };
+    let (first, retry, second) = (
+        delivery("first", 0),
+        delivery("first", 1),
+        delivery("second", 0),
+    );
+
+    let parts = |id: &str| {
+        let (prefix, counter) = id.split_once('-').expect("an id is prefix-counter");
+        assert_eq!((prefix.len(), counter.len()), (16, 16), "{id}");
+        assert!(
+            id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'),
+            "{id}"
+        );
+        (
+            prefix.to_string(),
+            u64::from_str_radix(counter, 16).expect("the counter is hex"),
+        )
+    };
+    let (first_prefix, first_counter) = parts(&first.delivery_id);
+    let (second_prefix, second_counter) = parts(&second.delivery_id);
+    assert_eq!(first_prefix, second_prefix, "one process, one prefix");
+    assert!(second_counter > first_counter, "the counter climbs");
+
+    assert_eq!(first.headers.get("Shove-Retry-Count"), None);
+    assert_eq!(second.headers.get("Shove-Retry-Count"), None);
+    assert_eq!(first.retry_count, 0);
+    assert_eq!(retry.delivery_id, format!("{}-r1", first.delivery_id));
+    assert_eq!(
+        retry.headers.get("Shove-Retry-Count").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(retry.retry_count, 1);
+    broker.close().await;
+}
+
 #[tokio::test]
 async fn publish_and_consume_batch() {
     let tb = TestBroker::start().await;
@@ -2805,7 +2917,7 @@ async fn run_fifo_until_timeout_clean_drain() {
 #[tokio::test]
 async fn run_fifo_until_timeout_observes_handler_panic() {
     // Shard-level panic boundary: the NATS FIFO consume loop runs each handler
-    // through `invoke_handler`, which spawns it and turns a panic into
+    // through `invoke_handler`, which catches a panic and turns it into
     // `Outcome::Retry`. The panic never propagates out of the shard task — it
     // always returns `Ok(())`.
     // As a result, `outcome.panics` and `outcome.errors` will both be zero.
@@ -3797,9 +3909,9 @@ async fn external_stream_retry_naks_in_place_and_writes_nothing() {
             "delivery {i}: the same record at the same stream sequence"
         );
         assert_eq!(
-            meta.headers.get("Shove-Retry-Count").map(String::as_str),
-            Some("0"),
-            "delivery {i}: the publisher's count header never climbs, so no copy was republished"
+            meta.headers.get("Shove-Retry-Count"),
+            None,
+            "delivery {i}: the publisher stamps no count and no copy was republished"
         );
     }
     assert_eq!(
