@@ -1,0 +1,36 @@
+docs/pages/ops/backends.mdx
+  s_1001dc3147e1e5::t_03fe91859afcde 53,55
+tests/nats_integration.rs
+  s_1001dc3147e1e5::t_fd80c638da45c8 735-879
+  s_15738d063649d8::t_7ec705bc30e831 880-883
+src/backends/nats/topology.rs
+  s_1001dc3147e1e5::t_d67655a4a1c765 3,6,13,16-71
+  s_1001dc3147e1e5::t_923e22f8f8aed0 123-132,148-156,160,171-185,229-233,251-253
+  s_1001dc3147e1e5::t_fd83141415311c 318-408
+docs/pages/backends/nats.mdx
+  s_1001dc3147e1e5::t_03fe91859afcde 126-129,345,352
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7973ac7771d05ae74303d881baa5d490715ec99b",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_15738d063649d8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b185d55-8392-4565-840a-ce026d0108d7",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
