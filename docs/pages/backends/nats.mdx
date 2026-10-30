@@ -150,6 +150,8 @@ An exhausted budget dead-letters to shove's own DLQ stream as before, and the de
 A shove-owned stream keeps the hold-then-republish path: the incremented copy is published after the delay, and only a `Defer` naks in place.
 This is `RetryStrategy::InPlace`, implied by `external()`; [Outcomes](/concepts/outcomes) has the per-backend table.
 
+A consumer attaches to the durable `{queue}-consumer` as it finds it, and creates it only when nothing has. JetStream stops redelivering a message after the durable's `max_deliver` deliveries and tells no consumer, so a message that is redelivered that often waits on the stream for good and is never dead-lettered. On an external stream a retry is a redelivery, and a message runs out of retries on delivery `max_retries + 1`, so a consumer refuses to attach, with a `ShoveError::Topology`, when `0 < max_deliver <= max_retries`. Any other cap draws a warning on attach, on every stream, naming the cap, since a `Defer`, an `ack_wait` expiry or a failed ack redelivers a message as well. Lift a cap in place with `nats consumer edit <stream> <durable> --max-deliver=-1`.
+
 `external()` and `nats_stream_config()` are mutually exclusive - and both are incompatible with `nats_subjects()` and `sequenced()`, which configure stream *creation* that external mode skips. `build()` panics if they are combined.
 `nats_external_stream()` remains for one release as a deprecated alias of `external()`.
 
