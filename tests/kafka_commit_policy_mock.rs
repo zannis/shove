@@ -2296,8 +2296,9 @@ async fn acked_positions_commit_while_a_record_waits_for_a_permit() {
 /// error, which nothing tells apart from an outage, so the member ends with
 /// a connection error and reconnects; `A` is handed to the handler again,
 /// rejected again, and dead-lettered once the DLQ takes writes, and `B` is
-/// handled behind it. Nothing was committed past `A` before its dead letter
-/// landed, and no discard is counted.
+/// handled behind it. The reconnect resumes from the committed position, so
+/// `A` coming back is the proof nothing was committed past it, and no
+/// discard is counted.
 #[tokio::test]
 async fn dlq_publish_failure_redelivers_concurrent() {
     const REJECT_TOPIC: &str = "kafka-dlq-failure-redelivers";
@@ -2319,7 +2320,6 @@ async fn dlq_publish_failure_redelivers_concurrent() {
             .expect("create the topic through the mock API");
     }
     produce_on(&bootstrap, REJECT_TOPIC, &["A", "B"]).await;
-    mock.track_requests();
     mock.refuse_produce(RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN, SENDS_PER_PUBLISH);
 
     let handler = Recorder::new(|id, _| {
@@ -2331,26 +2331,24 @@ async fn dlq_publish_failure_redelivers_concurrent() {
     });
     let (run, shutdown) =
         start_on::<RejectTopic, _>(connect(&bootstrap).await, handler.clone(), one_permit);
-
-    // The last refused send ends the member; its reconnect waits out a
-    // backoff of half a second at least before the record comes back.
     wait_until(
-        || mock.requests_of(RDKafkaApiKey::Produce) >= SENDS_PER_PUBLISH,
+        || handler.count() >= 1,
         DELIVERY_TIMEOUT,
-        "the three sends of A's dead letter refused",
+        "A reaching the handler",
     )
     .await;
-    let committed = committed_position_on(&bootstrap, REJECT_TOPIC, REJECT_GROUP, 0).await;
-    assert!(
-        matches!(committed, None | Some(0)),
-        "nothing is committed past A once its dead letter failed: {committed:?}"
-    );
+    let first_assign = per_record_probe::assigns_queued();
+
     wait_until(
         || handler.times_seen("A") >= 2,
         DELIVERY_TIMEOUT,
         "A handed to the handler again after its dead letter failed",
     )
     .await;
+    assert!(
+        per_record_probe::assigns_queued() > first_assign,
+        "A came back through a reconnect"
+    );
     wait_for_position(
         &bootstrap,
         REJECT_TOPIC,
