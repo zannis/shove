@@ -1,0 +1,21 @@
+CLAUDE.md
+  s_1001dc3147e1e5::t_981420dc55faf2 157-160
+  s_1001dc3147e1e5::t_51b985aa03d1ac 82-87
+  s_1001dc3147e1e5::t_aa117263d64324 100-102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "529f26e8fe4c21e978ec40d5fdbfeb5b7fb55257",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
