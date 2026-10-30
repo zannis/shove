@@ -661,6 +661,15 @@ The member then leaves its group once that commit returns on its thread, and a g
 The deadline is chosen against the 30 s termination grace Kubernetes gives a Pod.
 The thread finishes on its own and never holds the runtime or the process, so a frozen coordinator cannot turn a deploy into a `SIGKILL`.
 
+A member that ends on an error closes its consumer on a thread of its own too, with nothing committed, before it reconnects or returns the error.
+That holds for the standard and the sequenced consumer, a fenced consumer and a failed subscribe included.
+It waits for the close for at most the same 20 s.
+The close sends the member's LeaveGroup and waits for the coordinator's answer, so the member has left its group when the error reaches the caller.
+A process that exits on the error therefore does not cut the LeaveGroup short, and its group does not wait out `session.timeout.ms` for the member.
+Against a coordinator that does not answer, the reconnect or the error comes up to 20 s later, and the close finishes on its thread.
+If a commit is still in flight on its thread, the close runs once that commit returns, and the error is returned without waiting for it.
+A member whose task is aborted closes off the runtime thread as well, but nothing waits for that close.
+
 A final commit the broker does not confirm ends the member with `ShoveError::Commit` instead of a clean exit.
 The error reads `offset commit at shutdown`, because the commit it names can be the one in flight when the stop landed.
 The error names the topic, the position the commit carried per partition, and a `CommitFailure`.
