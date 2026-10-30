@@ -663,7 +663,7 @@ The thread finishes on its own and never holds the runtime or the process, so a 
 
 A member that ends on an error closes its consumer on a thread of its own too, with nothing committed, before it reconnects or returns the error.
 That holds for the standard and the sequenced consumer, a fenced consumer and a failed subscribe included.
-It waits for the close for at most the same 20 s.
+It waits for the close for at most the same 20 s, and returns without waiting when no thread can be spawned to run it.
 The close sends the member's LeaveGroup and waits for the coordinator's answer, so the member has left its group when the error reaches the caller.
 A process that exits on the error therefore does not cut the LeaveGroup short, and its group does not wait out `session.timeout.ms` for the member.
 Against a coordinator that does not answer, the reconnect or the error comes up to 20 s later, and the close finishes on its thread.
@@ -677,7 +677,7 @@ The error names the topic, the position the commit carried per partition, and a 
 A broker's answer says this commit did not land.
 A local timeout after the request was sent does not prove that, because the broker may have accepted the commit.
 `Deadline` means nothing answered within the time it carries.
-That is the 15 s share when the stop found a commit in flight, and the 20 s deadline when the final commit was the one left unanswered.
+That is the 15 s share when the commit the stop found in flight went unanswered, and what is left of the 20 s deadline when the final commit was the one left unanswered, all of it when nothing was in flight.
 Against a frozen coordinator, a member with traffic under the default policy has usually made a commit that never comes back, so it usually reports the 15 s share.
 `NoThread` means no thread could be spawned for the commit, so this commit was never made.
 `Deadline` says its result is unknown, because the detached thread may still land it.

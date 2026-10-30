@@ -3372,7 +3372,7 @@ async fn close_without_commit(consumer: LoopConsumer, queue: &str, deadline: Dur
         tracing::warn!(
             queue,
             error = %e,
-            "the consumer handle could not be handed to its close thread"
+            "no thread could be spawned to wait for the consumer's close; the close is not awaited"
         );
     }
 }
