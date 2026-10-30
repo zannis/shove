@@ -6873,7 +6873,7 @@ impl KafkaConsumer {
                 // deadlock, and a refusal past this count is a logic bug
                 // surfaced at once rather than silently accumulating (sec-K-4).
                 let (completion_tx, mut completion_rx) =
-                    mpsc::channel::<Completion>(prefetch_count as usize + 1);
+                    mpsc::channel::<Completion>(usize::from(prefetch_count).saturating_add(1));
                 // A fault a handler task meets ends this loop the way the
                 // loop ends when it meets the fault itself: at once, with
                 // the error and the record uncommitted rather than pinned in
