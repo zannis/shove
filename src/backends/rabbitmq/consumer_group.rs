@@ -258,7 +258,10 @@ impl RabbitMqConsumerGroup {
             let handler = handler_factory();
             let consumer = RabbitMqConsumer::new(pool_for_spawner[idx].clone());
             let options = if concurrent {
-                options
+                ConsumerOptions {
+                    prefetch_count: options.prefetch_count.max(1),
+                    ..options
+                }
             } else {
                 ConsumerOptions {
                     prefetch_count: 1,
