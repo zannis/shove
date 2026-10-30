@@ -2241,6 +2241,58 @@ async fn sequenced_publish_batch_keeps_slice_order_under_partial_failure() {
     broker.close().await;
 }
 
+/// A record whose delivery fails is the failure of a sequenced batch, and
+/// it wins over a later record that cannot be enqueued at all. Records 0
+/// and 1 are each over half of librdkafka's 1 MB `batch.size`, so each
+/// opens its own produce request, and the mock fails the second request.
+/// Record 4 is over `message.max.bytes`, so its enqueue is refused.
+#[tokio::test]
+async fn sequenced_publish_batch_reports_a_delivery_failure_ahead_of_a_later_refusal() {
+    let topic = MockSequencedTopic::topology().queue();
+    let (mock, broker) = mock_broker_with(topic).await;
+    let publisher = broker.publisher().await.expect("publisher");
+    mock.request_errors(
+        RDKafkaApiKey::Produce,
+        &[
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR,
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_POLICY_VIOLATION,
+        ],
+    );
+    let pads = [600_000, 600_000, 0, 0, 1_100_000];
+    let batch: Vec<KeyedRecord> = (0..)
+        .zip(pads)
+        .map(|(seq, pad)| KeyedRecord {
+            key: "account-7".into(),
+            seq,
+            pad: "x".repeat(pad),
+        })
+        .collect();
+
+    let err = publisher
+        .publish_batch::<MockSequencedTopic>(&batch)
+        .await
+        .expect_err("the second record's delivery fails");
+
+    let ShoveError::PartialBatch(failure) = &err else {
+        panic!("expected a partial batch, got {err:?}");
+    };
+    assert_eq!(failure.failed(), &[1], "the failed delivery comes first");
+    assert_eq!(failure.unattempted(), &[2, 3, 4]);
+    assert_eq!(failure.succeeded(), 1);
+    assert!(
+        failure.source().to_string().contains("PolicyViolation"),
+        "the delivery's error is the one reported: {}",
+        failure.source()
+    );
+    let stored = sequence_on_partition(&mock.bootstrap_servers(), topic).await;
+    assert_eq!(stored.first(), Some(&0), "stored: {stored:?}");
+    assert!(
+        !stored.contains(&1) && !stored.contains(&4),
+        "stored: {stored:?}"
+    );
+    broker.close().await;
+}
+
 // ===========================================================================
 // Rejection & DLQ
 // ===========================================================================
