@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
@@ -1122,9 +1123,28 @@ const MAX_OPEN_PULLS: usize = 2;
 /// first, so no message is started without a slot.
 type Deliveries = stream::Zip<Batch, stream::Iter<std::vec::IntoIter<OwnedSemaphorePermit>>>;
 
+/// The first pause before a worker opens another pull after the server ended
+/// one early, refusing it or cutting it short with nothing delivered. The
+/// pause doubles, up to [`ENDED_PULL_PAUSE_MAX`], while that keeps happening,
+/// and a delivery resets it. The pulls already open go on meanwhile.
+const ENDED_PULL_PAUSE: Duration = Duration::from_millis(100);
+
+/// The longest pause [`ENDED_PULL_PAUSE`] grows to.
+const ENDED_PULL_PAUSE_MAX: Duration = Duration::from_secs(5);
+
+fn ended_pull_backoff() -> Backoff {
+    Backoff::new(ENDED_PULL_PAUSE, ENDED_PULL_PAUSE_MAX)
+}
+
+/// The next pause from `backoff`, whose iterator never ends.
+fn next_pause(backoff: &mut Backoff) -> Duration {
+    backoff.next().unwrap_or(ENDED_PULL_PAUSE_MAX)
+}
+
 /// One open pull of a worker.
 struct Pull {
     deliveries: Deliveries,
+    opened: tokio::time::Instant,
     /// Whether it has delivered a message.
     delivered: bool,
     /// Whether it has ended, so [`next_event`] drops it.
@@ -1135,6 +1155,7 @@ impl Pull {
     fn new(batch: Batch, reserved: Vec<OwnedSemaphorePermit>) -> Self {
         Self {
             deliveries: batch.zip(stream::iter(reserved)),
+            opened: tokio::time::Instant::now(),
             delivered: false,
             ended: false,
         }
@@ -1153,8 +1174,9 @@ enum PullEvent {
         OwnedSemaphorePermit,
     ),
     /// A pull ended. It is already dropped, so the slots it reserved and did
-    /// not fill are free again. `delivered` is whether it delivered a message.
-    Ended { delivered: bool },
+    /// not fill are free again. `delivered` is whether it delivered a
+    /// message, and `early` whether it ended before its expiry.
+    Ended { delivered: bool, early: bool },
 }
 
 /// The next event of a worker's open pulls, never ready while there are
@@ -1172,6 +1194,7 @@ fn next_event(pulls: &mut Vec<Pull>) -> impl Future<Output = PullEvent> + '_ {
                     pull.ended = true;
                     ended = Some(PullEvent::Ended {
                         delivered: pull.delivered,
+                        early: pull.opened.elapsed() < PULL_EXPIRES,
                     });
                     break;
                 }
@@ -1193,8 +1216,17 @@ fn next_event(pulls: &mut Vec<Pull>) -> impl Future<Output = PullEvent> + '_ {
 #[allow(clippy::large_enum_variant)]
 enum Step {
     Stop,
+    Resume,
     Reserved(Result<Vec<OwnedSemaphorePermit>>),
     Event(PullEvent),
+}
+
+/// Waits out the pause before a worker's next pull, never ready without one.
+async fn pause_over(pause: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
+    match pause {
+        Some(sleep) => sleep.as_mut().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// The message tasks of one worker that have started and not finished, held
@@ -1343,16 +1375,20 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
         let queue = self.topology.queue();
         let mut pulls: Vec<Pull> = Vec::with_capacity(MAX_OPEN_PULLS);
         let mut quiet_since = tokio::time::Instant::now();
+        let mut pause: Option<Pin<Box<tokio::time::Sleep>>> = None;
+        let mut pause_backoff = ended_pull_backoff();
         loop {
-            let may_pull = pulls.len() < MAX_OPEN_PULLS;
+            let may_pull = pulls.len() < MAX_OPEN_PULLS && pause.is_none();
             let step = tokio::select! {
                 biased;
                 _ = self.shutdown.cancelled() => Step::Stop,
+                () = pause_over(&mut pause), if pause.is_some() => Step::Resume,
                 reserved = reserve_free_slots(&self.slots), if may_pull => Step::Reserved(reserved),
                 event = next_event(&mut pulls), if !pulls.is_empty() => Step::Event(event),
             };
             match step {
                 Step::Stop => return self.stop(consumer, pulls).await,
+                Step::Resume => pause = None,
                 Step::Reserved(reserved) => {
                     let reserved = reserved?;
                     let request = consumer
@@ -1371,23 +1407,49 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                 }
                 Step::Event(PullEvent::Delivery(Ok(msg), slot)) => {
                     quiet_since = tokio::time::Instant::now();
+                    pause_backoff = ended_pull_backoff();
                     self.start(msg, slot, ack_wait);
                 }
                 Step::Event(PullEvent::Delivery(Err(e), _)) => {
-                    tracing::error!(error = %e, queue, "consumer stream error");
-                    metrics::record_backend_error(
-                        metrics::BackendLabel::Nats,
-                        metrics::BackendErrorKind::Consume,
-                    );
-                    return Err(ShoveError::Connection(format!(
-                        "consumer stream error on {queue}: {e}"
-                    )));
+                    // The server ended the pull with a status: it refused it
+                    // (`Exceeded MaxWaiting`), lost its cluster leader, or the
+                    // durable is gone. Only a probe that fails makes that a
+                    // connection error; otherwise the worker pulls again
+                    // after a pause.
+                    tracing::warn!(error = %e, queue, "the server ended a pull, probing the connection");
+                    let Some(probe) = self.unless_stopped(consumer.get_info()).await else {
+                        return self.stop(consumer, pulls).await;
+                    };
+                    if let Err(probe_err) = probe {
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::Nats,
+                            metrics::BackendErrorKind::Consume,
+                        );
+                        return Err(ShoveError::Connection(format!(
+                            "a pull on {queue} ended with `{e}`, and the connection probe failed: {probe_err}"
+                        )));
+                    }
+                    quiet_since = tokio::time::Instant::now();
+                    pause = Some(Box::pin(tokio::time::sleep(next_pause(&mut pause_backoff))));
                 }
-                Step::Event(PullEvent::Ended { delivered }) => {
+                Step::Event(PullEvent::Ended { delivered, early }) => {
+                    if delivered {
+                        continue;
+                    }
+                    if early {
+                        // Cut short with nothing delivered, as when the
+                        // server cancels a waiting pull to make room for
+                        // another: pulling again at once could only repeat it.
+                        if pause.is_none() {
+                            pause =
+                                Some(Box::pin(tokio::time::sleep(next_pause(&mut pause_backoff))));
+                        }
+                        continue;
+                    }
                     // A silent outage ends pulls exactly like an idle topic
                     // does, so a worker that has seen nothing for a whole
                     // pull's expiry probes its connection.
-                    if delivered || quiet_since.elapsed() < PULL_EXPIRES {
+                    if quiet_since.elapsed() < PULL_EXPIRES {
                         continue;
                     }
                     let Some(probe) = self.unless_stopped(consumer.get_info()).await else {

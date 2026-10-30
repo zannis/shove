@@ -6433,3 +6433,110 @@ async fn a_stop_during_the_liveness_probe_ends_the_worker() {
         .expect("the consumer stops cleanly");
     broker.close().await;
 }
+
+shove::define_topic!(
+    MaxWaitingTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-max-waiting").dlq().build()
+);
+
+impl MessageHandler<MaxWaitingTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// A pull the server ends with a status, while the server still answers, is
+/// not a connection error. The durable keeps one waiting pull at a time, so
+/// once the worker has a slot free beside its open pull, the second pull it
+/// asks for is refused with `409 Exceeded MaxWaiting`. The worker probes its
+/// connection, finds the server answering, and goes on consuming without
+/// spending the single reconnect attempt it is allowed.
+#[tokio::test]
+async fn a_pull_the_server_refuses_is_not_a_connection_error() {
+    use async_nats::jetstream::consumer::AckPolicy;
+    use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<MaxWaitingTopic>()
+        .await
+        .unwrap();
+    client
+        .jetstream()
+        .get_stream("nats-max-waiting")
+        .await
+        .unwrap()
+        .create_consumer(PullConsumerConfig {
+            durable_name: Some("nats-max-waiting-consumer".to_string()),
+            ack_policy: AckPolicy::Explicit,
+            max_ack_pending: -1,
+            max_waiting: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<MaxWaitingTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(2)
+                    .with_max_reconnect_attempts(1),
+            )
+            .await
+    });
+    wait_for_open_pull(&client, "nats-max-waiting", "nats-max-waiting-consumer").await;
+
+    let publisher = broker.publisher().await.unwrap();
+    let message = |id: &str| SimpleMessage {
+        id: id.to_string(),
+        content: String::new(),
+    };
+    publisher
+        .publish::<MaxWaitingTopic>(&message("first"))
+        .await
+        .unwrap();
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "first is handled"
+    );
+    // The slot the first message freed asks for a second pull, which the
+    // server refuses while the first pull still waits.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !handle.is_finished(),
+        "the refused pull ended the consumer: {:?}",
+        handle.await
+    );
+
+    publisher
+        .publish::<MaxWaitingTopic>(&message("second"))
+        .await
+        .unwrap();
+    assert!(
+        handler.counter.wait_for(2, TIMEOUT).await,
+        "the worker goes on consuming"
+    );
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("the consumer stops in time")
+        .expect("the consumer task does not panic")
+        .expect("the consumer stops cleanly");
+    broker.close().await;
+}
