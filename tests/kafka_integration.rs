@@ -5685,6 +5685,91 @@ async fn lag_stats_provider_refuses_an_unknown_topic() {
     tb.broker().close().await;
 }
 
+/// Deleting a prefix of a log raises its low watermark. A group that never
+/// committed starts at that watermark under `earliest`, so its lag is the
+/// records the log still holds, and the high watermark alone would count the
+/// deleted prefix too.
+#[tokio::test]
+async fn lag_stats_provider_counts_only_the_records_above_a_raised_low_watermark() {
+    use rdkafka::admin::{AdminClient, AdminOptions};
+    use rdkafka::client::DefaultClientContext;
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+    use rdkafka::{ClientConfig, Offset, TopicPartitionList};
+    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
+
+    const TOPIC: &str = "kafka-lag-raised-low-watermark";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 3).await;
+
+    let produced = [10usize, 6, 4];
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", tb.brokers())
+        .create()
+        .expect("failed to create raw producer");
+    for (partition, &count) in (0..).zip(&produced) {
+        for n in 0..count {
+            producer
+                .send(
+                    FutureRecord::to(TOPIC)
+                        .partition(partition)
+                        .key("k")
+                        .payload(&format!("record-{n}")),
+                    Duration::from_secs(10),
+                )
+                .await
+                .map_err(|(e, _)| e)
+                .expect("raw publish should succeed");
+        }
+    }
+    drop(producer);
+
+    // Partition 0 loses its first seven records, partition 1 all six, and
+    // partition 2 keeps its log from offset zero.
+    let mut prefixes = TopicPartitionList::new();
+    prefixes
+        .add_partition_offset(TOPIC, 0, Offset::Offset(7))
+        .expect("delete before offset 7");
+    prefixes
+        .add_partition_offset(TOPIC, 1, Offset::Offset(6))
+        .expect("delete before offset 6");
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", tb.brokers())
+        .create()
+        .expect("failed to create admin client");
+    let deleted = admin
+        .delete_records(&prefixes, &AdminOptions::new())
+        .await
+        .expect("delete_records failed");
+    drop(admin);
+    let mut low_watermarks: Vec<(i32, i64)> = deleted
+        .elements()
+        .iter()
+        .map(|element| {
+            element.error().expect("the prefix was deleted");
+            (
+                element.partition(),
+                element.offset().to_raw().expect("an offset"),
+            )
+        })
+        .collect();
+    low_watermarks.sort_unstable();
+    assert_eq!(low_watermarks, [(0, 7), (1, 6)]);
+
+    let stats = KafkaLagStatsProvider::new(tb.client())
+        .get_queue_stats(
+            TOPIC,
+            "kafka-lag-raised-low-watermark-consumer",
+            KafkaAutoOffsetReset::Earliest,
+        )
+        .await
+        .expect("lag from the raised start of the log");
+
+    // 3 retained on partition 0, none on partition 1, 4 on partition 2.
+    assert_eq!(stats.messages_pending, 7);
+
+    tb.broker().close().await;
+}
+
 #[tokio::test]
 async fn lag_stats_provider_reports_zero_after_consumption() {
     use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
