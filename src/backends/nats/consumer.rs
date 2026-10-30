@@ -1124,9 +1124,9 @@ const MAX_OPEN_PULLS: usize = 2;
 type Deliveries = stream::Zip<Batch, stream::Iter<std::vec::IntoIter<OwnedSemaphorePermit>>>;
 
 /// The first pause before a worker opens another pull after the server ended
-/// one early, refusing it or cutting it short with nothing delivered. The
-/// pause doubles, up to [`ENDED_PULL_PAUSE_MAX`], while that keeps happening,
-/// and a delivery resets it. The pulls already open go on meanwhile.
+/// one with a status. The pause doubles, up to [`ENDED_PULL_PAUSE_MAX`], while
+/// that keeps happening, and a delivery resets it. The pulls already open go
+/// on meanwhile.
 const ENDED_PULL_PAUSE: Duration = Duration::from_millis(100);
 
 /// The longest pause [`ENDED_PULL_PAUSE`] grows to.
@@ -1144,7 +1144,6 @@ fn next_pause(backoff: &mut Backoff) -> Duration {
 /// One open pull of a worker.
 struct Pull {
     deliveries: Deliveries,
-    opened: tokio::time::Instant,
     /// Whether it has delivered a message.
     delivered: bool,
     /// Whether it has ended, so [`next_event`] drops it.
@@ -1155,7 +1154,6 @@ impl Pull {
     fn new(batch: Batch, reserved: Vec<OwnedSemaphorePermit>) -> Self {
         Self {
             deliveries: batch.zip(stream::iter(reserved)),
-            opened: tokio::time::Instant::now(),
             delivered: false,
             ended: false,
         }
@@ -1174,9 +1172,8 @@ enum PullEvent {
         OwnedSemaphorePermit,
     ),
     /// A pull ended. It is already dropped, so the slots it reserved and did
-    /// not fill are free again. `delivered` is whether it delivered a
-    /// message, and `early` whether it ended before its expiry.
-    Ended { delivered: bool, early: bool },
+    /// not fill are free again. `delivered` is whether it delivered a message.
+    Ended { delivered: bool },
 }
 
 /// The next event of a worker's open pulls, never ready while there are
@@ -1194,7 +1191,6 @@ fn next_event(pulls: &mut Vec<Pull>) -> impl Future<Output = PullEvent> + '_ {
                     pull.ended = true;
                     ended = Some(PullEvent::Ended {
                         delivered: pull.delivered,
-                        early: pull.opened.elapsed() < PULL_EXPIRES,
                     });
                     break;
                 }
@@ -1432,18 +1428,8 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                     quiet_since = tokio::time::Instant::now();
                     pause = Some(Box::pin(tokio::time::sleep(next_pause(&mut pause_backoff))));
                 }
-                Step::Event(PullEvent::Ended { delivered, early }) => {
+                Step::Event(PullEvent::Ended { delivered }) => {
                     if delivered {
-                        continue;
-                    }
-                    if early {
-                        // Cut short with nothing delivered, as when the
-                        // server cancels a waiting pull to make room for
-                        // another: pulling again at once could only repeat it.
-                        if pause.is_none() {
-                            pause =
-                                Some(Box::pin(tokio::time::sleep(next_pause(&mut pause_backoff))));
-                        }
                         continue;
                     }
                     // A silent outage ends pulls exactly like an idle topic
