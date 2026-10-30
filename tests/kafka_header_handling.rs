@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,16 +30,15 @@ use rdkafka::producer::{
 use rdkafka::types::{RDKafkaHeaders, RDKafkaRespErr};
 use rdkafka::{ClientConfig, Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
-use shove::ShoveError;
-use shove::Topic;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
-use shove::handler::MessageHandler;
-use shove::kafka::{KafkaClient, KafkaConfig, KafkaConsumer};
+use shove::handler::{BatchMessageHandler, MessageHandler};
+use shove::kafka::{BatchConsumerOptions, KafkaClient, KafkaConfig, KafkaConsumer};
 use shove::markers::Kafka;
-use shove::metadata::MessageMetadata;
+use shove::metadata::{DeadMessageMetadata, MessageMetadata};
 use shove::outcome::Outcome;
-use shove::topology::TopologyBuilder;
+use shove::topology::{SequenceFailure, TopologyBuilder};
+use shove::{BroadcastStart, SequencedTopic, ShoveError, Topic};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -56,6 +56,15 @@ const HOLD: Duration = Duration::from_millis(50);
 const HOSTILE_KEY: &[u8] = &[0xff, 0xfe];
 /// A header value that is not UTF-8.
 const BINARY_VALUE: &[u8] = &[0x00, 0xff];
+/// Every header a `String` map cannot hold, with a repeated key: a copy must
+/// carry all of them byte for byte and in this order.
+const HOSTILE_HEADERS: [(&[u8], Option<&[u8]>); 5] = [
+    (HOSTILE_KEY, Some(b"k")),
+    (b"bin", Some(BINARY_VALUE)),
+    (b"null", None),
+    (b"dup", Some(b"first")),
+    (b"dup", Some(b"second")),
+];
 
 const HOSTILE_TOPIC: &str = "kafka-headers-hostile-key";
 const RETRY_TOPIC: &str = "kafka-headers-retry-copy";
@@ -64,6 +73,11 @@ const DEATH_TOPIC: &str = "kafka-headers-death-count";
 const DEATH_DLQ: &str = "kafka-headers-death-count-dlq";
 const DEAD_LETTER_TOPIC: &str = "kafka-headers-dead-letter";
 const DEAD_LETTER_DLQ: &str = "kafka-headers-dead-letter-dlq";
+const SEQUENCED_TOPIC: &str = "kafka-headers-sequenced";
+const SEQUENCED_DLQ: &str = "kafka-headers-sequenced-dlq";
+const BATCH_TOPIC: &str = "kafka-headers-batch";
+const BATCH_DLQ: &str = "kafka-headers-batch-dlq";
+const BROADCAST_TOPIC: &str = "kafka-headers-broadcast";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct Order {
@@ -95,6 +109,27 @@ shove::define_topic!(
     Order,
     TopologyBuilder::new(DEAD_LETTER_TOPIC).dlq().build()
 );
+shove::define_sequenced_topic!(
+    SequencedOrders,
+    Order,
+    |order: &Order| order.id.clone(),
+    TopologyBuilder::new(SEQUENCED_TOPIC)
+        .sequenced(SequenceFailure::FailAll)
+        .routing_shards(1)
+        .hold_queue(HOLD)
+        .dlq()
+        .build()
+);
+shove::define_topic!(
+    BatchTopic,
+    Order,
+    TopologyBuilder::new(BATCH_TOPIC).dlq().build()
+);
+shove::define_topic!(
+    BroadcastTopic,
+    Order,
+    TopologyBuilder::new(BROADCAST_TOPIC).broadcast().build()
+);
 
 /// One delivery as the handler saw it.
 #[derive(Clone)]
@@ -104,10 +139,12 @@ struct Delivery {
 }
 
 /// Records every delivery and answers it with `decide`, given the number of
-/// deliveries before it and the delivery's metadata.
+/// deliveries before it and the delivery's metadata; a batch is answered by
+/// its first message. Records every dead letter a drain hands it too.
 #[derive(Clone)]
 struct Recorder {
     seen: Arc<Mutex<Vec<Delivery>>>,
+    dead: Arc<Mutex<Vec<(String, DeadMessageMetadata)>>>,
     decide: fn(usize, &MessageMetadata) -> Outcome,
 }
 
@@ -115,6 +152,7 @@ impl Recorder {
     fn new(decide: fn(usize, &MessageMetadata) -> Outcome) -> Self {
         Self {
             seen: Arc::default(),
+            dead: Arc::default(),
             decide,
         }
     }
@@ -125,6 +163,14 @@ impl Recorder {
 
     fn count(&self) -> usize {
         self.seen.lock().expect("handler mutex poisoned").len()
+    }
+
+    fn ids(&self) -> Vec<String> {
+        self.deliveries().into_iter().map(|d| d.id).collect()
+    }
+
+    fn dead_letters(&self) -> Vec<(String, DeadMessageMetadata)> {
+        self.dead.lock().expect("handler mutex poisoned").clone()
     }
 }
 
@@ -137,6 +183,29 @@ impl<T: Topic<Message = Order>> MessageHandler<T> for Recorder {
             id: msg.id,
             metadata,
         });
+        outcome
+    }
+
+    async fn handle_dead(&self, msg: Order, metadata: DeadMessageMetadata, _: &()) {
+        self.dead
+            .lock()
+            .expect("handler mutex poisoned")
+            .push((msg.id, metadata));
+    }
+}
+
+impl<T: Topic<Message = Order>> BatchMessageHandler<T> for Recorder {
+    type Context = ();
+    async fn handle_batch(&self, messages: Vec<(Order, MessageMetadata)>, _: &()) -> Outcome {
+        let mut seen = self.seen.lock().expect("handler mutex poisoned");
+        let before = seen.len();
+        let outcome = messages.first().map_or(Outcome::Ack, |(_, metadata)| {
+            (self.decide)(before, metadata)
+        });
+        seen.extend(messages.into_iter().map(|(order, metadata)| Delivery {
+            id: order.id,
+            metadata,
+        }));
         outcome
     }
 }
@@ -180,40 +249,67 @@ async fn connect(bootstrap: &str) -> KafkaClient {
         .expect("connect to the mock cluster")
 }
 
-/// A shove consumer of one topic, running on its own task.
+/// Waits for `done`, failing once `DELIVERY_TIMEOUT` passes.
+async fn wait_for(done: impl Fn() -> bool, what: &str) {
+    let deadline = Instant::now() + DELIVERY_TIMEOUT;
+    while !done() {
+        assert!(
+            Instant::now() < deadline,
+            "{what} did not happen within {DELIVERY_TIMEOUT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A shove consume loop running on its own task.
 struct Running {
     shutdown: CancellationToken,
     task: JoinHandle<Result<(), ShoveError>>,
 }
 
 impl Running {
+    /// Runs `consume` on its own task, with a consumer on a fresh client and
+    /// that client's shutdown token, for `consume` to pass on as the loop's
+    /// own as well: the DLQ drain stops on the client's token alone.
+    async fn spawn<F, Fut>(bootstrap: &str, consume: F) -> Self
+    where
+        F: FnOnce(KafkaConsumer, CancellationToken) -> Fut,
+        Fut: Future<Output = Result<(), ShoveError>> + Send + 'static,
+    {
+        let client = connect(bootstrap).await;
+        let shutdown = client.shutdown_token();
+        let task = tokio::spawn(consume(KafkaConsumer::new(client), shutdown.clone()));
+        Self { shutdown, task }
+    }
+
+    /// The consumer of `T`'s topic.
     async fn start<T>(bootstrap: &str, handler: &Recorder) -> Self
     where
         T: Topic<Message = Order>,
     {
-        let client = connect(bootstrap).await;
-        let shutdown = CancellationToken::new();
-        let options = ConsumerOptions::<Kafka>::new().with_shutdown(shutdown.clone());
         let handler = handler.clone();
-        let task = tokio::spawn(async move {
-            KafkaConsumer::new(client)
-                .run::<T, _>(handler, (), options)
+        Self::spawn(bootstrap, |consumer, shutdown| async move {
+            consumer
+                .run::<T, _>(
+                    handler,
+                    (),
+                    ConsumerOptions::<Kafka>::new().with_shutdown(shutdown),
+                )
                 .await
-        });
-        Self { shutdown, task }
+        })
+        .await
     }
 
-    /// Waits for `done`, failing at once if the consumer ends first.
+    /// Waits for `done`, failing at once if the loop ends first.
     async fn wait_until(&self, done: impl Fn() -> bool, what: &str) {
-        let deadline = Instant::now() + DELIVERY_TIMEOUT;
-        while !done() {
-            assert!(!self.task.is_finished(), "the consumer ended before {what}");
-            assert!(
-                Instant::now() < deadline,
-                "{what} did not happen within {DELIVERY_TIMEOUT:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_for(
+            || {
+                assert!(!self.task.is_finished(), "the consumer ended before {what}");
+                done()
+            },
+            what,
+        )
+        .await;
     }
 
     async fn stop(self) {
@@ -264,24 +360,39 @@ fn wire(headers: &[(&[u8], Option<&[u8]>)]) -> OwnedHeaders {
     list
 }
 
-/// Produces order `id` to `topic` carrying exactly `headers`, in order.
-async fn produce(bootstrap: &str, topic: &str, id: &str, headers: &[(&[u8], Option<&[u8]>)]) {
+fn order_payload(id: &str) -> Vec<u8> {
+    serde_json::to_vec(&Order { id: id.into() }).expect("encode the record")
+}
+
+/// Produces `payload` to `topic` under `key`, carrying exactly `headers`, in
+/// order.
+async fn produce_record(
+    bootstrap: &str,
+    topic: &str,
+    key: &str,
+    payload: &[u8],
+    headers: &[(&[u8], Option<&[u8]>)],
+) {
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", bootstrap)
         .set("enable.idempotence", "false")
         .create()
         .expect("mock producer");
-    let payload = serde_json::to_vec(&Order { id: id.into() }).expect("encode the record");
     producer
         .send(
             FutureRecord::to(topic)
-                .key(id)
-                .payload(&payload)
+                .key(key)
+                .payload(payload)
                 .headers(wire(headers)),
             Duration::from_secs(10),
         )
         .await
         .expect("produce to the mock cluster");
+}
+
+/// Produces order `id`, keyed by its id, carrying exactly `headers`.
+async fn produce(bootstrap: &str, topic: &str, id: &str, headers: &[(&[u8], Option<&[u8]>)]) {
+    produce_record(bootstrap, topic, id, &order_payload(id), headers).await;
 }
 
 /// Every header of `msg`, in order and byte for byte.
@@ -309,9 +420,24 @@ fn headers_of(msg: &BorrowedMessage<'_>) -> Vec<WireHeader> {
         .collect()
 }
 
-/// The first `count` records of `topic`, each as its order id and its
-/// headers, read by a raw consumer from the start of partition 0.
-async fn read_topic(bootstrap: &str, topic: &str, count: usize) -> Vec<(String, Vec<WireHeader>)> {
+/// A record as a raw consumer reads it back.
+struct Record {
+    key: String,
+    payload: Vec<u8>,
+    headers: Vec<WireHeader>,
+}
+
+impl Record {
+    fn order_id(&self) -> String {
+        serde_json::from_slice::<Order>(&self.payload)
+            .expect("an order payload")
+            .id
+    }
+}
+
+/// The first `count` records of `topic`, read by a raw consumer from the
+/// start of partition 0.
+async fn read_topic(bootstrap: &str, topic: &str, count: usize) -> Vec<Record> {
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", bootstrap)
         .set("group.id", format!("{topic}-raw-reader"))
@@ -334,9 +460,11 @@ async fn read_topic(bootstrap: &str, topic: &str, count: usize) -> Vec<(String, 
                 )
             })
             .expect("raw consumer receive");
-        let order: Order =
-            serde_json::from_slice(msg.payload().unwrap_or_default()).expect("an order payload");
-        records.push((order.id, headers_of(&msg)));
+        records.push(Record {
+            key: String::from_utf8_lossy(msg.key().unwrap_or_default()).into_owned(),
+            payload: msg.payload().unwrap_or_default().to_vec(),
+            headers: headers_of(&msg),
+        });
     }
     records
 }
@@ -348,6 +476,21 @@ fn foreign(headers: &[WireHeader]) -> Vec<WireHeader> {
         .filter(|(key, _)| !key.starts_with(b"Shove-"))
         .cloned()
         .collect()
+}
+
+/// A handler's header map without shove's own.
+fn foreign_map(headers: &HashMap<String, String>) -> HashMap<String, String> {
+    headers
+        .iter()
+        .filter(|(key, _)| !key.starts_with("Shove-"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// What a handler's map holds of `HOSTILE_HEADERS`: the one header whose key
+/// and value are both UTF-8, the repeated key at its last value.
+fn hostile_headers_as_strings() -> HashMap<String, String> {
+    HashMap::from([("dup".to_string(), "second".to_string())])
 }
 
 /// The value of every `key` header in `headers`, in order.
@@ -439,22 +582,24 @@ async fn retry_copy_preserves_binary_and_duplicate_headers() {
     consumer.stop().await;
 
     let records = read_topic(&bootstrap, RETRY_TOPIC, 2).await;
-    let (id, copy) = &records[1];
-    assert_eq!(id, "retried", "the second record is the retry copy");
+    let copy = &records[1];
+    assert_eq!(copy.key, "retried", "the second record is the retry copy");
     assert_eq!(
-        foreign(copy),
+        foreign(&copy.headers),
         owned(&original),
-        "the copy carries the original's headers byte for byte and in order: {copy:?}"
+        "the copy carries the original's headers byte for byte and in order: {:?}",
+        copy.headers
     );
     assert_eq!(
-        values_of(copy, "Shove-Retry-Count"),
+        values_of(&copy.headers, "Shove-Retry-Count"),
         [Some(b"1".to_vec())],
         "the copy carries one retry count, the incremented one"
     );
     assert_eq!(
-        values_of(copy, "Shove-Message-Id").len(),
+        values_of(&copy.headers, "Shove-Message-Id").len(),
         1,
-        "the copy carries one message id: {copy:?}"
+        "the copy carries one message id: {:?}",
+        copy.headers
     );
 }
 
@@ -538,33 +683,28 @@ async fn death_count_saturates() {
     let dead = read_topic(&bootstrap, DEATH_DLQ, 1).await;
     consumer.stop().await;
 
-    assert_eq!(dead[0].0, "dead");
+    assert_eq!(dead[0].key, "dead");
     assert_eq!(
-        values_of(&dead[0].1, "Shove-Death-Count"),
+        values_of(&dead[0].headers, "Shove-Death-Count"),
         [Some(b"4294967295".to_vec())],
         "the dead letter's death count holds at u32::MAX: {:?}",
-        dead[0].1
+        dead[0].headers
     );
 }
 
 /// A dead letter carries every header of the original byte for byte and in
 /// order, a key that is not UTF-8, a binary value, a null value and a
-/// repeated key included, and one each of shove's own, rewritten.
+/// repeated key included, and one each of shove's own, rewritten. The DLQ
+/// drain then hands it to `handle_dead` once, with only the headers whose
+/// key and value are UTF-8.
 #[tokio::test]
 async fn dead_letter_carries_every_header_byte_for_byte() {
     let mock = Mock::start(&[DEAD_LETTER_TOPIC, DEAD_LETTER_DLQ]);
     let bootstrap = mock.bootstrap();
-    let foreign_headers: [(&[u8], Option<&[u8]>); 5] = [
-        (HOSTILE_KEY, Some(b"k")),
-        (b"bin", Some(BINARY_VALUE)),
-        (b"null", None),
-        (b"dup", Some(b"first")),
-        (b"dup", Some(b"second")),
-    ];
     let mut original: Vec<(&[u8], Option<&[u8]>)> = vec![(b"Shove-Message-Id", Some(b"m-1"))];
-    original.extend_from_slice(&foreign_headers[..3]);
+    original.extend_from_slice(&HOSTILE_HEADERS[..3]);
     original.push((b"Shove-Retry-Count", Some(b"0")));
-    original.extend_from_slice(&foreign_headers[3..]);
+    original.extend_from_slice(&HOSTILE_HEADERS[3..]);
     produce(&bootstrap, DEAD_LETTER_TOPIC, "rejected", &original).await;
 
     let handler = Recorder::new(|_, _| Outcome::Reject);
@@ -572,10 +712,10 @@ async fn dead_letter_carries_every_header_byte_for_byte() {
     let dead = read_topic(&bootstrap, DEAD_LETTER_DLQ, 1).await;
     consumer.stop().await;
 
-    let headers = &dead[0].1;
+    let headers = &dead[0].headers;
     assert_eq!(
         foreign(headers),
-        owned(&foreign_headers),
+        owned(&HOSTILE_HEADERS),
         "the dead letter carries the original's headers byte for byte and in order: {headers:?}"
     );
     for (key, value) in [
@@ -591,4 +731,234 @@ async fn dead_letter_carries_every_header_byte_for_byte() {
             "the dead letter carries one {key}: {headers:?}"
         );
     }
+
+    let drain = Running::spawn(&bootstrap, |consumer, shutdown| {
+        let handler = handler.clone();
+        async move {
+            consumer
+                .run_dlq_with_options::<DeadLetterTopic, _>(
+                    handler,
+                    (),
+                    ConsumerOptions::<Kafka>::new().with_shutdown(shutdown),
+                )
+                .await
+        }
+    })
+    .await;
+    drain
+        .wait_until(
+            || !handler.dead_letters().is_empty(),
+            "the dead letter reaching the drain",
+        )
+        .await;
+    tokio::time::sleep(SETTLE).await;
+    drain.stop().await;
+
+    let drained = handler.dead_letters();
+    assert_eq!(
+        drained.len(),
+        1,
+        "the drain hands the dead letter over once"
+    );
+    let (id, metadata) = &drained[0];
+    assert_eq!(id, "rejected");
+    assert_eq!(metadata.reason.as_deref(), Some("rejected"));
+    assert_eq!(metadata.original_queue.as_deref(), Some(DEAD_LETTER_TOPIC));
+    assert_eq!(metadata.death_count, 1);
+    let dead_letter_id = values_of(headers, "Shove-Message-Id")
+        .into_iter()
+        .flatten()
+        .map(|id| String::from_utf8(id).expect("a UTF-8 message id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        [metadata.message.delivery_id.clone()],
+        dead_letter_id.as_slice(),
+        "the drain reads the dead letter's own id"
+    );
+    assert_eq!(
+        foreign_map(&metadata.message.headers),
+        hostile_headers_as_strings(),
+        "the drain's map holds only the headers whose key and value are UTF-8"
+    );
+}
+
+/// A sequenced consumer hands a record whose header key is not UTF-8 to its
+/// handler and dead-letters it on `Reject`; the `FailAll` cascade then
+/// dead-letters the next record of the key without the handler. Both dead
+/// letters carry every header of their record byte for byte and in order.
+#[tokio::test]
+async fn sequenced_consumer_dead_letters_hostile_headers_byte_for_byte() {
+    let mock = Mock::start(&[SEQUENCED_TOPIC, SEQUENCED_DLQ]);
+    let bootstrap = mock.bootstrap();
+    for id in ["rejected", "poisoned"] {
+        produce_record(
+            &bootstrap,
+            SEQUENCED_TOPIC,
+            "acct-1",
+            &order_payload(id),
+            &HOSTILE_HEADERS,
+        )
+        .await;
+    }
+
+    let handler = Recorder::new(|_, _| Outcome::Reject);
+    let consumer = Running::spawn(&bootstrap, |consumer, shutdown| {
+        let handler = handler.clone();
+        async move {
+            consumer
+                .run_fifo::<SequencedOrders, _>(
+                    handler,
+                    (),
+                    ConsumerOptions::<Kafka>::new().with_shutdown(shutdown),
+                )
+                .await
+        }
+    })
+    .await;
+    let dead = read_topic(&bootstrap, SEQUENCED_DLQ, 2).await;
+    tokio::time::sleep(SETTLE).await;
+    consumer.stop().await;
+
+    assert_eq!(
+        handler.ids(),
+        ["rejected"],
+        "the poisoned key's next record never reaches the handler"
+    );
+    assert_eq!(
+        foreign_map(&handler.deliveries()[0].metadata.headers),
+        hostile_headers_as_strings(),
+        "the handler's map holds only the headers whose key and value are UTF-8"
+    );
+    assert_eq!(
+        dead.iter().map(Record::order_id).collect::<Vec<_>>(),
+        ["rejected", "poisoned"],
+        "each record is dead-lettered once, in order"
+    );
+    for record in &dead {
+        assert_eq!(
+            foreign(&record.headers),
+            owned(&HOSTILE_HEADERS),
+            "the dead letter of {} carries its headers byte for byte and in order",
+            record.order_id()
+        );
+    }
+}
+
+/// A batch consumer dead-letters a rejected batch, a record that does not
+/// decode and one past the size limit included, each dead letter carrying
+/// every header of its record byte for byte and in order.
+#[tokio::test]
+async fn batch_consumer_dead_letters_hostile_headers_byte_for_byte() {
+    const SIZE_LIMIT: usize = 256;
+    let mock = Mock::start(&[BATCH_TOPIC, BATCH_DLQ]);
+    let bootstrap = mock.bootstrap();
+    let records: [(&str, Vec<u8>); 3] = [
+        ("decoded", order_payload("decoded")),
+        ("undecodable", b"not an order".to_vec()),
+        ("oversize", vec![b'x'; SIZE_LIMIT + 1]),
+    ];
+    for (key, payload) in &records {
+        produce_record(&bootstrap, BATCH_TOPIC, key, payload, &HOSTILE_HEADERS).await;
+    }
+
+    let batch_size = records.len();
+    let handler = Recorder::new(|_, _| Outcome::Reject);
+    let consumer = Running::spawn(&bootstrap, |consumer, shutdown| {
+        let handler = handler.clone();
+        async move {
+            consumer
+                .run_batch::<BatchTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_shutdown(shutdown)
+                        .with_max_batch_size(batch_size)
+                        .with_max_batch_age(Duration::from_secs(1))
+                        .with_max_message_size(SIZE_LIMIT),
+                )
+                .await
+        }
+    })
+    .await;
+    let dead = read_topic(&bootstrap, BATCH_DLQ, batch_size).await;
+    tokio::time::sleep(SETTLE).await;
+    consumer.stop().await;
+
+    assert_eq!(
+        handler.ids(),
+        ["decoded"],
+        "only the record that decodes reaches the handler"
+    );
+    assert_eq!(
+        foreign_map(&handler.deliveries()[0].metadata.headers),
+        hostile_headers_as_strings(),
+        "the handler's map holds only the headers whose key and value are UTF-8"
+    );
+    let mut keys: Vec<&str> = dead.iter().map(|record| record.key.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["decoded", "oversize", "undecodable"],
+        "each record is dead-lettered once"
+    );
+    for record in &dead {
+        assert_eq!(
+            foreign(&record.headers),
+            owned(&HOSTILE_HEADERS),
+            "the dead letter of {} carries its headers byte for byte and in order",
+            record.key
+        );
+    }
+}
+
+/// A broadcast subscriber hands a record whose header key is not UTF-8 to its
+/// handler once, with only the headers whose key and value are UTF-8, and
+/// goes on to the record behind it.
+#[tokio::test]
+async fn broadcast_subscriber_survives_a_non_utf8_header_key() {
+    let mock = Mock::start(&[BROADCAST_TOPIC]);
+    let bootstrap = mock.bootstrap();
+    produce(&bootstrap, BROADCAST_TOPIC, "hostile", &HOSTILE_HEADERS).await;
+
+    let broker = Broker::<Kafka>::from_client(connect(&bootstrap).await);
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<BroadcastTopic, _>(
+            handler.clone(),
+            ConsumerOptions::new().with_broadcast_start(BroadcastStart::Head),
+        )
+        .expect("subscribe from the head");
+    wait_for(
+        || handler.count() == 1,
+        "the hostile record reaching the handler",
+    )
+    .await;
+    produce(&bootstrap, BROADCAST_TOPIC, "after", &[]).await;
+    wait_for(
+        || handler.count() == 2,
+        "the record behind it reaching the handler",
+    )
+    .await;
+    tokio::time::sleep(SETTLE).await;
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending(), DELIVERY_TIMEOUT)
+        .await;
+    assert!(
+        outcome.is_clean(),
+        "the subscriber stops clean: {outcome:?}"
+    );
+    broker.close().await;
+
+    assert_eq!(
+        handler.ids(),
+        ["hostile", "after"],
+        "each record is handled once"
+    );
+    assert_eq!(
+        *handler.deliveries()[0].metadata.headers,
+        hostile_headers_as_strings(),
+        "the handler sees only the header whose key and value are UTF-8"
+    );
 }
