@@ -171,6 +171,24 @@ A header NATS cannot carry is refused with `ShoveError::Validation` before anyth
 
 `consumer_group()` creates a coordinated pull consumer backed by a JetStream durable deliver-group. `NatsConsumerGroupConfig::new(min..=max)` sets the autoscale bounds. The group coordinates via JetStream — only one consumer processes a given message at a time.
 
+### Flow control
+
+Each worker bounds its own in-flight work: a group member, or a consumer started directly or through a supervisor.
+It holds `prefetch_count` slots with concurrent processing on and one without, and a prefetch of zero is lowered to one.
+Each pull asks JetStream for as many messages as the worker has free slots, so every message it is delivered starts at once.
+None waits on the client while its `ack_wait` runs, and a slow handler or a long hold does not get the messages behind it redelivered.
+
+The durable a group or a consumer creates therefore has no ack budget of its own: `max_ack_pending` is `-1` unless `with_max_ack_pending` sets a cap.
+Workers attached to one durable, from any number of processes, each keep up to their own prefetch in flight, and a cap is shared by all of them.
+A group's registration upserts its durable on every start, so the budget follows the config.
+A consumer started directly or through a supervisor creates the durable only when none exists, so a durable an earlier version created keeps the budget it was created with until it is recreated.
+
+A `Retry` on a shove-owned stream is held un-acked for its delay and gives up its slot for the hold, so the worker goes on with other messages meanwhile.
+Holds are bounded on their own, at the same count: a retry that finds every hold taken waits for one and keeps its slot.
+A held message, a retry waiting for a hold, and a message whose retry copy or dead letter is being published all get a JetStream progress acknowledgement at least every third of the durable's `ack_wait`, so none of these waits gets the message redelivered.
+On a stop or a scale-down, the messages a worker pulled and never started are nak'd without delay, so another consumer takes them at once.
+A message held for a retry at that point is left un-acked, and is redelivered once its `ack_wait` expires.
+
 ## Sequenced delivery
 
 Messages for the same key stay in order. NATS uses subject-based shard routing: the publisher derives a subject suffix from `T::sequence_key()` and routes to a dedicated shard subject. Each shard consumer is configured with `max_ack_pending: 1`, meaning at most one message per shard is in-flight at a time. Messages for the same key are never processed concurrently.
@@ -223,7 +241,7 @@ See the [Basic example](/backends/nats/examples/basic) for a complete runnable w
 - **JetStream must be enabled on the server.** Connecting to a server without JetStream and calling `topology().declare::<T>()` will return an error. The `-js` flag is required on the NATS server.
 - **URL scheme must be one the client can connect with, and must match your TLS options.** The four supported schemes are `nats://`, `tls://`, `ws://`, and `wss://` — the exact set `async-nats` accepts. Anything else, `nats+tls://` included, is rejected before a connection is attempted rather than failing inside the client. Of those, `tls://` and `wss://` are encrypted; `nats://` and `ws://` are cleartext, as is a schemeless address (the client reads it as `nats://`). Setting any of `tls_ca_cert`, `tls_client_cert`, or `tls_client_key` on a cleartext URL is rejected at connect time — use `tls://` or `wss://` to make the encrypted transport explicit, which guards against silent downgrade.
 - **Reconnect bounds.** `ConsumerOptions::<Nats>::new().with_max_reconnect_attempts(N)` caps reconnect attempts after a connection drop; default is unlimited. Set this when you want the consumer to surface `Connection` errors after `N` failed redials rather than retry forever.
-- **Stream config is tunable; most durable-consumer tuning is not.** Stream retention, storage bounds (`max_age` / `max_bytes` / `max_messages`), and `num_replicas` are configurable via [`nats_stream_config`](#bounded--replicated-managed-stream) (or skipped entirely with [`external`](#bind-to-an-externally-provisioned-stream)); the defaults remain `WorkQueue` / `StorageType::File` / `DiscardPolicy::New` / single-replica / unbounded. The **durable consumers** are declared with `AckPolicy::Explicit` and a 120 s deduplication window; a consumer group's durable defaults its `max_ack_pending` to the group's aggregate in-flight budget (`prefetch × max_consumers` with concurrent processing on, `max_consumers` in the default sequential mode where each member holds one message at a time; overridable with `with_max_ack_pending`), while the batch consumer's bootstrap durable - created only when nothing pre-declared it - leaves `max_ack_pending` unbounded, since a finite budget split across concurrent batch workers pins partially-filled pulls open for the whole `max_batch_age` window (in-flight stays bounded by the pull requests themselves, at most one batch per worker). The remaining knobs are not yet user-configurable, so open an issue if you need them surfaced.
+- **Stream config is tunable; most durable-consumer tuning is not.** Stream retention, storage bounds (`max_age` / `max_bytes` / `max_messages`), and `num_replicas` are configurable via [`nats_stream_config`](#bounded--replicated-managed-stream) (or skipped entirely with [`external`](#bind-to-an-externally-provisioned-stream)); the defaults remain `WorkQueue` / `StorageType::File` / `DiscardPolicy::New` / single-replica / unbounded. The **durable consumers** are declared with `AckPolicy::Explicit` and a 120 s deduplication window. The durable a consumer group or a consumer creates leaves `max_ack_pending` unbounded unless `with_max_ack_pending` sets a cap, since each worker pulls only what it can start (see [Flow control](#flow-control)). The batch consumer's bootstrap durable - created only when nothing pre-declared it - is unbounded too, since a finite budget split across concurrent batch workers pins partially-filled pulls open for the whole `max_batch_age` window (in-flight stays bounded by the pull requests themselves, at most one batch per worker). The remaining knobs are not yet user-configurable, so open an issue if you need them surfaced.
 
 ## Examples
 
