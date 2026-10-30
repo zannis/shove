@@ -130,6 +130,50 @@ fn in_place_retry_count(metadata: &MessageMetadata) -> u32 {
     metadata.delivery_count.map_or(0, |n| n.saturating_sub(1))
 }
 
+/// Judges the `max_deliver` of the durable a consumer has attached to.
+///
+/// JetStream stops redelivering a message after `max_deliver` deliveries and
+/// tells nobody, so a message redelivered that often waits on the stream for
+/// good, never delivered again and never dead-lettered. JetStream reports a
+/// durable with no cap as `-1`, and every other value warns.
+///
+/// On an external stream a retry is a redelivery and the retry count is the
+/// delivery count, so a message runs out of retries, and is dead-lettered, on
+/// delivery `max_retries + 1`. A cap at or below `max_retries` keeps that
+/// delivery from ever happening, so the consumer refuses to attach.
+fn check_max_deliver(
+    queue: &str,
+    consumer: &str,
+    max_deliver: i64,
+    strategy: RetryStrategy,
+    max_retries: u32,
+) -> Result<()> {
+    if max_deliver <= 0 {
+        return Ok(());
+    }
+    if strategy == RetryStrategy::InPlace && max_deliver <= i64::from(max_retries) {
+        return Err(ShoveError::Topology(format!(
+            "the durable `{consumer}` on external stream `{queue}` stops redelivering a message \
+             after max_deliver = {max_deliver} deliveries, but a retry there is a redelivery, \
+             and max_retries = {max_retries} takes {} deliveries to run out. The message would \
+             wait on the stream for good and never be dead-lettered. Lift the cap in place with \
+             `nats consumer edit {queue} {consumer} --max-deliver=-1`, raise it above \
+             max_retries, or lower max_retries.",
+            i64::from(max_retries).saturating_add(1)
+        )));
+    }
+    tracing::warn!(
+        queue,
+        consumer,
+        max_deliver,
+        "the durable stops redelivering a message after max_deliver deliveries and tells no \
+         consumer, so a message redelivered that often waits on the stream for good, never \
+         dead-lettered; lift the cap in place with `nats consumer edit {queue} {consumer} \
+         --max-deliver=-1`"
+    );
+    Ok(())
+}
+
 /// Reads `Shove-Sequence-Key` from headers.
 ///
 /// Empty when the message carries no key — either it predates the header or it
@@ -2148,6 +2192,13 @@ impl NatsConsumer {
                     };
 
                     let config = &pull_consumer.cached_info().config;
+                    check_max_deliver(
+                        queue,
+                        &consumer_name,
+                        config.max_deliver,
+                        worker.retry_strategy,
+                        worker.max_retries,
+                    )?;
                     // The server's effective ack_wait, which paces the progress acks.
                     let ack_wait = config.ack_wait;
                     // The fallback never updates an existing durable's budget.
@@ -3898,6 +3949,58 @@ mod retry_strategy_tests {
         let external = TopologyBuilder::new("nats-external").external().build();
         assert_eq!(resolve_retry_strategy(&owned), RetryStrategy::Republish);
         assert_eq!(resolve_retry_strategy(&external), RetryStrategy::InPlace);
+    }
+
+    fn attach(max_deliver: i64, strategy: RetryStrategy, max_retries: u32) -> Result<()> {
+        check_max_deliver(
+            "orders",
+            "orders-consumer",
+            max_deliver,
+            strategy,
+            max_retries,
+        )
+    }
+
+    #[test]
+    fn a_durable_with_no_cap_attaches_under_any_budget() {
+        for max_deliver in [-1, 0] {
+            for strategy in [RetryStrategy::InPlace, RetryStrategy::Republish] {
+                for max_retries in [0, 10, u32::MAX] {
+                    assert!(attach(max_deliver, strategy, max_retries).is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_in_place_budget_needs_one_delivery_more_than_its_retries() {
+        assert!(matches!(
+            attach(3, RetryStrategy::InPlace, 3),
+            Err(ShoveError::Topology(_))
+        ));
+        assert!(matches!(
+            attach(3, RetryStrategy::InPlace, 10),
+            Err(ShoveError::Topology(_))
+        ));
+        assert!(attach(3, RetryStrategy::InPlace, 2).is_ok());
+        assert!(attach(1, RetryStrategy::InPlace, 0).is_ok());
+        assert!(attach(i64::MAX, RetryStrategy::InPlace, u32::MAX).is_ok());
+    }
+
+    #[test]
+    fn a_republish_budget_does_not_depend_on_the_cap() {
+        assert!(attach(3, RetryStrategy::Republish, 10).is_ok());
+        assert!(attach(1, RetryStrategy::Republish, u32::MAX).is_ok());
+    }
+
+    #[test]
+    fn the_refusal_names_the_durable_the_cap_and_the_deliveries_the_budget_needs() {
+        let Err(ShoveError::Topology(message)) = attach(3, RetryStrategy::InPlace, u32::MAX) else {
+            panic!("a cap of 3 cannot serve u32::MAX retries");
+        };
+        assert!(message.contains("orders-consumer"), "{message}");
+        assert!(message.contains("max_deliver = 3"), "{message}");
+        assert!(message.contains("4294967296"), "{message}");
     }
 
     #[test]

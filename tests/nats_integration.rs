@@ -6859,6 +6859,205 @@ async fn attaching_to_a_capped_durable_names_the_budget_in_force() {
     broker.close().await;
 }
 
+shove::define_topic!(
+    ExternalBudgetTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-external-budget")
+        .external()
+        .dlq()
+        .build()
+);
+
+impl MessageHandler<ExternalBudgetTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// Stands in for the infrastructure that owns the durable `consumer` of
+/// `stream`, one that stops redelivering a message after `max_deliver`
+/// deliveries.
+async fn provision_durable(client: &NatsClient, stream: &str, consumer: &str, max_deliver: i64) {
+    use async_nats::jetstream::consumer::AckPolicy;
+    use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+
+    client
+        .jetstream()
+        .get_stream(stream)
+        .await
+        .expect("the stream exists")
+        .create_consumer(PullConsumerConfig {
+            durable_name: Some(consumer.to_string()),
+            ack_policy: AckPolicy::Explicit,
+            max_deliver,
+            ..Default::default()
+        })
+        .await
+        .expect("infra provisions the durable");
+}
+
+/// Runs a consumer of topic `T` until it has handled one more message.
+async fn consume_one_simple<T>(tb: &TestBroker, options: ConsumerOptions<Nats>)
+where
+    T: shove::Topic<Message = SimpleMessage>,
+    CountingHandler: MessageHandler<T, Context = ()>,
+{
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let options = options.with_shutdown(shutdown.clone());
+    let consumer = NatsConsumer::new(tb.client());
+    let handle = tokio::spawn(async move { consumer.run::<T, _>(hc, (), options).await });
+    tb.broker()
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<T>(&SimpleMessage {
+            id: "one-more".into(),
+            content: String::new(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the message is handled"
+    );
+    shutdown.cancel();
+    handle.await.unwrap().unwrap();
+}
+
+/// On an external stream a retry is a redelivery, and the retry count is the
+/// delivery count, so a message runs out of retries on delivery
+/// `max_retries + 1`. A durable that gives up after fewer deliveries leaves
+/// that message on the stream for good, never dead-lettered, so a consumer
+/// asked to retry more often than the durable delivers refuses to attach.
+#[tokio::test]
+async fn external_max_deliver_below_budget_is_refused() {
+    const STREAM: &str = "nats-external-budget";
+    const DURABLE: &str = "nats-external-budget-consumer";
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    provision_limits_stream(&client, STREAM).await;
+    broker
+        .topology()
+        .declare::<ExternalBudgetTopic>()
+        .await
+        .unwrap();
+    provision_durable(&client, STREAM, DURABLE, 3).await;
+
+    // A retry budget of 3 needs 4 deliveries, and 5 needs 6.
+    for max_retries in [3, 5] {
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            NatsConsumer::new(client.clone()).run::<ExternalBudgetTopic, _>(
+                CountingHandler::new(),
+                (),
+                ConsumerOptions::<Nats>::new().with_max_retries(max_retries),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("max_retries {max_retries}: the refusal is immediate"))
+        .expect_err("a budget the durable cannot reach must be refused");
+        let shove::ShoveError::Topology(msg) = err else {
+            panic!("expected ShoveError::Topology, got {err:?}");
+        };
+        assert!(
+            msg.contains(DURABLE)
+                && msg.contains("max_deliver")
+                && msg.contains(&format!("max_retries = {max_retries}")),
+            "the error names the durable, the cap and the budget: {msg}"
+        );
+    }
+
+    // 3 deliveries are enough for 2 retries: the third delivery is the one
+    // that dead-letters.
+    consume_one_simple::<ExternalBudgetTopic>(
+        &tb,
+        ConsumerOptions::<Nats>::new().with_max_retries(2),
+    )
+    .await;
+    broker.close().await;
+}
+
+/// A durable that counts deliveries stops redelivering a message after the
+/// cap, and nothing tells the consumer: such a message waits on the stream for
+/// good. A consumer that attaches to one says so, with the in-place change
+/// that lifts the cap, and says nothing about a durable with no cap.
+#[tokio::test]
+async fn a_durable_that_counts_deliveries_is_named_in_a_warning() {
+    use tracing::Level;
+    use tracing::subscriber::set_default;
+
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let _logging = set_default(subscriber);
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<CappedTopic>().await.unwrap();
+    provision_limits_stream(&client, "nats-external-budget").await;
+    broker
+        .topology()
+        .declare::<ExternalBudgetTopic>()
+        .await
+        .unwrap();
+
+    // A stream shove owns, whose durable gives up after 5 deliveries.
+    provision_durable(&client, "nats-capped", "nats-capped-consumer", 5).await;
+    consume_one_capped(&tb, ConsumerOptions::<Nats>::new()).await;
+    let warned = logs.contents();
+    assert!(
+        warned.contains("max_deliver=5")
+            && warned
+                .contains("nats consumer edit nats-capped nats-capped-consumer --max-deliver=-1"),
+        "the cap and its in-place fix are named: {warned}"
+    );
+
+    // An external stream whose durable gives up after 3 deliveries, enough
+    // for the 2 retries this consumer spends.
+    logs.clear();
+    provision_durable(
+        &client,
+        "nats-external-budget",
+        "nats-external-budget-consumer",
+        3,
+    )
+    .await;
+    consume_one_simple::<ExternalBudgetTopic>(
+        &tb,
+        ConsumerOptions::<Nats>::new().with_max_retries(2),
+    )
+    .await;
+    let warned = logs.contents();
+    assert!(
+        warned.contains("max_deliver=3"),
+        "an external durable that is allowed is still named: {warned}"
+    );
+    broker.close().await;
+
+    // A durable with no cap, the one a consumer bootstraps itself.
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<CappedTopic>().await.unwrap();
+    logs.clear();
+    consume_one_capped(&tb, ConsumerOptions::<Nats>::new()).await;
+    let quiet = logs.contents();
+    assert!(
+        !quiet.contains("max_deliver"),
+        "a durable with no cap is not warned about: {quiet}"
+    );
+    broker.close().await;
+}
+
 /// Each ack sent for a durable: the stream sequence it is for, its payload
 /// (empty or `+ACK` for an ack, `+WPI` for a progress ack, `-NAK`, ...) and
 /// when it was seen.
