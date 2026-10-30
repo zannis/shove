@@ -144,6 +144,19 @@ pub(super) const DEFAULT_PARTITIONS: i32 = 8;
 /// or `KafkaTopologyDeclarer::with_replication_factor`.
 pub(super) const DEFAULT_REPLICATION: i32 = 1;
 
+/// How many times `declare` reads the metadata of a topic it found existing
+/// before it gives up on the answer. The broker that said the topic exists
+/// can be ahead of the one metadata comes from, and a topic created a moment
+/// ago has no leaders yet; both settle within a few seconds.
+pub(super) const PARTITION_METADATA_ATTEMPTS: u32 = 8;
+
+/// The first wait between two such reads; each wait doubles, up to
+/// [`PARTITION_METADATA_RETRY_MAX`].
+pub(super) const PARTITION_METADATA_RETRY_INITIAL: Duration = Duration::from_millis(100);
+
+/// The longest wait between two such reads.
+pub(super) const PARTITION_METADATA_RETRY_MAX: Duration = Duration::from_secs(1);
+
 // ---------------------------------------------------------------------------
 // Client lifecycle
 // ---------------------------------------------------------------------------
@@ -153,6 +166,24 @@ pub(super) const DEFAULT_REPLICATION: i32 = 1;
 /// healthy cluster but short enough that a hung broker cannot stall
 /// shutdown indefinitely.
 pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+
+/// The longest the producer flush at shutdown waits for records still queued
+/// to be delivered. Past it, `flush` returns with the records unsent.
+pub(super) const PRODUCER_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The longest `shutdown` waits for a producer build that is still in flight
+/// when it arrives. A build takes milliseconds; it takes longer only while
+/// librdkafka's constructor is held on slow storage or a helper process, and
+/// a shutdown has nothing to gain from outwaiting that. A build that
+/// finishes after the wait is not flushed.
+pub(super) const PRODUCER_BUILD_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+
+/// The topic a `ping` asks the broker about. Metadata has to name a topic or
+/// ask for all of them, and a probe repeated for the life of the process must
+/// not ask for all of them. The topic need not exist: any answer from a
+/// broker, an unknown-topic or authorization error included, shows that the
+/// cluster is reachable.
+pub(super) const PING_PROBE_TOPIC: &str = "shove-ping-probe";
 
 /// How long the concurrent receive loop waits for its final synchronous
 /// offset commit at shutdown before giving up on the result.

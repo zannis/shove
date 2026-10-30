@@ -10,10 +10,16 @@
 //! not become a `Topology` error: that stays the retry path it always was.
 //! A shove-owned main topic is never probed, because another process may
 //! still declare it.
+//!
+//! The tests at the end of the file use the same cluster for the client's
+//! shutdown: the producer flush must leave the runtime free, and
+//! `run_until_timeout` must not leave its signal task running.
 
 #![cfg(all(feature = "kafka", feature = "test-support"))]
 
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rdkafka::mocking::MockCluster;
@@ -662,4 +668,101 @@ async fn dead_letter_drain_refuses_a_missing_external_topic() {
         "startup-external-dlq-missing",
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Client shutdown, on the same mock cluster
+// ---------------------------------------------------------------------------
+
+/// Dropped when the future that owns it is dropped.
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Drives `work` beside a 10 ms ticker and returns the longest gap between
+/// two ticks. On the current-thread runtime of `#[tokio::test]` the ticker
+/// only runs while `work` is suspended, so the gap is how long `work` held
+/// the runtime's one thread.
+async fn longest_stall<T>(work: impl Future<Output = T>) -> (T, Duration) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let ticker = tokio::spawn({
+        let stop = Arc::clone(&stop);
+        async move {
+            let mut longest = Duration::ZERO;
+            let mut last = tokio::time::Instant::now();
+            while !stop.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let now = tokio::time::Instant::now();
+                longest = longest.max(now.saturating_duration_since(last));
+                last = now;
+            }
+            longest
+        }
+    });
+    // The ticker takes its first reading before `work` starts.
+    tokio::task::yield_now().await;
+    let output = work.await;
+    stop.store(true, Ordering::Relaxed);
+    (output, ticker.await.expect("the ticker joins"))
+}
+
+/// Closing a client flushes its producer, and a flush against a broker that
+/// never answers blocks until the record times out. That wait must not sit
+/// on the runtime's thread: here it is the only thread there is, and a
+/// sibling task has to keep running through it.
+#[tokio::test]
+async fn shutdown_with_unreachable_broker_does_not_block_runtime() {
+    let broker = Broker::<Kafka>::from_client(connect("127.0.0.1:1").await);
+    let publisher = broker.publisher().await.expect("a publisher handle");
+    // A record the unreachable broker can never take, so the flush has
+    // something to wait for.
+    let publishing = tokio::spawn(async move {
+        publisher
+            .publish::<OwnedMissing>(&Order { id: "stuck".into() })
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let ((), longest) = longest_stall(broker.close()).await;
+
+    assert!(
+        longest < Duration::from_secs(1),
+        "the runtime stalled for {longest:?} while the client shut down"
+    );
+    publishing.abort();
+}
+
+/// `run_until_timeout` races the caller's signal against the broker's own
+/// cancellation. When the broker wins, the signal task is aborted and awaited
+/// instead of being left running with nobody to read its result.
+#[tokio::test]
+async fn run_until_timeout_aborts_signal_task() {
+    let mock = mock_with(&[]);
+    let client = connect(&mock.bootstrap_servers()).await;
+    let broker_token = client.shutdown_token();
+    let broker = Broker::<Kafka>::from_client(client);
+    let group = broker.consumer_group();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let guard = DropFlag(Arc::clone(&dropped));
+    broker_token.cancel();
+
+    let outcome = group
+        .run_until_timeout(
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            },
+            STARTUP_BOUND,
+        )
+        .await;
+
+    assert!(outcome.is_clean(), "{outcome:?}");
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the signal task is still running after run_until_timeout returned"
+    );
 }

@@ -4,6 +4,8 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "test-support")]
+use rdkafka::mocking::MockCluster;
 use shove::kafka::{KafkaClient, KafkaConfig};
 use shove::{Broker, Kafka, ShoveError};
 use testcontainers::runners::AsyncRunner;
@@ -32,6 +34,33 @@ async fn start_broker() -> (
 async fn ping_succeeds_against_running_broker() {
     let (_container, broker) = start_broker().await;
     broker.ping().await.expect("ping should succeed");
+}
+
+/// A probe is repeated for the life of the process, so it must not ask the
+/// cluster to describe every topic it hosts. Against a mock cluster with
+/// three topics, the answer to a ping lists none of them, and at most the one
+/// topic the probe asks about.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn ping_does_not_fetch_all_topics() {
+    const TOPICS: [&str; 3] = ["ping-orders", "ping-invoices", "ping-shipments"];
+    let mock = MockCluster::new(1).expect("mock cluster");
+    for topic in TOPICS {
+        mock.create_topic(topic, 1, 1).expect("mock topic");
+    }
+    let client = KafkaClient::connect(&KafkaConfig::new(mock.bootstrap_servers()))
+        .await
+        .expect("connect to the mock cluster");
+
+    let listed = client
+        .ping_topics_for_test(Duration::from_secs(5))
+        .await
+        .expect("the mock broker answers a ping");
+
+    assert!(
+        listed.len() <= 1 && listed.iter().all(|topic| !TOPICS.contains(&topic.as_str())),
+        "the ping asked for the cluster's topics and was told about {listed:?}"
+    );
 }
 
 #[tokio::test]

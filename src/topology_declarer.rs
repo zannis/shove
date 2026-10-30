@@ -49,7 +49,10 @@ impl TopologyDeclarer<Kafka> {
     /// Partition floor for the topics this declarer creates: each topic gets
     /// `max(topology_default, n)` partitions so Kafka can spread load across at
     /// least `n` consumers. `declare` only ever expands partition counts,
-    /// never shrinks them.
+    /// never shrinks them. A sequenced topic is the exception: its partition
+    /// count is its `routing_shards`, `n` has no effect on it, and `declare`
+    /// never adds partitions to it (see
+    /// [`KafkaTopologyDeclarer::with_min_partitions`](crate::kafka::KafkaTopologyDeclarer::with_min_partitions)).
     pub fn with_min_partitions(mut self, n: i32) -> Self {
         self.inner = self.inner.with_min_partitions(n);
         self

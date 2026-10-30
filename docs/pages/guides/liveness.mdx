@@ -27,7 +27,7 @@ Every production backend issues a real round-trip. There are no local-state shor
 
 | Backend   | RPC                                                | Side effects             |
 |-----------|----------------------------------------------------|--------------------------|
-| Kafka     | `fetch_metadata(None, timeout)` on the metadata client `connect` builds | none                     |
+| Kafka     | a metadata request for one probe topic, never for all topics, on the metadata client `connect` builds | none                     |
 | Redis     | `PING` on the multiplexed connection               | none                     |
 | NATS      | subscribe + unsubscribe-after(1) + flush + publish + await echo on a unique inbox | none |
 | RabbitMQ  | transient channel open + close                     | none                     |
@@ -35,6 +35,8 @@ Every production backend issues a real round-trip. There are no local-state shor
 | InMemory  | shutdown-token check (no I/O)                      | none                     |
 
 The SQS call is the only one with a meaningful operational cost: each probe is one billable `ListQueues` request. Sized k8s probes (one every few seconds) put this well under a dollar a month per pod, but plan accordingly for very large fleets.
+
+The Kafka probe asks the broker about a single topic named `shove-ping-probe`, which need not exist. Any answer from a broker, including an unknown-topic or an authorization error for that topic, shows that the cluster is reachable. The answer therefore does not grow with the number of topics in the cluster. On a cluster with ACLs, a principal without `Describe` on that topic gets an authorization error for it, and the broker may log the denied `Describe` on every probe.
 
 ## Timeouts
 

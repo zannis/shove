@@ -6144,6 +6144,267 @@ async fn topology_expands_partitions_on_redeclare() {
     broker.close().await;
 }
 
+/// Declarers that start together and all find the topic short of the count
+/// they ask for race on `CreatePartitions`: the winner expands it, and the
+/// broker answers the others `INVALID_PARTITIONS` because the topic already
+/// has the count they asked for. A declarer that finds the topic at the count
+/// it wanted has nothing left to do, so every one of them succeeds.
+#[tokio::test]
+async fn concurrent_declares_that_expand_one_topic_all_succeed() {
+    const TOPIC: &str = "kafka-expand-race";
+    const DECLARERS: usize = 8;
+    shove::define_topic!(
+        ExpandRaceTopic,
+        SimpleMessage,
+        TopologyBuilder::new(TOPIC).build()
+    );
+
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(DECLARERS));
+    let mut declares = Vec::new();
+    for _ in 0..DECLARERS {
+        let client = KafkaClient::connect_with_retry(&KafkaConfig::new(tb.brokers()), 10)
+            .await
+            .expect("connect a declarer");
+        let barrier = Arc::clone(&barrier);
+        declares.push(tokio::spawn(async move {
+            barrier.wait().await;
+            KafkaTopologyDeclarer::new(client)
+                .with_min_partitions(12)
+                .declare(ExpandRaceTopic::topology())
+                .await
+        }));
+    }
+    for declare in declares {
+        declare
+            .await
+            .expect("the declare task joins")
+            .expect("a declarer that lost the expansion race still succeeds");
+    }
+
+    assert_eq!(live_partition_count(tb.brokers(), TOPIC), Some(12));
+}
+
+/// Raising a topic's partitions under a group that resets to `latest` skips
+/// the records produced to the new partitions before the group is assigned
+/// them, so the registry says so. A group that resets to `earliest` loses
+/// nothing and the registry stays quiet.
+#[tokio::test]
+async fn registry_warns_when_it_raises_partitions_under_a_latest_group() {
+    use std::fmt::Debug;
+    use std::sync::Mutex as StdMutex;
+    use tracing::field::{Field, Visit};
+    use tracing::subscriber::set_default;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct Warned(Arc<StdMutex<Vec<String>>>);
+
+    struct Fields(Vec<String>);
+
+    impl Visit for Fields {
+        fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+            self.0.push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for Warned {
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut fields = Fields(Vec::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0.join(" "));
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct Idle;
+
+    impl<T: Topic<Message = SimpleMessage>> MessageHandler<T> for Idle {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    shove::define_topic!(
+        GrowUnderLatestTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-grow-latest").build()
+    );
+    shove::define_topic!(
+        GrowUnderEarliestTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-grow-earliest").build()
+    );
+
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), "kafka-grow-latest", 1).await;
+    provision_topic(tb.brokers(), "kafka-grow-earliest", 1).await;
+    let broker = tb.broker();
+    let warned = Warned::default();
+    let _log = set_default(tracing_subscriber::registry().with(warned.clone()));
+
+    let mut group = broker.consumer_group();
+    group
+        .register::<GrowUnderLatestTopic, _>(
+            ConsumerGroupConfig::new(
+                KafkaConsumerGroupConfig::new(1..=12)
+                    .with_auto_offset_reset(KafkaAutoOffsetReset::Latest),
+            ),
+            || Idle,
+        )
+        .await
+        .expect("register the latest group");
+    group
+        .register::<GrowUnderEarliestTopic, _>(
+            ConsumerGroupConfig::new(
+                KafkaConsumerGroupConfig::new(1..=12)
+                    .with_auto_offset_reset(KafkaAutoOffsetReset::Earliest),
+            ),
+            || Idle,
+        )
+        .await
+        .expect("register the earliest group");
+
+    let events = warned.0.lock().unwrap().clone();
+    assert!(
+        events.iter().any(|event| {
+            event.contains("queue=\"kafka-grow-latest\"")
+                && event.contains("from=1")
+                && event.contains("to=12")
+        }),
+        "no warning for the latest group in {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event.contains("queue=\"kafka-grow-earliest\"") && event.contains("from=")
+        }),
+        "the earliest group warned about the raise in {events:?}"
+    );
+    assert_eq!(
+        live_partition_count(tb.brokers(), "kafka-grow-latest"),
+        Some(12)
+    );
+    broker.close().await;
+}
+
+// ===========================================================================
+// Sequenced topics keep their partition count
+// ===========================================================================
+
+/// Keys are routed over the topic's partitions, so adding one remaps part of
+/// the keys while their backlog sits in the partition they used to map to.
+/// Declaring a sequenced topology over a topic with fewer partitions than
+/// its routing shards is refused, with both counts named, and the topic is
+/// left as it was.
+#[tokio::test]
+async fn sequenced_topic_with_fewer_partitions_is_refused() {
+    const TOPIC: &str = "kafka-seq-fewer-partitions";
+    shove::define_sequenced_topic!(
+        FewerPartitionsTopic,
+        OrderMessage,
+        |msg: &OrderMessage| msg.order_id.clone(),
+        TopologyBuilder::new(TOPIC)
+            .sequenced(SequenceFailure::Skip)
+            .routing_shards(4)
+            .hold_queue(Duration::from_millis(200))
+            .dlq()
+            .build()
+    );
+
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 2).await;
+    let broker = tb.broker();
+
+    let err = broker
+        .topology()
+        .declare::<FewerPartitionsTopic>()
+        .await
+        .expect_err("a sequenced topic with fewer partitions than shards is refused");
+
+    match &err {
+        ShoveError::Topology(message) => assert!(
+            message.contains("2 partitions") && message.contains("routing_shards (4)"),
+            "the refusal must name both counts: {message}"
+        ),
+        other => panic!("expected a Topology error, got {other:?}"),
+    }
+    assert_eq!(
+        live_partition_count(tb.brokers(), TOPIC),
+        Some(2),
+        "the refused declare changed the partition count"
+    );
+    broker.close().await;
+}
+
+/// More partitions than shards remaps nothing, so the declare goes through
+/// and the topic keeps the count it has.
+#[tokio::test]
+async fn sequenced_topic_with_more_partitions_is_accepted_and_left_alone() {
+    const TOPIC: &str = "kafka-seq-more-partitions";
+    shove::define_sequenced_topic!(
+        MorePartitionsTopic,
+        OrderMessage,
+        |msg: &OrderMessage| msg.order_id.clone(),
+        TopologyBuilder::new(TOPIC)
+            .sequenced(SequenceFailure::Skip)
+            .routing_shards(2)
+            .hold_queue(Duration::from_millis(200))
+            .dlq()
+            .build()
+    );
+
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 6).await;
+    let broker = tb.broker();
+
+    broker
+        .topology()
+        .declare::<MorePartitionsTopic>()
+        .await
+        .expect("a sequenced topic with more partitions than shards is accepted");
+
+    assert_eq!(live_partition_count(tb.brokers(), TOPIC), Some(6));
+    broker.close().await;
+}
+
+/// A minimum partition count is for topics whose keys do not route over the
+/// partitions. A sequenced topic is created with exactly its routing shards,
+/// and re-declaring it with a larger minimum adds nothing.
+#[tokio::test]
+async fn sequenced_topic_ignores_a_minimum_partition_count() {
+    const TOPIC: &str = "kafka-seq-min-partitions";
+    shove::define_sequenced_topic!(
+        MinPartitionsTopic,
+        OrderMessage,
+        |msg: &OrderMessage| msg.order_id.clone(),
+        TopologyBuilder::new(TOPIC)
+            .sequenced(SequenceFailure::Skip)
+            .routing_shards(3)
+            .hold_queue(Duration::from_millis(200))
+            .dlq()
+            .build()
+    );
+
+    let tb = TestBroker::start().await;
+    let declarer = || KafkaTopologyDeclarer::new(tb.client()).with_min_partitions(12);
+
+    declarer()
+        .declare(MinPartitionsTopic::topology())
+        .await
+        .expect("the first declare creates the topic");
+    declarer()
+        .declare(MinPartitionsTopic::topology())
+        .await
+        .expect("the second declare leaves it alone");
+
+    assert_eq!(live_partition_count(tb.brokers(), TOPIC), Some(3));
+}
+
 // ===========================================================================
 // DLQ consumer edge cases
 // ===========================================================================

@@ -161,6 +161,8 @@ Trade-offs:
 
 For Kafka, the "routing shard" concept maps to partition count. Partition count is set at topic creation time and is operationally expensive to change later (it requires partition reassignment). Think carefully before choosing a low number for a Kafka-backed sequenced topic in production.
 
+`declare` creates a sequenced Kafka topic with exactly `routing_shards` partitions and never adds partitions to an existing one, because adding a partition remaps keys whose backlog sits in the partition they mapped to before. A topic with fewer partitions than `routing_shards` is refused with a `ShoveError::Topology` that names both counts. A topic with more partitions is accepted as it is, with a warning.
+
 A routing shard count of 0 panics at `build()` time. The builder enforces this guard.
 
 ## Consuming sequenced topics
