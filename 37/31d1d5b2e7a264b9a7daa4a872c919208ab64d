@@ -1,0 +1,87 @@
+tests/kafka_integration.rs
+  s_1001dc3147e1e5::t_ecb7e2a13245bb 2004-2026,2028-2033,2035-2115,2201-2241
+  s_1001dc3147e1e5::t_c053184fbaddca 2002,2116-2193,2197-2200
+  s_1001dc3147e1e5::t_2c5c0e7d680076 2027
+  s_1001dc3147e1e5::t_b422039ab9c9ec 2194-2196
+  s_1001dc3147e1e5::t_cea7c854d871d3 11-13
+  s_546dac487857ed::t_65eb9466b87a0a 2003,2034
+tests/kafka_schema_registry.rs
+  s_1001dc3147e1e5::t_fa72f0adc5792b 1103-1107
+  s_1001dc3147e1e5::t_e0a52456cd1280 1006-1024,1026-1086,1088-1102,1108-1142
+  s_1001dc3147e1e5::t_40fa9a094a2455 1087
+  s_1001dc3147e1e5::t_dcbf2ca1d166d6 11,13
+  s_1001dc3147e1e5::t_a71ce46d2bd0a2 1025
+src/backends/kafka/client.rs
+  s_1001dc3147e1e5::t_7d55ea21a97cd0 456-457
+  s_1001dc3147e1e5::t_b15990bac182b0 564-569
+  s_1001dc3147e1e5::t_eda1ea767fc7b4 1767,1770
+  s_1001dc3147e1e5::t_e2b503d845797a 28-31
+  s_1001dc3147e1e5::t_a8b3bedafa1d50 848-853,868-878,880-902
+  s_1001dc3147e1e5::t_3de3e54f8a139e 2194
+  s_1001dc3147e1e5::t_efff8164a46896 46
+  s_1001dc3147e1e5::t_628834723e0c85 559-562
+  s_1001dc3147e1e5::t_0d78d73c0f8ed6 778-782,799,801-817
+  s_1001dc3147e1e5::t_9236abf8d02e8b 1336,1339,1343
+  s_1001dc3147e1e5::t_dfd0279af8a66b 582,2181-2193,2195-2233,2235-2261
+  s_1001dc3147e1e5::t_d3717b82494d6f 767
+  s_1001dc3147e1e5::t_6c3ca428a00d97 854
+  s_1001dc3147e1e5::t_dbcb26e2d00478 482-558,563,570-575
+  s_1001dc3147e1e5::t_e660f60fea9e49 2234
+  s_1001dc3147e1e5::t_46d0f0c23db8a7 855-856
+  s_1001dc3147e1e5::t_87fa3b71950435 576-581
+  s_1001dc3147e1e5::t_8128a8dab1e829 458
+  s_1001dc3147e1e5::t_ba7d67a17e77b9 4,8
+  s_1001dc3147e1e5::t_07af0914564dde 857-858
+  s_1001dc3147e1e5::t_e84a46fe5393f1 2117-2120,2132,2149,2175,2455
+docs/pages/guides/batch-publishing.mdx
+  s_1001dc3147e1e5::t_87d5a498c29c86 56
+  s_1001dc3147e1e5::t_bd77463aa1ec7e 71-72
+docs/pages/backends/kafka.mdx
+  s_1001dc3147e1e5::t_13242885d1f5b6 257
+  s_1001dc3147e1e5::t_ef7c7f4e42c4ba 258
+  s_1001dc3147e1e5::t_4a90aec4a663e3 256,259-260
+  s_1001dc3147e1e5::t_0f537e4ce29cdf 283
+src/publisher.rs
+  s_1001dc3147e1e5::t_e96b63fe78f6da 68
+src/backends/kafka/publisher.rs
+  s_1001dc3147e1e5::t_9749af2a1ba49d 435-437
+  s_1001dc3147e1e5::t_0fc2afcdd0221a 2,11-12,31-85,92,99-102,106,108-111,119-142,144-197,199-204,206,220-222
+  s_1001dc3147e1e5::t_cd06e85dbdbdc6 198,205,207-209,211,213-216,219,223,225-229
+  s_1001dc3147e1e5::t_d43d614108ad23 143
+  s_1001dc3147e1e5::t_585801c4b66362 9
+  s_1001dc3147e1e5::t_7101bf394e3686 477-480
+  s_1001dc3147e1e5::t_cddb345b9f1011 118
+  s_1001dc3147e1e5::t_9ce0e82fa24ca7 289-305
+  s_1001dc3147e1e5::t_e4bae9e0e95832 402
+  s_1001dc3147e1e5::t_91654a027fdb7e 403,406
+  s_1001dc3147e1e5::t_e64ef344e9d4ad 339-341,343-345,347-348,362-387
+  s_1001dc3147e1e5::t_07dd65c37031ef 481-487,501-504,506-507,509,511-513,515-519,521-542,552-567
+  s_1001dc3147e1e5::t_e178a3b8915f73 112-117
+  s_1001dc3147e1e5::t_8befa26e5f6939 461-463
+  s_1001dc3147e1e5::t_739b45c1a55f55 24
+  s_1001dc3147e1e5::t_becbea8cea1dc2 210,520
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3731d1d5b2e7a264b9a7daa4a872c919208ab64d",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_546dac487857ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a8a0d911-5746-479a-bff2-871d957b0fe3",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
