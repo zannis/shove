@@ -56,14 +56,15 @@ use super::publisher::{PublishResult, header_value, publish_with_retry};
 
 /// JetStream redelivers any message not acked within `ack_wait`, a clock that
 /// starts at delivery. A consumer takes delivery only of what it can start at
-/// once: a worker pulls no more messages than it has free slots, a FIFO
-/// shard's durable delivers one at a time, and a DLQ drain pulls one dead
-/// letter at a time. So the clock measures the handler and its settlement, and
-/// the 3x margin over the handler timeout lets a handler run to its limit with
-/// room to settle. A copy's publish and a retry's hold renew the clock with
-/// progress acks instead of drawing on the margin. Floor at the JetStream
-/// default (30s) so short handler timeouts don't tighten redelivery below the
-/// server default.
+/// once: a worker pulls no more messages than it has free slots, and a FIFO
+/// shard's durable delivers one at a time. So the clock measures the handler
+/// and its settlement, and the 3x margin over the handler timeout lets a
+/// handler run to its limit with room to settle. A DLQ drain asks for one dead
+/// letter per pull and reads at most two ahead of its call, so a dead letter
+/// waits behind at most two calls, which the margin covers as well. A copy's
+/// publish and a retry's hold renew the clock with progress acks instead of
+/// drawing on the margin. Floor at the JetStream default (30s) so short
+/// handler timeouts don't tighten redelivery below the server default.
 pub(super) fn derive_ack_wait(handler_timeout: Duration) -> Duration {
     handler_timeout
         .saturating_mul(3)
@@ -1184,6 +1185,33 @@ const MAX_OPEN_PULLS: usize = 2;
 /// The idle heartbeat of the DLQ drain's pulls, the one `messages()` sets, so
 /// a dead connection still ends the drain's stream with an error.
 const DLQ_PULL_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// The longest expiry a pull request can carry, which it holds as an `i64` of
+/// nanoseconds.
+const MAX_PULL_EXPIRES: Duration = Duration::from_nanos(i64::MAX.unsigned_abs());
+
+/// How long the DLQ drain holds each pull open.
+///
+/// async-nats renews a pull of its own accord once the pull is as old as its
+/// expiry plus 5 s with no request since, and a `handle_dead` call makes none
+/// while it runs. A pull that expires inside a long call is therefore renewed
+/// behind it, and brings the next dead letter in early. So the pull is held
+/// open for as long as a call may run: the handler timeout, or the durable's
+/// `ack_wait` without one, since a call longer than that loses its own dead
+/// letter to redelivery anyway. It is never shorter than the worker's
+/// [`PULL_EXPIRES`].
+///
+/// A call within that bound ends before the renewal can fire when it starts
+/// within 5 s of the pull being sent, as it does while dead letters are
+/// waiting. One that starts late in an idle pull can outlast the renewal and
+/// bring one dead letter in, and a reconnect during a call brings in another.
+/// The client stops there, at two.
+fn dlq_pull_expires(handler_timeout: Option<Duration>, ack_wait: Duration) -> Duration {
+    handler_timeout
+        .unwrap_or(ack_wait)
+        .max(PULL_EXPIRES)
+        .min(MAX_PULL_EXPIRES)
+}
 
 /// How long a consumer that leaves without a stop waits for the message tasks
 /// it started: the default handler timeout plus the grace the other backends
@@ -2333,8 +2361,12 @@ impl NatsConsumer {
     }
 
     /// Drains the dead letters of topic `T` into [`MessageHandler::handle_dead`]
-    /// with the default options, until the client is closed. It pulls one dead
-    /// letter at a time.
+    /// with the default options, until the client is closed. It asks for one
+    /// dead letter per pull and holds each pull open for the handler timeout,
+    /// 30 s at least, or for the durable's `ack_wait` when there is none. The
+    /// client reads at most two dead letters ahead of a running call, and none
+    /// ahead of a call that starts within 5 s of its pull and ends within that
+    /// time.
     /// [`run_dlq_with_options`](Self::run_dlq_with_options) takes the options of
     /// a consumer.
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
@@ -2353,9 +2385,10 @@ impl NatsConsumer {
     ///   settled, and so does closing the client, whatever the token holds.
     /// - `with_max_message_size` gates the dead letters. One over the limit is
     ///   logged with its size and acked without reaching `handle_dead`.
-    /// - `with_handler_timeout` bounds `handle_dead`, and a panic in it is
-    ///   caught. The dead letter is acked whatever the call came to, so
-    ///   `with_handler_timeout_outcome` has nothing to act on.
+    /// - `with_handler_timeout` bounds `handle_dead`, sets how long each pull
+    ///   stays open, and a panic in the call is caught. The dead letter is
+    ///   acked whatever the call came to, so `with_handler_timeout_outcome` has
+    ///   nothing to act on.
     /// - `with_consumer_group` labels the size sample of the drain.
     /// - `with_max_reconnect_attempts` bounds its consecutive reconnects.
     ///
@@ -2454,10 +2487,13 @@ impl NatsConsumer {
                         ))
                     })?;
 
-                // One letter per pull, or buffered ones outlive ack_wait behind a slow handle_dead.
+                // One letter per pull, held open as long as a call may run (see dlq_pull_expires).
+                let expires =
+                    dlq_pull_expires(handler_timeout, pull_consumer.cached_info().config.ack_wait);
                 let mut messages = pull_consumer
                     .stream()
                     .max_messages_per_batch(1)
+                    .expires(expires)
                     .heartbeat(DLQ_PULL_HEARTBEAT)
                     .messages()
                     .await
@@ -3538,6 +3574,51 @@ mod guarded_tests {
             tokio::task::yield_now().await;
         }
         assert!(gone.load(Ordering::Acquire), "the call outlived its caller");
+    }
+}
+
+/// [`dlq_pull_expires`]: how long the DLQ drain holds each pull open.
+#[cfg(test)]
+mod dlq_pull_tests {
+    use super::*;
+
+    const ACK_WAIT: Duration = Duration::from_secs(90);
+
+    #[test]
+    fn a_short_timeout_keeps_the_worker_expiry() {
+        assert_eq!(
+            dlq_pull_expires(Some(Duration::from_secs(5)), ACK_WAIT),
+            PULL_EXPIRES
+        );
+        assert_eq!(dlq_pull_expires(Some(PULL_EXPIRES), ACK_WAIT), PULL_EXPIRES);
+    }
+
+    #[test]
+    fn a_longer_timeout_sets_the_expiry() {
+        for secs in [31, 120, 3600] {
+            let timeout = Duration::from_secs(secs);
+            assert_eq!(dlq_pull_expires(Some(timeout), ACK_WAIT), timeout);
+        }
+    }
+
+    #[test]
+    fn no_timeout_leaves_the_ack_wait_as_the_longest_call() {
+        assert_eq!(dlq_pull_expires(None, ACK_WAIT), ACK_WAIT);
+        assert_eq!(
+            dlq_pull_expires(None, Duration::from_secs(10)),
+            PULL_EXPIRES,
+            "never below the worker expiry"
+        );
+    }
+
+    #[test]
+    fn an_absurd_timeout_is_held_to_what_a_pull_can_carry() {
+        let expires = dlq_pull_expires(Some(Duration::MAX), ACK_WAIT);
+        assert_eq!(expires, MAX_PULL_EXPIRES);
+        assert!(
+            i64::try_from(expires.as_nanos()).is_ok(),
+            "the request carries the expiry as an i64 of nanoseconds"
+        );
     }
 }
 
