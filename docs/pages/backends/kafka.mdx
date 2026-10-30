@@ -253,6 +253,11 @@ They configure topic *creation* and *reconciliation*, which external mode skips,
 `publisher().await?` returns a `Publisher<Kafka>`. Messages are produced via `rdkafka`. The message key is derived from the topic's partition-key logic (or from `T::sequence_key()` for sequenced topics).
 For topic provisioning, see [Declare topology](#declare-topology).
 
+`publish` and `publish_with_headers` send a record again after a transient failure, three sends in all, and then return `ShoveError::Connection`.
+An authorization error is returned at the first refusal as `ShoveError::Topology`.
+A fatal error librdkafka raised on the producer is returned as `ShoveError::Unknown` whatever its cause, including a principal that may not request a producer id; `is_retryable()` is false for both.
+On a sequenced topic `publish_batch` sends the records in slice order and reports the first failure with every record after it, so re-publishing `to_republish()` keeps each key's order; see [Batch publishing](/guides/batch-publishing).
+
 ### Producer tuning
 
 shove pins the correctness-critical producer settings (`acks=all`, `enable.idempotence=true`) and keeps them non-configurable. Idempotence caps `max.in.flight.requests.per.connection` at 5, so sustained throughput is bounded by messages per request — i.e. by batching. librdkafka's defaults (`linger.ms=5`, no compression) favor low latency; high-rate pipelines can raise the throughput ceiling with three opt-in knobs on `KafkaConfig`:
@@ -275,6 +280,7 @@ Unset throughput settings keep librdkafka's defaults.
 
 The client holds a single producer, built at the first publish.
 `publisher()` and the consumer's retry, defer, and DLQ republishes share it.
+A producer librdkafka raised a fatal error on refuses every record from then on, so the publish that meets the error fails and the next publish builds a new producer.
 A long linger also delays those republishes, and the offset commits gated on them for sequenced topics.
 Keep linger modest when consumers republish on the same client.
 

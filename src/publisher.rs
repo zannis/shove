@@ -65,7 +65,7 @@ impl<B: Backend> Publisher<B> {
     ///
     /// | Backend | Shape | What that means |
     /// |---|---|---|
-    /// | Kafka | **sparse** | every record is attempted independently, so `failed()` names exactly the rejected ones and `unattempted()` is empty |
+    /// | Kafka | **sparse**, or **prefix** on a sequenced topic | without a sequence key every record is attempted independently, so `failed()` names exactly the rejected ones and `unattempted()` is empty; a sequenced topic sends in slice order, `failed()` is the first failure and `unattempted()` everything after it |
     /// | SNS | **sparse** | rejected entries are named per 10-entry chunk; a chunk that errors as a whole, and every later chunk, becomes `unattempted()` |
     /// | NATS | **sparse + tail** | ack failures are exact over the submitted prefix; if submission breaks partway, the rest of the batch is `unattempted()` |
     /// | RabbitMQ | **prefix** | confirms are awaited in order and the call stops at the first nack: `failed()` is that one index, `unattempted()` is everything after it |
