@@ -1,0 +1,20 @@
+src/backends/kafka/client.rs
+  s_1001dc3147e1e5::t_d5a5f64928f863 1512-1513
+  s_1001dc3147e1e5::t_5672df2cfb9234 2315-2357
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0f685939c0abbd3893845693e813b0852b0cb89f",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
