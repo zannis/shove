@@ -54,7 +54,7 @@ The same `trace_id` UUID appears on both delivery attempts. The 15-second run wi
 
 ### `StdoutAuditHandler` serialises the full record
 
-`StdoutAuditHandler` implements `AuditHandler\<Payments\>` and serialises the complete `AuditRecord\<PaymentEvent\>` to pretty JSON. The record carries `trace_id` — a UUID that the framework assigns once per original message and propagates across hold-queue round-trips via the SQS message attribute `shove-trace-id`. This is what allows the same `trace_id` to appear on both the retry and the final ack delivery.
+`StdoutAuditHandler` implements `AuditHandler\<Payments\>` and serialises the complete `AuditRecord\<PaymentEvent\>` to pretty JSON. The record carries `trace_id`, taken from the `x-trace-id` message attribute of the delivery, or a new UUID when the delivery has none. A retry copy carries the attributes of the original, so a publisher that sets `x-trace-id` with `publish_with_headers` keeps one `trace_id` across every attempt. See [Trace ID propagation](/guides/audit#trace-id-propagation) for the call.
 
 ### 15-second run window
 

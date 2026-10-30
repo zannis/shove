@@ -55,9 +55,9 @@ Unlike the NATS sequenced example (which drops to `NatsConsumer::run_fifo`), thi
 
 `StdoutAuditHandler` derives `Clone` and `Default` because `group.register` calls the factory closure once per worker, and audited handlers must be cloneable so each worker gets its own instance. The `Clone` impl here is trivially cheap — `StdoutAuditHandler` holds no state. A handler that writes to a database connection pool would clone an `Arc` instead.
 
-### Trace ID propagation on NATS
+### Trace ID propagation
 
-On NATS, shove embeds the `trace_id` in a JetStream message header (`shove-trace-id`) before publishing to the hold queue. When the hold queue delivers the message back, the consumer reads the header and restores the trace ID into the `AuditRecord`. This round-trip through JetStream's metadata system is what allows the same UUID to appear on both delivery attempts.
+`Audited` takes the `trace_id` from the `x-trace-id` header of the delivery, and generates a new UUID for a delivery that has none. A retry copy carries the headers of the original, so a publisher that sets `x-trace-id` with `publish_with_headers` keeps one `trace_id` across every attempt. See [Trace ID propagation](/guides/audit#trace-id-propagation) for the call.
 
 ### 10-second window and hold queue TTL
 
