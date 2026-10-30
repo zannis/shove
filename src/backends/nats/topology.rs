@@ -1,16 +1,74 @@
 use std::time::Duration;
 
+use async_nats::jetstream::ErrorCode;
 use async_nats::jetstream::consumer::AckPolicy;
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+use async_nats::jetstream::context::GetStreamErrorKind;
 use async_nats::jetstream::stream::{
     Config as StreamConfig, DiscardPolicy, RetentionPolicy, StorageType,
 };
 
 use crate::ShoveError;
 use crate::error::Result;
-use crate::topology::{NatsRetention, NatsStreamConfig, QueueTopology};
+use crate::topology::{NatsRetention, NatsStreamConfig, QueueTopology, SequenceConfig};
 
 use super::client::NatsClient;
+use super::consumer::map_get_stream_error;
+
+/// JetStream's default `duplicate_window`.
+const DEFAULT_DUPLICATE_WINDOW: Duration = Duration::from_secs(120);
+
+/// The `duplicate_window` of a stream that keeps its messages for `max_age`,
+/// zero for no limit. JetStream refuses a window longer than the age, so the
+/// window is the default or the age, whichever is shorter.
+fn duplicate_window(max_age: Duration) -> Duration {
+    if max_age.is_zero() {
+        DEFAULT_DUPLICATE_WINDOW
+    } else {
+        max_age.min(DEFAULT_DUPLICATE_WINDOW)
+    }
+}
+
+fn retention_policy(retention: NatsRetention) -> RetentionPolicy {
+    match retention {
+        NatsRetention::WorkQueue => RetentionPolicy::WorkQueue,
+        NatsRetention::Limits => RetentionPolicy::Limits,
+        NatsRetention::Interest => RetentionPolicy::Interest,
+    }
+}
+
+/// The stream shove declares for `name` over `subjects` from an explicit
+/// `cfg`.
+fn declared_config(name: &str, subjects: Vec<String>, cfg: &NatsStreamConfig) -> StreamConfig {
+    // `None` maps to JetStream's "unlimited" sentinels (Duration::ZERO / -1),
+    // preserving the historical unbounded default.
+    let max_age = cfg.max_age.unwrap_or_default();
+    StreamConfig {
+        name: name.to_string(),
+        subjects,
+        retention: retention_policy(cfg.retention),
+        storage: StorageType::File,
+        discard: DiscardPolicy::New,
+        duplicate_window: duplicate_window(max_age),
+        max_age,
+        max_bytes: cfg.max_bytes.unwrap_or(-1),
+        max_messages: cfg.max_messages.unwrap_or(-1),
+        num_replicas: cfg.num_replicas.max(1),
+        ..Default::default()
+    }
+}
+
+/// `existing` with the fields shove owns set again from `owned`: subjects,
+/// retention, storage, the discard policy and the duplicate window. Every other
+/// field stays as it is, the limits and replicas an operator tuned among them.
+fn with_owned_fields(mut existing: StreamConfig, owned: StreamConfig) -> StreamConfig {
+    existing.subjects = owned.subjects;
+    existing.retention = owned.retention;
+    existing.storage = owned.storage;
+    existing.discard = owned.discard;
+    existing.duplicate_window = duplicate_window(existing.max_age);
+    existing
+}
 
 /// The stream config a `.broadcast()` topology must be declared with.
 ///
@@ -29,7 +87,9 @@ use super::client::NatsClient;
 ///
 /// An explicit [`nats_stream_config`](crate::TopologyBuilder::nats_stream_config)
 /// is honoured — except for `WorkQueue`, which is refused here rather than left
-/// to fail later as an opaque consumer-create error.
+/// to fail later as an opaque consumer-create error. Without one the stream is
+/// declared with `Interest` retention over shove's defaults, and an existing
+/// stream keeps the tuning it has, as with any stream declared without a config.
 fn broadcast_stream_config(topology: &QueueTopology) -> Result<NatsStreamConfig> {
     let explicit = topology.nats_stream_config();
     let mut cfg = explicit.cloned().unwrap_or_default();
@@ -62,9 +122,47 @@ impl NatsTopologyDeclarer {
     }
 
     /// Create or **reconcile** a shove-managed stream. `config` is the caller's
-    /// explicit [`NatsStreamConfig`] (retention/bounds/replicas); `None` keeps
-    /// shove's historical defaults (WorkQueue / unbounded / single-replica).
+    /// explicit [`NatsStreamConfig`] (retention/bounds/replicas) and is applied
+    /// in full. With `None` the stream is reconciled over shove's defaults, see
+    /// [`reconcile_stream`](Self::reconcile_stream).
+    async fn create_stream(
+        &self,
+        name: &str,
+        subjects: Vec<String>,
+        config: Option<&NatsStreamConfig>,
+    ) -> Result<()> {
+        match config {
+            Some(cfg) => {
+                self.apply_stream(declared_config(name, subjects, cfg))
+                    .await
+            }
+            None => {
+                let defaults = NatsStreamConfig::default();
+                self.reconcile_stream(declared_config(name, subjects, &defaults))
+                    .await
+            }
+        }
+    }
+
+    /// Create the stream `owned` describes, or set only the fields shove owns on
+    /// one that exists.
     ///
+    /// A stream that does not exist yet is created from `owned` as it is: shove's
+    /// historical defaults (WorkQueue / unbounded / single-replica), with
+    /// `Interest` retention for a broadcast topology. One that exists keeps the
+    /// limits, replicas and other tuning it has: only the fields shove owns are
+    /// set again (subjects, retention, storage, the discard policy and the
+    /// duplicate window), so re-declaring a stream whose topology carries no
+    /// `nats_stream_config`, such as a dead-letter stream, never undoes what an
+    /// operator tuned.
+    async fn reconcile_stream(&self, owned: StreamConfig) -> Result<()> {
+        let desired = match self.existing_stream_config(&owned.name).await? {
+            Some(existing) => with_owned_fields(existing, owned),
+            None => owned,
+        };
+        self.apply_stream(desired).await
+    }
+
     /// Uses `create_or_update_stream` rather than `get_or_create_stream` so that
     /// a config change actually takes effect on an already-existing stream:
     /// `get_or_create` returns the existing stream verbatim and would silently
@@ -73,35 +171,11 @@ impl NatsTopologyDeclarer {
     /// `storage`) make the JetStream UPDATE fail loud rather than no-op silently —
     /// the operator must recreate the stream (or use
     /// [`external`](crate::TopologyBuilder::external) to let infra own it).
-    async fn create_stream(
-        &self,
-        name: &str,
-        subjects: Vec<String>,
-        config: Option<&NatsStreamConfig>,
-    ) -> Result<()> {
-        let cfg = config.cloned().unwrap_or_default();
-        let retention = match cfg.retention {
-            NatsRetention::WorkQueue => RetentionPolicy::WorkQueue,
-            NatsRetention::Limits => RetentionPolicy::Limits,
-            NatsRetention::Interest => RetentionPolicy::Interest,
-        };
+    async fn apply_stream(&self, desired: StreamConfig) -> Result<()> {
+        let name = desired.name.clone();
         self.client
             .jetstream()
-            .create_or_update_stream(StreamConfig {
-                name: name.to_string(),
-                subjects,
-                retention,
-                storage: StorageType::File,
-                discard: DiscardPolicy::New,
-                duplicate_window: Duration::from_secs(120),
-                // `None` maps to JetStream's "unlimited" sentinels (Duration::ZERO
-                // / -1), preserving the historical unbounded default.
-                max_age: cfg.max_age.unwrap_or_default(),
-                max_bytes: cfg.max_bytes.unwrap_or(-1),
-                max_messages: cfg.max_messages.unwrap_or(-1),
-                num_replicas: cfg.num_replicas.max(1),
-                ..Default::default()
-            })
+            .create_or_update_stream(desired)
             .await
             .map_err(|e| {
                 ShoveError::Topology(format!(
@@ -110,6 +184,21 @@ impl NatsTopologyDeclarer {
             })?;
 
         Ok(())
+    }
+
+    /// The config of stream `name`, `None` when the server has no such stream.
+    async fn existing_stream_config(&self, name: &str) -> Result<Option<StreamConfig>> {
+        match self.client.jetstream().get_stream(name).await {
+            Ok(stream) => Ok(Some(stream.cached_info().config.clone())),
+            Err(e) => match e.kind() {
+                GetStreamErrorKind::JetStream(error)
+                    if error.error_code() == ErrorCode::STREAM_NOT_FOUND =>
+                {
+                    Ok(None)
+                }
+                _ => Err(map_get_stream_error(name, e)),
+            },
+        }
     }
 
     async fn declare_standard(&self, topology: &QueueTopology) -> Result<()> {
@@ -139,7 +228,13 @@ impl NatsTopologyDeclarer {
             // WorkQueue retention — see `broadcast_stream_config`.
             if topology.broadcast() {
                 let cfg = broadcast_stream_config(topology)?;
-                self.create_stream(queue, subjects, Some(&cfg)).await?;
+                match topology.nats_stream_config() {
+                    Some(_) => self.create_stream(queue, subjects, Some(&cfg)).await?,
+                    None => {
+                        self.reconcile_stream(declared_config(queue, subjects, &cfg))
+                            .await?;
+                    }
+                }
             } else {
                 self.create_stream(queue, subjects, topology.nats_stream_config())
                     .await?;
@@ -155,11 +250,12 @@ impl NatsTopologyDeclarer {
         Ok(())
     }
 
-    async fn declare_sequenced(&self, topology: &QueueTopology) -> Result<()> {
+    async fn declare_sequenced(
+        &self,
+        topology: &QueueTopology,
+        seq: &SequenceConfig,
+    ) -> Result<()> {
         let queue = topology.queue();
-        let seq = topology
-            .sequencing()
-            .expect("sequenced topology must have sequencing config");
 
         let subjects: Vec<String> = (0..seq.routing_shards())
             .map(|i| format!("{queue}.shard.{i}"))
@@ -176,10 +272,9 @@ impl NatsTopologyDeclarer {
 
 impl NatsTopologyDeclarer {
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
-        if topology.sequencing().is_some() {
-            self.declare_sequenced(topology).await
-        } else {
-            self.declare_standard(topology).await
+        match topology.sequencing() {
+            Some(seq) => self.declare_sequenced(topology, seq).await,
+            None => self.declare_standard(topology).await,
         }
     }
 
@@ -242,5 +337,96 @@ impl NatsTopologyDeclarer {
                 ))
             })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_duplicate_window_is_the_shorter_of_the_default_and_max_age() {
+        assert_eq!(duplicate_window(Duration::ZERO), DEFAULT_DUPLICATE_WINDOW);
+        assert_eq!(
+            duplicate_window(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            duplicate_window(Duration::from_secs(119)),
+            Duration::from_secs(119)
+        );
+        assert_eq!(
+            duplicate_window(Duration::from_secs(120)),
+            DEFAULT_DUPLICATE_WINDOW
+        );
+        assert_eq!(
+            duplicate_window(Duration::from_secs(3600)),
+            DEFAULT_DUPLICATE_WINDOW
+        );
+    }
+
+    /// A single-node server takes one replica only, so the replica count an
+    /// operator sets is checked here, on the config the declaration builds.
+    #[test]
+    fn re_declaring_sets_the_owned_fields_and_keeps_replicas_and_limits() {
+        let existing = StreamConfig {
+            name: "orders-dlq".to_string(),
+            subjects: vec!["orders-dlq".to_string(), "extra".to_string()],
+            retention: RetentionPolicy::WorkQueue,
+            storage: StorageType::File,
+            discard: DiscardPolicy::Old,
+            duplicate_window: Duration::from_secs(120),
+            num_replicas: 3,
+            max_bytes: 5_000_000,
+            max_messages: 1_000,
+            max_age: Duration::from_secs(60),
+            description: Some("tuned by the operator".to_string()),
+            ..Default::default()
+        };
+        let owned = declared_config(
+            "orders-dlq",
+            vec!["orders-dlq".to_string()],
+            &NatsStreamConfig::default(),
+        );
+
+        let declared = with_owned_fields(existing, owned);
+
+        assert_eq!(declared.subjects, ["orders-dlq"]);
+        assert_eq!(declared.discard, DiscardPolicy::New);
+        assert_eq!(declared.num_replicas, 3);
+        assert_eq!(declared.max_bytes, 5_000_000);
+        assert_eq!(declared.max_messages, 1_000);
+        assert_eq!(declared.max_age, Duration::from_secs(60));
+        assert_eq!(
+            declared.description.as_deref(),
+            Some("tuned by the operator")
+        );
+        assert_eq!(
+            declared.duplicate_window,
+            Duration::from_secs(60),
+            "the window follows the max_age the operator set"
+        );
+    }
+
+    #[test]
+    fn an_explicit_config_is_applied_in_full() {
+        let declared = declared_config(
+            "orders",
+            vec!["orders".to_string()],
+            &NatsStreamConfig {
+                retention: NatsRetention::Limits,
+                max_age: Some(Duration::from_secs(30)),
+                max_bytes: Some(1_000_000),
+                max_messages: None,
+                num_replicas: 3,
+            },
+        );
+
+        assert_eq!(declared.retention, RetentionPolicy::Limits);
+        assert_eq!(declared.max_age, Duration::from_secs(30));
+        assert_eq!(declared.duplicate_window, Duration::from_secs(30));
+        assert_eq!(declared.max_bytes, 1_000_000);
+        assert_eq!(declared.max_messages, -1);
+        assert_eq!(declared.num_replicas, 3);
     }
 }

@@ -732,6 +732,245 @@ async fn topology_managed_config_reconciles_existing_stream() {
     broker.close().await;
 }
 
+shove::define_topic!(
+    ShortLivedTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-short-lived")
+        .nats_stream_config(NatsStreamConfig {
+            retention: NatsRetention::Limits,
+            max_age: Some(Duration::from_secs(30)),
+            max_bytes: None,
+            max_messages: None,
+            num_replicas: 1,
+        })
+        .dlq()
+        .build()
+);
+
+/// The config of stream `name`, as the server holds it.
+async fn stream_config(client: &NatsClient, name: &str) -> JsStreamConfig {
+    let mut stream = client
+        .jetstream()
+        .get_stream(name)
+        .await
+        .expect("the stream exists");
+    stream.info().await.expect("stream info").config.clone()
+}
+
+/// JetStream refuses a stream whose duplicate window is longer than its
+/// `max_age`, so the window shrinks to the age when the age is the shorter and
+/// stays at the default 120 s otherwise.
+#[tokio::test]
+async fn max_age_below_dedup_window_declares() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+
+    broker
+        .topology()
+        .declare::<ShortLivedTopic>()
+        .await
+        .expect("a max_age below the default duplicate window declares");
+    let short = stream_config(&client, "nats-short-lived").await;
+    assert_eq!(short.max_age, Duration::from_secs(30));
+    assert_eq!(
+        short.duplicate_window,
+        Duration::from_secs(30),
+        "the window follows a max_age shorter than the default"
+    );
+    assert_eq!(
+        stream_config(&client, "nats-short-lived-dlq")
+            .await
+            .duplicate_window,
+        Duration::from_secs(120),
+        "a stream with no max_age keeps the default window"
+    );
+
+    broker
+        .topology()
+        .declare::<ManagedConfigTopic>()
+        .await
+        .unwrap();
+    let long = stream_config(&client, "nats-managed-cfg").await;
+    assert_eq!(long.max_age, Duration::from_secs(600));
+    assert_eq!(
+        long.duplicate_window,
+        Duration::from_secs(120),
+        "a max_age longer than the default leaves the window at the default"
+    );
+
+    broker.close().await;
+}
+
+/// What an operator sets on a stream shove declares: limits, a description,
+/// and a `max_age` shorter than the default duplicate window, which the
+/// operator has to match with the window itself.
+async fn operator_tunes(client: &NatsClient, name: &str) {
+    let mut config = stream_config(client, name).await;
+    config.max_bytes = 5_000_000;
+    config.max_messages = 1_000;
+    config.max_age = Duration::from_secs(90);
+    config.duplicate_window = Duration::from_secs(90);
+    config.description = Some("tuned by the operator".to_string());
+    client
+        .jetstream()
+        .update_stream(&config)
+        .await
+        .expect("the operator tunes the stream");
+}
+
+/// Re-declaring a topology that carries no `nats_stream_config` updates the
+/// fields shove owns and leaves the rest of a stream as the operator tuned it:
+/// its limits, its description and, on a cluster, its replica count. The
+/// single-node test server holds one replica only, so the limits stand in for
+/// the replicas the same path keeps. Applies to the dead-letter streams, the
+/// sequenced stream and a standard stream alike.
+#[tokio::test]
+async fn redeclare_keeps_operator_replicas() {
+    const TUNED: [&str; 4] = [
+        "nats-work",
+        "nats-work-dlq",
+        "nats-seq-skip",
+        "nats-seq-skip-dlq",
+    ];
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
+    for name in TUNED {
+        operator_tunes(&client, name).await;
+    }
+
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
+
+    for name in TUNED {
+        let config = stream_config(&client, name).await;
+        assert_eq!(config.max_bytes, 5_000_000, "{name} keeps max_bytes");
+        assert_eq!(config.max_messages, 1_000, "{name} keeps max_messages");
+        assert_eq!(
+            config.max_age,
+            Duration::from_secs(90),
+            "{name} keeps max_age"
+        );
+        assert_eq!(
+            config.duplicate_window,
+            Duration::from_secs(90),
+            "{name} keeps a window its max_age allows"
+        );
+        assert_eq!(
+            config.description.as_deref(),
+            Some("tuned by the operator"),
+            "{name} keeps its description"
+        );
+        assert_eq!(config.num_replicas, 1, "{name} keeps its replicas");
+        assert_eq!(
+            config.retention,
+            RetentionPolicy::WorkQueue,
+            "{name} stays what shove declared"
+        );
+    }
+    assert_eq!(
+        stream_config(&client, "nats-seq-skip").await.subjects,
+        ["nats-seq-skip.shard.0", "nats-seq-skip.shard.1"],
+        "the sequenced stream keeps the shard subjects shove owns"
+    );
+
+    broker.close().await;
+}
+
+shove::define_topic!(
+    TunedBroadcastTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-bcast-tuned").broadcast().build()
+);
+shove::define_topic!(
+    ConfiguredBroadcastTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-bcast-configured")
+        .broadcast()
+        .nats_stream_config(NatsStreamConfig {
+            retention: NatsRetention::Limits,
+            max_age: None,
+            max_bytes: Some(2_000_000),
+            max_messages: None,
+            num_replicas: 1,
+        })
+        .build()
+);
+
+/// The stream of a `.broadcast()` topology without a `nats_stream_config`
+/// keeps its tuning on re-declare like any other stream shove creates, and one
+/// whose topology carries a config has it applied in full.
+#[tokio::test]
+async fn redeclaring_a_broadcast_stream_keeps_the_tuning_its_topology_leaves_out() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<TunedBroadcastTopic>()
+        .await
+        .unwrap();
+    broker
+        .topology()
+        .declare::<ConfiguredBroadcastTopic>()
+        .await
+        .unwrap();
+    operator_tunes(&client, "nats-bcast-tuned").await;
+    operator_tunes(&client, "nats-bcast-configured").await;
+
+    broker
+        .topology()
+        .declare::<TunedBroadcastTopic>()
+        .await
+        .unwrap();
+    broker
+        .topology()
+        .declare::<ConfiguredBroadcastTopic>()
+        .await
+        .unwrap();
+
+    let tuned = stream_config(&client, "nats-bcast-tuned").await;
+    assert_eq!(tuned.max_bytes, 5_000_000, "keeps max_bytes");
+    assert_eq!(tuned.max_messages, 1_000, "keeps max_messages");
+    assert_eq!(tuned.max_age, Duration::from_secs(90), "keeps max_age");
+    assert_eq!(
+        tuned.duplicate_window,
+        Duration::from_secs(90),
+        "keeps a window its max_age allows"
+    );
+    assert_eq!(
+        tuned.description.as_deref(),
+        Some("tuned by the operator"),
+        "keeps its description"
+    );
+    assert_eq!(tuned.num_replicas, 1, "keeps its replicas");
+    assert_eq!(
+        tuned.retention,
+        RetentionPolicy::Interest,
+        "stays what shove declared"
+    );
+
+    let configured = stream_config(&client, "nats-bcast-configured").await;
+    assert_eq!(configured.max_bytes, 2_000_000, "the config sets max_bytes");
+    assert_eq!(configured.max_messages, -1, "the config sets max_messages");
+    assert_eq!(
+        configured.max_age,
+        Duration::ZERO,
+        "the config sets max_age"
+    );
+    assert_eq!(
+        configured.description, None,
+        "the config sets the stream whole"
+    );
+    assert_eq!(configured.retention, RetentionPolicy::Limits);
+
+    broker.close().await;
+}
+
 // ===========================================================================
 // Basic publish & consume
 // ===========================================================================
@@ -3740,6 +3979,49 @@ async fn direct_and_fifo_entry_points_refuse_a_broadcast_start() {
             && msg.contains("with_broadcast_start(Tail)")
             && msg.contains("NatsConsumer::run_fifo"),
         "the error names the topic, the start and the entry point: {msg}"
+    );
+}
+
+// A `SequencedTopic` paired with a topology built without `.sequenced(...)`,
+// which a hand-written pairing can produce.
+shove::define_sequenced_topic!(
+    NoSequencingTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("nats-no-sequencing").build()
+);
+
+impl MessageHandler<NoSequencingTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// `run_fifo` on a topic whose topology carries no sequencing config returns a
+/// `Topology` error, where there are no shards to attach to.
+#[tokio::test]
+async fn run_fifo_without_a_sequenced_topology_is_a_topology_error() {
+    let tb = TestBroker::start().await;
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        NatsConsumer::new(tb.client()).run_fifo::<NoSequencingTopic, _>(
+            CountingHandler::new(),
+            (),
+            ConsumerOptions::<Nats>::new(),
+        ),
+    )
+    .await
+    .expect("the refusal is synchronous")
+    .expect_err("a topology without sequencing has no shards to consume");
+    let shove::ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("nats-no-sequencing") && msg.contains("sequencing"),
+        "the error names the topic and what it lacks: {msg}"
     );
 }
 
@@ -6816,6 +7098,205 @@ async fn attaching_to_a_capped_durable_names_the_budget_in_force() {
     broker.close().await;
 }
 
+shove::define_topic!(
+    ExternalBudgetTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-external-budget")
+        .external()
+        .dlq()
+        .build()
+);
+
+impl MessageHandler<ExternalBudgetTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// Stands in for the infrastructure that owns the durable `consumer` of
+/// `stream`, one that stops redelivering a message after `max_deliver`
+/// deliveries.
+async fn provision_durable(client: &NatsClient, stream: &str, consumer: &str, max_deliver: i64) {
+    use async_nats::jetstream::consumer::AckPolicy;
+    use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+
+    client
+        .jetstream()
+        .get_stream(stream)
+        .await
+        .expect("the stream exists")
+        .create_consumer(PullConsumerConfig {
+            durable_name: Some(consumer.to_string()),
+            ack_policy: AckPolicy::Explicit,
+            max_deliver,
+            ..Default::default()
+        })
+        .await
+        .expect("infra provisions the durable");
+}
+
+/// Runs a consumer of topic `T` until it has handled one more message.
+async fn consume_one_simple<T>(tb: &TestBroker, options: ConsumerOptions<Nats>)
+where
+    T: shove::Topic<Message = SimpleMessage>,
+    CountingHandler: MessageHandler<T, Context = ()>,
+{
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let options = options.with_shutdown(shutdown.clone());
+    let consumer = NatsConsumer::new(tb.client());
+    let handle = tokio::spawn(async move { consumer.run::<T, _>(hc, (), options).await });
+    tb.broker()
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<T>(&SimpleMessage {
+            id: "one-more".into(),
+            content: String::new(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the message is handled"
+    );
+    shutdown.cancel();
+    handle.await.unwrap().unwrap();
+}
+
+/// On an external stream a retry is a redelivery, and the retry count is the
+/// delivery count, so a message runs out of retries on delivery
+/// `max_retries + 1`. A durable that gives up after fewer deliveries leaves
+/// that message on the stream for good, never dead-lettered, so a consumer
+/// asked to retry more often than the durable delivers refuses to attach.
+#[tokio::test]
+async fn external_max_deliver_below_budget_is_refused() {
+    const STREAM: &str = "nats-external-budget";
+    const DURABLE: &str = "nats-external-budget-consumer";
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    provision_limits_stream(&client, STREAM).await;
+    broker
+        .topology()
+        .declare::<ExternalBudgetTopic>()
+        .await
+        .unwrap();
+    provision_durable(&client, STREAM, DURABLE, 3).await;
+
+    // A retry budget of 3 needs 4 deliveries, and 5 needs 6.
+    for max_retries in [3, 5] {
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            NatsConsumer::new(client.clone()).run::<ExternalBudgetTopic, _>(
+                CountingHandler::new(),
+                (),
+                ConsumerOptions::<Nats>::new().with_max_retries(max_retries),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("max_retries {max_retries}: the refusal is immediate"))
+        .expect_err("a budget the durable cannot reach must be refused");
+        let shove::ShoveError::Topology(msg) = err else {
+            panic!("expected ShoveError::Topology, got {err:?}");
+        };
+        assert!(
+            msg.contains(DURABLE)
+                && msg.contains("max_deliver")
+                && msg.contains(&format!("max_retries = {max_retries}")),
+            "the error names the durable, the cap and the budget: {msg}"
+        );
+    }
+
+    // 3 deliveries are enough for 2 retries: the third delivery is the one
+    // that dead-letters.
+    consume_one_simple::<ExternalBudgetTopic>(
+        &tb,
+        ConsumerOptions::<Nats>::new().with_max_retries(2),
+    )
+    .await;
+    broker.close().await;
+}
+
+/// A durable that counts deliveries stops redelivering a message after the
+/// cap, and nothing tells the consumer: such a message waits on the stream for
+/// good. A consumer that attaches to one says so, with the in-place change
+/// that lifts the cap, and says nothing about a durable with no cap.
+#[tokio::test]
+async fn a_durable_that_counts_deliveries_is_named_in_a_warning() {
+    use tracing::Level;
+    use tracing::subscriber::set_default;
+
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let _logging = set_default(subscriber);
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<CappedTopic>().await.unwrap();
+    provision_limits_stream(&client, "nats-external-budget").await;
+    broker
+        .topology()
+        .declare::<ExternalBudgetTopic>()
+        .await
+        .unwrap();
+
+    // A stream shove owns, whose durable gives up after 5 deliveries.
+    provision_durable(&client, "nats-capped", "nats-capped-consumer", 5).await;
+    consume_one_capped(&tb, ConsumerOptions::<Nats>::new()).await;
+    let warned = logs.contents();
+    assert!(
+        warned.contains("max_deliver=5")
+            && warned
+                .contains("nats consumer edit nats-capped nats-capped-consumer --max-deliver=-1"),
+        "the cap and its in-place fix are named: {warned}"
+    );
+
+    // An external stream whose durable gives up after 3 deliveries, enough
+    // for the 2 retries this consumer spends.
+    logs.clear();
+    provision_durable(
+        &client,
+        "nats-external-budget",
+        "nats-external-budget-consumer",
+        3,
+    )
+    .await;
+    consume_one_simple::<ExternalBudgetTopic>(
+        &tb,
+        ConsumerOptions::<Nats>::new().with_max_retries(2),
+    )
+    .await;
+    let warned = logs.contents();
+    assert!(
+        warned.contains("max_deliver=3"),
+        "an external durable that is allowed is still named: {warned}"
+    );
+    broker.close().await;
+
+    // A durable with no cap, the one a consumer bootstraps itself.
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<CappedTopic>().await.unwrap();
+    logs.clear();
+    consume_one_capped(&tb, ConsumerOptions::<Nats>::new()).await;
+    let quiet = logs.contents();
+    assert!(
+        !quiet.contains("max_deliver"),
+        "a durable with no cap is not warned about: {quiet}"
+    );
+    broker.close().await;
+}
+
 /// Each ack sent for a durable: the stream sequence it is for, its payload
 /// (empty or `+ACK` for an ack, `+WPI` for a progress ack, `-NAK`, ...) and
 /// when it was seen.
@@ -7201,6 +7682,107 @@ async fn an_unconfirmable_duplicate_copy_delays_the_original_and_never_loses_it(
         "the original is redelivered rather than acked while its copy cannot be confirmed: {seen:?}"
     );
     assert_eq!(stream_last_sequence(&client, "nats-hold").await, 3);
+    assert_eq!(
+        stream_messages(&client, "nats-hold-dlq").await,
+        0,
+        "nothing was dead-lettered"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// A caller picks its own `Nats-Msg-Id`, and a retry copy's id extends the
+/// original's with `-r1`. A caller that also uses `{id}-r1` for another message
+/// inside the duplicate window makes JetStream answer the copy's publish with a
+/// duplicate PubAck for that message. The stored message is not the copy, so
+/// the PubAck does not retire the original: it is redelivered, and its copy is
+/// stored once the window has let the id go.
+#[tokio::test]
+async fn a_caller_id_that_collides_with_a_retry_copy_does_not_lose_the_original() {
+    const WINDOW: Duration = Duration::from_secs(5);
+
+    /// The delivery id and retry count of each call.
+    type Seen = Arc<Mutex<Vec<(String, u32)>>>;
+
+    /// Retries the caller's original, acks everything else.
+    #[derive(Clone)]
+    struct RetryTheOriginal {
+        seen: Seen,
+    }
+
+    impl MessageHandler<HoldTopic> for RetryTheOriginal {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+            let original = meta.delivery_id == "caller-a";
+            self.seen
+                .lock()
+                .await
+                .push((meta.delivery_id, meta.retry_count));
+            if original {
+                Outcome::Retry
+            } else {
+                Outcome::Ack
+            }
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<HoldTopic>().await.unwrap();
+    shrink_duplicate_window(&client, "nats-hold", WINDOW).await;
+    for (id, content) in [("caller-a", "original"), ("caller-a-r1", "another message")] {
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert(NATS_MESSAGE_ID, id);
+        raw_publish(&client, "nats-hold", headers, &simple_payload(content)).await;
+    }
+
+    let handler = RetryTheOriginal {
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let seen = Arc::clone(&handler.seen);
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<HoldTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(3)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let deadline = Instant::now() + WINDOW.saturating_add(TIMEOUT);
+    while !seen.lock().await.contains(&("caller-a-r1".to_string(), 1)) {
+        assert!(
+            Instant::now() < deadline,
+            "the retry copy never arrived, saw {:?}",
+            seen.lock().await.clone()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        settle_stream_messages(&client, "nats-hold", 0).await,
+        0,
+        "the original and the caller's message are both retired"
+    );
+
+    let seen = seen.lock().await.clone();
+    let attempts = seen
+        .iter()
+        .filter(|call| **call == ("caller-a".to_string(), 0))
+        .count();
+    assert!(
+        attempts >= 2,
+        "the original is redelivered while its copy is held off: {seen:?}"
+    );
     assert_eq!(
         stream_messages(&client, "nats-hold-dlq").await,
         0,

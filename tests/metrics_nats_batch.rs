@@ -8,15 +8,15 @@
 //!   **once per flush** — the two sides of the documented batch-metrics rule.
 //! - The batch `Outcome::Reject` arm moves `shove_messages_discarded_total`
 //!   exactly when the rejected messages are genuinely gone — a bare topology,
-//!   where the server-confirmed `double_ack` retires them with no copy — and
+//!   where the server-confirmed ack retires them with no copy — and
 //!   not when a DLQ holds them.
 //!
 //! The discard settlement here is NATS-shaped: unlike Kafka, where the
 //! `PendingDiscard` waits on a later offset commit, `settle_reject_batch`
-//! settles each message the moment its `double_ack` resolves. The bare-reject
+//! settles each message the moment its confirmed ack resolves. The bare-reject
 //! scenario therefore waits until the stream has actually retired the
 //! messages before snapshotting, which is the observable form of "the
-//! double_ack landed, so `confirm` fired".
+//! ack was confirmed, so `confirm` fired".
 //!
 //! Uses `metrics-util::debugging::DebuggingRecorder`, which takes the *global*
 //! recorder slot — hence its own integration binary and a single `#[test]`.
@@ -339,7 +339,7 @@ where
     );
     // Settlement is per message and immediate on this backend; the stream
     // retiring every message is the observable proof it completed (for `Ack`
-    // the plain acks, for `Reject` the DLQ publishes plus double_acks).
+    // the plain acks, for `Reject` the DLQ publishes plus confirmed acks).
     let remaining = wait_for_stream_count(tb.client_ref(), queue, 0, TIMEOUT).await;
     assert_eq!(
         remaining, 0,
@@ -374,7 +374,7 @@ async fn batch_metrics_count_messages_and_observe_duration_per_flush() {
 
     // -- Scenario 2: bare topology, Reject ----------------------------------
     //
-    // Nothing holds these payloads once the double_ack lands, so every one of
+    // Nothing holds these payloads once the confirmed ack lands, so every one of
     // them is a real discard.
     let bare = run_scenario::<BareRejectTopic>(&tb, BARE_TOPIC, Outcome::Reject).await;
 
@@ -451,7 +451,7 @@ async fn batch_metrics_count_messages_and_observe_duration_per_flush() {
         ),
         u64::from(BATCH),
         "with no DLQ declared, every rejected message is dropped on the floor \
-         once its double_ack lands — that is exactly what \
+         once its ack is confirmed — that is exactly what \
          `shove_messages_discarded_total` promises to report, and a 0 here is \
          the silent data loss the counter exists to make visible"
     );
