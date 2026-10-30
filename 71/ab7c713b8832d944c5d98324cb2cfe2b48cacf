@@ -1,0 +1,57 @@
+src/publisher_internal.rs
+  s_1001dc3147e1e5::t_df3a7af2965de3 49-63
+  s_1001dc3147e1e5::t_844d7e0cc97ecf 20,23
+  s_1001dc3147e1e5::t_2394aaad115d25 157-192
+  s_1001dc3147e1e5::t_ec3641d191a43f 5,7-19,21-22,24-27,35-43
+src/backends/redis/constants.rs
+  s_1001dc3147e1e5::t_e420293ca71b38 42-52
+  s_1001dc3147e1e5::t_751424aa590fa2 15-28
+src/backends/sns/publisher.rs
+  s_1001dc3147e1e5::t_081d18a468eae0 19-22
+  s_1001dc3147e1e5::t_5dbcef75a1a0e0 194
+  s_1001dc3147e1e5::t_6dfb3c8251e756 380
+src/backends/rabbitmq/headers.rs
+  s_1001dc3147e1e5::t_149c7370657660 21-29
+  s_1001dc3147e1e5::t_6932ad99a2b5ee 99
+  s_1001dc3147e1e5::t_7e27b889eb5b05 159-165
+src/backends/nats/constants.rs
+  s_1001dc3147e1e5::t_e78e7e814569d8 43-53
+  s_1001dc3147e1e5::t_339fd883b4dd59 15-26
+src/backends/sns/router.rs
+  s_1001dc3147e1e5::t_de5bfb56addfac 8-9,18-21
+  s_1001dc3147e1e5::t_93c89c4c39b5ee 602,605-608
+  s_1001dc3147e1e5::t_c4857c0fd5d684 22
+  s_1001dc3147e1e5::t_514647543fe06f 609
+tests/publisher_reserved_headers.rs
+  s_1001dc3147e1e5::t_faa77d1ef9702b 1-3,5-10,19,24-25,32,35,50,73,77,112,197,201,243,283,287,317-452,454
+  s_1001dc3147e1e5::t_b72a70635a0e14 453
+  s_1001dc3147e1e5::t_c5c4b6305fcd63 455
+src/backends/kafka/constants.rs
+  s_1001dc3147e1e5::t_039f43da35680f 295-300
+  s_1001dc3147e1e5::t_28cb41d02b960a 25-35
+src/backends/redis/consumer.rs
+  s_1001dc3147e1e5::t_0e03f108fe37db 33-34
+src/backends/inmemory/constants.rs
+  s_1001dc3147e1e5::t_c9f0c6493b3552 9-31
+src/backends/sns/topology.rs
+  s_1001dc3147e1e5::t_aee9794de6c5b8 8-9
+  s_1001dc3147e1e5::t_68d390cfede324 402
+  s_1001dc3147e1e5::t_10a7f51b47cf5c 18-24
+  s_1001dc3147e1e5::t_cdd45aa5c0e51c 490-495
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "71ab7c713b8832d944c5d98324cb2cfe2b48cacf",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
