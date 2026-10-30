@@ -125,7 +125,9 @@ shove::define_topic!(
 
 The stream's duplicate window is the shorter of 120 s and `max_age`, so a stream that keeps its messages for less than two minutes declares with a window that age allows, where JetStream would refuse a longer one.
 
-A stream shove declares without a `nats_stream_config`, such as a dead-letter stream or the stream of a sequenced topic, is created with the defaults above. Once it exists, `declare()` keeps the limits, replicas and other settings it has and sets again only the fields shove owns: the subjects, retention, storage, discard policy and duplicate window. Tune such a stream with the `nats` CLI and the next start leaves the tuning in place.
+A stream shove declares without a `nats_stream_config`, such as a dead-letter stream, the stream of a sequenced topic or the stream of a `.broadcast()` topic, is created with the defaults above, and with `Interest` retention for a broadcast topic. Once it exists, `declare()` keeps the limits, replicas and other settings it has and sets again only the fields shove owns: the subjects, retention, storage, discard policy and duplicate window. Tune such a stream with the `nats` CLI and the next start leaves the tuning in place.
+
+Removing a `nats_stream_config` from a topology follows the same rule. The stream keeps the limits and replicas that config set, and `declare()` does not reset them to the defaults, so lift them with the `nats` CLI if they should go. Retention is set again too, back to the default, and JetStream refuses to change a stream's retention to or from `WorkQueue`. A stream whose removed config chose `Limits` or `Interest` therefore fails `declare()` on a topology that is not a broadcast one.
 
 ### Bind to an externally-provisioned stream
 
@@ -155,6 +157,8 @@ A shove-owned stream keeps the hold-then-republish path: the incremented copy is
 This is `RetryStrategy::InPlace`, implied by `external()`; [Outcomes](/concepts/outcomes) has the per-backend table.
 
 A consumer attaches to the durable `{queue}-consumer` as it finds it, and creates it only when nothing has. JetStream stops redelivering a message after the durable's `max_deliver` deliveries and tells no consumer, so a message that is redelivered that often waits on the stream for good and is never dead-lettered. On an external stream a retry is a redelivery, and a message runs out of retries on delivery `max_retries + 1`, so a consumer refuses to attach, with a `ShoveError::Topology`, when `0 < max_deliver <= max_retries`. Any other cap draws a warning on attach, on every stream, naming the cap, since a `Defer`, an `ack_wait` expiry or a failed ack redelivers a message as well. Lift a cap in place with `nats consumer edit <stream> <durable> --max-deliver=-1`.
+
+That check covers a single consumer's attach and the attach of a group's workers. A consumer group upserts its durable at every registration from its own config, which sets no `max_deliver`, so registering a group lifts a cap the durable had, and a cap set afterwards is judged when a worker next attaches. The durables of FIFO shards and of a DLQ drain are attached without the check, so a cap on one of them goes unreported.
 
 `external()` and `nats_stream_config()` are mutually exclusive - and both are incompatible with `nats_subjects()` and `sequenced()`, which configure stream *creation* that external mode skips. `build()` panics if they are combined.
 `nats_external_stream()` remains for one release as a deprecated alias of `external()`.
