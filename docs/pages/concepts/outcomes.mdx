@@ -40,7 +40,8 @@ The topic topology defines the hold queues; the consumer options define `max_ret
 ## With no hold queues
 
 The tier formula above needs at least one hold queue.
-A topology that declares none gives `Retry` and `Defer` no delay to pick, and each backend redelivers the message in its own way:
+A topology that declares none gives `Retry` and `Defer` no delay to pick.
+For the single-message consumers of a shared queue, each backend then redelivers the message in its own way:
 
 | Backend | Redelivered | Warning logged |
 |---|---|---|
@@ -62,6 +63,11 @@ Declare a hold queue to choose the delay.
 The warnings in the table are logged each time the consumer takes the fallback.
 Building a topology that declares a DLQ and no hold queues also logs one warning at build time, whichever backend it runs on.
 The warning links back to this section and is described in [Configuring hold queues](/guides/retries#configuring-hold-queues).
+It is skipped for a sequenced topology and for one that calls `allow_message_loss()`.
+
+Two other consumers never take this fallback.
+A broadcast subscription discards a `Retry` and waits 1 s before it redelivers a `Defer`, on every backend that supports broadcast; see [Broadcast](/concepts/broadcast#best-effort-is-the-contract-not-a-limitation).
+A batch consumer redelivers the whole batch for a `Retry` or a `Defer`, with no per-batch retry budget; see [`BatchConsumer`](https://docs.rs/shove/latest/shove/struct.BatchConsumer.html#method.run).
 
 ## Reject vs Retry
 

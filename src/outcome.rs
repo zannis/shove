@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// [`Retry`](Outcome::Retry) and [`Defer`](Outcome::Defer) take their delay
 /// from the topology's hold queues. A topology that declares none gives them
-/// no delay to pick, and each backend redelivers in its own way:
+/// no delay to pick. For the single-message consumers of a shared queue, each
+/// backend then redelivers in its own way:
 ///
 /// - **Kafka**: after a fixed 1 s the record is republished into the topic,
 ///   with the retry count incremented for a `Retry`. Under
@@ -30,11 +31,18 @@ use serde::{Deserialize, Serialize};
 ///
 /// Those warnings are logged each time the fallback is taken. Building a
 /// topology that declares a DLQ and no hold queues also logs one warning at
-/// build time, on every backend.
+/// build time, whichever backend it runs on. The warning is skipped for a
+/// sequenced topology and for one that calls `allow_message_loss()`.
 ///
 /// A `Retry` still increments the retry count on every backend except
 /// RabbitMQ. The 1 s wait on Kafka and NATS has no setting; declare a hold
 /// queue to choose the delay.
+///
+/// Two other consumers never take this fallback. A
+/// [`BroadcastSubscriber`](crate::BroadcastSubscriber) discards a `Retry` and
+/// waits 1 s before it redelivers a `Defer`, on every backend that supports
+/// broadcast. A [`BatchConsumer`](crate::BatchConsumer) redelivers the whole
+/// batch for a `Retry` or a `Defer`, with no per-batch retry budget.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Outcome {
     /// Processed successfully. Remove from queue.
@@ -94,10 +102,9 @@ pub enum Outcome {
     /// to `Ack`, `Retry`, or `Reject`.
     ///
     /// If no hold queues are configured, `Defer` falls back the way
-    /// [`Retry`](Outcome::Retry) does, with the retry counter left unchanged.
-    /// Kafka and NATS redeliver after a fixed 1 s and the other backends
-    /// redeliver with no delay. Which backends log a warning is listed under
-    /// "Without hold queues" on [`Outcome`].
+    /// [`Retry`](Outcome::Retry) does. Kafka and NATS redeliver after a fixed
+    /// 1 s and the other backends redeliver with no delay. Which backends log
+    /// a warning is listed under "Without hold queues" on [`Outcome`].
     ///
     /// # Sequenced (FIFO) consumers
     ///

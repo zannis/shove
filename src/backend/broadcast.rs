@@ -210,10 +210,11 @@ mod settling {
     /// handler.
     ///
     /// A broadcast topology cannot declare hold queues (`build()` rejects the
-    /// pair), so there is no configured backoff to read. One second matches the
-    /// fallback every backend's `route_outcome` already uses when `hold_queues` is
-    /// empty, so a `Defer` on a broadcast subscription is paced like a `Defer`
-    /// anywhere else.
+    /// pair), so there is no configured backoff to read. One second is the delay
+    /// Kafka and NATS already use for a `Defer` when `hold_queues` is empty; the
+    /// other backends redeliver an ordinary `Defer` with no delay in that case.
+    /// Every broadcast loop waits this one constant regardless, so a broadcast
+    /// `Defer` is paced the same on every backend.
     #[allow(dead_code)] // Callers gated behind backend features.
     pub(crate) const BROADCAST_DEFER_DELAY: Duration = Duration::from_secs(1);
 
