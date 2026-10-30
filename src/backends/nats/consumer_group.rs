@@ -345,6 +345,11 @@ impl NatsConsumerGroup {
                         return;
                     }
                 };
+                // A dropped `JoinHandle` detaches its task; abort the shards with this wrapper.
+                let _shards: Vec<AbortOnDrop> = handles
+                    .iter()
+                    .map(|handle| AbortOnDrop(handle.abort_handle()))
+                    .collect();
                 for handle in handles {
                     match handle.await {
                         Ok(Ok(())) => {}
