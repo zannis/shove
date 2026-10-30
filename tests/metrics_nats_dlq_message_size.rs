@@ -9,11 +9,11 @@
 //! `record_message_size` is placed on each backend's main consume path. The
 //! dedicated DLQ-drain loops are a second delivery path that call site does
 //! not cover: `NatsConsumer::run_dlq` in `src/backends/nats/consumer.rs` pulls
-//! from the DLQ stream and applies its own `DEFAULT_MAX_MESSAGE_SIZE` gate
-//! without touching the main loop, so it applied a size limit while never
-//! sampling the size. The same held for the Kafka, RabbitMQ and in-memory DLQ
-//! loops; each has its own `metrics_*_dlq_message_size` binary asserting the
-//! same rule.
+//! from the DLQ stream and applies its own `max_message_size` gate without
+//! touching the main loop, so it applied a size limit while never sampling
+//! the size. The same held for the Kafka, RabbitMQ and in-memory DLQ loops;
+//! each has its own `metrics_*_dlq_message_size` binary asserting the same
+//! rule.
 //!
 //! Three things are pinned here, and the third is the reason this is worth a
 //! test rather than a code comment:

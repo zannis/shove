@@ -200,6 +200,12 @@ A held message, a retry waiting for a hold, and a message whose retry copy or de
 On a stop or a scale-down, the messages a worker pulled and never started are nak'd without delay, so another consumer takes them at once.
 A message held for a retry at that point is left un-acked, and is redelivered once its `ack_wait` expires.
 
+A consumer that leaves any other way than a stop waits for the message tasks it started before it returns.
+That covers a consumer that has spent its reconnect attempts, one that hit an error a reconnect cannot clear, and one that was told to shut down while it waited to reconnect.
+The wait ends after 35 s, the default handler timeout plus a 5 s grace.
+A task still running then goes on, and settles its message when it finishes.
+An error that sends the consumer to reconnect does not wait: the tasks it started keep their slots, so the worker pulls only what it can start.
+
 ## Sequenced delivery
 
 Messages for the same key stay in order. NATS uses subject-based shard routing: the publisher derives a subject suffix from `T::sequence_key()` and routes to a dedicated shard subject. Each shard consumer is configured with `max_ack_pending: 1`, meaning at most one message per shard is in-flight at a time. Messages for the same key are never processed concurrently.
@@ -220,7 +226,45 @@ Until then it holds its shard: every message behind it, other keys included, wai
 A dead letter whose publish fails keeps the message un-acked, and the publish is retried until it lands.
 The delay before each attempt doubles from about a second up to a 30 s ceiling and is jittered by up to half either way, so attempts at the ceiling come 15 to 45 s apart.
 
+When a group's drain timeout runs out with a handler still going, the group aborts its shard tasks along with its own task.
+The message a shard was handling is then left un-acked, and JetStream redelivers it once its `ack_wait` expires.
+No shard settles a message after the group has reported the timeout.
+
 See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced example](/backends/nats/examples/sequenced) for a runnable walkthrough.
+
+## Draining the DLQ
+
+`NatsConsumer::run_dlq` reads the dead-letter stream of a topic into `handle_dead`, and runs until the broker is closed.
+`run_dlq_with_options` takes the options of a consumer, and stops once the token given to `with_shutdown` fires and the dead letter in hand has settled:
+
+```rust,no_run
+let stop = CancellationToken::new();
+consumer
+    .run_dlq_with_options::<OrderTopic, _>(
+        AlertingHandler,
+        (),
+        ConsumerOptions::<Nats>::new()
+            .with_shutdown(stop.clone())
+            .with_handler_timeout(Duration::from_secs(10))
+            .with_max_message_size(1_000_000),
+    )
+    .await?;
+```
+
+The drain acks every dead letter once it is done with it.
+`handle_dead` runs under the handler timeout, 30 s by default, and a panic in it is caught.
+A call that panics or times out is logged and its dead letter is acked, and the drain goes on with the next one.
+
+A dead letter over `max_message_size`, 10 MiB by default, never reaches `handle_dead`.
+The drain logs it with its size and acks it, which removes it from the DLQ stream.
+A dead letter the codec cannot decode is logged and acked the same way.
+Neither one counts in `shove_messages_discarded_total`.
+`with_max_reconnect_attempts` bounds the consecutive reconnects of the drain, as it does for any consumer.
+
+The drain labels its metrics with the source topic and the `consumer_group` of its options, `default` when it has none.
+The `handle_dead` call is measured like a handler call, so it shows in `shove_messages_inflight` and `shove_message_processing_duration_seconds`.
+`shove_messages_consumed_total` counts it as `ack` when it returns, and as `retry` when it panics or times out, or under the outcome set with `with_handler_timeout_outcome` after a timeout, although the dead letter is acked either way.
+Give the drain its own `with_consumer_group` to keep these series apart from those of the main consumer.
 
 ## Consumer groups + autoscaling
 

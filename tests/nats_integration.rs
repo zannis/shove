@@ -7261,3 +7261,546 @@ async fn a_worker_pulls_again_once_its_connection_comes_back() {
         .expect("the consumer stops cleanly");
     broker.close().await;
 }
+
+// ===========================================================================
+// DLQ drain
+// ===========================================================================
+
+/// Records the id of every dead letter it is handed. A letter called `boom`
+/// makes `handle_dead` panic, and one called `hang` makes it never return.
+#[derive(Clone)]
+struct DeadLetterProbe {
+    handled: Arc<Mutex<Vec<String>>>,
+    counter: WaitableCounter,
+}
+
+impl DeadLetterProbe {
+    fn new() -> Self {
+        Self {
+            handled: Arc::new(Mutex::new(Vec::new())),
+            counter: WaitableCounter::new(),
+        }
+    }
+
+    async fn handled(&self) -> Vec<String> {
+        self.handled.lock().await.clone()
+    }
+}
+
+impl MessageHandler<WorkTopic> for DeadLetterProbe {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+
+    async fn handle_dead(&self, msg: SimpleMessage, _meta: DeadMessageMetadata, _: &()) {
+        self.handled.lock().await.push(msg.id.clone());
+        self.counter.increment();
+        match msg.id.as_str() {
+            "boom" => panic!("handle_dead panics on purpose"),
+            "hang" => std::future::pending::<()>().await,
+            _ => {}
+        }
+    }
+}
+
+/// Puts a dead letter carrying `payload` straight into the DLQ stream of
+/// [`WorkTopic`].
+async fn publish_dead_letter(client: &NatsClient, payload: &[u8]) {
+    raw_publish(
+        client,
+        "nats-work-dlq",
+        async_nats::HeaderMap::new(),
+        payload,
+    )
+    .await;
+}
+
+/// Runs a DLQ drain of [`WorkTopic`] on a task of its own.
+fn spawn_dlq_drain(
+    client: &NatsClient,
+    probe: &DeadLetterProbe,
+    options: ConsumerOptions<Nats>,
+) -> tokio::task::JoinHandle<Result<(), shove::ShoveError>> {
+    let consumer = NatsConsumer::new(client.clone());
+    let probe = probe.clone();
+    tokio::spawn(async move {
+        consumer
+            .run_dlq_with_options::<WorkTopic, _>(probe, (), options)
+            .await
+    })
+}
+
+/// Cancels `shutdown` and expects the drain to stop cleanly.
+async fn stop_dlq_drain(
+    shutdown: &CancellationToken,
+    drain: tokio::task::JoinHandle<Result<(), shove::ShoveError>>,
+) {
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), drain)
+        .await
+        .expect("the drain stops in time")
+        .expect("the drain task does not panic")
+        .expect("the drain stops cleanly");
+}
+
+/// The drain gates dead letters at the `max_message_size` its options carry,
+/// not at a fixed 10 MiB. An oversized letter is logged with its size and
+/// acked without reaching `handle_dead`, and the letter behind it is handled.
+#[tokio::test]
+async fn dlq_drain_honours_max_message_size() {
+    use tracing::Level;
+    use tracing::subscriber::set_default;
+
+    const LIMIT: usize = 100;
+
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let _logging = set_default(subscriber);
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    let oversized = serde_json::to_vec(&SimpleMessage {
+        id: "oversized".into(),
+        content: "x".repeat(400),
+    })
+    .unwrap();
+    let small = simple_payload("small");
+    assert!(small.len() <= LIMIT && LIMIT < oversized.len());
+    publish_dead_letter(&client, &oversized).await;
+    publish_dead_letter(&client, &small).await;
+
+    let probe = DeadLetterProbe::new();
+    let shutdown = CancellationToken::new();
+    let drain = spawn_dlq_drain(
+        &client,
+        &probe,
+        ConsumerOptions::<Nats>::new()
+            .with_shutdown(shutdown.clone())
+            .with_max_message_size(LIMIT),
+    );
+
+    assert!(
+        probe.counter.wait_for(1, TIMEOUT).await,
+        "the small letter is handled"
+    );
+    assert_eq!(
+        settle_stream_messages(&client, "nats-work-dlq", 0).await,
+        0,
+        "both letters are acked"
+    );
+    assert_eq!(
+        probe.handled().await,
+        ["small"],
+        "the oversized letter never reaches handle_dead"
+    );
+    let warned = logs.contents();
+    assert!(
+        warned.contains(&format!("bytes={}", oversized.len())),
+        "the oversized letter is logged with its size: {warned}"
+    );
+
+    stop_dlq_drain(&shutdown, drain).await;
+    broker.close().await;
+}
+
+/// A panicking `handle_dead` neither ends the drain nor keeps its letter: the
+/// panic is caught, the letter is acked, and the letter behind it is handled.
+#[tokio::test]
+async fn dlq_drain_survives_panicking_handle_dead() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    publish_dead_letter(&client, &simple_payload("boom")).await;
+    publish_dead_letter(&client, &simple_payload("after")).await;
+
+    let probe = DeadLetterProbe::new();
+    let shutdown = CancellationToken::new();
+    let drain = spawn_dlq_drain(
+        &client,
+        &probe,
+        ConsumerOptions::<Nats>::new().with_shutdown(shutdown.clone()),
+    );
+
+    assert!(
+        probe.counter.wait_for(2, TIMEOUT).await,
+        "the letter behind the panicking one is handled: {:?}",
+        probe.handled().await
+    );
+    assert_eq!(probe.handled().await, ["boom", "after"]);
+    assert_eq!(
+        settle_stream_messages(&client, "nats-work-dlq", 0).await,
+        0,
+        "the panicking letter is acked too"
+    );
+    assert!(!drain.is_finished(), "the drain outlives the panic");
+
+    stop_dlq_drain(&shutdown, drain).await;
+    broker.close().await;
+}
+
+/// A `handle_dead` that never returns holds the drain for the handler timeout
+/// at most: its letter is acked and the letter behind it is handled.
+#[tokio::test]
+async fn dlq_drain_bounds_handle_dead_by_the_handler_timeout() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    publish_dead_letter(&client, &simple_payload("hang")).await;
+    publish_dead_letter(&client, &simple_payload("after")).await;
+
+    let probe = DeadLetterProbe::new();
+    let shutdown = CancellationToken::new();
+    let drain = spawn_dlq_drain(
+        &client,
+        &probe,
+        ConsumerOptions::<Nats>::new()
+            .with_shutdown(shutdown.clone())
+            .with_handler_timeout(Duration::from_millis(500)),
+    );
+
+    assert!(
+        probe.counter.wait_for(2, TIMEOUT).await,
+        "the letter behind the hanging one is handled: {:?}",
+        probe.handled().await
+    );
+    assert_eq!(probe.handled().await, ["hang", "after"]);
+    assert_eq!(
+        settle_stream_messages(&client, "nats-work-dlq", 0).await,
+        0,
+        "the letter that timed out is acked too"
+    );
+
+    stop_dlq_drain(&shutdown, drain).await;
+    broker.close().await;
+}
+
+/// The drain ends when the token of its options fires, with the broker still
+/// open.
+#[tokio::test]
+async fn dlq_drain_stops_on_options_shutdown() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    let probe = DeadLetterProbe::new();
+    let shutdown = CancellationToken::new();
+    let drain = spawn_dlq_drain(
+        &client,
+        &probe,
+        ConsumerOptions::<Nats>::new().with_shutdown(shutdown.clone()),
+    );
+    wait_for_open_pull(&client, "nats-work-dlq", "nats-work-dlq-consumer").await;
+
+    shutdown.cancel();
+    let stopped = tokio::time::timeout(Duration::from_secs(10), drain).await;
+    assert!(
+        !client.shutdown_token().is_cancelled(),
+        "the broker is still open"
+    );
+    stopped
+        .expect("the drain stops when the token of its options fires")
+        .expect("the drain task does not panic")
+        .expect("the drain stops cleanly");
+    broker.close().await;
+}
+
+/// `with_broadcast_start` is read by a broadcast subscription alone, so the
+/// drain refuses it instead of dropping it silently.
+#[tokio::test]
+async fn dlq_drain_refuses_a_broadcast_start() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+
+    let err = NatsConsumer::new(tb.client())
+        .run_dlq_with_options::<WorkTopic, _>(
+            DeadLetterProbe::new(),
+            (),
+            ConsumerOptions::<Nats>::new().with_broadcast_start(shove::BroadcastStart::Head),
+        )
+        .await
+        .expect_err("a broadcast start is refused");
+    let shove::ShoveError::Topology(message) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(message.contains("NatsConsumer::run_dlq"), "{message}");
+    broker.close().await;
+}
+
+// ===========================================================================
+// Exit drain
+// ===========================================================================
+
+shove::define_topic!(
+    ExitDrainTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-exit-drain").build()
+);
+
+/// Starts, works for `work`, then finishes, so a test can tell from the two
+/// counters where in a handler a consumer returned.
+#[derive(Clone)]
+struct SlowToFinish {
+    work: Duration,
+    started: WaitableCounter,
+    finished: WaitableCounter,
+}
+
+impl SlowToFinish {
+    fn new(work: Duration) -> Self {
+        Self {
+            work,
+            started: WaitableCounter::new(),
+            finished: WaitableCounter::new(),
+        }
+    }
+}
+
+impl MessageHandler<ExitDrainTopic> for SlowToFinish {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.started.increment();
+        tokio::time::sleep(self.work).await;
+        self.finished.increment();
+        Outcome::Ack
+    }
+}
+
+/// Starts a consumer of [`ExitDrainTopic`] on `handler`, publishes one
+/// message, and returns once the handler is running on it.
+async fn consume_one_slow_message(
+    tb: &TestBroker,
+    handler: &SlowToFinish,
+    options: ConsumerOptions<Nats>,
+) -> tokio::task::JoinHandle<Result<(), shove::ShoveError>> {
+    let broker = tb.broker();
+    broker.topology().declare::<ExitDrainTopic>().await.unwrap();
+    let consumer = NatsConsumer::new(tb.client());
+    let hc = handler.clone();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<ExitDrainTopic, _>(hc, (), options.with_prefetch_count(2))
+            .await
+    });
+    wait_for_open_pull(&tb.client(), "nats-exit-drain", "nats-exit-drain-consumer").await;
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<ExitDrainTopic>(&SimpleMessage {
+            id: "slow".into(),
+            content: String::new(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        handler.started.wait_for(1, TIMEOUT).await,
+        "the handler is running"
+    );
+    handle
+}
+
+/// Ends the open pull of the consumer of [`ExitDrainTopic`] with a status the
+/// worker counts as a connection error, by deleting the durable it pulls from.
+async fn delete_exit_drain_durable(client: &NatsClient) {
+    client
+        .jetstream()
+        .get_stream("nats-exit-drain")
+        .await
+        .expect("the stream exists")
+        .delete_consumer("nats-exit-drain-consumer")
+        .await
+        .expect("the durable is deleted");
+}
+
+/// A consumer that leaves on a stream error does not leave its handlers
+/// behind. The error spends the only reconnect attempt, and the consumer
+/// returns it only once the handler that was running has finished.
+#[tokio::test]
+async fn stream_error_exit_waits_for_in_flight_handlers() {
+    let tb = TestBroker::start().await;
+    let handler = SlowToFinish::new(Duration::from_secs(3));
+    let handle = consume_one_slow_message(
+        &tb,
+        &handler,
+        ConsumerOptions::<Nats>::new().with_max_reconnect_attempts(1),
+    )
+    .await;
+
+    delete_exit_drain_durable(&tb.client()).await;
+    let ended = tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the consumer exits on the stream error")
+        .expect("the consumer task does not panic");
+
+    assert!(
+        ended.is_err(),
+        "the stream error is what ends the consumer: {ended:?}"
+    );
+    assert_eq!(
+        handler.finished.get(),
+        1,
+        "the consumer returned while its handler was still running"
+    );
+    tb.broker().close().await;
+}
+
+/// A shutdown that arrives while the consumer waits to reconnect after a
+/// stream error ends it as a stop would: only once the handlers it started in
+/// the cycle that failed have finished.
+#[tokio::test]
+async fn shutdown_during_reconnect_backoff_waits_for_in_flight_handlers() {
+    use tracing::Level;
+    use tracing::subscriber::set_default;
+
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let _logging = set_default(subscriber);
+
+    let tb = TestBroker::start().await;
+    let handler = SlowToFinish::new(Duration::from_secs(3));
+    let shutdown = CancellationToken::new();
+    let handle = consume_one_slow_message(
+        &tb,
+        &handler,
+        ConsumerOptions::<Nats>::new().with_shutdown(shutdown.clone()),
+    )
+    .await;
+
+    delete_exit_drain_durable(&tb.client()).await;
+    let deadline = Instant::now() + TIMEOUT;
+    while !logs.contents().contains("consumer error, reconnecting") {
+        assert!(
+            Instant::now() < deadline,
+            "the stream error never sent the consumer to reconnect: {}",
+            logs.contents()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    shutdown.cancel();
+    let ended = tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the consumer exits on the shutdown")
+        .expect("the consumer task does not panic");
+
+    assert!(
+        ended.is_ok(),
+        "a shutdown ends the consumer cleanly: {ended:?}"
+    );
+    assert_eq!(
+        handler.finished.get(),
+        1,
+        "the consumer returned while its handler was still running"
+    );
+    tb.broker().close().await;
+}
+
+// ===========================================================================
+// FIFO group abort
+// ===========================================================================
+
+shove::define_sequenced_topic!(
+    SeqAbortTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("nats-fifo-abort")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_millis(200))
+        .dlq()
+        .build()
+);
+
+/// Starts, works for `work`, then acks.
+#[derive(Clone)]
+struct SlowFifoHandler {
+    work: Duration,
+    started: WaitableCounter,
+}
+
+impl MessageHandler<SeqAbortTopic> for SlowFifoHandler {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.started.increment();
+        tokio::time::sleep(self.work).await;
+        Outcome::Ack
+    }
+}
+
+/// A group whose drain times out aborts its shard tasks with it. The shard
+/// that was waiting on a handler is gone, so it never settles that handler's
+/// message after the timeout was reported: the message stays in the stream,
+/// un-acked.
+#[tokio::test]
+async fn fifo_group_drain_timeout_stops_shards() {
+    const WORK: Duration = Duration::from_secs(3);
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqAbortTopic>().await.unwrap();
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<SeqAbortTopic>(&OrderMessage {
+            order_id: "A".into(),
+            amount: 0,
+        })
+        .await
+        .unwrap();
+
+    let handler = SlowFifoHandler {
+        work: WORK,
+        started: WaitableCounter::new(),
+    };
+    let mut group = broker.consumer_group();
+    group
+        .register_fifo::<SeqAbortTopic, _>(
+            ConsumerGroupConfig::new(NatsConsumerGroupConfig::default()),
+            {
+                let h = handler.clone();
+                move || h.clone()
+            },
+        )
+        .await
+        .unwrap();
+
+    let signal = {
+        let started = handler.started.clone();
+        async move {
+            started.wait_for(1, Duration::from_secs(30)).await;
+        }
+    };
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_millis(500))
+        .await;
+    assert!(
+        outcome.timed_out,
+        "the handler outlasts the drain: {outcome:?}"
+    );
+
+    // Past the point where the handler would have returned, and a shard that
+    // survived the abort would have acked the message.
+    tokio::time::sleep(WORK + Duration::from_secs(1)).await;
+    assert_eq!(
+        stream_messages(&client, "nats-fifo-abort").await,
+        1,
+        "a shard settled its message after the drain timeout was reported"
+    );
+    broker.close().await;
+}
