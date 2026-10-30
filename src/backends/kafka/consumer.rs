@@ -12913,8 +12913,8 @@ mod message_id_tests {
         assert!(
             deferred
                 .strip_prefix("a-d")
-                .is_some_and(|uuid| Uuid::try_parse(uuid).is_ok()),
-            "{deferred}"
+                .is_some_and(|suffix| Uuid::try_parse(suffix).is_ok()),
+            "a Defer copy's id is the base, `-d` and a UUID"
         );
         assert_ne!(deferred, copy_message_id("a", Hop::Defer));
     }
