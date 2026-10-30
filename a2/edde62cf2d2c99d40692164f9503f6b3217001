@@ -1,0 +1,25 @@
+docs/pages/guides/observability.mdx
+  s_1001dc3147e1e5::t_14c5ee65c3f052 279,281-287,289,291
+src/backends/redis/publisher.rs
+  s_1001dc3147e1e5::t_f421608c234e4d 42,44-45
+src/backends/redis/constants.rs
+  s_1001dc3147e1e5::t_82d23636dd2e3a 7-8
+src/publisher.rs
+  s_1001dc3147e1e5::t_0a0715ea9db4db 34-37,40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a2edde62cf2d2c99d40692164f9503f6b3217001",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
