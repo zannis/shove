@@ -1,0 +1,56 @@
+docs/pages/backends/kafka.mdx
+  s_1001dc3147e1e5::t_09486ba4071dc3 258
+  s_1001dc3147e1e5::t_f05617c2661c69 283-286
+src/backends/kafka/publisher.rs
+  s_1001dc3147e1e5::t_dec6c72294017e 212-215
+  s_1001dc3147e1e5::t_75f6af9518a834 38-39
+  s_1001dc3147e1e5::t_e93c302b126064 174-175,181-184,190
+  s_1001dc3147e1e5::t_b2f57432dbceb5 5
+src/backends/kafka/client.rs
+  s_1001dc3147e1e5::t_af2d95e0eb0d90 655
+  s_1001dc3147e1e5::t_df1ebc9b6ae097 2431
+  s_1001dc3147e1e5::t_f64be4a9d36574 9
+  s_1001dc3147e1e5::t_bdc76f789e60fc 964-965,970-971,975-976
+  s_1001dc3147e1e5::t_41f52762ad6959 1012-1020
+  s_1001dc3147e1e5::t_2a88d38961609d 563-564,566,570,572-586,592-596,604-614,617,620-625,628,631-654,656-669
+  s_1001dc3147e1e5::t_ded36ae25f93e6 629-630
+  s_1001dc3147e1e5::t_c1b9eff4dbc8b9 2384-2388
+  s_1001dc3147e1e5::t_9423267b6c31d1 8
+  s_1001dc3147e1e5::t_ad439ad41c3966 567-569,597-598,602-603
+  s_1001dc3147e1e5::t_925e42df82271c 1930
+  s_1001dc3147e1e5::t_2e8391e42e74c5 27
+  s_1001dc3147e1e5::t_4bb093767f0cff 944
+  s_1001dc3147e1e5::t_19fbbc7ceb4a84 930-933,941-943,945
+  s_1001dc3147e1e5::t_3ca50581d28ef8 2498-2559
+  s_1001dc3147e1e5::t_735e00cba6bec1 467,473-479,481-491,495-496,498,504-505,507,520-521,526,530-532,534,543-547,549-551
+  s_1001dc3147e1e5::t_61b6269ff3199e 2377-2378,2380
+  s_1001dc3147e1e5::t_b847ddaf74a6df 2437-2497
+  s_1001dc3147e1e5::t_d70581126af562 748,753
+  s_75dc8c8d29ca8f::t_12bb4e7cea9dc0 571
+src/backends/kafka/constants.rs
+  s_1001dc3147e1e5::t_1ae499aa7bd9c3 181-191
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6f73f1f26da63b2bed69b806473efd74a2c6565d",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_75dc8c8d29ca8f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1b902fc7-53eb-4627-a926-3bc86aa1e117",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+src/batch.rs
+  s_1001dc3147e1e5::t_64727241d6f707 67-70
+  s_1001dc3147e1e5::t_44c0cee4120c66 89-92
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bedc399176402a775f78c253c29348de8b1ce1bb",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
