@@ -3610,11 +3610,11 @@ struct PendingCommit {
 /// unconfirmed (see the receive loop), so `recv()` yields nothing of it and
 /// serves the rebalance callbacks and the poll budget instead. A record it
 /// does yield is put back with the pause widened: under `PerRecord` it
-/// belongs to a partition assigned during the pause, and the sequenced
-/// consumer, which commits with nothing paused, takes its pause from the
-/// first record that arrives. The wait ends on the answer, on shutdown, or
-/// on a fault a handler task reports over `fault_rx`, when the loop has
-/// handler tasks. The answer is librdkafka's result for the whole
+/// belongs to a partition assigned during the pause, as it does during a
+/// sequenced consumer's wait on its record, and a sequenced commit made
+/// with nothing paused takes its pause from the first record that arrives.
+/// The wait ends on the answer, on shutdown, or on a fault a handler task
+/// reports over `fault_rx`, when the loop has handler tasks. The answer is librdkafka's result for the whole
 /// commit operation, which it waits for without a timeout of its own
 /// (bundled librdkafka 2.12.1, `rdkafka_offset.c:403-406`): a request
 /// unanswered for `socket.timeout.ms` is retried up to two times
