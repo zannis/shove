@@ -1008,7 +1008,7 @@ async fn a_cancellation_during_the_negative_cache_step_leaves_no_inflight_entry(
 // A sequenced batch through a publisher that frames with the registry
 // ---------------------------------------------------------------------------
 
-const LEDGER_BATCH: usize = 8;
+const LEDGER_BATCH: u32 = 8;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct LedgerEntry {
@@ -1033,7 +1033,7 @@ async fn reverse_order_latest(
     Path(subject): Path<String>,
 ) -> Json<serde_json::Value> {
     let arrival = s.calls.fetch_add(1, Ordering::SeqCst);
-    let later = u32::try_from(LEDGER_BATCH.saturating_sub(arrival)).expect("a small count");
+    let later = LEDGER_BATCH.saturating_sub(u32::try_from(arrival).expect("a small count"));
     tokio::time::sleep(std::time::Duration::from_millis(40) * later).await;
     Json(serde_json::json!({
         "subject": subject,
@@ -1088,7 +1088,7 @@ async fn a_sequenced_batch_resolves_the_schema_id_once_and_keeps_slice_order() {
         )
         .await
         .expect("publisher");
-    let batch: Vec<LedgerEntry> = (0..8)
+    let batch: Vec<LedgerEntry> = (0..LEDGER_BATCH)
         .map(|seq| LedgerEntry {
             account: "acct-1".into(),
             seq,
@@ -1116,8 +1116,9 @@ async fn a_sequenced_batch_resolves_the_schema_id_once_and_keeps_slice_order() {
         .add_partition_offset(topic, 0, Offset::Beginning)
         .expect("name the partition");
     consumer.assign(&assignment).expect("assign the partition");
-    let mut stored = Vec::with_capacity(LEDGER_BATCH);
-    while stored.len() < LEDGER_BATCH {
+    let expected = batch.len();
+    let mut stored = Vec::with_capacity(expected);
+    while stored.len() < expected {
         let message = tokio::time::timeout(std::time::Duration::from_secs(10), consumer.recv())
             .await
             .expect("every record is read back")
@@ -1135,7 +1136,7 @@ async fn a_sequenced_batch_resolves_the_schema_id_once_and_keeps_slice_order() {
     }
     assert_eq!(
         stored,
-        (0..8).collect::<Vec<u32>>(),
+        (0..LEDGER_BATCH).collect::<Vec<u32>>(),
         "stored in slice order"
     );
     broker.close().await;
