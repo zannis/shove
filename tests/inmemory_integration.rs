@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -2141,6 +2141,57 @@ async fn autoscaling_scales_up_under_backlog_then_drains_clean() {
     // InMemoryConsumerGroupRegistry. This test verifies the full integrated
     // lifecycle: broker setup → topic declaration → consumer group registration
     // → autoscaling enabled → backlog published → signal → clean drain.
+}
+
+/// Raises its flag only after a pause, so a drop that nothing waits for is
+/// still unfinished when the caller moves on.
+struct SlowDrop(Arc<AtomicBool>);
+
+impl Drop for SlowDrop {
+    fn drop(&mut self) {
+        std::thread::sleep(Duration::from_millis(300));
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// With autoscaling on, `run_until_timeout` races the caller's signal against
+/// the group's own cancellation. When the cancellation wins, the signal task
+/// is aborted and awaited, so the signal future is gone, and has finished
+/// dropping what it held, by the time the call goes on to stop the autoscaler
+/// and drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autoscaled_run_until_timeout_waits_for_the_aborted_signal_task() {
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .unwrap();
+    let group = broker.consumer_group();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let held = SlowDrop(Arc::clone(&dropped));
+    group.cancellation_token().cancel();
+    let cfg = AutoscalerConfig {
+        poll_interval: Duration::from_millis(100),
+        scale_up_multiplier: 1.5,
+        scale_down_multiplier: 0.3,
+        hysteresis_duration: Duration::from_millis(100),
+        cooldown_duration: Duration::from_millis(200),
+    };
+
+    let outcome = group
+        .enable_autoscaling(cfg)
+        .run_until_timeout(
+            async move {
+                let _held = held;
+                std::future::pending::<()>().await;
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+    assert!(outcome.is_clean(), "{outcome:?}");
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "run_until_timeout returned while the aborted signal task was still dropping"
+    );
 }
 
 // ---------------------------------------------------------------------------

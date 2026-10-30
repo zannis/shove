@@ -53,6 +53,9 @@ cargo add shove --features kafka-msk-iam
 
 `KafkaConfig::new` takes a bootstrap server address (e.g. `localhost:9092`). TLS and SASL are configured via `KafkaTls` and `KafkaSasl` on the config — available when the `kafka-ssl` feature is enabled.
 
+librdkafka's constructors can block while they read TLS files.
+`connect` builds its metadata consumer on a blocking thread, and so do `declare` for its admin client and the autoscaler for its lag-reading consumer, so none of them holds the runtime's thread.
+
 ## Connecting to AWS MSK
 
 The `kafka-msk-iam` feature adds IAM-based authentication for Amazon MSK clusters. It pulls in `aws-config`, `aws-credential-types`, and `aws-msk-iam-sasl-signer`. Use it alongside `kafka-ssl`:
@@ -102,6 +105,24 @@ Declaration is idempotent, so it is safe to call on every startup.
 Producer topic auto-creation defaults to off (`allow.auto.create.topics=false`), so declare the topology before the first publish or provision the topic outside shove.
 A publish to a topic nobody declared fails with a `Connection` error after the produce timeout, and the topic stays absent.
 Set [`KafkaConfig::with_producer_auto_create_topics(true)`](https://docs.rs/shove/latest/shove/kafka/struct.KafkaConfig.html#method.with_producer_auto_create_topics) to allow creation on first publish when the broker enables `auto.create.topics.enable=true`.
+
+### Partitions of an existing topic
+
+`declare` creates the main topic with at least eight partitions, and more when `with_min_partitions` or the registry's `max_consumers` ask for more.
+It raises an existing topic to that count.
+A group with no committed offset on a partition starts it at its `auto.offset.reset`.
+Under `KafkaAutoOffsetReset::Latest` a record produced to a new partition before the group is assigned it is skipped, so the registry logs a warning when it raises the partitions under a group configured with `Latest`.
+
+A sequenced topic is created with exactly its `routing_shards` partitions, and `with_min_partitions` has no effect on it.
+Keys are routed over the partitions, so adding one remaps part of the keys while their backlog sits in the partition they mapped to before.
+`declare` therefore never adds partitions to a sequenced topic.
+A topic with fewer partitions than `routing_shards` is refused with a `ShoveError::Topology` that names both counts, and the topic is left as it was.
+A topic with more partitions is accepted as it is and logged with a warning.
+
+Several processes can declare the same topic at once.
+A declarer that finds the topic already at the count it asked for has nothing to do, including one that loses the race to expand it.
+The metadata of a topic that was just created can lag, so `declare` reads it again for up to a few seconds while the broker answers unknown topic or leader not available.
+A declarer whose expansion the controller refuses reads the count again, for the same few seconds, until it shows the count asked for, because the broker that answers can still report the old one.
 
 ### Retry and defer without hold queues
 
@@ -256,6 +277,16 @@ The client holds a single producer, built at the first publish.
 `publisher()` and the consumer's retry, defer, and DLQ republishes share it.
 A long linger also delays those republishes, and the offset commits gated on them for sequenced topics.
 Keep linger modest when consumers republish on the same client.
+
+### Closing the client
+
+`Broker::close` cancels the client's shutdown token, waits 500 ms for work in flight, and then flushes the producer.
+A producer build still running at that point is waited for at most 2 s, and a build that outlasts the wait is not flushed.
+The flush gives records still queued up to 5 s to be delivered, and a record that is not delivered by then is dropped with a warning in the log.
+The flush runs on a blocking thread, so a broker that never answers holds `close` for those 5 s and leaves the runtime free.
+
+`run_until_timeout` on a consumer group starts draining when its signal future resolves or when the client's shutdown token is cancelled first.
+In the second case it aborts the task that runs the signal future and waits for it to finish.
 
 ## Consume
 
@@ -458,7 +489,7 @@ broker
 
 Messages for the same key stay in order. Kafka uses partition-key routing: `T::sequence_key()` becomes the Kafka message key, so messages with the same key always land on the same partition. A single consumer handles each partition at a time, guaranteeing that messages for the same key are never processed concurrently.
 
-Ordering is partition-scoped: two messages with different keys may land on different partitions and be processed concurrently. The partition count is fixed at topic creation time and caps the maximum degree of parallelism across the consumer group.
+Ordering is partition-scoped: two messages with different keys may land on different partitions and be processed concurrently. The partition count is the topology's `routing_shards`, fixed at topic creation time, and caps the maximum degree of parallelism across the consumer group. `declare` never adds partitions to a sequenced topic, see [Partitions of an existing topic](#partitions-of-an-existing-topic).
 
 See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced example](/backends/kafka/examples/sequenced) for a runnable walkthrough.
 
@@ -850,7 +881,7 @@ The Kafka backend emits `shove_messages_failed_total` with the following `reason
 ## Gotchas
 
 - **Replication factor defaults to `1`** — safe for single-broker dev, unsafe in production. Set `with_default_replication_factor(3)` on the registry (or `with_replication_factor` on the topology declarer) before the first declaration. The default exists so the no-config dev path works; the constant lives in `kafka::constants::DEFAULT_REPLICATION`.
-- **Partition count is set at topic creation time** and is rarely changed after the fact. Choose carefully — partition count caps the maximum degree of parallelism a consumer group can achieve (one consumer per partition maximum).
+- **Partition count is set at topic creation time** and is rarely changed after the fact. Choose carefully — partition count caps the maximum degree of parallelism a consumer group can achieve (one consumer per partition maximum). `declare` raises a non-sequenced topic to the count it is given and never adds partitions to a sequenced one, see [Partitions of an existing topic](#partitions-of-an-existing-topic).
 - **Consumer-group rebalances** during scale events cause brief delivery pauses. The larger the group and the more topics, the longer the rebalance. shove pins `session.timeout.ms` to 10 seconds and `max.poll.interval.ms` to 5 minutes (constants in `kafka::constants`); neither is settable via `KafkaConfig`. If handlers are slow, raise the handler timeout with `with_handler_timeout` (per group) or `with_default_handler_timeout` (registry-wide) instead.
 - **On Windows**, the `cmake-build` feature is required for `rdkafka` (the underlying C library). This is handled automatically via the `[target.'cfg(windows)'.dependencies]` entry in `Cargo.toml`.
 - **SASL and TLS** require the `kafka-ssl` feature.

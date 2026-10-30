@@ -140,6 +140,10 @@ if let Some(n) = tuning.min_partitions() {
 declarer.declare::<IngestionTopic>().await?;
 ```
 
+The minimum partition count has no effect on a sequenced topology. Its
+partition count is its `routing_shards`, and `declare` never adds partitions to
+a sequenced topic.
+
 ## Knobs shove doesn't model
 
 `EnvVars` is the primitive the constructors above are built on, and it is

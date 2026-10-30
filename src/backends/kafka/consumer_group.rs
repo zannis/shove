@@ -1246,7 +1246,8 @@ impl KafkaConsumerGroupRegistry {
         )?;
 
         let mut declarer = KafkaTopologyDeclarer::new(client.clone())
-            .with_min_partitions(config.max_consumers as i32);
+            .with_min_partitions(i32::from(config.max_consumers))
+            .with_group_offset_reset(config.auto_offset_reset());
         if let Some(rf) = self.default_replication_factor {
             declarer = declarer.with_replication_factor(rf);
         }

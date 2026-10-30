@@ -357,10 +357,13 @@ impl RegistryImpl for KafkaConsumerGroupRegistry {
         self.start_all();
 
         let broker_token = self.client_shutdown_token();
-        let signal_handle = tokio::spawn(signal);
+        let mut signal_handle = tokio::spawn(signal);
         tokio::select! {
-            _ = broker_token.cancelled() => {}
-            res = signal_handle => {
+            _ = broker_token.cancelled() => {
+                signal_handle.abort();
+                let _ = signal_handle.await;
+            }
+            res = &mut signal_handle => {
                 let _ = res;
                 broker_token.cancel();
             }

@@ -77,6 +77,15 @@ pub use consumer::final_commit_spawn_probe;
 #[doc(hidden)]
 pub use consumer::per_record_probe;
 
+/// Test-only seam (see the `test-support` feature): the topic a `ping` asks
+/// the broker about, so a test that looks for it in the cluster reads the
+/// constant itself.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn ping_probe_topic_for_test() -> &'static str {
+    constants::PING_PROBE_TOPIC
+}
+
 /// Test-only seam (see the `test-support` feature): the `session.timeout.ms`
 /// every shove consumer is created with, so a test that waits past it asserts
 /// against the constant itself rather than a hand-copied value.
