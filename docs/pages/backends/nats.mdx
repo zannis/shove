@@ -271,7 +271,8 @@ Neither one counts in `shove_messages_discarded_total`.
 `with_max_reconnect_attempts` bounds the consecutive reconnects of the drain, as it does for any consumer.
 
 The drain records `shove_message_size_bytes` for every dead letter, under the source topic and the `consumer_group` of its options, `default` when it has none.
-It records nothing else: a `handle_dead` call moves none of `shove_messages_consumed_total`, `shove_messages_inflight`, `shove_message_processing_duration_seconds` and `shove_messages_failed_total`, since the dead letter was counted when the main consumer retired it.
+A `handle_dead` call moves none of `shove_messages_consumed_total`, `shove_messages_inflight`, `shove_message_processing_duration_seconds` and `shove_messages_failed_total`, since the dead letter was counted when the main consumer retired it.
+The one other series the drain touches is `shove_backend_errors_total{backend="nats",kind="consume"}`, which counts a stream error or a closed stream.
 
 ## Consumer groups + autoscaling
 

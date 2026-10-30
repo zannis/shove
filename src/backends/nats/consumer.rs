@@ -1197,8 +1197,7 @@ const MAX_PULL_EXPIRES: Duration = Duration::from_nanos(i64::MAX.unsigned_abs())
 /// behind it, and brings the next dead letter in early. So the pull is held
 /// open for as long as a call may run: the handler timeout, or the durable's
 /// `ack_wait` without one, since a call longer than that loses its own dead
-/// letter to redelivery anyway. It is never shorter than the worker's
-/// [`PULL_EXPIRES`].
+/// letter to redelivery anyway. The worker's [`PULL_EXPIRES`] is the floor.
 ///
 /// A call within that bound ends before the renewal can fire when it starts
 /// within 5 s of the pull being sent, as it does while dead letters are
@@ -2360,12 +2359,16 @@ impl NatsConsumer {
     }
 
     /// Drains the dead letters of topic `T` into [`MessageHandler::handle_dead`]
-    /// with the default options, until the client is closed. It asks for one
-    /// dead letter per pull and holds each pull open for the handler timeout,
-    /// 30 s at least, or for the durable's `ack_wait` when there is none. The
-    /// client reads at most two dead letters ahead of a running call, and none
-    /// ahead of a call that starts within 5 s of its pull and ends within that
-    /// time.
+    /// with the default options. It runs until the client is closed, or until
+    /// it meets an error that a reconnect cannot clear, such as a DLQ stream
+    /// that does not exist, which it returns.
+    ///
+    /// It asks for one dead letter per pull and holds each pull open for the
+    /// handler timeout, 30 s at least, or for the durable's `ack_wait` when
+    /// there is none. The client reads at most two dead letters ahead of a
+    /// running call, and none ahead of a call that starts within 5 s of its pull
+    /// and ends within that time.
+    ///
     /// [`run_dlq_with_options`](Self::run_dlq_with_options) takes the options of
     /// a consumer.
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
@@ -2391,9 +2394,11 @@ impl NatsConsumer {
     /// - `with_consumer_group` labels the size sample of the drain.
     /// - `with_max_reconnect_attempts` bounds its consecutive reconnects.
     ///
-    /// The drain records `shove_message_size_bytes` for each dead letter and no
-    /// other series: a `handle_dead` call moves no consumed, in-flight,
-    /// duration or failed metric.
+    /// The drain records `shove_message_size_bytes` for each dead letter. A
+    /// `handle_dead` call moves no consumed, in-flight, duration or failed
+    /// metric. The one other series the drain touches is
+    /// `shove_backend_errors_total{backend="nats", kind="consume"}`, which counts
+    /// a stream error or a closed stream.
     ///
     /// A `with_broadcast_start` is refused, as on every entry point that does
     /// not read it.
@@ -2437,15 +2442,14 @@ impl NatsConsumer {
         let max_message_size = options.max_message_size;
         let handler_timeout = options.handler_timeout;
         let ack_wait = derive_ack_wait(handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT));
-        // `shove_message_size_bytes` labels a DLQ drain with the SOURCE topic,
-        // not the DLQ stream name, and with the consumer group its options
-        // carry. The internal `{dlq}-consumer` durable supplies no label. Redis
-        // already drains its DLQ through `run_stream_loop`, which labels every
-        // metric `topology.queue()` whichever stream it reads; a DLQ name here
-        // would make `topic` mean two different things depending on the backend,
-        // and would stop a per-topic size profile summing across the main and DLQ
-        // paths. The DLQ drain stays distinguishable through the metrics that
-        // exist to name it, not by overloading `topic`.
+        // `shove_message_size_bytes` labels a DLQ drain with the SOURCE topic and
+        // the consumer group its options carry. The internal `{dlq}-consumer`
+        // durable supplies no label. Redis already drains its DLQ through
+        // `run_stream_loop`, which labels every metric `topology.queue()`
+        // whichever stream it reads; a DLQ name here would make `topic` mean two
+        // different things depending on the backend, and would stop a per-topic
+        // size profile summing across the main and DLQ paths. The metrics that
+        // exist to name the DLQ side keep the drain distinguishable.
         let topic: Arc<str> = Arc::from(topology.queue());
         let group: Option<Arc<str>> = options.consumer_group.clone();
 
@@ -3607,7 +3611,7 @@ mod dlq_pull_tests {
         assert_eq!(
             dlq_pull_expires(None, Duration::from_secs(10)),
             PULL_EXPIRES,
-            "never below the worker expiry"
+            "the worker expiry is the floor"
         );
     }
 
