@@ -3045,7 +3045,7 @@ async fn a_rejected_batch_renews_its_ack_wait_while_its_dead_letters_publish() {
 
 /// A durable whose `max_ack_pending` covers a single batch is named for what
 /// it costs a consumer that reads ahead, and the warning gives the in-place
-/// change that lifts it, not the recreation of the durable.
+/// change that lifts it, which keeps the durable's position in the stream.
 #[tokio::test]
 async fn a_single_batch_budget_names_the_in_place_fix() {
     let (logs, _logging) = capture_warnings();
