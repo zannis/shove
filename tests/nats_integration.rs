@@ -7629,6 +7629,42 @@ async fn dlq_drain_pulls_one_letter_at_a_time() {
     broker.close().await;
 }
 
+/// A handler timeout past the default stretches the drain's pulls to match, and
+/// the server takes them: a dead letter published after the drain is waiting is
+/// still handled and acked.
+#[tokio::test]
+async fn dlq_drain_works_with_a_handler_timeout_past_the_default() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    let probe = DeadLetterProbe::new();
+    let shutdown = CancellationToken::new();
+    let drain = spawn_dlq_drain(
+        &client,
+        &probe,
+        ConsumerOptions::<Nats>::new()
+            .with_shutdown(shutdown.clone())
+            .with_handler_timeout(Duration::from_secs(120)),
+    );
+    wait_for_open_pull(&client, "nats-work-dlq", "nats-work-dlq-consumer").await;
+    publish_dead_letter(&client, &simple_payload("late")).await;
+
+    assert!(
+        probe.counter.wait_for(1, TIMEOUT).await,
+        "the dead letter is handled"
+    );
+    assert_eq!(
+        settle_stream_messages(&client, "nats-work-dlq", 0).await,
+        0,
+        "the dead letter is acked"
+    );
+
+    stop_dlq_drain(&shutdown, drain).await;
+    broker.close().await;
+}
+
 /// The drain also ends when the broker closes, with the token of its options
 /// still unfired.
 #[tokio::test]

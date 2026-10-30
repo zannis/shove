@@ -257,7 +257,12 @@ On either stop the drain finishes the dead letter in hand first, and it acks eve
 `handle_dead` runs under the handler timeout, 30 s by default, and a panic in it is caught.
 A call that panics or times out is logged and its dead letter is acked, and the drain goes on with the next one.
 `with_handler_timeout_outcome` has nothing to act on there, since the dead letter is acked either way.
-The drain pulls one dead letter at a time, so none waits behind a slow `handle_dead` for longer than the durable's `ack_wait` and gets handled twice.
+The drain asks for one dead letter per pull and holds each pull open for the handler timeout, 30 s at least, or for the durable's `ack_wait` when there is no handler timeout.
+The client renews a pull of its own accord once the pull is as old as its expiry plus 5 s, and again when the connection comes back, and a renewal during a call brings the next dead letter in behind it.
+Holding the pull open keeps that from happening to a call that starts within 5 s of its pull, as one does while dead letters are waiting, and ends within the timeout.
+A call that starts late in an idle pull can still outlast the renewal, a reconnect during a call renews too, and the client reads no further ahead than two dead letters.
+A dead letter therefore waits behind at most two calls, which the durable's `ack_wait`, three times the handler timeout, covers.
+With no handler timeout nothing bounds a call, and one that outlasts the `ack_wait` has its own dead letter redelivered.
 
 A dead letter over `max_message_size`, 10 MiB by default, never reaches `handle_dead`.
 The drain logs it with its size and acks it, which removes it from the DLQ stream.
