@@ -6540,3 +6540,136 @@ async fn a_pull_the_server_refuses_is_not_a_connection_error() {
         .expect("the consumer stops cleanly");
     broker.close().await;
 }
+
+/// What a `tracing` subscriber wrote, for asserting on a log line.
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    fn contents(&self) -> String {
+        let buffer = self.0.lock().expect("log buffer mutex poisoned");
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    fn clear(&self) {
+        self.0.lock().expect("log buffer mutex poisoned").clear();
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("log buffer mutex poisoned")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+shove::define_topic!(
+    CappedTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-capped").dlq().build()
+);
+
+impl MessageHandler<CappedTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// Runs a consumer of [`CappedTopic`] until it has handled one more message.
+async fn consume_one_capped(tb: &TestBroker, options: ConsumerOptions<Nats>) {
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let options = options.with_shutdown(shutdown.clone());
+    let consumer = NatsConsumer::new(tb.client());
+    let handle = tokio::spawn(async move { consumer.run::<CappedTopic, _>(hc, (), options).await });
+    tb.broker()
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<CappedTopic>(&SimpleMessage {
+            id: "capped".into(),
+            content: String::new(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the message is handled"
+    );
+    shutdown.cancel();
+    handle.await.unwrap().unwrap();
+}
+
+/// A consumer that attaches to a durable with a finite `max_ack_pending` it
+/// did not ask for, as on a durable an earlier version created, names the
+/// budget in force and the in-place change that lifts it. One given that very
+/// cap says nothing.
+#[tokio::test]
+async fn attaching_to_a_capped_durable_names_the_budget_in_force() {
+    use async_nats::jetstream::consumer::AckPolicy;
+    use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+    use tracing::Level;
+    use tracing::subscriber::set_default;
+
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let _logging = set_default(subscriber);
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<CappedTopic>().await.unwrap();
+    client
+        .jetstream()
+        .get_stream("nats-capped")
+        .await
+        .unwrap()
+        .create_consumer(PullConsumerConfig {
+            durable_name: Some("nats-capped-consumer".to_string()),
+            ack_policy: AckPolicy::Explicit,
+            max_ack_pending: 5,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    consume_one_capped(&tb, ConsumerOptions::<Nats>::new()).await;
+    let warned = logs.contents();
+    assert!(
+        warned.contains("max_ack_pending=5")
+            && warned
+                .contains("nats consumer edit nats-capped nats-capped-consumer --max-pending=-1"),
+        "the budget in force and its in-place fix are named: {warned}"
+    );
+
+    logs.clear();
+    consume_one_capped(&tb, ConsumerOptions::<Nats>::new().with_max_ack_pending(5)).await;
+    let quiet = logs.contents();
+    assert!(
+        !quiet.contains("nats consumer edit"),
+        "a consumer given that cap is not warned: {quiet}"
+    );
+    broker.close().await;
+}
