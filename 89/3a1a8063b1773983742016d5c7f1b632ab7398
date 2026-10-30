@@ -1,0 +1,25 @@
+src/consumer_supervisor.rs
+  s_1001dc3147e1e5::t_8e9669bf74924e 60-61,64-71,73-74
+  s_1001dc3147e1e5::t_eb06ee4ed3dbfa 477-492
+src/backends/nats/consumer_group.rs
+  s_1001dc3147e1e5::t_a6c98316051cdc 611,621,625-626
+  s_1001dc3147e1e5::t_2c38d44479ad1b 556-557,566,578,583-584
+  s_1001dc3147e1e5::t_3be59f0871da69 923
+  s_1001dc3147e1e5::t_d147bd6e29d261 1433-1541
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "893a1a8063b1773983742016d5c7f1b632ab7398",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
