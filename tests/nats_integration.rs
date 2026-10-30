@@ -82,6 +82,16 @@ impl WaitableCounter {
     }
 }
 
+/// Counts the drop of whatever holds it, such as a handler call that is aborted
+/// while it runs.
+struct CountOnDrop(WaitableCounter);
+
+impl Drop for CountOnDrop {
+    fn drop(&mut self) {
+        self.0.increment();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Message types
 // ---------------------------------------------------------------------------
@@ -2888,14 +2898,6 @@ async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
     let started = WaitableCounter::new();
     let started_clone = started.clone();
     let dropped = WaitableCounter::new();
-
-    /// Counts the drop of the handler call that holds it.
-    struct CountOnDrop(WaitableCounter);
-    impl Drop for CountOnDrop {
-        fn drop(&mut self) {
-            self.0.increment();
-        }
-    }
 
     #[derive(Clone)]
     struct SlowHandler {
@@ -7290,11 +7292,12 @@ async fn a_worker_pulls_again_once_its_connection_comes_back() {
 
 /// Records the id of every dead letter it is handed, then spends `delay` on it.
 /// A letter called `boom` makes `handle_dead` panic, and one called `hang`
-/// makes it never return.
+/// makes it never return, counting `dropped` if the call is dropped.
 #[derive(Clone)]
 struct DeadLetterProbe {
     handled: Arc<Mutex<Vec<String>>>,
     counter: WaitableCounter,
+    dropped: WaitableCounter,
     delay: Duration,
 }
 
@@ -7307,6 +7310,7 @@ impl DeadLetterProbe {
         Self {
             handled: Arc::new(Mutex::new(Vec::new())),
             counter: WaitableCounter::new(),
+            dropped: WaitableCounter::new(),
             delay,
         }
     }
@@ -7330,7 +7334,10 @@ impl MessageHandler<WorkTopic> for DeadLetterProbe {
         }
         match msg.id.as_str() {
             "boom" => panic!("handle_dead panics on purpose"),
-            "hang" => std::future::pending::<()>().await,
+            "hang" => {
+                let _dropped = CountOnDrop(self.dropped.clone());
+                std::future::pending::<()>().await
+            }
             _ => {}
         }
     }
@@ -7545,6 +7552,35 @@ async fn dlq_drain_stops_on_options_shutdown() {
         .expect("the drain stops when the token of its options fires")
         .expect("the drain task does not panic")
         .expect("the drain stops cleanly");
+    broker.close().await;
+}
+
+/// Aborting the drain while a `handle_dead` runs takes that call down with it,
+/// though no handler timeout would ever end it.
+#[tokio::test]
+async fn aborting_the_dlq_drain_aborts_its_handle_dead() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    publish_dead_letter(&client, &simple_payload("hang")).await;
+
+    let probe = DeadLetterProbe::new();
+    let drain = spawn_dlq_drain(
+        &client,
+        &probe,
+        ConsumerOptions::<Nats>::new().without_handler_timeout(),
+    );
+    assert!(
+        probe.counter.wait_for(1, TIMEOUT).await,
+        "handle_dead is running"
+    );
+
+    drain.abort();
+    assert!(
+        probe.dropped.wait_for(1, Duration::from_secs(5)).await,
+        "the aborted drain left its handle_dead running"
+    );
     broker.close().await;
 }
 
