@@ -177,6 +177,12 @@ shove::define_topic!(
 );
 
 shove::define_topic!(
+    StopRaceTopic,
+    BatchMessage,
+    TopologyBuilder::new("nats-batch-stop-race").build()
+);
+
+shove::define_topic!(
     AbortFlushTopic,
     BatchMessage,
     TopologyBuilder::new("nats-batch-abort-flush").build()
@@ -399,6 +405,7 @@ impl_recording_for!(
     ReconnectTopic,
     RenewTopic,
     BudgetTopic,
+    StopRaceTopic,
 );
 
 // ---------------------------------------------------------------------------
@@ -2325,6 +2332,106 @@ async fn a_batch_read_ahead_held_past_its_ack_wait_is_not_redelivered() {
         (0, 0, 0),
         "everything is acked and nothing was redelivered"
     );
+    broker.close().await;
+}
+
+/// Stops its consumer as the last thing its first flush does, with no yield
+/// between the stop and the end of the flush, and acks every flush. The seqs
+/// of every flush are recorded as it starts.
+#[derive(Clone)]
+struct StopOnFirstFlush {
+    batches: Arc<Mutex<Vec<Vec<u32>>>>,
+    shutdown: CancellationToken,
+}
+
+impl BatchMessageHandler<StopRaceTopic> for StopOnFirstFlush {
+    type Context = ();
+    async fn handle_batch(
+        &self,
+        messages: Vec<(BatchMessage, MessageMetadata)>,
+        _: &(),
+    ) -> Outcome {
+        let first = {
+            let mut batches = self.batches.lock().unwrap();
+            batches.push(messages.iter().map(|(m, _)| m.seq).collect());
+            batches.len() == 1
+        };
+        if first {
+            // Time for the consumer to read the whole batch ahead.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            self.shutdown.cancel();
+        }
+        Outcome::Ack
+    }
+}
+
+/// A stop the consumer sees in the same wake-up as the end of a flush counts
+/// as a stop during that flush, so the batch read ahead goes back to the
+/// server with a nak and the stopping consumer leaves it unflushed. On the
+/// test's single-threaded runtime the flush task runs to its end in the poll
+/// that stops the consumer, so the consumer sees both at once.
+#[tokio::test]
+async fn a_stop_seen_with_the_end_of_a_flush_hands_the_batch_read_ahead_back() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<StopRaceTopic>().await.unwrap();
+    publish_seq::<StopRaceTopic>(&broker, 0..10).await;
+
+    let shutdown = CancellationToken::new();
+    let handler = StopOnFirstFlush {
+        batches: Arc::default(),
+        shutdown: shutdown.clone(),
+    };
+    let h = handler.clone();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<StopRaceTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(5)
+                    .with_max_batch_age(Duration::from_millis(300))
+                    .with_shutdown(shutdown),
+            )
+            .await
+    });
+    tokio::time::timeout(TIMEOUT, handle)
+        .await
+        .expect("the consumer stops in time")
+        .expect("the consumer task does not panic")
+        .expect("the consumer stops cleanly");
+    assert_eq!(
+        handler.batches.lock().unwrap().clone(),
+        vec![(0..5).collect::<Vec<_>>()],
+        "the consumer that stopped flushed the batch read ahead"
+    );
+
+    // Handed back with a nak, so another consumer takes it at once.
+    let second = RecordingBatchHandler::new();
+    let h = second.clone();
+    let second_shutdown = CancellationToken::new();
+    let sc = second_shutdown.clone();
+    let consumer = broker.batch_consumer();
+    let second_handle = tokio::spawn(async move {
+        consumer
+            .run::<StopRaceTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(5)
+                    .with_max_batch_age(Duration::from_millis(300))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+    assert!(
+        second.wait_for_batches(1, Duration::from_secs(5)).await,
+        "the batch read ahead was not handed back"
+    );
+    assert_eq!(sorted(&second.seen()), (5..10).collect::<Vec<_>>());
+    second_shutdown.cancel();
+    second_handle.await.unwrap().ok();
     broker.close().await;
 }
 
