@@ -105,8 +105,8 @@ On an external stream both outcomes nak with the 1 s delay, and the retry count 
 A `Retry` spends `max_retries` in every case, so the usual DLQ routing applies once the budget is spent.
 
 NATS logs no warning for a `Retry` or a `Defer` without hold queues.
-Building a topology that declares a DLQ and no hold queues logs a warning that says retries have no delay; on NATS they wait 1 s.
-[With no hold queues](/concepts/outcomes#with-no-hold-queues) lists the fallback of every backend.
+Building a topology that declares a DLQ and no hold queues logs one warning at build time, which links to [With no hold queues](/concepts/outcomes#with-no-hold-queues).
+That page lists the fallback of every backend.
 
 ## Stream management
 

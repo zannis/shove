@@ -56,7 +56,7 @@ Hold-queue names are derived from the queue name and delay: `{queue}-hold-{N}s`.
 
 If no hold queues are configured, `Outcome::Retry` has no delay tier to pick and each backend falls back to its own redelivery. Kafka and NATS wait a fixed 1 s. RabbitMQ, Redis Streams, SQS and the in-process broker redeliver with no delay. [With no hold queues](/concepts/outcomes#with-no-hold-queues) lists the mechanism and the warnings per backend. Configure at least one hold queue for any topic where transient failures are expected: a 1 s wait, or none at all, rarely gives a failing dependency time to recover.
 
-If a topic has hold queues but no DLQ, a warning is logged at build time: messages that exhaust `max_retries` will be silently discarded. If a topic has a DLQ but no hold queues, another build-time warning says retries will use broker redelivery with no delay. The builder is shared by every backend, so that wording describes RabbitMQ, Redis Streams, SQS and the in-process broker; Kafka and NATS wait 1 s.
+If a topic has hold queues but no DLQ, a warning is logged at build time: messages that exhaust `max_retries` will be silently discarded. If a topic has a DLQ but no hold queues, another build-time warning says `Retry` and `Defer` fall back to the backend's no-hold-queue behaviour and links to [With no hold queues](/concepts/outcomes#with-no-hold-queues), which lists that behaviour per backend.
 
 ## max\_retries
 

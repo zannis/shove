@@ -115,8 +115,8 @@ Under `RetryStrategy::InPlace` the handler's task waits 1 s holding its prefetch
 A `Retry` spends `max_retries` under either strategy, so the usual DLQ routing applies once the budget is spent.
 
 Kafka logs no warning for a `Retry` or a `Defer` without hold queues.
-Building a topology that declares a DLQ and no hold queues logs a warning that says retries have no delay; on Kafka they wait 1 s.
-[With no hold queues](/concepts/outcomes#with-no-hold-queues) lists the fallback of every backend.
+Building a topology that declares a DLQ and no hold queues logs one warning at build time, which links to [With no hold queues](/concepts/outcomes#with-no-hold-queues).
+That page lists the fallback of every backend.
 
 ### Bind to an infra-owned topic
 
