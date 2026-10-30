@@ -31,14 +31,13 @@ impl<B: Backend> Publisher<B> {
 
     /// Publish `msg` with caller-supplied `headers`.
     ///
-    /// Some header names are reserved on every backend, in any ASCII letter
-    /// case, because a backend stamps them itself or reads them back as its
-    /// own: names that start with `shove-`, `x-retry-count`, `x-message-id`,
-    /// `x-death` or `x-sequence-key`, and the exact names `x-original-queue`,
-    /// `payload` and `shard`. A reserved name returns
-    /// [`ShoveError::Validation`] naming the header, and nothing is published.
+    /// A reserved header name returns [`ShoveError::Validation`] naming the
+    /// header, and nothing is published. The names are the ones a backend
+    /// stamps itself or reads back as its own, and some belong to one backend
+    /// only. The [reserved header names] guide lists them.
     ///
     /// [`ShoveError::Validation`]: crate::error::ShoveError::Validation
+    /// [reserved header names]: https://shove.rs/guides/observability#reserved-header-names
     pub async fn publish_with_headers<T: Topic>(
         &self,
         msg: &T::Message,

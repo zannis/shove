@@ -39,9 +39,10 @@ pub fn shard_for_key(key: &str, routing_shards: u16) -> u16 {
 /// shared by every publish on this publisher and its clones — redis-rs dials
 /// a fresh TCP socket on every `get_multiplexed_async_connection` call, so
 /// acquiring per publish opened (and dropped) a connection per message.
-/// On a publish error the cached connection is invalidated and the next
+/// On a connection failure the cached connection is invalidated and the next
 /// publish dials a fresh one; the error itself still propagates to the
-/// caller unchanged.
+/// caller unchanged. A publish refused before anything is sent, because a
+/// header names a field the entry carries as its own, leaves it in place.
 #[derive(Clone)]
 pub struct RedisPublisher {
     client: RedisClient,

@@ -276,16 +276,19 @@ The consumer surfaces this via `metadata.headers.get("x-trace-id")` in the handl
 
 ### Reserved header names
 
-`publish_with_headers` refuses a reserved header name. On every backend it returns `ShoveError::Validation` naming the header, and nothing is published. Names match in any letter case.
+`publish_with_headers` refuses a reserved header name. It returns `ShoveError::Validation` naming the header, and nothing is published. Names match in any letter case. Most reserved names apply to every backend. Two belong to the one backend that writes them and stay free on the others.
 
-| Match | Reserved names |
-|---|---|
-| Starts with | `shove-`, `x-retry-count`, `x-message-id`, `x-death`, `x-sequence-key` |
-| Exactly | `x-original-queue`, `payload`, `shard` |
+| Reserved name | Match | Backends |
+|---|---|---|
+| `shove-` | starts with | all |
+| `x-retry-count`, `x-message-id`, `x-death`, `x-sequence-key` | starts with | all |
+| `x-original-queue` | exactly | all |
+| `payload` | exactly | Redis |
+| `shard` | exactly | SNS/SQS |
 
-These are the names a backend stamps itself or reads back as its own: the retry count, the message id, the dead-letter reason, count and original queue, the sequence key, the `payload` field of a Redis stream entry, and the `shard` attribute that routes a sequenced SNS message to its queue. A caller-supplied header with one of these names could override the value `shove` stamps. A name that only resembles a reserved one, such as `payload-type` or `x-shove-trace`, is accepted.
+These are the names a backend stamps itself or reads back as its own: the retry count, the message id, the dead-letter reason, count and original queue, and the sequence key, plus two fields only one backend has. Those are the `payload` field of a Redis stream entry and the `shard` attribute that routes a sequenced SNS message to its queue. A caller-supplied header with one of these names could override the value `shove` stamps. A name that only resembles a reserved one, such as `payload-type` or `x-shove-trace`, is accepted. So is `payload` on every backend but Redis and `shard` on every backend but SNS/SQS.
 
-This is a behaviour change for callers that set a reserved name. Earlier versions accepted the `shove-` names, `x-original-queue`, `payload` and `shard` and sent them. A caller that still sets one now gets the error, so rename the header to a name outside the list, such as `x-source`.
+This is a behaviour change for callers that set a reserved name. Earlier versions accepted the `shove-` names and `x-original-queue` on every backend, `payload` on Redis and `shard` on SNS/SQS, and sent them. A caller that still sets one now gets the error, so rename the header to a name outside the list, such as `x-source`. A handler that republishes a delivery's `metadata.headers` must drop the reserved names first, because Kafka and NATS deliveries include the `Shove-*` headers that shove stamps itself.
 
 ## Connecting to OpenTelemetry
 
