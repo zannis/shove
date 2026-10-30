@@ -2264,14 +2264,14 @@ impl NatsConsumer {
         Ok(())
     }
 
-    /// Spawn one task per routing shard and return the join handles.
+    /// Spawn one task per routing shard and return the join handles. Each
+    /// handle resolves to its shard's `Result<()>`, an error once the shard has
+    /// spent its reconnect attempts or met an error a reconnect cannot clear.
     ///
-    /// Each shard task internally returns `()` (errors are logged within the
-    /// task), so each handle is wrapped to produce `Result<()>` for a uniform
-    /// handle type across backends.
+    /// A topic whose topology carries no sequencing config has no shards to
+    /// attach to, and returns a `Topology` error.
     ///
-    /// The `pub(crate)` visibility is required for Phase 2 (Task 16), which
-    /// calls this from the consumer-group module.
+    /// The `pub(crate)` visibility lets the consumer-group module call this.
     pub(crate) async fn spawn_fifo_shards<T, H>(
         &self,
         handler: H,
@@ -2285,9 +2285,14 @@ impl NatsConsumer {
         let topology = T::topology();
         let queue = topology.queue();
         options.refuse_broadcast_start(queue, "NatsConsumer::run_fifo")?;
-        let seq_config = topology
-            .sequencing()
-            .expect("run_fifo requires a sequenced topology");
+        let seq_config = topology.sequencing().ok_or_else(|| {
+            ShoveError::Topology(format!(
+                "topic '{queue}' implements `SequencedTopic` but its topology has no \
+                 sequencing config; `NatsConsumer::run_fifo` would attach to shard subjects \
+                 that were never declared. Add `.sequenced(...)` to the topology, or consume \
+                 the topic with `run`."
+            ))
+        })?;
         let routing_shards = seq_config.routing_shards();
         let on_failure = seq_config.on_failure();
 
@@ -2314,7 +2319,7 @@ impl NatsConsumer {
         );
 
         let mut shard_tasks: Vec<tokio::task::JoinHandle<Result<()>>> =
-            Vec::with_capacity(routing_shards as usize);
+            Vec::with_capacity(usize::from(routing_shards));
 
         for shard in 0..routing_shards {
             let consumer_name = format!("{queue}-shard-{shard}");

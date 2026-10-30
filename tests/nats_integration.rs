@@ -3743,6 +3743,49 @@ async fn direct_and_fifo_entry_points_refuse_a_broadcast_start() {
     );
 }
 
+// A `SequencedTopic` paired with a topology built without `.sequenced(...)`,
+// which a hand-written pairing can produce.
+shove::define_sequenced_topic!(
+    NoSequencingTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("nats-no-sequencing").build()
+);
+
+impl MessageHandler<NoSequencingTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// `run_fifo` on a topic whose topology carries no sequencing config returns a
+/// `Topology` error, where there are no shards to attach to.
+#[tokio::test]
+async fn run_fifo_without_a_sequenced_topology_is_a_topology_error() {
+    let tb = TestBroker::start().await;
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        NatsConsumer::new(tb.client()).run_fifo::<NoSequencingTopic, _>(
+            CountingHandler::new(),
+            (),
+            ConsumerOptions::<Nats>::new(),
+        ),
+    )
+    .await
+    .expect("the refusal is synchronous")
+    .expect_err("a topology without sequencing has no shards to consume");
+    let shove::ShoveError::Topology(msg) = err else {
+        panic!("expected ShoveError::Topology, got {err:?}");
+    };
+    assert!(
+        msg.contains("nats-no-sequencing") && msg.contains("sequencing"),
+        "the error names the topic and what it lacks: {msg}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // External streams: a Retry never writes into the stream
 // ---------------------------------------------------------------------------
