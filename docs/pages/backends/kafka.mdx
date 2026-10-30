@@ -338,12 +338,13 @@ Only an operator clears either, with an ACL grant or the topic created, so the c
 A retryable error reconnects, which rejoins the group and fetches the committed offsets again, and a permanent one ends the member.
 That holds for a group member, `KafkaConsumer::run`, `run_batch`, `run_fifo`, a broadcast subscription and `run_dlq`, and for every wait in them that polls.
 
-A committed-offset fetch can fail with the code a failed broker connection reports.
-librdkafka retries the fetch through failed connections for as long as the assignment it was sent for stands, so that error reaches the consumer only once an assign or revoke has changed the assignment under the fetch.
+A committed-offset fetch can fail with the code a failed broker connection or a broker name that did not resolve reports, because librdkafka fails the requests it holds for a broker with that code.
+librdkafka retries the fetch through those failures for as long as the assignment it was sent for stands, so the error reaches the consumer only once an assign or revoke has changed the assignment under the fetch.
 The fetch's partitions then stay unfetched, and so does every partition assigned to the member after them, until they are revoked.
 The member keeps heartbeating meanwhile, so the group never moves them.
-The code alone cannot tell that error from a broker failure, so a failed connection that may be one ends the member's connection instead of being ridden out.
-That is a failed connection within `socket.timeout.ms` of an assign or revoke that itself landed within `socket.timeout.ms` of an earlier assign, or of a failed connection the consumer rode out: a fetch may have been pending when that change landed.
+The code alone cannot tell that error from a broker failure, so a failed connection or name resolution that may be one ends the member's connection instead of being ridden out.
+That is one within `socket.timeout.ms` of an assign or revoke that itself landed within `socket.timeout.ms` of an earlier assign, or of a failed connection or name resolution the consumer rode out: a fetch may have been pending when that change landed.
+Every broker being down at once is still ridden out, because librdkafka never fails a queued request, a committed-offset fetch among them, with that code.
 shove leaves `socket.timeout.ms` at librdkafka's default, 60 s.
 The reconnect rejoins the group and fetches the committed offsets again.
 A bounce that lands on a member with no such change behind it is ridden out as above.
