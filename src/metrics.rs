@@ -219,6 +219,13 @@ pub(crate) enum FailReason {
     /// cascade — see "Hold-queue eviction is *not* a cascade" on this enum for
     /// why.
     SequenceTimeout,
+    /// A `Retry` or `Defer` republish was refused in a way no later send can
+    /// get past, too large for the producer or the broker or invalid to the
+    /// broker, so the message was dead-lettered under the death reason
+    /// `republish_failed` instead. Emitted after the handler ran. Kafka-only:
+    /// it is the only backend whose consumer republishes through a producer
+    /// that answers that way.
+    RepublishFailed,
 }
 
 #[allow(dead_code)]
@@ -236,6 +243,7 @@ impl FailReason {
             FailReason::SchemaUnavailable => "schema_unavailable",
             FailReason::Malformed => "malformed",
             FailReason::SequenceTimeout => "sequence_timeout",
+            FailReason::RepublishFailed => "republish_failed",
         }
     }
 
@@ -433,8 +441,9 @@ pub(crate) fn record_discarded(_: &str, _: Option<&str>, _: FailReason) {}
 ///   a message dropped *before* the handler (oversize, undecodable, or a
 ///   batch-accumulation drop) settles a discard under exactly the same rules
 ///   as a post-handler terminal outcome: the increment lands iff the message
-///   is truly gone — no DLQ declared, or the DLQ publish failed — and the
-///   retirement was broker-acknowledged. Kafka (all three group-consume
+///   is truly gone — no DLQ declared, or the DLQ publish failed and the
+///   message was retired anyway — and the retirement was
+///   broker-acknowledged. Kafka (all three group-consume
 ///   paths), RabbitMQ and the in-memory backend meet that contract on their
 ///   **consume** paths: every drop between the topic and the handler is
 ///   counted there. No backend's counter is complete outright, because the
@@ -455,6 +464,17 @@ pub(crate) fn record_discarded(_: &str, _: Option<&str>, _: FailReason) {}
 /// - **Not every terminal outcome is a discard.** SNS/SQS deliberately never
 ///   calls this: its reject path deletes nothing, it makes the message visible
 ///   again for AWS-side redrive. See `backends::sns::router::route_reject`.
+/// - **Not every failed dead letter is a discard.** On Kafka's concurrent and
+///   sequenced consumers a dead letter that fails and may land later retires
+///   nothing. No commit passes the record: the concurrent consumer reconnects
+///   and is handed it again, the sequenced one keeps it and tries the publish
+///   again, and the pending discard settles as survived. The one dead letter
+///   there whose failure is a discard is one that can never be published,
+///   refused by the producer or the broker as too large or as invalid: the
+///   record is retired as lost and counted, under `FailReason::RepublishFailed`
+///   when its `Retry` or `Defer` copy could not be published before it.
+///   Kafka's batch consumer still retires a record whose dead letter failed,
+///   and counts it as lost.
 /// - **Not every failure is terminal.** Two reasons `record_failed` counts
 ///   never reach this function on their own. `FailReason::SchemaUnavailable`:
 ///   the consumer keeps the record and retries the lookup, so there is
@@ -985,6 +1005,7 @@ mod tests {
             (FailReason::SchemaUnavailable, "schema_unavailable"),
             (FailReason::Malformed, "malformed"),
             (FailReason::SequenceTimeout, "sequence_timeout"),
+            (FailReason::RepublishFailed, "republish_failed"),
         ];
         for (reason, label) in all {
             assert_eq!(reason.as_label(), label, "label changed for {reason:?}");
