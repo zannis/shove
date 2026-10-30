@@ -1123,13 +1123,15 @@ const MAX_OPEN_PULLS: usize = 2;
 /// first, so no message is started without a slot.
 type Deliveries = stream::Zip<Batch, stream::Iter<std::vec::IntoIter<OwnedSemaphorePermit>>>;
 
-/// The first pause before a worker opens another pull after the server ended
-/// one with a status. The pause doubles, up to [`ENDED_PULL_PAUSE_MAX`], while
-/// that keeps happening, and a delivery resets it. The pulls already open go
-/// on meanwhile.
+/// The base of the pause before a worker opens another pull after the server
+/// ended one with a status. [`Backoff`] jitters each pause by up to half the
+/// base either way, so the first is 50-150 ms. The base doubles with each
+/// further such pull, up to [`ENDED_PULL_PAUSE_MAX`], and only a delivery
+/// resets it. The pulls already open go on meanwhile.
 const ENDED_PULL_PAUSE: Duration = Duration::from_millis(100);
 
-/// The longest pause [`ENDED_PULL_PAUSE`] grows to.
+/// The most the base of [`ENDED_PULL_PAUSE`] grows to, so a pause at the cap
+/// is 2.5-7.5 s.
 const ENDED_PULL_PAUSE_MAX: Duration = Duration::from_secs(5);
 
 fn ended_pull_backoff() -> Backoff {
@@ -1161,8 +1163,7 @@ impl Pull {
 }
 
 /// What [`next_event`] reports from a worker's open pulls.
-// Returned once per event and never stored, so boxing would only add an
-// allocation per message.
+// Never stored, so boxing would only add an allocation per message.
 #[allow(clippy::large_enum_variant)]
 enum PullEvent {
     /// A message, or the status the server ended its pull with, with the
@@ -1260,8 +1261,7 @@ impl BusyTasks {
     /// Waits until no counted task is running.
     async fn idle(&self) {
         loop {
-            // Registered before the count is read, so the last task's
-            // notification cannot slip in between.
+            // Enabled before the count is read, so no notification is missed.
             let mut finished = std::pin::pin!(self.finished.notified());
             finished.as_mut().enable();
             if self.running() == 0 {
@@ -1407,11 +1407,6 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                     self.start(msg, slot, ack_wait);
                 }
                 Step::Event(PullEvent::Delivery(Err(e), _)) => {
-                    // The server ended the pull with a status: it refused it
-                    // (`Exceeded MaxWaiting`), lost its cluster leader, or the
-                    // durable is gone. Only a probe that fails makes that a
-                    // connection error; otherwise the worker pulls again
-                    // after a pause.
                     tracing::warn!(error = %e, queue, "the server ended a pull, probing the connection");
                     let Some(probe) = self.unless_stopped(consumer.get_info()).await else {
                         return self.stop(consumer, pulls).await;
@@ -1432,9 +1427,7 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                     if delivered {
                         continue;
                     }
-                    // A silent outage ends pulls exactly like an idle topic
-                    // does, so a worker that has seen nothing for a whole
-                    // pull's expiry probes its connection.
+                    // A dead connection ends pulls the way an idle topic does.
                     if quiet_since.elapsed() < PULL_EXPIRES {
                         continue;
                     }
@@ -1747,14 +1740,10 @@ impl NatsConsumer {
         let topology = T::topology();
         let queue = topology.queue();
         options.refuse_broadcast_start(queue, "NatsConsumer::run")?;
-        // Every worker of a topic, in any process and in any group member,
-        // binds to the same durable consumer name; the JetStream server
-        // load-balances messages across their pulls, and each worker bounds
-        // its own in-flight work (`Worker`).
+        // Every worker of the topic, in any process, binds to this one durable.
         let consumer_name = super::constants::consumer_name(queue);
 
-        // Zero is lowered to one, as `ConsumerOptions::with_prefetch_count`
-        // documents.
+        // Zero is lowered to one, as `ConsumerOptions::with_prefetch_count` documents.
         let prefetch = options.prefetch_count.max(1);
         let retry_strategy = resolve_retry_strategy(topology);
         let max_ack_pending = options.max_ack_pending.unwrap_or(UNBOUNDED_ACK_PENDING);
@@ -1854,11 +1843,9 @@ impl NatsConsumer {
                     };
 
                     let config = &pull_consumer.cached_info().config;
-                    // Effective server-side ack_wait, used to pace the progress acks
-                    // that keep a waiting message from being redelivered.
+                    // The server's effective ack_wait, which paces the progress acks.
                     let ack_wait = config.ack_wait;
-                    // The fallback only ever creates the durable, so a budget an
-                    // earlier version gave it stays until it is changed.
+                    // The fallback never updates an existing durable's budget.
                     let in_force = config.max_ack_pending;
                     if in_force > 0 && max_ack_pending == UNBOUNDED_ACK_PENDING {
                         tracing::warn!(
