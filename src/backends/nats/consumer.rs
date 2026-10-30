@@ -3228,6 +3228,12 @@ impl<T: Topic> BatchIntake<T> {
     /// Renews, with a progress ack, the `ack_wait` of every message of the
     /// batch read ahead, which waits out the flush in progress before its own
     /// flush, then schedules the next renewal.
+    ///
+    /// The renewals go on until the consumer stops, so a flush that never
+    /// ends keeps the batch read ahead with this consumer: one with no
+    /// handler timeout and a handler that never returns, or, on a
+    /// multi-threaded runtime, one whose handler holds its thread. A stop
+    /// releases the batch.
     async fn renew_read_ahead(&mut self) {
         let renewals = async {
             for msg in &self.forming.acks {
@@ -3298,8 +3304,10 @@ impl<T: Topic> BatchIntake<T> {
     /// The client connected again. The server may have lost the open pull's
     /// request with the old connection, so the messages it had delivered go
     /// into the batch in hand and the pull is dropped. The next pull goes out
-    /// as after any pull: at once if the batch in hand is empty, and
-    /// otherwise once that batch starts its flush.
+    /// as after any pull ([`wants_pull`](Self::wants_pull)): at once if the
+    /// batch in hand is empty and no poison message waits for a settle slot,
+    /// and otherwise once that batch has started its flush and every waiting
+    /// poison message has a slot.
     async fn on_reconnect(&mut self) {
         if !self.reconnects.reconnected(&self.ctx.client, self.queue) {
             return;
@@ -3732,10 +3740,14 @@ impl NatsConsumer {
     /// A message the handler cannot be given is counted as a failure, then
     /// dead-lettered and acked in a task of its own, up to
     /// [`POISON_SETTLE_CONCURRENCY`] at once, so a slow dead-letter publish
-    /// holds up neither the healthy messages behind it nor the flush. Its
+    /// holds up neither the healthy messages of its pull nor the flush. Its
     /// `ack_wait` is renewed with progress acks while the publish runs, and
-    /// the ack follows the publish. The consumer waits for these tasks, up to
-    /// [`EXIT_DRAIN_TIMEOUT`], before it returns.
+    /// the ack follows the publish. Messages beyond that bound wait for a slot
+    /// in the order they came, and no further pull is sent while any of them
+    /// waits, so more than [`POISON_SETTLE_CONCURRENCY`] slow dead letters
+    /// hold back the next pull until all but that many have settled. The
+    /// consumer waits for these tasks, up to [`EXIT_DRAIN_TIMEOUT`], before it
+    /// returns.
     ///
     /// # Pull statuses and reconnects
     ///
@@ -3746,8 +3758,10 @@ impl NatsConsumer {
     /// client reconnects the consumer reads what the open pull had delivered
     /// into the batch in hand and drops the pull, since a server that
     /// restarted or failed over has lost the request without a word. It pulls
-    /// again as after any pull: at once if the batch in hand is empty, and
-    /// otherwise once that batch starts its flush.
+    /// again as after any pull: at once if the batch in hand is empty and no
+    /// oversized or undecodable message waits for a settle slot, and
+    /// otherwise once that batch has started its flush and every waiting
+    /// message has a slot.
     ///
     /// # The durable and `max_ack_pending`
     ///
