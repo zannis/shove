@@ -6,13 +6,17 @@
 //! `Ack`, whole-batch Nak redelivery on `Retry`/`Defer`, the per-message
 //! DLQ-publish-then-ack path on `Reject`, the drop-from-batch arms for
 //! oversized/undeserializable payloads, the runtime sequencing guard, the
-//! `max_ack_pending` clamp, and the flush-on-shutdown drain.
+//! `max_ack_pending` clamp, and the flush-on-shutdown drain. They also cover
+//! the batch read ahead of a flush and its hand-back on a stop, the background
+//! settlement of poison messages, the statuses a pull can end with, and the
+//! pull a reconnect replaces.
 
 #![cfg(feature = "nats")]
 
 use async_nats::header::NATS_MESSAGE_ID;
 use async_nats::jetstream::consumer::AckPolicy;
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+use async_nats::jetstream::stream::Config as StreamConfig;
 use serde::{Deserialize, Serialize};
 use shove::BatchConsumerOptions;
 use shove::broker::Broker;
@@ -24,6 +28,7 @@ use shove::outcome::Outcome;
 use shove::topic::{NotSequenced, Topic};
 use shove::topology::{QueueTopology, SequenceFailure, TopologyBuilder};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use testcontainers::ImageExt;
@@ -32,6 +37,7 @@ use testcontainers_modules::nats::{Nats as NatsContainer, NatsServerCmd};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tracing::subscriber::{DefaultGuard, set_default};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -150,6 +156,50 @@ shove::define_topic!(
     SupplyTopic,
     BatchMessage,
     TopologyBuilder::new("nats-batch-supply").build()
+);
+
+shove::define_topic!(
+    ReadAheadTopic,
+    BatchMessage,
+    TopologyBuilder::new("nats-batch-readahead").build()
+);
+
+shove::define_topic!(
+    HandBackTopic,
+    BatchMessage,
+    TopologyBuilder::new("nats-batch-handback").build()
+);
+
+shove::define_topic!(
+    PoisonStallTopic,
+    BatchMessage,
+    TopologyBuilder::new("nats-batch-poison-stall")
+        .dlq()
+        .build()
+);
+
+shove::define_topic!(
+    RefusedPullTopic,
+    BatchMessage,
+    TopologyBuilder::new("nats-batch-refused").build()
+);
+
+shove::define_topic!(
+    ReconnectTopic,
+    BatchMessage,
+    TopologyBuilder::new("nats-batch-reconnect").build()
+);
+
+shove::define_topic!(
+    RenewTopic,
+    BatchMessage,
+    TopologyBuilder::new("nats-batch-renew").dlq().build()
+);
+
+shove::define_topic!(
+    BudgetTopic,
+    BatchMessage,
+    TopologyBuilder::new("nats-batch-budget").build()
 );
 
 /// A message that is only an enum. A payload naming a variant it does not have
@@ -331,6 +381,12 @@ impl_recording_for!(
     OversizeTopic,
     IdleTopic,
     SupplyTopic,
+    HandBackTopic,
+    PoisonStallTopic,
+    RefusedPullTopic,
+    ReconnectTopic,
+    RenewTopic,
+    BudgetTopic,
 );
 
 // ---------------------------------------------------------------------------
@@ -1760,5 +1816,973 @@ async fn an_idle_consumer_survives_empty_windows_then_consumes() {
     let mut seen = handler.seen();
     seen.sort_unstable();
     assert_eq!(seen, vec![0, 1, 2]);
+    broker.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Read-ahead, background poison settlement, pull statuses, reconnects
+// ---------------------------------------------------------------------------
+
+/// How the first flush of a [`FirstFlushHandler`] is held up.
+#[derive(Clone)]
+enum Hold {
+    /// The handler blocks its thread for this long, without yielding.
+    BlockThread(Duration),
+    /// The handler waits for a permit, which the test adds.
+    Gate(Arc<tokio::sync::Semaphore>),
+}
+
+/// Holds its first flush up as told, and acks every flush. The seqs of every
+/// flush are recorded as the flush starts.
+#[derive(Clone)]
+struct FirstFlushHandler {
+    batches: Arc<Mutex<Vec<Vec<u32>>>>,
+    started: Arc<Notify>,
+    hold: Hold,
+    held: Arc<AtomicBool>,
+}
+
+impl FirstFlushHandler {
+    fn new(hold: Hold) -> Self {
+        Self {
+            batches: Arc::new(Mutex::new(Vec::new())),
+            started: Arc::new(Notify::new()),
+            hold,
+            held: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn seen(&self) -> Vec<u32> {
+        self.batches
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .copied()
+            .collect()
+    }
+}
+
+macro_rules! impl_first_flush_for {
+    ($($topic:ty),* $(,)?) => {
+        $(
+            impl BatchMessageHandler<$topic> for FirstFlushHandler {
+                type Context = ();
+                async fn handle_batch(
+                    &self,
+                    messages: Vec<(BatchMessage, MessageMetadata)>,
+                    _: &(),
+                ) -> Outcome {
+                    self.batches
+                        .lock()
+                        .unwrap()
+                        .push(messages.iter().map(|(m, _)| m.seq).collect());
+                    self.started.notify_one();
+                    if self.held.swap(false, Ordering::SeqCst) {
+                        match &self.hold {
+                            Hold::BlockThread(time) => std::thread::sleep(*time),
+                            Hold::Gate(gate) => gate
+                                .acquire()
+                                .await
+                                .expect("the gate is never closed")
+                                .forget(),
+                        }
+                    }
+                    Outcome::Ack
+                }
+            }
+        )*
+    };
+}
+
+impl_first_flush_for!(ReadAheadTopic, HandBackTopic);
+
+/// How the durable `consumer` of `stream` stands: its un-acked deliveries, its
+/// messages still waiting in the stream and its redeliveries.
+async fn durable_state(client: &NatsClient, stream: &str, consumer: &str) -> (usize, u64, usize) {
+    let info = client
+        .jetstream()
+        .get_stream(stream)
+        .await
+        .expect("the stream exists")
+        .consumer_info(consumer)
+        .await
+        .expect("the durable exists");
+    (info.num_ack_pending, info.num_pending, info.num_redelivered)
+}
+
+/// Waits until the durable has `expected` deliveries out un-acked, and returns
+/// the last count it saw.
+async fn wait_for_ack_pending(
+    client: &NatsClient,
+    stream: &str,
+    consumer: &str,
+    expected: usize,
+) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let pending = durable_state(client, stream, consumer).await.0;
+        if pending == expected || Instant::now() >= deadline {
+            return pending;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// While a flush runs, the next batch is already pulled: the consumer keeps
+/// one pull outstanding. Nothing is lost or handled twice across the
+/// hand-over from one batch to the one read ahead, not even when the flush
+/// holds its thread for longer than the pull's window and the 5 s the client
+/// allows past it, after which the client abandons a pull and what it
+/// delivered. The batch read ahead is read while the flush is held, so no
+/// message waits on a redelivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_read_ahead_loses_and_duplicates_nothing() {
+    const MESSAGES: u32 = 600;
+    const BATCH_SIZE: usize = 100;
+    const STREAM: &str = "nats-batch-readahead";
+    const DURABLE: &str = "nats-batch-readahead-consumer";
+    const WINDOW: Duration = Duration::from_millis(500);
+    const HOLD: Duration = Duration::from_millis(6_500);
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<ReadAheadTopic>().await.unwrap();
+    publish_seq::<ReadAheadTopic>(&broker, 0..MESSAGES).await;
+
+    let handler = FirstFlushHandler::new(Hold::BlockThread(HOLD));
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<ReadAheadTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(BATCH_SIZE)
+                    .with_max_batch_age(WINDOW)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    tokio::time::timeout(TIMEOUT, handler.started.notified())
+        .await
+        .expect("the first flush starts");
+    let flush_started = Instant::now();
+
+    // The first flush holds its batch, and the pull for the next is already
+    // served: two batches are out on the server.
+    assert_eq!(
+        wait_for_ack_pending(&client, STREAM, DURABLE, 2 * BATCH_SIZE).await,
+        2 * BATCH_SIZE,
+        "the flush in progress and the batch read ahead are both delivered"
+    );
+    assert_eq!(
+        handler.batches.lock().unwrap().len(),
+        1,
+        "only the first batch has reached the handler"
+    );
+
+    let deadline = flush_started + HOLD + Duration::from_secs(10);
+    while handler.seen().len() < MESSAGES as usize && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        flush_started.elapsed() < HOLD + Duration::from_secs(10),
+        "the batch read ahead waited on a redelivery: all {MESSAGES} reached the handler only after {:?}",
+        flush_started.elapsed()
+    );
+    // A duplicate would surface within a moment of the last flush.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let batches = handler.batches.lock().unwrap().clone();
+    assert!(
+        batches.iter().all(|b| b.len() <= BATCH_SIZE),
+        "no flush exceeds max_batch_size, got sizes {:?}",
+        batches.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    let mut seen = handler.seen();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        (0..MESSAGES).collect::<Vec<_>>(),
+        "every message reaches the handler exactly once"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    assert_eq!(
+        durable_state(&client, STREAM, DURABLE).await,
+        (0, 0, 0),
+        "everything is acked and nothing was redelivered"
+    );
+    broker.close().await;
+}
+
+/// A stop that lands during a flush finishes that flush and hands the batch
+/// read ahead back to the server at once, instead of flushing it as well,
+/// which would double the time the stop takes. Another consumer takes the
+/// handed-back messages straight away.
+#[tokio::test]
+async fn a_stop_during_a_flush_hands_the_batch_read_ahead_back() {
+    const BATCH_SIZE: usize = 100;
+    const STREAM: &str = "nats-batch-handback";
+    const DURABLE: &str = "nats-batch-handback-consumer";
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<HandBackTopic>().await.unwrap();
+    publish_seq::<HandBackTopic>(&broker, 0..200).await;
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler = FirstFlushHandler::new(Hold::Gate(Arc::clone(&gate)));
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<HandBackTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(BATCH_SIZE)
+                    .with_max_batch_age(Duration::from_secs(10))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+    tokio::time::timeout(TIMEOUT, handler.started.notified())
+        .await
+        .expect("the first flush starts");
+    assert_eq!(
+        wait_for_ack_pending(&client, STREAM, DURABLE, 2 * BATCH_SIZE).await,
+        2 * BATCH_SIZE,
+        "the batch read ahead is delivered"
+    );
+
+    shutdown.cancel();
+
+    // The flush is still held, and another consumer already takes the batch
+    // that was read ahead: it was handed back with a nak, so it waits on no
+    // ack_wait.
+    let second = RecordingBatchHandler::new();
+    let h = second.clone();
+    let second_shutdown = CancellationToken::new();
+    let sc = second_shutdown.clone();
+    let consumer = broker.batch_consumer();
+    let second_handle = tokio::spawn(async move {
+        consumer
+            .run::<HandBackTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(BATCH_SIZE)
+                    .with_max_batch_age(Duration::from_secs(10))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+    assert!(
+        second.wait_for_batches(1, Duration::from_secs(5)).await,
+        "the batch read ahead was not handed back while the flush was held"
+    );
+
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("the stop finishes with the flush in progress")
+        .expect("the consumer task does not panic")
+        .expect("the consumer stops cleanly");
+    second_shutdown.cancel();
+    second_handle.await.unwrap().ok();
+
+    assert_eq!(
+        handler.batches.lock().unwrap().len(),
+        1,
+        "the batch read ahead was not flushed by the consumer that stopped"
+    );
+    assert_eq!(handler.seen(), (0..100).collect::<Vec<_>>());
+    let mut taken = second.seen();
+    taken.sort_unstable();
+    assert_eq!(taken, (100..200).collect::<Vec<_>>());
+    broker.close().await;
+}
+
+/// Replaces the dead-letter stream `dlq` with one whose publishes are never
+/// acknowledged, so each attempt to dead-letter waits out the client's ack
+/// timeout, 5 s, and the three attempts of a publish take over 15 s.
+async fn silence_dlq(client: &NatsClient, dlq: &str) {
+    let js = client.jetstream();
+    js.delete_stream(dlq).await.expect("the DLQ stream exists");
+    js.create_stream(StreamConfig {
+        name: dlq.to_string(),
+        subjects: vec![dlq.to_string()],
+        no_ack: true,
+        ..Default::default()
+    })
+    .await
+    .expect("the silent DLQ stream is created");
+}
+
+/// Replaces the dead-letter stream `dlq` with one that acknowledges publishes.
+async fn repair_dlq(client: &NatsClient, dlq: &str) {
+    let js = client.jetstream();
+    js.delete_stream(dlq).await.expect("the DLQ stream exists");
+    js.create_stream(StreamConfig {
+        name: dlq.to_string(),
+        subjects: vec![dlq.to_string()],
+        ..Default::default()
+    })
+    .await
+    .expect("the working DLQ stream is created");
+}
+
+/// Publishes `payload` as it is, bypassing the codec, with an id of its own.
+async fn raw_publish(client: &NatsClient, subject: &str, id: &str, payload: &'static str) {
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert(NATS_MESSAGE_ID, id);
+    client
+        .jetstream()
+        .publish_with_headers(subject.to_string(), headers, payload.into())
+        .await
+        .expect("raw publish should succeed")
+        .await
+        .expect("raw publish should be acked");
+}
+
+/// Polls until the stream holds exactly `expected` messages, and returns the
+/// last count it saw.
+async fn wait_for_exact_stream_count(
+    client: &NatsClient,
+    stream_name: &str,
+    expected: u64,
+    timeout: Duration,
+) -> u64 {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let count = stream_count(client, stream_name).await;
+        if count == expected || Instant::now() >= deadline {
+            return count;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A poison message whose dead letter cannot be published for a long while
+/// does not hold the receive loop: the healthy messages behind it flush at
+/// once. The poison message stays un-acked until its dead letter lands, and is
+/// acked after it.
+#[tokio::test]
+async fn poison_settlement_does_not_stall_healthy_messages() {
+    const MAIN: &str = "nats-batch-poison-stall";
+    const DLQ: &str = "nats-batch-poison-stall-dlq";
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<PoisonStallTopic>()
+        .await
+        .unwrap();
+    silence_dlq(&client, DLQ).await;
+
+    raw_publish(&client, MAIN, "stalled-poison", "not json at all").await;
+    publish_seq::<PoisonStallTopic>(&broker, 0..3).await;
+
+    let handler = RecordingBatchHandler::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<PoisonStallTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(10)
+                    .with_max_batch_age(Duration::from_millis(300))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    // Inside the first 5 s attempt to dead-letter the poison message.
+    assert!(
+        handler.wait_for_batches(1, Duration::from_secs(4)).await,
+        "the healthy messages wait on the poison message's dead letter"
+    );
+    assert_eq!(sorted(&handler.seen()), vec![0, 1, 2]);
+    assert_eq!(
+        wait_for_exact_stream_count(&client, MAIN, 1, Duration::from_secs(3)).await,
+        1,
+        "the healthy messages are acked and the poison message is not"
+    );
+
+    repair_dlq(&client, DLQ).await;
+    assert_eq!(
+        wait_for_exact_stream_count(&client, DLQ, 1, TIMEOUT).await,
+        1,
+        "the dead letter lands once the DLQ answers"
+    );
+    assert_eq!(
+        wait_for_exact_stream_count(&client, MAIN, 0, TIMEOUT).await,
+        0,
+        "the poison message is acked after its dead letter"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// A stop that lands while poison messages wait for a slot to settle in ends
+/// the consumer within the bound it puts on the settlements in progress, and
+/// leaves every message un-acked: none is retired without its dead letter,
+/// the ones still waiting included.
+#[tokio::test]
+async fn a_stop_while_poison_waits_for_a_slot_loses_nothing() {
+    const MAIN: &str = "nats-batch-poison-stall";
+    const DLQ: &str = "nats-batch-poison-stall-dlq";
+    // One more than the settlements the consumer runs at once, and then some.
+    const POISON: usize = 20;
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<PoisonStallTopic>()
+        .await
+        .unwrap();
+    silence_dlq(&client, DLQ).await;
+    for n in 0..POISON {
+        raw_publish(
+            &client,
+            MAIN,
+            &format!("waiting-poison-{n}"),
+            "not json at all",
+        )
+        .await;
+    }
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<PoisonStallTopic, _>(
+                RecordingBatchHandler::new(),
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(50)
+                    .with_max_batch_age(Duration::from_millis(300))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    // Every message is read, the first 16 are publishing their dead letters
+    // and the rest wait for a slot.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the stop waits for the settlements in progress, and for no longer")
+        .expect("the consumer task does not panic")
+        .expect("the consumer stops cleanly");
+
+    assert_eq!(
+        stream_count(&client, MAIN).await,
+        POISON as u64,
+        "no poison message was acked without a dead letter that was confirmed"
+    );
+    broker.close().await;
+}
+
+/// What a `tracing` subscriber wrote, for asserting on a log line.
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    fn contents(&self) -> String {
+        let buffer = self.0.lock().expect("log buffer mutex poisoned");
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("log buffer mutex poisoned")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Logs at `WARN` and above on this thread are written into the returned
+/// buffer until the guard drops.
+fn capture_warnings() -> (CapturedLogs, DefaultGuard) {
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    (logs, set_default(subscriber))
+}
+
+/// A pull the server ends with a status, while the server still answers, is
+/// not a connection error. The durable keeps one waiting pull and another
+/// reader holds it, so the consumer's pull is refused with `409 Exceeded
+/// MaxWaiting`. The consumer probes its connection, finds the server
+/// answering, and goes on without spending the one reconnect attempt it is
+/// allowed. It consumes once the holder lets go.
+#[tokio::test]
+async fn a_batch_pull_the_server_refuses_is_not_a_connection_error() {
+    let (logs, _logging) = capture_warnings();
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<RefusedPullTopic>()
+        .await
+        .unwrap();
+    let durable = client
+        .jetstream()
+        .get_stream("nats-batch-refused")
+        .await
+        .unwrap()
+        .create_consumer(PullConsumerConfig {
+            durable_name: Some("nats-batch-refused-consumer".to_string()),
+            ack_policy: AckPolicy::Explicit,
+            max_ack_pending: -1,
+            max_waiting: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // Takes the durable's one waiting slot, and is never read.
+    let holder = durable
+        .batch()
+        .max_messages(1)
+        .expires(Duration::from_secs(120))
+        .messages()
+        .await
+        .unwrap();
+
+    let handler = RecordingBatchHandler::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<RefusedPullTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(5)
+                    .with_max_batch_age(Duration::from_millis(300))
+                    .with_max_reconnect_attempts(1)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let refused = logs.contents();
+    assert!(
+        refused.contains("Exceeded MaxWaiting"),
+        "the pull was refused: {refused}"
+    );
+    assert!(
+        !handle.is_finished(),
+        "the refused pull ended the consumer: {:?}",
+        handle.await
+    );
+
+    drop(holder);
+    publish_seq::<RefusedPullTopic>(&broker, 0..3).await;
+    assert!(
+        handler.wait_for_batches(1, TIMEOUT).await,
+        "the consumer goes on once the waiting slot is free"
+    );
+    assert_eq!(sorted(&handler.seen()), vec![0, 1, 2]);
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("the consumer stops in time")
+        .expect("the consumer task does not panic")
+        .expect("the consumer stops cleanly");
+    broker.close().await;
+}
+
+/// A free host port, for a container whose port must survive a restart.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    listener
+        .local_addr()
+        .expect("read the bound address")
+        .port()
+}
+
+/// An idle consumer's pull is lost when the server is killed and restarts:
+/// the restarted server knows nothing of it. Once the client has reconnected,
+/// the consumer pulls again at once, so a message published after the restart
+/// is handled well inside the 30 s the lost pull would otherwise hold the
+/// consumer for.
+#[tokio::test]
+async fn a_batch_consumer_pulls_again_once_its_connection_comes_back() {
+    use testcontainers::core::ContainerPort;
+
+    let port = free_port();
+    let cmd = NatsServerCmd::default().with_jetstream();
+    let container = NatsContainer::default()
+        .with_cmd(&cmd)
+        .with_mapped_port(port, ContainerPort::Tcp(4222))
+        .start()
+        .await
+        .expect("failed to start NATS container");
+    let host = container.get_host().await.expect("failed to get host");
+    let client =
+        NatsClient::connect_with_retry(&NatsConfig::new(format!("nats://{host}:{port}")), 10)
+            .await
+            .expect("failed to connect to NATS");
+    let broker = Broker::<Nats>::from_client(client.clone());
+    broker.topology().declare::<ReconnectTopic>().await.unwrap();
+
+    let handler = RecordingBatchHandler::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<ReconnectTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    // One message fills a batch, so the flush follows the pull.
+                    .with_max_batch_size(1)
+                    // The lost pull's client-side backstop is 5 s past this.
+                    .with_max_batch_age(Duration::from_secs(25))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    let stream = client
+        .jetstream()
+        .get_stream("nats-batch-reconnect")
+        .await
+        .expect("the stream exists");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Ok(info) = stream.consumer_info("nats-batch-reconnect-consumer").await
+            && info.num_waiting > 0
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no pull request was ever opened");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let opened = Instant::now();
+
+    // SIGKILL with no SIGTERM first: a stop lets the server answer its
+    // waiting pulls before it goes.
+    let killed = tokio::process::Command::new("docker")
+        .args(["kill", container.id()])
+        .output()
+        .await
+        .expect("docker kill runs");
+    assert!(
+        killed.status.success(),
+        "docker kill failed: {}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    container.start().await.expect("the server starts again");
+    let deadline = Instant::now() + TIMEOUT;
+    while !client.is_connected() {
+        assert!(Instant::now() < deadline, "the client never reconnected");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let reconnected = opened.elapsed();
+
+    let publisher = broker.publisher().await.unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    while let Err(e) = publisher
+        .publish::<ReconnectTopic>(&BatchMessage::new(7))
+        .await
+    {
+        assert!(
+            Instant::now() < deadline,
+            "JetStream never took the publish: {e}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        handler.wait_for_batches(1, Duration::from_secs(10)).await,
+        "the message published {reconnected:?} after the pull opened, once the client was \
+         back, waited more than 10 s: the consumer kept its place on the lost pull"
+    );
+    assert_eq!(handler.seen(), vec![7]);
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("the consumer stops in time")
+        .expect("the consumer task does not panic")
+        .expect("the consumer stops cleanly");
+    broker.close().await;
+}
+
+/// Each ack sent for a durable: the stream sequence it is for, and its
+/// payload (empty or `+ACK` for an ack, `+WPI` for a progress ack, ...).
+type AckLog = Arc<Mutex<Vec<(u64, String)>>>;
+
+/// Watches every ack sent for the durable `consumer` on `stream`, by
+/// subscribing to the ack subjects the server routes them on,
+/// `$JS.ACK.{stream}.{consumer}.{delivered}.{stream_seq}...`.
+async fn watch_acks(client: &NatsClient, stream: &str, consumer: &str) -> AckLog {
+    use futures_util::StreamExt;
+
+    let raw = client.jetstream().client();
+    let mut acks = raw
+        .subscribe(format!("$JS.ACK.{stream}.{consumer}.>"))
+        .await
+        .expect("the ack subjects can be watched");
+    raw.flush()
+        .await
+        .expect("the watch is in place before any ack");
+    let log: AckLog = Arc::default();
+    let sink = log.clone();
+    tokio::spawn(async move {
+        while let Some(ack) = acks.next().await {
+            let sequence = ack
+                .subject
+                .split('.')
+                .nth(5)
+                .and_then(|token| token.parse().ok())
+                .expect("an ack subject names the stream sequence");
+            let payload = String::from_utf8_lossy(&ack.payload).into_owned();
+            sink.lock().unwrap().push((sequence, payload));
+        }
+    });
+    log
+}
+
+const RENEW_MAIN: &str = "nats-batch-renew";
+const RENEW_DLQ: &str = "nats-batch-renew-dlq";
+const RENEW_DURABLE: &str = "nats-batch-renew-consumer";
+
+/// Declares [`RenewTopic`] with a dead-letter stream that never answers and a
+/// durable whose `ack_wait` is 3 s, and watches the durable's acks.
+async fn renew_setup(tb: &TestBroker) -> AckLog {
+    let client = tb.client();
+    tb.broker()
+        .topology()
+        .declare::<RenewTopic>()
+        .await
+        .unwrap();
+    silence_dlq(&client, RENEW_DLQ).await;
+    client
+        .jetstream()
+        .get_stream(RENEW_MAIN)
+        .await
+        .unwrap()
+        .create_consumer(PullConsumerConfig {
+            durable_name: Some(RENEW_DURABLE.to_string()),
+            ack_policy: AckPolicy::Explicit,
+            max_ack_pending: -1,
+            ack_wait: Duration::from_secs(3),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    watch_acks(&client, RENEW_MAIN, RENEW_DURABLE).await
+}
+
+/// How many progress acks the log holds for the message at `sequence`.
+fn renewals(acks: &AckLog, sequence: u64) -> usize {
+    acks.lock()
+        .unwrap()
+        .iter()
+        .filter(|(seq, payload)| *seq == sequence && payload == "+WPI")
+        .count()
+}
+
+/// A poison message gets the same renewals while its dead letter publishes.
+#[tokio::test]
+async fn a_poison_message_renews_its_ack_wait_while_its_dead_letter_publishes() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let acks = renew_setup(&tb).await;
+    raw_publish(
+        &tb.client(),
+        RENEW_MAIN,
+        "renewed-poison",
+        "not json at all",
+    )
+    .await;
+
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<RenewTopic, _>(
+                RecordingBatchHandler::new(),
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(10)
+                    .with_max_batch_age(Duration::from_millis(300)),
+            )
+            .await
+    });
+
+    // The 3 s of ack_wait pass once over while the dead letter waits.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let renewed = renewals(&acks, 1);
+    assert!(
+        renewed >= 2,
+        "the poison message was renewed {renewed} times in 4 s of waiting on its dead letter"
+    );
+
+    handle.abort();
+    broker.close().await;
+}
+
+/// A dead-letter publish that takes longer than the durable's `ack_wait` does
+/// not get its message redelivered: each message of a rejected batch gets a
+/// progress ack every third of the `ack_wait` while its publish runs.
+#[tokio::test]
+async fn a_rejected_batch_renews_its_ack_wait_while_its_dead_letters_publish() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let acks = renew_setup(&tb).await;
+    publish_seq::<RenewTopic>(&broker, 0..2).await;
+
+    let handler = RecordingBatchHandler::new().scripting([Outcome::Reject]);
+    let h = handler.clone();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<RenewTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(10)
+                    .with_max_batch_age(Duration::from_millis(300)),
+            )
+            .await
+    });
+    assert!(
+        handler.wait_for_batches(1, TIMEOUT).await,
+        "the batch reaches the handler"
+    );
+
+    // The 3 s of ack_wait pass once over while the dead letters wait.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    for sequence in 1..=2 {
+        let renewed = renewals(&acks, sequence);
+        assert!(
+            renewed >= 2,
+            "message {sequence} was renewed {renewed} times in 4 s of waiting on its dead letter"
+        );
+    }
+    assert_eq!(
+        handler.batches().len(),
+        1,
+        "nothing was redelivered meanwhile"
+    );
+
+    handle.abort();
+    broker.close().await;
+}
+
+/// A durable whose `max_ack_pending` covers a single batch is named for what
+/// it costs a consumer that reads ahead, and the warning gives the in-place
+/// change that lifts it, not the recreation of the durable.
+#[tokio::test]
+async fn a_single_batch_budget_names_the_in_place_fix() {
+    let (logs, _logging) = capture_warnings();
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<BudgetTopic>().await.unwrap();
+    client
+        .jetstream()
+        .get_stream("nats-batch-budget")
+        .await
+        .unwrap()
+        .create_consumer(PullConsumerConfig {
+            durable_name: Some("nats-batch-budget-consumer".to_string()),
+            ack_policy: AckPolicy::Explicit,
+            max_ack_pending: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    publish_seq::<BudgetTopic>(&broker, 0..1).await;
+
+    let handler = RecordingBatchHandler::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<BudgetTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(10)
+                    .with_max_batch_age(Duration::from_millis(300))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+    assert!(
+        handler.wait_for_batches(1, TIMEOUT).await,
+        "the batch reaches the handler"
+    );
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let warned = logs.contents();
+    assert!(
+        warned.contains("max_ack_pending=10")
+            && warned.contains(
+                "nats consumer edit nats-batch-budget nats-batch-budget-consumer --max-pending=-1"
+            ),
+        "the budget in force and its in-place fix are named: {warned}"
+    );
+    assert!(
+        !warned.contains("recreate"),
+        "recreating the durable is not advised: {warned}"
+    );
     broker.close().await;
 }
