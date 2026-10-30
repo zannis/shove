@@ -28,6 +28,10 @@ use serde::{Deserialize, Serialize};
 /// - **In-process**: no delay. A warning is logged for a `Defer` and none for
 ///   a `Retry`.
 ///
+/// Those warnings are logged each time the fallback is taken. Building a
+/// topology that declares a DLQ and no hold queues also logs one warning at
+/// build time, on every backend.
+///
 /// A `Retry` still increments the retry count on every backend except
 /// RabbitMQ. The 1 s wait on Kafka and NATS has no setting; declare a hold
 /// queue to choose the delay.

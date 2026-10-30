@@ -60,7 +60,8 @@ Declare a hold queue to choose the delay.
 [Kafka](/backends/kafka#retry-and-defer-without-hold-queues) and [NATS](/backends/nats#retry-and-defer-without-hold-queues) describe the two backends in more detail.
 
 The warnings in the table are logged each time the consumer takes the fallback.
-Building a topology that declares a DLQ and no hold queues also logs one backend-neutral warning, described in [Configuring hold queues](/guides/retries#configuring-hold-queues).
+Building a topology that declares a DLQ and no hold queues also logs one warning at build time, whichever backend it runs on.
+The warning links back to this section and is described in [Configuring hold queues](/guides/retries#configuring-hold-queues).
 
 ## Reject vs Retry
 

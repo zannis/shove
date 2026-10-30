@@ -1127,7 +1127,7 @@ impl TopologyBuilder {
             if self.dlq.is_some() && self.hold_queues.is_empty() {
                 tracing::warn!(
                     queue = self.queue,
-                    "topic has a DLQ but no hold queues — retries will use broker redelivery with no delay"
+                    "topic has a DLQ but no hold queues — Retry and Defer fall back to the backend's no-hold-queue behaviour; see https://shove.rs/concepts/outcomes#with-no-hold-queues"
                 );
             }
         }
