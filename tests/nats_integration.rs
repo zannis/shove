@@ -32,6 +32,7 @@ use testcontainers_modules::nats::{Nats as NatsContainer, NatsServerCmd};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use uuid::{Uuid, Version};
 
 // ---------------------------------------------------------------------------
 // WaitableCounter
@@ -875,11 +876,11 @@ impl MessageHandler<WorkTopic> for IdRecorder {
     }
 }
 
-/// The id of a fresh publish is a per-process prefix and a counter, no
-/// delivery of it carries a `Shove-Retry-Count` until a retry copy is
-/// published, and that copy extends the id with `-r1`.
+/// The id of a fresh publish is a random UUID, no delivery of it carries a
+/// `Shove-Retry-Count` until a retry copy is published, and that copy extends
+/// the id with `-r1`.
 #[tokio::test]
-async fn a_fresh_publish_carries_a_counter_id_and_no_retry_count() {
+async fn a_fresh_publish_carries_a_random_id_and_no_retry_count() {
     let tb = TestBroker::start().await;
     let broker = tb.broker();
     let client = tb.client();
@@ -938,22 +939,12 @@ async fn a_fresh_publish_carries_a_counter_id_and_no_retry_count() {
         delivery("second", 0),
     );
 
-    let parts = |id: &str| {
-        let (prefix, counter) = id.split_once('-').expect("an id is prefix-counter");
-        assert_eq!((prefix.len(), counter.len()), (16, 16), "{id}");
-        assert!(
-            id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'),
-            "{id}"
-        );
-        (
-            prefix.to_string(),
-            u64::from_str_radix(counter, 16).expect("the counter is hex"),
-        )
-    };
-    let (first_prefix, first_counter) = parts(&first.delivery_id);
-    let (second_prefix, second_counter) = parts(&second.delivery_id);
-    assert_eq!(first_prefix, second_prefix, "one process, one prefix");
-    assert!(second_counter > first_counter, "the counter climbs");
+    let uuid =
+        |id: &str| Uuid::parse_str(id).unwrap_or_else(|e| panic!("the id {id} is no UUID: {e}"));
+    let (first_id, second_id) = (uuid(&first.delivery_id), uuid(&second.delivery_id));
+    assert_eq!(first_id.get_version(), Some(Version::Random));
+    assert_eq!(second_id.get_version(), Some(Version::Random));
+    assert_ne!(first_id, second_id);
 
     assert_eq!(first.headers.get("Shove-Retry-Count"), None);
     assert_eq!(second.headers.get("Shove-Retry-Count"), None);
