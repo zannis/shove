@@ -1,0 +1,31 @@
+docs/pages/ops/backends.mdx
+  s_1001dc3147e1e5::t_83ce875349e443 131-132
+  s_1001dc3147e1e5::t_ef299a374847fa 127
+  s_1001dc3147e1e5::t_b050a9c388743f 129
+  s_1001dc3147e1e5::t_9c0e769c025b21 101,103-104
+  s_1001dc3147e1e5::t_aa63f290a0c0f1 119
+docs/pages/backends/kafka.mdx
+  s_1001dc3147e1e5::t_8e1ec15ecae2d4 654
+  s_1001dc3147e1e5::t_7c20c3f8cb0deb 671
+  s_1001dc3147e1e5::t_628452dd8e4285 566,568-570,572-575
+  s_1001dc3147e1e5::t_d3ce1c9f668c8b 663
+  s_1001dc3147e1e5::t_d31ada4e9fb5d7 642-643
+  s_1001dc3147e1e5::t_4d862967118110 705
+  s_1001dc3147e1e5::t_ebe5a0af535d24 512-513,515-516
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e23bbfee452761135077c13d3e3493dbf482a0a5",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
