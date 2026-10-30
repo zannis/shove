@@ -5033,6 +5033,18 @@ impl IntervalCommits<'_> {
     }
 }
 
+/// How long a record waits for a prefetch permit before
+/// [`acquire_permit_while_polling`] starts calling `recv()`.
+///
+/// A polled `recv()` hands over the next fetched record at once, and putting
+/// that record back costs a seek, a pause and a refetch that librdkafka
+/// backs off before. A member on one permit draining a backlog would pay it
+/// for every second record, which throttles it to a few dozen records a
+/// second. Inside the grace a permit that frees takes the record in hand
+/// with nothing put back. A wait that outlasts it polls from then on, far
+/// inside the 10 s floor of `max.poll.interval.ms`.
+const PERMIT_WAIT_GRACE: Duration = Duration::from_secs(1);
+
 /// Wait for a prefetch permit while the receive loop keeps polling.
 ///
 /// The record in hand is decoded and tracked, and every permit is held: by
@@ -5043,11 +5055,11 @@ impl IntervalCommits<'_> {
 /// a running holder that turns into an in-place wait afterwards, would then
 /// park the loop for the whole delay, and a park past the limit has the
 /// member evicted. So the permit is acquired inside a `select!` that also
-/// polls, which serves the rebalance callbacks and the results of commits
-/// made before the wait. A record `recv()` yields meanwhile comes from a
-/// partition that is not paused; it is put back (see [`put_back`]) and the
-/// assignment is paused, so it arrives again, in order, once a permit frees
-/// and the loop resumes.
+/// polls once [`PERMIT_WAIT_GRACE`] has run out, which serves the rebalance
+/// callbacks and the results of commits made before the wait. A record
+/// `recv()` yields meanwhile comes from a partition that is not paused; it
+/// is put back (see [`put_back`]) and the assignment is paused, so it
+/// arrives again, in order, once a permit frees and the loop resumes.
 ///
 /// `commits`, under `CommitPolicy::Interval`, has the wait commit as the
 /// loop does: positions completed before the wait, and the ones a rebalance
@@ -5078,6 +5090,9 @@ async fn acquire_permit_while_polling(
     permit_wait_probe::ENTERED.fetch_add(1, Ordering::SeqCst);
     let fault = handler_fault(fault_rx);
     tokio::pin!(fault);
+    let grace = tokio::time::sleep(PERMIT_WAIT_GRACE);
+    tokio::pin!(grace);
+    let mut polling = false;
     let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -5105,9 +5120,10 @@ async fn acquire_permit_while_polling(
                 })?;
                 return Ok(Some(permit));
             }
+            () = &mut grace, if !polling => polling = true,
             _ = housekeeping.tick(), if commits.is_some() => {}
             _ = tokio::time::sleep_until(commit_deadline), if committable => {}
-            received = consumer.recv() => {
+            received = consumer.recv(), if polling => {
                 let msg = received.map_err(|e| {
                     tracing::error!(error = %e, queue, "consumer recv error");
                     map_kafka_error(

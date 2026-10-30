@@ -331,17 +331,7 @@ async fn produce(bootstrap: &str, ids: &[&str]) {
 /// Produces one record onto the topic with `payload` as is, so a test can
 /// put a record the topic's codec cannot decode in front of valid ones.
 async fn produce_raw(bootstrap: &str, payload: Vec<u8>) {
-    let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", bootstrap)
-        .create()
-        .expect("mock producer");
-    producer
-        .send(
-            FutureRecord::<(), Vec<u8>>::to(TOPIC).payload(&payload),
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("produce to the mock cluster");
+    produce_raw_on(bootstrap, TOPIC, &payload).await;
 }
 
 /// `produce` onto another topic of the same shape.
@@ -2814,4 +2804,54 @@ async fn an_unpublishable_record_whose_dead_letter_also_fails_is_discarded_as_lo
             "the failed republish is counted once"
         );
     }
+}
+
+/// A record that waits a moment for the permit a running handler holds is
+/// not put back. The wait polls only once the permit has not freed within a
+/// grace, so a member on one permit draining a backlog pays no seek, pause
+/// and refetch for each record behind a running one. Every record but the
+/// first waits for the permit its predecessor holds, and none is handed back
+/// to the broker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_waiting_briefly_for_a_permit_is_not_put_back() {
+    use shove::kafka::{permit_wait_probe, put_back_probe};
+
+    const DRAIN_TOPIC: &str = "kafka-permit-wait-drain";
+    const RECORDS: usize = 200;
+    shove::define_topic!(DrainTopic, Order, TopologyBuilder::new(DRAIN_TOPIC).build());
+
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    mock.api()
+        .create_topic(DRAIN_TOPIC, 1, 1)
+        .expect("create the topic through the mock API");
+    let ids: Vec<String> = (0..RECORDS).map(|i| format!("r{i}")).collect();
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    produce_on(&bootstrap, DRAIN_TOPIC, &id_refs).await;
+
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let (run, shutdown) =
+        start_on::<DrainTopic, _>(connect(&bootstrap).await, handler.clone(), one_permit);
+    wait_until(
+        || handler.count() == RECORDS,
+        DELIVERY_TIMEOUT,
+        "the backlog drained",
+    )
+    .await;
+    shutdown.cancel();
+    run.await
+        .expect("the run task completes")
+        .expect("a clean stop");
+
+    assert!(
+        permit_wait_probe::entered() >= RECORDS / 2,
+        "the records waited for the permit, {} waits",
+        permit_wait_probe::entered()
+    );
+    assert_eq!(
+        put_back_probe::permit_wait(),
+        0,
+        "no record was handed back to the broker while one waited for the permit"
+    );
+    assert_eq!(handler.ids(), ids, "each record once, in order");
 }
