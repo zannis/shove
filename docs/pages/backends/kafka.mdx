@@ -676,7 +676,9 @@ The error names the topic, the position the commit carried per partition, and a 
 `Rejected` carries the error the commit returned: the broker's answer, or a librdkafka local error.
 A broker's answer says this commit did not land.
 A local timeout after the request was sent does not prove that, because the broker may have accepted the commit.
-`Deadline` means nothing answered within the time it carries, normally the 20 s deadline.
+`Deadline` means nothing answered within the time it carries.
+That is the 15 s share when the stop found a commit in flight, and the 20 s deadline when the final commit was the one left unanswered.
+Against a frozen coordinator, a member with traffic under the default policy has usually made a commit that never comes back, so it usually reports the 15 s share.
 `NoThread` means no thread could be spawned for the commit, so this commit was never made.
 `Deadline` says its result is unknown, because the detached thread may still land it.
 Redelivery then starts from the last position the broker accepted for each partition, which an earlier commit may have advanced.
