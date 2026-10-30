@@ -2853,3 +2853,71 @@ async fn a_record_waiting_briefly_for_a_permit_is_not_put_back() {
     );
     assert_eq!(handler.ids(), ids, "each record once, in order");
 }
+
+/// A dead letter that fails with an error no retry gets past ends the member
+/// with that error, where a reconnect would only fail the same way again. The
+/// test seam refuses every dead letter with the `Topology` error a client
+/// whose producer cannot be built answers with. `A` is rejected once, the
+/// run returns that error with no reconnect left to try it again, and
+/// nothing is committed or counted as discarded.
+#[tokio::test]
+async fn a_dlq_publish_failure_that_cannot_be_retried_ends_the_member() {
+    use shove::kafka::dlq_publish_probe;
+
+    const FATAL_TOPIC: &str = "kafka-dlq-failure-not-retryable";
+    const FATAL_DLQ: &str = "kafka-dlq-failure-not-retryable-dlq";
+    const FATAL_GROUP: &str = "kafka-dlq-failure-not-retryable-consumer";
+    shove::define_topic!(
+        FatalTopic,
+        Order,
+        TopologyBuilder::new(FATAL_TOPIC).dlq().build()
+    );
+
+    #[cfg(feature = "metrics")]
+    let snapshotter = install_recorder();
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    for topic in [FATAL_TOPIC, FATAL_DLQ] {
+        mock.api()
+            .create_topic(topic, 1, 1)
+            .expect("create the topic through the mock API");
+    }
+    produce_on(&bootstrap, FATAL_TOPIC, &["A", "B"]).await;
+    dlq_publish_probe::refuse(true);
+
+    let handler = Recorder::new(|id, _| {
+        if id == "A" {
+            Outcome::Reject
+        } else {
+            Outcome::Ack
+        }
+    });
+    let (run, shutdown) =
+        start_on::<FatalTopic, _>(connect(&bootstrap).await, handler.clone(), one_permit);
+    let result = tokio::time::timeout(DELIVERY_TIMEOUT, run)
+        .await
+        .expect("the member ends within the bound")
+        .expect("the run task completes");
+    let err = result.expect_err("the dead letter's failure ends the member");
+    assert!(
+        matches!(&err, ShoveError::Topology(msg) if msg.contains("refused by the test seam")),
+        "the member ends with the error that cannot be retried, as it came: {err}"
+    );
+    assert_eq!(
+        handler.ids(),
+        ["A"],
+        "A is handled once: no reconnect handed it over again, and B waited behind it"
+    );
+    assert_eq!(
+        committed_position_on(&bootstrap, FATAL_TOPIC, FATAL_GROUP, 0).await,
+        None,
+        "nothing is committed past A"
+    );
+    #[cfg(feature = "metrics")]
+    assert_eq!(
+        discarded_total(&snapshotter, FATAL_TOPIC),
+        0,
+        "A is not retired, so nothing is discarded"
+    );
+    drop(shutdown);
+}
