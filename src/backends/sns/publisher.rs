@@ -20,6 +20,10 @@ use crate::topic::Topic;
 /// message to its shard queue by.
 pub(crate) const SHARD_ATTR: &str = "shard";
 
+/// Attribute names only this backend writes itself, which a caller may not set.
+/// The names every backend reserves are in `validate_headers`.
+pub(crate) const RESERVED_ATTRS: &[&str] = &[SHARD_ATTR];
+
 /// Maximum number of messages in a single SNS PublishBatch call.
 const SNS_BATCH_LIMIT: usize = 10;
 
@@ -291,7 +295,7 @@ impl SnsPublisher {
         message: &T::Message,
         headers: HashMap<String, String>,
     ) -> Result<()> {
-        validate_headers(&headers)?;
+        validate_headers(&headers, RESERVED_ATTRS)?;
         self.do_publish::<T>(message, Some(headers)).await
     }
 

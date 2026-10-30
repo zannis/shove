@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn every_internal_key_is_reserved_by_validate_headers() {
-        assert_internal_keys_reserved("RabbitMQ", INTERNAL_KEYS);
+        assert_internal_keys_reserved("RabbitMQ", INTERNAL_KEYS, &[]);
     }
 
     fn make_delivery(headers: Option<FieldTable>, tag: u64, redelivered: bool) -> Delivery {

@@ -6,7 +6,7 @@ use std::time::Duration;
 use tracing::{debug, error, warn};
 
 #[cfg(test)]
-use crate::backends::sns::publisher::SHARD_ATTR;
+use crate::backends::sns::publisher::{RESERVED_ATTRS, SHARD_ATTR};
 use crate::metrics;
 use crate::metrics::{BackendErrorKind, BackendLabel, record_backend_error};
 use crate::topology::QueueTopology;
@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn every_internal_attribute_is_reserved_by_validate_headers() {
-        assert_internal_keys_reserved("SNS/SQS", INTERNAL_KEYS);
+        assert_internal_keys_reserved("SNS/SQS", INTERNAL_KEYS, RESERVED_ATTRS);
     }
 
     #[test]
