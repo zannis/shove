@@ -1,0 +1,25 @@
+src/backends/sns/consumer_group.rs
+  s_1001dc3147e1e5::t_47a4cb6160e98f 198-201
+tests/sns_sqs_integration.rs
+  s_1001dc3147e1e5::t_0c080838950c12 2368-2410
+tests/rabbitmq_integration.rs
+  s_1001dc3147e1e5::t_45bc55ded75a4e 2059-2103
+src/backends/rabbitmq/consumer_group.rs
+  s_1001dc3147e1e5::t_ca75955a284249 261-264
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ac1604af9475c063dd44ed1bc916f5c3c2389fac",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
