@@ -768,13 +768,14 @@ const COORDINATOR_WARM_UP: Duration = Duration::from_secs(60);
 /// and the last connection error once [`COORDINATOR_WARM_UP`] has passed, fails
 /// the test.
 async fn lag_stats_once_coordinator_answers(
-    stats_provider: &shove::kafka::KafkaLagStatsProvider,
+    client: &KafkaClient,
     queue: &str,
     group_id: &str,
     reset: KafkaAutoOffsetReset,
 ) -> KafkaQueueStats {
-    use shove::kafka::KafkaQueueStatsProvider;
+    use shove::kafka::{KafkaLagStatsProvider, KafkaQueueStatsProvider};
 
+    let stats_provider = KafkaLagStatsProvider::new(client.clone());
     let deadline = Instant::now() + COORDINATOR_WARM_UP;
     loop {
         match stats_provider.get_queue_stats(queue, group_id, reset).await {
@@ -5589,8 +5590,6 @@ async fn deserialization_failure_rejects_to_dlq() {
 
 #[tokio::test]
 async fn lag_stats_provider_reports_pending_messages() {
-    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider};
-
     let tb = TestBroker::start().await;
     let broker = tb.broker();
     let client = tb.client();
@@ -5607,9 +5606,8 @@ async fn lag_stats_provider_reports_pending_messages() {
             .unwrap();
     }
 
-    let stats_provider = KafkaLagStatsProvider::new(client.clone());
     let stats = lag_stats_once_coordinator_answers(
-        &stats_provider,
+        &client,
         "kafka-work",
         "kafka-work-consumer",
         KafkaAutoOffsetReset::Earliest,
@@ -5630,8 +5628,6 @@ async fn lag_stats_provider_reports_pending_messages() {
 /// number of records published.
 #[tokio::test]
 async fn lag_stats_provider_sums_every_partition_of_a_multi_partition_topic() {
-    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
-
     shove::define_sequenced_topic!(
         SixPartitionLagTopic,
         OrderMessage,
@@ -5663,22 +5659,21 @@ async fn lag_stats_provider_sums_every_partition_of_a_multi_partition_topic() {
             .unwrap();
     }
 
-    let stats_provider = KafkaLagStatsProvider::new(tb.client());
+    let client = tb.client();
     let from_start = lag_stats_once_coordinator_answers(
-        &stats_provider,
+        &client,
         "kafka-lag-six-partitions",
         "kafka-lag-six-partitions-fifo",
         KafkaAutoOffsetReset::Earliest,
     )
     .await;
-    let from_tail = stats_provider
-        .get_queue_stats(
-            "kafka-lag-six-partitions",
-            "kafka-lag-six-partitions-fifo",
-            KafkaAutoOffsetReset::Latest,
-        )
-        .await
-        .expect("lag from the tail of the log");
+    let from_tail = lag_stats_once_coordinator_answers(
+        &client,
+        "kafka-lag-six-partitions",
+        "kafka-lag-six-partitions-fifo",
+        KafkaAutoOffsetReset::Latest,
+    )
+    .await;
 
     assert_eq!(from_start.messages_pending, 24);
     assert_eq!(from_tail.messages_pending, 0);
@@ -5724,7 +5719,6 @@ async fn lag_stats_provider_counts_only_the_records_above_a_raised_low_watermark
     use rdkafka::client::DefaultClientContext;
     use rdkafka::producer::{FutureProducer, FutureRecord};
     use rdkafka::{ClientConfig, Offset, TopicPartitionList};
-    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider};
 
     const TOPIC: &str = "kafka-lag-raised-low-watermark";
     let produced = [10i64, 6, 4];
@@ -5786,7 +5780,7 @@ async fn lag_stats_provider_counts_only_the_records_above_a_raised_low_watermark
     );
 
     let stats = lag_stats_once_coordinator_answers(
-        &KafkaLagStatsProvider::new(tb.client()),
+        &tb.client(),
         TOPIC,
         "kafka-lag-raised-low-watermark-consumer",
         KafkaAutoOffsetReset::Earliest,
