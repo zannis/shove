@@ -1,0 +1,23 @@
+docs/pages/backends/nats.mdx
+  s_1001dc3147e1e5::t_bd46b532c10016 184
+src/backends/nats/consumer.rs
+  s_1001dc3147e1e5::t_13dc2dae77b034 1127-1129
+  s_1001dc3147e1e5::t_175d30f59d5a6c 1175-1176
+  s_1001dc3147e1e5::t_41cd042dc0639e 1431
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f60bbf98378355d3c4909611daa3921b94d63fac",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
