@@ -12453,6 +12453,25 @@ mod error_classifier_tests {
         assert!(!transient(consumption(RDKafkaErrorCode::Authentication)));
     }
 
+    /// A broker response past `receive.message.max.bytes`: librdkafka
+    /// reconnects, and the response the broker sends again is as large
+    /// (`rdkafka_broker.c:2130-2141`, `:2174`).
+    #[test]
+    fn an_oversized_broker_response_ends_the_loop() {
+        assert!(!transient(consumption(RDKafkaErrorCode::BadMessage)));
+    }
+
+    /// librdkafka out of a system resource: a broker thread it could not
+    /// create, which leaves it without that broker
+    /// (`rdkafka_broker.c:5050-5059`), or the buffer a decompression needs
+    /// (`rdkafka_msgset_reader.c:379`).
+    #[test]
+    fn an_exhausted_system_resource_ends_the_loop() {
+        assert!(!transient(consumption(
+            RDKafkaErrorCode::CriticalSystemResource
+        )));
+    }
+
     /// A fetch error librdkafka passes on and retries without end
     /// (`rdkafka_fetcher.c:327-342`).
     #[test]
