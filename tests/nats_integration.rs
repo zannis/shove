@@ -6458,6 +6458,16 @@ impl MessageHandler<MaxWaitingTopic> for CountingHandler {
 async fn a_pull_the_server_refuses_is_not_a_connection_error() {
     use async_nats::jetstream::consumer::AckPolicy;
     use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+    use tracing::Level;
+    use tracing::subscriber::set_default;
+
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let _logging = set_default(subscriber);
 
     let tb = TestBroker::start().await;
     let broker = tb.broker();
@@ -6517,6 +6527,11 @@ async fn a_pull_the_server_refuses_is_not_a_connection_error() {
     // The slot the first message freed asks for a second pull, which the
     // server refuses while the first pull still waits.
     tokio::time::sleep(Duration::from_secs(1)).await;
+    let refused = logs.contents();
+    assert!(
+        refused.contains("Exceeded MaxWaiting"),
+        "the second pull was refused: {refused}"
+    );
     assert!(
         !handle.is_finished(),
         "the refused pull ended the consumer: {:?}",
