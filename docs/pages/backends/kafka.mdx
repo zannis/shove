@@ -679,11 +679,12 @@ That holds for a hole between delivered records.
 A trailing control record is different: with nothing delivered after it, the committed position stays one below the high watermark.
 An idle transactional topic therefore reads a lag of 1 until the next record arrives, and nothing is redelivered.
 
-On shutdown the consumer first waits for its in-flight handlers to finish.
+On shutdown the consumer first waits for its in-flight handlers to finish, unless that wait fails, as described below.
 That wait is bounded by the handler timeout.
 An in-place delay does not extend it: shutdown cuts the delay short, and the record stays uncommitted.
 The consumer keeps polling while it waits, and a record it is handed meanwhile goes back to the broker with the assignment paused.
 A handler that holds its slot past `max.poll.interval.ms` therefore does not evict the member, and a rebalance that needs this member's revoke completes during the wait.
+A partition that rebalance revokes is left out of the final commit, so its next owner is handed again every record its handlers completed since the last accepted commit.
 It then drains the republish queue and commits its final position **synchronously**.
 That commit carries every partition's current position, whether or not an earlier commit already offered it.
 It therefore offers every safe position, including one a rejected commit left to re-offer.
@@ -714,6 +715,12 @@ A process that exits on the error therefore does not cut the LeaveGroup short, a
 Against a coordinator that does not answer, the reconnect or the error comes up to 20 s later, and the close finishes on its thread.
 If a commit is still in flight on its thread, the close runs once that commit returns, and the error is returned without waiting for it.
 A member whose task is aborted closes off the runtime thread as well, but nothing waits for that close.
+
+The wait for the handlers at a stop can fail too: on a receive error that ends a consumer, see [Broker outages](#broker-outages), or on a put-back or a pause librdkafka refuses.
+The stop then ends as an error exit does, with no final commit: the consumer closes with nothing committed, and every record completed since the last accepted commit is redelivered.
+The close comes before the handlers finish, so the member leaves its group while they may still run, and the stop returns once every one of them has finished.
+The stop has already fired, so a retryable error reconnects nothing, and the stop ends as a clean one: `run` returns `Ok(())`.
+A permanent error is returned.
 
 A final commit the broker does not confirm ends the member with `ShoveError::Commit` instead of a clean exit.
 The error reads `offset commit at shutdown`, because the commit it names can be the one in flight when the stop landed.
@@ -762,6 +769,8 @@ What that means for replay:
   When the final commit is rejected or hits its deadline, redelivery starts from the last position the broker accepted, and the member reports that with `ShoveError::Commit`.
   A commit request librdkafka abandoned on a coordinator reconnect can also be applied after the final one, as the commit section above describes.
   A coordinator hiccup overlapping the shutdown can therefore replay a few records.
+  A stop whose wait for the handlers failed makes no final commit, so every record completed since the last accepted commit is redelivered, even when `run` returns `Ok(())`.
+  A partition revoked during that wait is redelivered from its last accepted commit too.
 
 `Outcome::Reject` routes to the DLQ (if configured) and commits the offset; the original is not redelivered. Messages that exhaust `max_retries` follow the same DLQ-then-commit path.
 A dead letter that fails and may land later commits nothing.
