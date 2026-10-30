@@ -2921,3 +2921,303 @@ async fn a_dlq_publish_failure_that_cannot_be_retried_ends_the_member() {
     );
     drop(shutdown);
 }
+
+/// Under `PerRecord` too, a dead letter that cannot be published retires
+/// nothing. The broker refuses the three sends of `A`'s dead letter; the
+/// member ends with a connection error before the next record is handed out
+/// and reconnects, `A` is handed to the handler again and dead-lettered once
+/// the DLQ takes writes, and `B` follows it. No discard is counted.
+#[tokio::test]
+async fn a_dlq_publish_failure_under_per_record_redelivers() {
+    const PER_RECORD_TOPIC: &str = "kafka-dlq-failure-per-record";
+    const PER_RECORD_DLQ: &str = "kafka-dlq-failure-per-record-dlq";
+    const PER_RECORD_GROUP: &str = "kafka-dlq-failure-per-record-consumer";
+    shove::define_topic!(
+        PerRecordRejectTopic,
+        Order,
+        TopologyBuilder::new(PER_RECORD_TOPIC).dlq().build()
+    );
+
+    #[cfg(feature = "metrics")]
+    let snapshotter = install_recorder();
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    for topic in [PER_RECORD_TOPIC, PER_RECORD_DLQ] {
+        mock.api()
+            .create_topic(topic, 1, 1)
+            .expect("create the topic through the mock API");
+    }
+    produce_on(&bootstrap, PER_RECORD_TOPIC, &["A", "B"]).await;
+    mock.refuse_produce(RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN, SENDS_PER_PUBLISH);
+
+    let handler = Recorder::new(|id, _| {
+        if id == "A" {
+            Outcome::Reject
+        } else {
+            Outcome::Ack
+        }
+    });
+    let (run, shutdown) =
+        start_on::<PerRecordRejectTopic, _>(connect(&bootstrap).await, handler.clone(), |token| {
+            options(CommitPolicy::PerRecord, token)
+        });
+    wait_until(
+        || handler.count() >= 1,
+        DELIVERY_TIMEOUT,
+        "A reaching the handler",
+    )
+    .await;
+    let first_assign = per_record_probe::assigns_queued();
+
+    wait_until(
+        || handler.times_seen("A") >= 2,
+        DELIVERY_TIMEOUT,
+        "A handed to the handler again after its dead letter failed",
+    )
+    .await;
+    assert!(
+        per_record_probe::assigns_queued() > first_assign,
+        "A came back through a reconnect"
+    );
+    wait_for_position(
+        &bootstrap,
+        PER_RECORD_TOPIC,
+        PER_RECORD_GROUP,
+        2,
+        DELIVERY_TIMEOUT,
+        "A dead-lettered and B acked",
+    )
+    .await;
+    shutdown.cancel();
+    run.await
+        .expect("the run task completes")
+        .expect("a clean stop");
+
+    assert_eq!(
+        handler.ids(),
+        ["A", "A", "B"],
+        "A is redelivered, and B is handed out only behind it"
+    );
+    assert_eq!(
+        high_watermark(&bootstrap, PER_RECORD_DLQ, 0).await,
+        1,
+        "A is dead-lettered once"
+    );
+    #[cfg(feature = "metrics")]
+    assert_eq!(
+        discarded_total(&snapshotter, PER_RECORD_TOPIC),
+        0,
+        "a record kept through a failed dead letter is never counted as discarded"
+    );
+}
+
+/// The dead letter of a record that no longer decodes for its in-place
+/// redelivery retires nothing when it cannot be published. On an
+/// infra-owned topic a `Retry` waits in place and decodes the record again;
+/// the codec here refuses every second decode, so that decode fails and the
+/// record is dropped before the handler from inside its handler task. The
+/// broker refuses the three sends of its dead letter, the task reports the
+/// fault, and the member reconnects: the record is handed to the handler
+/// again, and its second dead letter lands. No discard is counted.
+#[tokio::test]
+async fn an_in_place_dead_letter_that_fails_after_a_failed_decode_redelivers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use shove::codec::Codec;
+
+    const UNDECODABLE_TOPIC: &str = "kafka-in-place-undecodable-dlq-failure";
+    const UNDECODABLE_DLQ: &str = "kafka-in-place-undecodable-dlq-failure-dlq";
+    const UNDECODABLE_GROUP: &str = "kafka-in-place-undecodable-dlq-failure-consumer";
+
+    static DECODES: AtomicUsize = AtomicUsize::new(0);
+
+    /// JSON that refuses every second decode: the first, the third and so
+    /// on succeed.
+    struct EveryOtherDecode;
+    impl Codec<Order> for EveryOtherDecode {
+        const NAME: &'static str = "every-other-decode";
+        fn encode(value: &Order) -> Result<Vec<u8>, ShoveError> {
+            Ok(serde_json::to_vec(value)?)
+        }
+        fn decode(bytes: &[u8]) -> Result<Order, ShoveError> {
+            if DECODES.fetch_add(1, Ordering::SeqCst) % 2 == 1 {
+                return Err(ShoveError::Codec {
+                    codec: Self::NAME,
+                    source: "every second decode is refused".into(),
+                });
+            }
+            Ok(serde_json::from_slice(bytes)?)
+        }
+    }
+
+    shove::define_topic!(
+        UndecodableTopic,
+        Order,
+        TopologyBuilder::new(UNDECODABLE_TOPIC)
+            .external()
+            .hold_queue(Duration::from_millis(200))
+            .dlq()
+            .build(),
+        codec = EveryOtherDecode
+    );
+
+    #[cfg(feature = "metrics")]
+    let snapshotter = install_recorder();
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    for topic in [UNDECODABLE_TOPIC, UNDECODABLE_DLQ] {
+        mock.api()
+            .create_topic(topic, 1, 1)
+            .expect("create the topic through the mock API");
+    }
+    produce_on(&bootstrap, UNDECODABLE_TOPIC, &["A"]).await;
+    mock.refuse_produce(RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN, SENDS_PER_PUBLISH);
+
+    let handler = Recorder::new(|_, _| Outcome::Retry);
+    let (run, shutdown) =
+        start_on::<UndecodableTopic, _>(connect(&bootstrap).await, handler.clone(), one_permit);
+    wait_until(
+        || handler.count() >= 1,
+        DELIVERY_TIMEOUT,
+        "A reaching the handler",
+    )
+    .await;
+    let first_assign = per_record_probe::assigns_queued();
+
+    wait_until(
+        || handler.count() >= 2,
+        DELIVERY_TIMEOUT,
+        "A handed to the handler again after its dead letter failed",
+    )
+    .await;
+    assert!(
+        per_record_probe::assigns_queued() > first_assign,
+        "A came back through a reconnect"
+    );
+    wait_for_position(
+        &bootstrap,
+        UNDECODABLE_TOPIC,
+        UNDECODABLE_GROUP,
+        1,
+        DELIVERY_TIMEOUT,
+        "A dead-lettered after its second failed decode",
+    )
+    .await;
+    shutdown.cancel();
+    run.await
+        .expect("the run task completes")
+        .expect("a clean stop");
+
+    assert_eq!(handler.ids(), ["A", "A"], "A is redelivered once");
+    let dead = read_records(&bootstrap, UNDECODABLE_DLQ, 1).await;
+    assert_eq!(
+        dead[0].header("Shove-Death-Reason"),
+        Some("deserialization_error"),
+        "the dead letter names the decode that failed"
+    );
+    assert_eq!(
+        high_watermark(&bootstrap, UNDECODABLE_DLQ, 0).await,
+        1,
+        "A is dead-lettered once"
+    );
+    assert_eq!(
+        high_watermark(&bootstrap, UNDECODABLE_TOPIC, 0).await,
+        1,
+        "nothing is written into the infra-owned topic"
+    );
+    #[cfg(feature = "metrics")]
+    assert_eq!(
+        discarded_total(&snapshotter, UNDECODABLE_TOPIC),
+        0,
+        "a record kept through a failed dead letter is never counted as discarded"
+    );
+}
+
+/// A rebalance completes while a record waits for a permit. Member A takes
+/// the head of both partitions on one permit: the first is retried and its
+/// republish holds the permit through a 30 s hold, so the second waits for
+/// that permit. Member B joins, and the cooperative rebalance cannot finish
+/// until A serves its callbacks, which only the permit wait's polling can
+/// do. B handling the head of the partition it took, inside A's hold, shows
+/// the wait served them.
+#[tokio::test]
+async fn a_rebalance_completes_while_a_record_waits_for_a_permit() {
+    use shove::kafka::permit_wait_probe;
+
+    const WAIT_REBALANCE_TOPIC: &str = "kafka-rebalance-during-permit-wait";
+    /// Far longer than the rebalance a joining member starts.
+    const HOLD: Duration = Duration::from_secs(30);
+    /// The bound for a wait that spans that rebalance: the mock coordinator
+    /// waits up to `session.timeout.ms` for its members to rejoin.
+    const REBALANCE_TIMEOUT: Duration = Duration::from_secs(60);
+    shove::define_topic!(
+        WaitRebalanceTopic,
+        Order,
+        TopologyBuilder::new(WAIT_REBALANCE_TOPIC)
+            .hold_queue(HOLD)
+            .build()
+    );
+
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    mock.api()
+        .create_topic(WAIT_REBALANCE_TOPIC, 2, 1)
+        .expect("create the topic through the mock API");
+    produce_to(&bootstrap, WAIT_REBALANCE_TOPIC, 0, "h0").await;
+    produce_to(&bootstrap, WAIT_REBALANCE_TOPIC, 1, "h1").await;
+
+    let a = Recorder::new(|_, metadata| {
+        if metadata.retry_count == 0 {
+            Outcome::Retry
+        } else {
+            Outcome::Ack
+        }
+    });
+    let (run_a, stop_a) =
+        start_on::<WaitRebalanceTopic, _>(connect(&bootstrap).await, a.clone(), one_permit);
+    wait_until(
+        || a.count() >= 1,
+        DELIVERY_TIMEOUT,
+        "A retrying the head it took first",
+    )
+    .await;
+    wait_until(
+        || permit_wait_probe::entered() >= 2,
+        DELIVERY_TIMEOUT,
+        "the other head waiting for the permit the hold keeps",
+    )
+    .await;
+    let retried_at = a.deliveries()[0].at;
+
+    let b = Recorder::new(|_, _| Outcome::Ack);
+    let (run_b, stop_b) =
+        start_on::<WaitRebalanceTopic, _>(connect(&bootstrap).await, b.clone(), |token| {
+            ConsumerOptions::<Kafka>::new().with_shutdown(token)
+        });
+    wait_until(
+        || b.count() >= 1,
+        REBALANCE_TIMEOUT,
+        "B handling the head of the partition it took",
+    )
+    .await;
+    assert!(
+        retried_at.elapsed() < HOLD,
+        "the rebalance completed inside A's hold, while A waited for its permit"
+    );
+    let first_of_b = b.deliveries()[0].clone();
+    assert_eq!(
+        first_of_b.offset,
+        Some(0),
+        "B starts at the head of the moved partition, which A never committed: {first_of_b:?}"
+    );
+
+    // A stops inside the rebalance B's departure starts, so its final commit
+    // may be refused; only the rebalance inside the hold matters here.
+    stop_b.cancel();
+    run_b
+        .await
+        .expect("B's task completes")
+        .expect("B stops clean");
+    stop_a.cancel();
+    let _ = run_a.await.expect("A's task completes");
+}
