@@ -256,7 +256,7 @@ For topic provisioning, see [Declare topology](#declare-topology).
 `publish` and `publish_with_headers` send a record again after a transient failure, three sends in all, and then return `ShoveError::Connection`.
 An authorization error is returned at the first refusal as `ShoveError::Topology`.
 A producer that librdkafka marked fatal returns `ShoveError::Unknown` whatever the cause, including a principal that may not request a producer id; `is_retryable()` is false for both.
-On a sequenced topic `publish_batch` sends the records in slice order and reports the first failure with every record after it, so re-publishing `to_republish()` keeps each key's order; see [Batch publishing](/guides/batch-publishing).
+On a sequenced topic `publish_batch` sends the records in slice order and reports the first failure with every record after it, so a re-publish of `to_republish()` stores copies of the failed record and every record after it in slice order; see [Batch publishing](/guides/batch-publishing).
 
 ### Producer tuning
 

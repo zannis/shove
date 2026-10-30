@@ -1043,8 +1043,8 @@ impl KafkaClient {
     }
 
     /// Sends a batch to `topic` in slice order and reports a prefix, so a
-    /// republish of what the report names keeps the order of records that
-    /// share a key. Nothing is retried.
+    /// republish of what the report names stores copies of the failed record
+    /// and every record after it in slice order. Nothing is retried.
     pub(super) async fn publish_in_order(
         &self,
         topic: &str,

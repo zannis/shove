@@ -491,7 +491,8 @@ impl KafkaPublisher {
     /// nothing is left unattempted. On a sequenced topic the records are
     /// sent in slice order and the report is a prefix: the first record that
     /// failed, with every record after it unattempted, so republishing the
-    /// report's records keeps each key's order.
+    /// report's records stores copies of the failed record and every record
+    /// after it in slice order.
     pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
         self.publish_batch_report::<T>(messages)
             .await
