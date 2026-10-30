@@ -42,7 +42,7 @@ pub trait KafkaQueueStatsProvider: Send + Sync {
     /// `queue` names the topic, `group_id` is the Kafka consumer group whose
     /// committed offsets are queried. Callers must pass the actual group ID
     /// (e.g. `"{queue}-fifo"` for FIFO groups) rather than re-deriving it from
-    /// the queue name — re-derivation is what caused the bug fixed by arch-K-1.
+    /// the queue name.
     ///
     /// `reset` is the group's `auto.offset.reset` policy. It determines the
     /// effective start position — and therefore the lag — for partitions where
@@ -355,7 +355,7 @@ impl StatsConsumer {
 
 /// Default stats provider that queries Kafka consumer lag.
 ///
-/// perf-K-10: caches one consumer per group_id so each autoscaler poll
+/// Caches one consumer per group_id so each autoscaler poll
 /// reuses the connection + metadata cache instead of doing a fresh broker
 /// handshake. Typical deployments have one or two distinct group_ids
 /// (`{queue}-consumer` for standard groups, `{queue}-fifo` for FIFO).
@@ -471,7 +471,7 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
         group_id: &str,
         reset: KafkaAutoOffsetReset,
     ) -> Result<KafkaQueueStats> {
-        // perf-K-10: reuse a cached BaseConsumer keyed by group_id.
+        // Reuse a cached BaseConsumer keyed by group_id.
         let consumer = self.get_or_create_consumer(group_id).await?;
         let queue = queue.to_string();
 
@@ -505,7 +505,7 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
             tpl.add_partition(&queue, pid);
         }
 
-        // perf-K-11: committed_offsets can fail with transient errors (e.g.
+        // committed_offsets can fail with transient errors (e.g.
         // NotCoordinator) when the group coordinator hasn't been elected.
         // Drive the retry loop with tokio::time::sleep between attempts so
         // we don't hold a spawn_blocking worker across the backoff (the old
@@ -1527,7 +1527,7 @@ mod tests {
         assert_eq!(count, 1, "should stay at min=1");
     }
 
-    // -- arch-K-1: autoscaler uses the group's actual consumer group ID --
+    // -- autoscaler uses the group's actual consumer group ID --
 
     fn make_group_registry_with_group_id(
         queue: &str,
@@ -1563,7 +1563,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_metrics_passes_stored_group_id_to_stats_provider() {
         // Standard group: group_id defaults to "{queue}-consumer". Regression
-        // test for arch-K-1 on the standard path — without it the FIFO test
+        // test for the standard path — without it the FIFO test
         // alone left the default-derivation case uncovered.
         let queue = "orders";
         let expected_group_id = format!("{queue}-consumer");
@@ -1609,7 +1609,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_metrics_uses_fifo_group_id_for_fifo_groups() {
         // FIFO group: group_id = "{queue}-fifo", NOT "{queue}-consumer".
-        // Before the arch-K-1 fix, the autoscaler always derived group_id as
+        // Before the fix, the autoscaler always derived group_id as
         // "{queue}-consumer", so committed offsets for the FIFO group were never
         // found and the fallback path reported the full partition watermark as lag.
         let queue = "orders";
