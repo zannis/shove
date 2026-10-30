@@ -3135,7 +3135,7 @@ async fn an_in_place_dead_letter_that_fails_after_a_failed_decode_redelivers() {
 
 /// A rebalance completes while a record waits for a permit. Member A takes
 /// the head of both partitions on one permit: the first is retried and its
-/// republish holds the permit through a 30 s hold, so the second waits for
+/// republish holds the permit through a 90 s hold, so the second waits for
 /// that permit. Member B joins, and the cooperative rebalance cannot finish
 /// until A serves its callbacks, which only the permit wait's polling can
 /// do. B handling the head of the partition it took, inside A's hold, shows
@@ -3145,8 +3145,9 @@ async fn a_rebalance_completes_while_a_record_waits_for_a_permit() {
     use shove::kafka::permit_wait_probe;
 
     const WAIT_REBALANCE_TOPIC: &str = "kafka-rebalance-during-permit-wait";
-    /// Far longer than the rebalance a joining member starts.
-    const HOLD: Duration = Duration::from_secs(30);
+    /// Longer than `REBALANCE_TIMEOUT`, so a rebalance B's wait sees complete
+    /// always completes inside the hold. The stops end the hold at once.
+    const HOLD: Duration = Duration::from_secs(90);
     /// The bound for a wait that spans that rebalance: the mock coordinator
     /// waits up to `session.timeout.ms` for its members to rejoin.
     const REBALANCE_TIMEOUT: Duration = Duration::from_secs(60);
