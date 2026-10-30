@@ -502,8 +502,8 @@ Ordering is partition-scoped: two messages with different keys may land on diffe
 
 A sequenced consumer group handles its records on one shard task.
 When the group's drain timeout runs out with a handler still going, the group aborts the shard task along with its own task, and the handler call the shard is awaiting goes with it.
-The record that handler was working on stays uncommitted, and the next member to take its partition receives it again.
-The shard commits nothing after the group has reported `timed_out`.
+A handler still running when the abort reaches the shard is dropped with it: its record stays uncommitted, and the next member to take its partition receives it again.
+A handler that finishes in the moment between the report and the abort can still have its record committed.
 
 See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced example](/backends/kafka/examples/sequenced) for a runnable walkthrough.
 
