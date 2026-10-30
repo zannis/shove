@@ -1,6 +1,8 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -852,13 +854,16 @@ where
 
         shard.processing.store(true, Ordering::Release);
         let retry_count = metadata.retry_count;
-        let handler = Arc::clone(shard.handler);
-        let ctx = Arc::clone(shard.ctx);
         let attempt = metadata.clone();
         let outcome = invoke_handler(
-            async move { handler.handle(payload, attempt, ctx.as_ref()).await },
+            async {
+                shard
+                    .handler
+                    .handle(payload, attempt, shard.ctx.as_ref())
+                    .await
+            },
             shard.handler_timeout,
-            shard.timeout_outcome.clone(),
+            shard.timeout_outcome.as_ref(),
             shard.topic,
             shard.group,
         )
@@ -1007,35 +1012,43 @@ pub(super) fn abort_on_drop<T>(handles: &[tokio::task::JoinHandle<T>]) -> Vec<Ab
 /// How a [`guarded`] call ended.
 enum Guarded<T> {
     Done(T),
-    /// The call panicked; the error is the task's `JoinError`.
-    Panicked(tokio::task::JoinError),
-    /// The call outlasted this limit and was aborted.
+    /// The call panicked; the text is the panic's message.
+    Panicked(String),
+    /// The call outlasted this limit and was dropped.
     TimedOut(Duration),
 }
 
-/// Runs `fut` in a child task, so a panic inside it ends that task while the
-/// caller carries on, and gives up on it after `timeout`. Records no metric.
+/// The text a panic was raised with, whether it was given a literal or a
+/// formatted string.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic payload that is no text".to_string())
+}
+
+/// Polls `fut` on the caller's own task, so a panic inside it is caught while
+/// the caller carries on, and gives up on it after `timeout`. Records no
+/// metric.
 ///
-/// The child is aborted when the call times out and when the caller is
-/// dropped, as an aborted FIFO shard or DLQ drain is. A bare `JoinHandle` would
-/// detach it to run on with no limit.
-async fn guarded<F>(fut: F, timeout: Option<Duration>) -> Guarded<F::Output>
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    let mut join = tokio::spawn(fut);
-    let _abort = AbortOnDrop(join.abort_handle());
-    let joined = match timeout {
-        Some(limit) => match tokio::time::timeout(limit, &mut join).await {
-            Ok(joined) => joined,
+/// No task runs the call apart from the caller, so the call is dropped when it
+/// times out and when the caller is dropped, as an aborted FIFO shard or DLQ
+/// drain is, and a message costs the one task its caller already is. A call
+/// that blocks its thread without ever yielding cannot be cut off by the
+/// limit until it returns.
+async fn guarded<F: Future>(fut: F, timeout: Option<Duration>) -> Guarded<F::Output> {
+    let caught = AssertUnwindSafe(fut).catch_unwind();
+    let caught = match timeout {
+        Some(limit) => match tokio::time::timeout(limit, caught).await {
+            Ok(caught) => caught,
             Err(_) => return Guarded::TimedOut(limit),
         },
-        None => join.await,
+        None => caught.await,
     };
-    match joined {
+    match caught {
         Ok(output) => Guarded::Done(output),
-        Err(e) => Guarded::Panicked(e),
+        Err(payload) => Guarded::Panicked(panic_message(payload.as_ref())),
     }
 }
 
@@ -1044,29 +1057,29 @@ where
 ///
 /// The future runs under [`guarded`], so a panic inside the user's handler is
 /// caught there and surfaced as `Outcome::Retry` with metrics recorded.
-/// Without this, the spawned task would abort before the metric calls and
-/// panicked handlers would disappear from the consumed/latency series even
-/// though the caller still requeues them.
+/// Without this, the panic would unwind past the metric calls and panicked
+/// handlers would disappear from the consumed/latency series even though the
+/// caller still requeues them.
 async fn invoke_handler<F>(
     fut: F,
     timeout: Option<Duration>,
-    timeout_outcome: Option<Outcome>,
+    timeout_outcome: Option<&Outcome>,
     topic: &str,
     group: Option<&str>,
 ) -> Outcome
 where
-    F: Future<Output = Outcome> + Send + 'static,
+    F: Future<Output = Outcome>,
 {
     let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
     let outcome = match guarded(fut, timeout).await {
         Guarded::Done(outcome) => outcome,
-        Guarded::Panicked(e) => {
-            tracing::warn!(error = %e, "handler task panicked, retrying message");
+        Guarded::Panicked(message) => {
+            tracing::warn!(error = %message, "handler panicked, retrying message");
             Outcome::Retry
         }
         Guarded::TimedOut(limit) => {
-            let resolved = handler_timeout_outcome(timeout_outcome);
+            let resolved = handler_timeout_outcome(timeout_outcome.cloned());
             tracing::warn!(outcome = ?resolved, "handler timed out after {limit:?}");
             metrics::record_failed(topic, group, metrics::FailReason::Timeout);
             resolved
@@ -1417,6 +1430,29 @@ impl Drop for BusyTask {
     }
 }
 
+/// Waits, for at most [`EXIT_DRAIN_TIMEOUT`], for the tasks `busy` counts, when
+/// a consumer of `queue` leaves any other way than a stop, which has drained
+/// them already.
+async fn wait_for_busy_tasks(busy: &BusyTasks, queue: &str) {
+    let running = busy.running();
+    if running == 0 {
+        return;
+    }
+    tracing::info!(
+        queue,
+        running,
+        "the consumer is exiting, waiting for in-flight tasks"
+    );
+    if !busy.idle_within(EXIT_DRAIN_TIMEOUT).await {
+        tracing::warn!(
+            queue,
+            running = busy.running(),
+            timeout = ?EXIT_DRAIN_TIMEOUT,
+            "tasks were still running when the wait ended; each settles its message as it finishes"
+        );
+    }
+}
+
 /// Waits for a free processing slot, then takes every other free one: the
 /// slots the next pull is sized to and reserves for its messages.
 async fn reserve_free_slots(slots: &Arc<Semaphore>) -> Result<Vec<OwnedSemaphorePermit>> {
@@ -1653,24 +1689,7 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
     /// started, when the consumer leaves any other way than a stop, which has
     /// drained them already.
     async fn drain_on_exit(&self) {
-        let running = self.busy.running();
-        if running == 0 {
-            return;
-        }
-        let queue = self.topology.queue();
-        tracing::info!(
-            queue,
-            running,
-            "the consumer is exiting, waiting for in-flight tasks"
-        );
-        if !self.busy.idle_within(EXIT_DRAIN_TIMEOUT).await {
-            tracing::warn!(
-                queue,
-                running = self.busy.running(),
-                timeout = ?EXIT_DRAIN_TIMEOUT,
-                "tasks were still running when the wait ended; each settles its message as it finishes"
-            );
-        }
+        wait_for_busy_tasks(&self.busy, self.topology.queue()).await;
     }
 
     /// Size-checks and decodes `msg`, runs the handler on it and settles its
@@ -1714,11 +1733,10 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
         }
         let retry_count = metadata.retry_count;
 
-        let worker = Arc::clone(&self);
         let outcome = invoke_handler(
-            async move { worker.handler.handle(payload, metadata, &worker.ctx).await },
+            async { self.handler.handle(payload, metadata, &self.ctx).await },
             self.handler_timeout,
-            self.timeout_outcome.clone(),
+            self.timeout_outcome.as_ref(),
             queue,
             group,
         )
@@ -2573,14 +2591,8 @@ impl NatsConsumer {
                         };
 
                     let metadata = extract_dead_metadata(&msg);
-                    let dead_handler = Arc::clone(&handler);
-                    let dead_ctx = Arc::clone(&ctx);
                     let call = guarded(
-                        async move {
-                            dead_handler
-                                .handle_dead(payload, metadata, dead_ctx.as_ref())
-                                .await;
-                        },
+                        async { handler.handle_dead(payload, metadata, ctx.as_ref()).await },
                         handler_timeout,
                     )
                     .await;
@@ -3313,6 +3325,24 @@ mod retry_strategy_tests {
         assert_eq!(sequenced(u32::MAX, Some(5)), u32::MAX);
         assert_eq!(sequenced(1, Some(u32::MAX)), u32::MAX);
     }
+
+    fn with_count(value: &str) -> Option<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_COUNT_HEADER, value);
+        Some(headers)
+    }
+
+    /// A publish stamps no count of its own, so a message that has never been
+    /// retried reads as zero retries, as one an earlier version stamped with
+    /// `0` does.
+    #[test]
+    fn a_missing_retry_count_header_reads_as_zero_retries() {
+        assert_eq!(get_retry_count(&None), 0);
+        assert_eq!(get_retry_count(&Some(HeaderMap::new())), 0);
+        assert_eq!(get_retry_count(&with_count("0")), 0);
+        assert_eq!(get_retry_count(&with_count("3")), 3);
+        assert_eq!(get_retry_count(&with_count("many")), 0);
+    }
 }
 
 #[cfg(test)]
@@ -3527,12 +3557,51 @@ mod guarded_tests {
         ));
     }
 
+    async fn panics_with_a_formatted_message() {
+        panic!(
+            "{}",
+            String::from("the call panics with a formatted message")
+        );
+    }
+
+    async fn panics_with_a_payload_that_is_no_text() {
+        std::panic::panic_any(7_u32);
+    }
+
+    /// The caller gets the panic back as its text, whether the panic carried a
+    /// literal, a formatted string or something that is no text at all.
     #[tokio::test]
-    async fn a_panic_is_reported_to_the_caller() {
-        assert!(matches!(
-            guarded(panics(), None).await,
-            Guarded::Panicked(_)
-        ));
+    async fn a_panic_is_reported_to_the_caller_with_its_message() {
+        for timeout in [None, Some(Duration::from_secs(1))] {
+            assert!(matches!(
+                guarded(panics(), timeout).await,
+                Guarded::Panicked(message) if message == "the call panics on purpose"
+            ));
+            assert!(matches!(
+                guarded(panics_with_a_formatted_message(), timeout).await,
+                Guarded::Panicked(message)
+                    if message == "the call panics with a formatted message"
+            ));
+            assert!(matches!(
+                guarded(panics_with_a_payload_that_is_no_text(), timeout).await,
+                Guarded::Panicked(message) if message == "a panic payload that is no text"
+            ));
+        }
+    }
+
+    /// The caller polls the call itself: no child task is spawned for it, so a
+    /// message costs one task and not two.
+    #[tokio::test]
+    async fn a_guarded_call_runs_on_the_callers_task() {
+        tokio::spawn(async {
+            let caller = tokio::task::id();
+            for timeout in [None, Some(Duration::from_secs(1))] {
+                let call = guarded(async { tokio::task::id() }, timeout).await;
+                assert!(matches!(call, Guarded::Done(id) if id == caller));
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -3540,6 +3609,24 @@ mod guarded_tests {
         let limit = Duration::from_secs(5);
         let call = guarded(std::future::pending::<()>(), Some(limit)).await;
         assert!(matches!(call, Guarded::TimedOut(at) if at == limit));
+    }
+
+    /// A call that outlasts its limit is dropped before the caller carries on,
+    /// so it cannot run alongside whatever the caller does next.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_past_its_limit_is_dropped_before_the_caller_resumes() {
+        let gone = Arc::new(AtomicBool::new(false));
+        let held = Dropped(Arc::clone(&gone));
+        let call = guarded(
+            async move {
+                let _held = held;
+                std::future::pending::<()>().await;
+            },
+            Some(Duration::from_secs(5)),
+        )
+        .await;
+        assert!(matches!(call, Guarded::TimedOut(_)));
+        assert!(gone.load(Ordering::Acquire), "the call outlived its limit");
     }
 
     /// Sets its flag when the call it was moved into is dropped.
