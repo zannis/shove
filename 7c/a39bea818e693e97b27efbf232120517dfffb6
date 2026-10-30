@@ -1,0 +1,21 @@
+docs/pages/ops/backends.mdx
+  s_1001dc3147e1e5::t_1ac56f582490d1 61
+  s_1001dc3147e1e5::t_0f359bbe00de39 53
+  s_1001dc3147e1e5::t_a17eaf895233be 62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7ca39bea818e693e97b27efbf232120517dfffb6",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
