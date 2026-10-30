@@ -31,12 +31,12 @@ impl<B: Backend> Publisher<B> {
 
     /// Publish `msg` with caller-supplied `headers`.
     ///
-    /// On every backend, a header name that starts with `shove-` in any ASCII
-    /// letter case is reserved for the headers shove stamps itself, such as the
-    /// retry count and the message id. So are names that start with
-    /// `x-retry-count`, `x-message-id`, `x-death` or `x-sequence-key`. A
-    /// reserved name returns [`ShoveError::Validation`] naming the header, and
-    /// nothing is published.
+    /// Some header names are reserved on every backend, in any ASCII letter
+    /// case, because a backend stamps them itself or reads them back as its
+    /// own: names that start with `shove-`, `x-retry-count`, `x-message-id`,
+    /// `x-death` or `x-sequence-key`, and the exact names `x-original-queue`,
+    /// `payload` and `shard`. A reserved name returns
+    /// [`ShoveError::Validation`] naming the header, and nothing is published.
     ///
     /// [`ShoveError::Validation`]: crate::error::ShoveError::Validation
     pub async fn publish_with_headers<T: Topic>(
