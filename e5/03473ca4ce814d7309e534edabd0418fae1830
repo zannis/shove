@@ -1,0 +1,21 @@
+CLAUDE.md
+  s_1001dc3147e1e5::t_0a1d6607ad3cd7 97-102
+src/backend/batch_consumer.rs
+  s_1001dc3147e1e5::t_48b68902f83a8b 15-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e503473ca4ce814d7309e534edabd0418fae1830",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
