@@ -34,7 +34,7 @@ use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::routing::{
-    PoisonedKeys, RetryDecision, decide_retry, handler_timeout_outcome, hold_index,
+    PoisonedKeys, RetryDecision, decide_retry, handler_timeout_outcome, hold_delay,
 };
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::QueueTopology;
@@ -579,13 +579,8 @@ async fn route_outcome(
             }
         }
         RetryDecision::Hold { increment: true } => {
-            let new_count = retry_count + 1;
-            let delay = if hold_queues.is_empty() {
-                Duration::from_secs(1)
-            } else {
-                let idx = hold_index(retry_count, hold_queues.len());
-                hold_queues[idx].delay()
-            };
+            let new_count = retry_count.saturating_add(1);
+            let delay = hold_delay(hold_queues, retry_count);
 
             if in_place {
                 // An external stream is never written by its consumer: the
@@ -606,11 +601,7 @@ async fn route_outcome(
             return;
         }
         RetryDecision::Hold { increment: false } => {
-            let delay = if hold_queues.is_empty() {
-                Duration::from_secs(1)
-            } else {
-                hold_queues[0].delay()
-            };
+            let delay = hold_delay(hold_queues, 0);
             if let Err(e) = msg.ack_with(AckKind::Nak(Some(delay))).await {
                 tracing::error!(error = %e, "failed to nak-with-delay for defer");
             }
@@ -640,23 +631,18 @@ fn dlq_fail_reason(reason: &str) -> metrics::FailReason {
 // Sequenced settlement
 // ---------------------------------------------------------------------------
 
-/// The hold before a retried record is handed back on a topology without
-/// hold queues.
-const NO_HOLD_QUEUE_DELAY: Duration = Duration::from_secs(1);
-
 /// The `ack_wait` JetStream applies to a consumer whose config leaves it at
 /// zero.
 const JETSTREAM_DEFAULT_ACK_WAIT: Duration = Duration::from_secs(30);
 
-/// The hold before the attempt after `retry_count`: the hold queue at that
-/// index, the last one once the count runs past the ladder, and
-/// [`NO_HOLD_QUEUE_DELAY`] without hold queues.
-fn retry_hold_delay(hold_queues: &[HoldQueue], retry_count: u32) -> Duration {
-    usize::try_from(retry_count)
-        .ok()
-        .and_then(|tier| hold_queues.get(tier))
-        .or_else(|| hold_queues.last())
-        .map_or(NO_HOLD_QUEUE_DELAY, HoldQueue::delay)
+/// The count a sequenced record first reaches its handler with: its
+/// `Shove-Retry-Count` plus one for every earlier JetStream delivery, so each
+/// hand-off to a new delivery spends a retry, whether a stop, a crash or an
+/// `ack_wait` expiry made it.
+fn sequenced_retry_count(metadata: &MessageMetadata) -> u32 {
+    metadata
+        .retry_count
+        .saturating_add(in_place_retry_count(metadata))
 }
 
 /// How often a held record renews its `ack_wait` with a progress ack: a third
@@ -685,8 +671,7 @@ async fn hold_with_progress(
     let started = tokio::time::Instant::now();
     loop {
         let remaining = delay.saturating_sub(started.elapsed());
-        // The renewal is in the select too: a publish can block while the
-        // client reconnects.
+        // A publish can block while the client reconnects.
         let renewed = tokio::select! {
             biased;
             _ = shutdown.cancelled() => return false,
@@ -796,14 +781,14 @@ async fn dead_letter_unhandled<H, C>(
 }
 
 /// Dead-letters a record whose outcome is terminal, a `Reject` or an exhausted
-/// `Retry`, with the accounting of `route_outcome`'s DLQ arm: the failure
-/// counts at once, the discard only once `double_ack` confirms the record is
-/// retired.
+/// `Retry`, stamped with the count it was settled at, and with the accounting
+/// of `route_outcome`'s DLQ arm: the failure counts at once, the discard only
+/// once `double_ack` confirms the record is retired.
 async fn dead_letter_terminal<H, C>(
     shard: &FifoShard<'_, H, C>,
     msg: &Message,
     reason: &'static str,
-    retry_count: Option<u32>,
+    retry_count: u32,
 ) -> ShardStep {
     let pending = metrics::record_terminal(
         shard.topic,
@@ -811,10 +796,9 @@ async fn dead_letter_terminal<H, C>(
         dlq_fail_reason(reason),
         shard.topology.dlq().is_some(),
     );
-    match dead_letter_in_place(shard, msg, reason, retry_count).await {
+    match dead_letter_in_place(shard, msg, reason, Some(retry_count)).await {
         DeadLetter::Landed => {
-            // `double_ack` for the same reason as `route_outcome`'s DLQ arm:
-            // only a server-confirmed ack proves the record is retired.
+            // Only a server-confirmed ack proves the record is retired.
             match msg.double_ack().await {
                 Ok(()) => pending.confirm(),
                 Err(e) => {
@@ -838,11 +822,12 @@ async fn dead_letter_terminal<H, C>(
 /// timeout and a handler panic, holds the record un-acked through the
 /// attempt's hold delay ([`hold_with_progress`]) and then hands it back to the
 /// handler in process, decoded afresh from its bytes. The retry count lives in
-/// memory, seeded from `Shove-Retry-Count`, and nothing is republished. The
-/// shard durable's `max_ack_pending: 1` keeps every later record on the shard
-/// undelivered meanwhile. A `Reject` or an exhausted retry budget
-/// dead-letters the record under the topic's `SequenceFailure`, and a failed
-/// dead-letter publish is retried in place ([`dead_letter_in_place`]).
+/// memory, seeded by [`sequenced_retry_count`], and nothing is republished.
+/// The shard durable's `max_ack_pending: 1` keeps every later record on the
+/// shard undelivered meanwhile. A `Reject` or an exhausted retry budget
+/// dead-letters the record under the topic's `SequenceFailure`, with the
+/// count it was settled at, and a failed dead-letter publish is retried in
+/// place ([`dead_letter_in_place`]).
 async fn settle_sequenced<T, H>(shard: &FifoShard<'_, H, H::Context>, msg: &Message) -> ShardStep
 where
     T: SequencedTopic,
@@ -915,9 +900,7 @@ where
     }
 
     let mut metadata = extract_message_metadata(msg);
-    // Set once the record has been held: from then on its count is the one in
-    // `metadata`, not the one in its header.
-    let mut held = false;
+    metadata.retry_count = sequenced_retry_count(&metadata);
     loop {
         let payload: T::Message =
             match <T::Codec as crate::Codec<T::Message>>::decode_owned(msg.payload.clone()) {
@@ -934,7 +917,7 @@ where
                         metrics::FailReason::Deserialize,
                     );
                     poison_key(shard.poisoned, &seq_key, queue);
-                    let count = held.then_some(metadata.retry_count);
+                    let count = Some(metadata.retry_count);
                     return dead_letter_unhandled(shard, msg, "deserialization_error", count).await;
                 }
             };
@@ -968,11 +951,10 @@ where
                 // FailAll: a DLQ-terminal outcome poisons the key, so every
                 // later message for it is dead-lettered instead of handled.
                 poison_key(shard.poisoned, &seq_key, queue);
-                let count = held.then_some(retry_count);
-                return dead_letter_terminal(shard, msg, reason, count).await;
+                return dead_letter_terminal(shard, msg, reason, retry_count).await;
             }
             RetryDecision::Hold { increment } => {
-                let delay = retry_hold_delay(topology.hold_queues(), retry_count);
+                let delay = hold_delay(topology.hold_queues(), retry_count);
                 if !hold_with_progress(msg, delay, shard.ack_wait, shard.shutdown).await {
                     return ShardStep::Stopped { redelivery: None };
                 }
@@ -980,7 +962,6 @@ where
                     metadata.retry_count = retry_count.saturating_add(1);
                 }
                 metadata.redelivered = true;
-                held = true;
             }
         }
     }
@@ -991,24 +972,41 @@ where
 /// record to be redelivered once its `ack_wait` expires.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Naks the record a stopping shard still holds, so the server hands it to
+/// How much of [`RELEASE_TIMEOUT`] the consumer-info sweep in
+/// [`release_held`] may take, so a sweep that times out still leaves time for
+/// the nak.
+const SWEEP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Naks the record a stopping shard still holds, so the server can hand it to
 /// the next consumer of the shard at once, ahead of every record behind it.
+///
+/// Best effort: whatever does not happen within [`RELEASE_TIMEOUT`], and every
+/// release the server spends elsewhere, leaves the record to be redelivered
+/// once its `ack_wait` expires. Nothing is lost either way, and nothing behind
+/// the record is delivered first.
 ///
 /// Called once the shard's pull subscription is dropped. The server keeps
 /// that subscription's pull request on the durable's waiting list until it
 /// next sweeps the list, and a nak processed before then is spent on the dead
 /// request: the redelivery goes to an inbox nobody reads, or, on
-/// nats-server 2.10.14, is dropped. Either way the record then waits out
-/// `ack_wait`. A consumer-info request sweeps the list, so it goes first.
+/// nats-server 2.10.14, is dropped. A consumer-info request sweeps the list,
+/// so it goes first. The sweep only finds the request dead once the
+/// subscription's UNSUB has reached the server, and that UNSUB is sent from a
+/// task the subscription's drop spawned: the yield gives that task its turn,
+/// with no guarantee that it has sent the UNSUB by then.
 async fn release_held(consumer: &PullConsumer, msg: &Message, redelivery: Option<Duration>) {
     let release = async {
-        // The dropped subscription's UNSUB is sent from a task its drop spawned.
         tokio::task::yield_now().await;
-        if let Err(e) = consumer.get_info().await {
-            tracing::warn!(
+        match tokio::time::timeout(SWEEP_TIMEOUT, consumer.get_info()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(
                 error = %e,
                 "failed to clear the stopped shard's pull request before releasing its held message"
-            );
+            ),
+            Err(_) => tracing::warn!(
+                timeout = ?SWEEP_TIMEOUT,
+                "timed out clearing the stopped shard's pull request before releasing its held message"
+            ),
         }
         msg.ack_with(AckKind::Nak(redelivery)).await
     };
@@ -2609,6 +2607,35 @@ mod retry_strategy_tests {
             u32::MAX - 1
         );
     }
+
+    fn sequenced(header_count: u32, delivery_count: Option<u32>) -> u32 {
+        let mut metadata = metadata(delivery_count);
+        metadata.retry_count = header_count;
+        sequenced_retry_count(&metadata)
+    }
+
+    #[test]
+    fn a_sequenced_count_spends_a_retry_per_earlier_delivery() {
+        assert_eq!(
+            sequenced(0, Some(1)),
+            0,
+            "a first delivery keeps the header's count"
+        );
+        assert_eq!(sequenced(2, Some(1)), 2);
+        assert_eq!(sequenced(0, Some(3)), 2, "two hand-offs spend two retries");
+        assert_eq!(sequenced(2, Some(4)), 5);
+        assert_eq!(
+            sequenced(3, None),
+            3,
+            "no delivery info keeps the header's count"
+        );
+    }
+
+    #[test]
+    fn a_sequenced_count_saturates() {
+        assert_eq!(sequenced(u32::MAX, Some(5)), u32::MAX);
+        assert_eq!(sequenced(1, Some(u32::MAX)), u32::MAX);
+    }
 }
 
 #[cfg(test)]
@@ -2640,46 +2667,11 @@ mod ack_wait_tests {
     }
 }
 
-/// [`retry_hold_delay`] and [`progress_interval`]: how long a sequenced
-/// record is held, and how often its `ack_wait` is renewed meanwhile.
+/// [`progress_interval`]: how often a held sequenced record renews its
+/// `ack_wait`.
 #[cfg(test)]
 mod sequenced_hold_tests {
     use super::*;
-
-    fn ladder(delays_ms: &[u64]) -> Vec<HoldQueue> {
-        delays_ms
-            .iter()
-            .map(|&ms| HoldQueue {
-                name: format!("hold-{ms}ms"),
-                delay: Duration::from_millis(ms),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn each_retry_takes_its_tier_and_the_last_tier_repeats() {
-        let hold_queues = ladder(&[100, 200, 400]);
-        let delays: Vec<Duration> = [0, 1, 2, 3, 50]
-            .into_iter()
-            .map(|count| retry_hold_delay(&hold_queues, count))
-            .collect();
-        assert_eq!(delays, [100, 200, 400, 400, 400].map(Duration::from_millis));
-    }
-
-    #[test]
-    fn a_count_from_a_hostile_header_takes_the_last_tier() {
-        let hold_queues = ladder(&[100, 200]);
-        assert_eq!(
-            retry_hold_delay(&hold_queues, u32::MAX),
-            Duration::from_millis(200)
-        );
-    }
-
-    #[test]
-    fn no_hold_queues_hold_for_a_second() {
-        assert_eq!(retry_hold_delay(&[], 0), Duration::from_secs(1));
-        assert_eq!(retry_hold_delay(&[], u32::MAX), Duration::from_secs(1));
-    }
 
     #[test]
     fn a_held_record_is_renewed_three_times_per_ack_wait() {

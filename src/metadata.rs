@@ -54,7 +54,7 @@ pub struct MessageMetadata {
     /// from the broker's redelivery count on an external NATS stream, where a
     /// `Defer` and an `ack_wait` expiry therefore count as well. A sequenced
     /// NATS consumer retries in place too and keeps it in memory, seeded from
-    /// the record's own header.
+    /// the record's own header plus one for every earlier JetStream delivery.
     pub retry_count: u32,
     /// Opaque delivery identifier (AMQP tag, SQS receipt handle, etc).
     pub delivery_id: String,
