@@ -7288,19 +7288,26 @@ async fn a_worker_pulls_again_once_its_connection_comes_back() {
 // DLQ drain
 // ===========================================================================
 
-/// Records the id of every dead letter it is handed. A letter called `boom`
-/// makes `handle_dead` panic, and one called `hang` makes it never return.
+/// Records the id of every dead letter it is handed, then spends `delay` on it.
+/// A letter called `boom` makes `handle_dead` panic, and one called `hang`
+/// makes it never return.
 #[derive(Clone)]
 struct DeadLetterProbe {
     handled: Arc<Mutex<Vec<String>>>,
     counter: WaitableCounter,
+    delay: Duration,
 }
 
 impl DeadLetterProbe {
     fn new() -> Self {
+        Self::slow(Duration::ZERO)
+    }
+
+    fn slow(delay: Duration) -> Self {
         Self {
             handled: Arc::new(Mutex::new(Vec::new())),
             counter: WaitableCounter::new(),
+            delay,
         }
     }
 
@@ -7318,6 +7325,9 @@ impl MessageHandler<WorkTopic> for DeadLetterProbe {
     async fn handle_dead(&self, msg: SimpleMessage, _meta: DeadMessageMetadata, _: &()) {
         self.handled.lock().await.push(msg.id.clone());
         self.counter.increment();
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
         match msg.id.as_str() {
             "boom" => panic!("handle_dead panics on purpose"),
             "hang" => std::future::pending::<()>().await,
@@ -7534,6 +7544,51 @@ async fn dlq_drain_stops_on_options_shutdown() {
         .expect("the drain stops when the token of its options fires")
         .expect("the drain task does not panic")
         .expect("the drain stops cleanly");
+    broker.close().await;
+}
+
+/// A DLQ durable whose `ack_wait` is less than three letters' handling long.
+/// The drain handles one letter at a time, so a drain that pulled the backlog
+/// up front would leave the later letters waiting past `ack_wait` and handle
+/// them twice. One that pulls a letter as it finishes the last sees no
+/// redelivery.
+#[tokio::test]
+async fn dlq_drain_pulls_one_letter_at_a_time() {
+    const ACK_WAIT: Duration = Duration::from_secs(2);
+    const LETTERS: u32 = 5;
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    predeclare_durable(&client, "nats-work-dlq", "nats-work-dlq-consumer", ACK_WAIT).await;
+    for i in 0..LETTERS {
+        publish_dead_letter(&client, &simple_payload(&format!("letter-{i}"))).await;
+    }
+
+    let probe = DeadLetterProbe::slow(Duration::from_millis(700));
+    let shutdown = CancellationToken::new();
+    let drain = spawn_dlq_drain(
+        &client,
+        &probe,
+        ConsumerOptions::<Nats>::new().with_shutdown(shutdown.clone()),
+    );
+
+    assert!(
+        probe
+            .counter
+            .wait_for(LETTERS, Duration::from_secs(30))
+            .await,
+        "every letter is handled"
+    );
+    // A redelivery of any of them would be handled within this.
+    tokio::time::sleep(ACK_WAIT.saturating_add(Duration::from_secs(2))).await;
+    let mut handled = probe.handled().await;
+    handled.sort();
+    let expected: Vec<String> = (0..LETTERS).map(|i| format!("letter-{i}")).collect();
+    assert_eq!(handled, expected, "a letter was handled more than once");
+
+    stop_dlq_drain(&shutdown, drain).await;
     broker.close().await;
 }
 

@@ -1180,6 +1180,10 @@ const PULL_EXPIRES: Duration = Duration::from_secs(30);
 /// pull.
 const MAX_OPEN_PULLS: usize = 2;
 
+/// The idle heartbeat of the DLQ drain's pulls, the one `messages()` sets, so
+/// a dead connection still ends the drain's stream with an error.
+const DLQ_PULL_HEARTBEAT: Duration = Duration::from_secs(15);
+
 /// How long a consumer that leaves without a stop waits for the message tasks
 /// it started: the default handler timeout plus the grace the other backends
 /// give their shutdown drains, so a handler held to the default has settled
@@ -2328,7 +2332,8 @@ impl NatsConsumer {
     }
 
     /// Drains the dead letters of topic `T` into [`MessageHandler::handle_dead`]
-    /// with the default options, until the client is closed.
+    /// with the default options, until the client is closed. It pulls one dead
+    /// letter at a time.
     /// [`run_dlq_with_options`](Self::run_dlq_with_options) takes the options of
     /// a consumer.
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
@@ -2448,9 +2453,16 @@ impl NatsConsumer {
                         ))
                     })?;
 
-                let mut messages = pull_consumer.messages().await.map_err(|e| {
-                    ShoveError::Connection(format!("failed to get DLQ message stream: {e}"))
-                })?;
+                // One letter per pull, or buffered ones outlive ack_wait behind a slow handle_dead.
+                let mut messages = pull_consumer
+                    .stream()
+                    .max_messages_per_batch(1)
+                    .heartbeat(DLQ_PULL_HEARTBEAT)
+                    .messages()
+                    .await
+                    .map_err(|e| {
+                        ShoveError::Connection(format!("failed to get DLQ message stream: {e}"))
+                    })?;
 
                 loop {
                     // Biased, so no letter is taken once shutdown fired.
