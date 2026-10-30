@@ -680,8 +680,7 @@ impl ProducerCell {
 /// finished or cancelled mid-send, its reference goes through
 /// [`release_producer`].
 struct ProducerLease {
-    // Fields drop in declaration order, so `_release` holds the reference
-    // that can be the last one.
+    // Fields drop in order, so `_release` holds the possibly last reference.
     producer: Arc<KafkaProducerInner>,
     _release: ReleaseOnDrop,
 }
