@@ -36,7 +36,9 @@
 //!
 //! The final section runs a sequenced consumer against the same mock: a
 //! streak of rejected commits fences it, and it reconnects once the close
-//! that error exit makes has had its LeaveGroup answered.
+//! that error exit makes has had its LeaveGroup answered; and a stop that
+//! finds its commit in flight unanswered reports the share of the shutdown
+//! deadline it waited, as the standard consumer's does under `Interval`.
 //!
 //! `test-support` gates the seams this file reads; both Kafka coverage rows
 //! enable it, so the suite runs in each.
@@ -71,14 +73,15 @@ use shove::handler::MessageHandler;
 use shove::kafka::{
     CommitPolicy, KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroup,
     KafkaConsumerGroupConfig, fence_probe, final_commit_spawn_probe,
-    housekeeping_interval_for_test, per_record_probe, shutdown_commit_deadline_for_test,
+    housekeeping_interval_for_test, pending_commit_budget_for_test, per_record_probe,
+    shutdown_commit_deadline_for_test,
 };
 use shove::markers::Kafka;
 use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
 use shove::topic::Topic;
 use shove::topology::{SequenceFailure, TopologyBuilder};
-use shove::{SequencedTopic, ShoveError};
+use shove::{CommitFailure, SequencedTopic, ShoveError};
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -3444,23 +3447,33 @@ async fn interval_sustained_rejection_fences() {
 /// made on the runtime thread. The topic declares no DLQ, so `o1`'s
 /// `Reject` discards it, and the commit that retires it must be confirmed
 /// before the discard counts. The mock holds the answer to that commit for
-/// 2 s and then refuses it, refuses the re-offer at once, and accepts the
-/// one after. The runtime is current-thread, and a ticker on it keeps
-/// ticking through the held answer. No reconnect happens, each record is
-/// handled once, and `messages_discarded_total` counts `o1` once, after the
-/// re-offer the broker accepted.
+/// 2 s and then refuses it, holds the re-offer's answer for 1 s and refuses
+/// it too, and accepts the one after. The runtime is current-thread, and a
+/// ticker on it keeps ticking through the held answers. No reconnect
+/// happens, each record is handled once, and `messages_discarded_total`
+/// counts nothing while a refusal is held or once it has landed, and `o1`
+/// once, after the re-offer the broker accepted and before the stop.
 #[cfg(feature = "metrics")]
 #[tokio::test(flavor = "current_thread")]
 async fn rejected_discard_commit_keeps_the_member() {
     const HELD: Duration = Duration::from_secs(2);
+    /// How long the re-offer's refusal is held: the first refusal has
+    /// landed by then, and nothing may count the discard meanwhile.
+    const RE_OFFER_HELD: Duration = Duration::from_secs(1);
     let snapshotter = install_recorder();
+    // A snapshot drains the counters it reads, so the reads add up here.
+    let discarded = std::cell::Cell::new(0u64);
+    let discarded_so_far = || {
+        discarded.set(discarded.get() + discarded_total(&snapshotter, TOPIC));
+        discarded.get()
+    };
     let mock = Mock::start();
     let bootstrap = mock.bootstrap();
     produce(&bootstrap, &["o1", "o2"]).await;
     mock.track_requests();
     let refused = RDKafkaRespErr::RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED;
     mock.answer_next_offset_commit_late(HELD, refused);
-    mock.answer_next_offset_commit_late(Duration::ZERO, refused);
+    mock.answer_next_offset_commit_late(RE_OFFER_HELD, refused);
 
     let handler = Recorder::new(|id, _| {
         if id == "o1" {
@@ -3486,7 +3499,41 @@ async fn rejected_discard_commit_keeps_the_member() {
     .await;
     let assigns = per_record_probe::assigns_queued();
 
-    wait_for_committed_position(&bootstrap, 2, HELD + DELIVERY_TIMEOUT).await;
+    wait_until(
+        || mock.offset_commit_requests() >= 1,
+        DELIVERY_TIMEOUT,
+        "the commit retiring o1 reaching the broker",
+    )
+    .await;
+    assert_eq!(
+        discarded_so_far(),
+        0,
+        "the discard does not count while the refusal of its commit is held"
+    );
+    wait_until(
+        || mock.offset_commit_requests() >= 2,
+        HELD + DELIVERY_TIMEOUT,
+        "the refused commit being re-offered",
+    )
+    .await;
+    assert_eq!(
+        discarded_so_far(),
+        0,
+        "the refused commit counted no discard"
+    );
+
+    wait_for_committed_position(&bootstrap, 2, RE_OFFER_HELD + DELIVERY_TIMEOUT).await;
+    wait_until(
+        || discarded_so_far() >= 1,
+        DELIVERY_TIMEOUT,
+        "the accepted re-offer counting the discard",
+    )
+    .await;
+    assert_eq!(
+        discarded_so_far(),
+        1,
+        "the discard is counted once, on the re-offer the broker accepted"
+    );
     let stall = ticker.longest_gap_since(started_at);
     assert!(
         stall < TICK_STALL,
@@ -3494,7 +3541,7 @@ async fn rejected_discard_commit_keeps_the_member() {
     );
     assert!(
         mock.offset_commit_requests() >= 3,
-        "the held rejection, the refused re-offer, and the accepted one, requests: {}",
+        "the two held rejections and the accepted re-offer, requests: {}",
         mock.offset_commit_requests()
     );
     assert_eq!(
@@ -3509,9 +3556,9 @@ async fn rejected_discard_commit_keeps_the_member() {
         .expect("the run task completes")
         .expect("a clean stop");
     assert_eq!(
-        discarded_total(&snapshotter, TOPIC),
+        discarded_so_far(),
         1,
-        "the discard is counted once, on the re-offer the broker accepted"
+        "the stop's final commit counts the discard no second time"
     );
 }
 
@@ -3624,6 +3671,92 @@ async fn an_aborted_member_closes_off_runtime() {
     assert!(
         stall < TICK_STALL,
         "the close waited for the held LeaveGroup off the runtime thread, the ticker stopped for {stall:?}"
+    );
+    assert_eq!(handler.ids(), ["o1"]);
+}
+
+/// Holds the answer to the next OffsetCommit and, once that request has
+/// reached the broker, takes the broker down, as a coordinator that drops
+/// off the network would: the connection carrying the commit closes with no
+/// answer, and the commit's retry waits for a broker that does not come
+/// back. The commit then has no answer for the whole share of the shutdown
+/// deadline a stop gives it. A held answer alone would not do: the
+/// heartbeat queued behind it times out after the 10 s session timeout and
+/// fails the connection, and the retried commit is answered long before
+/// the 15 s share has run out.
+async fn take_the_broker_down_under_a_commit(mock: &Mock) {
+    mock.delay_next_offset_commit_answer(pending_commit_budget_for_test());
+    wait_until(
+        || mock.offset_commit_requests() >= 1,
+        DELIVERY_TIMEOUT,
+        "the record's commit reaching the broker",
+    )
+    .await;
+    mock.api()
+        .broker_down(BROKER_ID)
+        .expect("take the mock broker down");
+}
+
+/// What a stop that gave up on its commit in flight reports: the `Deadline`
+/// kind carrying the share of the shutdown deadline, and the position the
+/// unanswered commit carried, after waiting out the share and inside the
+/// deadline.
+fn assert_the_share_was_waited_out(
+    result: Result<(), ShoveError>,
+    topic: &str,
+    took: Duration,
+    share: Duration,
+) {
+    let err = result.expect_err("the stop reports the commit it could not finish");
+    let ShoveError::Commit(failed) = &err else {
+        panic!("a Commit error naming the unanswered commit: {err:?}");
+    };
+    assert_eq!(failed.topic, topic);
+    assert_eq!(
+        failed.offsets,
+        [(0, 1)],
+        "the position the commit in flight carried"
+    );
+    assert_eq!(
+        failed.kind,
+        CommitFailure::Deadline(share),
+        "the Deadline kind carrying the share of the shutdown deadline"
+    );
+    assert!(
+        took >= share - Duration::from_millis(500) && took < shutdown_commit_deadline_for_test(),
+        "the stop waits out its share and ends inside the deadline, took {took:?}"
+    );
+}
+
+/// A stop that finds an `Interval` commit in flight, with no answer inside
+/// the share of the shutdown deadline it is given, ends with
+/// `ShoveError::Commit` of the `Deadline` kind carrying that share, and
+/// makes no second commit. The broker goes down under the record's commit,
+/// see [`take_the_broker_down_under_a_commit`], and the stop fires then.
+#[tokio::test]
+async fn an_interval_stop_with_its_commit_unanswered_reports_the_pending_share() {
+    let share = pending_commit_budget_for_test();
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    produce(&bootstrap, &["o1"]).await;
+    mock.track_requests();
+
+    let handler = Acking::default();
+    let h = handler.clone();
+    let (run, shutdown) = start(connect(&bootstrap).await, h, |token| {
+        options(CommitPolicy::Interval(Duration::from_millis(500)), token)
+    });
+    take_the_broker_down_under_a_commit(&mock).await;
+    let stopped_at = Instant::now();
+    shutdown.cancel();
+    let result = run.await.expect("the run task completes");
+    let took = stopped_at.elapsed();
+
+    assert_the_share_was_waited_out(result, TOPIC, took, share);
+    assert_eq!(
+        mock.offset_commit_requests(),
+        1,
+        "no second commit races the one in flight"
     );
     assert_eq!(handler.ids(), ["o1"]);
 }
@@ -3916,4 +4049,99 @@ async fn a_sequenced_error_exit_closes_before_it_reconnects() {
 
     token.cancel();
     group.shutdown().await;
+}
+
+/// The text of every event logged in this process, as `field=value` pairs,
+/// for a test that reads what a run only logs. Installed as the global
+/// subscriber: one per test process, which nextest gives every test.
+#[derive(Clone, Default)]
+struct Logged(Arc<Mutex<Vec<String>>>);
+
+impl Logged {
+    fn install() -> Self {
+        use tracing_subscriber::layer::SubscriberExt;
+        let logged = Self::default();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(logged.clone()),
+        )
+        .expect("install the log capture");
+        logged
+    }
+
+    fn lines(&self) -> Vec<String> {
+        self.0.lock().expect("log mutex poisoned").clone()
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Logged {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        let mut line = String::new();
+        event.record(
+            &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                line.push_str(&format!("{}={value:?} ", field.name()));
+            },
+        );
+        self.0.lock().expect("log mutex poisoned").push(line);
+    }
+}
+
+/// The same stop on a sequenced consumer: its commit in flight has no
+/// answer inside the share, so the member ends with `ShoveError::Commit` of
+/// the `Deadline` kind carrying it, and no second commit is made.
+/// `run_fifo_until_timeout` counts that error under `errors` and logs it,
+/// so the kind is read from the log.
+#[tokio::test]
+async fn a_sequenced_stop_with_its_commit_unanswered_reports_the_pending_share() {
+    let logged = Logged::install();
+    let share = pending_commit_budget_for_test();
+    let (mock, bootstrap) = sequenced_mock(&["o1"]).await;
+    mock.track_requests();
+
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let stop = CancellationToken::new();
+    let signal = stop.clone().cancelled_owned();
+    let client = connect(&bootstrap).await;
+    let h = handler.clone();
+    let run = tokio::spawn(async move {
+        KafkaConsumer::new(client)
+            .run_fifo_until_timeout::<SequencedOrders, _, _>(
+                h,
+                (),
+                ConsumerOptions::<Kafka>::new(),
+                signal,
+                shutdown_commit_deadline_for_test() + DELIVERY_TIMEOUT,
+            )
+            .await
+    });
+    take_the_broker_down_under_a_commit(&mock).await;
+    let stopped_at = Instant::now();
+    stop.cancel();
+    let outcome = run.await.expect("the run task completes");
+    let took = stopped_at.elapsed();
+
+    assert_eq!(
+        (outcome.errors, outcome.panics, outcome.timed_out),
+        (1, 0, false),
+        "the stop ends the member with its error: {outcome:?}"
+    );
+    let kind = CommitFailure::Deadline(share).to_string();
+    let reported = logged
+        .lines()
+        .into_iter()
+        .filter(|line| line.contains("offset commit at shutdown"))
+        .collect::<Vec<_>>();
+    assert!(
+        !reported.is_empty() && reported.iter().all(|line| line.contains(&kind)),
+        "the member's error is the Deadline kind carrying the share, `{kind}`: {reported:?}"
+    );
+    assert!(
+        took >= share - Duration::from_millis(500) && took < shutdown_commit_deadline_for_test(),
+        "the stop waits out its share and ends inside the deadline, took {took:?}"
+    );
+    assert_eq!(
+        mock.offset_commit_requests(),
+        1,
+        "no second commit races the one in flight"
+    );
+    assert_eq!(handler.ids(), ["o1"]);
 }
