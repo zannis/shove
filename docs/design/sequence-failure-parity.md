@@ -129,9 +129,8 @@ so poisoning without the key would have taken out the whole shard — strictly
 worse than the `Skip` behaviour it replaced.
 
 The header is written **after** user-supplied headers so a caller cannot
-overwrite it. (`publisher_internal::validate_headers` reserves the `x-`-prefixed
-internal names shared with the other backends, but not the `Shove-` names this
-backend uses.)
+overwrite it. (`publisher_internal::validate_headers` also rejects every
+caller-supplied name that starts with `shove-`, in any ASCII casing.)
 
 Backwards compatibility: a message published by an older version carries no
 key, `get_sequence_key` returns `""`, and rule 5 applies — it is never poisoned.

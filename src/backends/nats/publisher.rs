@@ -118,9 +118,7 @@ impl NatsPublisher {
         }
 
         // After the user headers: the sequence key drives FailAll poisoning, so
-        // a caller must not be able to overwrite it. (`validate_headers` guards
-        // the `x-` internal names shared with the other backends, but not the
-        // `Shove-` names this backend uses.)
+        // a caller must not be able to overwrite it.
         if let Some(key) = seq_key {
             headers.insert(SEQUENCE_KEY_HEADER, key);
         }
