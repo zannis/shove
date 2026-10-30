@@ -1,0 +1,21 @@
+docs/pages/backends/kafka.mdx
+  s_1001dc3147e1e5::t_4631f1b0b7ade4 679-681
+src/error.rs
+  s_1001dc3147e1e5::t_2c189c32e37971 61-67,72-73,101-102,148-152
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "89ecc40db450d313f033e09e1ee78ed0aa09989a",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
