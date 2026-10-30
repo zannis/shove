@@ -273,7 +273,10 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         // Wait for the external signal or an externally-triggered cancel.
         let mut signal_task = tokio::spawn(signal);
         tokio::select! {
-            _ = consumer_token.cancelled() => { signal_task.abort(); }
+            _ = consumer_token.cancelled() => {
+                signal_task.abort();
+                let _ = signal_task.await;
+            }
             res = &mut signal_task => { let _ = res; }
         }
 
