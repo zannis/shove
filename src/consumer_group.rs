@@ -77,6 +77,13 @@ pub(crate) fn reject_fifo_concurrency_prefetch_controlled(queue: &str) -> ShoveE
     ))
 }
 
+/// The registry once the autoscaler task is gone. `None` means a clone of the
+/// `Arc` outlived that task, which the contract of
+/// [`HasCoordinatedGroups::spawn_autoscaler`] rules out.
+fn reclaim_registry<R>(registry: Arc<Mutex<R>>) -> Option<R> {
+    Arc::into_inner(registry).map(Mutex::into_inner)
+}
+
 pub struct ConsumerGroup<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static = ()> {
     pub(crate) inner: B::RegistryImpl,
     client: B::Client,
@@ -283,29 +290,16 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         // Stop the autoscaler first; bounded-join so a stuck metrics poll can't
         // consume the drain budget. Count a panic observed before the deadline.
         auto_token.cancel();
-        let mut autoscaler_panics = 0usize;
         let grace = Duration::from_secs(1);
         let mut handle = handle;
-        tokio::select! {
-            res = &mut handle => {
-                if matches!(&res, Err(e) if e.is_panic()) {
-                    autoscaler_panics += 1;
-                }
-            }
+        let autoscaler_panicked = tokio::select! {
+            res = &mut handle => matches!(res, Err(e) if e.is_panic()),
             _ = tokio::time::sleep(grace) => {
                 handle.abort();
-                if let Err(e) = handle.await
-                    && e.is_panic()
-                {
-                    autoscaler_panics += 1;
-                }
+                matches!(handle.await, Err(e) if e.is_panic())
             }
-        }
-
-        // Autoscaler task (and its registry Arc clone) is now gone: sole owner.
-        let inner = Arc::try_unwrap(registry)
-            .unwrap_or_else(|_| unreachable!("autoscaler joined; registry Arc must be sole-owned"))
-            .into_inner();
+        };
+        let autoscaler_panics = usize::from(autoscaler_panicked);
 
         // Broadcast shutdown to every registered group at once before draining,
         // matching the non-autoscaling lifecycle: the non-autoscaling path calls
@@ -316,8 +310,21 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         // reaches them.
         consumer_token.cancel();
 
+        // Autoscaler task (and its registry Arc clone) is now gone: sole owner.
+        let Some(inner) = reclaim_registry(registry) else {
+            tracing::error!(
+                "the autoscaler task still holds the consumer group registry after it was \
+                 joined; the consumers are cancelled but cannot be drained"
+            );
+            return SupervisorOutcome {
+                errors: 1,
+                panics: autoscaler_panics,
+                timed_out: false,
+            };
+        };
+
         let mut outcome = inner.drain_until_timeout(drain_timeout).await;
-        outcome.panics += autoscaler_panics;
+        outcome.panics = outcome.panics.saturating_add(autoscaler_panics);
         outcome
     }
 }
@@ -343,10 +350,13 @@ impl<Ctx: Clone + Send + Sync + 'static> ConsumerGroup<Kafka, Ctx> {
 
 #[cfg(all(test, feature = "inmemory"))]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use serde::{Deserialize, Serialize};
+    use tokio::sync::Mutex;
 
+    use super::reclaim_registry;
     use crate::autoscaler::AutoscalerConfig;
     use crate::define_sequenced_topic;
     use crate::define_topic;
@@ -379,6 +389,20 @@ mod tests {
         async fn handle(&self, _: LedgerEntry, _: MessageMetadata, _: &()) -> Outcome {
             Outcome::Ack
         }
+    }
+
+    #[test]
+    fn reclaim_registry_returns_the_value_to_a_sole_owner() {
+        let registry = Arc::new(Mutex::new(7u32));
+        assert_eq!(reclaim_registry(registry), Some(7));
+    }
+
+    #[test]
+    fn reclaim_registry_refuses_while_a_clone_survives() {
+        let registry = Arc::new(Mutex::new(7u32));
+        let survivor = Arc::clone(&registry);
+        assert_eq!(reclaim_registry(registry), None);
+        drop(survivor);
     }
 
     #[tokio::test]

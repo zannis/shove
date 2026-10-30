@@ -45,10 +45,12 @@ pub trait HasCoordinatedGroups: Backend {
     /// The returned `JoinHandle` MUST NOT resolve until every clone of
     /// `registry` held by the spawned task — and any sub-tasks it spawns — has
     /// been dropped. `ConsumerGroup::run_until_timeout` reclaims sole ownership
-    /// of the registry via `Arc::try_unwrap` immediately after joining this
-    /// handle; a surviving clone makes that reclaim fail. The generic
-    /// `Autoscaler::run` loop satisfies this by holding the only clone inside
-    /// the awaited task future and spawning no detached sub-tasks that retain it.
+    /// of the registry via `Arc::into_inner` immediately after joining this
+    /// handle; a surviving clone makes that reclaim fail, and the run then ends
+    /// with one error in its outcome, its consumers cancelled but not drained.
+    /// The generic `Autoscaler::run` loop satisfies this by holding the only
+    /// clone inside the awaited task future and spawning no detached sub-tasks
+    /// that retain it.
     fn spawn_autoscaler(
         client: &Self::Client,
         registry: Arc<Mutex<Self::RegistryImpl>>,
