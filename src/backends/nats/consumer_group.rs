@@ -553,8 +553,8 @@ impl NatsConsumerGroup {
         );
         self.group_token.cancel();
 
-        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
-        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+        tally.add_errors(self.error_count.swap(0, Ordering::Relaxed));
+        tally.add_panics(self.panic_count.swap(0, Ordering::Relaxed));
 
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
             let _abort_guard = AbortOnDrop(handle.abort_handle());
@@ -563,7 +563,7 @@ impl NatsConsumerGroup {
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
-                    tally.panics += 1;
+                    tally.add_panics(1);
                 }
             }
         }
@@ -575,13 +575,13 @@ impl NatsConsumerGroup {
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "retired consumer task panicked");
-                    tally.panics += 1;
+                    tally.add_panics(1);
                 }
             }
         }
 
-        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
-        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+        tally.add_errors(self.error_count.swap(0, Ordering::Relaxed));
+        tally.add_panics(self.panic_count.swap(0, Ordering::Relaxed));
     }
 
     /// Abort every surviving consumer handle and tally the result.
@@ -608,7 +608,7 @@ impl NatsConsumerGroup {
                         group = %self.queue,
                         "consumer task panicked during abort escalation"
                     );
-                    tally.panics += 1;
+                    tally.add_panics(1);
                 }
             }
         }
@@ -618,12 +618,12 @@ impl NatsConsumerGroup {
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "retired consumer task panicked");
-                    tally.panics += 1;
+                    tally.add_panics(1);
                 }
             }
         }
-        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
-        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+        tally.add_errors(self.error_count.swap(0, Ordering::Relaxed));
+        tally.add_panics(self.panic_count.swap(0, Ordering::Relaxed));
     }
 
     fn spawn_one(&mut self) {
@@ -920,6 +920,7 @@ pub(crate) fn durable_max_ack_pending(config: &NatsConsumerGroupConfig) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::RegistryImpl;
     use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
     use crate::supervision::{
         RESPAWN_BACKOFF_MAX, RESPAWN_CIRCUIT_COOLDOWN, RESPAWN_CIRCUIT_LIMIT,
@@ -1427,6 +1428,115 @@ mod tests {
         assert_eq!(group.active_consumers(), 0);
         assert_eq!(tally.errors, 5);
         assert_eq!(tally.panics, 1);
+    }
+
+    // -- saturation --
+
+    fn saturated_tally() -> ShutdownTally {
+        ShutdownTally {
+            errors: usize::MAX,
+            panics: usize::MAX,
+        }
+    }
+
+    /// Waits until every retiring consumer task has finished.
+    async fn wait_retiring_finished(group: &NatsConsumerGroup) {
+        for _ in 0..200 {
+            if group.retiring.iter().all(JoinHandle::is_finished) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("a retiring consumer task did not finish within the wait budget");
+    }
+
+    #[tokio::test]
+    async fn a_drain_leaves_a_saturated_tally_saturated() {
+        // The consumer counts one error and one panic as it stops and then
+        // panics itself, so every addition a drain makes has something to add.
+        let errors = Arc::new(AtomicUsize::new(0));
+        let panics = Arc::new(AtomicUsize::new(0));
+        let (ec, pc) = (errors.clone(), panics.clone());
+        let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+            let (ec, pc) = (ec.clone(), pc.clone());
+            tokio::spawn(async move {
+                options.shutdown.cancelled().await;
+                ec.fetch_add(1, Ordering::Relaxed);
+                pc.fetch_add(1, Ordering::Relaxed);
+                panic!("the consumer task panics on purpose");
+            })
+        });
+        let mut group = test_group_with_spawner(NatsConsumerGroupConfig::new(1..=1), spawner);
+        group.error_count = errors;
+        group.panic_count = panics;
+        group.start();
+        group.retiring.push(tokio::spawn(async {
+            panic!("the retiring task panics on purpose")
+        }));
+        wait_retiring_finished(&group).await;
+        group.error_count.store(1, Ordering::Relaxed);
+        group.panic_count.store(1, Ordering::Relaxed);
+        let mut tally = saturated_tally();
+
+        group.drain_into(&mut tally).await;
+
+        assert_eq!(tally.errors, usize::MAX);
+        assert_eq!(tally.panics, usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn an_abort_leaves_a_saturated_tally_saturated() {
+        let spawner: Spawner = Arc::new(|_options: ConsumerOptions| {
+            tokio::spawn(async { panic!("the consumer task panics on purpose") })
+        });
+        let mut group = test_group_with_spawner(NatsConsumerGroupConfig::new(1..=1), spawner);
+        group.start();
+        group.retiring.push(tokio::spawn(async {
+            panic!("the retiring task panics on purpose")
+        }));
+        wait_finished(&group, 0).await;
+        wait_retiring_finished(&group).await;
+        group.error_count.store(1, Ordering::Relaxed);
+        group.panic_count.store(1, Ordering::Relaxed);
+        let mut tally = saturated_tally();
+
+        group.abort_remaining_into(&mut tally).await;
+
+        assert_eq!(tally.errors, usize::MAX);
+        assert_eq!(tally.panics, usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn a_saturated_panic_count_still_reads_as_a_dirty_shutdown() {
+        // Both groups hold saturated counts, and one of them harvests one more
+        // panic into its own on top. The registry adds the two together.
+        let panicking: Spawner = Arc::new(|_options: ConsumerOptions| {
+            tokio::spawn(async { panic!("the consumer task panics on purpose") })
+        });
+        let mut harvesting =
+            test_group_with_spawner(NatsConsumerGroupConfig::new(0..=2), panicking);
+        harvesting.panic_count.store(usize::MAX, Ordering::Relaxed);
+        harvesting.error_count.store(usize::MAX, Ordering::Relaxed);
+        assert!(harvesting.scale_up());
+        wait_finished(&harvesting, 0).await;
+        assert!(harvesting.scale_up());
+        let other = test_group(default_config());
+        other.panic_count.store(usize::MAX, Ordering::Relaxed);
+        other.error_count.store(usize::MAX, Ordering::Relaxed);
+        let registry = NatsConsumerGroupRegistry::from_groups(HashMap::from([
+            ("harvesting".to_string(), harvesting),
+            ("other".to_string(), other),
+        ]));
+
+        let outcome = registry.drain_until_timeout(Duration::from_secs(5)).await;
+
+        assert_eq!(outcome.panics, usize::MAX);
+        assert_eq!(outcome.errors, usize::MAX);
+        assert!(
+            !outcome.is_clean(),
+            "a saturated count never wraps to clean"
+        );
+        assert_eq!(outcome.exit_code(), 2);
     }
 
     // -- accessors --
