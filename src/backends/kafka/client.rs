@@ -1509,6 +1509,8 @@ impl KafkaClient {
                 return;
             }
         };
+        // A discard during the flush must not leave the last reference here.
+        drop(slot);
         match tokio::task::spawn_blocking(move || producer.flush(PRODUCER_FLUSH_TIMEOUT)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(
@@ -2307,6 +2309,49 @@ mod tests {
         assert!(
             client.producer.built().is_none(),
             "the refused publish built a producer"
+        );
+    }
+
+    /// `shutdown` lets go of the producer slot before it flushes. Holding it
+    /// through the flush, it could own the last reference to a producer a
+    /// fatal discard swapped out meanwhile, and destroy it on the runtime
+    /// thread. A record to an address nothing listens on keeps the flush
+    /// open for the 5 s message timeout, and the slot is counted 2 s in.
+    #[tokio::test]
+    async fn shutdown_holds_no_producer_slot_while_it_flushes() {
+        let client = client().await;
+        let publish = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .publish_with_retry("orders", None, OwnedHeaders::new(), b"{}", 1, "test")
+                    .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while client.producer.built().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the publish built no producer"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let close = tokio::spawn({
+            let client = client.clone();
+            async move { client.shutdown().await }
+        });
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let holders = Arc::strong_count(&client.producer.current());
+
+        close.await.expect("shutdown joins");
+        publish
+            .await
+            .expect("the publish joins")
+            .expect_err("nothing answers the record");
+        assert_eq!(
+            holders, 2,
+            "besides the cell and this count, shutdown held the slot through its flush"
         );
     }
 
