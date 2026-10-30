@@ -404,6 +404,11 @@ pub mod kafka {
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::permit_wait_probe;
+    /// Test-only seam (see the `test-support` feature): the topic a `ping`
+    /// asks the broker about, for tests that look for it in the cluster.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::ping_probe_topic_for_test;
 
     /// Test-only seam (see the `test-support` feature): the receive loop's
     /// shutdown commit deadline, for tests that time a shutdown against it.

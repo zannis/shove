@@ -823,16 +823,19 @@ impl KafkaClient {
         metadata_result.map_err(|e| ShoveError::Connection(format!("kafka ping failed: {e}")))
     }
 
-    /// Test-only seam (see the `test-support` feature): the names of the
-    /// topics the metadata answer to a `ping` lists.
+    /// Test-only seam (see the `test-support` feature): each topic the
+    /// metadata answer to a `ping` lists, with the error the broker gave it.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
-    pub async fn ping_topics_for_test(&self, timeout: Duration) -> Result<Vec<String>> {
+    pub async fn ping_topics_for_test(
+        &self,
+        timeout: Duration,
+    ) -> Result<Vec<(String, Option<RDKafkaRespErr>)>> {
         let metadata = self.ping_metadata(timeout).await?;
         Ok(metadata
             .topics()
             .iter()
-            .map(|topic| topic.name().to_string())
+            .map(|topic| (topic.name().to_string(), topic.error()))
             .collect())
     }
 
