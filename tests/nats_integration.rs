@@ -6346,3 +6346,85 @@ async fn broker_outage_during_a_retry_hold_loses_and_repeats_nothing() {
         .ok();
     broker.close().await;
 }
+
+shove::define_topic!(
+    IdleTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-idle").dlq().build()
+);
+
+impl MessageHandler<IdleTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// Waits until the durable `consumer` on `stream` has a pull request waiting
+/// on the server.
+async fn wait_for_open_pull(client: &NatsClient, stream: &str, consumer: &str) {
+    let stream = client
+        .jetstream()
+        .get_stream(stream)
+        .await
+        .expect("the stream exists");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Ok(info) = stream.consumer_info(consumer).await
+            && info.num_waiting > 0
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no pull request was ever opened on {consumer}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A stop that lands while an idle worker probes its connection still ends
+/// the worker at once. The server is frozen once the worker's pull is open,
+/// so the pull ends on the client's backstop, five seconds past its 30 s
+/// expiry, with nothing delivered, and the probe that follows waits on the
+/// frozen server.
+#[tokio::test]
+async fn a_stop_during_the_liveness_probe_ends_the_worker() {
+    /// Past the pull's expiry and the client's backstop, and two seconds into
+    /// the probe's request timeout.
+    const INTO_THE_PROBE: Duration = Duration::from_secs(37);
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<IdleTopic>().await.unwrap();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<IdleTopic, _>(
+                CountingHandler::new(),
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(2),
+            )
+            .await
+    });
+    wait_for_open_pull(&client, "nats-idle", "nats-idle-consumer").await;
+    let opened = Instant::now();
+    tb.pause().await;
+    tokio::time::sleep_until(opened + INTO_THE_PROBE).await;
+
+    shutdown.cancel();
+    let stopped = tokio::time::timeout(Duration::from_secs(10), handle).await;
+    tb.unpause().await;
+    stopped
+        .expect("the worker stops while its probe waits on the frozen server")
+        .expect("the consumer task does not panic")
+        .expect("the consumer stops cleanly");
+    broker.close().await;
+}
