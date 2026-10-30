@@ -3113,9 +3113,10 @@ pub(super) const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(5);
 /// rebalance — which by protocol resolves inside that window — never trips
 /// it; well below the "silent multi-hour wedge" this guards against.
 ///
-/// This is the floor. The receive loop uses [`fence_threshold`], which grows
-/// with a configured commit interval, because the streak can only clear on
-/// a drain and drains run once per interval.
+/// This is the floor. The receive loops use [`fence_threshold_over`], which
+/// grows with a configured commit interval, because a rejected position is
+/// re-offered only once per interval, and the streak ends on the first
+/// re-offer the coordinator accepts.
 const COMMIT_FENCE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Test-only probe (see the `test-support` feature): the fence threshold the
@@ -3162,12 +3163,13 @@ pub mod fence_probe {
 /// pinned `COMMIT_FENCE_TIMEOUT`, or under `test-support` the floor a test
 /// injected through `ConsumerOptionsInner::kafka_fence_floor`.
 ///
-/// A rejected commit is re-offered on the next drain, and the dirty streak
-/// clears only after `QUIET_DRAINS_TO_RESOLVE` further quiet drains, so a
-/// healthy recovery takes about three intervals. With the 60 s floor alone,
-/// an interval above 20 s would fence a consumer that merely recovered on
-/// schedule. Four intervals leaves one interval of margin above that, and the
-/// default 500 ms interval keeps the floor exactly as before.
+/// A rejected commit is re-offered one interval after its rejection, and
+/// the first re-offer the coordinator accepts ends the streak at once, see
+/// `PartitionTracker::resolve`. So the threshold bounds how many re-offers
+/// a recovery may take. Four intervals leave room for three whatever the
+/// interval, where the 60 s floor alone would leave fewer than three once
+/// the interval reaches 20 s. The default 500 ms interval keeps the floor
+/// exactly as before.
 fn fence_threshold_over(floor: Duration, commit_interval: Duration) -> Duration {
     floor.max(commit_interval.saturating_mul(4))
 }
@@ -5331,10 +5333,10 @@ async fn handler_fault(rx: Option<&mut mpsc::Receiver<ShoveError>>) -> ShoveErro
     }
 }
 
-/// The error that ends a member whose offset commits keep being rejected
-/// with no rebalance resolving them, see `OffsetTracker::fenced`. It is
-/// counted and logged here, because the reconnect it forces is the only
-/// other trace of it.
+/// The error that ends a member whose offset commits keep being rejected,
+/// or keep finding no thread to carry them, with no rebalance resolving
+/// them, see `OffsetTracker::fenced`. It is counted and logged here,
+/// because the reconnect it forces is the only other trace of it.
 fn fenced_error(
     queue: &str,
     group_id: &str,
@@ -5352,13 +5354,13 @@ fn fenced_error(
         group_id,
         partition,
         stuck_for = ?fence_timeout,
-        "consumer appears fenced from its group (offset commits rejected \
+        "consumer appears fenced from its group (offset commits rejected or not issued, \
          with no resolving rebalance); forcing a clean reconnect"
     );
     ShoveError::Connection(format!(
         "consumer on '{queue}' appears fenced from group '{group_id}': \
-         partition {partition} has had offset commits rejected for over \
-         {fence_timeout:?} with no resolving rebalance"
+         partition {partition} has had offset commits rejected or not issued for \
+         over {fence_timeout:?} with no resolving rebalance"
     ))
 }
 
@@ -6507,7 +6509,7 @@ impl KafkaConsumer {
             .kafka_auto_offset_reset
             .unwrap_or(KafkaAutoOffsetReset::Earliest);
         // The commit policy, the gate's window, and the fence threshold
-        // that has to grow with the window - see `fence_threshold`. The
+        // that has to grow with the window - see `fence_threshold_over`. The
         // interval is checked again here although both setters already
         // check it: `ConsumerOptions::kafka_commit_interval` is a public
         // field, and a value written past the setter would reach the gate,
