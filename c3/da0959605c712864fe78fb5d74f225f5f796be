@@ -1,0 +1,29 @@
+tests/inmemory_integration.rs
+  s_1001dc3147e1e5::t_dc4f8a02ce92ca 1384-1390
+  s_1001dc3147e1e5::t_7bbc96fdf95276 1391
+  s_0e6c78192283a2::t_aaa4663e970e7a 1367-1368,1370-1373,1375,1378-1379,1395,1399-1402,1404,1406,1412-1430,1438,1440,1444,1447-1448,1451-1454,1457-1458,1465-1466
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c3da0959605c712864fe78fb5d74f225f5f796be",
+  "prompts": {},
+  "sessions": {
+    "s_0e6c78192283a2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3cf5b94e4b0cf5ea",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
