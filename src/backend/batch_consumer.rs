@@ -9,11 +9,13 @@
 //! ([`BatchFailure`](crate::batch::BatchFailure)) — this module is the
 //! consume side.
 //!
-//! This module also houses the terminal-settlement machinery Kafka's
-//! *single-message* async-commit path depends on — `TerminalDiscard`,
-//! `RejectSettlement` and `reject_settlement` — not only its batch path. A
-//! later cleanup must not narrow the gate on those three below `kafka`
-//! without checking that single-message caller first.
+//! This module also houses terminal-settlement machinery that Kafka's batch
+//! path and two of its non-batch paths depend on: `TerminalDiscard`,
+//! `RejectSettlement` and `reject_settlement`. The non-batch callers are the
+//! *single-message* async-commit reject path and the sequenced consumer's
+//! dead letter (`FifoLoop::dead_letter`). A later cleanup must not narrow
+//! the gate on those three below `kafka` without checking both of those
+//! callers first.
 //!
 //! # Gating
 //!
