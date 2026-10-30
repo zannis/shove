@@ -822,20 +822,18 @@ impl KafkaClient {
         let mut attempts = 0u32;
 
         loop {
-            attempts += 1;
+            attempts = attempts.saturating_add(1);
             match Self::connect(config).await {
                 Ok(client) => return Ok(client),
                 Err(e) => {
                     if attempts >= max_attempts {
                         return Err(e);
                     }
-                    let delay = backoff
-                        .next()
-                        .expect("backoff iterator is infinite; this is a bug");
+                    let delay = backoff.next_delay();
                     tracing::warn!(
                         attempt = attempts,
                         max_attempts,
-                        delay_ms = delay.as_millis() as u64,
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                         error = %e,
                         "Kafka connection failed, retrying"
                     );

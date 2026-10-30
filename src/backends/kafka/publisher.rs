@@ -119,7 +119,7 @@ where
             return Err(failure.into_error(label, attempt, &error));
         };
         headers = recovered;
-        let delay = backoff.next().unwrap_or(Duration::from_secs(2));
+        let delay = backoff.next_delay();
         tracing::warn!(attempt, error = %error, "{label} failed, retrying");
         tokio::time::sleep(delay).await;
         attempt = attempt.saturating_add(1);
