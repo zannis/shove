@@ -907,7 +907,7 @@ mod tests {
     }
 
     /// Header bytes of a message with no payload, few enough that the byte
-    /// budget and not the message limit ends the reading.
+    /// budget is reached before the message limit.
     const HEADER_BYTES: usize = 16 * 1024;
 
     #[tokio::test]

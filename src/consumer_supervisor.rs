@@ -57,8 +57,8 @@ pub(crate) struct ShutdownTally {
     pub panics: usize,
 }
 
-/// Every addition saturates, so a count that has reached the top stays there
-/// instead of wrapping to a shutdown that reads as clean.
+/// Every addition saturates, so a count at the top stays at the top and a dirty
+/// shutdown cannot wrap around to a clean one.
 #[allow(dead_code)]
 impl ShutdownTally {
     pub(crate) fn add_errors(&mut self, n: usize) {
