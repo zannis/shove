@@ -757,6 +757,37 @@ async fn wait_for_zero_lag(client: &KafkaClient, topic: &str, group: &str, timeo
     }
 }
 
+/// How long a fresh broker may take to answer its first group-coordinator
+/// request. That request creates the offsets topic, and a leader is elected
+/// for it afterwards, which on a busy host outlasts the five attempts of the
+/// stats provider's own retry loop.
+const COORDINATOR_WARM_UP: Duration = Duration::from_secs(60);
+
+/// The lag stats of `queue`, read again while the broker's group coordinator
+/// is still coming up. Only a connection error is retried: any other error,
+/// and the last connection error once [`COORDINATOR_WARM_UP`] has passed, fails
+/// the test.
+async fn lag_stats_once_coordinator_answers(
+    stats_provider: &shove::kafka::KafkaLagStatsProvider,
+    queue: &str,
+    group_id: &str,
+    reset: KafkaAutoOffsetReset,
+) -> KafkaQueueStats {
+    use shove::kafka::KafkaQueueStatsProvider;
+
+    let deadline = Instant::now() + COORDINATOR_WARM_UP;
+    loop {
+        match stats_provider.get_queue_stats(queue, group_id, reset).await {
+            Ok(stats) => return stats,
+            Err(ShoveError::Connection(e)) if Instant::now() < deadline => {
+                eprintln!("the group coordinator is not up yet, reading again: {e}");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => panic!("lag stats of {queue} failed: {e:?}"),
+        }
+    }
+}
+
 /// The broker's view of `group` right now: its state and its member count.
 #[cfg(feature = "test-support")]
 fn group_state(brokers: &str, group: &str) -> (String, usize) {
@@ -5558,7 +5589,7 @@ async fn deserialization_failure_rejects_to_dlq() {
 
 #[tokio::test]
 async fn lag_stats_provider_reports_pending_messages() {
-    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
+    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider};
 
     let tb = TestBroker::start().await;
     let broker = tb.broker();
@@ -5577,14 +5608,13 @@ async fn lag_stats_provider_reports_pending_messages() {
     }
 
     let stats_provider = KafkaLagStatsProvider::new(client.clone());
-    let stats: KafkaQueueStats = stats_provider
-        .get_queue_stats(
-            "kafka-work",
-            "kafka-work-consumer",
-            KafkaAutoOffsetReset::Earliest,
-        )
-        .await
-        .expect("get_queue_stats should succeed");
+    let stats = lag_stats_once_coordinator_answers(
+        &stats_provider,
+        "kafka-work",
+        "kafka-work-consumer",
+        KafkaAutoOffsetReset::Earliest,
+    )
+    .await;
 
     assert!(
         stats.messages_pending >= 5,
@@ -5634,14 +5664,13 @@ async fn lag_stats_provider_sums_every_partition_of_a_multi_partition_topic() {
     }
 
     let stats_provider = KafkaLagStatsProvider::new(tb.client());
-    let from_start = stats_provider
-        .get_queue_stats(
-            "kafka-lag-six-partitions",
-            "kafka-lag-six-partitions-fifo",
-            KafkaAutoOffsetReset::Earliest,
-        )
-        .await
-        .expect("lag from the start of the log");
+    let from_start = lag_stats_once_coordinator_answers(
+        &stats_provider,
+        "kafka-lag-six-partitions",
+        "kafka-lag-six-partitions-fifo",
+        KafkaAutoOffsetReset::Earliest,
+    )
+    .await;
     let from_tail = stats_provider
         .get_queue_stats(
             "kafka-lag-six-partitions",
@@ -5695,7 +5724,7 @@ async fn lag_stats_provider_counts_only_the_records_above_a_raised_low_watermark
     use rdkafka::client::DefaultClientContext;
     use rdkafka::producer::{FutureProducer, FutureRecord};
     use rdkafka::{ClientConfig, Offset, TopicPartitionList};
-    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
+    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider};
 
     const TOPIC: &str = "kafka-lag-raised-low-watermark";
     let produced = [10i64, 6, 4];
@@ -5756,14 +5785,13 @@ async fn lag_stats_provider_counts_only_the_records_above_a_raised_low_watermark
         (0..).zip(deleted_before).collect::<Vec<_>>()
     );
 
-    let stats = KafkaLagStatsProvider::new(tb.client())
-        .get_queue_stats(
-            TOPIC,
-            "kafka-lag-raised-low-watermark-consumer",
-            KafkaAutoOffsetReset::Earliest,
-        )
-        .await
-        .expect("lag from the raised start of the log");
+    let stats = lag_stats_once_coordinator_answers(
+        &KafkaLagStatsProvider::new(tb.client()),
+        TOPIC,
+        "kafka-lag-raised-low-watermark-consumer",
+        KafkaAutoOffsetReset::Earliest,
+    )
+    .await;
 
     let retained: i64 = produced
         .iter()
