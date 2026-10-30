@@ -1771,8 +1771,10 @@ fn publish_fault(what: &str, topic: &str, e: ShoveError) -> ShoveError {
 /// Count and settle a message dropped before the handler on the concurrent
 /// path: the failure is recorded now, and the record is dead-lettered and
 /// completed by [`dead_letter_and_complete`], the transport the post-handler
-/// terminal path uses too. `Err` is that function's: a dead letter that may
-/// land later, which the caller turns into the member's fault.
+/// terminal path uses too. `Err` is that function's fault, which the caller
+/// reports as the member's: a dead letter that may land later, as the
+/// `Connection` fault the member reconnects on, or one that failed with an
+/// error no retry gets past, which ends the member.
 #[allow(clippy::too_many_arguments)]
 async fn discard_pre_handler(
     client: &KafkaClient,
