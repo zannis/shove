@@ -52,8 +52,9 @@ pub struct BatchFailure {
 impl BatchFailure {
     /// Indices the backend attempted and explicitly reported as rejected.
     ///
-    /// Sparse on Kafka, SNS, and NATS; a single index on the prefix backends
-    /// (RabbitMQ, InMemory, and Redis when Redis returned an explicit error).
+    /// Sparse on SNS, NATS, and Kafka without a sequence key; a single index
+    /// on the prefix backends (RabbitMQ, InMemory, Redis when Redis returned
+    /// an explicit error, and Kafka on a sequenced topic).
     /// See the table on
     /// [`Publisher::publish_batch`](crate::publisher::Publisher::publish_batch).
     pub fn failed(&self) -> &[usize] {
