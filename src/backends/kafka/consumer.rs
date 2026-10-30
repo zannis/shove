@@ -7,7 +7,9 @@ use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use rdkafka::bindings::{rd_kafka_header_cnt, rd_kafka_header_get_all, rd_kafka_header_remove};
+use rdkafka::bindings::{
+    rd_kafka_header_cnt, rd_kafka_header_get_all, rd_kafka_header_remove, rd_kafka_message_headers,
+};
 use rdkafka::client::{DefaultClientContext, OAuthToken};
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{
@@ -859,13 +861,19 @@ impl CoveredDiscard {
 /// key keeping its last value: the map `MessageMetadata::headers` hands a
 /// handler.
 ///
-/// Read through librdkafka's C API: rdkafka's `Headers` accessors unwrap
-/// every key as UTF-8, and the protocol lets a producer send any bytes there.
+/// Read through librdkafka's C API from the message itself: rdkafka's
+/// `Headers` accessors unwrap every key as UTF-8, and the protocol lets a
+/// producer send any bytes there. A header block librdkafka cannot parse
+/// reads as no headers, as rdkafka's own `headers()` reads it.
 fn extract_string_headers(msg: &BorrowedMessage<'_>) -> Arc<HashMap<String, String>> {
     let mut out = HashMap::new();
-    if let Some(list) = msg.headers().map(native_headers) {
-        // SAFETY: `list` is `msg`'s own header list, which lives as long as
-        // `msg` and is only read here.
+    let mut list = std::ptr::null_mut();
+    // SAFETY: `msg.ptr()` is the live message `msg` borrows; on success
+    // librdkafka points `list` at that message's own header list, which lives
+    // as long as `msg` and is only read here.
+    let err = unsafe { rd_kafka_message_headers(msg.ptr(), &mut list) };
+    if err == RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR && !list.is_null() {
+        // SAFETY: as above.
         let count = unsafe { rd_kafka_header_cnt(list) };
         for idx in 0..count {
             let mut name = std::ptr::null();
@@ -896,16 +904,6 @@ fn extract_string_headers(msg: &BorrowedMessage<'_>) -> Arc<HashMap<String, Stri
     Arc::new(out)
 }
 
-/// The librdkafka list behind `headers`. rdkafka hands a header list out as a
-/// reference to the zero-sized `BorrowedHeaders` at the list's own address,
-/// and its accessors cast that reference back the same way.
-fn native_headers(headers: &BorrowedHeaders) -> *mut RDKafkaHeaders {
-    std::ptr::from_ref(headers).cast_mut().cast()
-}
-
-// `native_headers` relies on this: a reference to a zero-sized type is only an address.
-const _: () = assert!(size_of::<BorrowedHeaders>() == 0);
-
 /// A record's headers, read once at receive.
 ///
 /// `strings` is the map a handler sees, see [`extract_string_headers`].
@@ -914,7 +912,6 @@ const _: () = assert!(size_of::<BorrowedHeaders>() == 0);
 /// keeps every header the record carried, in order, binary and null values,
 /// repeated keys and keys that are not UTF-8 included. `None` when the record
 /// carries no headers.
-#[derive(Clone)]
 struct RecordHeaders {
     strings: Arc<HashMap<String, String>>,
     wire: Option<OwnedHeaders>,
@@ -943,18 +940,29 @@ impl RecordHeaders {
     /// Every header of the record minus each `rewritten` key: the headers of
     /// a copy shove publishes on the record's behalf, before the copy sets
     /// those keys afresh.
+    ///
+    /// Writes to the copy through librdkafka. `OwnedHeaders` has no method
+    /// that removes a header, so this reaches the list behind it the way
+    /// rdkafka's own accessors do, through the address of the zero-sized
+    /// `BorrowedHeaders` that `as_borrowed` hands out.
     fn copy_without(&self, rewritten: &[&CStr]) -> OwnedHeaders {
         let copy = self.wire.clone().unwrap_or_default();
-        let list = native_headers(copy.as_borrowed());
+        let list = std::ptr::from_ref(copy.as_borrowed())
+            .cast_mut()
+            .cast::<RDKafkaHeaders>();
         for key in rewritten {
-            // SAFETY: `copy` is this call's own list, which nothing else reads
-            // while librdkafka edits it, and `key` is NUL-terminated. A key
-            // the list lacks answers `__NOENT`: there is nothing to drop.
+            // SAFETY: `list` is the list `copy` owns, which this call made and
+            // nothing else reads while librdkafka edits it, and `key` is
+            // NUL-terminated. A key the list lacks answers `__NOENT`: there is
+            // nothing to drop.
             unsafe { rd_kafka_header_remove(list, key.as_ptr()) };
         }
         copy
     }
 }
+
+// `copy_without` relies on this: a reference to a zero-sized type is only an address.
+const _: () = assert!(size_of::<BorrowedHeaders>() == 0);
 
 fn get_retry_count(headers: &HashMap<String, String>) -> u32 {
     headers
@@ -4293,7 +4301,6 @@ async fn decode_batch_message<T: Topic>(
 /// parks the batch in the DLQ byte-for-byte. With no DLQ configured there is
 /// nowhere for those bytes to go, so nothing is retained and a batch costs
 /// exactly what its decoded messages cost.
-#[derive(Clone)]
 struct RawMessage {
     payload: Bytes,
     key: Option<Bytes>,
