@@ -528,20 +528,19 @@ fn dlq_fail_reason(reason: &str) -> metrics::FailReason {
     }
 }
 
-/// A token that fires when `a` or `b` does. The guard ends the task that
-/// forwards them, so hold it as long as the token is in use.
+/// A token that fires when `first` or `second` does. It is a child of `first`,
+/// so `first` reaches it in the same step, and a task forwards `second` to it
+/// a scheduling step later. The guard ends that task, so hold it as long as the
+/// token is in use.
 fn cancelled_by_either(
-    a: &CancellationToken,
-    b: &CancellationToken,
+    first: &CancellationToken,
+    second: &CancellationToken,
 ) -> (CancellationToken, AbortOnDrop) {
-    let merged = CancellationToken::new();
+    let merged = first.child_token();
     let forward = tokio::spawn({
-        let (a, b, merged) = (a.clone(), b.clone(), merged.clone());
+        let (second, merged) = (second.clone(), merged.clone());
         async move {
-            tokio::select! {
-                _ = a.cancelled() => {}
-                _ = b.cancelled() => {}
-            }
+            second.cancelled().await;
             merged.cancel();
         }
     });
@@ -2429,6 +2428,7 @@ impl NatsConsumer {
         options.refuse_broadcast_start(topology.queue(), "NatsConsumer::run_dlq")?;
 
         let dlq_consumer_name = super::constants::dlq_consumer_name(dlq);
+        // The options' token goes first, so a stop through it reaches the drain at once.
         let (shutdown, _forwarder) =
             cancelled_by_either(&options.shutdown, &self.client.shutdown_token());
         let handler = Arc::new(handler);
@@ -3633,28 +3633,36 @@ mod either_token_tests {
             .is_ok()
     }
 
+    /// The first token reaches the merged one in the same step, so a stop
+    /// requested through it takes effect before anything else runs.
     #[tokio::test(start_paused = true)]
-    async fn either_source_fires_it() {
-        let (a, b) = (CancellationToken::new(), CancellationToken::new());
-        let (merged, _guard) = cancelled_by_either(&a, &b);
+    async fn the_first_token_fires_it_at_once() {
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        let (merged, _guard) = cancelled_by_either(&first, &second);
         assert!(!fires(&merged).await, "nothing has fired yet");
-        a.cancel();
-        assert!(fires(&merged).await, "the first source fires it");
-
-        let (a, b) = (CancellationToken::new(), CancellationToken::new());
-        let (merged, _guard) = cancelled_by_either(&a, &b);
-        b.cancel();
-        assert!(fires(&merged).await, "the second source fires it");
+        first.cancel();
+        assert!(merged.is_cancelled());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_dropped_guard_ends_the_forwarding() {
-        let (a, b) = (CancellationToken::new(), CancellationToken::new());
-        let (merged, guard) = cancelled_by_either(&a, &b);
+    async fn the_second_token_fires_it_through_the_forwarder() {
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        let (merged, _guard) = cancelled_by_either(&first, &second);
+        second.cancel();
+        assert!(fires(&merged).await);
+        assert!(!first.is_cancelled(), "the first token is left alone");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_guard_ends_only_the_forwarding() {
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        let (merged, guard) = cancelled_by_either(&first, &second);
         drop(guard);
         tokio::task::yield_now().await;
-        a.cancel();
+        second.cancel();
         assert!(!fires(&merged).await, "no task is left to forward it");
+        first.cancel();
+        assert!(merged.is_cancelled(), "the first token needs no task");
     }
 }
 
