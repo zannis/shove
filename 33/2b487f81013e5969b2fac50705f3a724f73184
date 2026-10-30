@@ -1,0 +1,20 @@
+tests/metrics_kafka_fifo_pre_handler_discard.rs
+  s_1001dc3147e1e5::t_c13b9cb036d670 38-41
+  s_1001dc3147e1e5::t_9e43406d8fcc02 42-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "332b487f81013e5969b2fac50705f3a724f73184",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
