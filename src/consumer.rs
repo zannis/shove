@@ -503,7 +503,10 @@ impl<B: Backend> ConsumerOptions<B> {
     /// - [`Outcome::Defer`] — redeliver via `hold_queues[0]` **without**
     ///   consuming retry budget, so a slow handler never dead-letters a valid
     ///   message. Note [`Outcome::Defer`]'s infinite-loop caveat: nothing
-    ///   bounds the redeliveries.
+    ///   bounds the redeliveries. On an external NATS stream a `Defer` does
+    ///   consume budget, because the retry count is JetStream's redelivery
+    ///   count, but it is still never dead-lettered, so the redeliveries stay
+    ///   unbounded there too.
     ///
     ///   On a **sequenced** consumer this inherits `Defer`'s existing
     ///   backend-specific handling, which is not uniform: Kafka, NATS,

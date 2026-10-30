@@ -12,7 +12,7 @@ The `Outcome` enum has four variants, each mapped to a distinct delivery action:
 
 **`Reject`** — a permanent failure. The message is malformed, violates a business rule, or references data that will never exist. No amount of waiting will fix it. The consumer routes the message to the DLQ if one is configured, or discards it with a warning log if not. The message is never retried.
 
-**`Defer`** — the message is not failed, just not yet ready. The consumer routes it to `hold_queues[0]` (the shortest delay) without incrementing the retry counter. This does not burn the retry budget. See [Defer — the special case](#defer--the-special-case) below.
+**`Defer`** — the message is not failed, just not yet ready. The consumer routes it to `hold_queues[0]` (the shortest delay) without incrementing the retry counter. This does not burn the retry budget, except on an external NATS stream, where the retry count is JetStream's redelivery count (see [Bind to an externally-provisioned stream](/backends/nats#bind-to-an-externally-provisioned-stream)). See [Defer — the special case](#defer--the-special-case) below.
 
 ## At-least-once and idempotency
 
@@ -86,8 +86,12 @@ When in doubt, ask: "Would this handler succeed if I called it again in five min
 - An upstream API that returned 429 (rate limited); the payload is valid, just the timing is wrong.
 
 `Defer` routes the message to `hold_queues[0]` (shortest delay) with the same retry count. It does not increment the counter and will never trigger DLQ routing as a result of deferral alone.
+The exception is an external NATS stream.
+There the retry count is JetStream's redelivery count (`num_delivered - 1`), so each deferral is a redelivery that raises it, and a later `Retry` is dead-lettered as soon as the count has reached `max_retries`.
+A `Defer` itself is still never dead-lettered.
+See [Bind to an externally-provisioned stream](/backends/nats#bind-to-an-externally-provisioned-stream).
 
-One caution: because `Defer` never increments the retry counter, a handler that always defers will loop the message between the main queue and `hold_queues[0]` indefinitely. There is no built-in circuit breaker. Ensure your handler has a condition that eventually resolves to `Ack`, `Retry`, or `Reject`.
+One caution: because `Defer` never increments the retry counter, a handler that always defers will loop the message between the main queue and `hold_queues[0]` indefinitely. There is no built-in circuit breaker. An [external NATS stream](/backends/nats#bind-to-an-externally-provisioned-stream) raises the retry count with each deferral, but a `Defer` is never dead-lettered, so the loop does not end there either. Ensure your handler has a condition that eventually resolves to `Ack`, `Retry`, or `Reject`.
 
 If no hold queues are configured on the topic, `Defer` redelivers through the fallback of its backend: a fixed 1 s wait on Kafka and NATS, no delay elsewhere. See [With no hold queues](#with-no-hold-queues).
 

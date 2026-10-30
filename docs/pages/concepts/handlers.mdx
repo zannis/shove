@@ -131,19 +131,19 @@ group
 | Outcome | What a timeout then does |
 |---|---|
 | `Retry` | **Default.** Redelivers and consumes retry budget, so a persistently slow handler eventually dead-letters — or, with no DLQ declared, is discarded once `max_retries` is exhausted. |
-| `Defer` | Redelivers via `hold_queues[0]` **without** consuming retry budget, so a slow handler never dead-letters a valid message. |
+| `Defer` | Redelivers via `hold_queues[0]` **without** consuming retry budget, so a slow handler never dead-letters a valid message. On an [external NATS stream](/backends/nats#bind-to-an-externally-provisioned-stream) every redelivery counts toward `max_retries`, so a `Defer` does consume budget there. |
 | `Reject` | Treats the timeout as terminal: dead-letters on the first occurrence, consuming no retry budget. |
 | `Ack` | Drops the message. The handler is cancelled mid-flight, so any work it had not yet committed is lost. |
 
 Leaving it unset preserves the existing behaviour on every backend.
 
-**Pick `Defer` when a timeout means "too slow right now", not "poisoned".** That is the case a service hits when its handler stalls on a downstream dependency: under `Retry` the stall burns the whole retry budget and the message is dead-lettered — or discarded, if the topology declares no DLQ — even though nothing was ever wrong with it. `Defer` is the outcome that survives a slow dependency without losing valid data.
+**Pick `Defer` when a timeout means "too slow right now", not "poisoned".** That is the case a service hits when its handler stalls on a downstream dependency: under `Retry` the stall burns the whole retry budget and the message is dead-lettered — or discarded, if the topology declares no DLQ — even though nothing was ever wrong with it. `Defer` is the outcome that survives a slow dependency without losing valid data. An [external NATS stream](/backends/nats#bind-to-an-externally-provisioned-stream) is the exception: its retry count is JetStream's redelivery count, so a `Defer` there raises the count that a later `Retry` is measured against.
 
 That discard is no longer silent: it increments `shove_messages_discarded_total`, which is worth alerting on whichever outcome you pick here. See [Alerting on silent discards](/guides/observability#alerting-on-silent-discards).
 
 Three caveats before you reach for it, all inherited from [`Outcome::Defer`](/concepts/outcomes) itself:
 
-- **Nothing bounds the redeliveries.** `Defer` has no circuit breaker, so a handler that times out forever is redelivered forever. Pair it with your own attempt ceiling — or with monitoring on `FailReason::Timeout` — if the work can genuinely never succeed.
+- **Nothing bounds the redeliveries.** `Defer` has no circuit breaker, so a handler that times out forever is redelivered forever. An [external NATS stream](/backends/nats#bind-to-an-externally-provisioned-stream) raises the retry count with each deferral, but a `Defer` is never dead-lettered, so the redeliveries stay unbounded there too. Pair it with your own attempt ceiling — or with monitoring on `FailReason::Timeout` — if the work can genuinely never succeed.
 - **On sequenced consumers, `Defer` is not uniform across backends.** Kafka, NATS, SNS/SQS and the in-memory backend refuse it — deferral would violate the ordering guarantee, so it is downgraded to `Retry` with a warning and the override does not spare the retry budget. RabbitMQ's sharded consumer and Redis Streams instead route it to a hold queue without incrementing the retry count, so it can defer indefinitely. Check which half your backend falls in before choosing `Defer` for an ordered topic.
 - **With no hold queues configured**, `Defer` redelivers after a fixed 1 s on Kafka and NATS and with no delay on the other backends. A slow handler then sees the same message again every second on those two, and in a hot redelivery loop on the rest. Declare at least one hold queue on the topic before choosing `Defer`. [With no hold queues](/concepts/outcomes#with-no-hold-queues) lists the fallback per backend.
 

@@ -31,7 +31,9 @@ pub(crate) enum RetryDecision {
     /// ack/commit. `reason` is one of "rejected" or "max_retries_exceeded".
     Dlq { reason: &'static str },
     /// Hold-and-redeliver. `increment` is true for `Retry` (consumes retry
-    /// budget) and false for `Defer` (does not).
+    /// budget) and false for `Defer` (does not). An external NATS stream counts
+    /// JetStream's redeliveries instead, so a `Defer` consumes budget there
+    /// whatever this flag says.
     Hold { increment: bool },
 }
 
