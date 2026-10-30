@@ -66,8 +66,9 @@ impl SendFailure {
     fn into_error(self, label: &str, attempts: u32, error: &KafkaError) -> ShoveError {
         match self {
             Self::Fatal(code, reason) => ShoveError::Unknown(format!(
-                "{label} failed: {error}; the producer hit a fatal error, {code}: {reason}, \
-                 and the next publish builds a new one"
+                "{label} failed: {error}; the producer was marked fatal, {code}: {reason}. A new \
+                 one is built at the next publish if it had delivered a record; if it never did, \
+                 every publish fails for a wait that grows with each such producer"
             )),
             Self::Unauthorized => ShoveError::Topology(format!("{label} was refused: {error}")),
             Self::Transient => {
