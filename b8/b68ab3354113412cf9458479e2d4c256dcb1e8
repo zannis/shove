@@ -1,0 +1,44 @@
+src/backends/nats/broadcast.rs
+  s_1001dc3147e1e5::t_e115dc0b2292cf 40-45,51-52,59,83-86,89-94,360-433,446,450,464,490-494
+src/backend/batch_consumer.rs
+  s_1001dc3147e1e5::t_e115dc0b2292cf 61
+src/backends/nats/topology.rs
+  s_1001dc3147e1e5::t_e115dc0b2292cf 3,6,13,16-71,123-132,148-156,160,171-185,229-233,251-253,318-408
+tests/metrics_nats_unconfirmed_ack.rs
+  s_1001dc3147e1e5::t_e115dc0b2292cf 1-298
+tests/nats_broadcast_integration.rs
+  s_1001dc3147e1e5::t_e115dc0b2292cf 435-642
+docs/pages/backends/nats.mdx
+  s_1001dc3147e1e5::t_e115dc0b2292cf 126-129,347,354
+docs/pages/concepts/broadcast.mdx
+  s_1001dc3147e1e5::t_e115dc0b2292cf 109-110
+src/metrics.rs
+  s_1001dc3147e1e5::t_e115dc0b2292cf 546
+docs/pages/ops/backends.mdx
+  s_1001dc3147e1e5::t_e115dc0b2292cf 53,55
+src/backends/nats/consumer.rs
+  s_1001dc3147e1e5::t_e115dc0b2292cf 20-21,604-636,794,810,876,886,890,1974,1980-1987,2979,3002
+tests/nats_integration.rs
+  s_1001dc3147e1e5::t_e115dc0b2292cf 735-883,7606-7693,7695-7696,7698,7700,7704-7705
+  s_1001dc3147e1e5::t_acbf0e4d2495ff 7694
+  s_1001dc3147e1e5::t_84fc52c0178f13 7697
+  s_1001dc3147e1e5::t_12fae1da63a966 7699
+  s_1001dc3147e1e5::t_792be51ab57268 7701-7703
+  s_1001dc3147e1e5::t_7652c442d9449a 7706
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b8b68ab3354113412cf9458479e2d4c256dcb1e8",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
