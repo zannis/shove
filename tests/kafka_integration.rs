@@ -7206,8 +7206,10 @@ async fn publish_batch_reports_sparse_indices_when_a_subset_fails() {
 }
 
 /// A Kafka batch whose *every* record is oversized is not partial, so it keeps
-/// returning the bare error. Guards the compatibility rule on the backend with
-/// the sparsest failure shape.
+/// returning the bare error: the `ShoveError::Validation` a record past the
+/// producer's size limit fails with, since no later send can get it past.
+/// Guards the compatibility rule on the backend with the sparsest failure
+/// shape.
 #[tokio::test]
 async fn publish_batch_wholly_failed_returns_the_bare_error() {
     let tb = TestBroker::start().await;
@@ -7236,7 +7238,14 @@ async fn publish_batch_wholly_failed_returns_the_bare_error() {
         !matches!(err, shove::ShoveError::PartialBatch(_)),
         "nothing succeeded, so this is not a partial batch; got {err:?}"
     );
-    assert!(matches!(err, shove::ShoveError::Connection(_)));
+    assert!(
+        matches!(err, shove::ShoveError::Validation(_)),
+        "a record past the size limit is refused as invalid input; got {err:?}"
+    );
+    assert!(
+        !err.is_retryable(),
+        "no later send can get it past the limit"
+    );
 
     broker.close().await;
 }
