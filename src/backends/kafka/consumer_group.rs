@@ -57,7 +57,7 @@ fn harvest_if_finished(
     true
 }
 
-/// Counts one more occurrence, stopping at the top instead of wrapping.
+/// Counts one more occurrence, saturating at the top.
 fn count_one(counter: &AtomicUsize) {
     // The closure always answers `Some`, so the update cannot fail.
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -760,9 +760,9 @@ impl KafkaConsumerGroup {
     ///
     /// The group's task holds an abort guard on the shard task, so aborting
     /// the group's task at a drain timeout aborts the shard and the handler
-    /// call it is awaiting. The record being handled stays uncommitted and is
-    /// redelivered, and the shard commits nothing after the group has
-    /// reported the timeout.
+    /// call it is awaiting. A handler still running when the abort reaches the
+    /// shard is dropped with it, and its record stays uncommitted and is
+    /// redelivered.
     pub fn new_fifo<T, H>(
         queue: impl Into<String>,
         client: KafkaClient,
@@ -1048,8 +1048,8 @@ impl KafkaConsumerGroup {
         self.take_counts_into(tally);
     }
 
-    /// Moves the counts the group's tasks recorded into `tally`, stopping at
-    /// the top instead of wrapping.
+    /// Moves the counts the group's tasks recorded into `tally`, saturating
+    /// at the top.
     fn take_counts_into(&self, tally: &mut ShutdownTally) {
         tally.errors = tally
             .errors
