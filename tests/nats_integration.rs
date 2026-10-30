@@ -245,7 +245,7 @@ shove::define_sequenced_topic!(
 // ---------------------------------------------------------------------------
 
 struct TestBroker {
-    _container: testcontainers::ContainerAsync<NatsContainer>,
+    container: testcontainers::ContainerAsync<NatsContainer>,
     client: NatsClient,
 }
 
@@ -268,10 +268,7 @@ impl TestBroker {
             .await
             .expect("failed to connect to NATS");
 
-        Self {
-            _container: container,
-            client,
-        }
+        Self { container, client }
     }
 
     fn broker(&self) -> Broker<Nats> {
@@ -280,6 +277,21 @@ impl TestBroker {
 
     fn client(&self) -> NatsClient {
         self.client.clone()
+    }
+
+    /// Freezes the server, keeping its connections and its host port.
+    async fn pause(&self) {
+        self.container
+            .pause()
+            .await
+            .expect("the NATS container pauses");
+    }
+
+    async fn unpause(&self) {
+        self.container
+            .unpause()
+            .await
+            .expect("the NATS container resumes");
     }
 }
 
@@ -5148,12 +5160,63 @@ impl MessageHandler<SeqShutdownHoldTopic> for RetryFirstSight {
     }
 }
 
+/// Starts a FIFO consumer of `T` on `client` that stops with `shutdown`.
+fn start_fifo<T, H>(
+    client: &NatsClient,
+    handler: H,
+    shutdown: CancellationToken,
+    max_retries: u32,
+) -> tokio::task::JoinHandle<Result<(), shove::ShoveError>>
+where
+    T: shove::SequencedTopic,
+    H: MessageHandler<T, Context = ()>,
+{
+    let consumer = NatsConsumer::new(client.clone());
+    tokio::spawn(async move {
+        consumer
+            .run_fifo::<T, H>(
+                handler,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(shutdown)
+                    .with_max_retries(max_retries),
+            )
+            .await
+    })
+}
+
+/// Stops the consumer `shutdown` controls, failing the test unless it ends
+/// cleanly within `within`.
+async fn stop_within(
+    shutdown: &CancellationToken,
+    handle: tokio::task::JoinHandle<Result<(), shove::ShoveError>>,
+    within: Duration,
+) {
+    shutdown.cancel();
+    tokio::time::timeout(within, handle)
+        .await
+        .expect("the stop ends the consumer in time")
+        .expect("the FIFO consumer task does not panic")
+        .expect("the FIFO consumer stops cleanly");
+}
+
 /// A stop during a hold ends the consumer at once, with nothing behind the
 /// held record handled. The record is released to the next consumer straight
 /// away, well inside its `ack_wait`, and that consumer handles it and then the
 /// record behind it. Nothing was republished.
 #[tokio::test]
 async fn fifo_shutdown_mid_hold_loses_nothing() {
+    shutdown_mid_hold_loses_nothing().await;
+}
+
+/// The same stop on a multi-threaded runtime, where the task that sends the
+/// dropped subscription's UNSUB can run beside the release.
+#[tokio::test(flavor = "multi_thread")]
+async fn fifo_shutdown_mid_hold_loses_nothing_multi_thread() {
+    shutdown_mid_hold_loses_nothing().await;
+}
+
+async fn shutdown_mid_hold_loses_nothing() {
     const STREAM: &str = "nats-seq-shutdown-hold";
     let tb = TestBroker::start().await;
     let broker = tb.broker();
@@ -5178,33 +5241,14 @@ async fn fifo_shutdown_mid_hold_loses_nothing() {
         seen: Arc::new(Mutex::new(Vec::new())),
         counter: WaitableCounter::new(),
     };
-    let start = |shutdown: CancellationToken| {
-        let consumer = NatsConsumer::new(client.clone());
-        let hc = handler.clone();
-        tokio::spawn(async move {
-            consumer
-                .run_fifo::<SeqShutdownHoldTopic, _>(
-                    hc,
-                    (),
-                    ConsumerOptions::<Nats>::new()
-                        .with_shutdown(shutdown)
-                        .with_max_retries(5),
-                )
-                .await
-        })
-    };
 
     let first_run = CancellationToken::new();
-    let handle = start(first_run.clone());
+    let handle =
+        start_fifo::<SeqShutdownHoldTopic, _>(&client, handler.clone(), first_run.clone(), 5);
     assert!(handler.counter.wait_for(1, TIMEOUT).await, "A is retried");
     // The shard is now holding A for a minute.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    first_run.cancel();
-    tokio::time::timeout(Duration::from_secs(5), handle)
-        .await
-        .expect("a stop during the hold ends the consumer at once")
-        .expect("the FIFO consumer task does not panic")
-        .expect("the FIFO consumer stops cleanly");
+    stop_within(&first_run, handle, Duration::from_secs(5)).await;
     assert_eq!(
         handler.seen.lock().await.clone(),
         [(0, Some(1))],
@@ -5212,7 +5256,8 @@ async fn fifo_shutdown_mid_hold_loses_nothing() {
     );
 
     let second_run = CancellationToken::new();
-    let handle = start(second_run.clone());
+    let handle =
+        start_fifo::<SeqShutdownHoldTopic, _>(&client, handler.clone(), second_run.clone(), 5);
     // The derived ack_wait is 90 s, so only a released record arrives in time.
     assert!(
         handler.counter.wait_for(3, TIMEOUT).await,
@@ -5307,27 +5352,7 @@ async fn fifo_refused_dead_letter_is_retried_in_place() {
     });
     // The window starts with the impostor's publish, so the consumer is up first.
     wait_for_durable(&client, STREAM, "nats-seq-dlq-retry-shard-0").await;
-
-    let mut impostor = async_nats::HeaderMap::new();
-    impostor.insert(
-        NATS_MESSAGE_ID,
-        "nats-seq-dlq-retry.nats-seq-dlq-retry-shard-0.1-dlq",
-    );
-    raw_publish(&client, DLQ, impostor, b"impostor").await;
-    for amount in 0..2u64 {
-        let payload = serde_json::to_vec(&OrderMessage {
-            order_id: "one-key".into(),
-            amount,
-        })
-        .expect("an OrderMessage encodes");
-        raw_publish(
-            &client,
-            "nats-seq-dlq-retry.shard.0",
-            async_nats::HeaderMap::new(),
-            &payload,
-        )
-        .await;
-    }
+    publish_behind_an_impostor(&client).await;
 
     assert!(handler.counter.wait_for(1, TIMEOUT).await, "A is rejected");
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -5364,5 +5389,383 @@ async fn fifo_refused_dead_letter_is_retried_in_place() {
 
     shutdown.cancel();
     handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// Stores an impostor under the dead-letter id of the first record of
+/// [`SeqDeadLetterRetryTopic`]'s only shard, then publishes A and B there on
+/// one key, `amount` 0 and 1, without a `Nats-Msg-Id` of their own.
+async fn publish_behind_an_impostor(client: &NatsClient) {
+    let mut impostor = async_nats::HeaderMap::new();
+    impostor.insert(
+        NATS_MESSAGE_ID,
+        "nats-seq-dlq-retry.nats-seq-dlq-retry-shard-0.1-dlq",
+    );
+    raw_publish(client, "nats-seq-dlq-retry-dlq", impostor, b"impostor").await;
+    for amount in 0..2u64 {
+        let payload = serde_json::to_vec(&OrderMessage {
+            order_id: "one-key".into(),
+            amount,
+        })
+        .expect("an OrderMessage encodes");
+        raw_publish(
+            client,
+            "nats-seq-dlq-retry.shard.0",
+            async_nats::HeaderMap::new(),
+            &payload,
+        )
+        .await;
+    }
+}
+
+/// A stop while a refused dead letter waits for its next attempt leaves the
+/// record un-acked at its position. The consumer ends at once, A and B are
+/// both still in the stream, the DLQ holds only the impostor, and the
+/// handler saw A once and never saw B.
+#[tokio::test]
+async fn fifo_shutdown_during_dead_letter_backoff_keeps_the_record() {
+    const STREAM: &str = "nats-seq-dlq-retry";
+    const DLQ: &str = "nats-seq-dlq-retry-dlq";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<SeqDeadLetterRetryTopic>()
+        .await
+        .unwrap();
+
+    let handler = RejectFirstMessage {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let shutdown = CancellationToken::new();
+    let handle =
+        start_fifo::<SeqDeadLetterRetryTopic, _>(&client, handler.clone(), shutdown.clone(), 0);
+    wait_for_durable(&client, STREAM, "nats-seq-dlq-retry-shard-0").await;
+    // The default two-minute window holds the impostor's id through the test.
+    publish_behind_an_impostor(&client).await;
+
+    assert!(handler.counter.wait_for(1, TIMEOUT).await, "A is rejected");
+    // Past the first refused round, so the shard is waiting out a backoff.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    stop_within(&shutdown, handle, Duration::from_secs(10)).await;
+
+    assert_eq!(
+        handler.seen.lock().await.clone(),
+        [0],
+        "A was handled once and nothing behind it was handled"
+    );
+    assert_eq!(
+        stream_messages(&client, STREAM).await,
+        2,
+        "A was not acked, and B is still behind it"
+    );
+    assert_eq!(
+        stream_messages(&client, DLQ).await,
+        1,
+        "the DLQ holds only the impostor"
+    );
+    broker.close().await;
+}
+
+/// A stop mid-ladder hands the record to the next consumer, and the hand-off
+/// spends a retry: each delivery starts one count higher than the last. A
+/// record that is retried and stopped forever still reaches the DLQ, here on
+/// its third delivery with `max_retries` at 2.
+#[tokio::test]
+async fn fifo_restart_mid_ladder_advances_the_count() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<SeqShutdownHoldTopic>()
+        .await
+        .unwrap();
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<SeqShutdownHoldTopic>(&OrderMessage {
+            order_id: "one-key".into(),
+            amount: 0,
+        })
+        .await
+        .unwrap();
+
+    let handler = RetryEveryCall {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    for delivery in 1..=2u32 {
+        let shutdown = CancellationToken::new();
+        let handle =
+            start_fifo::<SeqShutdownHoldTopic, _>(&client, handler.clone(), shutdown.clone(), 2);
+        assert!(
+            handler.counter.wait_for(delivery, TIMEOUT).await,
+            "delivery {delivery} reaches the handler"
+        );
+        // The shard is now holding the record for a minute.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stop_within(&shutdown, handle, Duration::from_secs(5)).await;
+        let seen = handler.seen.lock().await.clone();
+        assert_eq!(
+            seen.last()
+                .map(|meta| (meta.retry_count, meta.delivery_count)),
+            Some((delivery - 1, Some(delivery))),
+            "delivery {delivery} starts at count {}",
+            delivery - 1
+        );
+    }
+
+    // The third delivery starts at the budget, so its Retry dead-letters.
+    let shutdown = CancellationToken::new();
+    let handle =
+        start_fifo::<SeqShutdownHoldTopic, _>(&client, handler.clone(), shutdown.clone(), 2);
+    let dead = take_dead_letters(&client, "nats-seq-shutdown-hold-dlq", 1).await;
+    assert_eq!(
+        header(&dead[0], "Shove-Death-Reason"),
+        Some("max_retries_exceeded")
+    );
+    assert_eq!(
+        header(&dead[0], "Shove-Retry-Count"),
+        Some("2"),
+        "the dead letter carries the count the record was dead-lettered at"
+    );
+    let calls: Vec<(u32, Option<u32>)> = handler
+        .seen
+        .lock()
+        .await
+        .iter()
+        .map(|meta| (meta.retry_count, meta.delivery_count))
+        .collect();
+    assert_eq!(calls, [(0, Some(1)), (1, Some(2)), (2, Some(3))]);
+    stop_within(&shutdown, handle, Duration::from_secs(5)).await;
+    broker.close().await;
+}
+
+/// Retries every call, keeping each call's metadata.
+#[derive(Clone)]
+struct RetryEveryCall {
+    seen: Arc<Mutex<Vec<MessageMetadata>>>,
+    counter: WaitableCounter,
+}
+
+impl MessageHandler<SeqShutdownHoldTopic> for RetryEveryCall {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        self.seen.lock().await.push(meta);
+        self.counter.increment();
+        Outcome::Retry
+    }
+}
+
+/// A's first call, `amount` 0 at count 0, sleeps `first_delay` and answers
+/// `first_outcome`; a delay past the handler timeout makes it a timeout.
+/// Every other call acks. Each call's amount and metadata are kept in order.
+#[derive(Clone)]
+struct FirstCallOf {
+    first_outcome: Outcome,
+    first_delay: Duration,
+    calls: Arc<Mutex<Vec<(u64, MessageMetadata)>>>,
+    counter: WaitableCounter,
+}
+
+impl FirstCallOf {
+    fn new(first_outcome: Outcome, first_delay: Duration) -> Self {
+        Self {
+            first_outcome,
+            first_delay,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            counter: WaitableCounter::new(),
+        }
+    }
+
+    async fn answer(&self, amount: u64, meta: MessageMetadata) -> Outcome {
+        let first = amount == 0 && meta.retry_count == 0;
+        self.calls.lock().await.push((amount, meta));
+        self.counter.increment();
+        if !first {
+            return Outcome::Ack;
+        }
+        tokio::time::sleep(self.first_delay).await;
+        self.first_outcome.clone()
+    }
+
+    /// Asserts that A was retried in place, once, before B was handled: two
+    /// calls of the same delivery of A at stream sequence 1, then B.
+    async fn assert_a_retried_in_place(&self) {
+        let calls = self.calls.lock().await.clone();
+        let amounts: Vec<u64> = calls.iter().map(|(amount, _)| *amount).collect();
+        assert_eq!(amounts, [0, 0, 1], "B waits until A is settled");
+        for (attempt, (_, meta)) in calls.iter().take(2).enumerate() {
+            assert_eq!(
+                meta.retry_count,
+                u32::try_from(attempt).unwrap(),
+                "attempt {attempt}: the count climbs in memory"
+            );
+            assert_eq!(
+                meta.offset,
+                Some(1),
+                "attempt {attempt}: the same record, nothing republished"
+            );
+            assert_eq!(
+                meta.delivery_count,
+                Some(1),
+                "attempt {attempt}: JetStream delivered the record once"
+            );
+        }
+    }
+}
+
+impl MessageHandler<SeqSkipTopic> for FirstCallOf {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        self.answer(msg.amount, meta).await
+    }
+}
+
+/// Publishes A then B on one key of [`SeqSkipTopic`], runs a FIFO consumer
+/// with `handler_timeout` until A has been called twice and B once, and
+/// checks that A was retried in place.
+async fn first_call_is_retried_in_place(handler: FirstCallOf, handler_timeout: Duration) {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    for amount in 0..2u64 {
+        publisher
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "one-key".into(),
+                amount,
+            })
+            .await
+            .unwrap();
+    }
+
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqSkipTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(5)
+                    .with_handler_timeout(handler_timeout),
+            )
+            .await
+    });
+
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "A twice and B once, saw {:?}",
+        handler.calls.lock().await.clone()
+    );
+    // Let a stray fourth call surface before the assertions.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    handler.assert_a_retried_in_place().await;
+
+    stop_within(&shutdown, handle, Duration::from_secs(5)).await;
+    broker.close().await;
+}
+
+/// A `Defer` on a sequenced consumer is a `Retry`, carried out in place.
+#[tokio::test]
+async fn fifo_defer_retries_in_place() {
+    first_call_is_retried_in_place(
+        FirstCallOf::new(Outcome::Defer, Duration::ZERO),
+        Duration::from_secs(30),
+    )
+    .await;
+}
+
+/// A handler timeout on a sequenced consumer resolves to a `Retry`, carried
+/// out in place.
+#[tokio::test]
+async fn fifo_handler_timeout_retries_in_place() {
+    first_call_is_retried_in_place(
+        FirstCallOf::new(Outcome::Ack, Duration::from_secs(2)),
+        Duration::from_millis(500),
+    )
+    .await;
+}
+
+shove::define_sequenced_topic!(
+    SeqOutageTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("nats-seq-outage")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_secs(3))
+        .dlq()
+        .build()
+);
+
+impl MessageHandler<SeqOutageTopic> for FirstCallOf {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        self.answer(msg.amount, meta).await
+    }
+}
+
+/// The server freezes one second into A's three-second hold and resumes two
+/// seconds after it ended, so the shard hands A back and acks it while the
+/// server is down. The renewal and the ack wait in the connection and land
+/// once the server resumes: A is handled twice as one delivery, B once after
+/// it, both are retired, and nothing is redelivered or dead-lettered.
+#[tokio::test]
+async fn fifo_broker_outage_during_a_hold_loses_and_repeats_nothing() {
+    const STREAM: &str = "nats-seq-outage";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqOutageTopic>().await.unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    for amount in 0..2u64 {
+        publisher
+            .publish::<SeqOutageTopic>(&OrderMessage {
+                order_id: "one-key".into(),
+                amount,
+            })
+            .await
+            .unwrap();
+    }
+
+    let handler = FirstCallOf::new(Outcome::Retry, Duration::ZERO);
+    let shutdown = CancellationToken::new();
+    let handle = start_fifo::<SeqOutageTopic, _>(&client, handler.clone(), shutdown.clone(), 5);
+    assert!(handler.counter.wait_for(1, TIMEOUT).await, "A is retried");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    tb.pause().await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    tb.unpause().await;
+
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "A is handed back and B follows it, saw {:?}",
+        handler.calls.lock().await.clone()
+    );
+    assert_eq!(
+        settle_stream_messages(&client, STREAM, 0).await,
+        0,
+        "A and B are both retired"
+    );
+    // A redelivery of either would be handled within this.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    handler.assert_a_retried_in_place().await;
+    assert_eq!(
+        stream_messages(&client, "nats-seq-outage-dlq").await,
+        0,
+        "nothing was dead-lettered"
+    );
+
+    stop_within(&shutdown, handle, Duration::from_secs(5)).await;
     broker.close().await;
 }
