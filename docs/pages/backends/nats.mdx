@@ -217,14 +217,19 @@ A worker holds at most two batches, the one flushing and the one read ahead, and
 The flush runs in a task of its own, so on a multi-threaded runtime a handler that holds its thread does not keep the consumer from reading the pull.
 A message of the batch read ahead waits out the flush ahead of it before its own begins: the handler, the dead-letter publishes of a rejected batch, or the pause before a batch handed back is redelivered.
 While it waits, the consumer renews its `ack_wait` with a progress acknowledgement every third of the durable's `ack_wait`, so a flush ahead that outlasts the `ack_wait` does not get the batch read ahead redelivered.
-The clock of a message's `ack_wait` then has to cover the window and the message's own flush.
-The durable a batch consumer creates gets an `ack_wait` of `max_batch_age` plus a margin of three times the handler timeout, at least 30 s, and with no handler timeout the default one stands in.
+As with reading the pull, the renewals need a multi-threaded runtime to go on while the flush ahead holds its thread: on a current-thread runtime, a flush whose handler holds its thread stops them too.
+The consumer keeps renewing the batch read ahead until it stops, so a flush that never ends keeps that batch with it: one with no handler timeout and a handler that never returns, or, on a multi-threaded runtime, one whose handler holds its thread.
+A stop releases the batch.
+A message read ahead goes without a renewal for at most the window or a third of the `ack_wait`, whichever is longer, before its own flush starts.
+The `ack_wait` therefore has to cover the window and the message's own flush, and be at least about 1.5 times that flush.
+The durable a batch consumer creates gets an `ack_wait` of `max_batch_age` plus a margin of three times the handler timeout, at least 30 s, which covers both, and with no handler timeout the default one stands in.
 A durable that something else created keeps its own `ack_wait`, and the consumer logs a warning when it is below that figure, since a slow flush then risks a redelivery.
 
 A stop finishes the flush in progress and hands the batch read ahead back to the server with a nak, so another consumer takes it at once and the stop does not wait for a second flush.
 A stop with no flush in progress flushes the batch the consumer holds.
 
-A message over `max_message_size`, or one the codec cannot decode, is counted as a failure and dead-lettered in a task of its own, up to 16 at a time, so a slow dead-letter publish holds up neither the healthy messages behind it nor the flush.
+A message over `max_message_size`, or one the codec cannot decode, is counted as a failure and dead-lettered in a task of its own, up to 16 at a time, so a slow dead-letter publish holds up neither the healthy messages of its pull nor the flush.
+Such messages beyond those 16 wait for a slot in the order they came, and the consumer sends no further pull while any of them waits, so more than 16 slow dead letters hold back the next pull until all but 16 of them have settled.
 The dead letter is published first and the message acked after it.
 The dead-letter publishes of a rejected batch and of these messages get a progress acknowledgement at least every third of the durable's `ack_wait` while they run, so a publish that outlasts the `ack_wait` does not get its message redelivered.
 The consumer waits for these tasks, for at most 35 s, before it returns.
@@ -233,7 +238,7 @@ A pull the server ends with a status follows the rules of a concurrent worker (s
 `Exceeded MaxWaiting` and `Leadership Change` get a probe of the connection and a pause before the next pull, and only a failed probe spends a reconnect attempt.
 Any other status is a connection error that spends one.
 When the client reconnects, the consumer takes the messages the open pull had already delivered into the batch in hand and drops the pull, because a server that restarted or failed over has lost the request without a word.
-It pulls again as after any pull: at once if the batch in hand is empty, and otherwise once that batch starts its flush, which waits for a flush in progress to end.
+It pulls again as after any pull: at once if the batch in hand is empty and no oversized or undecodable message waits for a dead-letter slot, and otherwise once the batch in hand has started its flush, which waits for a flush in progress to end, and every waiting message has a slot.
 
 The durable has no ack budget of its own unless one is set: the bootstrap durable is created with `max_ack_pending: -1`.
 A durable created by an earlier version, or by hand, with a budget of less than two batches draws a warning when the consumer attaches, because the batch read ahead cannot fill while the flush in progress holds the budget, and every worker attached to the durable shares it.
