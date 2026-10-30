@@ -4703,8 +4703,15 @@ shove::define_topic!(
 /// publish and the original's ack. The copy's publish comes back as a
 /// duplicate of it, the read-back confirms it, and the original is acked
 /// without a second copy.
+///
+/// The hold frees the worker's slot, so the worker takes the stored copy
+/// during the hold. Its handler acks only after the hold is over, so the copy
+/// is still stored when the read-back looks for it.
 #[tokio::test]
 async fn a_stored_retry_copy_of_the_same_delivery_retires_the_original() {
+    /// Longer than the rest of the original's three-second hold.
+    const COPY_HANDLING: Duration = Duration::from_secs(5);
+
     #[derive(Clone)]
     struct RetryOnceThenAck {
         seen: Arc<Mutex<Vec<(u32, String)>>>,
@@ -4720,7 +4727,11 @@ async fn a_stored_retry_copy_of_the_same_delivery_retires_the_original() {
                 .await
                 .push((meta.retry_count, meta.delivery_id));
             self.counter.increment();
-            if first { Outcome::Retry } else { Outcome::Ack }
+            if first {
+                return Outcome::Retry;
+            }
+            tokio::time::sleep(COPY_HANDLING).await;
+            Outcome::Ack
         }
     }
 
@@ -5767,5 +5778,571 @@ async fn fifo_broker_outage_during_a_hold_loses_and_repeats_nothing() {
     );
 
     stop_within(&shutdown, handle, Duration::from_secs(5)).await;
+    broker.close().await;
+}
+
+// ===========================================================================
+// Flow control: each worker bounds its own in-flight work
+// ===========================================================================
+
+/// The `max_ack_pending` of the durable `consumer` on `stream`.
+async fn durable_max_ack_pending(client: &NatsClient, stream: &str, consumer: &str) -> i64 {
+    client
+        .jetstream()
+        .get_stream(stream)
+        .await
+        .expect("stream should exist")
+        .consumer_info(consumer)
+        .await
+        .expect("durable should exist")
+        .config
+        .max_ack_pending
+}
+
+/// Declares the durable `consumer` on `stream` ahead of the consumer, the way
+/// an operator might, with an unbounded budget and the given `ack_wait`.
+async fn predeclare_durable(client: &NatsClient, stream: &str, consumer: &str, ack_wait: Duration) {
+    use async_nats::jetstream::consumer::AckPolicy;
+    use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+
+    client
+        .jetstream()
+        .get_stream(stream)
+        .await
+        .expect("the stream exists")
+        .create_consumer(PullConsumerConfig {
+            durable_name: Some(consumer.to_string()),
+            ack_policy: AckPolicy::Explicit,
+            ack_wait,
+            max_ack_pending: -1,
+            ..Default::default()
+        })
+        .await
+        .expect("the durable is created");
+}
+
+shove::define_topic!(
+    FleetTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-fleet").dlq().build()
+);
+
+/// Runs each message for `hold`, counting the handlers running at once and
+/// keeping the most it saw.
+#[derive(Clone)]
+struct ConcurrencyProbe {
+    hold: Duration,
+    running: Arc<AtomicU32>,
+    peak: Arc<AtomicU32>,
+    done: WaitableCounter,
+}
+
+impl ConcurrencyProbe {
+    fn new(hold: Duration) -> Self {
+        Self {
+            hold,
+            running: Arc::new(AtomicU32::new(0)),
+            peak: Arc::new(AtomicU32::new(0)),
+            done: WaitableCounter::new(),
+        }
+    }
+}
+
+impl MessageHandler<FleetTopic> for ConcurrencyProbe {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(running, Ordering::SeqCst);
+        tokio::time::sleep(self.hold).await;
+        self.running.fetch_sub(1, Ordering::SeqCst);
+        self.done.increment();
+        Outcome::Ack
+    }
+}
+
+/// Four supervisor workers on one topic, each with a prefetch of two. The
+/// first to start creates the durable and the others attach to it, so a
+/// budget taken from one worker's prefetch would cap all four at two
+/// messages in flight. Each worker bounds itself instead, and the durable
+/// has no budget of its own.
+#[tokio::test]
+async fn supervisor_workers_are_not_capped_by_one_prefetch() {
+    const WORKERS: usize = 4;
+    const PREFETCH: u16 = 2;
+    const MESSAGES: u32 = 40;
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<FleetTopic>().await.unwrap();
+    let messages: Vec<SimpleMessage> = (0..MESSAGES)
+        .map(|i| SimpleMessage {
+            id: format!("fleet-{i}"),
+            content: String::new(),
+        })
+        .collect();
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish_batch::<FleetTopic>(&messages)
+        .await
+        .unwrap();
+
+    let probe = ConcurrencyProbe::new(Duration::from_millis(200));
+    let mut tokens = Vec::with_capacity(WORKERS);
+    let mut runs = Vec::with_capacity(WORKERS);
+    for _ in 0..WORKERS {
+        let mut supervisor = broker.consumer_supervisor();
+        supervisor
+            .register::<FleetTopic, _>(
+                probe.clone(),
+                ConsumerOptions::<Nats>::new().with_prefetch_count(PREFETCH),
+            )
+            .unwrap();
+        tokens.push(supervisor.cancellation_token());
+        runs.push(tokio::spawn(supervisor.run_until_timeout(
+            std::future::pending(),
+            Duration::from_secs(10),
+        )));
+    }
+
+    assert!(
+        probe.done.wait_for(MESSAGES, Duration::from_secs(60)).await,
+        "every message is handled, saw {}",
+        probe.done.get()
+    );
+    let peak = probe.peak.load(Ordering::SeqCst);
+    assert!(
+        peak >= 6,
+        "{WORKERS} workers at prefetch {PREFETCH} ran at most {peak} handlers at once"
+    );
+    assert_eq!(
+        durable_max_ack_pending(&client, "nats-fleet", "nats-fleet-consumer").await,
+        -1,
+        "the durable a worker creates has no budget of its own"
+    );
+
+    for token in &tokens {
+        token.cancel();
+    }
+    for run in runs {
+        assert!(run.await.unwrap().is_clean());
+    }
+    broker.close().await;
+}
+
+/// A group with a zero prefetch and concurrent processing runs one message at
+/// a time, the way `ConsumerOptions::with_prefetch_count` treats a zero, and
+/// its durable keeps no budget of its own.
+#[tokio::test]
+async fn group_prefetch_zero_concurrent_consumes() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    let messages: Vec<SimpleMessage> = (1..=3)
+        .map(|i| SimpleMessage {
+            id: format!("zero-{i}"),
+            content: String::new(),
+        })
+        .collect();
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish_batch::<WorkTopic>(&messages)
+        .await
+        .unwrap();
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let config = NatsConsumerGroupConfig::new(1..=1)
+        .with_prefetch_count(0)
+        .with_concurrent_processing(true);
+    let mut group = broker.consumer_group();
+    group
+        .register::<WorkTopic, _>(ConsumerGroupConfig::new(config), move || hc.clone())
+        .await
+        .unwrap();
+
+    let token = group.cancellation_token();
+    let counter = handler.counter.clone();
+    let t = token.clone();
+    tokio::spawn(async move {
+        counter.wait_for(3, TIMEOUT).await;
+        t.cancel();
+    });
+    let outcome = group
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+        .await;
+
+    assert_eq!(
+        handler.counter.get(),
+        3,
+        "a zero prefetch must run as one, not stall"
+    );
+    assert!(outcome.is_clean(), "the group drains: {outcome:?}");
+    assert_eq!(
+        durable_max_ack_pending(&client, "nats-work", "nats-work-consumer").await,
+        -1,
+        "the group's durable has no budget of its own"
+    );
+    broker.close().await;
+}
+
+shove::define_topic!(
+    QueuedTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-queued").dlq().build()
+);
+
+/// Sleeps `delay`, then records the message's id and acks it.
+#[derive(Clone)]
+struct SlowRecorder {
+    delay: Duration,
+    seen: Arc<Mutex<Vec<String>>>,
+    counter: WaitableCounter,
+}
+
+impl MessageHandler<QueuedTopic> for SlowRecorder {
+    type Context = ();
+    async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        tokio::time::sleep(self.delay).await;
+        self.seen.lock().await.push(msg.id);
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// A one-at-a-time worker on a durable whose `ack_wait` is three handler runs
+/// long. Every message is handled within its `ack_wait` once it is delivered,
+/// so a worker that only pulls what it can start never sees a redelivery,
+/// while one that pulled the backlog up front would leave the later messages
+/// waiting past `ack_wait` and handle them twice.
+#[tokio::test]
+async fn queued_messages_are_not_redelivered_mid_flight() {
+    const ACK_WAIT: Duration = Duration::from_secs(3);
+    const MESSAGES: u32 = 6;
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<QueuedTopic>().await.unwrap();
+    predeclare_durable(&client, "nats-queued", "nats-queued-consumer", ACK_WAIT).await;
+    let messages: Vec<SimpleMessage> = (0..MESSAGES)
+        .map(|i| SimpleMessage {
+            id: format!("queued-{i}"),
+            content: String::new(),
+        })
+        .collect();
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish_batch::<QueuedTopic>(&messages)
+        .await
+        .unwrap();
+
+    let handler = SlowRecorder {
+        delay: Duration::from_secs(1),
+        seen: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<QueuedTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    assert!(
+        handler
+            .counter
+            .wait_for(MESSAGES, Duration::from_secs(30))
+            .await,
+        "every message is handled"
+    );
+    // A redelivery of any of them would be handled within this.
+    tokio::time::sleep(ACK_WAIT.saturating_add(Duration::from_secs(2))).await;
+    let seen = handler.seen.lock().await.clone();
+    let mut calls: HashMap<&str, usize> = HashMap::new();
+    for id in &seen {
+        *calls.entry(id.as_str()).or_default() += 1;
+    }
+    let repeated: Vec<_> = calls.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(
+        repeated.is_empty(),
+        "redelivered mid-flight: {repeated:?}, calls {seen:?}"
+    );
+    assert_eq!(seen.len(), MESSAGES as usize, "calls {seen:?}");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// The delay of [`LongHoldTopic`]'s only hold tier.
+const RETRY_HOLD: Duration = Duration::from_secs(5);
+
+shove::define_topic!(
+    LongHoldTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-long-hold")
+        .hold_queue(RETRY_HOLD)
+        .dlq()
+        .build()
+);
+
+/// Each call's message id, retry count and arrival.
+type Calls = Arc<Mutex<Vec<(String, u32, Instant)>>>;
+
+/// Retries the message `held` on its first attempt and acks every other call,
+/// keeping each call.
+#[derive(Clone)]
+struct RetryHeldOnce {
+    calls: Calls,
+    counter: WaitableCounter,
+}
+
+impl RetryHeldOnce {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            counter: WaitableCounter::new(),
+        }
+    }
+
+    /// Records a call and answers it.
+    async fn answer(&self, id: String, retry_count: u32) -> Outcome {
+        let retry = id == "held" && retry_count == 0;
+        self.calls
+            .lock()
+            .await
+            .push((id, retry_count, Instant::now()));
+        self.counter.increment();
+        if retry { Outcome::Retry } else { Outcome::Ack }
+    }
+
+    /// The retry counts of every call `id` got, in call order.
+    async fn counts_of(&self, id: &str) -> Vec<u32> {
+        self.calls
+            .lock()
+            .await
+            .iter()
+            .filter(|(seen, _, _)| seen == id)
+            .map(|(_, count, _)| *count)
+            .collect()
+    }
+}
+
+impl MessageHandler<LongHoldTopic> for RetryHeldOnce {
+    type Context = ();
+    async fn handle(&self, msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        self.answer(msg.id, meta.retry_count).await
+    }
+}
+
+/// A one-at-a-time worker holds a retried message for a five-second delay on
+/// a durable whose `ack_wait` is two seconds. The hold gives up the worker's
+/// processing slot, so the messages behind it are handled during the delay,
+/// and its progress acks keep the held message from being redelivered while
+/// it waits.
+#[tokio::test]
+async fn retry_hold_does_not_block_other_messages() {
+    const ACK_WAIT: Duration = Duration::from_secs(2);
+    const QUICK: usize = 3;
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<LongHoldTopic>().await.unwrap();
+    predeclare_durable(
+        &client,
+        "nats-long-hold",
+        "nats-long-hold-consumer",
+        ACK_WAIT,
+    )
+    .await;
+    let publisher = broker.publisher().await.unwrap();
+    let ids = std::iter::once("held".to_string()).chain((0..QUICK).map(|i| format!("quick-{i}")));
+    for id in ids {
+        publisher
+            .publish::<LongHoldTopic>(&SimpleMessage {
+                id,
+                content: String::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let handler = RetryHeldOnce::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<LongHoldTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(3)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    // The held message twice and every other message once.
+    let expected = u32::try_from(QUICK + 2).unwrap();
+    assert!(
+        handler
+            .counter
+            .wait_for(expected, RETRY_HOLD.saturating_add(TIMEOUT))
+            .await,
+        "saw {:?}",
+        handler.calls.lock().await.clone()
+    );
+    // A redelivery of the held message would be handled within this.
+    tokio::time::sleep(ACK_WAIT).await;
+
+    let calls = handler.calls.lock().await.clone();
+    let held_at = calls
+        .iter()
+        .find(|(id, count, _)| id == "held" && *count == 0)
+        .map(|(_, _, at)| *at)
+        .expect("the held message is handled");
+    let quick: Vec<_> = calls
+        .iter()
+        .filter(|(id, _, _)| id.starts_with("quick-"))
+        .collect();
+    assert_eq!(quick.len(), QUICK, "each other message once: {calls:?}");
+    for (id, _, at) in &quick {
+        let after = at.saturating_duration_since(held_at);
+        assert!(
+            after < RETRY_HOLD.saturating_sub(Duration::from_secs(2)),
+            "{id} waited {after:?} behind the hold: {calls:?}"
+        );
+    }
+    assert_eq!(
+        handler.counts_of("held").await,
+        [0, 1],
+        "the held message once, then its copy: {calls:?}"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+shove::define_topic!(
+    OutageHoldTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-outage-hold")
+        .hold_queue(Duration::from_secs(3))
+        .dlq()
+        .build()
+);
+
+impl MessageHandler<OutageHoldTopic> for RetryHeldOnce {
+    type Context = ();
+    async fn handle(&self, msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        self.answer(msg.id, meta.retry_count).await
+    }
+}
+
+/// The server freezes one second into a three-second retry hold and resumes
+/// two seconds after it ended, so the hold's last renewal, the copy's publish
+/// and the original's ack all wait in the connection and land once the
+/// server resumes. The message is handled once and its copy once, both are
+/// retired, and nothing is dead-lettered.
+#[tokio::test]
+async fn broker_outage_during_a_retry_hold_loses_and_repeats_nothing() {
+    const STREAM: &str = "nats-outage-hold";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<OutageHoldTopic>()
+        .await
+        .unwrap();
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<OutageHoldTopic>(&SimpleMessage {
+            id: "held".into(),
+            content: String::new(),
+        })
+        .await
+        .unwrap();
+
+    let handler = RetryHeldOnce::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<OutageHoldTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(3)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "held is retried"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    tb.pause().await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    tb.unpause().await;
+
+    assert!(
+        handler.counter.wait_for(2, TIMEOUT).await,
+        "the copy is handled once the server resumes, saw {:?}",
+        handler.calls.lock().await.clone()
+    );
+    assert_eq!(
+        settle_stream_messages(&client, STREAM, 0).await,
+        0,
+        "the original and its copy are both retired"
+    );
+    // A redelivery of either would be handled within this.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(handler.counts_of("held").await, [0, 1]);
+    assert_eq!(
+        stream_last_sequence(&client, STREAM).await,
+        2,
+        "one copy was published"
+    );
+    assert_eq!(
+        stream_messages(&client, "nats-outage-hold-dlq").await,
+        0,
+        "nothing was dead-lettered"
+    );
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("the consumer stops in time")
+        .unwrap()
+        .ok();
     broker.close().await;
 }

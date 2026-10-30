@@ -298,9 +298,14 @@ pub struct ConsumerOptions<B: Backend> {
     #[cfg(feature = "aws-sns-sqs")]
     #[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
     pub receive_batch_size: u16,
-    /// Override for JetStream `max_ack_pending` on the durable consumer.
+    /// Cap for JetStream `max_ack_pending` on a durable consumer this consumer
+    /// creates.
     ///
-    /// `None` means use `prefetch_count` (the default for standalone consumers).
+    /// `None` (the default) creates the durable unbounded (`-1`). The cap is
+    /// not what bounds this consumer: it pulls no more messages than
+    /// `prefetch_count` lets it start. A durable is shared by every consumer
+    /// of the topic, in every process, so a cap set here bounds them all
+    /// together.
     #[cfg(feature = "nats")]
     #[cfg_attr(docsrs, doc(cfg(feature = "nats")))]
     pub max_ack_pending: Option<i64>,
@@ -802,7 +807,11 @@ impl ConsumerOptions<Sqs> {
 #[cfg(feature = "nats")]
 #[cfg_attr(docsrs, doc(cfg(feature = "nats")))]
 impl ConsumerOptions<Nats> {
-    /// Override the durable consumer's `max_ack_pending`.
+    /// Cap the `max_ack_pending` of a durable consumer this consumer creates,
+    /// which is otherwise unbounded. See
+    /// [`max_ack_pending`](Self::max_ack_pending): the cap is shared by every
+    /// consumer attached to the durable, and applies only when this consumer
+    /// is the one that creates it.
     ///
     /// Pass `-1` for an unbounded budget.
     ///

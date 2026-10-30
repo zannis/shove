@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_nats::HeaderMap;
 use async_nats::header::{HeaderName, HeaderValue, NATS_MESSAGE_ID};
 use async_nats::jetstream::Message;
-use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+use async_nats::jetstream::consumer::pull::{Batch, Config as PullConsumerConfig};
 use async_nats::jetstream::consumer::{AckPolicy, PullConsumer};
 use async_nats::jetstream::context::{
     ConsumerInfoError, ConsumerInfoErrorKind, GetStreamError, GetStreamErrorKind,
@@ -15,7 +16,7 @@ use async_nats::jetstream::context::{
 use async_nats::jetstream::message::AckKind;
 use futures_util::FutureExt;
 use futures_util::stream::{self, StreamExt};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
@@ -38,12 +39,12 @@ use crate::routing::{
 };
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::QueueTopology;
-use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Nats, ShoveError};
+use crate::{DEFAULT_MAX_MESSAGE_SIZE, Nats, ShoveError};
 
 use super::client::NatsClient;
 use super::constants::{
     COPY_OF_HEADER, DEATH_COUNT_HEADER, DEATH_REASON_HEADER, ORIGINAL_QUEUE_HEADER,
-    RETRY_COUNT_HEADER, SEQUENCE_KEY_HEADER,
+    RETRY_COUNT_HEADER, SEQUENCE_KEY_HEADER, UNBOUNDED_ACK_PENDING,
 };
 use super::publisher::{PublishResult, header_value, publish_with_retry};
 
@@ -51,15 +52,19 @@ use super::publisher::{PublishResult, header_value, publish_with_retry};
 // ack_wait derivation
 // ---------------------------------------------------------------------------
 
-/// JetStream redelivers any message not acked within `ack_wait`. Derive it
-/// from the handler timeout with a 3x margin so a handler running to its
-/// limit — plus queue-wait behind a full prefetch buffer (the `ack_wait`
-/// clock ticks from delivery, and delivered messages wait on the prefetch
-/// semaphore before their handler starts) — never has its message
-/// redelivered mid-flight. Floor at the JetStream default (30s) so short
-/// handler timeouts don't tighten redelivery below the server default.
+/// JetStream redelivers any message not acked within `ack_wait`, a clock that
+/// starts at delivery. A consumer takes delivery only of what it can start at
+/// once: a worker pulls no more messages than it has free slots, and a FIFO
+/// shard's durable delivers one at a time. So the clock measures the handler
+/// and its settlement, and the 3x margin over the handler timeout lets a
+/// handler run to its limit with room to settle. A copy's publish and a
+/// retry's hold renew the clock with progress acks instead of drawing on the
+/// margin. Floor at the JetStream default (30s) so short handler timeouts
+/// don't tighten redelivery below the server default.
 pub(super) fn derive_ack_wait(handler_timeout: Duration) -> Duration {
-    (handler_timeout * 3).max(Duration::from_secs(30))
+    handler_timeout
+        .saturating_mul(3)
+        .max(Duration::from_secs(30))
 }
 
 // ---------------------------------------------------------------------------
@@ -424,15 +429,16 @@ async fn publish_dead_letter(
 /// ack-then-republish path had.
 ///
 /// The original message is held *un-acked* for the whole backoff, so a crash or
-/// a failed republish can never drop it. JetStream redelivers any un-acked
-/// message once `ack_wait` elapses, so WIP progress acks are sent during the
-/// wait to keep extending that timer (the same enqueue/republish-before-ack
-/// ordering the Redis and Kafka paths use). Once `delay` has passed, an
-/// incremented copy is published durably (the PubAck is awaited) and only then
-/// is the original acked. On shutdown the hold is abandoned with the message
-/// still un-acked so it is redelivered on restart; on republish failure the
-/// original is nak'd for redelivery, at once or, when the copy's id is held by
-/// a message that is not this copy, after a second.
+/// a failed republish can never drop it (the same enqueue/republish-before-ack
+/// ordering the Redis and Kafka paths use). JetStream redelivers any un-acked
+/// message once `ack_wait` elapses, so the hold renews that timer with progress
+/// acks ([`hold_with_progress`]), and so does the copy's publish
+/// ([`renewing`]). Once `delay` has passed, an incremented copy is published
+/// durably (the PubAck is awaited) and only then is the original acked. On
+/// shutdown the hold is abandoned with the message still un-acked so it is
+/// redelivered on restart; on republish failure the original is nak'd for
+/// redelivery, at once or, when the copy's id is held by a message that is not
+/// this copy, after a second.
 ///
 /// Retry counting stays header-based — the republished copy carries an
 /// incremented `RETRY_COUNT_HEADER` — so, unlike a `Nak`-driven redelivery, a
@@ -446,39 +452,13 @@ async fn hold_then_republish(
     ack_wait: Duration,
     shutdown: &CancellationToken,
 ) {
-    // Heartbeat well inside ack_wait so the server never redelivers mid-hold.
-    // `ack_wait` of zero means "unknown"; fall back to a value safely under
-    // JetStream's 30s default.
-    let heartbeat = if ack_wait.is_zero() {
-        Duration::from_secs(15)
-    } else {
-        (ack_wait / 2).max(Duration::from_secs(1))
-    };
-
-    let started = tokio::time::Instant::now();
-    loop {
-        let remaining = delay.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            break;
-        }
-        let tick = remaining.min(heartbeat);
-        tokio::select! {
-            _ = tokio::time::sleep(tick) => {}
-            _ = shutdown.cancelled() => {
-                // Leave the message un-acked — it redelivers on restart.
-                return;
-            }
-        }
-        if started.elapsed() < delay
-            && let Err(e) = msg.ack_with(AckKind::Progress).await
-        {
-            tracing::warn!(error = %e, "failed to send progress ack during retry hold");
-        }
+    if !hold_with_progress(msg, delay, ack_wait, shutdown).await {
+        return;
     }
 
     // Publish the copy durably BEFORE acking the original: a failure leaves the
     // original for redelivery instead of silently dropping the message.
-    match publish_retry_copy(client, msg, new_count).await {
+    match renewing(msg, ack_wait, publish_retry_copy(client, msg, new_count)).await {
         Ok(()) => {
             if let Err(e) = msg.ack().await {
                 tracing::error!(error = %e, "failed to ack after retry republish");
@@ -512,108 +492,25 @@ async fn publish_retry_copy(client: &NatsClient, msg: &Message, new_count: u32) 
     .await
 }
 
-/// Dispatches message routing based on the handler's outcome.
-#[allow(clippy::too_many_arguments)]
-async fn route_outcome(
-    client: &NatsClient,
-    // Consumer-group label propagated to `metrics::record_failed` on
-    // DLQ-terminal outcomes (max_retries_exceeded, Rejected). Matches the
-    // shape `invoke_handler` already uses, and Kafka's `route_outcome`.
-    group: Option<&str>,
-    msg: &Message,
-    outcome: Outcome,
-    topology: &'static QueueTopology,
-    retry_count: u32,
-    max_retries: u32,
-    retry_strategy: RetryStrategy,
-    hold_queues: &[HoldQueue],
-    ack_wait: Duration,
-    shutdown: &CancellationToken,
-) {
-    let in_place = retry_strategy == RetryStrategy::InPlace;
-    let result: PublishResult = match decide_retry(&outcome, retry_count, max_retries) {
-        RetryDecision::Ack => {
-            if let Err(e) = msg.ack().await {
-                tracing::error!(error = %e, "failed to ack message");
-            }
-            return;
-        }
-        RetryDecision::Dlq { reason } => {
-            let pending = metrics::record_terminal(
-                topology.queue(),
-                group,
-                dlq_fail_reason(reason),
-                topology.dlq().is_some(),
-            );
-            let stamped = in_place.then_some(retry_count);
-            match publish_dead_letter(client, topology, msg, reason, stamped).await {
-                Ok(()) => {
-                    // The ack is what retires the message; until it lands
-                    // JetStream still owns the delivery and will redeliver on
-                    // ack-wait expiry, so a failed ack is not a discard.
-                    //
-                    // `double_ack` rather than `ack` because this is the arm
-                    // that decides whether a discard actually happened. `ack`
-                    // only publishes `+ACK` to the client connection and
-                    // returns as soon as it is written; a connection lost
-                    // before JetStream applies it redelivers the message while
-                    // `confirm` has already counted it gone. `double_ack`
-                    // waits for the server's reply, so `Ok` means the stream
-                    // really did retire the delivery. The extra round trip is
-                    // paid only on terminal outcomes (rejected or retries
-                    // exhausted), not on the happy path above.
-                    match msg.double_ack().await {
-                        Ok(()) => pending.confirm(),
-                        Err(e) => {
-                            tracing::error!(error = %e, "failed to ack after DLQ publish");
-                            pending.survived();
-                        }
-                    }
-                    return;
-                }
-                Err(e) => {
-                    // Not acked, so JetStream redelivers.
-                    pending.survived();
-                    Err(e)
-                }
-            }
-        }
-        RetryDecision::Hold { increment: true } => {
-            let new_count = retry_count.saturating_add(1);
-            let delay = hold_delay(hold_queues, retry_count);
-
-            if in_place {
-                // An external stream is never written by its consumer: the
-                // retry is the same delayed negative acknowledgement a `Defer`
-                // uses, and the redelivery it triggers increments the
-                // `num_delivered` that `in_place_retry_count` reads.
-                if let Err(e) = msg.ack_with(AckKind::Nak(Some(delay))).await {
-                    tracing::error!(error = %e, "failed to nak-with-delay for in-place retry");
-                }
-                return;
-            }
-
-            // Hold the original un-acked through the backoff, then durably
-            // republish an incremented copy and ack — see
-            // `hold_then_republish`. Keeps at-least-once across crashes and
-            // republish failures while leaving the retry count header-based.
-            hold_then_republish(client, msg, delay, new_count, ack_wait, shutdown).await;
-            return;
-        }
-        RetryDecision::Hold { increment: false } => {
-            let delay = hold_delay(hold_queues, 0);
-            if let Err(e) = msg.ack_with(AckKind::Nak(Some(delay))).await {
-                tracing::error!(error = %e, "failed to nak-with-delay for defer");
-            }
-            return;
-        }
-    };
-
-    // If we reach here, a routing operation failed — nak the message for redelivery.
-    if let Err(e) = result {
-        tracing::error!(error = %e, "routing failed, nak-ing message for redelivery");
-        if let Err(nak_err) = msg.ack_with(AckKind::Nak(e.redelivery_delay())).await {
-            tracing::error!(error = %nak_err, "failed to nak message after routing failure");
+/// Runs `work` while renewing `msg`'s `ack_wait` with a progress ack every
+/// [`progress_interval`], so a wait that can outlast `ack_wait`, such as a
+/// copy's publish with its retries and its duplicate read-back, never gets
+/// `msg` redelivered while it runs.
+async fn renewing<F: Future>(msg: &Message, ack_wait: Duration, work: F) -> F::Output {
+    let interval = progress_interval(ack_wait);
+    let mut work = std::pin::pin!(work);
+    loop {
+        // A publish can block while the client reconnects.
+        let renewed = tokio::select! {
+            biased;
+            out = &mut work => return out,
+            renewed = async {
+                tokio::time::sleep(interval).await;
+                msg.ack_with(AckKind::Progress).await
+            } => renewed,
+        };
+        if let Err(e) = renewed {
+            tracing::warn!(error = %e, "failed to renew the ack_wait of a waiting message");
         }
     }
 }
@@ -658,9 +555,10 @@ fn progress_interval(ack_wait: Duration) -> Duration {
 }
 
 /// Holds `msg` un-acked for `delay`, renewing its `ack_wait` with a progress
-/// ack every [`progress_interval`] and once more as the wait ends, so the
-/// record goes back to the handler with a whole `ack_wait` ahead of it.
-/// `false` when shutdown fired first, the record still un-acked.
+/// ack every [`progress_interval`] and once more as the wait ends, so what
+/// follows the hold, the handler on a FIFO shard or the copy's publish on a
+/// concurrent worker, has a whole `ack_wait` ahead of it. `false` when
+/// shutdown fired first, the record still un-acked.
 async fn hold_with_progress(
     msg: &Message,
     delay: Duration,
@@ -681,7 +579,7 @@ async fn hold_with_progress(
             } => renewed,
         };
         if let Err(e) = renewed {
-            tracing::warn!(error = %e, "failed to renew the ack_wait of a held sequenced message");
+            tracing::warn!(error = %e, "failed to renew the ack_wait of a held message");
         }
         if remaining <= interval {
             return true;
@@ -967,15 +865,41 @@ where
     }
 }
 
-/// How long a stopping shard spends releasing the record it holds. A release
-/// that cannot finish in time, on a connection that is down, leaves the
-/// record to be redelivered once its `ack_wait` expires.
+/// How long a stopping consumer spends releasing the messages it holds. A
+/// release that cannot finish in time, on a connection that is down, leaves
+/// them to be redelivered once their `ack_wait` expires.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How much of [`RELEASE_TIMEOUT`] the consumer-info sweep in
-/// [`release_held`] may take, so a sweep that times out still leaves time for
-/// the nak.
+/// [`sweep_waiting_list`] may take, so a sweep that times out still leaves
+/// time for the naks.
 const SWEEP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Has the server sweep the durable's waiting list once a stopping
+/// consumer's pull subscription is dropped, so neither a nak that follows
+/// nor a newly published message is spent on that subscription's request.
+///
+/// The server keeps the request on the waiting list until it next sweeps the
+/// list, and a delivery made before then goes to an inbox nobody reads, or,
+/// on nats-server 2.10.14, is dropped: the message waits out its `ack_wait`.
+/// A consumer-info request sweeps the list. The sweep only finds the request
+/// dead once the subscription's UNSUB has reached the server, and that UNSUB
+/// is sent from a task the subscription's drop spawned: the yield gives that
+/// task its turn, with no guarantee that it has sent the UNSUB by then.
+async fn sweep_waiting_list(consumer: &PullConsumer) {
+    tokio::task::yield_now().await;
+    match tokio::time::timeout(SWEEP_TIMEOUT, consumer.get_info()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(
+            error = %e,
+            "failed to clear a stopped consumer's pull request before releasing its messages"
+        ),
+        Err(_) => tracing::warn!(
+            timeout = ?SWEEP_TIMEOUT,
+            "timed out clearing a stopped consumer's pull request before releasing its messages"
+        ),
+    }
+}
 
 /// Naks the record a stopping shard still holds, so the server can hand it to
 /// the next consumer of the shard at once, ahead of every record behind it.
@@ -983,31 +907,11 @@ const SWEEP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Best effort: whatever does not happen within [`RELEASE_TIMEOUT`], and every
 /// release the server spends elsewhere, leaves the record to be redelivered
 /// once its `ack_wait` expires. Nothing is lost either way, and nothing behind
-/// the record is delivered first.
-///
-/// Called once the shard's pull subscription is dropped. The server keeps
-/// that subscription's pull request on the durable's waiting list until it
-/// next sweeps the list, and a nak processed before then is spent on the dead
-/// request: the redelivery goes to an inbox nobody reads, or, on
-/// nats-server 2.10.14, is dropped. A consumer-info request sweeps the list,
-/// so it goes first. The sweep only finds the request dead once the
-/// subscription's UNSUB has reached the server, and that UNSUB is sent from a
-/// task the subscription's drop spawned: the yield gives that task its turn,
-/// with no guarantee that it has sent the UNSUB by then.
+/// the record is delivered first. Called once the shard's pull subscription
+/// is dropped, and sweeps the waiting list first ([`sweep_waiting_list`]).
 async fn release_held(consumer: &PullConsumer, msg: &Message, redelivery: Option<Duration>) {
     let release = async {
-        tokio::task::yield_now().await;
-        match tokio::time::timeout(SWEEP_TIMEOUT, consumer.get_info()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::warn!(
-                error = %e,
-                "failed to clear the stopped shard's pull request before releasing its held message"
-            ),
-            Err(_) => tracing::warn!(
-                timeout = ?SWEEP_TIMEOUT,
-                "timed out clearing the stopped shard's pull request before releasing its held message"
-            ),
-        }
+        sweep_waiting_list(consumer).await;
         msg.ack_with(AckKind::Nak(redelivery)).await
     };
     match tokio::time::timeout(RELEASE_TIMEOUT, release).await {
@@ -1020,6 +924,38 @@ async fn release_held(consumer: &PullConsumer, msg: &Message, redelivery: Option
             timeout = ?RELEASE_TIMEOUT,
             "timed out releasing a held sequenced message; it is redelivered once ack_wait expires"
         ),
+    }
+}
+
+/// Naks, without delay, the messages a stopping worker pulled and never
+/// started, so the server can hand them to another consumer at once. Called
+/// once the worker's pull is dropped, and sweeps the waiting list first
+/// ([`sweep_waiting_list`]), which it does even with nothing to nak, so no
+/// message published from then on goes to the dropped pull's request.
+///
+/// Best effort within [`RELEASE_TIMEOUT`], like [`release_held`]: a message it
+/// cannot release is redelivered once its `ack_wait` expires.
+async fn release_pulled(consumer: &PullConsumer, unstarted: &[Message]) {
+    let release = async {
+        sweep_waiting_list(consumer).await;
+        for msg in unstarted {
+            if let Err(e) = msg.ack_with(AckKind::Nak(None)).await {
+                tracing::error!(
+                    error = %e,
+                    "failed to release a pulled message; it is redelivered once ack_wait expires"
+                );
+            }
+        }
+    };
+    if tokio::time::timeout(RELEASE_TIMEOUT, release)
+        .await
+        .is_err()
+    {
+        tracing::error!(
+            timeout = ?RELEASE_TIMEOUT,
+            unstarted = unstarted.len(),
+            "timed out releasing pulled messages; they are redelivered once ack_wait expires"
+        );
     }
 }
 
@@ -1163,6 +1099,452 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Concurrent worker
+// ---------------------------------------------------------------------------
+
+/// How long a worker's pull request waits on the server for messages. A pull
+/// that ends is replaced at once, so this only paces the pulls an idle topic
+/// costs and how often an idle worker probes its connection.
+const PULL_EXPIRES: Duration = Duration::from_secs(30);
+
+/// One pull's deliveries, each paired with the processing slot reserved for
+/// it when the pull was sized. The pairing ends with whichever side runs out
+/// first, so no message is started without a slot.
+type Deliveries = stream::Zip<Batch, stream::Iter<std::vec::IntoIter<OwnedSemaphorePermit>>>;
+
+/// The message tasks of one worker that have started and not finished, held
+/// retries included. The worker's `processing` flag, which tells a group's
+/// scale-down which members are idle, is set while there is one. The flag is
+/// written under the lock that guards the count, so the last task to finish
+/// always leaves it clear.
+struct BusyTasks {
+    count: Mutex<usize>,
+    processing: Arc<AtomicBool>,
+}
+
+impl BusyTasks {
+    fn new(processing: Arc<AtomicBool>) -> Arc<Self> {
+        Arc::new(Self {
+            count: Mutex::new(0),
+            processing,
+        })
+    }
+
+    /// Counts a task until the returned guard is dropped.
+    fn enter(self: &Arc<Self>) -> BusyTask {
+        let mut count = self.count.lock().unwrap_or_else(PoisonError::into_inner);
+        *count = count.saturating_add(1);
+        self.processing.store(true, Ordering::Release);
+        BusyTask(Arc::clone(self))
+    }
+}
+
+/// One task counted in [`BusyTasks`].
+struct BusyTask(Arc<BusyTasks>);
+
+impl Drop for BusyTask {
+    fn drop(&mut self) {
+        let mut count = self.0.count.lock().unwrap_or_else(PoisonError::into_inner);
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.0.processing.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Waits for a free processing slot, then takes every other free one: the
+/// slots the next pull is sized to and reserves for its messages.
+async fn reserve_free_slots(slots: &Arc<Semaphore>) -> Result<Vec<OwnedSemaphorePermit>> {
+    let first = Arc::clone(slots)
+        .acquire_owned()
+        .await
+        .map_err(|_| ShoveError::Connection("semaphore closed".to_string()))?;
+    let mut reserved = Vec::with_capacity(slots.available_permits().saturating_add(1));
+    reserved.push(first);
+    while let Ok(slot) = Arc::clone(slots).try_acquire_owned() {
+        reserved.push(slot);
+    }
+    Ok(reserved)
+}
+
+/// The messages a pull has delivered and the worker has not started, taken
+/// without waiting for more.
+fn take_ready(deliveries: &mut Deliveries) -> Vec<Message> {
+    let mut unstarted = Vec::new();
+    while let Some(Some((delivery, _slot))) = deliveries.next().now_or_never() {
+        if let Ok(msg) = delivery {
+            unstarted.push(msg);
+        }
+    }
+    unstarted
+}
+
+/// A concurrent consumer's worker: what every message task it starts shares.
+///
+/// The worker bounds its own in-flight work. It holds `prefetch` processing
+/// slots, and each pull asks the server for as many messages as the worker
+/// has free slots, reserving a slot for every message the pull may deliver.
+/// So each delivered message starts at once, and none waits on the client
+/// while its `ack_wait` runs. The durable needs no budget of its own for
+/// that, and a durable shove creates has none (`max_ack_pending: -1`) unless
+/// one is set: workers attached to one durable, from any number of
+/// processes, each keep up to their own `prefetch` in flight.
+///
+/// A retry on a shove-owned stream is held un-acked for its delay and gives
+/// up its processing slot for the hold, so the worker goes on with other
+/// messages meanwhile. Holds are bounded on their own, at `prefetch` hold
+/// slots: a retry that finds none free waits for one, keeping its processing
+/// slot and renewing its `ack_wait`.
+struct Worker<T: Topic, H: MessageHandler<T>> {
+    client: NatsClient,
+    topology: &'static QueueTopology,
+    handler: H,
+    ctx: H::Context,
+    group: Option<Arc<str>>,
+    prefetch: u16,
+    max_retries: u32,
+    retry_strategy: RetryStrategy,
+    max_message_size: Option<usize>,
+    handler_timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
+    slots: Arc<Semaphore>,
+    holds: Semaphore,
+    busy: Arc<BusyTasks>,
+    shutdown: CancellationToken,
+    _topic: PhantomData<fn() -> T>,
+}
+
+impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
+    /// `None` when shutdown fires before `work` finishes.
+    async fn unless_stopped<F: Future>(&self, work: F) -> Option<F::Output> {
+        tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => None,
+            out = work => Some(out),
+        }
+    }
+
+    /// Pulls and starts messages on `consumer` until shutdown, which releases
+    /// what the worker pulled and never started ([`release_pulled`]) and waits
+    /// for its tasks, or until a pull fails.
+    async fn pull_until_stopped(
+        self: &Arc<Self>,
+        consumer: &PullConsumer,
+        ack_wait: Duration,
+    ) -> Result<()> {
+        let queue = self.topology.queue();
+        let probe_after = empty_windows_before_probe(PULL_EXPIRES);
+        let mut empty_windows: u32 = 0;
+        loop {
+            let Some(reserved) = self.unless_stopped(reserve_free_slots(&self.slots)).await else {
+                self.drain().await;
+                return Ok(());
+            };
+            let reserved = reserved?;
+            let pull = consumer
+                .batch()
+                .max_messages(reserved.len())
+                .expires(PULL_EXPIRES)
+                .messages();
+            let Some(pull) = self.unless_stopped(pull).await else {
+                drop(reserved);
+                return self.stop(consumer, &[]).await;
+            };
+            let pull = pull.map_err(|e| {
+                ShoveError::Connection(format!("pull request on {queue} failed: {e}"))
+            })?;
+            let mut deliveries: Deliveries = pull.zip(stream::iter(reserved));
+            let mut delivered = false;
+            loop {
+                let Some(item) = self.unless_stopped(deliveries.next()).await else {
+                    let unstarted = take_ready(&mut deliveries);
+                    drop(deliveries);
+                    return self.stop(consumer, &unstarted).await;
+                };
+                match item {
+                    None => break,
+                    Some((Ok(msg), slot)) => {
+                        delivered = true;
+                        self.start(msg, slot, ack_wait);
+                    }
+                    Some((Err(e), _)) => {
+                        tracing::error!(error = %e, queue, "consumer stream error");
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::Nats,
+                            metrics::BackendErrorKind::Consume,
+                        );
+                        return Err(ShoveError::Connection(format!(
+                            "consumer stream error on {queue}: {e}"
+                        )));
+                    }
+                }
+            }
+            if delivered {
+                empty_windows = 0;
+                continue;
+            }
+            // A silent outage ends pulls exactly like an idle topic does: see
+            // `empty_windows_before_probe`.
+            empty_windows = empty_windows.saturating_add(1);
+            if empty_windows >= probe_after {
+                let Some(probe) = self.unless_stopped(consumer.get_info()).await else {
+                    self.drain().await;
+                    return Ok(());
+                };
+                probe.map_err(|e| {
+                    ShoveError::Connection(format!("liveness probe on {queue} failed: {e}"))
+                })?;
+                empty_windows = 0;
+            }
+        }
+    }
+
+    /// Starts `msg` in a task of its own, on the processing slot its pull
+    /// reserved for it.
+    fn start(self: &Arc<Self>, msg: Message, slot: OwnedSemaphorePermit, ack_wait: Duration) {
+        let busy = self.busy.enter();
+        let worker = Arc::clone(self);
+        tokio::spawn(async move {
+            worker.process(msg, slot, ack_wait).await;
+            drop(busy);
+        });
+    }
+
+    /// Releases what the worker pulled and never started, then waits for the
+    /// tasks it did start.
+    async fn stop(&self, consumer: &PullConsumer, unstarted: &[Message]) -> Result<()> {
+        release_pulled(consumer, unstarted).await;
+        self.drain().await;
+        Ok(())
+    }
+
+    /// Waits until every task the worker started has finished, held retries
+    /// included.
+    async fn drain(&self) {
+        tracing::info!(
+            queue = self.topology.queue(),
+            "shutdown signal received, draining in-flight tasks"
+        );
+        let all = u32::from(self.prefetch);
+        let _ = self.slots.acquire_many(all).await;
+        let _ = self.holds.acquire_many(all).await;
+    }
+
+    /// Size-checks and decodes `msg`, runs the handler on it and settles its
+    /// outcome.
+    async fn process(
+        self: Arc<Self>,
+        msg: Message,
+        slot: OwnedSemaphorePermit,
+        ack_wait: Duration,
+    ) {
+        let queue = self.topology.queue();
+        let group = self.group.as_deref();
+        metrics::record_message_size(queue, group, msg.payload.len());
+
+        if let Err(e) = validate_message_size(msg.payload.len(), self.max_message_size) {
+            tracing::warn!(error = %e, queue, "rejecting oversized message to DLQ");
+            metrics::record_failed(queue, group, metrics::FailReason::Oversize);
+            self.settle_unhandled(&msg, &e.to_string(), ack_wait).await;
+            return;
+        }
+
+        let payload: T::Message =
+            match <T::Codec as crate::Codec<T::Message>>::decode_owned(msg.payload.clone()) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        queue,
+                        "failed to deserialize message, sending to DLQ"
+                    );
+                    metrics::record_failed(queue, group, metrics::FailReason::Deserialize);
+                    self.settle_unhandled(&msg, "deserialization_error", ack_wait)
+                        .await;
+                    return;
+                }
+            };
+
+        let mut metadata = extract_message_metadata(&msg);
+        if self.retry_strategy == RetryStrategy::InPlace {
+            metadata.retry_count = in_place_retry_count(&metadata);
+        }
+        let retry_count = metadata.retry_count;
+
+        let worker = Arc::clone(&self);
+        let outcome = invoke_handler(
+            async move { worker.handler.handle(payload, metadata, &worker.ctx).await },
+            self.handler_timeout,
+            self.timeout_outcome.clone(),
+            queue,
+            group,
+        )
+        .await;
+
+        self.route_outcome(&msg, outcome, retry_count, slot, ack_wait)
+            .await;
+    }
+
+    /// Dead-letters a message the handler never saw, oversized or
+    /// undecodable, and acks it, or naks it for redelivery when the dead
+    /// letter cannot be published. Like the other NATS pre-handler drops it
+    /// counts only the failure the caller recorded, no discard.
+    async fn settle_unhandled(&self, msg: &Message, reason: &str, ack_wait: Duration) {
+        let dead_letter = publish_to_dlq(&self.client, self.topology, msg, reason);
+        match renewing(msg, ack_wait, dead_letter).await {
+            Ok(()) => {
+                if let Err(e) = msg.ack().await {
+                    tracing::error!(error = %e, "failed to ack message after DLQ publish");
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to publish a message the handler never saw to the DLQ, nak-ing"
+                );
+                if let Err(nak_err) = msg.ack_with(AckKind::Nak(e.redelivery_delay())).await {
+                    tracing::error!(error = %nak_err, "failed to nak message after DLQ publish failure");
+                }
+            }
+        }
+    }
+
+    /// Settles `msg` by the outcome its handler returned. `slot` is the
+    /// message's processing slot: a held retry gives it up for the hold, and
+    /// every other outcome keeps it until the message is settled.
+    async fn route_outcome(
+        &self,
+        msg: &Message,
+        outcome: Outcome,
+        retry_count: u32,
+        slot: OwnedSemaphorePermit,
+        ack_wait: Duration,
+    ) {
+        let topology = self.topology;
+        let in_place = self.retry_strategy == RetryStrategy::InPlace;
+        let result: PublishResult = match decide_retry(&outcome, retry_count, self.max_retries) {
+            RetryDecision::Ack => {
+                if let Err(e) = msg.ack().await {
+                    tracing::error!(error = %e, "failed to ack message");
+                }
+                return;
+            }
+            RetryDecision::Dlq { reason } => {
+                let pending = metrics::record_terminal(
+                    topology.queue(),
+                    self.group.as_deref(),
+                    dlq_fail_reason(reason),
+                    topology.dlq().is_some(),
+                );
+                let stamped = in_place.then_some(retry_count);
+                let dead_letter = publish_dead_letter(&self.client, topology, msg, reason, stamped);
+                match renewing(msg, ack_wait, dead_letter).await {
+                    Ok(()) => {
+                        // The ack is what retires the message; until it lands
+                        // JetStream still owns the delivery and will redeliver
+                        // on ack-wait expiry, so a failed ack is not a discard.
+                        //
+                        // `double_ack` rather than `ack` because this is the
+                        // arm that decides whether a discard actually
+                        // happened. `ack` only publishes `+ACK` to the client
+                        // connection and returns as soon as it is written; a
+                        // connection lost before JetStream applies it
+                        // redelivers the message while `confirm` has already
+                        // counted it gone. `double_ack` waits for the server's
+                        // reply, so `Ok` means the stream really did retire
+                        // the delivery. The extra round trip is paid only on
+                        // terminal outcomes (rejected or retries exhausted),
+                        // not on the happy path above.
+                        match msg.double_ack().await {
+                            Ok(()) => pending.confirm(),
+                            Err(e) => {
+                                tracing::error!(error = %e, "failed to ack after DLQ publish");
+                                pending.survived();
+                            }
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        // Not acked, so JetStream redelivers.
+                        pending.survived();
+                        Err(e)
+                    }
+                }
+            }
+            RetryDecision::Hold { increment: true } => {
+                let delay = hold_delay(topology.hold_queues(), retry_count);
+
+                if in_place {
+                    // An external stream is never written by its consumer:
+                    // the retry is the same delayed negative acknowledgement a
+                    // `Defer` uses, and the redelivery it triggers increments
+                    // the `num_delivered` that `in_place_retry_count` reads.
+                    if let Err(e) = msg.ack_with(AckKind::Nak(Some(delay))).await {
+                        tracing::error!(error = %e, "failed to nak-with-delay for in-place retry");
+                    }
+                    return;
+                }
+
+                // Hold the original un-acked through the backoff, then durably
+                // republish an incremented copy and ack — see
+                // `hold_then_republish`. Keeps at-least-once across crashes and
+                // republish failures while leaving the retry count header-based.
+                let Some(_hold) = self.take_hold_slot(msg, ack_wait).await else {
+                    return;
+                };
+                drop(slot);
+                hold_then_republish(
+                    &self.client,
+                    msg,
+                    delay,
+                    retry_count.saturating_add(1),
+                    ack_wait,
+                    &self.shutdown,
+                )
+                .await;
+                return;
+            }
+            RetryDecision::Hold { increment: false } => {
+                let delay = hold_delay(topology.hold_queues(), 0);
+                if let Err(e) = msg.ack_with(AckKind::Nak(Some(delay))).await {
+                    tracing::error!(error = %e, "failed to nak-with-delay for defer");
+                }
+                return;
+            }
+        };
+
+        // If we reach here, a routing operation failed — nak the message for redelivery.
+        if let Err(e) = result {
+            tracing::error!(error = %e, "routing failed, nak-ing message for redelivery");
+            if let Err(nak_err) = msg.ack_with(AckKind::Nak(e.redelivery_delay())).await {
+                tracing::error!(error = %nak_err, "failed to nak message after routing failure");
+            }
+        }
+    }
+
+    /// A hold slot for `msg`'s retry delay. When every slot is taken it waits
+    /// for one, renewing `msg`'s `ack_wait` meanwhile and once more on taking
+    /// it. `None` when shutdown fired first, `msg` still un-acked.
+    async fn take_hold_slot(
+        &self,
+        msg: &Message,
+        ack_wait: Duration,
+    ) -> Option<SemaphorePermit<'_>> {
+        if let Ok(hold) = self.holds.try_acquire() {
+            return Some(hold);
+        }
+        let hold = self
+            .unless_stopped(renewing(msg, ack_wait, self.holds.acquire()))
+            .await?
+            .ok()?;
+        if let Err(e) = msg.ack_with(AckKind::Progress).await {
+            tracing::warn!(error = %e, "failed to renew the ack_wait of a retry that waited for a hold slot");
+        }
+        Some(hold)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NatsConsumer
 // ---------------------------------------------------------------------------
 
@@ -1212,278 +1594,121 @@ impl NatsConsumer {
         let topology = T::topology();
         let queue = topology.queue();
         options.refuse_broadcast_start(queue, "NatsConsumer::run")?;
-        // All tasks in a consumer group bind to the same durable consumer name;
-        // the JetStream server load-balances messages across them. The registry
-        // pre-configures this consumer with an aggregate `max_ack_pending` so
-        // N pullers can actually have N × prefetch messages in flight.
+        // Every worker of a topic, in any process and in any group member,
+        // binds to the same durable consumer name; the JetStream server
+        // load-balances messages across their pulls, and each worker bounds
+        // its own in-flight work (`Worker`).
         let consumer_name = super::constants::consumer_name(queue);
 
-        let shutdown = options.shutdown.clone();
-        let processing = options.processing.clone();
-        let max_retries = options.max_retries;
-        let prefetch_count = options.prefetch_count;
-        let handler_timeout = options.handler_timeout;
-        let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
-        let hold_queues = topology.hold_queues();
+        // Zero is lowered to one, as `ConsumerOptions::with_prefetch_count`
+        // documents.
+        let prefetch = options.prefetch_count.max(1);
         let retry_strategy = resolve_retry_strategy(topology);
-
-        let max_message_size = options.max_message_size;
-        let max_ack_pending = options.max_ack_pending.unwrap_or(prefetch_count as i64);
-        let derived_ack_wait = derive_ack_wait(handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT));
-
-        let handler = Arc::new(handler);
-        let ctx = Arc::new(ctx);
-        let client = self.client.clone();
-        let topic: Arc<str> = Arc::from(queue);
-        let group: Option<Arc<str>> = options.consumer_group.clone();
+        let max_ack_pending = options.max_ack_pending.unwrap_or(UNBOUNDED_ACK_PENDING);
+        let derived_ack_wait =
+            derive_ack_wait(options.handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT));
 
         tracing::info!(
             queue,
             consumer = consumer_name,
-            prefetch_count,
+            prefetch_count = prefetch,
             max_ack_pending,
-            max_retries,
+            max_retries = options.max_retries,
             retry_strategy = ?retry_strategy,
             "NATS consumer started"
         );
 
-        let semaphore = Arc::new(Semaphore::new(prefetch_count as usize));
+        let slots = usize::from(prefetch);
+        let worker = Arc::new(Worker::<T, H> {
+            client: self.client.clone(),
+            topology,
+            handler,
+            ctx,
+            group: options.consumer_group.clone(),
+            prefetch,
+            max_retries: options.max_retries,
+            retry_strategy,
+            max_message_size: options.max_message_size,
+            handler_timeout: options.handler_timeout,
+            timeout_outcome: options.handler_timeout_outcome.clone(),
+            slots: Arc::new(Semaphore::new(slots)),
+            holds: Semaphore::new(slots),
+            busy: BusyTasks::new(options.processing.clone()),
+            shutdown: options.shutdown.clone(),
+            _topic: PhantomData,
+        });
 
-        run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, || {
-            let handler = handler.clone();
-            let ctx = ctx.clone();
-            let client = client.clone();
-            let processing = processing.clone();
-            let shutdown = shutdown.clone();
-            let consumer_name = consumer_name.clone();
-            let semaphore = semaphore.clone();
-            let topic = topic.clone();
-            let group = group.clone();
-            let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
-            async move {
-                let stream = client
-                    .jetstream()
-                    .get_stream(queue)
-                    .await
-                    .map_err(|e| map_get_stream_error(queue, e))?;
+        run_with_reconnect(
+            &options.shutdown,
+            queue,
+            options.max_reconnect_attempts,
+            || {
+                let worker = Arc::clone(&worker);
+                let consumer_name = consumer_name.clone();
+                async move {
+                    let stream = worker
+                        .client
+                        .jetstream()
+                        .get_stream(queue)
+                        .await
+                        .map_err(|e| map_get_stream_error(queue, e))?;
 
-                // Fast path: attach to the pre-declared durable consumer.
-                // `NatsTopologyDeclarer::declare_pull_consumer` does the
-                // upsert once at consumer-group registration, so the hot
-                // path stays read-only and there is no `CONSUMER.CREATE`
-                // storm on reconnect — every consumer just reads.
-                //
-                // Fallback (NotFound only): callers that use
-                // `NatsConsumer::run` directly (e.g. tests via
-                // `ConsumerSupervisor`) bypass the registry and don't
-                // pre-declare. In that case `get_consumer` returns
-                // `ConsumerInfoErrorKind::NotFound` and we one-shot
-                // `create_consumer` to bootstrap. Any other error
-                // (TimedOut, NoResponders, JetStream, …) means the
-                // server is in trouble, not that the consumer is
-                // missing — propagate so the reconnect loop retries
-                // instead of silently misreporting as a create failure.
-                let pull_consumer = match stream
-                    .get_consumer::<PullConsumerConfig>(&consumer_name)
-                    .await
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let is_not_found = e
-                            .downcast_ref::<ConsumerInfoError>()
-                            .is_some_and(|ce| {
-                                matches!(ce.kind(), ConsumerInfoErrorKind::NotFound)
-                            });
-                        if !is_not_found {
-                            return Err(ShoveError::Connection(format!(
-                                "get_consumer({consumer_name}) failed: {e}"
-                            )));
-                        }
-                        stream
-                            .create_consumer(PullConsumerConfig {
-                                durable_name: Some(consumer_name.clone()),
-                                ack_policy: AckPolicy::Explicit,
-                                max_ack_pending,
-                                ack_wait: derived_ack_wait,
-                                ..Default::default()
-                            })
-                            .await
-                            .map_err(|e| {
-                                ShoveError::Connection(format!(
-                                    "create_consumer({consumer_name}) fallback failed: {e}"
-                                ))
-                            })?
-                    }
-                };
-
-                // Effective server-side ack_wait, used to pace the WIP progress
-                // acks that keep retried messages alive during their backoff.
-                let ack_wait = pull_consumer.cached_info().config.ack_wait;
-
-                let mut messages = pull_consumer.messages().await.map_err(|e| {
-                    ShoveError::Connection(format!("failed to get message stream: {e}"))
-                })?;
-
-                loop {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => {
-                            tracing::info!(queue, "shutdown signal received, draining in-flight tasks");
-                            let _ = semaphore.acquire_many(prefetch_count as u32).await;
-                            return Ok(());
-                        }
-                        item = messages.next() => {
-                            let msg = match item {
-                                Some(Ok(msg)) => msg,
-                                Some(Err(e)) => {
-                                    tracing::error!(error = %e, queue, "consumer stream error");
-                                    metrics::record_backend_error(
-                                        metrics::BackendLabel::Nats,
-                                        metrics::BackendErrorKind::Consume,
-                                    );
-                                    return Err(ShoveError::Connection(
-                                        format!("consumer stream error on {queue}: {e}"),
-                                    ));
-                                }
-                                None => {
-                                    tracing::warn!(queue, "consumer stream closed");
-                                    metrics::record_backend_error(
-                                        metrics::BackendLabel::Nats,
-                                        metrics::BackendErrorKind::Consume,
-                                    );
-                                    return Err(ShoveError::Connection(
-                                        format!("consumer stream closed for {queue}"),
-                                    ));
-                                }
-                            };
-
-                            metrics::record_message_size(
-                                &topic,
-                                group.as_deref(),
-                                msg.payload.len(),
-                            );
-
-                            // Reject oversized messages before deserialization
-                            if let Err(e) = validate_message_size(msg.payload.len(), max_message_size) {
-                                tracing::warn!(
-                                    error = %e,
-                                    queue,
-                                    "rejecting oversized message to DLQ"
-                                );
-                                metrics::record_failed(
-                                    &topic,
-                                    group.as_deref(),
-                                    metrics::FailReason::Oversize,
-                                );
-                                if let Err(dlq_err) = publish_to_dlq(
-                                    &client,
-                                    topology,
-                                    &msg,
-                                    &e.to_string(),
-                                ).await {
-                                    tracing::error!(
-                                        error = %dlq_err,
-                                        "failed to publish oversized message to DLQ, nak-ing"
-                                    );
-                                    let _ = msg.ack_with(AckKind::Nak(dlq_err.redelivery_delay())).await;
-                                    continue;
-                                }
-                                let _ = msg.ack().await;
-                                continue;
+                    // Fast path: attach to the pre-declared durable consumer.
+                    // `NatsTopologyDeclarer::declare_pull_consumer` does the
+                    // upsert once at consumer-group registration, so the hot
+                    // path stays read-only and there is no `CONSUMER.CREATE`
+                    // storm on reconnect — every consumer just reads.
+                    //
+                    // Fallback (NotFound only): callers that use
+                    // `NatsConsumer::run` directly (e.g. tests via
+                    // `ConsumerSupervisor`) bypass the registry and don't
+                    // pre-declare. In that case `get_consumer` returns
+                    // `ConsumerInfoErrorKind::NotFound` and we one-shot
+                    // `create_consumer` to bootstrap. Any other error
+                    // (TimedOut, NoResponders, JetStream, …) means the
+                    // server is in trouble, not that the consumer is
+                    // missing — propagate so the reconnect loop retries
+                    // instead of silently misreporting as a create failure.
+                    let pull_consumer = match stream
+                        .get_consumer::<PullConsumerConfig>(&consumer_name)
+                        .await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let is_not_found =
+                                e.downcast_ref::<ConsumerInfoError>().is_some_and(|ce| {
+                                    matches!(ce.kind(), ConsumerInfoErrorKind::NotFound)
+                                });
+                            if !is_not_found {
+                                return Err(ShoveError::Connection(format!(
+                                    "get_consumer({consumer_name}) failed: {e}"
+                                )));
                             }
-
-                            // Deserialize payload; reject to DLQ on failure
-                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode_owned(msg.payload.clone()) {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        queue,
-                                        "failed to deserialize message, sending to DLQ"
-                                    );
-                                    metrics::record_failed(
-                                        &topic,
-                                        group.as_deref(),
-                                        metrics::FailReason::Deserialize,
-                                    );
-                                    if let Err(dlq_err) = publish_to_dlq(
-                                        &client,
-                                        topology,
-                                        &msg,
-                                        "deserialization_error",
-                                    ).await {
-                                        tracing::error!(
-                                            error = %dlq_err,
-                                            "failed to publish bad message to DLQ, nak-ing"
-                                        );
-                                        let _ = msg.ack_with(AckKind::Nak(dlq_err.redelivery_delay())).await;
-                                        continue;
-                                    }
-                                    let _ = msg.ack().await;
-                                    continue;
-                                }
-                            };
-
-                            let mut metadata = extract_message_metadata(&msg);
-                            if retry_strategy == RetryStrategy::InPlace {
-                                metadata.retry_count = in_place_retry_count(&metadata);
-                            }
-                            let retry_count = metadata.retry_count;
-
-                            let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
-                                ShoveError::Connection("semaphore closed".to_string())
-                            })?;
-
-                            let task_handler = handler.clone();
-                            let task_ctx = ctx.clone();
-                            let task_client = client.clone();
-                            let task_processing = processing.clone();
-                            let task_semaphore = semaphore.clone();
-                            let task_prefetch = prefetch_count;
-                            let task_topic = topic.clone();
-                            let task_group = group.clone();
-                            let task_shutdown = shutdown.clone();
-                            let task_timeout_outcome = handler_timeout_outcome_cfg.clone();
-
-                            tokio::spawn(async move {
-                                task_processing.store(true, Ordering::Release);
-
-                                let outcome = invoke_handler(
-                                    async move {
-                                        task_handler.handle(payload, metadata, task_ctx.as_ref()).await
-                                    },
-                                    handler_timeout,
-                                    task_timeout_outcome,
-                                    &task_topic,
-                                    task_group.as_deref(),
-                                )
-                                .await;
-
-                                route_outcome(
-                                    &task_client,
-                                    task_group.as_deref(),
-                                    &msg,
-                                    outcome,
-                                    topology,
-                                    retry_count,
-                                    max_retries,
-                                    retry_strategy,
-                                    hold_queues,
-                                    ack_wait,
-                                    &task_shutdown,
-                                )
-                                .await;
-
-                                drop(permit);
-                                // Only report idle when ALL permits are available (no other tasks in-flight)
-                                if task_semaphore.available_permits() == task_prefetch as usize {
-                                    task_processing.store(false, Ordering::Release);
-                                }
-                            });
+                            stream
+                                .create_consumer(PullConsumerConfig {
+                                    durable_name: Some(consumer_name.clone()),
+                                    ack_policy: AckPolicy::Explicit,
+                                    max_ack_pending,
+                                    ack_wait: derived_ack_wait,
+                                    ..Default::default()
+                                })
+                                .await
+                                .map_err(|e| {
+                                    ShoveError::Connection(format!(
+                                        "create_consumer({consumer_name}) fallback failed: {e}"
+                                    ))
+                                })?
                         }
-                    }
+                    };
+
+                    // Effective server-side ack_wait, used to pace the progress acks
+                    // that keep a waiting message from being redelivered.
+                    let ack_wait = pull_consumer.cached_info().config.ack_wait;
+
+                    worker.pull_until_stopped(&pull_consumer, ack_wait).await
                 }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -2288,7 +2513,7 @@ impl NatsConsumer {
                                 // whole `expires` window even when the stream
                                 // has supply. Flight stays bounded by the pull
                                 // requests themselves (≤ one batch per worker).
-                                max_ack_pending: -1,
+                                max_ack_pending: UNBOUNDED_ACK_PENDING,
                                 ack_wait: batch_ack_wait,
                                 ..Default::default()
                             })
@@ -2665,6 +2890,11 @@ mod ack_wait_tests {
             Duration::from_secs(360)
         );
     }
+
+    #[test]
+    fn a_huge_handler_timeout_saturates() {
+        assert_eq!(derive_ack_wait(Duration::MAX), Duration::MAX);
+    }
 }
 
 /// [`progress_interval`]: how often a held sequenced record renews its
@@ -2688,6 +2918,65 @@ mod sequenced_hold_tests {
     #[test]
     fn a_zero_ack_wait_is_the_server_default() {
         assert_eq!(progress_interval(Duration::ZERO), Duration::from_secs(10));
+    }
+}
+
+/// [`reserve_free_slots`] and [`BusyTasks`]: how a concurrent worker sizes its
+/// pulls and reports itself busy.
+#[cfg(test)]
+mod worker_flow_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_pull_reserves_every_free_slot() {
+        let slots = Arc::new(Semaphore::new(4));
+        let running = Arc::clone(&slots).try_acquire_owned().unwrap();
+        let reserved = reserve_free_slots(&slots).await.unwrap();
+        assert_eq!(reserved.len(), 3, "the three free slots");
+        assert_eq!(slots.available_permits(), 0);
+        drop(reserved);
+        assert_eq!(
+            slots.available_permits(),
+            3,
+            "the slots a pull did not fill go back"
+        );
+        drop(running);
+    }
+
+    #[tokio::test]
+    async fn a_pull_waits_for_a_free_slot() {
+        let slots = Arc::new(Semaphore::new(1));
+        let running = Arc::clone(&slots).try_acquire_owned().unwrap();
+        let mut reserve = std::pin::pin!(reserve_free_slots(&slots));
+        assert!(
+            reserve.as_mut().now_or_never().is_none(),
+            "no free slot, no pull"
+        );
+        drop(running);
+        assert_eq!(reserve.await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_processing_flag_is_set_until_the_last_task_finishes() {
+        let processing = Arc::new(AtomicBool::new(false));
+        let busy = BusyTasks::new(Arc::clone(&processing));
+        let first = busy.enter();
+        let second = busy.enter();
+        assert!(processing.load(Ordering::Acquire));
+        drop(first);
+        assert!(
+            processing.load(Ordering::Acquire),
+            "one task is still running"
+        );
+        drop(second);
+        assert!(!processing.load(Ordering::Acquire));
+        let third = busy.enter();
+        assert!(
+            processing.load(Ordering::Acquire),
+            "a new task sets it again"
+        );
+        drop(third);
+        assert!(!processing.load(Ordering::Acquire));
     }
 }
 
