@@ -1,0 +1,71 @@
+src/backends/sns/router.rs
+  s_1001dc3147e1e5::t_e5183c82569fcf 607
+  s_1001dc3147e1e5::t_5815cdc7b270e7 9
+src/backends/inmemory/constants.rs
+  s_1001dc3147e1e5::t_181ad8e979f098 29
+src/backends/sns/publisher.rs
+  s_1001dc3147e1e5::t_3bc3b09835b3f2 23-26
+  s_1001dc3147e1e5::t_45b60c53930019 298
+src/backends/nats/constants.rs
+  s_1001dc3147e1e5::t_e2aa17ff93765a 51
+tests/publisher_reserved_headers.rs
+  s_1001dc3147e1e5::t_b272ffef46b9ce 488
+  s_1001dc3147e1e5::t_92f57897869f94 59
+  s_1001dc3147e1e5::t_8a03be9f13580d 126-127
+  s_1001dc3147e1e5::t_fe69eb5b54052d 238-244
+  s_1001dc3147e1e5::t_7847aa0f34c37e 456
+  s_1001dc3147e1e5::t_4dd2b5b8cf9874 471-478
+  s_1001dc3147e1e5::t_bdd1164e986701 480,482-487,489-641,643-652
+  s_1001dc3147e1e5::t_1641d6b02587fe 30-40,481
+  s_1001dc3147e1e5::t_e9ce573eb4c319 261-262
+  s_1001dc3147e1e5::t_b885277cc6d9c5 352,355-356
+  s_1001dc3147e1e5::t_80508494eebd62 123
+  s_1001dc3147e1e5::t_ac8f3a4a418086 329-335
+  s_1001dc3147e1e5::t_8d2162fdce25d3 99,227,315
+  s_1001dc3147e1e5::t_263a4320e17333 3-4,10-11
+  s_1001dc3147e1e5::t_1000f7df1fe9dd 62-63
+  s_1001dc3147e1e5::t_a605fb3187173b 258
+  s_1001dc3147e1e5::t_335b34fe6eca68 479
+src/publisher_internal.rs
+  s_1001dc3147e1e5::t_bef556a63aaa37 150,168-171,179,192-195
+  s_1001dc3147e1e5::t_4067dd78adbfad 236
+  s_1001dc3147e1e5::t_726d5de06a60b3 177,190-191,196-223,225-228,230-231
+  s_1001dc3147e1e5::t_4681b3f892a3e7 31-33,35-38,51-58,63-65,68,73
+  s_1001dc3147e1e5::t_12bb05ad39696c 14-19
+  s_1001dc3147e1e5::t_00fe9071179a0f 112,119,126,133
+src/backends/kafka/publisher.rs
+  s_1001dc3147e1e5::t_0b812d24f09e08 464
+src/backends/kafka/constants.rs
+  s_1001dc3147e1e5::t_1e48bb1837df86 299
+src/backends/nats/publisher.rs
+  s_1001dc3147e1e5::t_cafbf6269daf2e 156
+src/backends/redis/publisher.rs
+  s_1001dc3147e1e5::t_8a1e56cdac2b6f 188
+  s_1001dc3147e1e5::t_53ce69dbfd6a47 399-403,409-410,413,420,425
+  s_1001dc3147e1e5::t_fcadff7e4b47fb 456
+  s_1001dc3147e1e5::t_1ce85099c73305 489-534
+src/backends/rabbitmq/headers.rs
+  s_1001dc3147e1e5::t_1de5b65f549aeb 163
+src/backends/rabbitmq/publisher.rs
+  s_1001dc3147e1e5::t_8f9708169c41bf 357
+src/backends/inmemory/publisher.rs
+  s_1001dc3147e1e5::t_dafa41571ef271 86
+src/backends/redis/constants.rs
+  s_1001dc3147e1e5::t_3bb53afbaf0204 16-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4b373db6139eb34564095c4e6430eb3386f50de5",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
