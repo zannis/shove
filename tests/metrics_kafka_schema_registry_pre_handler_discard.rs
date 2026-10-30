@@ -55,10 +55,11 @@
 //! handler proves the two poisons ahead of it were decoded and dropped —
 //! identical reasoning to `metrics_kafka_pre_handler_discard.rs`, which also
 //! documents why the shutdown drain then settles the pending discards.
-//! Scenario 2's FIFO loop commits each drop synchronously before `recv()`-ing
-//! the next message, so the marker reaching the handler proves both discards
-//! settled. Scenario 3's flush containing the marker is its barrier, and
-//! scenario 4's is the DLQ delivery itself.
+//! Scenario 2's FIFO loop handles one record at a time, so the marker
+//! reaching the handler proves both drops were decided; the commit that
+//! retires them, a gated one or the final commit at the stop, settles both
+//! discards before the snapshot. Scenario 3's flush containing the marker is
+//! its barrier, and scenario 4's is the DLQ delivery itself.
 //!
 //! Uses `metrics-util::debugging::DebuggingRecorder`, which takes the *global*
 //! recorder slot. Hence its own integration binary, a single `#[test]`, and
