@@ -195,7 +195,10 @@ impl SqsConsumerGroup {
             // still processing them one-at-a-time, reducing per-message API call overhead
             // and improving throughput when multiple consumers share the same queue.
             let options = if concurrent {
-                options
+                ConsumerOptions {
+                    prefetch_count: options.prefetch_count.max(1),
+                    ..options
+                }
             } else {
                 ConsumerOptions {
                     receive_batch_size: options.prefetch_count,
