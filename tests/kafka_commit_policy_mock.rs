@@ -4383,11 +4383,10 @@ async fn shutdown_drain_keeps_polling() {
         "the drain handed A's handler nothing behind the held record"
     );
 
+    // B stops inside the rebalance A's departure starts, so its final commit
+    // may be refused; only the rebalance inside the hold matters here.
     release.send(1).expect("the handlers hold the receiver");
     group_a.shutdown().await;
     token_b.cancel();
-    run_b
-        .await
-        .expect("B's task completes")
-        .expect("B ends clean");
+    let _ = run_b.await.expect("B's task completes");
 }

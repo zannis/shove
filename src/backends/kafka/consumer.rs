@@ -702,9 +702,8 @@ impl OffsetTracker {
     /// Cheap when the channel is empty (a single failed `try_recv`), so
     /// callers run it every loop iteration. Returns whether an assign event
     /// was among them: a partition this member is handed, or handed back,
-    /// keeps the pause flag librdkafka last gave it, so a loop that pauses
-    /// must re-apply its intent then (see the per-record pause in the
-    /// receive loop).
+    /// keeps the pause flag librdkafka last gave it, so the loop must
+    /// re-apply its intent then, see [`reconcile_pause_after_assign`].
     fn apply_rebalance_events(&mut self, rx: &std_mpsc::Receiver<RebalanceEvent>) -> bool {
         let mut assigned = false;
         while let Ok(event) = rx.try_recv() {
@@ -1634,13 +1633,13 @@ where
 #[cfg(feature = "kafka-schema-registry")]
 #[derive(Default)]
 struct RegistryStall {
-    /// Whether this stall paused the assignment itself, and so must resume
-    /// it in `end`.
-    paused: bool,
+    /// Whether a wait ran, so `end` has the loop's pause intent to re-apply.
+    waited: bool,
     /// Whether the loop holds a pause of its own over the stalled record,
-    /// as the concurrent loop does under `CommitPolicy::PerRecord`. The
-    /// stall then pauses nothing in `wait` and resumes nothing in `end`;
-    /// see `inside_pause`.
+    /// as the concurrent loop does under `CommitPolicy::PerRecord` and a
+    /// sequenced consumer does through every wait. The stall then pauses
+    /// nothing in `wait`, and `end` re-applies that pause; see
+    /// `inside_pause`.
     loop_holds_pause: bool,
     /// Whether the consumer never joins a group, as the broadcast
     /// subscription does not. Its inert group id still provokes a
@@ -1655,25 +1654,28 @@ impl RegistryStall {
     /// A stall for the groupless broadcast subscription, see `groupless`.
     fn groupless() -> Self {
         Self {
-            paused: false,
+            waited: false,
             loop_holds_pause: false,
             groupless: true,
         }
     }
 
-    /// A stall in the concurrent receive loop, which may already hold a
-    /// pause of its own: under `CommitPolicy::PerRecord` the assignment is
-    /// paused the moment a record is taken, before its decode. A stall
-    /// that starts inside that pause pauses nothing in `wait` and resumes
-    /// nothing in `end`; the commit of the record resumes the assignment,
-    /// see the resume at the top of the loop's pass. A stall that resumed
-    /// on its own there handed librdkafka a fetch for the next record while
-    /// the loop's `paused` still held, and the receive arm put that record
-    /// back and paused again: a fetch, a seek and a put-back per stall, and
-    /// a pause state the broker and the loop no longer agreed on.
+    /// A stall in a loop that may already hold a pause of its own: under
+    /// `CommitPolicy::PerRecord` the concurrent loop pauses the assignment
+    /// the moment a record is taken, before its decode, and a sequenced
+    /// consumer pauses it for every wait on the record in hand. A stall
+    /// that starts inside that pause pauses nothing in `wait`, and `end`
+    /// pauses the whole assignment again, which covers a partition the
+    /// group assigned during the stall; the loop's own resume ends the
+    /// pause, see the resume at the top of the concurrent loop's pass. A
+    /// stall that resumed on its own there handed librdkafka a fetch for the
+    /// next record while the loop's `paused` still held, and the receive
+    /// arm put that record back and paused again: a fetch, a seek and a
+    /// put-back per stall, and a pause state the broker and the loop no
+    /// longer agreed on.
     fn inside_pause(loop_holds_pause: bool) -> Self {
         Self {
-            paused: false,
+            waited: false,
             loop_holds_pause,
             groupless: false,
         }
@@ -1703,11 +1705,13 @@ impl RegistryStall {
         id: SchemaId,
         error: &SchemaRegistryError,
     ) -> Result<bool> {
-        if !self.paused && !self.loop_holds_pause {
-            consumer
-                .pause_assignment()
-                .map_err(|e| map_kafka_error("pause failed", e))?;
-            self.paused = true;
+        if !self.waited {
+            if !self.loop_holds_pause {
+                consumer
+                    .pause_assignment()
+                    .map_err(|e| map_kafka_error("pause failed", e))?;
+            }
+            self.waited = true;
         }
         tracing::warn!(
             queue,
@@ -1731,6 +1735,10 @@ impl RegistryStall {
                     let msg = match received {
                         Ok(msg) => msg,
                         Err(e) if self.groupless && is_ignorable_groupless_error(&e) => continue,
+                        Err(e) if recv_error_is_transient(&e) => {
+                            log_transient_recv_error(queue, &e);
+                            continue;
+                        }
                         Err(e) => {
                             return Err(map_kafka_error(
                                 &format!("consumer recv error on {queue} during a schema registry wait"),
@@ -1756,15 +1764,16 @@ impl RegistryStall {
         }
     }
 
-    /// Resume the assignment once the registry has answered.
+    /// Re-applies the loop's pause intent over its whole assignment once
+    /// the registry has answered, if a wait ran: resumed, or paused again
+    /// when the loop holds a pause of its own, see [`apply_pause_intent`].
+    /// Either way a partition the group assigned or handed back during the
+    /// stall follows the loop.
     fn end(&mut self, consumer: &KafkaStreamConsumer) -> Result<()> {
-        if self.paused {
-            consumer
-                .resume_assignment()
-                .map_err(|e| map_kafka_error("resume failed", e))?;
-            self.paused = false;
+        if !std::mem::take(&mut self.waited) {
+            return Ok(());
         }
-        Ok(())
+        apply_pause_intent(consumer, self.loop_holds_pause)
     }
 }
 
@@ -2510,6 +2519,66 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
     } else {
         ShoveError::Connection(format!("{context}: {e}"))
     }
+}
+
+/// Whether an error a consume loop's `recv()` returned is one librdkafka
+/// recovers from on its own. Such an error is logged, see
+/// [`log_transient_recv_error`], and the loop goes on polling on the same
+/// client. Every other error ends the loop with the error
+/// [`map_kafka_error`] makes of it. Every `recv()` arm reads this one table:
+/// each consume loop's, and each wait's that polls.
+///
+/// The transient codes, with the bundled librdkafka 2.12.1 source behind
+/// each:
+///
+/// - `BrokerTransportFailure` (`__TRANSPORT`): a broker connection could not
+///   be made, or failed. `rd_kafka_broker_fail` tears it down and
+///   reconnects under `reconnect.backoff.ms` (`rdkafka_broker.c:616-625`).
+/// - `Resolve` (`__RESOLVE`): a broker's name did not resolve. The same
+///   `rd_kafka_broker_fail`, and the next attempt resolves the name again
+///   (`rdkafka_broker.c:1127-1139`).
+/// - `AllBrokersDown` (`__ALL_BROKERS_DOWN`): every broker is down at once.
+///   It is raised once per outage, while librdkafka re-bootstraps and every
+///   broker keeps reconnecting (`rdkafka_broker.c:369-388`).
+///
+/// A broker failure reaches the application only at error level, and an
+/// identical one at most once every 30 s per broker
+/// (`rdkafka_broker.c:555-612`), so a bounce logs a handful of lines and the
+/// warning needs no rate limit of its own.
+///
+/// Every other code ends the loop, as it did before. That covers a fatal
+/// error, whether `MessageConsumptionFatal` or a `__FATAL` left
+/// untranslated (`rdkafka_event.h:77-91`), and `AutoOffsetReset`, see
+/// [`map_kafka_error`]. It covers `PollExceeded`, raised once librdkafka has
+/// left the group for a member that did not poll in time
+/// (`rdkafka_cgrp.c:5162-5210`). It also covers what a committed-offset
+/// fetch, a coordinator lookup, a join or a fetch passes to the
+/// application: authorization, a missing topic, `__TIMED_OUT`,
+/// `NotCoordinator` and the like. librdkafka does not recover from those on
+/// its own: a committed-offset fetch that fails leaves its partitions
+/// unfetched until the assignment changes (`rdkafka_assignment.c:198-232`),
+/// and the reconnect that ends the loop fetches them again. One such fetch
+/// reports `__TRANSPORT`: a request that failed after the assignment changed
+/// under it (`rdkafka_assignment.c:281-298`). It is ridden out with the
+/// broker failures, because the code alone cannot tell them apart.
+fn recv_error_is_transient(error: &KafkaError) -> bool {
+    matches!(
+        error,
+        KafkaError::MessageConsumption(
+            RDKafkaErrorCode::BrokerTransportFailure
+                | RDKafkaErrorCode::Resolve
+                | RDKafkaErrorCode::AllBrokersDown
+        )
+    )
+}
+
+/// Logs an error [`recv_error_is_transient`] rides out.
+fn log_transient_recv_error(queue: &str, error: &KafkaError) {
+    tracing::warn!(
+        queue,
+        error = %error,
+        "transient consumer error; librdkafka recovers on its own, polling continues"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3398,10 +3467,11 @@ fn spawn_named_thread(name: String, body: Box<dyn FnOnce() + Send>) -> std::io::
 }
 
 /// Test-only counters (see the `test-support` feature) for what a
-/// `CommitPolicy::PerRecord` loop does that nothing else observes: a commit
-/// attempted while no thread can carry it leaves no request at the broker
-/// and no record at the handler, so a test that holds the next record
-/// behind it needs this to know the attempt was made. nextest runs each
+/// concurrent loop does that nothing else observes: a commit attempted
+/// while no thread can carry it leaves no request at the broker and no
+/// record at the handler, so a test that holds the next record behind it
+/// needs this to know the attempt was made, and the drain that met an
+/// assign is invisible but for the pause it re-applies. nextest runs each
 /// test in its own process, so the counters belong to that test's
 /// consumers alone.
 #[cfg(feature = "test-support")]
@@ -3415,11 +3485,11 @@ pub mod per_record_probe {
     /// Assign events the rebalance callback queued for the loop, from any
     /// consumer in the process.
     pub static ASSIGNS_QUEUED: AtomicUsize = AtomicUsize::new(0);
-    /// Assigns a per-record loop reconciled from the drain at the top of a
-    /// pass.
+    /// Assigns a concurrent loop reconciled from the drain at the top of a
+    /// pass, under either commit policy.
     pub static RECONCILED_AT_TOP_OF_PASS: AtomicUsize = AtomicUsize::new(0);
-    /// Assigns a per-record loop's receive arm drained ahead of the record
-    /// that brought them, whose pause and resume cycle then covers them.
+    /// Assigns a concurrent loop's receive arm drained, and reconciled,
+    /// ahead of the record that brought them, under either commit policy.
     pub static ASSIGNS_DRAINED_AT_RECEIVE_ARM: AtomicUsize = AtomicUsize::new(0);
 
     pub fn commit_attempts() -> usize {
@@ -3790,29 +3860,20 @@ where
     }
 }
 
-/// Under `CommitPolicy::PerRecord` the pause is the receive loop's intent
-/// over its whole assignment, while librdkafka keeps a pause flag per
-/// partition: one revoked while paused and handed back later arrives
-/// paused, one assigned fresh arrives unpaused. The drain at the top of a
-/// pass re-applies the intent when it saw an assign event: that drain is
-/// the one an assign meets when nothing comes through `recv()`, on the
-/// housekeeping tick of an idle member, and without this call a partition
-/// handed back paused would stay paused until a record on another
-/// partition was taken. The receive arm's drain needs no call of its own:
-/// the record that brought it is taken next, and under `PerRecord` taking
-/// a record pauses the whole assignment and the commit of its completion,
-/// or of its drop, resumes the whole assignment, the returned partition
-/// included. Nothing to do under `Interval`, which never pauses on its own
-/// account, or when the drain saw no assign.
-fn reconcile_pause_after_assign(
-    consumer: &KafkaStreamConsumer,
-    per_record: bool,
-    paused: bool,
-    assigned: bool,
-) -> Result<()> {
-    if !(per_record && assigned) {
-        return Ok(());
-    }
+/// Re-applies a loop's pause intent over its whole assignment: `paused`
+/// pauses every partition the member holds, and otherwise every one is
+/// resumed.
+///
+/// A loop pauses and resumes its assignment as a whole, while librdkafka
+/// keeps a pause flag per partition and keeps it across a revoke. A
+/// partition revoked while the loop was paused and handed back later
+/// therefore arrives paused, and one assigned fresh arrives unpaused,
+/// whatever the loop's intent is by then: the revoke and the start that
+/// follows a re-assign clear only the library's own pause flag (bundled
+/// librdkafka 2.12.1, `rdkafka_assignment.c:371-375` and `:501-505`). Each
+/// loop calls this with the intent its own state holds, see
+/// [`reconcile_pause_after_assign`] and `RegistryStall::end`.
+fn apply_pause_intent(consumer: &KafkaStreamConsumer, paused: bool) -> Result<()> {
     if paused {
         consumer
             .pause_assignment()
@@ -3821,6 +3882,29 @@ fn reconcile_pause_after_assign(
         consumer
             .resume_assignment()
             .map_err(|e| map_kafka_error("resume failed", e))
+    }
+}
+
+/// Re-applies the loop's pause intent, see [`apply_pause_intent`], when the
+/// rebalance events a loop just drained held an assign, and does nothing
+/// otherwise. Every loop that keeps a group assignment calls it after every
+/// drain of its events, under every commit policy: the concurrent loop at
+/// the top of a pass, in its receive arm and in its permit wait, a
+/// sequenced consumer on every pass and wait, the batch loop and the DLQ
+/// drain. A drain that met an assign and left the intent unapplied would
+/// leave a partition handed back paused stalled for as long as the loop
+/// stays unpaused: under `CommitPolicy::Interval`, on a sequenced consumer
+/// between waits, and in the batch and DLQ loops between registry stalls,
+/// nothing else resumes it.
+fn reconcile_pause_after_assign(
+    consumer: &KafkaStreamConsumer,
+    paused: bool,
+    assigned: bool,
+) -> Result<()> {
+    if assigned {
+        apply_pause_intent(consumer, paused)
+    } else {
+        Ok(())
     }
 }
 
@@ -4145,13 +4229,20 @@ async fn commit_confirmed(
                 });
             }
             received = consumer.recv() => {
-                let msg = received.map_err(|e| {
-                    tracing::error!(error = %e, queue, "consumer recv error");
-                    map_kafka_error(
-                        &format!("consumer recv error on {queue} while waiting for a commit"),
-                        e,
-                    )
-                })?;
+                let msg = match received {
+                    Ok(msg) => msg,
+                    Err(e) if recv_error_is_transient(&e) => {
+                        log_transient_recv_error(queue, &e);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, queue, "consumer recv error");
+                        return Err(map_kafka_error(
+                            &format!("consumer recv error on {queue} while waiting for a commit"),
+                            e,
+                        ));
+                    }
+                };
                 put_back(consumer, queue, msg.partition(), msg.offset())?;
                 consumer
                     .pause_assignment()
@@ -5087,8 +5178,20 @@ enum Flushed {
     Redelivered,
 }
 
+/// What one drain of the batch loop's rebalance events found, see
+/// [`drain_batch_rebalance_events`].
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BatchRebalance {
+    /// The partitions of this consumer's topic whose ownership changed.
+    moved: BTreeSet<i32>,
+    /// Whether an assign was among the events, see
+    /// [`reconcile_pause_after_assign`].
+    assigned: bool,
+}
+
 /// Drains librdkafka's rebalance events, returning the partitions of this
-/// consumer's topic whose ownership changed.
+/// consumer's topic whose ownership changed, and whether an assign was among
+/// them. The DLQ drain, which keeps no batch, reads only the latter.
 ///
 /// Only a partition the in-flight batch actually spans invalidates it, so the
 /// caller intersects this set with the batch (see
@@ -5097,14 +5200,19 @@ enum Flushed {
 /// including members that gain a partition and lose nothing, and with an empty
 /// delta — so treating a bare "something happened" as invalidation throws away
 /// batches that were never at risk, redelivering them as duplicate writes.
-fn drain_batch_rebalance_events(rx: &std_mpsc::Receiver<RebalanceEvent>) -> BTreeSet<i32> {
-    let mut affected = BTreeSet::new();
-    while let Ok(RebalanceEvent::Assign(partitions) | RebalanceEvent::Revoke(partitions)) =
-        rx.try_recv()
-    {
-        affected.extend(partitions);
+fn drain_batch_rebalance_events(rx: &std_mpsc::Receiver<RebalanceEvent>) -> BatchRebalance {
+    let mut drained = BatchRebalance::default();
+    while let Ok(event) = rx.try_recv() {
+        let partitions = match event {
+            RebalanceEvent::Assign(partitions) => {
+                drained.assigned = true;
+                partitions
+            }
+            RebalanceEvent::Revoke(partitions) => partitions,
+        };
+        drained.moved.extend(partitions);
     }
-    affected
+    drained
 }
 
 /// Whether a rebalance that moved `affected` invalidates a batch spanning
@@ -5418,13 +5526,14 @@ struct IntervalCommits<'a> {
 }
 
 impl IntervalCommits<'_> {
-    fn settle(&mut self, consumer: &Arc<KafkaStreamConsumer>, queue: &str) -> Result<()> {
+    /// The `Ok` says whether the commit step's rebalance events held an
+    /// assign, see [`CommitSlot::pass`].
+    fn settle(&mut self, consumer: &Arc<KafkaStreamConsumer>, queue: &str) -> Result<bool> {
         while let Ok(completion) = self.completion_rx.try_recv() {
             self.tracker.mark_complete(completion);
         }
         self.slot
-            .pass(consumer, self.tracker, self.rebalance_rx, self.fence, queue)?;
-        Ok(())
+            .pass(consumer, self.tracker, self.rebalance_rx, self.fence, queue)
     }
 }
 
@@ -5440,56 +5549,71 @@ impl IntervalCommits<'_> {
 /// inside the 10 s floor of `max.poll.interval.ms`.
 const PERMIT_WAIT_GRACE: Duration = Duration::from_secs(1);
 
-/// Wait for a prefetch permit while the receive loop keeps polling.
+/// Wait for `permits` prefetch permits while the receive loop keeps polling.
 ///
-/// The record in hand is decoded and tracked, and every permit is held: by
-/// running handlers, by handlers waiting out an in-place delay, or by
-/// republishes waiting out their hold. librdkafka counts the member as
-/// polling only when a `recv()` actually polls its queue
+/// The receive loop waits here for one permit when a record is in hand,
+/// decoded and tracked, and every permit is held: by running handlers, by
+/// handlers waiting out an in-place delay, or by republishes waiting out
+/// their hold. Its shutdown arm waits here for every permit, the proof that
+/// every handler task has ended, see the drain there. librdkafka counts the
+/// member as polling only when a `recv()` actually polls its queue
 /// (`rd_kafka_app_polled`, bundled librdkafka 2.12.1, `rdkafka_int.h:1219`;
 /// rust-rdkafka 0.39 polls it with a zero timeout,
 /// `stream_consumer.rs:125-131`). A bare `acquire_owned().await` here would
 /// poll nothing, so a hold, or a running holder that turns into an in-place
 /// wait afterwards, would park the loop for the whole delay, and a park past
-/// `max.poll.interval.ms` has the member evicted. So the permit is acquired
-/// inside a `select!` whose `recv()` arm is armed once [`PERMIT_WAIT_GRACE`]
-/// has run out. From then on the member stays inside the interval because
-/// that arm is polled again on every wake of the wait: the housekeeping
-/// tick, the commit gate's deadline and the answer of the commit in flight
-/// under `CommitPolicy::Interval`, and the wake rust-rdkafka sends a pending
+/// `max.poll.interval.ms` has the member evicted; a park in the drain would
+/// also leave a rebalance that needs this member's revoke unfinished until
+/// the eviction. So the permits are acquired inside a `select!` whose
+/// `recv()` arm is armed once [`PERMIT_WAIT_GRACE`] has run out. From then
+/// on the member stays inside the interval because that arm is polled again
+/// on every wake of the wait: the housekeeping tick, the commit gate's
+/// deadline and the answer of the commit in flight under
+/// `CommitPolicy::Interval`, and the wake rust-rdkafka sends a pending
 /// `recv()` at half the poll interval (`stream_consumer.rs:238-263`). Those
 /// polls serve the rebalance callbacks. A record `recv()` yields meanwhile
 /// comes from a partition that is not paused; it is put back (see
 /// [`put_back`]) and the assignment is paused, so it arrives again, in
-/// order, once a permit frees and the loop resumes.
+/// order, once a permit frees and the loop resumes, or, after a stop, once
+/// the group hands it out again from the committed offset. A `recv()` error
+/// librdkafka recovers from on its own is logged and the wait goes on, see
+/// [`recv_error_is_transient`].
 ///
 /// `commits`, under `CommitPolicy::Interval`, has the wait commit as the
 /// loop does: positions completed before the wait, and the ones a rebalance
 /// or a rejected commit re-offers during it, are committed however long the
 /// wait runs, and the record in hand stays in flight, so no commit passes
 /// it. The wait wakes for that on the gate's deadline, on the answer of the
-/// commit in flight and on the housekeeping tick, as the loop does. Under
+/// commit in flight and on the housekeeping tick, as the loop does, and an
+/// assign among the events that step drains re-applies the loop's pause
+/// intent, see [`reconcile_pause_after_assign`]. Under
 /// `CommitPolicy::PerRecord` the loop holds its permit whenever it takes a
-/// record, so the wait only ever finds a free one, and commits nothing.
+/// record, so the record wait only ever finds a free one, and commits
+/// nothing. The drain commits nothing either: the stop commits what the
+/// handlers completed once the last permit is in.
 ///
-/// `Ok(None)` means shutdown fired first: it is read before the permit, and
-/// the caller reads it once more with the permit in hand, see the receive
-/// arm. A fault a handler task reports over `fault_rx` meanwhile ends the
-/// wait with that error, for the reason `RegistryStall::wait` gives: the
-/// loop's fault arm is not polled while this wait runs, and a permit may
-/// never free if the holder is the task that faulted.
+/// `Ok(None)` means `shutdown` fired first: it is read before the permits,
+/// and the caller reads it once more with the permit in hand, see the
+/// receive arm. A fault a handler task reports over `fault_rx` meanwhile
+/// ends the wait with that error, for the reason `RegistryStall::wait`
+/// gives: the loop's fault arm is not polled while this wait runs, and a
+/// permit may never free if the holder is the task that faulted. The drain
+/// passes neither: it runs once the stop has fired, and a fault reported
+/// during it leaves its record uncommitted, as the stop leaves every record
+/// whose handler did not complete.
 #[allow(clippy::too_many_arguments)]
 async fn acquire_permit_while_polling(
     semaphore: &Arc<tokio::sync::Semaphore>,
+    permits: u32,
     consumer: &Arc<KafkaStreamConsumer>,
-    shutdown: &CancellationToken,
+    shutdown: Option<&CancellationToken>,
     fault_rx: Option<&mut mpsc::Receiver<ShoveError>>,
     queue: &str,
     paused: &mut bool,
     mut commits: Option<IntervalCommits<'_>>,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
-    #[cfg(feature = "test-support")]
-    permit_wait_probe::ENTERED.fetch_add(1, Ordering::SeqCst);
+    let stop = stop_requested(shutdown);
+    tokio::pin!(stop);
     let fault = handler_fault(fault_rx);
     tokio::pin!(fault);
     let grace = tokio::time::sleep(PERMIT_WAIT_GRACE);
@@ -5499,7 +5623,8 @@ async fn acquire_permit_while_polling(
     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if let Some(commits) = commits.as_mut() {
-            commits.settle(consumer, queue)?;
+            let assigned = commits.settle(consumer, queue)?;
+            reconcile_pause_after_assign(consumer, *paused, assigned)?;
         }
         let now = Instant::now();
         let commit_deadline = commits.as_ref().map_or(now, |c| c.slot.gate.deadline(now));
@@ -5516,9 +5641,9 @@ async fn acquire_permit_while_polling(
             // hand to a handler on a consumer that is about to return:
             // handled ahead of the record that was waiting, and handled
             // again after the restart.
-            _ = shutdown.cancelled() => return Ok(None),
+            () = &mut stop => return Ok(None),
             e = &mut fault => return Err(e),
-            permit = semaphore.clone().acquire_owned() => {
+            permit = semaphore.clone().acquire_many_owned(permits) => {
                 let permit = permit.map_err(|_| {
                     ShoveError::Connection("semaphore closed".to_string())
                 })?;
@@ -5535,13 +5660,20 @@ async fn acquire_permit_while_polling(
                 }
             }
             received = consumer.recv(), if polling => {
-                let msg = received.map_err(|e| {
-                    tracing::error!(error = %e, queue, "consumer recv error");
-                    map_kafka_error(
-                        &format!("consumer recv error on {queue} while waiting for a permit"),
-                        e,
-                    )
-                })?;
+                let msg = match received {
+                    Ok(msg) => msg,
+                    Err(e) if recv_error_is_transient(&e) => {
+                        log_transient_recv_error(queue, &e);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, queue, "consumer recv error");
+                        return Err(map_kafka_error(
+                            &format!("consumer recv error on {queue} while waiting for a permit"),
+                            e,
+                        ));
+                    }
+                };
                 #[cfg(feature = "test-support")]
                 put_back_probe::PERMIT_WAIT.fetch_add(1, Ordering::SeqCst);
                 put_back(consumer, queue, msg.partition(), msg.offset())?;
@@ -5555,17 +5687,25 @@ async fn acquire_permit_while_polling(
                     // production. Each further record is put back at debug.
                     tracing::info!(
                         queue,
-                        "every prefetch permit is held while a record waits for one; assignment paused"
+                        "a record arrived while every prefetch permit is held; assignment paused"
                     );
                 }
                 tracing::debug!(
                     queue,
                     partition = msg.partition(),
                     offset = msg.offset(),
-                    "record delivered while another waits for a permit put back; pause widened to the current assignment"
+                    "record delivered during a permit wait put back; pause widened to the current assignment"
                 );
             }
         }
+    }
+}
+
+/// Resolves once `shutdown` fires, and never when there is none to read.
+async fn stop_requested(shutdown: Option<&CancellationToken>) {
+    match shutdown {
+        Some(shutdown) => shutdown.cancelled().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -5598,6 +5738,13 @@ fn assigned_partitions(consumer: &KafkaStreamConsumer, queue: &str) -> Option<BT
 /// different route — and under `cooperative-sticky`, where the callback fires
 /// on every member every round, gaining a partition is the common case.
 ///
+/// An assign among the events resumes the whole assignment, see
+/// [`reconcile_pause_after_assign`]: the batch loop holds no pause of its
+/// own, and every drain runs outside a registry stall, which pauses it only
+/// for its own wait and lifts that pause in `RegistryStall::end`. A
+/// partition revoked during a stall and handed back after it would
+/// otherwise come back paused and stay so.
+///
 /// Returns `Ok(true)` if the batch was abandoned, in which case the caller must
 /// also disarm the age deadline. An `Err` means the rewind could not put a
 /// still-held partition back and the caller must reconnect rather than keep
@@ -5608,7 +5755,8 @@ fn apply_batch_rebalance<T: Topic>(
     queue: &str,
     buffer: &mut BatchBuffer<T>,
 ) -> Result<bool> {
-    let moved = drain_batch_rebalance_events(rx);
+    let BatchRebalance { moved, assigned } = drain_batch_rebalance_events(rx);
+    reconcile_pause_after_assign(consumer, false, assigned)?;
     if moved.is_empty() || buffer.is_empty() {
         return Ok(false);
     }
@@ -5818,10 +5966,20 @@ async fn fifo_wait(
                 state.commits.settle(answer, &mut state.tracker, queue);
             }
             received = consumer.recv() => {
-                let msg = received.map_err(|e| {
-                    tracing::error!(error = %e, queue, "FIFO consumer recv error");
-                    map_kafka_error(&format!("FIFO consumer recv error on {queue} during a wait"), e)
-                })?;
+                let msg = match received {
+                    Ok(msg) => msg,
+                    Err(e) if recv_error_is_transient(&e) => {
+                        log_transient_recv_error(queue, &e);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, queue, "FIFO consumer recv error");
+                        return Err(map_kafka_error(
+                            &format!("FIFO consumer recv error on {queue} during a wait"),
+                            e,
+                        ));
+                    }
+                };
                 put_back(consumer, queue, msg.partition(), msg.offset())?;
                 consumer
                     .pause_assignment()
@@ -5845,25 +6003,15 @@ async fn fifo_wait(
 }
 
 impl FifoState {
-    /// Applies the rebalance events librdkafka queued, then the resume an
-    /// assign among them calls for, see
-    /// [`resume_after_assign`](Self::resume_after_assign).
+    /// Applies the rebalance events librdkafka queued, then re-applies the
+    /// loop's pause intent if an assign was among them, see
+    /// [`reconcile_pause_after_assign`]: a partition revoked during a wait
+    /// and handed back once the wait is over arrives paused, and nothing
+    /// else would resume it, and one handed out during a wait is paused
+    /// with the rest.
     fn apply_rebalance_events(&mut self, consumer: &KafkaStreamConsumer) -> Result<()> {
         let assigned = self.tracker.apply_rebalance_events(&self.rebalance_rx);
-        self.resume_after_assign(consumer, assigned)
-    }
-
-    /// After an assign the assignment is resumed unless this loop holds it
-    /// paused: librdkafka keeps a partition's pause flag across a revoke, so
-    /// a partition revoked during a wait and handed back later arrives
-    /// paused, and nothing else would resume it.
-    fn resume_after_assign(&self, consumer: &KafkaStreamConsumer, assigned: bool) -> Result<()> {
-        if assigned && !self.paused {
-            consumer
-                .resume_assignment()
-                .map_err(|e| map_kafka_error("resume failed", e))?;
-        }
-        Ok(())
+        reconcile_pause_after_assign(consumer, self.paused, assigned)
     }
 
     /// The top of every pass: the rebalance events, the commit the gate
@@ -5880,7 +6028,8 @@ impl FifoState {
     }
 
     /// The commit step the standard consumer runs, see [`CommitSlot::pass`],
-    /// then the resume an assign among its rebalance events calls for: at
+    /// then the pause intent an assign among its rebalance events calls for,
+    /// as in [`apply_rebalance_events`](Self::apply_rebalance_events): at
     /// the top of every pass, and on every pass of a wait on the record in
     /// hand, so a position acked before the wait and one a rebalance or a
     /// rejected commit re-offers during it are committed however long the
@@ -5908,7 +6057,7 @@ impl FifoState {
             fence,
             queue,
         )?;
-        self.resume_after_assign(consumer, assigned)
+        reconcile_pause_after_assign(consumer, self.paused, assigned)
     }
 
     /// The record in hand is finished with: acked, or dead-lettered with
@@ -6024,10 +6173,20 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                     state.commits.settle(answer, &mut state.tracker, queue);
                 }
                 received = consumer.recv() => {
-                    let msg = received.map_err(|e| {
-                        tracing::error!(error = %e, queue, "FIFO consumer recv error");
-                        map_kafka_error(&format!("FIFO consumer recv error on {queue}"), e)
-                    })?;
+                    let msg = match received {
+                        Ok(msg) => msg,
+                        Err(e) if recv_error_is_transient(&e) => {
+                            log_transient_recv_error(queue, &e);
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, queue, "FIFO consumer recv error");
+                            return Err(map_kafka_error(
+                                &format!("FIFO consumer recv error on {queue}"),
+                                e,
+                            ));
+                        }
+                    };
                     match self.record(consumer, state, &msg).await? {
                         FifoPass::Next => {}
                         FifoPass::Stop => return Ok(None),
@@ -6169,18 +6328,18 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
         // Loops only through the registry wait arm, which the
         // `kafka-schema-registry` feature adds.
         #[allow(clippy::never_loop)]
-        loop {
+        let staged = loop {
             let Some(decoded) = decode_or_shutdown(
                 decode_batch_message::<T>(&decode, record.payload),
                 &self.shutdown,
             )
             .await
             else {
-                return Ok(Staged::Stop);
+                break Staged::Stop;
             };
             match decoded {
-                BatchDecode::Decoded(message) => return Ok(Staged::Ready(message)),
-                BatchDecode::Dlq { reason, fail } => return Ok(Staged::Drop(fail, reason)),
+                BatchDecode::Decoded(message) => break Staged::Ready(message),
+                BatchDecode::Dlq { reason, fail } => break Staged::Drop(fail, reason),
                 #[cfg(feature = "kafka-schema-registry")]
                 BatchDecode::Unavailable { id, error } => {
                     pause_for_wait(consumer, &mut state.paused)?;
@@ -6197,15 +6356,15 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                         )
                         .await?
                     {
-                        return Ok(Staged::Stop);
+                        break Staged::Stop;
                     }
                     // The wait polled `recv()`, inside which a revoke of the
                     // record's partition cancels its token: read before the
                     // decode is retried.
                     match after_wait(&self.shutdown, Some(&record.revoked)) {
                         AfterWait::Dispatch => {}
-                        AfterWait::Stop => return Ok(Staged::Stop),
-                        AfterWait::Revoked => return Ok(Staged::Revoked),
+                        AfterWait::Stop => break Staged::Stop,
+                        AfterWait::Revoked => break Staged::Revoked,
                     }
                     // An outage can last: commit between its retries, as a
                     // hold does, see `fifo_wait`.
@@ -6216,7 +6375,10 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                 #[cfg(feature = "kafka-schema-registry")]
                 BatchDecode::Fatal(e) => return Err(e),
             }
-        }
+        };
+        #[cfg(feature = "kafka-schema-registry")]
+        stall.end(consumer)?;
+        Ok(staged)
     }
 
     /// Hands the record to the handler until it settles on a terminal
@@ -6776,10 +6938,10 @@ impl KafkaConsumer {
                         commits.pass(consumer, &mut tracker, &rebalance_rx, fence, queue)?;
                     let now = Instant::now();
                     #[cfg(feature = "test-support")]
-                    if per_record && assigned {
+                    if assigned {
                         per_record_probe::RECONCILED_AT_TOP_OF_PASS.fetch_add(1, Ordering::SeqCst);
                     }
-                    reconcile_pause_after_assign(consumer, per_record, paused, assigned)?;
+                    reconcile_pause_after_assign(consumer, paused, assigned)?;
                     // The gate spaces commits out (see `ASYNC_COMMIT_INTERVAL`):
                     // ungated, this drain committed on nearly every iteration —
                     // roughly once per message at speed — piling up in-flight
@@ -6960,12 +7122,24 @@ impl KafkaConsumer {
                             tracing::info!(queue, "shutdown signal received, draining in-flight tasks");
                             // A spare permit would otherwise deadlock the drain below.
                             drop(spare_permit.take());
-                            let _ = semaphore.acquire_many(prefetch_count as u32).await;
+                            // Polls throughout, so a long handler costs no eviction.
+                            let drained = acquire_permit_while_polling(
+                                &semaphore,
+                                u32::from(prefetch_count),
+                                consumer,
+                                None,
+                                None,
+                                queue,
+                                &mut paused,
+                                None,
+                            )
+                            .await?;
+                            drop(drained);
                             // Every task has exited. A task that ended on a
-                            // cancelled wait could not clear the busy flag
-                            // itself: a permit it releases goes to the queued
-                            // `acquire_many` above first, so its own
-                            // availability check never sees the full count.
+                            // cancelled wait may not have cleared the busy
+                            // flag itself: a permit it releases goes to the
+                            // queued wait above first, so its own
+                            // availability check need not see the full count.
                             processing.store(false, Ordering::Release);
                             while let Ok(completion) = completion_rx.try_recv() {
                                 tracker.mark_complete(completion);
@@ -7067,6 +7241,10 @@ impl KafkaConsumer {
                         msg_result = consumer.recv() => {
                             let msg = match msg_result {
                                 Ok(msg) => msg,
+                                Err(e) if recv_error_is_transient(&e) => {
+                                    log_transient_recv_error(queue, &e);
+                                    continue;
+                                }
                                 Err(e) => {
                                     tracing::error!(error = %e, queue, "consumer recv error");
                                     return Err(map_kafka_error(
@@ -7093,23 +7271,15 @@ impl KafkaConsumer {
                             // message arrives from the same poll. Apply pending
                             // events BEFORE tracking — otherwise the next
                             // iteration's drain would wipe the tracker entry this
-                            // message is about to seed. An assign drained here
-                            // needs no reconciling of its own: under
-                            // `PerRecord` the record below pauses the whole
-                            // assignment the moment it is taken, and the
-                            // commit of its completion, or of its drop,
-                            // resumes the whole assignment, a partition handed
-                            // back paused included. The top-of-pass drain is
-                            // the one that must reconcile, see
-                            // `reconcile_pause_after_assign`.
-                            #[cfg_attr(not(feature = "test-support"), allow(unused_variables))]
+                            // message is about to seed.
                             let assigned =
                                 tracker.apply_rebalance_events(&rebalance_rx);
                             #[cfg(feature = "test-support")]
-                            if per_record && assigned {
+                            if assigned {
                                 per_record_probe::ASSIGNS_DRAINED_AT_RECEIVE_ARM
                                     .fetch_add(1, Ordering::SeqCst);
                             }
+                            reconcile_pause_after_assign(consumer, paused, assigned)?;
 
                             // A paused assignment delivers nothing it held when
                             // the pause took effect, so a record that arrives
@@ -7418,10 +7588,13 @@ impl KafkaConsumer {
                                         slot: &mut commits,
                                         fence,
                                     });
+                                    #[cfg(feature = "test-support")]
+                                    permit_wait_probe::ENTERED.fetch_add(1, Ordering::SeqCst);
                                     match acquire_permit_while_polling(
                                         &semaphore,
+                                        1,
                                         consumer,
-                                        &shutdown,
+                                        Some(&shutdown),
                                         Some(&mut fault_rx),
                                         queue,
                                         &mut paused,
@@ -8027,6 +8200,10 @@ impl KafkaConsumer {
                         msg_result = consumer.recv() => {
                             let msg = match msg_result {
                                 Ok(msg) => msg,
+                                Err(e) if recv_error_is_transient(&e) => {
+                                    log_transient_recv_error(queue, &e);
+                                    continue;
+                                }
                                 Err(e) => {
                                     tracing::error!(error = %e, queue, "consumer recv error");
                                     return Err(map_kafka_error(
@@ -8869,6 +9046,10 @@ impl KafkaConsumer {
                                     }
                                     continue;
                                 }
+                                Err(e) if recv_error_is_transient(&e) => {
+                                    log_transient_recv_error(queue, &e);
+                                    continue;
+                                }
                                 Err(e) => {
                                     tracing::error!(error = %e, queue, "broadcast consumer recv error");
                                     return Err(map_kafka_error(
@@ -9354,9 +9535,13 @@ impl KafkaConsumer {
                 // here: `check_dlq_options` refuses it for the drain.
                 //
                 // The DLQ loop commits per message via commit_message and
-                // keeps no offset tracker, so rebalance events are irrelevant
-                // — the receiver is dropped deliberately.
-                let (rebalance_tx, _) = std_mpsc::channel::<RebalanceEvent>();
+                // keeps no offset tracker. It drains the rebalance events for
+                // the assigns among them alone: the drain holds no pause of
+                // its own outside a registry stall, so every assign resumes
+                // the whole assignment, and a partition revoked during a
+                // stall and handed back after it does not stay paused; see
+                // `reconcile_pause_after_assign`.
+                let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
                 let consumer = create_stream_consumer(
                     client_clone.base_config(),
                     &dlq_group_id,
@@ -9371,16 +9556,30 @@ impl KafkaConsumer {
                 consumer
                     .subscribe(&[dlq])
                     .map_err(|e| map_kafka_error("failed to subscribe to DLQ", e))?;
+                // Wakes an idle drain, so an assign is reconciled with no
+                // record to bring it.
+                let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
+                housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
                 loop {
+                    reconcile_pause_after_assign(
+                        &consumer,
+                        false,
+                        drain_batch_rebalance_events(&rebalance_rx).assigned,
+                    )?;
                     tokio::select! {
                         _ = shutdown.cancelled() => {
                             tracing::info!(dlq, "shutdown signal received, stopping DLQ consumer");
                             return Ok(());
                         }
+                        _ = housekeeping.tick() => {}
                         msg_result = consumer.recv() => {
                             let msg = match msg_result {
                                 Ok(msg) => msg,
+                                Err(e) if recv_error_is_transient(&e) => {
+                                    log_transient_recv_error(dlq, &e);
+                                    continue;
+                                }
                                 Err(e) => {
                                     tracing::error!(error = %e, dlq, "DLQ consumer recv error");
                                     return Err(map_kafka_error(
@@ -9389,6 +9588,14 @@ impl KafkaConsumer {
                                     ));
                                 }
                             };
+                            // The poll that delivered the record may have
+                            // queued an assign; reconciled before a stall can
+                            // start on the record.
+                            reconcile_pause_after_assign(
+                                &consumer,
+                                false,
+                                drain_batch_rebalance_events(&rebalance_rx).assigned,
+                            )?;
 
                             // perf-K-5: msg lives through commit_message at the end of this
                             // iteration and we never spawn — decode from msg.payload() directly
@@ -10964,15 +11171,41 @@ mod batch_rebalance_tests {
 
         assert_eq!(
             drain_batch_rebalance_events(&rx),
-            BTreeSet::from([1, 2, 5]),
-            "every partition whose ownership moved should be reported"
+            BatchRebalance {
+                moved: BTreeSet::from([1, 2, 5]),
+                assigned: true,
+            },
+            "every partition whose ownership moved should be reported, and the assign"
+        );
+    }
+
+    /// An assign is reported even when it hands over nothing, as the
+    /// tracker's drain reports it, and a revoke alone is no assign.
+    #[test]
+    fn drain_reports_an_assign_only_when_one_came() {
+        let (tx, rx) = std_mpsc::channel();
+        tx.send(RebalanceEvent::Revoke(vec![3])).unwrap();
+        assert_eq!(
+            drain_batch_rebalance_events(&rx),
+            BatchRebalance {
+                moved: BTreeSet::from([3]),
+                assigned: false,
+            }
+        );
+        tx.send(RebalanceEvent::Assign(Vec::new())).unwrap();
+        assert_eq!(
+            drain_batch_rebalance_events(&rx),
+            BatchRebalance {
+                moved: BTreeSet::new(),
+                assigned: true,
+            }
         );
     }
 
     #[test]
     fn drain_is_empty_when_nothing_happened() {
         let (_tx, rx) = std_mpsc::channel::<RebalanceEvent>();
-        assert!(drain_batch_rebalance_events(&rx).is_empty());
+        assert_eq!(drain_batch_rebalance_events(&rx), BatchRebalance::default());
     }
 
     #[test]
