@@ -144,8 +144,9 @@ pub enum CommitFailure {
     /// from one, so it is safe to log and to return as is.
     #[error("rejected: {0}")]
     Rejected(String),
-    /// The commit had no answer within the time it carries: the shutdown
-    /// deadline for a final commit, its share of that deadline for a commit
+    /// The commit had no answer within the time it carries: what is left of
+    /// the shutdown deadline for a final commit, all of it when no commit was
+    /// in flight, its share of that deadline for a commit
     /// found in flight at the stop, under either commit policy and on a
     /// sequenced consumer, or the time waited when the commit thread ended
     /// without reporting. The result is unknown: the detached commit thread
