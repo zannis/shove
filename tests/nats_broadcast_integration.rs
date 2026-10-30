@@ -433,6 +433,214 @@ async fn no_consumer_survives_a_clean_teardown() {
 }
 
 // ---------------------------------------------------------------------------
+// A slow handler
+// ---------------------------------------------------------------------------
+
+/// Records every key it is handed, and holds key 1 until the test lets it go.
+#[derive(Clone)]
+struct HoldFirst {
+    recorder: Recorder,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl MessageHandler<CacheInvalidations> for HoldFirst {
+    type Context = ();
+    async fn handle(&self, msg: Invalidate, meta: MessageMetadata, ctx: &()) -> Outcome {
+        let key = msg.key;
+        let outcome = self.recorder.handle(msg, meta, ctx).await;
+        if key == 1 {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        outcome
+    }
+}
+
+/// The delivery loop handles a message inline, so while a handler runs nothing
+/// reads the stream. The server drops an ephemeral consumer that no pull
+/// request has reached for its 30 s inactivity threshold once the last request
+/// has expired, and with the consumer goes everything the stream held for it.
+/// The subscription keeps reading while a handler runs, so its consumer stays
+/// and the messages published meanwhile are handled once the handler is done.
+#[tokio::test]
+async fn broadcast_survives_a_long_handler() {
+    /// Past the 30 s a pull request lasts and the 30 s threshold after it.
+    const HOLD: Duration = Duration::from_secs(65);
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("declare");
+    let publisher = broker.publisher().await.expect("publisher");
+
+    let handler = HoldFirst {
+        recorder: Recorder::new(),
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<CacheInvalidations, _>(
+            handler.clone(),
+            ConsumerOptions::new().with_handler_timeout(HOLD * 2),
+        )
+        .expect("subscribe");
+    tb.wait_for_consumers("nats-bcast-invalidations", 1).await;
+    let consumer = tb.consumers_on("nats-bcast-invalidations").await;
+
+    publisher
+        .publish::<CacheInvalidations>(&Invalidate { key: 1 })
+        .await
+        .expect("publish the held message");
+    tokio::time::timeout(Duration::from_secs(10), handler.entered.notified())
+        .await
+        .expect("the handler is entered");
+    publisher
+        .publish::<CacheInvalidations>(&Invalidate { key: 2 })
+        .await
+        .expect("publish behind the held message");
+    tokio::time::sleep(HOLD / 2).await;
+    publisher
+        .publish::<CacheInvalidations>(&Invalidate { key: 3 })
+        .await
+        .expect("publish later behind the held message");
+    tokio::time::sleep(HOLD / 2).await;
+
+    assert_eq!(
+        tb.consumers_on("nats-bcast-invalidations").await,
+        consumer,
+        "the subscription's consumer is still on the stream while its handler runs"
+    );
+    handler.release.notify_one();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while handler.recorder.keys().len() < 3 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        handler.recorder.keys(),
+        vec![1, 2, 3],
+        "everything published behind the held message is handled, in order"
+    );
+    assert_eq!(
+        tb.consumers_on("nats-bcast-invalidations").await,
+        consumer,
+        "and the same consumer served all of it"
+    );
+
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean(), "drained cleanly: {outcome:?}");
+}
+
+/// Records every attempt on every key it is handed, and defers key 1 until the
+/// test lets it go.
+#[derive(Clone)]
+struct DeferFirst {
+    recorder: Recorder,
+    released: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl MessageHandler<CacheInvalidations> for DeferFirst {
+    type Context = ();
+    async fn handle(&self, msg: Invalidate, meta: MessageMetadata, ctx: &()) -> Outcome {
+        let key = msg.key;
+        let outcome = self.recorder.handle(msg, meta, ctx).await;
+        if key == 1 && !self.released.load(std::sync::atomic::Ordering::Acquire) {
+            return Outcome::Defer;
+        }
+        outcome
+    }
+}
+
+/// A `Defer` hands the same message back to the handler a second later, in
+/// place, for as long as the handler keeps deferring it. The subscription keeps
+/// reading the stream through all of those waits, so its consumer stays and the
+/// messages published behind the deferred one are handled once it settles.
+#[tokio::test]
+async fn broadcast_survives_a_long_defer() {
+    /// Past the 30 s a pull request lasts and the 30 s threshold after it.
+    const HOLD: Duration = Duration::from_secs(65);
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("declare");
+    let publisher = broker.publisher().await.expect("publisher");
+
+    let handler = DeferFirst {
+        recorder: Recorder::new(),
+        released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<CacheInvalidations, _>(handler.clone(), ConsumerOptions::new())
+        .expect("subscribe");
+    tb.wait_for_consumers("nats-bcast-invalidations", 1).await;
+    let consumer = tb.consumers_on("nats-bcast-invalidations").await;
+
+    publisher
+        .publish::<CacheInvalidations>(&Invalidate { key: 1 })
+        .await
+        .expect("publish the deferred message");
+    publisher
+        .publish::<CacheInvalidations>(&Invalidate { key: 2 })
+        .await
+        .expect("publish behind the deferred message");
+    tokio::time::sleep(HOLD / 2).await;
+    publisher
+        .publish::<CacheInvalidations>(&Invalidate { key: 3 })
+        .await
+        .expect("publish later behind the deferred message");
+    tokio::time::sleep(HOLD / 2).await;
+
+    assert_eq!(
+        tb.consumers_on("nats-bcast-invalidations").await,
+        consumer,
+        "the subscription's consumer is still on the stream while a message is deferred"
+    );
+    handler
+        .released
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !handler.recorder.keys().ends_with(&[2, 3]) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let keys = handler.recorder.keys();
+    let deferred = keys.iter().take_while(|key| **key == 1).count();
+    assert!(
+        deferred > 10,
+        "key 1 was deferred through the window, {deferred} attempts"
+    );
+    assert_eq!(
+        &keys[deferred..],
+        &[2, 3],
+        "the messages behind it are handled in order once it settles"
+    );
+    assert_eq!(
+        tb.consumers_on("nats-bcast-invalidations").await,
+        consumer,
+        "and the same consumer served all of it"
+    );
+
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean(), "drained cleanly: {outcome:?}");
+}
+
+// ---------------------------------------------------------------------------
 // Reconnect
 // ---------------------------------------------------------------------------
 
