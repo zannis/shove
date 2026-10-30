@@ -17,7 +17,7 @@
 //! `metrics_nats_failall.rs` declares a DLQ, so it only ever exercises the
 //! `true` arm — where the pending discard settles against a DLQ retirement and
 //! `shove_messages_discarded_total` correctly stays at zero. The `false` arm,
-//! where the `double_ack` that retires a cascaded message is the thing that
+//! where the confirmed ack that retires a cascaded message is the thing that
 //! loses it, had no end-to-end coverage on this backend at all.
 //!
 //! That arm is the quietest possible regression: messages vanish and no counter
@@ -370,7 +370,7 @@ async fn failall_cascade_with_no_dlq_counts_every_message_as_discarded() {
     // All three key-A messages are gone and the topology declares nowhere for
     // them to go, so every one of them is data loss: the rejected delivery
     // through `record_terminal` and the two cascaded ones through
-    // `pending_discard`, each settled by the `double_ack` that dropped it.
+    // `pending_discard`, each settled by the confirmed ack that dropped it.
     let discarded = discarded_series(&snapshot);
     let discarded_total: u64 = discarded.iter().map(|(_, n)| *n).sum();
     assert_eq!(
