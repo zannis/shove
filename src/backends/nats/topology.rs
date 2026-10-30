@@ -87,7 +87,9 @@ fn with_owned_fields(mut existing: StreamConfig, owned: StreamConfig) -> StreamC
 ///
 /// An explicit [`nats_stream_config`](crate::TopologyBuilder::nats_stream_config)
 /// is honoured — except for `WorkQueue`, which is refused here rather than left
-/// to fail later as an opaque consumer-create error.
+/// to fail later as an opaque consumer-create error. Without one the stream is
+/// declared with `Interest` retention over shove's defaults, and an existing
+/// stream keeps the tuning it has, as with any stream declared without a config.
 fn broadcast_stream_config(topology: &QueueTopology) -> Result<NatsStreamConfig> {
     let explicit = topology.nats_stream_config();
     let mut cfg = explicit.cloned().unwrap_or_default();
@@ -121,16 +123,46 @@ impl NatsTopologyDeclarer {
 
     /// Create or **reconcile** a shove-managed stream. `config` is the caller's
     /// explicit [`NatsStreamConfig`] (retention/bounds/replicas) and is applied
-    /// in full.
+    /// in full. With `None` the stream is reconciled over shove's defaults, see
+    /// [`reconcile_stream`](Self::reconcile_stream).
+    async fn create_stream(
+        &self,
+        name: &str,
+        subjects: Vec<String>,
+        config: Option<&NatsStreamConfig>,
+    ) -> Result<()> {
+        match config {
+            Some(cfg) => {
+                self.apply_stream(declared_config(name, subjects, cfg))
+                    .await
+            }
+            None => {
+                let defaults = NatsStreamConfig::default();
+                self.reconcile_stream(declared_config(name, subjects, &defaults))
+                    .await
+            }
+        }
+    }
+
+    /// Create the stream `owned` describes, or set only the fields shove owns on
+    /// one that exists.
     ///
-    /// With `None` a stream that does not exist yet is created with shove's
-    /// historical defaults (WorkQueue / unbounded / single-replica). One that
-    /// exists keeps the limits, replicas and other tuning it has: only the
-    /// fields shove owns are set again (subjects, retention, storage, the
-    /// discard policy and the duplicate window), so re-declaring a dead-letter
-    /// or sequenced stream, whose config the topology cannot express, never
-    /// undoes what an operator tuned.
-    ///
+    /// A stream that does not exist yet is created from `owned` as it is: shove's
+    /// historical defaults (WorkQueue / unbounded / single-replica), with
+    /// `Interest` retention for a broadcast topology. One that exists keeps the
+    /// limits, replicas and other tuning it has: only the fields shove owns are
+    /// set again (subjects, retention, storage, the discard policy and the
+    /// duplicate window), so re-declaring a stream whose topology carries no
+    /// `nats_stream_config`, such as a dead-letter stream, never undoes what an
+    /// operator tuned.
+    async fn reconcile_stream(&self, owned: StreamConfig) -> Result<()> {
+        let desired = match self.existing_stream_config(&owned.name).await? {
+            Some(existing) => with_owned_fields(existing, owned),
+            None => owned,
+        };
+        self.apply_stream(desired).await
+    }
+
     /// Uses `create_or_update_stream` rather than `get_or_create_stream` so that
     /// a config change actually takes effect on an already-existing stream:
     /// `get_or_create` returns the existing stream verbatim and would silently
@@ -139,22 +171,8 @@ impl NatsTopologyDeclarer {
     /// `storage`) make the JetStream UPDATE fail loud rather than no-op silently —
     /// the operator must recreate the stream (or use
     /// [`external`](crate::TopologyBuilder::external) to let infra own it).
-    async fn create_stream(
-        &self,
-        name: &str,
-        subjects: Vec<String>,
-        config: Option<&NatsStreamConfig>,
-    ) -> Result<()> {
-        let desired = match config {
-            Some(cfg) => declared_config(name, subjects, cfg),
-            None => {
-                let owned = declared_config(name, subjects, &NatsStreamConfig::default());
-                match self.existing_stream_config(name).await? {
-                    Some(existing) => with_owned_fields(existing, owned),
-                    None => owned,
-                }
-            }
-        };
+    async fn apply_stream(&self, desired: StreamConfig) -> Result<()> {
+        let name = desired.name.clone();
         self.client
             .jetstream()
             .create_or_update_stream(desired)
@@ -210,7 +228,13 @@ impl NatsTopologyDeclarer {
             // WorkQueue retention — see `broadcast_stream_config`.
             if topology.broadcast() {
                 let cfg = broadcast_stream_config(topology)?;
-                self.create_stream(queue, subjects, Some(&cfg)).await?;
+                match topology.nats_stream_config() {
+                    Some(_) => self.create_stream(queue, subjects, Some(&cfg)).await?,
+                    None => {
+                        self.reconcile_stream(declared_config(queue, subjects, &cfg))
+                            .await?;
+                    }
+                }
             } else {
                 self.create_stream(queue, subjects, topology.nats_stream_config())
                     .await?;
