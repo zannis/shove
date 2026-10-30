@@ -973,14 +973,47 @@ async fn release_pulled(consumer: &PullConsumer, unstarted: &[Message]) {
 // Handler invocation
 // ---------------------------------------------------------------------------
 
+/// How a [`guarded`] call ended.
+enum Guarded<T> {
+    Done(T),
+    /// The call panicked; the error is the task's `JoinError`.
+    Panicked(tokio::task::JoinError),
+    /// The call outlasted this limit and was aborted.
+    TimedOut(Duration),
+}
+
+/// Runs `fut` in a child task, so a panic inside it ends that task and not the
+/// caller, and gives up on it after `timeout`. Records no metric.
+async fn guarded<F>(fut: F, timeout: Option<Duration>) -> Guarded<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let mut join = tokio::spawn(fut);
+    let joined = match timeout {
+        Some(limit) => match tokio::time::timeout(limit, &mut join).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                join.abort();
+                return Guarded::TimedOut(limit);
+            }
+        },
+        None => join.await,
+    };
+    match joined {
+        Ok(output) => Guarded::Done(output),
+        Err(e) => Guarded::Panicked(e),
+    }
+}
+
 /// Wraps a handler future with optional timeout, emitting inflight/consumed/duration metrics.
 /// Returns `Outcome::Retry` on timeout or panic.
 ///
-/// The future is run inside a child `tokio::spawn` so a panic inside the
-/// user's handler is caught here (as `JoinError::is_panic`) and surfaced as
-/// `Outcome::Retry` with metrics recorded — without this, the spawned task
-/// aborts before the metric calls and panicked handlers disappear from the
-/// consumed/latency series even though the caller still requeues them.
+/// The future runs under [`guarded`], so a panic inside the user's handler is
+/// caught there and surfaced as `Outcome::Retry` with metrics recorded.
+/// Without this, the spawned task would abort before the metric calls and
+/// panicked handlers would disappear from the consumed/latency series even
+/// though the caller still requeues them.
 async fn invoke_handler<F>(
     fut: F,
     timeout: Option<Duration>,
@@ -993,29 +1026,18 @@ where
 {
     let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
-    let mut join = tokio::spawn(fut);
-    let outcome = match timeout {
-        Some(duration) => match tokio::time::timeout(duration, &mut join).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "handler task panicked, retrying message");
-                Outcome::Retry
-            }
-            Err(_) => {
-                join.abort();
-                let resolved = handler_timeout_outcome(timeout_outcome);
-                tracing::warn!(outcome = ?resolved, "handler timed out after {duration:?}");
-                metrics::record_failed(topic, group, metrics::FailReason::Timeout);
-                resolved
-            }
-        },
-        None => match join.await {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::warn!(error = %e, "handler task panicked, retrying message");
-                Outcome::Retry
-            }
-        },
+    let outcome = match guarded(fut, timeout).await {
+        Guarded::Done(outcome) => outcome,
+        Guarded::Panicked(e) => {
+            tracing::warn!(error = %e, "handler task panicked, retrying message");
+            Outcome::Retry
+        }
+        Guarded::TimedOut(limit) => {
+            let resolved = handler_timeout_outcome(timeout_outcome);
+            tracing::warn!(outcome = ?resolved, "handler timed out after {limit:?}");
+            metrics::record_failed(topic, group, metrics::FailReason::Timeout);
+            resolved
+        }
     };
     let elapsed = start.elapsed().as_secs_f64();
     metrics::record_consumed(topic, group, &outcome);
@@ -2294,11 +2316,15 @@ impl NatsConsumer {
     ///   it as well.
     /// - `with_max_message_size` gates the dead letters. One over the limit is
     ///   logged with its size and acked without reaching `handle_dead`.
-    /// - `with_handler_timeout` and `with_handler_timeout_outcome` govern
-    ///   `handle_dead` as they govern `handle`, and a panic in it is caught. The
-    ///   dead letter is acked whatever the call came to.
-    /// - `with_consumer_group` labels the metrics of the drain.
+    /// - `with_handler_timeout` bounds `handle_dead`, and a panic in it is
+    ///   caught. The dead letter is acked whatever the call came to, so
+    ///   `with_handler_timeout_outcome` has nothing to act on.
+    /// - `with_consumer_group` labels the size sample of the drain.
     /// - `with_max_reconnect_attempts` bounds its consecutive reconnects.
+    ///
+    /// The drain records `shove_message_size_bytes` for each dead letter and no
+    /// other series: a `handle_dead` call moves no consumed, in-flight,
+    /// duration or failed metric.
     ///
     /// A `with_broadcast_start` is refused, as on every entry point that does
     /// not read it.
@@ -2339,7 +2365,6 @@ impl NatsConsumer {
         let client = self.client.clone();
         let max_message_size = options.max_message_size;
         let handler_timeout = options.handler_timeout;
-        let timeout_outcome = options.handler_timeout_outcome.clone();
         let ack_wait = derive_ack_wait(handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT));
         // `shove_message_size_bytes` labels a DLQ drain with the SOURCE topic,
         // not the DLQ stream name, and with the consumer group its options
@@ -2367,7 +2392,6 @@ impl NatsConsumer {
             let dlq_consumer_name = dlq_consumer_name.clone();
             let topic = topic.clone();
             let group = group.clone();
-            let timeout_outcome = timeout_outcome.clone();
             async move {
                 let stream = client
                     .jetstream()
@@ -2466,25 +2490,27 @@ impl NatsConsumer {
                     let metadata = extract_dead_metadata(&msg);
                     let dead_handler = Arc::clone(&handler);
                     let dead_ctx = Arc::clone(&ctx);
-                    let outcome = invoke_handler(
+                    let call = guarded(
                         async move {
                             dead_handler
                                 .handle_dead(payload, metadata, dead_ctx.as_ref())
                                 .await;
-                            Outcome::Ack
                         },
                         handler_timeout,
-                        timeout_outcome.clone(),
-                        &topic,
-                        group.as_deref(),
                     )
                     .await;
-                    if !matches!(outcome, Outcome::Ack) {
-                        tracing::warn!(
+                    match call {
+                        Guarded::Done(()) => {}
+                        Guarded::Panicked(e) => tracing::warn!(
+                            error = %e,
                             dlq,
-                            ?outcome,
-                            "handle_dead did not complete, acking the dead letter anyway"
-                        );
+                            "handle_dead panicked, acking the dead letter anyway"
+                        ),
+                        Guarded::TimedOut(limit) => tracing::warn!(
+                            ?limit,
+                            dlq,
+                            "handle_dead timed out, acking the dead letter anyway"
+                        ),
                     }
                     ack_dead_letter(&msg, dlq).await;
                 }
@@ -3394,6 +3420,41 @@ mod worker_flow_tests {
         assert_eq!(busy.running(), 1);
         drop(task);
         assert!(busy.idle_within(EXIT_DRAIN_TIMEOUT).await);
+    }
+}
+
+/// [`guarded`]: the call guard under every handler invocation.
+#[cfg(test)]
+mod guarded_tests {
+    use super::*;
+
+    async fn panics() {
+        panic!("the call panics on purpose");
+    }
+
+    #[tokio::test]
+    async fn a_returning_call_hands_back_its_output() {
+        assert!(matches!(guarded(async { 7 }, None).await, Guarded::Done(7)));
+        let limit = Some(Duration::from_secs(1));
+        assert!(matches!(
+            guarded(async { 7 }, limit).await,
+            Guarded::Done(7)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_panic_is_reported_to_the_caller() {
+        assert!(matches!(
+            guarded(panics(), None).await,
+            Guarded::Panicked(_)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_past_its_limit_is_cut_off() {
+        let limit = Duration::from_secs(5);
+        let call = guarded(std::future::pending::<()>(), Some(limit)).await;
+        assert!(matches!(call, Guarded::TimedOut(at) if at == limit));
     }
 }
 

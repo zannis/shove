@@ -254,6 +254,7 @@ consumer
 The drain acks every dead letter once it is done with it.
 `handle_dead` runs under the handler timeout, 30 s by default, and a panic in it is caught.
 A call that panics or times out is logged and its dead letter is acked, and the drain goes on with the next one.
+`with_handler_timeout_outcome` has nothing to act on there, since the dead letter is acked either way.
 
 A dead letter over `max_message_size`, 10 MiB by default, never reaches `handle_dead`.
 The drain logs it with its size and acks it, which removes it from the DLQ stream.
@@ -261,10 +262,8 @@ A dead letter the codec cannot decode is logged and acked the same way.
 Neither one counts in `shove_messages_discarded_total`.
 `with_max_reconnect_attempts` bounds the consecutive reconnects of the drain, as it does for any consumer.
 
-The drain labels its metrics with the source topic and the `consumer_group` of its options, `default` when it has none.
-The `handle_dead` call is measured like a handler call, so it shows in `shove_messages_inflight` and `shove_message_processing_duration_seconds`.
-`shove_messages_consumed_total` counts it as `ack` when it returns, and as `retry` when it panics or times out, or under the outcome set with `with_handler_timeout_outcome` after a timeout, although the dead letter is acked either way.
-Give the drain its own `with_consumer_group` to keep these series apart from those of the main consumer.
+The drain records `shove_message_size_bytes` for every dead letter, under the source topic and the `consumer_group` of its options, `default` when it has none.
+It records nothing else: a `handle_dead` call moves none of `shove_messages_consumed_total`, `shove_messages_inflight`, `shove_message_processing_duration_seconds` and `shove_messages_failed_total`, since the dead letter was counted when the main consumer retired it.
 
 ## Consumer groups + autoscaling
 
