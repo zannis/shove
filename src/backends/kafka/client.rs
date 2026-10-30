@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroU32;
 #[cfg(feature = "kafka-ssl")]
 use std::path::PathBuf;
 use std::process;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use rdkafka::ClientConfig;
@@ -24,7 +25,10 @@ use super::constants::{
     PARTITION_METADATA_RETRY_MAX, PING_PROBE_TOPIC, PRODUCER_BUILD_SHUTDOWN_WAIT,
     PRODUCER_FLUSH_TIMEOUT, SHUTDOWN_GRACE,
 };
-use super::publisher::publish_with_retry as publisher_publish_with_retry;
+use super::publisher::{
+    BatchRecord, publish_in_order as publisher_publish_in_order,
+    publish_with_retry as publisher_publish_with_retry,
+};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
@@ -39,6 +43,7 @@ use rdkafka::client::OAuthToken;
 use rdkafka::types::RDKafkaRespErr;
 
 use crate::ShoveError;
+use crate::batch::BatchReport;
 use crate::error::Result;
 use crate::metrics;
 use crate::retry::Backoff;
@@ -448,8 +453,9 @@ pub struct KafkaClient {
     /// Validated at `connect`; the producer is built from it at the first
     /// publish, see [`Self::producer`].
     producer_config: Arc<ClientConfig>,
-    /// The one producer every clone shares, built at the first publish.
-    producer: Arc<OnceCell<KafkaProducerInner>>,
+    /// The one producer every clone shares, built at the first publish and
+    /// built again after a fatal error.
+    producer: Arc<ProducerCell>,
     /// The consumer-type client `ping` probes with, built at `connect`.
     metadata: Arc<MetadataConsumer>,
     #[cfg(feature = "kafka-msk-iam")]
@@ -457,7 +463,6 @@ pub struct KafkaClient {
     shutdown_token: CancellationToken,
 }
 
-#[derive(Clone)]
 enum KafkaProducerInner {
     Default(FutureProducer<DefaultClientContext>),
     #[cfg(feature = "kafka-msk-iam")]
@@ -473,6 +478,107 @@ impl KafkaProducerInner {
             #[cfg(feature = "kafka-msk-iam")]
             Self::MskIam(p) => p.flush(timeout),
         }
+    }
+
+    /// The fatal error librdkafka raised on this producer, if it raised one.
+    fn fatal_error(&self) -> Option<(RDKafkaErrorCode, String)> {
+        match self {
+            Self::Default(p) => p.client().fatal_error(),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(p) => p.client().fatal_error(),
+        }
+    }
+
+    async fn publish_with_retry(
+        &self,
+        topic: &str,
+        key: Option<&[u8]>,
+        headers: OwnedHeaders,
+        payload: &[u8],
+        max_attempts: NonZeroU32,
+        label: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Default(p) => {
+                publisher_publish_with_retry(p, topic, key, headers, payload, max_attempts, label)
+                    .await
+            }
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(p) => {
+                publisher_publish_with_retry(p, topic, key, headers, payload, max_attempts, label)
+                    .await
+            }
+        }
+    }
+
+    async fn publish_in_order(
+        &self,
+        topic: &str,
+        records: Vec<BatchRecord>,
+        label: &str,
+    ) -> BatchReport {
+        match self {
+            Self::Default(p) => publisher_publish_in_order(p, topic, records, label).await,
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(p) => publisher_publish_in_order(p, topic, records, label).await,
+        }
+    }
+}
+
+/// The slot a producer is built into, once. A fatal error on the producer
+/// swaps a new, empty slot in, rather than resetting this one under a
+/// publish that is still reading it.
+type ProducerSlot = Arc<OnceCell<Arc<KafkaProducerInner>>>;
+
+/// The client's producer, shared by every clone of the client.
+///
+/// Locked only to clone or swap the slot, which cannot panic, so a
+/// poisoned lock still holds a valid slot.
+struct ProducerCell {
+    slot: RwLock<ProducerSlot>,
+}
+
+impl ProducerCell {
+    fn new() -> Self {
+        Self {
+            slot: RwLock::new(Arc::new(OnceCell::new())),
+        }
+    }
+
+    /// The slot in use now.
+    fn current(&self) -> ProducerSlot {
+        Arc::clone(&self.slot.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Swaps an empty slot in when the slot in use holds `dead`, so the
+    /// next publish builds a new producer, and returns the slot it replaced.
+    /// A slot with another producer, or a build in flight, came after `dead`
+    /// and is left alone.
+    fn discard(&self, dead: &Arc<KafkaProducerInner>) -> Option<ProducerSlot> {
+        let mut slot = self.slot.write().unwrap_or_else(PoisonError::into_inner);
+        if !slot.get().is_some_and(|current| Arc::ptr_eq(current, dead)) {
+            return None;
+        }
+        Some(std::mem::replace(&mut *slot, Arc::new(OnceCell::new())))
+    }
+
+    /// The producer in the slot in use, if one is built.
+    #[cfg(test)]
+    fn built(&self) -> Option<Arc<KafkaProducerInner>> {
+        self.current().get().cloned()
+    }
+}
+
+/// Drops a reference to a producer. Dropping the last one destroys the
+/// producer, which joins its threads and waits on its queue in librdkafka,
+/// so that drop runs on a blocking thread.
+fn release_producer(producer: Arc<KafkaProducerInner>) {
+    let Some(last) = Arc::into_inner(producer) else {
+        return;
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => drop(runtime.spawn_blocking(move || drop(last))),
+        Err(_) => drop(last),
     }
 }
 
@@ -658,7 +764,7 @@ impl KafkaClient {
             brokers: config.brokers.clone(),
             base_config: Arc::new(base_config),
             producer_config: Arc::new(producer_config),
-            producer: Arc::new(OnceCell::new()),
+            producer: Arc::new(ProducerCell::new()),
             metadata: Arc::new(metadata),
             #[cfg(feature = "kafka-msk-iam")]
             msk_context,
@@ -669,8 +775,11 @@ impl KafkaClient {
     /// The client's one producer, built on the first call and shared by
     /// every clone. A client that never publishes never builds it, and so
     /// never requests a producer id. After `shutdown` the build is refused.
-    async fn producer(&self) -> Result<&KafkaProducerInner> {
-        self.producer
+    /// A producer librdkafka raised a fatal error on is dropped by the
+    /// publish that met it, so the call after builds a new one.
+    async fn producer(&self) -> Result<Arc<KafkaProducerInner>> {
+        let slot = self.producer.current();
+        let producer = slot
             .get_or_try_init(|| async {
                 if self.shutdown_token.is_cancelled() {
                     return Err(ShoveError::Connection("client is shut down".into()));
@@ -687,8 +796,25 @@ impl KafkaClient {
                 })
                 .await
                 .map_err(|e| ShoveError::Topology(format!("producer build task failed: {e}")))?
+                .map(Arc::new)
             })
-            .await
+            .await?;
+        Ok(Arc::clone(producer))
+    }
+
+    /// Drops `producer` from the client when librdkafka raised a fatal error
+    /// on it, so the next publish builds a new one.
+    fn discard_if_fatal(&self, producer: &Arc<KafkaProducerInner>) {
+        let Some((code, reason)) = producer.fatal_error() else {
+            return;
+        };
+        if self.producer.discard(producer).is_some() {
+            tracing::warn!(
+                error = %code,
+                reason,
+                "the Kafka producer hit a fatal error; the next publish builds a new one"
+            );
+        }
     }
 
     pub async fn connect_with_retry(config: &KafkaConfig, max_attempts: u32) -> Result<Self> {
@@ -719,6 +845,17 @@ impl KafkaClient {
         }
     }
 
+    /// Publishes one record to `topic`, sending it again after a transient
+    /// failure, at most `max_attempts` sends in all.
+    ///
+    /// `max_attempts` of zero is `ShoveError::Validation`, returned before
+    /// anything is built or sent. An authorization error ends the call at
+    /// the first refusal with `ShoveError::Topology`, and a fatal error
+    /// librdkafka raised on the producer ends it with `ShoveError::Unknown`
+    /// whatever its cause, including a principal that may not request a
+    /// producer id; neither is retryable, and after a fatal error the next
+    /// publish builds a new producer. Any other failure is sent again, and
+    /// the last one is returned as `ShoveError::Connection`.
     pub async fn publish_with_retry(
         &self,
         topic: &str,
@@ -728,17 +865,41 @@ impl KafkaClient {
         max_attempts: u32,
         label: &str,
     ) -> Result<()> {
-        match self.producer().await? {
-            KafkaProducerInner::Default(p) => {
-                publisher_publish_with_retry(p, topic, key, headers, payload, max_attempts, label)
-                    .await
-            }
-            #[cfg(feature = "kafka-msk-iam")]
-            KafkaProducerInner::MskIam(p) => {
-                publisher_publish_with_retry(p, topic, key, headers, payload, max_attempts, label)
-                    .await
-            }
+        let Some(max_attempts) = NonZeroU32::new(max_attempts) else {
+            return Err(ShoveError::Validation(format!(
+                "{label}: max_attempts must be at least 1"
+            )));
+        };
+        let producer = self.producer().await?;
+        let result = producer
+            .publish_with_retry(topic, key, headers, payload, max_attempts, label)
+            .await;
+        if result.is_err() {
+            self.discard_if_fatal(&producer);
         }
+        release_producer(producer);
+        result
+    }
+
+    /// Sends a batch to `topic` in slice order and reports a prefix, so a
+    /// republish of what the report names keeps the order of records that
+    /// share a key. Nothing is retried.
+    pub(super) async fn publish_in_order(
+        &self,
+        topic: &str,
+        records: Vec<BatchRecord>,
+        label: &str,
+    ) -> BatchReport {
+        let producer = match self.producer().await {
+            Ok(producer) => producer,
+            Err(e) => return BatchReport::wholly_unattempted(records.len(), e),
+        };
+        let report = producer.publish_in_order(topic, records, label).await;
+        if report.first_err().is_some() {
+            self.discard_if_fatal(&producer);
+        }
+        release_producer(producer);
+        report
     }
 
     pub fn brokers(&self) -> &str {
@@ -1172,14 +1333,14 @@ impl KafkaClient {
         tokio::time::sleep(SHUTDOWN_GRACE).await;
         // A failing initializer waits for a build in flight and starts none,
         // and the cancelled token refuses every build from here on.
+        let slot = self.producer.current();
         let producer = match tokio::time::timeout(
             PRODUCER_BUILD_SHUTDOWN_WAIT,
-            self.producer
-                .get_or_try_init(|| async { Err::<KafkaProducerInner, ()>(()) }),
+            slot.get_or_try_init(|| async { Err::<Arc<KafkaProducerInner>, ()>(()) }),
         )
         .await
         {
-            Ok(Ok(producer)) => producer.clone(),
+            Ok(Ok(producer)) => Arc::clone(producer),
             Ok(Err(())) => return,
             Err(_elapsed) => {
                 tracing::warn!(
@@ -1603,8 +1764,10 @@ fn set_admin_oauth_token(rk: *mut rd_kafka_t, token: &OAuthToken) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rdkafka::bindings::rd_kafka_test_fatal_error;
     use rdkafka::mocking::MockCluster;
     use rdkafka::producer::DefaultProducerContext;
+    use rdkafka::types::RDKafka;
     use std::cell::Cell;
     use std::collections::VecDeque;
     use std::future::{Ready, ready};
@@ -1951,7 +2114,10 @@ mod tests {
         use futures_util::future::join_all;
 
         let client = client().await;
-        assert!(client.producer.get().is_none(), "connect built a producer");
+        assert!(
+            client.producer.built().is_none(),
+            "connect built a producer"
+        );
         let clones: Vec<KafkaClient> = (0..4).map(|_| client.clone()).collect();
         let built = join_all(clones.iter().map(|c| c.producer())).await;
         let first: &KafkaProducerInner = built[0].as_ref().expect("the first clone builds");
@@ -1963,7 +2129,7 @@ mod tests {
             );
         }
         assert!(
-            client.producer.get().is_some(),
+            client.producer.built().is_some(),
             "the cell is empty after the builds"
         );
     }
@@ -1980,7 +2146,7 @@ mod tests {
             .expect_err("a publish after shutdown is refused");
         assert!(matches!(err, ShoveError::Connection(_)), "got {err:?}");
         assert!(
-            client.producer.get().is_none(),
+            client.producer.built().is_none(),
             "the refused publish built a producer"
         );
     }
@@ -2006,10 +2172,91 @@ mod tests {
                 "attempt {attempt}: {err:?}"
             );
             assert!(
-                client.producer.get().is_none(),
+                client.producer.built().is_none(),
                 "attempt {attempt}: the cell is not empty"
             );
         }
+    }
+
+    /// Zero attempts is a caller error, refused before anything is sent.
+    #[tokio::test]
+    async fn zero_attempts_is_validation() {
+        let client = client().await;
+        let err = client
+            .publish_with_retry("orders", None, OwnedHeaders::new(), b"{}", 0, "test")
+            .await
+            .expect_err("no attempt is no publish");
+        assert!(matches!(err, ShoveError::Validation(_)), "got {err:?}");
+    }
+
+    // -- a fatal producer error --
+
+    fn native_handle(producer: &KafkaProducerInner) -> *mut RDKafka {
+        match producer {
+            KafkaProducerInner::Default(p) => p.client().native_ptr(),
+            #[cfg(feature = "kafka-msk-iam")]
+            KafkaProducerInner::MskIam(p) => p.client().native_ptr(),
+        }
+    }
+
+    fn fatal_error_of(producer: &KafkaProducerInner) -> Option<(RDKafkaErrorCode, String)> {
+        match producer {
+            KafkaProducerInner::Default(p) => p.client().fatal_error(),
+            #[cfg(feature = "kafka-msk-iam")]
+            KafkaProducerInner::MskIam(p) => p.client().fatal_error(),
+        }
+    }
+
+    /// A producer librdkafka raised a fatal error on refuses every record
+    /// from then on. The publish that meets it fails with an error that is
+    /// not retryable, and the next publish builds a new producer instead of
+    /// failing on the dead one for the client's lifetime.
+    #[tokio::test]
+    async fn fatal_producer_error_rebuilds_the_producer() {
+        use super::super::constants::MAX_PUBLISH_ATTEMPTS;
+
+        let (_mock, client) = client_on_a_mock_with(Some("orders")).await;
+        let publish = || {
+            client.publish_with_retry(
+                "orders",
+                None,
+                OwnedHeaders::new(),
+                b"{}",
+                MAX_PUBLISH_ATTEMPTS,
+                "test",
+            )
+        };
+        publish().await.expect("a healthy producer publishes");
+        let injected = {
+            let producer = client.producer().await.expect("the publish built it");
+            // SAFETY: the handle belongs to a live producer, held for the call.
+            unsafe {
+                rd_kafka_test_fatal_error(
+                    native_handle(&producer),
+                    RDKafkaRespErr::RD_KAFKA_RESP_ERR_OUT_OF_ORDER_SEQUENCE_NUMBER,
+                    c"injected by the test".as_ptr(),
+                )
+            }
+        };
+        assert_eq!(injected, RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR);
+
+        let err = publish()
+            .await
+            .expect_err("a fatal producer refuses the record");
+        assert!(
+            !err.is_retryable(),
+            "a fatal producer error reads as retryable: {err:?}"
+        );
+
+        publish()
+            .await
+            .expect("the next publish builds a new producer");
+        let producer = client.producer().await.expect("the rebuilt producer");
+        assert_eq!(
+            fatal_error_of(&producer),
+            None,
+            "the client still holds the dead producer"
+        );
     }
 
     /// TLS material librdkafka rejects fails `connect`, which builds the
@@ -2205,7 +2452,7 @@ mod tests {
         let refused = matches!(build_err, Some(ShoveError::Topology(_)));
         assert!(refused, "got {build_err:?}");
         assert!(
-            client.producer.get().is_none(),
+            client.producer.built().is_none(),
             "a failed build left a producer behind"
         );
     }
