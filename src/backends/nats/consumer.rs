@@ -1012,8 +1012,8 @@ enum Guarded<T> {
     TimedOut(Duration),
 }
 
-/// Runs `fut` in a child task, so a panic inside it ends that task and not the
-/// caller, and gives up on it after `timeout`. Records no metric.
+/// Runs `fut` in a child task, so a panic inside it ends that task while the
+/// caller carries on, and gives up on it after `timeout`. Records no metric.
 ///
 /// The child is aborted when the call times out and when the caller is
 /// dropped, as an aborted FIFO shard or DLQ drain is. A bare `JoinHandle` would
@@ -2405,11 +2405,11 @@ impl NatsConsumer {
         let ack_wait = derive_ack_wait(handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT));
         // `shove_message_size_bytes` labels a DLQ drain with the SOURCE topic,
         // not the DLQ stream name, and with the consumer group its options
-        // carry, never the internal `{dlq}-consumer` durable. Redis already
-        // drains its DLQ through `run_stream_loop`, which labels every metric
-        // `topology.queue()` whichever stream it reads; a DLQ name here would
-        // make `topic` mean two different things depending on the backend, and
-        // would stop a per-topic size profile summing across the main and DLQ
+        // carry. The internal `{dlq}-consumer` durable supplies no label. Redis
+        // already drains its DLQ through `run_stream_loop`, which labels every
+        // metric `topology.queue()` whichever stream it reads; a DLQ name here
+        // would make `topic` mean two different things depending on the backend,
+        // and would stop a per-topic size profile summing across the main and DLQ
         // paths. The DLQ drain stays distinguishable through the metrics that
         // exist to name it, not by overloading `topic`.
         let topic: Arc<str> = Arc::from(topology.queue());
@@ -3452,7 +3452,7 @@ mod worker_flow_tests {
         assert!(idle.as_mut().now_or_never().is_some());
     }
 
-    /// An exit waits for the tasks it leaves behind, but not past its bound.
+    /// An exit waits for the tasks it leaves behind, up to its bound.
     #[tokio::test(start_paused = true)]
     async fn an_exit_wait_gives_up_on_a_task_that_never_ends() {
         let busy = BusyTasks::new(Arc::new(AtomicBool::new(false)));

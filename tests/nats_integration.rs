@@ -7377,8 +7377,9 @@ async fn stop_dlq_drain(
 }
 
 /// The drain gates dead letters at the `max_message_size` its options carry,
-/// not at a fixed 10 MiB. An oversized letter is logged with its size and
-/// acked without reaching `handle_dead`, and the letter behind it is handled.
+/// which here is far below the 10 MiB default. An oversized letter is logged
+/// with its size and acked without reaching `handle_dead`, and the letter
+/// behind it is handled.
 #[tokio::test]
 async fn dlq_drain_honours_max_message_size() {
     use tracing::Level;
@@ -7755,9 +7756,9 @@ async fn delete_exit_drain_durable(client: &NatsClient) {
         .expect("the durable is deleted");
 }
 
-/// A consumer that leaves on a stream error does not leave its handlers
-/// behind. The error spends the only reconnect attempt, and the consumer
-/// returns it only once the handler that was running has finished.
+/// A consumer that leaves on a stream error waits for its handlers first. The
+/// error spends the only reconnect attempt, and the consumer returns it only
+/// once the handler that was running has finished.
 #[tokio::test]
 async fn stream_error_exit_waits_for_in_flight_handlers() {
     let tb = TestBroker::start().await;
