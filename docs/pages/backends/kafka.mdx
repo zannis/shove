@@ -444,17 +444,21 @@ A Kafka header key and value are bytes, and a producer may repeat a key.
 `MessageMetadata::headers` holds the headers whose key and value are both valid UTF-8, a repeated key keeping its last value, and leaves the rest out.
 A record carrying any other header still reaches the handler.
 Every copy a consumer publishes, a `Retry` or `Defer` republish and a dead letter, carries every header of the record byte for byte and in order, binary and null values, repeated keys and keys that are not UTF-8 included.
+librdkafka's API reads a key only up to its first NUL byte, so a key with an embedded NUL is cut there in the map and for any reader built on librdkafka.
 shove rewrites only the `Shove-*` headers it sets on the copy.
 
-A copy's `Shove-Message-Id`, which the handler reads as `delivery_id`, is the id the record was first published under plus one suffix for the hop:
+A copy carries its record's base id in `Shove-Base-Message-Id`.
+The base is the `Shove-Base-Message-Id` of a record that is itself a copy, the record's own `Shove-Message-Id` otherwise, and `{topic}-{partition}-{offset}` for a record that carries neither, so two records without an id never share a base.
+The copy's `Shove-Message-Id`, which the handler reads as `delivery_id`, is that base plus one suffix for the hop:
 
 | Copy | Suffix | The id is |
 |---|---|---|
 | `Retry` republish | `-r<attempt>` | the same for the same attempt |
 | `Defer` republish | `-d<uuid>` | new on every hop |
-| Dead letter | `-dlq` | the same for the same record |
+| Dead letter | `-dlq<death count>` | new on every death of the record |
 
-A later copy replaces the suffix instead of adding one, so the id stays one suffix longer than the one the record was published with, however many hops the record makes.
+A later copy replaces the suffix, so the id stays one suffix longer than the base however many hops the record makes.
+shove reads nothing from the shape of an id: a record whose own id ends in `-r7` or `-dlq` is a base like any other.
 
 ## Sequenced delivery
 

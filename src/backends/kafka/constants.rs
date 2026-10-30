@@ -22,6 +22,9 @@ pub(super) const DEATH_REASON_HEADER: &str = "Shove-Death-Reason";
 pub(super) const ORIGINAL_QUEUE_HEADER: &str = "Shove-Original-Queue";
 pub(super) const DEATH_COUNT_HEADER: &str = "Shove-Death-Count";
 pub(super) const MESSAGE_ID_HEADER: &str = "Shove-Message-Id";
+/// The id every copy of a record extends; a copy carries it beside its own
+/// `MESSAGE_ID_HEADER`.
+pub(super) const BASE_MESSAGE_ID_HEADER: &str = "Shove-Base-Message-Id";
 
 /// The keys above NUL-terminated, the form librdkafka's
 /// `rd_kafka_header_remove` takes. `c_header_keys_match_their_str_twins`
@@ -31,6 +34,7 @@ pub(super) const DEATH_REASON_KEY: &CStr = c"Shove-Death-Reason";
 pub(super) const ORIGINAL_QUEUE_KEY: &CStr = c"Shove-Original-Queue";
 pub(super) const DEATH_COUNT_KEY: &CStr = c"Shove-Death-Count";
 pub(super) const MESSAGE_ID_KEY: &CStr = c"Shove-Message-Id";
+pub(super) const BASE_MESSAGE_ID_KEY: &CStr = c"Shove-Base-Message-Id";
 
 // ---------------------------------------------------------------------------
 // Group ID derivations
@@ -317,6 +321,7 @@ mod tests {
             (ORIGINAL_QUEUE_KEY, ORIGINAL_QUEUE_HEADER),
             (DEATH_COUNT_KEY, DEATH_COUNT_HEADER),
             (MESSAGE_ID_KEY, MESSAGE_ID_HEADER),
+            (BASE_MESSAGE_ID_KEY, BASE_MESSAGE_ID_HEADER),
         ] {
             assert_eq!(c_key.to_bytes(), key.as_bytes());
         }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::CStr;
 use std::future::Future;
@@ -25,7 +26,6 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use uuid::fmt::Hyphenated;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backend::batch_consumer::settling::{
@@ -79,10 +79,11 @@ use super::client::KafkaClient;
 #[cfg(feature = "kafka-schema-registry")]
 use super::constants::REGISTRY_RETRY_DELAY;
 use super::constants::{
-    DEATH_COUNT_HEADER, DEATH_COUNT_KEY, DEATH_REASON_HEADER, DEATH_REASON_KEY, FETCH_MIN_BYTES,
-    FETCH_WAIT_MAX_MS, MAX_POLL_INTERVAL_MS, MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER,
-    MESSAGE_ID_KEY, ORIGINAL_QUEUE_HEADER, ORIGINAL_QUEUE_KEY, PENDING_COMMIT_BUDGET,
-    RETRY_COUNT_HEADER, RETRY_COUNT_KEY, SESSION_TIMEOUT_MS, SHUTDOWN_COMMIT_DEADLINE,
+    BASE_MESSAGE_ID_HEADER, BASE_MESSAGE_ID_KEY, DEATH_COUNT_HEADER, DEATH_COUNT_KEY,
+    DEATH_REASON_HEADER, DEATH_REASON_KEY, FETCH_MIN_BYTES, FETCH_WAIT_MAX_MS,
+    MAX_POLL_INTERVAL_MS, MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER, MESSAGE_ID_KEY,
+    ORIGINAL_QUEUE_HEADER, ORIGINAL_QUEUE_KEY, PENDING_COMMIT_BUDGET, RETRY_COUNT_HEADER,
+    RETRY_COUNT_KEY, SESSION_TIMEOUT_MS, SHUTDOWN_COMMIT_DEADLINE,
 };
 use super::consumer_group::{CommitPolicy, KafkaAutoOffsetReset};
 use super::offset_reset::target_from_timestamp_lookup;
@@ -863,8 +864,9 @@ impl CoveredDiscard {
 ///
 /// Read through librdkafka's C API from the message itself: rdkafka's
 /// `Headers` accessors unwrap every key as UTF-8, and the protocol lets a
-/// producer send any bytes there. A header block librdkafka cannot parse
-/// reads as no headers, as rdkafka's own `headers()` reads it.
+/// producer send any bytes there. librdkafka reports a key up to its first
+/// NUL byte. A header block librdkafka cannot parse reads as no headers, as
+/// rdkafka's own `headers()` reads it.
 fn extract_string_headers(msg: &BorrowedMessage<'_>) -> Arc<HashMap<String, String>> {
     let mut out = HashMap::new();
     let mut list = std::ptr::null_mut();
@@ -911,10 +913,13 @@ fn extract_string_headers(msg: &BorrowedMessage<'_>) -> Arc<HashMap<String, Stri
 /// byte: a republished or dead-lettered copy is built from it, so the copy
 /// keeps every header the record carried, in order, binary and null values,
 /// repeated keys and keys that are not UTF-8 included. `None` when the record
-/// carries no headers.
+/// carries no headers. `partition` and `offset` name a record that carries
+/// no id, see [`base_message_id`](Self::base_message_id).
 struct RecordHeaders {
     strings: Arc<HashMap<String, String>>,
     wire: Option<OwnedHeaders>,
+    partition: i32,
+    offset: i64,
 }
 
 impl RecordHeaders {
@@ -927,14 +932,25 @@ impl RecordHeaders {
         Self {
             strings,
             wire: msg.headers().map(BorrowedHeaders::detach),
+            partition: msg.partition(),
+            offset: msg.offset(),
         }
     }
 
-    /// The record's `Shove-Message-Id`, empty when it carries none.
-    fn message_id(&self) -> &str {
-        self.strings
-            .get(MESSAGE_ID_HEADER)
-            .map_or("", String::as_str)
+    /// The id every copy of the record on `topic` extends: the base a copy
+    /// carries in `Shove-Base-Message-Id`, else the record's own
+    /// `Shove-Message-Id`, else the record's position,
+    /// `{topic}-{partition}-{offset}`, so two records that carry no id never
+    /// share one. An empty header counts as absent, and nothing is read from
+    /// the shape of an id.
+    fn base_message_id(&self, topic: &str) -> Cow<'_, str> {
+        [BASE_MESSAGE_ID_HEADER, MESSAGE_ID_HEADER]
+            .into_iter()
+            .find_map(|key| self.strings.get(key).filter(|id| !id.is_empty()))
+            .map_or_else(
+                || Cow::Owned(format!("{topic}-{}-{}", self.partition, self.offset)),
+                |id| Cow::Borrowed(id.as_str()),
+            )
     }
 
     /// Every header of the record minus each `rewritten` key: the headers of
@@ -1042,77 +1058,59 @@ fn build_dead_metadata(
 // Header building helpers
 // ---------------------------------------------------------------------------
 
-const RETRY_ID_SUFFIX: &str = "-r";
-const DEFER_ID_SUFFIX: &str = "-d";
-const DEAD_LETTER_ID_SUFFIX: &str = "-dlq";
-/// `DEFER_ID_SUFFIX` and the hyphenated UUID after it.
-const DEFER_ID_SUFFIX_LEN: usize = DEFER_ID_SUFFIX.len() + Hyphenated::LENGTH;
-
-/// The id of the copy a `Retry` republishes as `attempt`: the same for the
-/// same attempt, so a republish repeated for one attempt carries one id.
-fn retry_message_id(original: &str, attempt: u32) -> String {
-    format!("{}{RETRY_ID_SUFFIX}{attempt}", base_message_id(original))
+/// The hop a copy of a record makes, which names the suffix of the copy's
+/// `Shove-Message-Id`.
+enum Hop {
+    /// A `Retry` republish as this attempt.
+    Retry(u32),
+    /// A `Defer` republish.
+    Defer,
+    /// A dead letter with this death count.
+    DeadLetter(u32),
 }
 
-/// The id of the copy a `Defer` republishes: a defer spends no attempt, so a
-/// fresh UUID tells its hops apart.
-fn defer_message_id(original: &str) -> String {
-    let mut buf = Uuid::encode_buffer();
-    let uuid = Uuid::new_v4().hyphenated().encode_lower(&mut buf);
-    format!("{}{DEFER_ID_SUFFIX}{uuid}", base_message_id(original))
-}
-
-fn dead_letter_message_id(original: &str) -> String {
-    format!("{}{DEAD_LETTER_ID_SUFFIX}", base_message_id(original))
-}
-
-/// `id` without the one suffix a copy adds, or `id` itself when it carries
-/// none.
-///
-/// A copy's `Shove-Message-Id` is the id the record was first published
-/// under, its base, plus one suffix for the hop the copy makes. A copy of a
-/// copy replaces the suffix instead of adding one, so the id stays one suffix
-/// longer than its base however many hops the record makes.
-fn base_message_id(id: &str) -> &str {
-    if let Some(base) = id.strip_suffix(DEAD_LETTER_ID_SUFFIX) {
-        return base;
+/// A copy's `Shove-Message-Id`: its record's base and one suffix for the
+/// hop. A retry's id is the same for the same attempt, so a republish
+/// repeated for one attempt carries one id; a defer spends no attempt, so a
+/// fresh UUID tells its hops apart; a dead letter's carries its death count,
+/// so each death of a record has its own. The base comes from the record, so
+/// a later copy replaces the suffix and the id stays one suffix longer than
+/// the base however many hops the record makes.
+fn copy_message_id(base: &str, hop: Hop) -> String {
+    match hop {
+        Hop::Retry(attempt) => format!("{base}-r{attempt}"),
+        Hop::Defer => {
+            let mut buf = Uuid::encode_buffer();
+            let uuid = Uuid::new_v4().hyphenated().encode_lower(&mut buf);
+            format!("{base}-d{uuid}")
+        }
+        Hop::DeadLetter(death_count) => format!("{base}-dlq{death_count}"),
     }
-    if let Some((base, attempt)) = id.rsplit_once(RETRY_ID_SUFFIX)
-        && !attempt.is_empty()
-        && attempt.bytes().all(|b| b.is_ascii_digit())
-    {
-        return base;
-    }
-    if let Some((base, hop)) = id
-        .len()
-        .checked_sub(DEFER_ID_SUFFIX_LEN)
-        .and_then(|at| id.split_at_checked(at))
-        && hop
-            .strip_prefix(DEFER_ID_SUFFIX)
-            .is_some_and(|uuid| Uuid::try_parse(uuid).is_ok())
-    {
-        return base;
-    }
-    id
 }
 
-/// The headers of a `Retry` or `Defer` republish of `original`: every header
-/// the record carried, byte for byte and in order, with shove's retry count
-/// and message id rewritten.
+/// The headers of a `Retry` or `Defer` republish of `original` into
+/// `topic`: every header the record carried, byte for byte and in order,
+/// with shove's retry count, base id and message id rewritten.
 fn headers_with_retry_count(
     original: &RecordHeaders,
+    topic: &str,
     retry_count: u32,
-    message_id: &str,
+    hop: Hop,
 ) -> OwnedHeaders {
+    let base = original.base_message_id(topic);
     original
-        .copy_without(&[RETRY_COUNT_KEY, MESSAGE_ID_KEY])
+        .copy_without(&[RETRY_COUNT_KEY, BASE_MESSAGE_ID_KEY, MESSAGE_ID_KEY])
         .insert(Header {
             key: RETRY_COUNT_HEADER,
             value: Some(retry_count.to_string().as_bytes()),
         })
         .insert(Header {
+            key: BASE_MESSAGE_ID_HEADER,
+            value: Some(base.as_bytes()),
+        })
+        .insert(Header {
             key: MESSAGE_ID_HEADER,
-            value: Some(message_id.as_bytes()),
+            value: Some(copy_message_id(&base, hop).as_bytes()),
         })
 }
 
@@ -1137,11 +1135,13 @@ fn headers_for_dlq(
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0)
         .saturating_add(1);
+    let base = original.base_message_id(original_queue);
     original
         .copy_without(&[
             DEATH_REASON_KEY,
             ORIGINAL_QUEUE_KEY,
             DEATH_COUNT_KEY,
+            BASE_MESSAGE_ID_KEY,
             MESSAGE_ID_KEY,
             RETRY_COUNT_KEY,
         ])
@@ -1162,8 +1162,12 @@ fn headers_for_dlq(
             value: Some(death_count.to_string().as_bytes()),
         })
         .insert(Header {
+            key: BASE_MESSAGE_ID_HEADER,
+            value: Some(base.as_bytes()),
+        })
+        .insert(Header {
             key: MESSAGE_ID_HEADER,
-            value: Some(dead_letter_message_id(original.message_id()).as_bytes()),
+            value: Some(copy_message_id(&base, Hop::DeadLetter(death_count)).as_bytes()),
         })
 }
 
@@ -2050,11 +2054,8 @@ async fn route_outcome(
                 hold_queues[idx].delay()
             };
 
-            let retry_headers = headers_with_retry_count(
-                headers,
-                new_count,
-                &retry_message_id(headers.message_id(), new_count),
-            );
+            let retry_headers =
+                headers_with_retry_count(headers, topic, new_count, Hop::Retry(new_count));
 
             (
                 run_delayed_republish(
@@ -2082,11 +2083,7 @@ async fn route_outcome(
             };
 
             // Defer does NOT increment retry count.
-            let defer_headers = headers_with_retry_count(
-                headers,
-                retry_count,
-                &defer_message_id(headers.message_id()),
-            );
+            let defer_headers = headers_with_retry_count(headers, topic, retry_count, Hop::Defer);
 
             (
                 run_delayed_republish(
@@ -10495,6 +10492,8 @@ mod batch_buffer_tests {
             headers: RecordHeaders {
                 strings: Arc::new(HashMap::new()),
                 wire: None,
+                partition: 0,
+                offset: 0,
             },
         }
     }
@@ -12872,51 +12871,51 @@ mod reconnect_tests {
     }
 }
 
-/// A copy's `Shove-Message-Id`: its base plus one suffix, whatever hops came
-/// before it.
+/// A copy's `Shove-Message-Id`: its record's base and one suffix for the hop.
 #[cfg(test)]
 mod message_id_tests {
     use super::*;
 
-    const BASE: &str = "0b9c0d5e-5d2a-4a59-8c1e-3f7a6f1e2d4c";
-
-    #[test]
-    fn every_copy_replaces_the_suffix_of_the_copy_before_it() {
-        for original in [
-            BASE.to_string(),
-            retry_message_id(BASE, 1),
-            defer_message_id(BASE),
-            dead_letter_message_id(BASE),
-        ] {
-            assert_eq!(base_message_id(&original), BASE, "{original}");
-            assert_eq!(retry_message_id(&original, 2), format!("{BASE}-r2"));
-            assert_eq!(dead_letter_message_id(&original), format!("{BASE}-dlq"));
-            let deferred = defer_message_id(&original);
-            assert_eq!(base_message_id(&deferred), BASE, "{deferred}");
-            assert_eq!(deferred.len(), BASE.len() + DEFER_ID_SUFFIX_LEN);
+    fn record(headers: &[(&str, &str)]) -> RecordHeaders {
+        RecordHeaders {
+            strings: Arc::new(
+                headers
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            ),
+            wire: None,
+            partition: 3,
+            offset: 17,
         }
     }
 
     #[test]
-    fn a_defer_copy_id_is_new_on_every_hop() {
-        assert_ne!(defer_message_id(BASE), defer_message_id(BASE));
+    fn the_base_is_the_carried_base_then_the_record_id_then_the_position() {
+        let carried = record(&[
+            (BASE_MESSAGE_ID_HEADER, "inv-r7"),
+            (MESSAGE_ID_HEADER, "inv-r7-r1"),
+        ]);
+        assert_eq!(carried.base_message_id("orders"), "inv-r7");
+        let original = record(&[(MESSAGE_ID_HEADER, "inv-r7")]);
+        assert_eq!(original.base_message_id("orders"), "inv-r7");
+        assert_eq!(record(&[]).base_message_id("orders"), "orders-3-17");
+        let empty = record(&[(BASE_MESSAGE_ID_HEADER, ""), (MESSAGE_ID_HEADER, "")]);
+        assert_eq!(empty.base_message_id("orders"), "orders-3-17");
     }
 
     #[test]
-    fn an_id_without_a_copy_suffix_is_its_own_base() {
-        // The last one's 38th byte from the end falls inside the `é`.
-        let split_inside_a_char = format!("é{}", "x".repeat(37));
-        for id in [
-            "",
-            "-r",
-            "order-r",
-            "order-r1x",
-            "order-d",
-            "order-dlqx",
-            "é-r",
-            split_inside_a_char.as_str(),
-        ] {
-            assert_eq!(base_message_id(id), id);
-        }
+    fn a_copy_id_is_its_base_and_one_suffix_for_the_hop() {
+        assert_eq!(copy_message_id("inv-r7", Hop::Retry(1)), "inv-r7-r1");
+        assert_eq!(copy_message_id("a-dlq", Hop::DeadLetter(1)), "a-dlq-dlq1");
+        assert_eq!(copy_message_id("a", Hop::DeadLetter(2)), "a-dlq2");
+        let deferred = copy_message_id("a", Hop::Defer);
+        assert!(
+            deferred
+                .strip_prefix("a-d")
+                .is_some_and(|uuid| Uuid::try_parse(uuid).is_ok()),
+            "{deferred}"
+        );
+        assert_ne!(deferred, copy_message_id("a", Hop::Defer));
     }
 }

@@ -78,6 +78,9 @@ const SEQUENCED_DLQ: &str = "kafka-headers-sequenced-dlq";
 const BATCH_TOPIC: &str = "kafka-headers-batch";
 const BATCH_DLQ: &str = "kafka-headers-batch-dlq";
 const BROADCAST_TOPIC: &str = "kafka-headers-broadcast";
+const RETRY_ID_TOPIC: &str = "kafka-headers-retry-ids";
+const DEAD_ID_TOPIC: &str = "kafka-headers-dead-letter-ids";
+const DEAD_ID_DLQ: &str = "kafka-headers-dead-letter-ids-dlq";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct Order {
@@ -129,6 +132,18 @@ shove::define_topic!(
     BroadcastTopic,
     Order,
     TopologyBuilder::new(BROADCAST_TOPIC).broadcast().build()
+);
+shove::define_topic!(
+    RetryIdTopic,
+    Order,
+    TopologyBuilder::new(RETRY_ID_TOPIC)
+        .hold_queue(HOLD)
+        .build()
+);
+shove::define_topic!(
+    DeadIdTopic,
+    Order,
+    TopologyBuilder::new(DEAD_ID_TOPIC).dlq().build()
 );
 
 /// One delivery as the handler saw it.
@@ -502,6 +517,14 @@ fn values_of(headers: &[WireHeader], key: &str) -> Vec<Option<Vec<u8>>> {
         .collect()
 }
 
+/// The value of every `key` header in `headers`, in order, as text.
+fn texts_of(headers: &[WireHeader], key: &str) -> Vec<String> {
+    values_of(headers, key)
+        .into_iter()
+        .map(|value| String::from_utf8_lossy(&value.unwrap_or_default()).into_owned())
+        .collect()
+}
+
 /// A header key that is not UTF-8 reaches the receive loop as bytes: the
 /// record is handed to the handler once, with only the headers whose key and
 /// value are both UTF-8, and the consumer goes on to the record behind it.
@@ -603,9 +626,9 @@ async fn retry_copy_preserves_binary_and_duplicate_headers() {
     );
 }
 
-/// Each `Defer` republishes a copy whose `Shove-Message-Id` replaces the
-/// previous hop's suffix instead of adding to it, so twenty defers leave the
-/// publisher's id and one suffix, and every hop's id is new.
+/// Each `Defer` republishes a copy whose `Shove-Message-Id` is the
+/// publisher's id, carried as the copy's base, and one suffix: twenty defers
+/// leave the id one suffix long, and every hop's id is new.
 #[tokio::test]
 async fn message_id_length_is_bounded_across_defers() {
     const DEFERS: usize = 20;
@@ -640,13 +663,19 @@ async fn message_id_length_is_bounded_across_defers() {
     consumer.stop().await;
     publisher.close().await;
 
-    let ids: Vec<String> = handler
-        .deliveries()
-        .into_iter()
-        .map(|d| d.metadata.delivery_id)
+    let deliveries = handler.deliveries();
+    let ids: Vec<String> = deliveries
+        .iter()
+        .map(|d| d.metadata.delivery_id.clone())
         .collect();
     assert_eq!(ids.len(), DEFERS + 1, "the acked copy is delivered once");
     let base = &ids[0];
+    assert!(
+        deliveries[1..]
+            .iter()
+            .all(|d| { d.metadata.headers.get("Shove-Base-Message-Id") == Some(base) }),
+        "every copy carries the publisher's id as its base"
+    );
     let last = &ids[DEFERS];
     assert!(
         last.len() <= base.len() + 40,
@@ -719,7 +748,8 @@ async fn dead_letter_carries_every_header_byte_for_byte() {
         "the dead letter carries the original's headers byte for byte and in order: {headers:?}"
     );
     for (key, value) in [
-        ("Shove-Message-Id", &b"m-1-dlq"[..]),
+        ("Shove-Message-Id", &b"m-1-dlq1"[..]),
+        ("Shove-Base-Message-Id", b"m-1"),
         ("Shove-Retry-Count", b"0"),
         ("Shove-Death-Count", b"1"),
         ("Shove-Death-Reason", b"rejected"),
@@ -771,7 +801,7 @@ async fn dead_letter_carries_every_header_byte_for_byte() {
         .map(|id| String::from_utf8(id).expect("a UTF-8 message id"))
         .collect::<Vec<_>>();
     assert_eq!(
-        [metadata.message.delivery_id.clone()],
+        std::slice::from_ref(&metadata.message.delivery_id),
         dead_letter_id.as_slice(),
         "the drain reads the dead letter's own id"
     );
@@ -960,5 +990,176 @@ async fn broadcast_subscriber_survives_a_non_utf8_header_key() {
         *handler.deliveries()[0].metadata.headers,
         hostile_headers_as_strings(),
         "the handler sees only the header whose key and value are UTF-8"
+    );
+}
+
+/// Records whose ids look like retry copies of one record, and two records
+/// that carry no id, retry into copies whose ids are their own: each copy's
+/// id is its record's base and the attempt, the base carried beside it.
+#[tokio::test]
+async fn retry_copies_of_distinct_records_never_share_an_id() {
+    let mock = Mock::start(&[RETRY_ID_TOPIC]);
+    let bootstrap = mock.bootstrap();
+    for id in ["inv-r7", "inv-r8"] {
+        produce(
+            &bootstrap,
+            RETRY_ID_TOPIC,
+            id,
+            &[(b"Shove-Message-Id", Some(id.as_bytes()))],
+        )
+        .await;
+    }
+    for id in ["foreign-2", "foreign-3"] {
+        produce(&bootstrap, RETRY_ID_TOPIC, id, &[]).await;
+    }
+
+    let handler = Recorder::new(|_, metadata| {
+        if metadata.retry_count == 0 {
+            Outcome::Retry
+        } else {
+            Outcome::Ack
+        }
+    });
+    let consumer = Running::start::<RetryIdTopic>(&bootstrap, &handler).await;
+    consumer
+        .wait_until(
+            || handler.count() == 8,
+            "every retry copy reaching the handler",
+        )
+        .await;
+    tokio::time::sleep(SETTLE).await;
+    consumer.stop().await;
+
+    let mut copies: Vec<(String, String, Option<String>)> = handler
+        .deliveries()
+        .into_iter()
+        .filter(|d| d.metadata.retry_count == 1)
+        .map(|d| {
+            let base = d.metadata.headers.get("Shove-Base-Message-Id").cloned();
+            (d.id, d.metadata.delivery_id, base)
+        })
+        .collect();
+    copies.sort();
+    let foreign_base = |offset: u8| format!("{RETRY_ID_TOPIC}-0-{offset}");
+    assert_eq!(
+        copies,
+        [
+            (
+                "foreign-2".to_string(),
+                format!("{}-r1", foreign_base(2)),
+                Some(foreign_base(2)),
+            ),
+            (
+                "foreign-3".to_string(),
+                format!("{}-r1", foreign_base(3)),
+                Some(foreign_base(3)),
+            ),
+            (
+                "inv-r7".to_string(),
+                "inv-r7-r1".to_string(),
+                Some("inv-r7".to_string()),
+            ),
+            (
+                "inv-r8".to_string(),
+                "inv-r8-r1".to_string(),
+                Some("inv-r8".to_string()),
+            ),
+        ],
+        "each record's retry copy is named after its own base"
+    );
+}
+
+/// Records whose ids look like dead letters of one record, and two records
+/// that carry no id, dead-letter under ids of their own, and a dead letter
+/// replayed with its headers dies again under a new one: each dead letter's
+/// id is its record's base and its death count, the base carried beside it.
+#[tokio::test]
+async fn dead_letters_of_distinct_records_and_deaths_never_share_an_id() {
+    let mock = Mock::start(&[DEAD_ID_TOPIC, DEAD_ID_DLQ]);
+    let bootstrap = mock.bootstrap();
+    for id in ["a", "a-dlq"] {
+        produce(
+            &bootstrap,
+            DEAD_ID_TOPIC,
+            id,
+            &[(b"Shove-Message-Id", Some(id.as_bytes()))],
+        )
+        .await;
+    }
+    for id in ["foreign-2", "foreign-3"] {
+        produce(&bootstrap, DEAD_ID_TOPIC, id, &[]).await;
+    }
+
+    let handler = Recorder::new(|_, _| Outcome::Reject);
+    let consumer = Running::start::<DeadIdTopic>(&bootstrap, &handler).await;
+    let first_deaths = read_topic(&bootstrap, DEAD_ID_DLQ, 4).await;
+    let dead_a = first_deaths
+        .iter()
+        .find(|record| record.key == "a")
+        .expect("the dead letter of a");
+    let replayed_headers: Vec<(&[u8], Option<&[u8]>)> = dead_a
+        .headers
+        .iter()
+        .map(|(key, value)| (key.as_slice(), value.as_deref()))
+        .collect();
+    produce_record(
+        &bootstrap,
+        DEAD_ID_TOPIC,
+        "a-replayed",
+        &dead_a.payload,
+        &replayed_headers,
+    )
+    .await;
+    let dead = read_topic(&bootstrap, DEAD_ID_DLQ, 5).await;
+    consumer.stop().await;
+
+    let mut ids: Vec<(String, Vec<String>)> = dead
+        .iter()
+        .map(|record| {
+            (
+                record.key.clone(),
+                texts_of(&record.headers, "Shove-Message-Id"),
+            )
+        })
+        .collect();
+    ids.sort();
+    let foreign_base = |offset: u8| format!("{DEAD_ID_TOPIC}-0-{offset}");
+    assert_eq!(
+        ids,
+        [
+            ("a".to_string(), vec!["a-dlq1".to_string()]),
+            ("a-dlq".to_string(), vec!["a-dlq-dlq1".to_string()]),
+            ("a-replayed".to_string(), vec!["a-dlq2".to_string()]),
+            (
+                "foreign-2".to_string(),
+                vec![format!("{}-dlq1", foreign_base(2))]
+            ),
+            (
+                "foreign-3".to_string(),
+                vec![format!("{}-dlq1", foreign_base(3))]
+            ),
+        ],
+        "each dead letter is named after its own base and death"
+    );
+    let mut bases: Vec<(String, Vec<String>)> = dead
+        .iter()
+        .map(|record| {
+            (
+                record.key.clone(),
+                texts_of(&record.headers, "Shove-Base-Message-Id"),
+            )
+        })
+        .collect();
+    bases.sort();
+    assert_eq!(
+        bases,
+        [
+            ("a".to_string(), vec!["a".to_string()]),
+            ("a-dlq".to_string(), vec!["a-dlq".to_string()]),
+            ("a-replayed".to_string(), vec!["a".to_string()]),
+            ("foreign-2".to_string(), vec![foreign_base(2)]),
+            ("foreign-3".to_string(), vec![foreign_base(3)]),
+        ],
+        "each dead letter carries its base once"
     );
 }

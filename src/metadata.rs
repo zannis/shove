@@ -183,10 +183,11 @@ pub struct MessageMetadata {
     ///
     /// On Kafka a header key and value are bytes, and a record may repeat a
     /// key. The map holds the headers whose key and value are both valid
-    /// UTF-8, a repeated key keeping its last value, and leaves the rest out.
-    /// A copy the consumer publishes, a retry or defer republish or a dead
-    /// letter, still carries every header of the record byte for byte and in
-    /// order.
+    /// UTF-8, a repeated key keeping its last value, and leaves the rest out;
+    /// librdkafka reads a key only up to its first NUL byte, so a key with an
+    /// embedded NUL is cut there. A copy the consumer publishes, a retry or
+    /// defer republish or a dead letter, still carries every header of the
+    /// record byte for byte and in order.
     ///
     /// ## Deduplication (`x-message-id`, RabbitMQ)
     ///
