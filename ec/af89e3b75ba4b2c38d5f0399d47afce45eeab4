@@ -1,0 +1,39 @@
+docs/pages/backends/nats.mdx
+  s_1001dc3147e1e5::t_dfa5751bd62833 105
+  s_1001dc3147e1e5::t_808c587ca6c6e1 96-104,106-110
+docs/pages/concepts/outcomes.mdx
+  s_1001dc3147e1e5::t_9e947757f20876 85
+  s_1001dc3147e1e5::t_c01c66174abe16 62
+  s_1001dc3147e1e5::t_ed1dd4e05c8b43 40-61,63-64
+src/outcome.rs
+  s_1001dc3147e1e5::t_2d546d33907872 50-52
+  s_1001dc3147e1e5::t_af40b2cf46c6c1 92-93
+  s_1001dc3147e1e5::t_c063bb0ece0eec 94-96
+  s_1001dc3147e1e5::t_2ed53bed512fe3 31-33
+  s_1001dc3147e1e5::t_d2e66e50818867 4-30
+  s_1001dc3147e1e5::t_9e788c886c3ab9 49
+docs/pages/backends/kafka.mdx
+  s_1001dc3147e1e5::t_fefedabe66a4c1 115
+  s_1001dc3147e1e5::t_555b30d85a0284 106-114,116-120
+docs/pages/guides/retries.mdx
+  s_1001dc3147e1e5::t_e44ccd141436da 57,59
+  s_1001dc3147e1e5::t_ea81191eb08fab 135
+docs/pages/concepts/handlers.mdx
+  s_1001dc3147e1e5::t_86aa8e178297f3 148
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ecaf89e3b75ba4b2c38d5f0399d47afce45eeab4",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
