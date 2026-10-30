@@ -551,9 +551,11 @@ See [Retries in place](#retries-in-place).
 
 A republish that fails and may succeed later ends the member with a connection error, under either commit policy.
 Nothing is committed past the record meanwhile, and the reconnect resumes from the committed position, so the record is redelivered.
-A copy that can never be published is dead-lettered instead, with the death reason `republish_failed`.
-That is a copy past the producer's `message.max.bytes`, librdkafka's 1 MB default, or one the broker refuses as too large for the topic or as invalid.
-It counts once in `shove_messages_failed_total{reason="republish_failed"}`.
+A failure no retry gets past, such as a producer that cannot be built, ends the member with that error instead, and it does not reconnect.
+A copy the broker refuses as too large for the topic or as invalid can never be published, so the record is dead-lettered instead, with the death reason `republish_failed`.
+A copy past the producer's `message.max.bytes`, librdkafka's 1 MB default, can never be published either, and neither can its dead letter, which the same producer refuses.
+That record is discarded and committed, an error is logged, and `messages_discarded_total` counts it under `republish_failed`.
+Either way the failed copy counts once per delivery in `shove_messages_failed_total{reason="republish_failed"}`.
 A revoke of the record's partition during the delay ends it with nothing published.
 The partition's next owner is handed the record again from the committed offset.
 
@@ -700,7 +702,11 @@ What that means for replay:
 A dead letter that fails and may land later commits nothing.
 The member ends with a connection error under either commit policy, reconnects, and is handed the record again, so the handler sees it again and no discard is counted.
 The same holds for a record dropped before the handler, oversize or undecodable.
-A dead letter that can never be published is the one exception: one past the producer's `message.max.bytes`, or one the broker refuses as too large or as invalid.
+Each such failure, of a dead letter or of a republish, costs a reconnect: the member leaves its group and joins it again, which rebalances the group.
+A reconnect counts against `max_reconnect_attempts` like any connection error, and the count resets only after a connection that lasted a minute.
+With a limit set, a DLQ that stays unwritable therefore ends the consumer once the limit is spent; with the default, no limit, the consumer keeps reconnecting under its backoff.
+A failure no retry gets past, such as a producer that cannot be built, ends the member with that error at once.
+A dead letter that can never be published is the one exception that discards: one past the producer's `message.max.bytes`, or one the broker refuses as too large or as invalid.
 The record is discarded and committed, an error is logged, and `messages_discarded_total` counts it.
 
 ## Schema Registry

@@ -257,6 +257,12 @@ pub struct ConsumerOptions<B: Backend> {
     /// finite value in environments where a permanently-unreachable broker
     /// should be surfaced rather than silently spinning.
     ///
+    /// On Kafka a `Retry`/`Defer` republish or a dead letter that fails and
+    /// may succeed later reconnects the member too, which leaves the group and
+    /// joins it again, and that reconnect counts here. With a finite value a
+    /// DLQ that stays unwritable therefore ends the consumer once the value is
+    /// spent; the count resets after a connection that lasted a minute.
+    ///
     /// # Example
     ///
     /// ```ignore

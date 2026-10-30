@@ -94,7 +94,7 @@ shove::metrics::set_prefix("billing_shove");
   | `max_retries_exceeded` | Retries exhausted, message dead-lettered | all |
   | `rejected` | Handler returned `Reject` | all |
   | `sequence_timeout` | A sequence key sat in `AwaitingRetry` past `hold_queue_timeout`, so the messages buffered behind it were dead-lettered to unblock the key. Deliberately separate from `timeout`, which is a handler-latency problem, not a stuck-ordering-key one | RabbitMQ |
-  | `republish_failed` | A `Retry` or `Defer` copy can never be published, too large for the producer or the broker or invalid to the broker, so the message was dead-lettered under that death reason | Kafka |
+  | `republish_failed` | A `Retry` or `Defer` copy can never be published, too large for the producer or the broker or invalid to the broker, so the message was dead-lettered under that death reason, or discarded when its dead letter could not be published either. Counted once per delivery | Kafka |
 
   Everything above `timeout` happens *before* the handler runs; `timeout`, `max_retries_exceeded`, `rejected` and `republish_failed` are emitted after it runs. `sequence_timeout` is the odd one out: those messages never reach the handler either, but they are retired by an ordering decision rather than by anything about the message itself.
 
