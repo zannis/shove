@@ -2540,7 +2540,8 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 ///   instead, see below.
 /// - `Resolve` (`__RESOLVE`): a broker's name did not resolve. The same
 ///   `rd_kafka_broker_fail`, and the next attempt resolves the name again
-///   (`rdkafka_broker.c:1127-1139`).
+///   (`rdkafka_broker.c:1127-1139`). `gate` reads it as it reads a
+///   `__TRANSPORT`.
 /// - `AllBrokersDown` (`__ALL_BROKERS_DOWN`): every broker is down at once.
 ///   It is raised once per outage, while librdkafka re-bootstraps and every
 ///   broker keeps reconnecting (`rdkafka_broker.c:369-388`).
@@ -2550,9 +2551,11 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 /// (`rdkafka_broker.c:555-612`), so a bounce logs a handful of lines and the
 /// warning needs no rate limit of its own.
 ///
-/// A committed-offset fetch can report `__TRANSPORT` as well. librdkafka
-/// retries the fetch through failed connections, with no deadline, for as
-/// long as the assignment it was sent for stands
+/// A committed-offset fetch can report `__TRANSPORT` or `__RESOLVE` as well:
+/// a broker that fails its connection, or cannot resolve its name, fails the
+/// requests queued for it with that code (`rdkafka_broker.c:698-707`,
+/// `:1136-1138`). librdkafka retries the fetch through such failures, with
+/// no deadline, for as long as the assignment it was sent for stands
 /// (`rdkafka_assignment.c:261-262`, `:588`, `rdkafka_request.c:1595`), so
 /// that error reaches `recv()` only once an assign or revoke has changed the
 /// assignment under the fetch. Its partitions then stay unfetched, and so
@@ -2560,15 +2563,16 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 /// (`rdkafka_assignment.c:283-298`, `:459-461`); the member keeps
 /// heartbeating, so the group never moves them. The code alone cannot tell
 /// that error from a broker failure, so [`TransportGate`] ends the loop on
-/// a `__TRANSPORT` that may be one: a `__TRANSPORT` within
+/// a `__TRANSPORT` or `__RESOLVE` that may be one: one within
 /// `socket.timeout.ms` of an assign or revoke that itself landed within
 /// `socket.timeout.ms` of an earlier assign, or of a ridden-out
-/// `__TRANSPORT`, because a fetch may have been pending when that change
-/// landed. The reconnect fetches the committed offsets again. The gate is
-/// blind to a coordinator that holds a fetch unanswered for longer than
-/// `socket.timeout.ms` while the application is handed no error: an
-/// assignment change after that bound, and a connection the coordinator
-/// drops after it, strand the fetch's partitions with the error ridden out.
+/// `__TRANSPORT` or `__RESOLVE`, because a fetch may have been pending when
+/// that change landed. The reconnect fetches the committed offsets again.
+/// The gate is blind to a coordinator that holds a fetch unanswered for
+/// longer than `socket.timeout.ms` while the application is handed no
+/// error: an assignment change after that bound, and a connection the
+/// coordinator drops after it, strand the fetch's partitions with the error
+/// ridden out.
 ///
 /// Every other code ends the loop. That covers a fatal error, whether
 /// `MessageConsumptionFatal` or a `__FATAL` left untranslated
@@ -2591,22 +2595,23 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 /// them (`rdkafka_cgrp.c:2434-2441`, `rdkafka_fetcher.c:327-338`).
 fn recv_error_is_transient(gate: &TransportGate, error: &KafkaError) -> bool {
     match error {
-        KafkaError::MessageConsumption(RDKafkaErrorCode::BrokerTransportFailure) => {
+        KafkaError::MessageConsumption(
+            RDKafkaErrorCode::BrokerTransportFailure | RDKafkaErrorCode::Resolve,
+        ) => {
             let rides_out = gate.rides_out(std::time::Instant::now());
             if !rides_out {
                 tracing::warn!(
                     error = %error,
                     bound = ?gate.bound,
-                    "broker transport failure within socket.timeout.ms of an assignment \
-                     change, which may have stranded a committed-offset fetch; ending the \
-                     loop so the reconnect fetches the committed offsets again"
+                    "broker connection or name resolution failure within socket.timeout.ms \
+                     of an assignment change, which may have stranded a committed-offset \
+                     fetch; ending the loop so the reconnect fetches the committed offsets \
+                     again"
                 );
             }
             rides_out
         }
-        KafkaError::MessageConsumption(
-            RDKafkaErrorCode::Resolve | RDKafkaErrorCode::AllBrokersDown,
-        ) => true,
+        KafkaError::MessageConsumption(RDKafkaErrorCode::AllBrokersDown) => true,
         _ => false,
     }
 }
@@ -2617,26 +2622,26 @@ fn log_transient_recv_error(queue: &str, error: &KafkaError) {
         queue,
         error = %error,
         "broker connection error ridden out; librdkafka reconnects and polling continues \
-         on the same client. A broker transport failure within socket.timeout.ms of an \
-         assignment change ends the loop instead, so the reconnect fetches the committed \
-         offsets again; a partition that stays unfetched after an outage needs the member \
-         restarted"
+         on the same client. A failed broker connection or name resolution within \
+         socket.timeout.ms of an assignment change ends the loop instead, so the reconnect \
+         fetches the committed offsets again; a partition that stays unfetched after an \
+         outage needs the member restarted"
     );
 }
 
-/// Whether a `__TRANSPORT` a receive loop met may be the one trace of a
-/// committed-offset fetch an assignment change stranded, see
+/// Whether a `__TRANSPORT` or `__RESOLVE` a receive loop met may be the one
+/// trace of a committed-offset fetch an assignment change stranded, see
 /// [`recv_error_is_transient`].
 ///
 /// The consumer's rebalance callback stamps every assign and revoke here,
 /// inside the poll that serves it: the stranded fetch's error can reach
 /// `recv()` before the loop drains the event. A change that lands within
 /// `bound` of the last assign, whose fetch may still be pending, or of the
-/// last `__TRANSPORT` ridden out, which may have left a fetch retrying
-/// through a failed connection, arms the gate. While it is armed, a
-/// `__TRANSPORT` within `bound` of the change that armed it ends the loop.
-/// A revoke starts no fetch, so it opens no window for the change behind
-/// it.
+/// last `__TRANSPORT` or `__RESOLVE` ridden out, which may have left a fetch
+/// retrying through a failing broker, arms the gate. While it is armed, a
+/// `__TRANSPORT` or `__RESOLVE` within `bound` of the change that armed it
+/// ends the loop. A revoke starts no fetch, so it opens no window for the
+/// change behind it.
 struct TransportGate {
     /// The consumer's `socket.timeout.ms`, see [`socket_timeout`].
     bound: Duration,
@@ -2648,7 +2653,7 @@ struct TransportGate {
 struct GateStamps {
     /// An assign the rebalance callback served.
     assign: Option<std::time::Instant>,
-    /// A `__TRANSPORT` a receive loop rode out.
+    /// A `__TRANSPORT` or `__RESOLVE` a receive loop rode out.
     ridden: Option<std::time::Instant>,
     /// The assign or revoke that armed the gate.
     armed: Option<std::time::Instant>,
@@ -2664,7 +2669,7 @@ impl TransportGate {
 
     /// Stamps the assign or revoke the rebalance callback serves at `now`,
     /// arming the gate if it lands within the bound of the last assign or of
-    /// the last ridden-out `__TRANSPORT`.
+    /// the last ridden-out `__TRANSPORT` or `__RESOLVE`.
     fn changed(&self, event: &RebalanceEvent, now: std::time::Instant) {
         let mut stamps = self.stamps();
         if self.within(stamps.assign, now) || self.within(stamps.ridden, now) {
@@ -2675,9 +2680,9 @@ impl TransportGate {
         }
     }
 
-    /// Whether a `__TRANSPORT` a receive loop met at `now` is ridden out:
-    /// it is, and is stamped, unless `now` falls within the bound of the
-    /// change that armed the gate.
+    /// Whether a `__TRANSPORT` or `__RESOLVE` a receive loop met at `now` is
+    /// ridden out: it is, and is stamped, unless `now` falls within the
+    /// bound of the change that armed the gate.
     fn rides_out(&self, now: std::time::Instant) -> bool {
         let mut stamps = self.stamps();
         if self.within(stamps.armed, now) {
@@ -12581,10 +12586,11 @@ mod error_classifier_tests {
         assert!(gate.rides_out(after(t0, 66)), "past it");
     }
 
-    /// The table reads the gate for a `__TRANSPORT` alone: an armed gate
-    /// ends the loop on one, and the other broker failures stay ridden out.
+    /// The table reads the gate for a `__TRANSPORT` and a `__RESOLVE`, the
+    /// two codes a failing broker fails a queued fetch with: an armed gate
+    /// ends the loop on either, and every broker being down stays ridden out.
     #[test]
-    fn an_armed_gate_ends_the_loop_on_a_transport_failure_alone() {
+    fn an_armed_gate_ends_the_loop_on_a_failed_connection_or_resolve() {
         let gate = TransportGate::new(GATE_BOUND);
         let now = std::time::Instant::now();
         gate.changed(&assign(), now);
@@ -12593,7 +12599,7 @@ mod error_classifier_tests {
             &gate,
             &consumption(RDKafkaErrorCode::BrokerTransportFailure)
         ));
-        assert!(recv_error_is_transient(
+        assert!(!recv_error_is_transient(
             &gate,
             &consumption(RDKafkaErrorCode::Resolve)
         ));
@@ -12601,6 +12607,35 @@ mod error_classifier_tests {
             &gate,
             &consumption(RDKafkaErrorCode::AllBrokersDown)
         ));
+    }
+
+    /// A `__RESOLVE` the table rides out is stamped like a `__TRANSPORT`: the
+    /// first assign after it arms the gate, with no earlier assign to open a
+    /// window, and the next `__RESOLVE` ends the loop. Every broker being
+    /// down stamps nothing.
+    #[test]
+    fn a_ridden_out_resolve_failure_arms_the_gate_like_a_transport_failure() {
+        let after_resolve = TransportGate::new(GATE_BOUND);
+        assert!(recv_error_is_transient(
+            &after_resolve,
+            &consumption(RDKafkaErrorCode::Resolve)
+        ));
+        after_resolve.changed(&assign(), std::time::Instant::now());
+        assert!(!recv_error_is_transient(
+            &after_resolve,
+            &consumption(RDKafkaErrorCode::Resolve)
+        ));
+
+        let after_all_down = TransportGate::new(GATE_BOUND);
+        assert!(recv_error_is_transient(
+            &after_all_down,
+            &consumption(RDKafkaErrorCode::AllBrokersDown)
+        ));
+        after_all_down.changed(&assign(), std::time::Instant::now());
+        assert!(
+            recv_error_is_transient(&after_all_down, &consumption(RDKafkaErrorCode::Resolve)),
+            "nothing armed the gate"
+        );
     }
 
     /// The bound is the consumer's `socket.timeout.ms`: the value its config
