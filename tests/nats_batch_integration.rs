@@ -171,6 +171,12 @@ shove::define_topic!(
 );
 
 shove::define_topic!(
+    AbortFlushTopic,
+    BatchMessage,
+    TopologyBuilder::new("nats-batch-abort-flush").build()
+);
+
+shove::define_topic!(
     PoisonStallTopic,
     BatchMessage,
     TopologyBuilder::new("nats-batch-poison-stall")
@@ -2019,6 +2025,81 @@ async fn batch_read_ahead_loses_and_duplicates_nothing() {
         durable_state(&client, STREAM, DURABLE).await,
         (0, 0, 0),
         "everything is acked and nothing was redelivered"
+    );
+    broker.close().await;
+}
+
+/// Sets its flag when it is dropped, as a flush that is aborted drops the call
+/// it holds.
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A flush that never returns.
+#[derive(Clone)]
+struct EndlessFlush {
+    started: Arc<Notify>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl BatchMessageHandler<AbortFlushTopic> for EndlessFlush {
+    type Context = ();
+    async fn handle_batch(&self, _: Vec<(BatchMessage, MessageMetadata)>, _: &()) -> Outcome {
+        let _flag = DropFlag(Arc::clone(&self.dropped));
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
+/// The flush runs in a task of its own, and that task goes down with the
+/// consumer: aborting the consumer drops the handler call it was awaiting, as
+/// it does on every other consume path, so no handler outlives its consumer.
+#[tokio::test]
+async fn aborting_the_batch_consumer_aborts_its_flush() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<AbortFlushTopic>()
+        .await
+        .unwrap();
+    publish_seq::<AbortFlushTopic>(&broker, 0..1).await;
+
+    let handler = EndlessFlush {
+        started: Arc::new(Notify::new()),
+        dropped: Arc::new(AtomicBool::new(false)),
+    };
+    let h = handler.clone();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<AbortFlushTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(1)
+                    .with_max_batch_age(Duration::from_millis(300))
+                    .with_handler_timeout(Duration::from_secs(3600)),
+            )
+            .await
+    });
+    tokio::time::timeout(TIMEOUT, handler.started.notified())
+        .await
+        .expect("the flush starts");
+    assert!(!handler.dropped.load(Ordering::SeqCst));
+
+    handle.abort();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !handler.dropped.load(Ordering::SeqCst) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        handler.dropped.load(Ordering::SeqCst),
+        "the handler call outlived the consumer that was awaiting it"
     );
     broker.close().await;
 }
