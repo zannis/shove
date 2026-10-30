@@ -257,6 +257,15 @@ pub struct ConsumerOptions<B: Backend> {
     /// finite value in environments where a permanently-unreachable broker
     /// should be surfaced rather than silently spinning.
     ///
+    /// On Kafka's concurrent consumer a `Retry`/`Defer` republish or a dead
+    /// letter that fails and may succeed later reconnects the member too,
+    /// which leaves the group and joins it again, and that reconnect counts
+    /// here. With a finite value a DLQ that stays unwritable therefore ends
+    /// that consumer once the value is spent; the count resets after a
+    /// connection that lasted a minute. Kafka's sequenced consumer
+    /// (`run_fifo`) tries such a dead letter again in place, without a
+    /// reconnect, so the limit never ends it on a DLQ outage.
+    ///
     /// # Example
     ///
     /// ```ignore

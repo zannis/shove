@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use rdkafka::client::ClientContext;
+use rdkafka::error::RDKafkaErrorCode;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use uuid::Uuid;
@@ -28,6 +29,11 @@ use super::constants::{
 
 /// Publish a message to Kafka with retry on transient failures.
 /// Shared by both the publisher and consumer (for DLQ / retry publishes).
+///
+/// A record the producer or the broker refuses as too large or as invalid
+/// is not sent again, because no later send can get past that, and comes
+/// back as `ShoveError::Validation`. The consumer reads that variant as a
+/// publish that can never succeed.
 pub(super) async fn publish_with_retry<C>(
     producer: &FutureProducer<C>,
     topic: &str,
@@ -61,6 +67,18 @@ where
         match producer.send(record, PRODUCE_TIMEOUT).await {
             Ok(_) => return Ok(()),
             Err((e, _)) => {
+                if matches!(
+                    e.rdkafka_error_code(),
+                    Some(RDKafkaErrorCode::MessageSizeTooLarge | RDKafkaErrorCode::InvalidRecord)
+                ) {
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::Kafka,
+                        metrics::BackendErrorKind::Publish,
+                    );
+                    return Err(ShoveError::Validation(format!(
+                        "{label} refused, and no later send can get past it: {e}"
+                    )));
+                }
                 if attempt == max_attempts {
                     metrics::record_backend_error(
                         metrics::BackendLabel::Kafka,
