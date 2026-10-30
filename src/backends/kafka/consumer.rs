@@ -5359,6 +5359,10 @@ struct FifoRecord<'m> {
 enum FifoPass {
     Next,
     Stop,
+    /// The record in hand could not be dead-lettered, with an error no retry
+    /// gets past. The loop stops as on a stop, its final commit included, and
+    /// the member then ends with the error.
+    End(ShoveError),
 }
 
 /// How a wait on the record in hand ended.
@@ -5591,7 +5595,10 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
     /// One connection: subscribe and consume until a stop or a fault. A stop
     /// ends with the final commit and the consumer's close on a thread of
     /// their own; a fault closes the consumer off the runtime thread too,
-    /// with nothing committed.
+    /// with nothing committed. A dead letter that failed with an error no
+    /// retry gets past ends as a stop does, the final commit carrying what
+    /// was acked before it, and then returns that error, so
+    /// `run_with_reconnect` ends the member on it.
     async fn run_connection(self: Arc<Self>) -> Result<()> {
         let queue = self.queue.as_str();
         let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
@@ -5621,16 +5628,21 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
             Err(e) => Err(map_kafka_error("failed to subscribe", e)),
         };
         match ended {
-            Ok(()) => {
+            Ok(fault) => {
                 let pending_commit = state.pending_commit.take();
-                stop_with_final_commit(
+                let stopped = stop_with_final_commit(
                     consumer,
                     &mut state.tracker,
                     &mut state.rebalance_rx,
                     pending_commit,
                     queue,
                 )
-                .await
+                .await;
+                // The fault outranks the stop's result; the stop logs its own failure.
+                match fault {
+                    Some(e) => Err(e),
+                    None => stopped,
+                }
             }
             Err(e) => {
                 close_off_runtime_or_leak(consumer, queue, &mut spawn_named_thread);
@@ -5640,12 +5652,14 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
     }
 
     /// The receive loop. `Ok` is a stop: whatever record was in hand is left
-    /// uncommitted, and nothing behind it was handed to the handler.
+    /// uncommitted, and nothing behind it was handed to the handler. It
+    /// carries the error of a dead letter no retry gets past when that is
+    /// what stopped the loop, see [`FifoPass::End`].
     async fn consume(
         &self,
         consumer: &Arc<KafkaStreamConsumer>,
         state: &mut FifoState,
-    ) -> Result<()> {
+    ) -> Result<Option<ShoveError>> {
         let queue = self.queue.as_str();
         // Wakes an idle member, so rebalance events are applied and the
         // positions they re-offer are committed without a record to wait
@@ -5661,7 +5675,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                 biased;
                 _ = self.shutdown.cancelled() => {
                     tracing::info!(queue, "shutdown signal received, stopping FIFO consumer");
-                    return Ok(());
+                    return Ok(None);
                 }
                 _ = housekeeping.tick() => {}
                 // Wakes the loop when the commit gate's window expires with
@@ -5673,8 +5687,10 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                         tracing::error!(error = %e, queue, "FIFO consumer recv error");
                         map_kafka_error(&format!("FIFO consumer recv error on {queue}"), e)
                     })?;
-                    if let FifoPass::Stop = self.record(consumer, state, &msg).await? {
-                        return Ok(());
+                    match self.record(consumer, state, &msg).await? {
+                        FifoPass::Next => {}
+                        FifoPass::Stop => return Ok(None),
+                        FifoPass::End(e) => return Ok(Some(e)),
                     }
                 }
             }
@@ -5682,7 +5698,8 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
     }
 
     /// Takes one record and carries it to its end: acked, dead-lettered,
-    /// left to its partition's next owner, or kept uncommitted for a stop.
+    /// left to its partition's next owner, or kept uncommitted for a stop or
+    /// for an error that ends the member.
     async fn record(
         &self,
         consumer: &Arc<KafkaStreamConsumer>,
@@ -5976,13 +5993,23 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
     /// the dead letter's count, and completes the record once the dead
     /// letter landed.
     ///
-    /// A publish that fails keeps the record: it is tried again after
-    /// [`DEAD_LETTER_RETRY_INITIAL`], doubling up to
-    /// [`DEAD_LETTER_RETRY_MAX`], with the assignment paused and the member
-    /// polling, and nothing is committed past it meanwhile. A dead letter the
-    /// producer or the broker refuses as too large or as invalid can never be
-    /// published, and trying it again would block the partition for good: the
-    /// record is completed as lost instead, and the loop goes on to the next.
+    /// A publish that fails is settled by its error:
+    /// - `ShoveError::Validation`: the producer or the broker refused the dead
+    ///   letter as too large or as invalid, so it can never be published, and
+    ///   trying it again would block the partition for good. The record is
+    ///   completed as lost, an error is logged, and the loop goes on to the
+    ///   next.
+    /// - Any other error no retry gets past ([`ShoveError::is_retryable`] is
+    ///   false), such as the `Topology` error of a producer that cannot be
+    ///   built, ends the loop with [`FifoPass::End`]. The record stays
+    ///   uncommitted, `pending` settles as survived, and the member ends with
+    ///   the error once the stop's final commit has carried what was acked
+    ///   before it.
+    /// - A retryable error keeps the record: the publish is tried again after
+    ///   [`DEAD_LETTER_RETRY_INITIAL`], doubling up to
+    ///   [`DEAD_LETTER_RETRY_MAX`], with the assignment paused and the member
+    ///   polling, and nothing is committed past it meanwhile.
+    ///
     /// `pending` is the record's discard: settled at once when the dead letter
     /// is in the DLQ, and on the commit that retires the record when no DLQ is
     /// declared or the dead letter can never be published. A stop or a revoke
@@ -6029,6 +6056,18 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                 // DLQ was, and nothing holds a copy.
                 state.complete(record, Some(TerminalDiscard::Lost(pending)));
                 return Ok(FifoPass::Next);
+            }
+            if !e.is_retryable() {
+                tracing::error!(
+                    error = %e,
+                    queue,
+                    partition = record.partition,
+                    offset = record.offset,
+                    "dead-letter publish failed with an error no retry gets past; the record stays \
+                     uncommitted and the consumer ends"
+                );
+                pending.survived();
+                return Ok(FifoPass::End(e));
             }
             let delay = backoff.next().unwrap_or(DEAD_LETTER_RETRY_MAX);
             tracing::error!(
@@ -7852,10 +7891,15 @@ impl KafkaConsumer {
     /// count lives in memory, read from the record's `Shove-Retry-Count` on
     /// every delivery, so a restart or a rebalance starts it again. Once the
     /// budget is spent, or on a `Reject`, the record is dead-lettered under
-    /// its `SequenceFailure`. A dead letter that cannot be published keeps
-    /// the record uncommitted and is tried again after a backoff, polling,
-    /// until it lands. A stop during any of these waits returns at once and
-    /// leaves the record for the restart.
+    /// its `SequenceFailure`. A dead letter that fails and may land later
+    /// keeps the record uncommitted and is tried again after a backoff,
+    /// polling, until it lands. A stop during any of these waits returns at
+    /// once and leaves the record for the restart. A dead letter that can
+    /// never be published, too large or invalid, is discarded and counted.
+    /// One that fails with an error no retry gets past, such as a producer
+    /// that cannot be built, ends the member once its final commit has run,
+    /// with the record left uncommitted; `run_fifo` logs the error and
+    /// returns `Ok(())`.
     ///
     /// Either `RetryStrategy` is accepted, and both retry in place. Offsets
     /// are committed asynchronously at most every 500 ms, synchronously when

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(feature = "metrics")]
-use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::mocking::MockCluster;
@@ -67,6 +67,13 @@ const UNPUBLISHABLE_GROUP: &str = "kafka-fifo-in-place-unpublishable-fifo";
 /// Bytes of padding that put a record past the `message.max.bytes` shove's
 /// producer runs with, librdkafka's 1 MB default.
 const OVERSIZE: usize = 1_200_000;
+
+#[cfg(feature = "test-support")]
+const FATAL_TOPIC: &str = "kafka-fifo-in-place-dlq-fatal";
+#[cfg(feature = "test-support")]
+const FATAL_DLQ: &str = "kafka-fifo-in-place-dlq-fatal-dlq";
+#[cfg(feature = "test-support")]
+const FATAL_GROUP: &str = "kafka-fifo-in-place-dlq-fatal-fifo";
 
 const STOP_TOPIC: &str = "kafka-fifo-in-place-stop";
 const STOP_DLQ: &str = "kafka-fifo-in-place-stop-dlq";
@@ -140,6 +147,19 @@ shove::define_sequenced_topic!(
     Order,
     |_order: &Order| KEY.to_string(),
     TopologyBuilder::new(UNPUBLISHABLE_TOPIC)
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(ORDER_HOLD)
+        .dlq()
+        .build()
+);
+
+#[cfg(feature = "test-support")]
+shove::define_sequenced_topic!(
+    FatalTopic,
+    Order,
+    |_order: &Order| KEY.to_string(),
+    TopologyBuilder::new(FATAL_TOPIC)
         .sequenced(SequenceFailure::Skip)
         .routing_shards(1)
         .hold_queue(ORDER_HOLD)
@@ -499,6 +519,47 @@ async fn read_ids(bootstrap: &str, topic: &str, count: usize) -> Vec<String> {
     ids
 }
 
+/// Installs the debugging recorder as the process's global recorder; one per
+/// test process, which nextest gives every test.
+#[cfg(feature = "metrics")]
+fn install_recorder() -> Snapshotter {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    recorder.install().expect("install the debugging recorder");
+    snapshotter
+}
+
+/// Every `shove_messages_discarded_total` series of `topic` with a count
+/// above zero, as `(reason, count)`, from one snapshot: a snapshot drains the
+/// counters it reads.
+#[cfg(feature = "metrics")]
+fn discarded_by_reason(snapshotter: &Snapshotter, topic: &str) -> Vec<(String, u64)> {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(key, _, _, _)| {
+            key.key().name() == "shove_messages_discarded_total"
+                && key
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == "topic" && l.value() == topic)
+        })
+        .map(|(key, _, _, value)| {
+            let reason = key
+                .key()
+                .labels()
+                .find(|l| l.key() == "reason")
+                .map_or_else(String::new, |l| l.value().to_string());
+            match value {
+                DebugValue::Counter(n) => (reason, n),
+                other => panic!("shove_messages_discarded_total is not a counter: {other:?}"),
+            }
+        })
+        .filter(|(_, n)| *n > 0)
+        .collect()
+}
+
 /// A sequenced consumer running on its own task, on a fresh client, through
 /// `run_fifo_until_timeout`: its outcome counts a consumer task that ended
 /// with an error, a final commit the broker refused included, which
@@ -771,12 +832,7 @@ async fn fifo_dlq_publish_failure_redelivers() {
     const FAILED_PUBLISH: Duration = Duration::from_secs(20);
 
     #[cfg(feature = "metrics")]
-    let snapshotter = {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        recorder.install().expect("install the debugging recorder");
-        snapshotter
-    };
+    let snapshotter = install_recorder();
 
     let mock = Mock::start(&[OUTAGE_TOPIC, OUTAGE_DLQ]);
     let bootstrap = mock.bootstrap();
@@ -846,30 +902,7 @@ async fn fifo_dlq_publish_failure_redelivers() {
 
     #[cfg(feature = "metrics")]
     {
-        let discarded: Vec<(String, u64)> = snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .filter(|(key, _, _, _)| {
-                key.key().name() == "shove_messages_discarded_total"
-                    && key
-                        .key()
-                        .labels()
-                        .any(|l| l.key() == "topic" && l.value() == OUTAGE_TOPIC)
-            })
-            .map(|(key, _, _, value)| {
-                let reason = key
-                    .key()
-                    .labels()
-                    .find(|l| l.key() == "reason")
-                    .map_or_else(String::new, |l| l.value().to_string());
-                match value {
-                    DebugValue::Counter(n) => (reason, n),
-                    other => panic!("shove_messages_discarded_total is not a counter: {other:?}"),
-                }
-            })
-            .filter(|(_, n)| *n > 0)
-            .collect();
+        let discarded = discarded_by_reason(&snapshotter, OUTAGE_TOPIC);
         assert!(
             discarded.is_empty(),
             "a record kept through a DLQ outage is never counted as discarded: {discarded:?}"
@@ -885,12 +918,7 @@ async fn fifo_dlq_publish_failure_redelivers() {
 #[tokio::test]
 async fn fifo_unpublishable_dead_letter_is_discarded_and_counted() {
     #[cfg(feature = "metrics")]
-    let snapshotter = {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        recorder.install().expect("install the debugging recorder");
-        snapshotter
-    };
+    let snapshotter = install_recorder();
 
     let mock = Mock::start(&[UNPUBLISHABLE_TOPIC, UNPUBLISHABLE_DLQ]);
     let bootstrap = mock.bootstrap();
@@ -936,35 +964,75 @@ async fn fifo_unpublishable_dead_letter_is_discarded_and_counted() {
     );
 
     #[cfg(feature = "metrics")]
+    assert_eq!(
+        discarded_by_reason(&snapshotter, UNPUBLISHABLE_TOPIC),
+        [("rejected".to_string(), 1)],
+        "the record whose dead letter can never be published is counted once as discarded"
+    );
+}
+
+/// A dead letter that fails with an error no retry gets past ends the member
+/// with that error, where trying it again in place would hold the partition
+/// forever. The test seam refuses every dead letter with the `Topology` error
+/// a client whose producer cannot be built answers with. `A1` and `A2` are
+/// acked inside one commit window, so the position past `A2` waits for the
+/// gate; `B` is rejected and its dead letter refused. The member ends on its
+/// own with that error, `C` behind `B` is never handled, the stop's final
+/// commit carries `A1` and `A2` and stops at `B`, and nothing is
+/// dead-lettered or counted as discarded.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn fifo_dead_letter_failure_that_cannot_be_retried_ends_the_member() {
+    use shove::kafka::dlq_publish_probe;
+
+    #[cfg(feature = "metrics")]
+    let snapshotter = install_recorder();
+    let mock = Mock::start(&[FATAL_TOPIC, FATAL_DLQ]);
+    let bootstrap = mock.bootstrap();
+    produce(&bootstrap, FATAL_TOPIC, &["A1", "A2", "B", "C"]).await;
+    dlq_publish_probe::refuse(true);
+
+    let handler = Recorder::new(|id, _| {
+        if id == "B" {
+            Outcome::Reject
+        } else {
+            Outcome::Ack
+        }
+    });
+    let consumer = Running::fifo::<FatalTopic>(&bootstrap, &handler).await;
+    wait_until(
+        || consumer.task.is_finished(),
+        DELIVERY_TIMEOUT,
+        "the member ending on the dead letter no retry gets past",
+    )
+    .await;
+    let outcome = consumer.task.await.expect("the consumer task joins");
+    assert_eq!(
+        (outcome.errors, outcome.panics, outcome.timed_out),
+        (1, 0, false),
+        "the member ends on its own with the error: {outcome:?}"
+    );
+    assert_eq!(
+        handler.ids(),
+        ["A1", "A2", "B"],
+        "C behind B is never handled"
+    );
+    assert_eq!(
+        committed_position(&bootstrap, FATAL_TOPIC, FATAL_GROUP).await,
+        Some(2),
+        "the final commit carries the acked records and stops at B"
+    );
+    assert_eq!(
+        high_watermark(&bootstrap, FATAL_DLQ).await,
+        0,
+        "nothing is dead-lettered"
+    );
+    #[cfg(feature = "metrics")]
     {
-        let discarded: Vec<(String, u64)> = snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .filter(|(key, _, _, _)| {
-                key.key().name() == "shove_messages_discarded_total"
-                    && key
-                        .key()
-                        .labels()
-                        .any(|l| l.key() == "topic" && l.value() == UNPUBLISHABLE_TOPIC)
-            })
-            .map(|(key, _, _, value)| {
-                let reason = key
-                    .key()
-                    .labels()
-                    .find(|l| l.key() == "reason")
-                    .map_or_else(String::new, |l| l.value().to_string());
-                match value {
-                    DebugValue::Counter(n) => (reason, n),
-                    other => panic!("shove_messages_discarded_total is not a counter: {other:?}"),
-                }
-            })
-            .filter(|(_, n)| *n > 0)
-            .collect();
-        assert_eq!(
-            discarded,
-            [("rejected".to_string(), 1)],
-            "the record whose dead letter can never be published is counted once as discarded"
+        let discarded = discarded_by_reason(&snapshotter, FATAL_TOPIC);
+        assert!(
+            discarded.is_empty(),
+            "B is not retired, so nothing is discarded: {discarded:?}"
         );
     }
 }

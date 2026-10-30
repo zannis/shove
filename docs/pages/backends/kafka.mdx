@@ -496,12 +496,15 @@ With long tiers and frequent restarts a record can block its partition indefinit
 A dead letter carries the count the record reached in its `Shove-Retry-Count` header.
 
 Once the budget is spent, or on a `Reject`, the record is dead-lettered and its `SequenceFailure` applies.
-A dead letter that cannot be published keeps the record uncommitted.
+A dead letter that fails and may land later keeps the record uncommitted.
 Each publish attempt makes up to three sends, about 15 s in all against a broker that does not answer, and the consumer does not poll during it.
 Between attempts the consumer waits 1 s, the wait doubling up to 30 s with ±50 % jitter, and polls with its assignment paused.
 Nothing behind the record is handled meanwhile.
 No discard is counted for a record kept that way.
 The same holds for a record dropped before the handler and for a `FailAll` cascade.
+A failure no retry gets past, such as a producer that cannot be built, ends the member with that error, and it does not reconnect.
+Before it ends, the member makes the final commit a stop makes, so the positions acked ahead of the record are committed.
+The record stays uncommitted, and no discard is counted for it.
 A dead letter that can never be published is not tried again, because trying it again would block the partition for good.
 That is a dead letter past the producer's `message.max.bytes`, or one the broker refuses as too large or as invalid.
 The record is discarded and committed, an error is logged, `messages_discarded_total` counts it, and the consumer goes on to the next record.
