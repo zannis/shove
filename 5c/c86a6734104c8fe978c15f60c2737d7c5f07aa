@@ -1,0 +1,22 @@
+tests/kafka_commit_policy_mock.rs
+  s_1001dc3147e1e5::t_4e22abd184e224 3637
+  s_1001dc3147e1e5::t_04e1223b176cfb 3635-3636
+src/backends/kafka/consumer.rs
+  s_1001dc3147e1e5::t_dcf14cf1c65c19 10022
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5cc86a6734104c8fe978c15f60c2737d7c5f07aa",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": null
+    }
+  }
+}
