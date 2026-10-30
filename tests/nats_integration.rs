@@ -2782,11 +2782,10 @@ async fn run_fifo_until_timeout_clean_drain() {
 
 #[tokio::test]
 async fn run_fifo_until_timeout_observes_handler_panic() {
-    // Shard-level panic boundary: the NATS FIFO consume loop spawns each
-    // handler via `tokio::spawn` and awaits it through a oneshot channel.
-    // When the handler panics, the task panics before sending, the receiver
-    // closes, and the consume loop treats the closed channel as `Outcome::Retry`.
-    // The panic never propagates out of the shard task — it always returns `Ok(())`.
+    // Shard-level panic boundary: the NATS FIFO consume loop runs each handler
+    // through `invoke_handler`, which spawns it and turns a panic into
+    // `Outcome::Retry`. The panic never propagates out of the shard task — it
+    // always returns `Ok(())`.
     // As a result, `outcome.panics` and `outcome.errors` will both be zero.
     // This test documents and verifies that contract: the harness does not
     // crash or deadlock when handlers panic, and the outcome is clean.
@@ -2815,7 +2814,7 @@ async fn run_fifo_until_timeout_observes_handler_panic() {
 
     let consumer = NatsConsumer::new(client.clone());
     // max_retries=1: dispatched at retry_count 0 (0 < 1) where it panics
-    // (Retry) and is republished, then dispatched again at retry_count 1 where
+    // (Retry) and is held, then handed back at retry_count 1 where
     // 1 >= max_retries routes it to the DLQ.
     let opts = ConsumerOptions::<Nats>::new().with_max_retries(1);
 
@@ -2832,8 +2831,8 @@ async fn run_fifo_until_timeout_observes_handler_panic() {
         )
         .await;
 
-    // The shard absorbs handler panics at the oneshot channel level (see above),
-    // so neither panics nor errors are incremented. The harness returns cleanly.
+    // The shard absorbs handler panics in `invoke_handler` (see above), so
+    // neither panics nor errors are incremented. The harness returns cleanly.
     assert!(
         !outcome.timed_out,
         "harness must not hang on handler panics; got {outcome:?}"
@@ -2852,8 +2851,8 @@ async fn run_fifo_until_timeout_observes_handler_panic() {
 
 #[tokio::test]
 async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
-    // The NATS FIFO consume loop processes messages sequentially: it awaits the
-    // oneshot receiver for each handler before moving to the next message.
+    // The NATS FIFO consume loop processes messages sequentially: it awaits
+    // each handler before moving to the next message.
     // A handler currently in-flight when shutdown fires keeps running until it
     // completes. With a slow handler (60 s sleep) and a short drain budget
     // (500 ms), the timeout fires before the shard finishes, the JoinSet
@@ -4896,5 +4895,474 @@ async fn two_readers_sharing_a_dlq_both_dead_letter_one_record() {
     shutdown.cancel();
     first.await.unwrap().ok();
     second.await.unwrap().ok();
+    broker.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Sequenced retries: the record waits at its position
+// ---------------------------------------------------------------------------
+
+/// Retries `amount` 0 until its retry count reaches 2 and acks everything
+/// else, keeping every call's amount and retry count in order.
+#[derive(Clone)]
+struct RetryFirstMessageTwice {
+    calls: Arc<Mutex<Vec<(u64, u32)>>>,
+    counter: WaitableCounter,
+}
+
+impl MessageHandler<SeqSkipTopic> for RetryFirstMessageTwice {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        self.calls.lock().await.push((msg.amount, meta.retry_count));
+        self.counter.increment();
+        if msg.amount == 0 && meta.retry_count < 2 {
+            Outcome::Retry
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+/// Two messages for one key, A then B. A is retried twice before it acks,
+/// and B is not handled until A has been: the calls are A, A, A, B.
+#[tokio::test]
+async fn fifo_retry_keeps_key_order() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    for amount in 0..2u64 {
+        publisher
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "one-key".into(),
+                amount,
+            })
+            .await
+            .unwrap();
+    }
+
+    let handler = RetryFirstMessageTwice {
+        calls: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqSkipTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(5),
+            )
+            .await
+    });
+
+    assert!(
+        handler.counter.wait_for(4, TIMEOUT).await,
+        "two retries of A, its ack and B are four calls"
+    );
+    // Let a stray fifth call surface before the assertions.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let calls = handler.calls.lock().await.clone();
+    let labels: Vec<&str> = calls
+        .iter()
+        .map(|(amount, _)| if *amount == 0 { "A" } else { "B" })
+        .collect();
+    assert_eq!(
+        labels,
+        ["A", "A", "A", "B"],
+        "B waits until A is settled: {calls:?}"
+    );
+    let counts: Vec<u32> = calls.iter().map(|(_, count)| *count).collect();
+    assert_eq!(counts, [0, 1, 2, 0], "A's count climbs in place: {calls:?}");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// The hold of [`SeqLongHoldTopic`], longer than the 30 s `ack_wait` a 1 s
+/// handler timeout derives.
+const LONG_HOLD: Duration = Duration::from_secs(35);
+
+shove::define_sequenced_topic!(
+    SeqLongHoldTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("nats-seq-long-hold")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(LONG_HOLD)
+        .dlq()
+        .build()
+);
+
+/// Retries a message on its first call and acks it afterwards, keeping every
+/// call's metadata.
+#[derive(Clone)]
+struct RetryOnceRecording {
+    seen: Arc<Mutex<Vec<MessageMetadata>>>,
+    counter: WaitableCounter,
+}
+
+impl MessageHandler<SeqLongHoldTopic> for RetryOnceRecording {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        let first = meta.retry_count == 0;
+        self.seen.lock().await.push(meta);
+        self.counter.increment();
+        if first { Outcome::Retry } else { Outcome::Ack }
+    }
+}
+
+/// A hold longer than the shard durable's `ack_wait` keeps the record: the
+/// progress acks sent through the hold stop JetStream redelivering it, so the
+/// handler sees it once per attempt, one retry plus the final ack, every time
+/// as the same delivery of the same stream sequence.
+#[tokio::test]
+async fn fifo_hold_longer_than_ack_wait_is_not_redelivered() {
+    const STREAM: &str = "nats-seq-long-hold";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<SeqLongHoldTopic>()
+        .await
+        .unwrap();
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<SeqLongHoldTopic>(&OrderMessage {
+            order_id: "held".into(),
+            amount: 1,
+        })
+        .await
+        .unwrap();
+
+    let handler = RetryOnceRecording {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqLongHoldTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(1)
+                    .with_handler_timeout(Duration::from_secs(1)),
+            )
+            .await
+    });
+
+    wait_for_durable(&client, STREAM, "nats-seq-long-hold-shard-0").await;
+    let ack_wait = durable_ack_wait(&client, STREAM, "nats-seq-long-hold-shard-0").await;
+    assert_eq!(ack_wait, Duration::from_secs(30));
+    assert!(LONG_HOLD > ack_wait, "the hold outlasts ack_wait");
+
+    assert!(
+        handler
+            .counter
+            .wait_for(2, LONG_HOLD.saturating_add(TIMEOUT))
+            .await,
+        "the record is handed back once the hold is over"
+    );
+    // A redelivery JetStream made during the hold would be handled next.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let seen = handler.seen.lock().await.clone();
+    assert_eq!(seen.len(), 2, "one retry plus the final ack: {seen:?}");
+    for (attempt, meta) in seen.iter().enumerate() {
+        assert_eq!(
+            meta.retry_count,
+            u32::try_from(attempt).unwrap(),
+            "attempt {attempt}: the count climbs in memory"
+        );
+        assert_eq!(
+            meta.offset,
+            Some(1),
+            "attempt {attempt}: the same record, nothing republished"
+        );
+        assert_eq!(
+            meta.delivery_count,
+            Some(1),
+            "attempt {attempt}: JetStream delivered the record once"
+        );
+        assert_eq!(meta.redelivered, attempt > 0, "attempt {attempt}");
+    }
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+shove::define_sequenced_topic!(
+    SeqShutdownHoldTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("nats-seq-shutdown-hold")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_secs(60))
+        .dlq()
+        .build()
+);
+
+/// Each call's amount and JetStream delivery count, in call order.
+type Sightings = Arc<Mutex<Vec<(u64, Option<u32>)>>>;
+
+/// Retries `amount` 0 the first time it is seen and acks every other call,
+/// keeping each call's amount and JetStream delivery count. Shared by every
+/// consumer a test starts, so a restart sees what the first run saw.
+#[derive(Clone)]
+struct RetryFirstSight {
+    seen: Sightings,
+    counter: WaitableCounter,
+}
+
+impl MessageHandler<SeqShutdownHoldTopic> for RetryFirstSight {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        let mut seen = self.seen.lock().await;
+        let first_sight = msg.amount == 0 && seen.iter().all(|(amount, _)| *amount != 0);
+        seen.push((msg.amount, meta.delivery_count));
+        drop(seen);
+        self.counter.increment();
+        if first_sight {
+            Outcome::Retry
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+/// A stop during a hold ends the consumer at once, with nothing behind the
+/// held record handled. The record is released to the next consumer straight
+/// away, well inside its `ack_wait`, and that consumer handles it and then the
+/// record behind it. Nothing was republished.
+#[tokio::test]
+async fn fifo_shutdown_mid_hold_loses_nothing() {
+    const STREAM: &str = "nats-seq-shutdown-hold";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<SeqShutdownHoldTopic>()
+        .await
+        .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    for amount in 0..2u64 {
+        publisher
+            .publish::<SeqShutdownHoldTopic>(&OrderMessage {
+                order_id: "one-key".into(),
+                amount,
+            })
+            .await
+            .unwrap();
+    }
+
+    let handler = RetryFirstSight {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let start = |shutdown: CancellationToken| {
+        let consumer = NatsConsumer::new(client.clone());
+        let hc = handler.clone();
+        tokio::spawn(async move {
+            consumer
+                .run_fifo::<SeqShutdownHoldTopic, _>(
+                    hc,
+                    (),
+                    ConsumerOptions::<Nats>::new()
+                        .with_shutdown(shutdown)
+                        .with_max_retries(5),
+                )
+                .await
+        })
+    };
+
+    let first_run = CancellationToken::new();
+    let handle = start(first_run.clone());
+    assert!(handler.counter.wait_for(1, TIMEOUT).await, "A is retried");
+    // The shard is now holding A for a minute.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    first_run.cancel();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("a stop during the hold ends the consumer at once")
+        .expect("the FIFO consumer task does not panic")
+        .expect("the FIFO consumer stops cleanly");
+    assert_eq!(
+        handler.seen.lock().await.clone(),
+        [(0, Some(1))],
+        "nothing behind the held record was handled"
+    );
+
+    let second_run = CancellationToken::new();
+    let handle = start(second_run.clone());
+    // The derived ack_wait is 90 s, so only a released record arrives in time.
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "the restarted consumer handles A and then B, saw {:?}",
+        handler.seen.lock().await.clone()
+    );
+    assert_eq!(
+        handler.seen.lock().await.clone(),
+        [(0, Some(1)), (0, Some(2)), (1, Some(1))],
+        "A comes back as JetStream's second delivery, ahead of B"
+    );
+    assert_eq!(
+        stream_last_sequence(&client, STREAM).await,
+        2,
+        "no copy was published"
+    );
+
+    second_run.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+shove::define_sequenced_topic!(
+    SeqDeadLetterRetryTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("nats-seq-dlq-retry")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_millis(200))
+        .dlq()
+        .build()
+);
+
+/// Rejects `amount` 0 and acks every other call, keeping each call's amount.
+#[derive(Clone)]
+struct RejectFirstMessage {
+    seen: Arc<Mutex<Vec<u64>>>,
+    counter: WaitableCounter,
+}
+
+impl MessageHandler<SeqDeadLetterRetryTopic> for RejectFirstMessage {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.seen.lock().await.push(msg.amount);
+        self.counter.increment();
+        if msg.amount == 0 {
+            Outcome::Reject
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+/// A sequenced record whose dead letter is refused stays at its position: an
+/// impostor holds the dead letter's id, so the publish fails until the
+/// duplicate window lets the real copy through. The publish is retried in
+/// place, the handler is not asked again, the record stays un-acked, and the
+/// record behind it waits until the dead letter has landed.
+#[tokio::test]
+async fn fifo_refused_dead_letter_is_retried_in_place() {
+    const STREAM: &str = "nats-seq-dlq-retry";
+    const DLQ: &str = "nats-seq-dlq-retry-dlq";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<SeqDeadLetterRetryTopic>()
+        .await
+        .unwrap();
+    shrink_duplicate_window(&client, DLQ, Duration::from_secs(3)).await;
+
+    let handler = RejectFirstMessage {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqDeadLetterRetryTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(0),
+            )
+            .await
+    });
+    // The window starts with the impostor's publish, so the consumer is up first.
+    wait_for_durable(&client, STREAM, "nats-seq-dlq-retry-shard-0").await;
+
+    let mut impostor = async_nats::HeaderMap::new();
+    impostor.insert(
+        NATS_MESSAGE_ID,
+        "nats-seq-dlq-retry.nats-seq-dlq-retry-shard-0.1-dlq",
+    );
+    raw_publish(&client, DLQ, impostor, b"impostor").await;
+    for amount in 0..2u64 {
+        let payload = serde_json::to_vec(&OrderMessage {
+            order_id: "one-key".into(),
+            amount,
+        })
+        .expect("an OrderMessage encodes");
+        raw_publish(
+            &client,
+            "nats-seq-dlq-retry.shard.0",
+            async_nats::HeaderMap::new(),
+            &payload,
+        )
+        .await;
+    }
+
+    assert!(handler.counter.wait_for(1, TIMEOUT).await, "A is rejected");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        handler.counter.get(),
+        1,
+        "the refused dead letter is retried without asking the handler again"
+    );
+    assert_eq!(
+        stream_messages(&client, STREAM).await,
+        2,
+        "A is not acked while its dead letter is refused, and B waits behind it"
+    );
+
+    let dead = take_dead_letters(&client, DLQ, 2).await;
+    assert!(
+        dead.iter().any(|msg| msg.payload.as_ref() != b"impostor"),
+        "the real dead letter lands once the window has passed"
+    );
+    assert!(
+        handler.counter.wait_for(2, TIMEOUT).await,
+        "B is handled once A is dead-lettered"
+    );
+    assert_eq!(
+        handler.seen.lock().await.clone(),
+        [0, 1],
+        "A is handled once, then B"
+    );
+    assert_eq!(
+        stream_last_sequence(&client, DLQ).await,
+        2,
+        "the impostor and a single dead letter of A"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
     broker.close().await;
 }

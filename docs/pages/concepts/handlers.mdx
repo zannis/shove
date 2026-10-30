@@ -210,6 +210,7 @@ Under `RetryStrategy::InPlace` on Kafka, implied by an external topology, no cop
 The count advances on each `Retry` the handler's task waits out, and is kept in memory for the redelivery.
 Under `RetryStrategy::InPlace` on an external NATS stream, the count is the number of redeliveries JetStream reports.
 A `Defer` nak and an `ack_wait` expiry are redeliveries there, so they advance it too.
+A sequenced NATS consumer publishes no copy either: it holds the record through each `Retry` and hands it back, with the count kept in memory and seeded from the record's `Shove-Retry-Count` header.
 
 `delivery_count` is the broker's own attempt counter, so it sees deliveries `shove` never initiated — a consumer crash, an ack that never landed, a visibility timeout expiring. It is reported where the backend supplies one:
 
