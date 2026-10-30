@@ -10,8 +10,8 @@
 //! *server* answers in its place, with a `503` status that says nobody was
 //! listening. async-nats's `double_ack` takes any reply for the confirmation,
 //! that status included, so the ack that never reached a consumer used to pass
-//! for a retirement and the discard was counted for a message the broker still
-//! owns. The accounting waits for a reply without a status.
+//! for a retirement and the discard was counted for a message that nothing had
+//! confirmed gone. The accounting waits for a reply without a status.
 //!
 //! The fixture rejects two messages in one consumer. The first is acked and
 //! confirmed as usual, so the counter has to read 1 for it: a consumer that
@@ -292,7 +292,7 @@ async fn a_reject_is_counted_as_discarded_only_when_its_ack_is_confirmed() {
     let discarded_total: u64 = discarded.iter().map(|(_, n)| *n).sum();
     assert_eq!(
         discarded_total, 1,
-        "only the confirmed ack counts a discard: the ack that found no consumer retired \
-         nothing and the broker still owns the message; got {discarded:?}"
+        "only the confirmed ack counts a discard: the ack that found no consumer was \
+         never applied, so nothing confirms its message gone; got {discarded:?}"
     );
 }
