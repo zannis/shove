@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 #[cfg(feature = "kafka-schema-registry")]
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -34,8 +35,8 @@ const QUEUE_FULL_WAIT: Duration = Duration::from_millis(100);
 
 /// What a failed send says about sending the record again.
 enum SendFailure {
-    /// librdkafka raised a fatal error on the producer, which refuses every
-    /// record from then on: the code and reason it raised.
+    /// librdkafka marked the producer fatal, so it refuses every record from
+    /// then on: the code and reason of that error.
     Fatal(RDKafkaErrorCode, String),
     /// The broker refused the principal, and refuses it again.
     Unauthorized,
@@ -170,20 +171,23 @@ where
     }
 }
 
-/// Sends `records` to `topic` in slice order and reports a prefix.
+/// Sends `records` to `topic` in slice order and reports a prefix, and sets
+/// `delivered` when the broker acknowledges any of them.
 ///
 /// Each record is enqueued before the next, and the delivery reports are
 /// awaited once the enqueueing is done, every one of them, so no record is
 /// in flight when the report returns. The first record that fails, as it is
 /// enqueued or on delivery, is the report's failure, and every record after
-/// it is unattempted whatever became of it: republishing from the failure
-/// keeps the order of records that share a key. A record that cannot be
-/// enqueued ends the enqueueing, so nothing after it is sent.
+/// it is unattempted whatever became of it: a republish from the failure
+/// stores copies of those records in slice order, after the stored records
+/// that came before the failure. A record that cannot be enqueued ends the
+/// enqueueing, so nothing after it is sent.
 pub(super) async fn publish_in_order<C>(
     producer: &FutureProducer<C>,
     topic: &str,
     records: Vec<BatchRecord>,
     label: &str,
+    delivered: &AtomicBool,
 ) -> BatchReport
 where
     C: ClientContext + 'static,
@@ -205,7 +209,10 @@ where
     let mut first = None;
     for (index, delivery) in deliveries.into_iter().enumerate() {
         let error = match delivery.await {
-            Ok(Ok(_)) => continue,
+            Ok(Ok(_)) => {
+                delivered.store(true, Ordering::Release);
+                continue;
+            }
             Ok(Err((error, _))) => SendFailure::of(producer, &error).into_error(label, 1, &error),
             Err(_canceled) => {
                 ShoveError::Connection(format!("{label}: the producer dropped the delivery report"))

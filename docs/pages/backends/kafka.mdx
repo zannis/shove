@@ -255,7 +255,7 @@ For topic provisioning, see [Declare topology](#declare-topology).
 
 `publish` and `publish_with_headers` send a record again after a transient failure, three sends in all, and then return `ShoveError::Connection`.
 An authorization error is returned at the first refusal as `ShoveError::Topology`.
-A fatal error librdkafka raised on the producer is returned as `ShoveError::Unknown` whatever its cause, including a principal that may not request a producer id; `is_retryable()` is false for both.
+A producer that librdkafka marked fatal returns `ShoveError::Unknown` whatever the cause, including a principal that may not request a producer id; `is_retryable()` is false for both.
 On a sequenced topic `publish_batch` sends the records in slice order and reports the first failure with every record after it, so re-publishing `to_republish()` keeps each key's order; see [Batch publishing](/guides/batch-publishing).
 
 ### Producer tuning
@@ -280,7 +280,10 @@ Unset throughput settings keep librdkafka's defaults.
 
 The client holds a single producer, built at the first publish.
 `publisher()` and the consumer's retry, defer, and DLQ republishes share it.
-A producer librdkafka raised a fatal error on refuses every record from then on, so the publish that meets the error fails and the next publish builds a new producer.
+A producer that librdkafka marked fatal refuses every record from then on, so the publish that meets the error fails and the client builds a new producer.
+It does so at the next publish when the dead producer had delivered a record.
+A producer that died before it delivered anything usually met a fault the next one meets too, such as a principal that may not request a producer id, so the client waits before it builds again: 1 s, doubling for each such producer in a row up to 60 s, and back to 1 s once a producer delivers.
+Until the wait is over every publish fails at once with the same `ShoveError::Unknown`, and no producer is built.
 A long linger also delays those republishes, and the offset commits gated on them for sequenced topics.
 Keep linger modest when consumers republish on the same client.
 
