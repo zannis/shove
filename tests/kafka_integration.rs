@@ -5698,10 +5698,11 @@ async fn lag_stats_provider_counts_only_the_records_above_a_raised_low_watermark
     use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
 
     const TOPIC: &str = "kafka-lag-raised-low-watermark";
+    let produced = [10i64, 6, 4];
+    let deleted_before = [7i64, 6, 0];
     let tb = TestBroker::start().await;
     provision_topic(tb.brokers(), TOPIC, 3).await;
 
-    let produced = [10usize, 6, 4];
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", tb.brokers())
         .create()
@@ -5723,15 +5724,12 @@ async fn lag_stats_provider_counts_only_the_records_above_a_raised_low_watermark
     }
     drop(producer);
 
-    // Partition 0 loses its first seven records, partition 1 all six, and
-    // partition 2 keeps its log from offset zero.
     let mut prefixes = TopicPartitionList::new();
-    prefixes
-        .add_partition_offset(TOPIC, 0, Offset::Offset(7))
-        .expect("delete before offset 7");
-    prefixes
-        .add_partition_offset(TOPIC, 1, Offset::Offset(6))
-        .expect("delete before offset 6");
+    for (partition, &before) in (0..).zip(&deleted_before) {
+        prefixes
+            .add_partition_offset(TOPIC, partition, Offset::Offset(before))
+            .expect("delete before the offset");
+    }
     let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
         .set("bootstrap.servers", tb.brokers())
         .create()
@@ -5753,7 +5751,10 @@ async fn lag_stats_provider_counts_only_the_records_above_a_raised_low_watermark
         })
         .collect();
     low_watermarks.sort_unstable();
-    assert_eq!(low_watermarks, [(0, 7), (1, 6)]);
+    assert_eq!(
+        low_watermarks,
+        (0..).zip(deleted_before).collect::<Vec<_>>()
+    );
 
     let stats = KafkaLagStatsProvider::new(tb.client())
         .get_queue_stats(
@@ -5764,8 +5765,15 @@ async fn lag_stats_provider_counts_only_the_records_above_a_raised_low_watermark
         .await
         .expect("lag from the raised start of the log");
 
-    // 3 retained on partition 0, none on partition 1, 4 on partition 2.
-    assert_eq!(stats.messages_pending, 7);
+    let retained: i64 = produced
+        .iter()
+        .zip(&deleted_before)
+        .map(|(produced, deleted)| produced - deleted)
+        .sum();
+    assert_eq!(
+        stats.messages_pending,
+        u64::try_from(retained).expect("a count of records")
+    );
 
     tb.broker().close().await;
 }
