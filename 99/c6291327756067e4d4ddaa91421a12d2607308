@@ -1,0 +1,19 @@
+tests/kafka_schema_registry_integration.rs
+  s_1001dc3147e1e5::t_d70607a40c0d89 833-835
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "99c6291327756067e4d4ddaa91421a12d2607308",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "unknown"
+      },
+      "human_author": null
+    }
+  }
+}
