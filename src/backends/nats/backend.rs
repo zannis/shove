@@ -315,7 +315,7 @@ impl RegistryImpl for NatsConsumerGroupRegistry {
             },
             Err(_) => {
                 tracing::warn!(
-                    timeout_ms = drain_timeout.as_millis() as u64,
+                    timeout_ms = u64::try_from(drain_timeout.as_millis()).unwrap_or(u64::MAX),
                     "drain timeout elapsed; aborting surviving consumer tasks"
                 );
                 self.abort_all_remaining_into(&mut tally).await;
