@@ -3119,11 +3119,11 @@ pub(super) const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(5);
 const COMMIT_FENCE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Test-only probe (see the `test-support` feature): the fence threshold the
-/// last concurrent receive loop started with, so a test can prove that a
-/// raised commit interval raised the threshold the loop judges commits by,
-/// and not only the helper the loop calls, and how many times a loop has
-/// found itself fenced. nextest runs each test in its own process, so the
-/// values belong to that test's consumers alone.
+/// last receive loop started with, concurrent or sequenced, so a test can
+/// prove that a raised commit interval raised the threshold the loop judges
+/// commits by, and not only the helper the loop calls, and how many times a
+/// loop has found itself fenced. nextest runs each test in its own process,
+/// so the values belong to that test's consumers alone.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod fence_probe {
@@ -3970,6 +3970,55 @@ impl CommitSlot {
         tracker.commit_rejected(&positions, discards, now);
         self.gate.mark_rejected(now);
     }
+
+    /// The commit step of a pass, the same in every loop that commits
+    /// through a slot: the concurrent receive loop, its permit wait, and a
+    /// sequenced consumer's pass and waits. It settles the answer of the
+    /// commit in flight if it came, applies the rebalance events, ends the
+    /// member with [`fenced_error`] once a partition's commits have been
+    /// rejected for `fence.threshold` with nothing resolving them (see
+    /// `OffsetTracker::fenced`), and then makes the commit the gate allows.
+    /// The events are applied before the commit, so a partition revoked
+    /// meanwhile is dropped with its completions and never committed by this
+    /// member.
+    ///
+    /// Under `CommitPolicy::PerRecord` the step makes no commit: that loop
+    /// commits through [`commit_confirmed`] and waits for the answer. The
+    /// `Ok` says whether the events held an assign, see
+    /// `OffsetTracker::apply_rebalance_events`.
+    fn pass(
+        &mut self,
+        consumer: &Arc<KafkaStreamConsumer>,
+        tracker: &mut OffsetTracker,
+        rebalance_rx: &std_mpsc::Receiver<RebalanceEvent>,
+        fence: Fence<'_>,
+        queue: &str,
+    ) -> Result<bool> {
+        self.settle_arrived(tracker, queue);
+        let assigned = tracker.apply_rebalance_events(rebalance_rx);
+        let now = Instant::now();
+        if let Some(partition) = tracker.fenced(now, fence.threshold) {
+            return Err(fenced_error(
+                queue,
+                fence.group_id,
+                partition,
+                fence.threshold,
+            ));
+        }
+        if !self.gate.per_record {
+            self.commit_due(consumer, tracker, queue, now);
+        }
+        Ok(assigned)
+    }
+}
+
+/// What the fenced consumer detector judges a loop's commits by, see
+/// [`CommitSlot::pass`]: the threshold, from [`fence_threshold_over`], and
+/// the group the member's error names.
+#[derive(Clone, Copy)]
+struct Fence<'a> {
+    threshold: Duration,
+    group_id: &'a str,
 }
 
 /// The answer of `in_flight`, or a future that never resolves when nothing
@@ -5286,9 +5335,8 @@ fn fenced_error(
 
 /// The receive loop's offset bookkeeping under `CommitPolicy::Interval`,
 /// lent to [`acquire_permit_while_polling`] so the wait does on every pass
-/// what a pass of the loop does: it takes in the completions and the answer
-/// of the commit in flight, applies the rebalance events, checks the fence
-/// and makes the commit the gate allows.
+/// what a pass of the loop does: it takes in the completions, then runs the
+/// commit step, see [`CommitSlot::pass`].
 struct IntervalCommits<'a> {
     tracker: &'a mut OffsetTracker,
     completion_rx: &'a mut mpsc::Receiver<Completion>,
@@ -5296,8 +5344,7 @@ struct IntervalCommits<'a> {
     // across the wait's awaits would make the future `!Send`.
     rebalance_rx: &'a mut std_mpsc::Receiver<RebalanceEvent>,
     slot: &'a mut CommitSlot,
-    fence_timeout: Duration,
-    group_id: &'a str,
+    fence: Fence<'a>,
 }
 
 impl IntervalCommits<'_> {
@@ -5305,18 +5352,8 @@ impl IntervalCommits<'_> {
         while let Ok(completion) = self.completion_rx.try_recv() {
             self.tracker.mark_complete(completion);
         }
-        self.slot.settle_arrived(self.tracker, queue);
-        self.tracker.apply_rebalance_events(self.rebalance_rx);
-        let now = Instant::now();
-        if let Some(partition) = self.tracker.fenced(now, self.fence_timeout) {
-            return Err(fenced_error(
-                queue,
-                self.group_id,
-                partition,
-                self.fence_timeout,
-            ));
-        }
-        self.slot.commit_due(consumer, self.tracker, queue, now);
+        self.slot
+            .pass(consumer, self.tracker, self.rebalance_rx, self.fence, queue)?;
         Ok(())
     }
 }
@@ -5552,6 +5589,9 @@ struct FifoLoop<T: Topic, H: MessageHandler<T>> {
     group_id: String,
     auto_offset_reset: KafkaAutoOffsetReset,
     max_poll_interval_ms: u32,
+    /// The fenced consumer detector's threshold, see [`fence_threshold_over`],
+    /// for the fixed default interval the loop commits on.
+    fence_timeout: Duration,
     shutdown: CancellationToken,
     processing: Arc<AtomicBool>,
     max_retries: u32,
@@ -5584,6 +5624,10 @@ struct FifoState {
     rebalance_rx: std_mpsc::Receiver<RebalanceEvent>,
     /// The commit gate and the one commit in flight, see [`CommitSlot`].
     commits: CommitSlot,
+    /// The fenced consumer detector's threshold, see [`fence_threshold_over`].
+    fence_timeout: Duration,
+    /// The member's group, which the fence's error names.
+    group_id: String,
     /// Whether the loop holds its assignment paused: a wait on the record in
     /// hand pauses it. The next pass resumes it.
     paused: bool,
@@ -5731,13 +5775,19 @@ async fn fifo_wait(
 }
 
 impl FifoState {
-    /// Applies the rebalance events librdkafka queued. After an assign the
-    /// assignment is resumed unless this loop holds it paused: librdkafka
-    /// keeps a partition's pause flag across a revoke, so a partition
-    /// revoked during a wait and handed back later arrives paused, and
-    /// nothing else would resume it.
+    /// Applies the rebalance events librdkafka queued, then the resume an
+    /// assign among them calls for, see
+    /// [`resume_after_assign`](Self::resume_after_assign).
     fn apply_rebalance_events(&mut self, consumer: &KafkaStreamConsumer) -> Result<()> {
         let assigned = self.tracker.apply_rebalance_events(&self.rebalance_rx);
+        self.resume_after_assign(consumer, assigned)
+    }
+
+    /// After an assign the assignment is resumed unless this loop holds it
+    /// paused: librdkafka keeps a partition's pause flag across a revoke, so
+    /// a partition revoked during a wait and handed back later arrives
+    /// paused, and nothing else would resume it.
+    fn resume_after_assign(&self, consumer: &KafkaStreamConsumer, assigned: bool) -> Result<()> {
         if assigned && !self.paused {
             consumer
                 .resume_assignment()
@@ -5759,11 +5809,12 @@ impl FifoState {
         Ok(())
     }
 
-    /// The answer of the commit in flight if it came, the rebalance events,
-    /// then the commit the gate allows: at the top of every pass, and on
-    /// every pass of a wait on the record in hand, so a position acked
-    /// before the wait and one a rebalance or a rejected commit re-offers
-    /// during it are committed however long the wait runs.
+    /// The commit step the standard consumer runs, see [`CommitSlot::pass`],
+    /// then the resume an assign among its rebalance events calls for: at
+    /// the top of every pass, and on every pass of a wait on the record in
+    /// hand, so a position acked before the wait and one a rebalance or a
+    /// rejected commit re-offers during it are committed however long the
+    /// wait runs.
     ///
     /// Commits are spaced as the standard consumer spaces them, at most once
     /// per `ASYNC_COMMIT_INTERVAL`, and made as it makes them under
@@ -5771,15 +5822,23 @@ impl FifoState {
     /// its own while the loop goes on, see [`CommitSlot`]. A discard rides
     /// the commit that retires its record and counts once the broker
     /// accepted it. A rejected commit is re-offered with its discards on a
-    /// later pass, for as long as rejections last: the sequenced consumer
-    /// has no fenced consumer detector. The commit in flight when the loop
-    /// stops is the stop's to settle.
+    /// later pass, and a streak of rejections nothing resolves fences the
+    /// member as it fences the standard consumer: the connection ends with
+    /// the error, and `run_with_reconnect` reconnects. The commit in flight
+    /// when the loop stops is the stop's to settle.
     fn commit_due(&mut self, consumer: &Arc<KafkaStreamConsumer>, queue: &str) -> Result<()> {
-        self.commits.settle_arrived(&mut self.tracker, queue);
-        self.apply_rebalance_events(consumer)?;
-        self.commits
-            .commit_due(consumer, &mut self.tracker, queue, Instant::now());
-        Ok(())
+        let fence = Fence {
+            threshold: self.fence_timeout,
+            group_id: &self.group_id,
+        };
+        let assigned = self.commits.pass(
+            consumer,
+            &mut self.tracker,
+            &self.rebalance_rx,
+            fence,
+            queue,
+        )?;
+        self.resume_after_assign(consumer, assigned)
     }
 
     /// The record in hand is finished with: acked, or dead-lettered with
@@ -5827,6 +5886,8 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
             tracker: OffsetTracker::with_assignments(self.queue.clone(), assignments),
             rebalance_rx,
             commits: CommitSlot::new(CommitPolicy::Interval(ASYNC_COMMIT_INTERVAL)),
+            fence_timeout: self.fence_timeout,
+            group_id: self.group_id.clone(),
             paused: false,
         };
         let ended = match consumer.subscribe(&[queue]) {
@@ -6615,26 +6676,27 @@ impl KafkaConsumer {
                 let tail_semaphore = semaphore.clone();
                 let tail_processing = processing.clone();
                 let ended: Result<()> = async move {
+                let fence = Fence {
+                    threshold: fence_timeout,
+                    group_id: &group_id,
+                };
                 loop {
-                    // Drain completed offsets, then apply any partition
-                    // assignment changes BEFORE committing: a revoked
-                    // partition's tracker (and any completions queued for it)
-                    // is dropped so this member never commits offsets for a
-                    // partition it no longer owns.
+                    // Completed offsets first, then the commit step, whose
+                    // rebalance events drop a revoked partition's tracker,
+                    // and the completions queued for it, before anything is
+                    // committed; under `Interval` the step makes the commit
+                    // too, see `CommitSlot::pass`.
                     while let Ok(completion) = completion_rx.try_recv() {
                         tracker.mark_complete(completion);
                     }
-                    commits.settle_arrived(&mut tracker, queue);
-                    let assigned = tracker.apply_rebalance_events(&rebalance_rx);
+                    let assigned =
+                        commits.pass(&consumer, &mut tracker, &rebalance_rx, fence, queue)?;
                     let now = Instant::now();
                     #[cfg(feature = "test-support")]
                     if per_record && assigned {
                         per_record_probe::RECONCILED_AT_TOP_OF_PASS.fetch_add(1, Ordering::SeqCst);
                     }
                     reconcile_pause_after_assign(&consumer, per_record, paused, assigned)?;
-                    if let Some(partition) = tracker.fenced(now, fence_timeout) {
-                        return Err(fenced_error(queue, &group_id, partition, fence_timeout));
-                    }
                     // The gate spaces commits out (see `ASYNC_COMMIT_INTERVAL`):
                     // ungated, this drain committed on nearly every iteration —
                     // roughly once per message at speed — piling up in-flight
@@ -6645,12 +6707,8 @@ impl KafkaConsumer {
                     // (dirty/quiet-drain accounting, pending discards) stay tied
                     // to actual commit offers. Only a drain that offered a
                     // commit consumes the window.
-                    if !per_record {
-                        // On a thread of its own, the loop going on meanwhile;
-                        // the answer is read back on a later pass, see
-                        // `CommitSlot`.
-                        commits.commit_due(&consumer, &mut tracker, queue, now);
-                    } else if commits.in_flight.is_none()
+                    if per_record
+                        && commits.in_flight.is_none()
                         && commits.gate.due(now)
                         && let Some(DrainedCommit {
                             tpl,
@@ -7273,13 +7331,12 @@ impl KafkaConsumer {
                                 // lasts, so the wait keeps polling, and commits
                                 // under `Interval`; see the helper.
                                 None => {
-                                    let commits = (!per_record).then(|| IntervalCommits {
+                                    let commits = (!per_record).then_some(IntervalCommits {
                                         tracker: &mut tracker,
                                         completion_rx: &mut completion_rx,
                                         rebalance_rx: &mut rebalance_rx,
                                         slot: &mut commits,
-                                        fence_timeout,
-                                        group_id: &group_id,
+                                        fence,
                                     });
                                     match acquire_permit_while_polling(
                                         &semaphore,
@@ -8120,7 +8177,9 @@ impl KafkaConsumer {
     /// Either `RetryStrategy` is accepted, and both retry in place. Offsets
     /// are committed at most every 500 ms, one commit at a time on a thread
     /// of its own while the consumer goes on, and once more at the stop. A
-    /// commit the coordinator rejects is re-offered.
+    /// commit the coordinator rejects is re-offered, and a member whose
+    /// commits keep being rejected with no rebalance resolving them is
+    /// treated as fenced and reconnects, as the standard consumer does.
     pub async fn run_fifo<T, H>(
         &self,
         handler: H,
@@ -8227,6 +8286,9 @@ impl KafkaConsumer {
             }
         };
         let max_poll_interval_ms = max_poll_interval_ms(&options);
+        let fence_timeout = fence_threshold_over(fence_floor(&options), ASYNC_COMMIT_INTERVAL);
+        #[cfg(feature = "test-support")]
+        fence_probe::record(fence_timeout);
         #[cfg(feature = "kafka-schema-registry")]
         let schema_accepted: Arc<[Arc<str>]> = options
             .schema_accepted_subjects
@@ -8245,6 +8307,7 @@ impl KafkaConsumer {
                 .kafka_auto_offset_reset
                 .unwrap_or(KafkaAutoOffsetReset::Earliest),
             max_poll_interval_ms,
+            fence_timeout,
             shutdown: options.shutdown.clone(),
             processing: options.processing.clone(),
             max_retries: options.max_retries,

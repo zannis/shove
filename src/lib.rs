@@ -405,7 +405,8 @@ pub mod kafka {
     pub use crate::backends::kafka::shutdown_commit_deadline_for_test;
 
     /// Test-only probe (see the `test-support` feature): the fence threshold
-    /// the last concurrent receive loop started with.
+    /// the last receive loop started with, concurrent or sequenced, and how
+    /// many times a loop has found itself fenced.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::fence_probe;

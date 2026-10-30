@@ -34,6 +34,9 @@
 //! are shove-owned, because a republish writes into its topic, and are
 //! created through the mock API as well.
 //!
+//! The final section runs a sequenced consumer against the same mock: a
+//! streak of rejected commits fences it, and it reconnects.
+//!
 //! `test-support` gates the seams this file reads; both Kafka coverage rows
 //! enable it, so the suite runs in each.
 
@@ -60,7 +63,6 @@ use rdkafka::producer::{
 use rdkafka::types::{RDKafkaApiKey, RDKafkaMockCluster, RDKafkaRespErr};
 use rdkafka::{ClientConfig, Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
-use shove::ShoveError;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
 use shove::consumer_group::ConsumerGroupConfig;
@@ -74,7 +76,8 @@ use shove::markers::Kafka;
 use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
 use shove::topic::Topic;
-use shove::topology::TopologyBuilder;
+use shove::topology::{SequenceFailure, TopologyBuilder};
+use shove::{SequencedTopic, ShoveError};
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -3720,4 +3723,130 @@ async fn a_completion_after_a_fault_is_not_counted_as_refused() {
         0,
         "B's completion after the loop ended is not counted as refused"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The sequenced consumer's commit answers
+// ---------------------------------------------------------------------------
+
+const SEQUENCED_TOPIC: &str = "kafka-commit-policy-mock-sequenced";
+const SEQUENCED_DLQ: &str = "kafka-commit-policy-mock-sequenced-dlq";
+/// The group a sequenced consumer of the topic joins: `{queue}-fifo`.
+const SEQUENCED_GROUP: &str = "kafka-commit-policy-mock-sequenced-fifo";
+
+shove::define_sequenced_topic!(
+    SequencedOrders,
+    Order,
+    |order: &Order| order.id.clone(),
+    TopologyBuilder::new(SEQUENCED_TOPIC)
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_millis(50))
+        .dlq()
+        .build()
+);
+
+/// One mock broker with the sequenced topic and its DLQ created as well,
+/// and `ids` produced onto the topic.
+async fn sequenced_mock(ids: &[&str]) -> (Mock, String) {
+    let mock = Mock::start();
+    for topic in [SEQUENCED_TOPIC, SEQUENCED_DLQ] {
+        mock.api()
+            .create_topic(topic, 1, 1)
+            .expect("create the topic through the mock API");
+    }
+    let bootstrap = mock.bootstrap();
+    produce_on(&bootstrap, SEQUENCED_TOPIC, ids).await;
+    (mock, bootstrap)
+}
+
+/// Starts one sequenced member on the topic through
+/// `KafkaConsumerGroup::new_fifo`, whose config carries the fence floor
+/// seam, and returns the group and the token that stops it.
+async fn start_sequenced_group(
+    bootstrap: &str,
+    handler: &Recorder,
+    fence_floor: Duration,
+) -> (KafkaConsumerGroup, CancellationToken) {
+    let token = CancellationToken::new();
+    let h = handler.clone();
+    let mut group = KafkaConsumerGroup::new_fifo::<SequencedOrders, _>(
+        SEQUENCED_TOPIC,
+        connect(bootstrap).await,
+        KafkaConsumerGroupConfig::new(1..=1).with_commit_fence_floor_for_test(fence_floor),
+        token.clone(),
+        move || h.clone(),
+        (),
+    );
+    group.start();
+    (group, token)
+}
+
+/// A sequenced member whose commits keep being rejected, with no rebalance
+/// resolving them, is fenced and reconnects, as the standard consumer is.
+/// Every OffsetCommit is refused, so the streak the first rejection starts
+/// never clears; at the threshold the member reconnects, and the new
+/// connection is handed the first record again from the position nothing
+/// committed past. The floor is lowered through the group config's test
+/// seam, and the sequenced consumer's fixed 500 ms interval keeps the
+/// threshold at it.
+#[tokio::test]
+async fn a_sequenced_member_whose_commits_keep_being_rejected_is_fenced() {
+    const FLOOR: Duration = Duration::from_secs(5);
+    let (mock, bootstrap) = sequenced_mock(&["o1", "o2"]).await;
+    mock.track_requests();
+    mock.reject_commits(512);
+
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let (mut group, token) = start_sequenced_group(&bootstrap, &handler, FLOOR).await;
+    wait_until(
+        || handler.count() == 2,
+        DELIVERY_TIMEOUT,
+        "both records reaching the handler",
+    )
+    .await;
+    let first_delivery = handler.deliveries()[0].at;
+
+    wait_until(
+        || fence_probe::fired() >= 1,
+        FLOOR + DELIVERY_TIMEOUT,
+        "the fence firing on the rejected streak",
+    )
+    .await;
+    assert_eq!(
+        fence_probe::last_threshold(),
+        Some(FLOOR),
+        "the sequenced consumer judges rejected commits by the floor"
+    );
+    wait_until(
+        || handler.count() >= 3,
+        DELIVERY_TIMEOUT,
+        "the reconnected member receiving the first record again",
+    )
+    .await;
+    let until_fence = handler.deliveries()[2]
+        .at
+        .saturating_duration_since(first_delivery);
+    assert!(
+        until_fence >= FLOOR,
+        "the fence waits out its floor, fired after {until_fence:?}"
+    );
+    assert_eq!(
+        handler.ids()[..3],
+        ["o1", "o2", "o1"],
+        "the reconnect replays from the position nothing committed past"
+    );
+    assert!(
+        mock.offset_commit_requests() >= 3,
+        "the rejected commit was re-offered before the fence, requests: {}",
+        mock.offset_commit_requests()
+    );
+    assert_eq!(
+        committed_position_on(&bootstrap, SEQUENCED_TOPIC, SEQUENCED_GROUP, 0).await,
+        None,
+        "no commit was accepted"
+    );
+
+    token.cancel();
+    group.shutdown().await;
 }

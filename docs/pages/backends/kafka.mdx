@@ -513,7 +513,9 @@ Offsets are committed at most every 500 ms, the standard consumer's default inte
 That goes on during a hold, a dead-letter retry and a schema registry stall, so the positions acked before the wait, and the ones a rebalance or a rejected commit re-offers during it, are committed however long the wait runs.
 No commit passes the record being waited on.
 A commit the coordinator rejects is re-offered, and a record discarded with no DLQ counts only once the broker accepted the commit that retires it.
-A sequenced member whose commits keep being rejected keeps re-offering them: it has no fenced consumer detector.
+A sequenced member whose commits keep being rejected, none accepted and no rebalance resolving them, is treated as fenced and reconnects, as the standard consumer does.
+Its threshold is the 60 s floor, because its interval is fixed at 500 ms.
+The reconnect hands it the records again from the position the broker last accepted.
 On a stop the consumer commits its final position synchronously and closes, as the standard consumer does; see [Offset commit semantics](#offset-commit-semantics).
 
 See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced example](/backends/kafka/examples/sequenced) for a runnable walkthrough.

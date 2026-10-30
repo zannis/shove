@@ -509,11 +509,11 @@ impl KafkaConsumerGroupConfig {
         self
     }
 
-    /// Test-only seam (see the `test-support` feature): judge the group's
-    /// concurrent members' rejected commits by this floor instead of the
-    /// pinned sixty seconds, so a test can watch the fenced consumer
-    /// detector fire in seconds. The threshold still grows with the commit
-    /// interval above the floor.
+    /// Test-only seam (see the `test-support` feature): judge the rejected
+    /// commits of the group's members, concurrent and sequenced, by this
+    /// floor instead of the pinned sixty seconds, so a test can watch the
+    /// fenced consumer detector fire in seconds. The threshold still grows
+    /// with the commit interval above the floor.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn with_commit_fence_floor_for_test(mut self, floor: Duration) -> Self {
