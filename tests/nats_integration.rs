@@ -5917,6 +5917,11 @@ async fn supervisor_workers_are_not_capped_by_one_prefetch() {
         peak >= 6,
         "{WORKERS} workers at prefetch {PREFETCH} ran at most {peak} handlers at once"
     );
+    let bound = u32::try_from(WORKERS).unwrap() * u32::from(PREFETCH);
+    assert!(
+        peak <= bound,
+        "{WORKERS} workers at prefetch {PREFETCH} ran {peak} handlers at once, past their {bound} slots"
+    );
     assert_eq!(
         durable_max_ack_pending(&client, "nats-fleet", "nats-fleet-consumer").await,
         -1,

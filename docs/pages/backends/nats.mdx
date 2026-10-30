@@ -177,6 +177,9 @@ Each worker bounds its own in-flight work: a group member, or a consumer started
 It holds `prefetch_count` slots with concurrent processing on and one without, and a prefetch of zero is lowered to one.
 Each pull asks JetStream for as many messages as the worker has free slots, so every message it is delivered starts at once.
 None waits on the client while its `ack_wait` runs, and a slow handler or a long hold does not get the messages behind it redelivered.
+A worker keeps up to two pulls open, each for slots that are free, so a pull for the slots its handlers free is under way while the earlier pull's messages are still arriving or running.
+A worker with a single slot, which is every sequential member and any prefetch of one, pulls each message once the one before it is settled, and so pays one pull round trip per message.
+Concurrent processing with a larger prefetch restores pipelining.
 
 The durable a group or a consumer creates therefore has no ack budget of its own: `max_ack_pending` is `-1` unless `with_max_ack_pending` sets a cap.
 Workers attached to one durable, from any number of processes, each keep up to their own prefetch in flight, and a cap is shared by all of them.
