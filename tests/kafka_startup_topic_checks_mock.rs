@@ -737,8 +737,8 @@ async fn shutdown_with_unreachable_broker_does_not_block_runtime() {
 }
 
 /// `run_until_timeout` races the caller's signal against the broker's own
-/// cancellation. When the broker wins, the signal task is aborted and awaited
-/// instead of being left running with nobody to read its result.
+/// cancellation. When the broker wins, the signal task is aborted and awaited,
+/// and the signal future is gone when the call returns.
 #[tokio::test]
 async fn run_until_timeout_aborts_signal_task() {
     let mock = mock_with(&[]);

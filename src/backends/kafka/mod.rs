@@ -79,7 +79,7 @@ pub use consumer::per_record_probe;
 
 /// Test-only seam (see the `test-support` feature): the topic a `ping` asks
 /// the broker about, so a test that looks for it in the cluster reads the
-/// constant itself rather than a hand-copied name.
+/// constant itself.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn ping_probe_topic_for_test() -> &'static str {

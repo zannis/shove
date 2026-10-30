@@ -788,10 +788,11 @@ impl KafkaClient {
         self.shutdown_token.clone()
     }
 
-    /// Liveness check. Issues a single metadata request, for one probe topic
-    /// and never for all of them, on the metadata consumer `connect` built. Any answer from a broker shows the cluster is
-    /// reachable, so the probe topic's own error is not looked at. No new
-    /// socket, no consumer-group churn, no producer, and no topic created.
+    /// Liveness check. Issues a single metadata request that names one probe
+    /// topic, on the metadata consumer `connect` built. Any answer from a
+    /// broker shows the cluster is reachable, so the probe topic's own error
+    /// is not looked at. No new socket, no consumer-group churn, no producer,
+    /// and no topic created.
     ///
     /// Returns `Err(ShoveError::Connection)` if the client is shut down, the
     /// metadata fetch fails, or `spawn_blocking` itself fails.
@@ -1538,7 +1539,7 @@ where
 }
 
 /// Test-only seam: run the exact admin OAUTHBEARER priming path
-/// ([`prime_admin_oauth_token`]) against a caller-supplied admin client and
+/// (`prime_admin_oauth_token`) against a caller-supplied admin client and
 /// context. Exists because MSK IAM's presigned-URL tokens cannot be validated
 /// without real AWS, so the integration test substitutes an unsecured-JWT
 /// context to exercise this code path against a local OAUTHBEARER broker.
@@ -2436,7 +2437,7 @@ mod tests {
 
     /// Leader election trails a topic's creation, and a declarer that lost
     /// the creation race reads the topic in that window: LEADER_NOT_AVAILABLE
-    /// is retried, not trusted, so the answer comes after the error clears.
+    /// is read again until it clears, so the answer comes after the error does.
     #[tokio::test]
     async fn ensure_partitions_waits_out_a_leader_not_available_answer() {
         const CLEARS_AFTER: Duration = Duration::from_millis(1500);

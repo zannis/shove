@@ -174,7 +174,7 @@ impl KafkaTopologyDeclarer {
         self
     }
 
-    /// Sets `retention.ms` from a [`Duration`]. Sugar for
+    /// Sets `retention.ms` from a [`Duration`](std::time::Duration). Sugar for
     /// [`with_topic_config`](Self::with_topic_config).
     ///
     /// # Panics
