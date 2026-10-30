@@ -509,10 +509,11 @@ A dead letter that can never be published is not tried again, because trying it 
 That is a dead letter past the producer's `message.max.bytes`, or one the broker refuses as too large or as invalid.
 The record is discarded and committed, an error is logged, `messages_discarded_total` counts it, and the consumer goes on to the next record.
 
-Offsets are committed asynchronously at most every 500 ms, the standard consumer's default interval.
-That goes on during a hold, a dead-letter retry and a schema registry stall, so the positions acked before the wait, and the ones a rebalance re-offers during it, are committed however long the wait runs.
+Offsets are committed at most every 500 ms, the standard consumer's default interval, and the same way: one commit at a time, synchronously on a thread of its own, while the consumer goes on.
+That goes on during a hold, a dead-letter retry and a schema registry stall, so the positions acked before the wait, and the ones a rebalance or a rejected commit re-offers during it, are committed however long the wait runs.
 No commit passes the record being waited on.
-A commit that retires a record discarded with no DLQ is made synchronously, on a thread of its own, so the discard counts only once the broker accepted it.
+A commit the coordinator rejects is re-offered, and a record discarded with no DLQ counts only once the broker accepted the commit that retires it.
+A sequenced member whose commits keep being rejected keeps re-offering them: it has no fenced consumer detector.
 On a stop the consumer commits its final position synchronously and closes, as the standard consumer does; see [Offset commit semantics](#offset-commit-semantics).
 
 See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced example](/backends/kafka/examples/sequenced) for a runnable walkthrough.
@@ -562,13 +563,16 @@ Either way the failed copy counts once per delivery in `shove_messages_failed_to
 A revoke of the record's partition during the delay ends it with nothing published.
 The partition's next owner is handed the record again from the committed offset.
 
-Under `CommitPolicy::Interval`, the default, completions are tracked in memory per partition and committed **asynchronously, at most once per commit interval**.
+Under `CommitPolicy::Interval`, the default, completions are tracked in memory per partition and committed **at most once per commit interval, one commit at a time**.
 The interval is 500 ms by default, configurable with `with_commit_interval` on `KafkaConsumerGroupConfig` or `ConsumerOptions::<Kafka>`.
-The gate keeps the number of in-flight commits O(1) however fast the consumer runs.
+Each commit runs synchronously on a thread of its own, so it never blocks the runtime thread, and the consumer goes on handling records while it runs and reads the answer back.
+rdkafka 0.39 reports nothing back for an asynchronous commit: it sets no `offset_commit_cb`, so the result reaches no callback (bundled librdkafka 2.12.1, `rdkafka_offset.c:387-403`, `rdkafka_cgrp.c:3871-3908`).
+The next commit is made only once the last one's answer is in, so one commit is in flight however fast the consumer runs.
 A longer interval trades coordinator requests for a wider replay window.
-A commit the coordinator rejects is re-offered on a later drain.
-A consumer whose commits keep being rejected with no rebalance resolving them is treated as fenced and reconnects.
-That threshold grows with the interval, because the streak can only clear on a drain.
+A commit the coordinator rejects is re-offered an interval after the rejection, with any discard that rode on it, and the consumer keeps polling in between, so a rebalance behind a `REBALANCE_IN_PROGRESS` can complete.
+A rejection never ends the member by itself.
+A consumer whose commits keep being rejected, none accepted and no rebalance resolving them, is treated as fenced and reconnects.
+That threshold grows with the interval, because a rejected position is re-offered only once per interval.
 
 Under `CommitPolicy::PerRecord`, set with `with_commit_policy` on the same two configs, every completion is committed at once.
 The next record is handed out only once the coordinator has accepted that commit.
@@ -635,8 +639,8 @@ On shutdown the consumer first waits for its in-flight handlers to finish.
 That wait is bounded by the handler timeout.
 An in-place delay does not extend it: shutdown cuts the delay short, and the record stays uncommitted.
 It then drains the republish queue and commits its final position **synchronously**.
-That commit carries every partition's current position, whether or not an earlier asynchronous commit already offered it.
-It therefore offers every safe position, including one an asynchronous commit still in flight may not have landed.
+That commit carries every partition's current position, whether or not an earlier commit already offered it.
+It therefore offers every safe position, including one a rejected commit left to re-offer.
 Only the broker's answer confirms them.
 The commit runs on a dedicated thread that also owns the consumer's close.
 The thread is spawned before it is handed the consumer, so a failed spawn never closes the consumer on the runtime thread.
@@ -647,7 +651,7 @@ Once the process exits, the broker drops the member after the session timeout, a
 The consumer waits for at most 20 s (`SHUTDOWN_COMMIT_DEADLINE` in `kafka::constants`).
 That wait covers the commit and the close that follows it on the same thread, and the thread reports the two separately.
 A close that outlives the deadline is logged at warn level and is never reported as a failed commit.
-Under `CommitPolicy::PerRecord` a commit in flight when shutdown fires is waited for first, for at most three quarters of that deadline.
+A commit in flight when shutdown fires is waited for first, for at most three quarters of that deadline, under either commit policy and on a sequenced consumer.
 If it is accepted, the final commit carries the position again, as every final commit does.
 If it is rejected, the final commit re-offers its position.
 If it has no answer in time, the stop ends with `ShoveError::Commit` of the `Deadline` kind carrying that share, and issues no second commit.
@@ -656,7 +660,7 @@ The deadline is chosen against the 30 s termination grace Kubernetes gives a Pod
 The thread finishes on its own and never holds the runtime or the process, so a frozen coordinator cannot turn a deploy into a `SIGKILL`.
 
 A final commit the broker does not confirm ends the member with `ShoveError::Commit` instead of a clean exit.
-The error reads `offset commit at shutdown`, because under `CommitPolicy::PerRecord` the commit it names can be the one in flight when the stop landed.
+The error reads `offset commit at shutdown`, because the commit it names can be the one in flight when the stop landed.
 The error names the topic, the position the commit carried per partition, and a `CommitFailure`.
 `Rejected` carries the error the commit returned: the broker's answer, or a librdkafka local error.
 A broker's answer says this commit did not land.
@@ -664,7 +668,7 @@ A local timeout after the request was sent does not prove that, because the brok
 `Deadline` means nothing answered within the time it carries, normally the 20 s deadline.
 `NoThread` means no thread could be spawned for the commit, so this commit was never made.
 `Deadline` says its result is unknown, because the detached thread may still land it.
-Redelivery then starts from the last position the broker accepted for each partition, which an earlier asynchronous commit may have advanced.
+Redelivery then starts from the last position the broker accepted for each partition, which an earlier commit may have advanced.
 The error carries positions and the error text only, never a record's payload, key or headers.
 A consumer group counts the error once under `SupervisorOutcome::errors`, so `exit_code()` is 1 where it was 0 in 0.15.0.
 A sequenced member now makes the same final commit, so a final commit the broker refuses ends it with `ShoveError::Commit` too, where it ended clean in 0.16.0.
@@ -698,7 +702,7 @@ What that means for replay:
   A record whose handler had not settled when shutdown fired stays uncommitted and is redelivered.
   A record the consumer had fetched but not yet handed to a handler is not handled during the drain, and is redelivered too.
   When the final commit is rejected or hits its deadline, redelivery starts from the last position the broker accepted, and the member reports that with `ShoveError::Commit`.
-  An asynchronous commit librdkafka was still retrying can also land after the final one.
+  A commit request librdkafka abandoned on a coordinator reconnect can also be applied after the final one, as the commit section above describes.
   A coordinator hiccup overlapping the shutdown can therefore replay a few records.
 
 `Outcome::Reject` routes to the DLQ (if configured) and commits the offset; the original is not redelivered. Messages that exhaust `max_retries` follow the same DLQ-then-commit path.
