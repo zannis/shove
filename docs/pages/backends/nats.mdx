@@ -107,6 +107,7 @@ A `Retry` spends `max_retries` in every case, so the usual DLQ routing applies o
 NATS logs no warning for a `Retry` or a `Defer` without hold queues.
 Building a topology that declares a DLQ and no hold queues logs one warning at build time, which links to [With no hold queues](/concepts/outcomes#with-no-hold-queues).
 That page lists the fallback of every backend.
+A sequenced topology and one that calls `allow_message_loss()` get no such warning.
 
 ## Stream management
 
