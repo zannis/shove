@@ -4481,35 +4481,79 @@ async fn shrink_duplicate_window(client: &NatsClient, stream: &str, window: Dura
         .expect("the duplicate window is mutable");
 }
 
+/// Waits until the durable `consumer` exists on `stream`, so a test can start
+/// a clock only once the consumer is ready to take deliveries.
+async fn wait_for_durable(client: &NatsClient, stream: &str, consumer: &str) {
+    let stream = client
+        .jetstream()
+        .get_stream(stream)
+        .await
+        .expect("the stream exists");
+    let deadline = Instant::now() + TIMEOUT;
+    while stream.consumer_info(consumer).await.is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the durable {consumer} was never created"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Polls `stream`'s message count until it is `expected` or `TIMEOUT` passes,
+/// and returns the last count seen.
+async fn settle_stream_messages(client: &NatsClient, stream: &str, expected: u64) -> u64 {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let messages = stream_messages(client, stream).await;
+        if messages == expected || Instant::now() >= deadline {
+            return messages;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The sequence of the last message `stream` ever stored.
+async fn stream_last_sequence(client: &NatsClient, stream: &str) -> u64 {
+    let mut stream = client
+        .jetstream()
+        .get_stream(stream)
+        .await
+        .expect("the stream exists");
+    stream
+        .info()
+        .await
+        .expect("stream info")
+        .state
+        .last_sequence
+}
+
+/// Rejects every message and counts how often it was asked.
+struct CountingReject(WaitableCounter);
+
+impl MessageHandler<WorkTopic> for CountingReject {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.0.increment();
+        Outcome::Reject
+    }
+}
+
 /// A dead letter's id can be predicted, so anyone able to publish to the DLQ
 /// subject can store a message under it first. JetStream then answers the
 /// real dead letter with a duplicate PubAck, which counts only once the stored
 /// message proves to be the same copy. The impostor is not, so the original
-/// stays un-acked while it holds the id, and dead-letters once the duplicate
-/// window lets the real copy through.
+/// stays un-acked while it holds the id, is redelivered a second apart rather
+/// than at once, and dead-letters once the duplicate window lets the real copy
+/// through.
 #[tokio::test]
 async fn impostor_under_a_dead_letter_id_does_not_retire_the_original() {
-    struct CountingReject(WaitableCounter);
-
-    impl MessageHandler<WorkTopic> for CountingReject {
-        type Context = ();
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
-            self.0.increment();
-            Outcome::Reject
-        }
-    }
+    const WINDOW: Duration = Duration::from_secs(6);
 
     let tb = TestBroker::start().await;
     let broker = tb.broker();
     let client = tb.client();
     broker.topology().declare::<WorkTopic>().await.unwrap();
-    shrink_duplicate_window(&client, "nats-work-dlq", Duration::from_secs(5)).await;
-
-    let mut impostor = async_nats::HeaderMap::new();
-    impostor.insert(NATS_MESSAGE_ID, "nats-work.nats-work-consumer.1-dlq");
-    raw_publish(&client, "nats-work-dlq", impostor, b"impostor").await;
-    let payload = simple_payload("held-off");
-    raw_publish(&client, "nats-work", async_nats::HeaderMap::new(), &payload).await;
+    shrink_duplicate_window(&client, "nats-work-dlq", WINDOW).await;
 
     let rejects = WaitableCounter::new();
     let handler = CountingReject(rejects.clone());
@@ -4527,6 +4571,14 @@ async fn impostor_under_a_dead_letter_id_does_not_retire_the_original() {
             )
             .await
     });
+    // The window starts with the impostor's publish, so the consumer is up first.
+    wait_for_durable(&client, "nats-work", "nats-work-consumer").await;
+
+    let mut impostor = async_nats::HeaderMap::new();
+    impostor.insert(NATS_MESSAGE_ID, "nats-work.nats-work-consumer.1-dlq");
+    raw_publish(&client, "nats-work-dlq", impostor, b"impostor").await;
+    let payload = simple_payload("held-off");
+    raw_publish(&client, "nats-work", async_nats::HeaderMap::new(), &payload).await;
 
     assert!(
         rejects.wait_for(2, TIMEOUT).await,
@@ -4556,6 +4608,169 @@ async fn impostor_under_a_dead_letter_id_does_not_retire_the_original() {
     assert_eq!(
         header(real, "Shove-Copy-Of"),
         Some("nats-work.nats-work-consumer.1")
+    );
+    // Each refused attempt waits a second before its redelivery, so the
+    // window holds at most one delivery per second plus the final one.
+    let runs = rejects.get();
+    assert!(
+        runs <= 8,
+        "the held original ran {runs} times in a {WINDOW:?} window: it is redelivered at once"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// The other side of the read-back check: a crash between a dead letter's
+/// publish and its original's ack leaves the dead letter stored, and the
+/// redelivered original's publish comes back as a duplicate of it. That
+/// stored copy is the one this delivery would publish, so it is confirmed:
+/// the original is acked after one delivery and the DLQ keeps a single copy.
+#[tokio::test]
+async fn a_stored_dead_letter_of_the_same_delivery_retires_the_original() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    let payload = simple_payload("already-dead");
+    let mut copy = async_nats::HeaderMap::new();
+    copy.insert("Shove-Death-Reason", "rejected");
+    copy.insert("Shove-Original-Queue", "nats-work");
+    copy.insert("Shove-Death-Count", "1");
+    copy.insert("Shove-Copy-Of", "nats-work.nats-work-consumer.1");
+    copy.insert(NATS_MESSAGE_ID, "nats-work.nats-work-consumer.1-dlq");
+    raw_publish(&client, "nats-work-dlq", copy, &payload).await;
+    raw_publish(&client, "nats-work", async_nats::HeaderMap::new(), &payload).await;
+
+    let rejects = WaitableCounter::new();
+    let handler = CountingReject(rejects.clone());
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    assert_eq!(
+        settle_stream_messages(&client, "nats-work", 0).await,
+        0,
+        "the original is acked once its stored dead letter is confirmed"
+    );
+    assert_eq!(rejects.get(), 1, "the original is handled once");
+    assert_eq!(
+        stream_messages(&client, "nats-work-dlq").await,
+        1,
+        "the DLQ keeps a single copy"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+shove::define_topic!(
+    HoldTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-hold")
+        .hold_queue(Duration::from_secs(3))
+        .dlq()
+        .build()
+);
+
+/// The hold path's side of the read-back check: the retry copy this delivery
+/// would publish is already stored, as after a crash between the copy's
+/// publish and the original's ack. The copy's publish comes back as a
+/// duplicate of it, the read-back confirms it, and the original is acked
+/// without a second copy.
+#[tokio::test]
+async fn a_stored_retry_copy_of_the_same_delivery_retires_the_original() {
+    #[derive(Clone)]
+    struct RetryOnceThenAck {
+        seen: Arc<Mutex<Vec<(u32, String)>>>,
+        counter: WaitableCounter,
+    }
+
+    impl MessageHandler<HoldTopic> for RetryOnceThenAck {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+            let first = meta.retry_count == 0;
+            self.seen
+                .lock()
+                .await
+                .push((meta.retry_count, meta.delivery_id));
+            self.counter.increment();
+            if first { Outcome::Retry } else { Outcome::Ack }
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<HoldTopic>().await.unwrap();
+    let payload = simple_payload("already-copied");
+    raw_publish(&client, "nats-hold", async_nats::HeaderMap::new(), &payload).await;
+
+    let handler = RetryOnceThenAck {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        counter: WaitableCounter::new(),
+    };
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<HoldTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(3)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the original is retried"
+    );
+    // The original is now held for 3 s. Store its copy first, as a publish
+    // whose ack was lost would have.
+    let mut copy = async_nats::HeaderMap::new();
+    copy.insert("Shove-Retry-Count", "1");
+    copy.insert("Shove-Copy-Of", "nats-hold.nats-hold-consumer.1");
+    copy.insert(NATS_MESSAGE_ID, "nats-hold.nats-hold-consumer.1-r1");
+    raw_publish(&client, "nats-hold", copy, &payload).await;
+
+    assert_eq!(
+        settle_stream_messages(&client, "nats-hold", 0).await,
+        0,
+        "the original and its copy are both acked"
+    );
+    let seen = handler.seen.lock().await.clone();
+    assert_eq!(
+        seen,
+        [
+            (0, String::new()),
+            (1, "nats-hold.nats-hold-consumer.1-r1".to_string()),
+        ],
+        "the original once, then its single copy"
+    );
+    assert_eq!(
+        stream_last_sequence(&client, "nats-hold").await,
+        2,
+        "the copy's own publish stored nothing new"
     );
 
     shutdown.cancel();
