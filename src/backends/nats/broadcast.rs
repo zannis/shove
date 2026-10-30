@@ -88,15 +88,17 @@ const BROADCAST_INACTIVE_THRESHOLD: Duration = Duration::from_secs(30);
 /// How many messages the delivery loop sets aside while a handler runs. The
 /// loop reads the stream behind the message it handles so the consumer keeps
 /// pulling, and it stops at this many, or at [`MAX_READ_AHEAD_BYTES`] of
-/// payload, whichever comes first: from then on the consumer pulls again only
-/// once the handler is done, as it does with no read-ahead at all.
+/// message bytes, whichever comes first: from then on the consumer pulls again
+/// only once the handler is done, as it does with no read-ahead at all.
 const MAX_READ_AHEAD: usize = 1_024;
 
-/// How many payload bytes the delivery loop sets aside while a handler runs.
-/// Reading stops once the messages set aside add up to this, so a few large
-/// messages cannot fill the memory that [`MAX_READ_AHEAD`] small ones would
-/// leave alone. The message that takes the total past it is kept, so the loop
-/// holds this and at most one message more.
+/// How many bytes of messages the delivery loop sets aside while a handler
+/// runs, counted at their length on the wire: headers, payload, subject and
+/// reply. Reading stops once the messages set aside add up to this, so a few
+/// large messages, or messages with large headers and no payload, cannot fill
+/// the memory that [`MAX_READ_AHEAD`] small ones would leave alone. The message
+/// that takes the total past it is kept, so the loop holds this and at most one
+/// message more.
 const MAX_READ_AHEAD_BYTES: usize = 4 * 1024 * 1024;
 
 /// How many times the awaited teardown asks the server to delete the consumer
@@ -372,7 +374,7 @@ where
 /// [`BROADCAST_INACTIVE_THRESHOLD`] passes with no request. So while a handler
 /// runs, or a `Defer` waits, the loop goes on reading the stream and sets the
 /// messages aside, up to [`MAX_READ_AHEAD`] of them and [`MAX_READ_AHEAD_BYTES`]
-/// of payload, for the loop to handle in order afterwards.
+/// of message bytes, for the loop to handle in order afterwards.
 ///
 /// Every message is gated by `max_message_size` as it is read, before it can
 /// be set aside, so a message over the limit is never held.
@@ -383,7 +385,7 @@ struct Intake<S> {
     max_message_size: Option<usize>,
     /// Taken off the stream while a handler ran, oldest first.
     ahead: VecDeque<Message>,
-    /// The payload bytes of `ahead`.
+    /// The wire bytes of `ahead`: headers, payload, subject and reply.
     ahead_bytes: usize,
     /// How the stream ended while a handler ran, reported once `ahead` is
     /// handled.
@@ -427,12 +429,12 @@ where
     /// The oldest message set aside, with its bytes no longer counted.
     fn take_aside(&mut self) -> Option<Message> {
         let msg = self.ahead.pop_front()?;
-        self.ahead_bytes = self.ahead_bytes.saturating_sub(msg.payload.len());
+        self.ahead_bytes = self.ahead_bytes.saturating_sub(msg.length);
         Some(msg)
     }
 
     fn set_aside(&mut self, msg: Message) {
-        self.ahead_bytes = self.ahead_bytes.saturating_add(msg.payload.len());
+        self.ahead_bytes = self.ahead_bytes.saturating_add(msg.length);
         self.ahead.push_back(msg);
     }
 
@@ -492,8 +494,8 @@ where
 
     /// Runs `work`, reading the stream meanwhile so the consumer keeps pulling
     /// for as long as it runs. Stops reading when [`MAX_READ_AHEAD`] messages
-    /// or [`MAX_READ_AHEAD_BYTES`] of payload are set aside, or the stream has
-    /// ended, and finishes `work` all the same.
+    /// or [`MAX_READ_AHEAD_BYTES`] of message bytes are set aside, or the stream
+    /// has ended, and finishes `work` all the same.
     async fn reading_during<F: Future>(&mut self, work: F) -> F::Output {
         let mut work = std::pin::pin!(work);
         while self.has_room() {
@@ -725,6 +727,41 @@ mod tests {
         }
     }
 
+    /// A message with no payload and `header_bytes` of headers.
+    fn header_heavy(context: &Context, header_bytes: usize) -> Message {
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("Bulk", "x".repeat(header_bytes));
+        Message {
+            message: async_nats::Message {
+                subject: "orders".into(),
+                reply: None,
+                payload: Bytes::new(),
+                headers: Some(headers),
+                status: None,
+                description: None,
+                length: "orders".len() + header_bytes,
+            },
+            context: context.clone(),
+        }
+    }
+
+    /// A stream of messages that never ends, each made by `make`, and the
+    /// count of those it has handed out.
+    fn endless_of(
+        make: impl Fn() -> Message,
+    ) -> (
+        impl Stream<Item = std::result::Result<Message, String>> + Unpin,
+        Arc<AtomicUsize>,
+    ) {
+        let produced = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&produced);
+        let messages = stream::iter(std::iter::from_fn(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Some(Ok(make()))
+        }));
+        (messages, produced)
+    }
+
     /// A stream of messages that never ends, each of `size` bytes, and the
     /// count of those it has handed out.
     fn endless(
@@ -734,13 +771,7 @@ mod tests {
         impl Stream<Item = std::result::Result<Message, String>> + Unpin,
         Arc<AtomicUsize>,
     ) {
-        let produced = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&produced);
-        let messages = stream::iter(std::iter::from_fn(move || {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Some(Ok(message(&context, size)))
-        }));
-        (messages, produced)
+        endless_of(move || message(&context, size))
     }
 
     /// A future that stays pending for `polls` polls. The loop polls it once
@@ -873,6 +904,55 @@ mod tests {
             "two more fill the budget again"
         );
         assert_eq!(intake.ahead_bytes, MAX_READ_AHEAD_BYTES);
+    }
+
+    /// Header bytes of a message with no payload, few enough that the byte
+    /// budget and not the message limit ends the reading.
+    const HEADER_BYTES: usize = 16 * 1024;
+
+    #[tokio::test]
+    async fn read_ahead_counts_the_header_bytes_of_messages_without_a_payload() {
+        let context = lazy_context().await;
+        let (source, produced) = endless_of(|| header_heavy(&context, HEADER_BYTES));
+        let mut intake = intake_of(source, None);
+        let wire_bytes = HEADER_BYTES + "orders".len();
+
+        intake.reading_during(pending_for(MAX_READ_AHEAD * 2)).await;
+
+        let read = produced.load(Ordering::SeqCst);
+        assert_eq!(
+            read,
+            MAX_READ_AHEAD_BYTES.div_ceil(wire_bytes),
+            "no message is read once the headers alone reach the budget"
+        );
+        assert_eq!(intake.ahead.len(), read);
+        assert_eq!(intake.ahead_bytes, read * wire_bytes);
+        assert!(
+            intake.ahead.iter().all(|msg| msg.payload.is_empty()),
+            "none of the bytes counted is payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn taking_a_message_aside_frees_its_header_bytes_for_more_read_ahead() {
+        let context = lazy_context().await;
+        let (source, produced) = endless_of(|| header_heavy(&context, HEADER_BYTES));
+        let mut intake = intake_of(source, None);
+        let wire_bytes = HEADER_BYTES + "orders".len();
+        intake.reading_during(pending_for(MAX_READ_AHEAD * 2)).await;
+        let filled = produced.load(Ordering::SeqCst);
+
+        intake.next().await.expect("a message");
+        intake.next().await.expect("a message");
+        assert_eq!(intake.ahead_bytes, (filled - 2) * wire_bytes);
+        intake.reading_during(pending_for(MAX_READ_AHEAD * 2)).await;
+
+        assert_eq!(
+            produced.load(Ordering::SeqCst),
+            filled + 2,
+            "two more fill the budget again"
+        );
+        assert_eq!(intake.ahead_bytes, filled * wire_bytes);
     }
 
     #[tokio::test]
