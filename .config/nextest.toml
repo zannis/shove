@@ -22,6 +22,13 @@ slow-timeout = { period = "90s" }
 filter = 'binary_id(shove::metrics_sqs_sequenced)'
 threads-required = 'num-test-threads'
 
+[[profile.default.overrides]]
+# On a heavily loaded host this test's process can keep its output pipes
+# open past the default 100 ms leak timeout after it exits, which nextest
+# reports as a leak; the test leaves nothing running.
+filter = 'test(=backends::kafka::client::tests::creating_the_stats_consumer_leaves_the_runtime_free)'
+leak-timeout = "1s"
+
 [[profile.default.scripts]]
 # The `metrics_rabbitmq_*` binaries share the container rather than starting
 # their own: each carves out a private vhost per run, so they cannot collide
