@@ -35,7 +35,8 @@
 //! created through the mock API as well.
 //!
 //! The final section runs a sequenced consumer against the same mock: a
-//! streak of rejected commits fences it, and it reconnects.
+//! streak of rejected commits fences it, and it reconnects once the close
+//! that error exit makes has had its LeaveGroup answered.
 //!
 //! `test-support` gates the seams this file reads; both Kafka coverage rows
 //! enable it, so the suite runs in each.
@@ -3515,12 +3516,13 @@ async fn rejected_discard_commit_keeps_the_member() {
 }
 
 /// A member that ends on an error closes its consumer off the runtime
-/// thread. Its record's dead letter cannot be published, which ends the
-/// loop, and its one reconnect attempt is spent at once, so the run returns
-/// the error. The close then waits for the coordinator to answer the
-/// member's LeaveGroup, which the mock holds as a coordinator gone quiet
-/// would. A ticker on the same current-thread runtime keeps ticking through
-/// the close.
+/// thread, and has left its group when the error is returned. Its record's
+/// dead letter cannot be published, which ends the loop, and its one
+/// reconnect attempt is spent at once, so the run returns the error. The
+/// close waits for the coordinator to answer the member's LeaveGroup, which
+/// the mock holds as a coordinator gone quiet would, and the run returns
+/// only once that answer is in. A ticker on the same current-thread runtime
+/// keeps ticking through the close.
 #[tokio::test(flavor = "current_thread")]
 async fn error_exit_closes_off_runtime() {
     const EXIT_TOPIC: &str = "kafka-error-exit-close";
@@ -3564,15 +3566,19 @@ async fn error_exit_closes_off_runtime() {
         .await
         .expect("the member ends within the bound")
         .expect("the run task completes");
+    let returned_after = failing_at.elapsed();
     assert!(
         matches!(&result, Err(ShoveError::Connection(_))),
         "the failed dead letter ends the member once its reconnect is spent: {result:?}"
     );
 
-    tokio::time::sleep(CLOSE_HOLD + TICK_STALL).await;
+    assert!(
+        returned_after >= CLOSE_HOLD,
+        "the run returns once the held LeaveGroup is answered, returned after {returned_after:?}"
+    );
     assert!(
         mock.requests_of(RDKafkaApiKey::LeaveGroup) >= 1,
-        "the close reached the coordinator"
+        "the member left its group before the run returned"
     );
     let stall = ticker.longest_gap_since(failing_at);
     assert!(
@@ -3845,6 +3851,67 @@ async fn a_sequenced_member_whose_commits_keep_being_rejected_is_fenced() {
         committed_position_on(&bootstrap, SEQUENCED_TOPIC, SEQUENCED_GROUP, 0).await,
         None,
         "no commit was accepted"
+    );
+
+    token.cancel();
+    group.shutdown().await;
+}
+
+/// A sequenced member that ends a connection on an error waits for its
+/// consumer's close, off the runtime thread, before it reconnects. The fence
+/// ends the connection, and the mock holds the answer to the LeaveGroup the
+/// close sends: the reconnect's JoinGroup reaches the broker only once that
+/// answer is in. A ticker on the same current-thread runtime keeps ticking
+/// through the close.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sequenced_error_exit_closes_before_it_reconnects() {
+    const FLOOR: Duration = Duration::from_secs(5);
+    let (mock, bootstrap) = sequenced_mock(&["o1"]).await;
+    mock.track_requests();
+    mock.reject_commits(512);
+    mock.answer_next_late(
+        RDKafkaApiKey::LeaveGroup,
+        CLOSE_HOLD,
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR,
+    );
+
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let ticker = Ticker::start();
+    // Before the member starts: on this one thread, a close that blocked it
+    // would block this task too.
+    let started_at = Instant::now();
+    let (mut group, token) = start_sequenced_group(&bootstrap, &handler, FLOOR).await;
+    wait_until(
+        || fence_probe::fired() >= 1,
+        FLOOR + DELIVERY_TIMEOUT,
+        "the fence ending the connection",
+    )
+    .await;
+    wait_until(
+        || handler.count() >= 2,
+        CLOSE_HOLD + DELIVERY_TIMEOUT,
+        "the reconnected member receiving o1 again",
+    )
+    .await;
+
+    let left = *mock
+        .request_timestamps(RDKafkaApiKey::LeaveGroup)
+        .first()
+        .expect("the close sent a LeaveGroup");
+    let rejoined = mock
+        .request_timestamps(RDKafkaApiKey::JoinGroup)
+        .into_iter()
+        .find(|&joined| joined > left)
+        .expect("the reconnect sent a JoinGroup after the LeaveGroup");
+    let gap = Duration::from_micros(u64::try_from(rejoined - left).expect("arrival order"));
+    assert!(
+        gap >= CLOSE_HOLD,
+        "the reconnect waits for the close, which waits for the held LeaveGroup answer: gap {gap:?}"
+    );
+    let stall = ticker.longest_gap_since(started_at);
+    assert!(
+        stall < TICK_STALL,
+        "the close waited for the held LeaveGroup off the runtime thread, the ticker stopped for {stall:?}"
     );
 
     token.cancel();

@@ -3330,12 +3330,13 @@ pub(super) fn check_per_record_prefetch(
 /// and reports the commit's result and the close separately, each waited
 /// for inside `deadline`, so a close that outlives the deadline is logged
 /// and never read as a commit that missed it. The one other holder there can
-/// be is a commit thread shutdown did not wait out (see
-/// [`stop_with_final_commit`]); then this thread's drop closes nothing, the
-/// thread says so, the loop logs that the close follows that commit, and
-/// the close runs when that thread drops its clone, off the runtime either
-/// way. `None` for `tpl` means
-/// there is nothing to commit and the thread only closes. The thread is
+/// be is a commit thread whose answer the loop did not wait for: one a stop
+/// did not wait out (see [`stop_with_final_commit`]), or one an `Err` exit
+/// left in flight (see [`close_without_commit`]). Then this thread's drop
+/// closes nothing, the thread says so, the loop logs that the close follows
+/// that commit, and the close runs when that thread drops its clone, off the
+/// runtime either way. `None` for `tpl` means there is nothing to commit and
+/// the thread only closes. The thread is
 /// spawned before it is handed the consumer, and a spawn failure disposes of
 /// the consumer off the runtime too; see [`final_commit_on_thread`] and
 /// [`close_off_runtime_or_leak`].
@@ -3349,6 +3350,29 @@ async fn final_commit_off_runtime(
     deadline: Duration,
 ) -> std::result::Result<(), CommitFailure> {
     final_commit_on_thread(consumer, tpl, queue, deadline, &mut spawn_named_thread).await
+}
+
+/// Close the consumer on a thread of its own with nothing committed, and
+/// wait at most `deadline` for the close: the end of a consume loop that
+/// makes no final commit, an `Err` exit or a stop whose commit in flight
+/// had no answer in time. It is [`final_commit_off_runtime`] with nothing
+/// to commit.
+///
+/// The close sends the member's LeaveGroup and waits for its answer, so a
+/// loop that waits for it has left its group when it returns, and a process
+/// that exits on the loop's error does not cut the leave short and leave
+/// the group to wait out `session.timeout.ms` for the member. A close that
+/// outlives `deadline` is logged and finishes on its thread. With a commit
+/// still in flight on another thread, that thread holds a handle too, and
+/// the close runs once that commit returns.
+async fn close_without_commit(consumer: LoopConsumer, queue: &str, deadline: Duration) {
+    if let Err(e) = final_commit_off_runtime(consumer, None, queue, deadline).await {
+        tracing::warn!(
+            queue,
+            error = %e,
+            "the consumer handle could not be handed to its close thread"
+        );
+    }
 }
 
 /// Spawn a detached OS thread named `name` running `body`, the spawner the
@@ -3466,12 +3490,15 @@ impl FinalCommit for LoopConsumer {
 /// Dropping the last handle runs `rd_kafka_consumer_close`, which blocks
 /// until librdkafka has left the group: rust-rdkafka 0.39 polls until the
 /// consumer reports closed (`base_consumer.rs:766-780`), and a coordinator
-/// that does not answer the LeaveGroup holds it there. So this handle,
-/// dropped on a runtime thread, hands the consumer to a thread of its own
-/// instead, see [`close_off_runtime_or_leak`]. That covers every exit that
-/// does not go through the final commit, the loop's `Err` exits and its
-/// task aborted where it waits included. Dropped on any other thread, the
-/// final commit's included, it drops the consumer there.
+/// that does not answer the LeaveGroup holds it there. Every exit a loop
+/// takes itself closes on a thread of its own and waits for the close: a
+/// stop through the final commit, an `Err` exit through
+/// [`close_without_commit`]. An exit the loop does not take itself, its
+/// task aborted where it waits or a panic unwinding through it, drops this
+/// handle on a runtime thread instead, and the handle then hands the
+/// consumer to a thread of its own, see [`close_off_runtime_or_leak`];
+/// nothing waits for that close. Dropped on any other thread, the final
+/// commit's included, it drops the consumer there.
 struct LoopConsumer {
     consumer: ManuallyDrop<Arc<KafkaStreamConsumer>>,
     queue: String,
@@ -3620,8 +3647,8 @@ where
         Ok(Ok(false)) => {
             tracing::warn!(
                 queue,
-                "the consumer handle was dropped but another holder remains, the per-record commit \
-                 thread shutdown did not wait out; the close runs when that commit returns"
+                "the consumer handle was dropped but another holder remains, a commit thread \
+                 still waiting on its answer; the close runs when that commit returns"
             );
         }
         Ok(Err(_recv)) => {
@@ -4172,10 +4199,12 @@ async fn stop_with_final_commit(
                 for discard in pending.discards {
                     discard.survived();
                 }
-                let remaining = SHUTDOWN_COMMIT_DEADLINE.saturating_sub(started.elapsed());
-                if let Err(e) = final_commit_off_runtime(consumer, None, queue, remaining).await {
-                    tracing::warn!(queue, error = %e, "the consumer handle could not be handed to its close thread");
-                }
+                close_without_commit(
+                    consumer,
+                    queue,
+                    SHUTDOWN_COMMIT_DEADLINE.saturating_sub(started.elapsed()),
+                )
+                .await;
                 return Err(ShoveError::Commit(Box::new(FailedCommit {
                     topic: queue.to_string(),
                     offsets,
@@ -5333,6 +5362,14 @@ fn fenced_error(
     ))
 }
 
+/// What the receive loop's shutdown arm hands the tail once its handler
+/// tasks have drained: what [`stop_with_final_commit`] reads.
+struct Stopped {
+    tracker: OffsetTracker,
+    rebalance_rx: std_mpsc::Receiver<RebalanceEvent>,
+    pending_commit: Option<PendingCommit>,
+}
+
 /// The receive loop's offset bookkeeping under `CommitPolicy::Interval`,
 /// lent to [`acquire_permit_while_polling`] so the wait does on every pass
 /// what a pass of the loop does: it takes in the completions, then runs the
@@ -5856,12 +5893,13 @@ impl FifoState {
 impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
     /// One connection: subscribe and consume until a stop or a fault. A stop
     /// ends with the final commit and the consumer's close on a thread of
-    /// their own; a fault closes the consumer off the runtime thread too,
-    /// with nothing committed, and so does an abort of the member's task,
-    /// see [`LoopConsumer`]. A dead letter that failed with an error no
-    /// retry gets past ends as a stop does, the final commit carrying what
-    /// was acked before it, and then returns that error, so
-    /// `run_with_reconnect` ends the member on it.
+    /// their own; a fault closes the consumer on a thread of its own too,
+    /// with nothing committed, and waits for the close before it returns
+    /// the error, see [`close_without_commit`]. An abort of the member's
+    /// task leaves the close to [`LoopConsumer`]. A dead letter that failed
+    /// with an error no retry gets past ends as a stop does, the final
+    /// commit carrying what was acked before it, and then returns that
+    /// error, so `run_with_reconnect` ends the member on it.
     async fn run_connection(self: Arc<Self>) -> Result<()> {
         let queue = self.queue.as_str();
         let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
@@ -5894,8 +5932,13 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
             Ok(()) => self.consume(&consumer, &mut state).await,
             Err(e) => Err(map_kafka_error("failed to subscribe", e)),
         };
-        // An `Err` drops `consumer` on the way out, off the runtime thread.
-        let fault = ended?;
+        let fault = match ended {
+            Ok(fault) => fault,
+            Err(e) => {
+                close_without_commit(consumer, queue, SHUTDOWN_COMMIT_DEADLINE).await;
+                return Err(e);
+            }
+        };
         let pending_commit = state.commits.in_flight.take();
         let stopped = stop_with_final_commit(
             consumer,
@@ -6587,8 +6630,10 @@ impl KafkaConsumer {
                 // The map the rebalance callback cancels revoked partitions'
                 // tokens in; the tracker below shares it. See `AssignmentTokens`.
                 let assignments = AssignmentTokens::default();
-                // Every exit that does not reach the final commit, a failed
-                // subscribe included, closes it off the runtime thread.
+                // Closed on a thread of its own on every exit, and waited
+                // for: through the final commit on a stop, through
+                // `close_without_commit` on an `Err`, a failed subscribe
+                // included. An abort leaves it to `LoopConsumer`'s drop.
                 let consumer = LoopConsumer::new(
                     create_stream_consumer(
                         client.base_config(),
@@ -6603,9 +6648,11 @@ impl KafkaConsumer {
                     )?,
                     queue,
                 );
-                consumer
-                    .subscribe(&[queue])
-                    .map_err(|e| map_kafka_error("failed to subscribe", e))?;
+                if let Err(e) = consumer.subscribe(&[queue]) {
+                    let e = map_kafka_error("failed to subscribe", e);
+                    close_without_commit(consumer, queue, SHUTDOWN_COMMIT_DEADLINE).await;
+                    return Err(e);
+                }
 
                 let queue_owned = queue.to_string();
                 // perf-K-6: OffsetTracker is touched only by this receive loop; handler
@@ -6667,15 +6714,18 @@ impl KafkaConsumer {
 
                 // The receive loop runs inside one block so that every exit
                 // it takes lands on the tail below it: a clean shutdown
-                // returns `Ok` from its own arm after its drain and final
-                // commit, and every other exit is fatal and returns `Err`.
-                // The block owns the loop's state, the spare permit included,
-                // so that state is dropped before the tail runs; the tail
-                // keeps its own handles.
+                // returns `Ok` from its own arm after its drain, with what
+                // the final commit reads, and every other exit is fatal and
+                // returns `Err`. The block owns the loop's state, the spare
+                // permit included, so that state is dropped before the tail
+                // runs. It borrows the consumer, which the tail closes; the
+                // tail keeps its own handles.
                 let tail_cancel = task_cancel.clone();
                 let tail_semaphore = semaphore.clone();
                 let tail_processing = processing.clone();
-                let ended: Result<()> = async move {
+                let loop_consumer = &consumer;
+                let ended: Result<Stopped> = async move {
+                let consumer = loop_consumer;
                 let fence = Fence {
                     threshold: fence_timeout,
                     group_id: &group_id,
@@ -6690,13 +6740,13 @@ impl KafkaConsumer {
                         tracker.mark_complete(completion);
                     }
                     let assigned =
-                        commits.pass(&consumer, &mut tracker, &rebalance_rx, fence, queue)?;
+                        commits.pass(consumer, &mut tracker, &rebalance_rx, fence, queue)?;
                     let now = Instant::now();
                     #[cfg(feature = "test-support")]
                     if per_record && assigned {
                         per_record_probe::RECONCILED_AT_TOP_OF_PASS.fetch_add(1, Ordering::SeqCst);
                     }
-                    reconcile_pause_after_assign(&consumer, per_record, paused, assigned)?;
+                    reconcile_pause_after_assign(consumer, per_record, paused, assigned)?;
                     // The gate spaces commits out (see `ASYNC_COMMIT_INTERVAL`):
                     // ungated, this drain committed on nearly every iteration —
                     // roughly once per message at speed — piling up in-flight
@@ -6732,7 +6782,7 @@ impl KafkaConsumer {
                         // between them. The assignment stays paused until
                         // a commit is accepted, see the resume below.
                         match commit_confirmed(
-                            &consumer,
+                            consumer,
                             tpl,
                             &shutdown,
                             Some(&mut fault_rx),
@@ -6887,14 +6937,11 @@ impl KafkaConsumer {
                             while let Ok(completion) = completion_rx.try_recv() {
                                 tracker.mark_complete(completion);
                             }
-                            return stop_with_final_commit(
-                                consumer,
-                                &mut tracker,
-                                &mut rebalance_rx,
-                                commits.in_flight.take(),
-                                queue,
-                            )
-                            .await;
+                            return Ok(Stopped {
+                                tracker,
+                                rebalance_rx,
+                                pending_commit: commits.in_flight.take(),
+                            });
                         }
                         fault = fault_rx.recv() => {
                             // `None` cannot happen while `fault_tx` lives in
@@ -7051,7 +7098,7 @@ impl KafkaConsumer {
                             {
                                 #[cfg(feature = "test-support")]
                                 put_back_probe::PAUSED_RECEIVE.fetch_add(1, Ordering::SeqCst);
-                                put_back(&consumer, queue, partition, offset)?;
+                                put_back(consumer, queue, partition, offset)?;
                                 consumer
                                     .pause_assignment()
                                     .map_err(|e| map_kafka_error("pause failed", e))?;
@@ -7167,7 +7214,7 @@ impl KafkaConsumer {
                                                 ),
                                                 Ok(RegistryDecode::Unavailable { id, error }) => {
                                                     if !stall
-                                                        .wait(&consumer, &shutdown, Some(&mut fault_rx), &topic, group.as_deref(), queue, id, &error)
+                                                        .wait(consumer, &shutdown, Some(&mut fault_rx), &topic, group.as_deref(), queue, id, &error)
                                                         .await?
                                                     {
                                                         break Staged::Stop;
@@ -7199,7 +7246,7 @@ impl KafkaConsumer {
                                                 }
                                             }
                                         };
-                                        stall.end(&consumer)?;
+                                        stall.end(consumer)?;
                                         staged
                                     }
                                     None => {
@@ -7340,7 +7387,7 @@ impl KafkaConsumer {
                                     });
                                     match acquire_permit_while_polling(
                                         &semaphore,
-                                        &consumer,
+                                        consumer,
                                         &shutdown,
                                         Some(&mut fault_rx),
                                         queue,
@@ -7607,23 +7654,43 @@ impl KafkaConsumer {
                 }
                 }
                 .await;
-                // Every fatal exit passes through here, whether the fault arm
-                // took it, the loop met a registry deployment fault itself, a
-                // seek or pause failed, or the connection was lost: the child
-                // token ends every sibling task's in-place wait, the permit
-                // drain is the only aggregate proof that detached tasks have
-                // released their permits, and only then is the busy flag
-                // cleared. Nothing is committed here: every task's record stays
-                // uncommitted and is redelivered on restart, or by the
-                // reconnect a retryable error leads to. The spare permit, if
-                // one was held, went with the block's state, so the drain
-                // cannot wait on it, and so did the consumer, whose close runs
-                // on a thread of its own, see `LoopConsumer`.
-                let Err(e) = ended else { return Ok(()) };
-                tail_cancel.cancel();
-                let _ = tail_semaphore.acquire_many(prefetch_count as u32).await;
-                tail_processing.store(false, Ordering::Release);
-                Err(e)
+                // A stop ends with the final commit, made with what the
+                // shutdown arm handed back. Every fatal exit, whether the
+                // fault arm took it, the loop met a registry deployment fault
+                // itself, a seek or pause failed, or the connection was lost,
+                // closes the consumer first, on a thread of its own and
+                // waited for, so the member has left its group when the
+                // error is returned, see `close_without_commit`. Then the
+                // child token ends every sibling task's in-place wait, the
+                // permit drain is the only aggregate proof that detached
+                // tasks have released their permits, and only then is the
+                // busy flag cleared. Nothing is committed on that path: every
+                // task's record stays uncommitted and is redelivered on
+                // restart, or by the reconnect a retryable error leads to.
+                // The spare permit, if one was held, went with the block's
+                // state, so the drain cannot wait on it.
+                let Stopped {
+                    mut tracker,
+                    mut rebalance_rx,
+                    pending_commit,
+                } = match ended {
+                    Ok(stopped) => stopped,
+                    Err(e) => {
+                        close_without_commit(consumer, queue, SHUTDOWN_COMMIT_DEADLINE).await;
+                        tail_cancel.cancel();
+                        let _ = tail_semaphore.acquire_many(prefetch_count as u32).await;
+                        tail_processing.store(false, Ordering::Release);
+                        return Err(e);
+                    }
+                };
+                stop_with_final_commit(
+                    consumer,
+                    &mut tracker,
+                    &mut rebalance_rx,
+                    pending_commit,
+                    queue,
+                )
+                .await
             }
         })
         .await
@@ -12795,8 +12862,8 @@ mod final_commit_thread_tests {
         );
     }
 
-    /// With another holder of the handle left, the per-record commit thread
-    /// a stop did not wait out, the final thread's drop closes nothing: the
+    /// With another holder of the handle left, a commit thread a stop did
+    /// not wait out, the final thread's drop closes nothing: the
     /// commit's result is still the result, and the loop logs that the close
     /// follows that holder instead of claiming it ran.
     #[tokio::test]
