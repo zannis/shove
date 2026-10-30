@@ -235,8 +235,9 @@ See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequ
 
 ## Draining the DLQ
 
-`NatsConsumer::run_dlq` reads the dead-letter stream of a topic into `handle_dead`, and runs until the broker is closed.
-`run_dlq_with_options` takes the options of a consumer, and stops once the token given to `with_shutdown` fires and the dead letter in hand has settled:
+`NatsConsumer::run_dlq` reads the dead-letter stream of a topic into `handle_dead`.
+It runs until the broker is closed, or until it meets an error that a reconnect cannot clear, such as a DLQ stream that does not exist, which it returns.
+`run_dlq_with_options` takes the options of a consumer, and also stops once the token given to `with_shutdown` fires:
 
 ```rust,no_run
 let stop = CancellationToken::new();
@@ -252,7 +253,7 @@ consumer
     .await?;
 ```
 
-The drain acks every dead letter once it is done with it.
+On either stop the drain finishes the dead letter in hand first, and it acks every dead letter once it is done with it.
 `handle_dead` runs under the handler timeout, 30 s by default, and a panic in it is caught.
 A call that panics or times out is logged and its dead letter is acked, and the drain goes on with the next one.
 `with_handler_timeout_outcome` has nothing to act on there, since the dead letter is acked either way.
