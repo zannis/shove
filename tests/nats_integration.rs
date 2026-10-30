@@ -2887,13 +2887,26 @@ async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
     // avoiding a race where the signal fires before the message is delivered.
     let started = WaitableCounter::new();
     let started_clone = started.clone();
+    let dropped = WaitableCounter::new();
+
+    /// Counts the drop of the handler call that holds it.
+    struct CountOnDrop(WaitableCounter);
+    impl Drop for CountOnDrop {
+        fn drop(&mut self) {
+            self.0.increment();
+        }
+    }
 
     #[derive(Clone)]
-    struct SlowHandler(WaitableCounter);
+    struct SlowHandler {
+        started: WaitableCounter,
+        dropped: WaitableCounter,
+    }
     impl MessageHandler<SeqSkipTopic> for SlowHandler {
         type Context = ();
         async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
-            self.0.increment();
+            self.started.increment();
+            let _dropped = CountOnDrop(self.dropped.clone());
             // Block well beyond drain timeout.
             tokio::time::sleep(Duration::from_secs(60)).await;
             Outcome::Ack
@@ -2919,13 +2932,22 @@ async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
     };
     let drain = Duration::from_millis(500);
 
+    let handler = SlowHandler {
+        started,
+        dropped: dropped.clone(),
+    };
     let outcome = consumer
-        .run_fifo_until_timeout::<SeqSkipTopic, _, _>(SlowHandler(started), (), opts, signal, drain)
+        .run_fifo_until_timeout::<SeqSkipTopic, _, _>(handler, (), opts, signal, drain)
         .await;
 
     // STRICT — handler ignores shutdown, drain budget runs out, shard aborted.
     assert!(outcome.timed_out, "expected timed_out, got {outcome:?}");
     assert_eq!(outcome.exit_code(), 3);
+    // The shard takes the handler call it was awaiting down with it.
+    assert!(
+        dropped.wait_for(1, Duration::from_secs(5)).await,
+        "the aborted shard left its handler running"
+    );
 
     broker.close().await;
 }
@@ -7725,11 +7747,12 @@ shove::define_sequenced_topic!(
         .build()
 );
 
-/// Starts, works for `work`, then acks.
+/// Starts, works for `work`, then finishes and acks.
 #[derive(Clone)]
 struct SlowFifoHandler {
     work: Duration,
     started: WaitableCounter,
+    finished: WaitableCounter,
 }
 
 impl MessageHandler<SeqAbortTopic> for SlowFifoHandler {
@@ -7737,14 +7760,15 @@ impl MessageHandler<SeqAbortTopic> for SlowFifoHandler {
     async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.started.increment();
         tokio::time::sleep(self.work).await;
+        self.finished.increment();
         Outcome::Ack
     }
 }
 
-/// A group whose drain times out aborts its shard tasks with it. The shard
-/// that was waiting on a handler is gone, so it never settles that handler's
-/// message after the timeout was reported: the message stays in the stream,
-/// un-acked.
+/// A group whose drain times out aborts its shard tasks with it, and a shard
+/// takes the handler call it is awaiting along. The handler never finishes,
+/// and nothing settles its message after the timeout was reported: the message
+/// stays in the stream, un-acked.
 #[tokio::test]
 async fn fifo_group_drain_timeout_stops_shards() {
     const WORK: Duration = Duration::from_secs(3);
@@ -7767,6 +7791,7 @@ async fn fifo_group_drain_timeout_stops_shards() {
     let handler = SlowFifoHandler {
         work: WORK,
         started: WaitableCounter::new(),
+        finished: WaitableCounter::new(),
     };
     let mut group = broker.consumer_group();
     group
@@ -7797,6 +7822,11 @@ async fn fifo_group_drain_timeout_stops_shards() {
     // Past the point where the handler would have returned, and a shard that
     // survived the abort would have acked the message.
     tokio::time::sleep(WORK + Duration::from_secs(1)).await;
+    assert_eq!(
+        handler.finished.get(),
+        0,
+        "the handler ran on after its shard was aborted"
+    );
     assert_eq!(
         stream_messages(&client, "nats-fifo-abort").await,
         1,
