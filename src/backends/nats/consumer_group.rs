@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::nats::client::NatsClient;
 use crate::backends::nats::constants::UNBOUNDED_ACK_PENDING;
-use crate::backends::nats::consumer::{NatsConsumer, derive_ack_wait};
+use crate::backends::nats::consumer::{NatsConsumer, abort_on_drop, derive_ack_wait};
 use crate::backends::nats::topology::NatsTopologyDeclarer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_group::reject_fifo_concurrency;
@@ -345,11 +345,7 @@ impl NatsConsumerGroup {
                         return;
                     }
                 };
-                // A dropped `JoinHandle` detaches its task; abort the shards with this wrapper.
-                let _shards: Vec<AbortOnDrop> = handles
-                    .iter()
-                    .map(|handle| AbortOnDrop(handle.abort_handle()))
-                    .collect();
+                let _shards = abort_on_drop(&handles);
                 for handle in handles {
                     match handle.await {
                         Ok(Ok(())) => {}

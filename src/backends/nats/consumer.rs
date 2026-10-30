@@ -973,6 +973,16 @@ async fn release_pulled(consumer: &PullConsumer, unstarted: &[Message]) {
 // Handler invocation
 // ---------------------------------------------------------------------------
 
+/// Guards that abort the tasks of `handles` when dropped. A dropped
+/// `JoinHandle` detaches its task, so a caller that awaits shard tasks holds
+/// these to take them down with it when it is aborted or dropped itself.
+pub(super) fn abort_on_drop<T>(handles: &[tokio::task::JoinHandle<T>]) -> Vec<AbortOnDrop> {
+    handles
+        .iter()
+        .map(|handle| AbortOnDrop(handle.abort_handle()))
+        .collect()
+}
+
 /// How a [`guarded`] call ended.
 enum Guarded<T> {
     Done(T),
@@ -2084,6 +2094,7 @@ impl NatsConsumer {
         let handles = self
             .spawn_fifo_shards::<T, H>(handler, ctx, options)
             .await?;
+        let _shards = abort_on_drop(&handles);
         for handle in handles {
             match handle.await {
                 Ok(Ok(())) => {}
