@@ -67,6 +67,13 @@ const STOP_GROUP: &str = "kafka-fifo-in-place-stop-fifo";
 /// Long enough that the stop always lands inside the hold.
 const STOP_HOLD: Duration = Duration::from_secs(30);
 
+const WAIT_COMMIT_TOPIC: &str = "kafka-fifo-in-place-wait-commit";
+const WAIT_COMMIT_DLQ: &str = "kafka-fifo-in-place-wait-commit-dlq";
+const WAIT_COMMIT_GROUP: &str = "kafka-fifo-in-place-wait-commit-fifo";
+/// Long enough that a commit the test sees before it runs out landed during
+/// the hold.
+const WAIT_COMMIT_HOLD: Duration = Duration::from_secs(30);
+
 const REVOKE_TOPIC: &str = "kafka-fifo-in-place-revoke";
 const REVOKE_DLQ: &str = "kafka-fifo-in-place-revoke-dlq";
 const REVOKE_GROUP: &str = "kafka-fifo-in-place-revoke-fifo";
@@ -129,6 +136,18 @@ shove::define_sequenced_topic!(
         .sequenced(SequenceFailure::Skip)
         .routing_shards(1)
         .hold_queue(STOP_HOLD)
+        .dlq()
+        .build()
+);
+
+shove::define_sequenced_topic!(
+    WaitCommitTopic,
+    Order,
+    |_order: &Order| KEY.to_string(),
+    TopologyBuilder::new(WAIT_COMMIT_TOPIC)
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(WAIT_COMMIT_HOLD)
         .dlq()
         .build()
 );
@@ -384,6 +403,30 @@ async fn committed_position_of(
     .expect("probe task")
 }
 
+/// Polls the broker until the group's committed position on the topic's one
+/// partition is `expected`, failing once `timeout` has passed.
+async fn wait_for_committed_position(
+    bootstrap: &str,
+    topic: &'static str,
+    group: &'static str,
+    expected: i64,
+    timeout: Duration,
+    what: &str,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let committed = committed_position(bootstrap, topic, group).await;
+        if committed == Some(expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the committed position is {committed:?}, not {expected}, after {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// The ids of the first `count` records of `topic`, read by a raw consumer
 /// from the start of partition 0.
 async fn read_ids(bootstrap: &str, topic: &str, count: usize) -> Vec<String> {
@@ -545,6 +588,60 @@ async fn fifo_retry_keeps_key_order() {
         committed_position(&bootstrap, ORDER_TOPIC, ORDER_GROUP).await,
         Some(2),
         "both records are committed once they are acked"
+    );
+}
+
+/// The records acked ahead of a held record are committed while it holds.
+/// `A1`, `A2` and `A3` are acked back to back inside one commit window: the
+/// commit of `A1` opens the window, and the positions of the two behind it
+/// wait for the gate. `B` is then retried and held for 30 s. The position
+/// past `A3` is committed during the hold, within a few windows, and nothing
+/// is committed past `B`.
+#[tokio::test]
+async fn fifo_commits_acked_positions_during_a_hold() {
+    let mock = Mock::start(&[WAIT_COMMIT_TOPIC, WAIT_COMMIT_DLQ]);
+    let bootstrap = mock.bootstrap();
+    produce(&bootstrap, WAIT_COMMIT_TOPIC, &["A1", "A2", "A3", "B"]).await;
+
+    let handler = Recorder::new(|id, metadata| {
+        if id == "B" && metadata.retry_count == 0 {
+            Outcome::Retry
+        } else {
+            Outcome::Ack
+        }
+    });
+    let consumer = Running::fifo::<WaitCommitTopic>(&bootstrap, &handler).await;
+    consumer
+        .wait_until(
+            || handler.count() == 4,
+            DELIVERY_TIMEOUT,
+            "B reaching the handler behind the three acked records",
+        )
+        .await;
+    let held_at = handler.deliveries()[3].at;
+    wait_for_committed_position(
+        &bootstrap,
+        WAIT_COMMIT_TOPIC,
+        WAIT_COMMIT_GROUP,
+        3,
+        Duration::from_secs(10),
+        "the acked records committed during B's hold",
+    )
+    .await;
+    assert!(
+        held_at.elapsed() < WAIT_COMMIT_HOLD,
+        "the commit landed while B was held"
+    );
+    assert_eq!(
+        handler.ids(),
+        ["A1", "A2", "A3", "B"],
+        "B is still held: nothing was handed back or taken behind it"
+    );
+    consumer.stop().await;
+    assert_eq!(
+        committed_position(&bootstrap, WAIT_COMMIT_TOPIC, WAIT_COMMIT_GROUP).await,
+        Some(3),
+        "nothing is committed past the held record"
     );
 }
 
