@@ -1512,8 +1512,8 @@ pub mod put_back_probe {
 
     /// A record received while `RegistryStall::wait` polled through a stall.
     pub static REGISTRY_STALL: AtomicUsize = AtomicUsize::new(0);
-    /// A record received while `acquire_permit_while_polling` waited for a
-    /// prefetch permit.
+    /// A record received while `acquire_permit_while_polling` waited for
+    /// prefetch permits: for the record in hand, or in the shutdown drain.
     pub static PERMIT_WAIT: AtomicUsize = AtomicUsize::new(0);
     /// A record the receive arm put back because the assignment was, or had
     /// to be, paused for waiting handlers.
@@ -2492,6 +2492,8 @@ where
 /// Maps a rdkafka `KafkaError` to the appropriate `ShoveError` variant.
 /// Permanent errors (bad config, fatal consumption, cancelled) become
 /// `Topology`; transient errors (broker down, network) become `Connection`.
+/// A receive loop never ends on the `recv()` errors librdkafka recovers from
+/// on its own, so it maps none of those, see [`recv_error_is_transient`].
 ///
 /// `AutoOffsetReset` is permanent too: librdkafka raises it when a
 /// partition has no committed offset (or the committed one is out of range)
