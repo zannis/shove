@@ -105,7 +105,7 @@ At-least-once by default. Handlers return one of:
 - `Ack` — success
 - `Retry` — delayed retry through hold queues with escalating backoff
 - `Reject` — dead-letter immediately
-- `Defer` — delay without consuming a retry budget
+- `Defer` — delay without consuming a retry budget (an external NATS stream is the exception: its [retry count is JetStream's redelivery count](https://shove.rs/backends/nats#bind-to-an-externally-provisioned-stream))
 
 Full semantics: [Outcomes & Delivery](https://shove.rs/concepts/outcomes).
 

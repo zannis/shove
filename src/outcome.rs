@@ -71,11 +71,19 @@ pub enum Outcome {
     Reject,
 
     /// Delay and re-deliver via hold queue WITHOUT incrementing the retry
-    /// counter. Always routes to `hold_queues[0]` (shortest delay),
-    /// regardless of retry count — no escalating backoff.
+    /// counter, except on an external NATS stream (see below). Always routes
+    /// to `hold_queues[0]` (shortest delay), regardless of retry count — no
+    /// escalating backoff.
     ///
     /// Unlike [`Retry`], deferred messages never exhaust `max_retries` and
-    /// will never be routed to the DLQ as a result of deferral alone.
+    /// will never be routed to the DLQ as a result of deferral alone. The
+    /// first of those has an exception: on an external NATS stream the retry
+    /// count is JetStream's redelivery count (`num_delivered - 1`), so each
+    /// deferral raises it, and a later `Retry` is dead-lettered as soon as the
+    /// count has reached `max_retries`. A `Defer` itself is still never
+    /// dead-lettered. See "Bind to an externally-provisioned stream" in the
+    /// NATS guide:
+    /// <https://shove.rs/backends/nats#bind-to-an-externally-provisioned-stream>
     ///
     /// # When to use
     ///
@@ -98,8 +106,10 @@ pub enum Outcome {
     /// Because `Defer` never increments the retry counter, a handler that
     /// always returns `Defer` will bounce the message between the main queue
     /// and `hold_queues[0]` **indefinitely**. There is no built-in circuit
-    /// breaker. Ensure your handler has a condition that eventually resolves
-    /// to `Ack`, `Retry`, or `Reject`.
+    /// breaker. An external NATS stream raises the retry count with each
+    /// deferral, but a `Defer` is never dead-lettered, so the loop does not end
+    /// there either. Ensure your handler has a condition that eventually
+    /// resolves to `Ack`, `Retry`, or `Reject`.
     ///
     /// If no hold queues are configured, `Defer` falls back the way
     /// [`Retry`](Outcome::Retry) does. Kafka and NATS redeliver after a fixed

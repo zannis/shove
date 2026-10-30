@@ -29,6 +29,8 @@ Every message delivery follows the same path. The handler receives the message a
                                             main queue (retry_count unchanged)
 ```
 
+The `Defer` branch leaves the count alone on every backend except an external NATS stream, where the count is JetStream's redelivery count and each deferral raises it. See [Bind to an externally-provisioned stream](/backends/nats#bind-to-an-externally-provisioned-stream).
+
 When `retry_count >= max_retries`, the consumer routes to the DLQ instead of a hold queue. If no DLQ is configured and the message hits its retry limit, it is discarded with a warning log.
 
 ## Configuring hold queues
@@ -105,6 +107,8 @@ For idempotent handlers — those that produce the same result regardless of how
 - Always routes to `hold_queues[0]` (the shortest delay), regardless of retry count. There is no escalating backoff for deferred messages.
 - Will never exhaust `max_retries` and will never be routed to the DLQ as a result of deferral alone.
 
+The one exception is an external NATS stream. There the retry count is JetStream's redelivery count (`num_delivered - 1`), so every deferral is a redelivery that raises it, and a later `Retry` is dead-lettered as soon as the count has reached `max_retries`. A `Defer` itself is still never routed to the DLQ. See [Bind to an externally-provisioned stream](/backends/nats#bind-to-an-externally-provisioned-stream).
+
 Use cases for `Defer`:
 
 - **Scheduled delivery** — the message carries a "not-before" timestamp that hasn't arrived yet.
@@ -113,9 +117,9 @@ Use cases for `Defer`:
 
 Use `Retry` (not `Defer`) for genuine transient failures — network errors, database timeouts, temporary unavailability. `Retry` increments the counter and escalates through the hold queues. `Defer` is specifically for "the message is fine but not yet actionable."
 
-**Caution:** because `Defer` never increments the retry counter, a handler that always returns `Defer` will bounce the message between the main queue and `hold_queues[0]` indefinitely. There is no built-in circuit breaker. Ensure your handler has a condition that eventually resolves to `Ack`, `Retry`, or `Reject`.
+**Caution:** because `Defer` never increments the retry counter, a handler that always returns `Defer` will bounce the message between the main queue and `hold_queues[0]` indefinitely. There is no built-in circuit breaker. An [external NATS stream](/backends/nats#bind-to-an-externally-provisioned-stream) raises the retry count with each deferral, but a `Defer` is never dead-lettered, so the loop does not end there either. Ensure your handler has a condition that eventually resolves to `Ack`, `Retry`, or `Reject`.
 
-On NATS (and on the in-process broker, which models it) `Defer` naks the message in place rather than republishing a copy, so `MessageMetadata::delivery_count` advances on every deferred hop even though `retry_count` does not. That gives the handler a deferral count without having to track one in the message body:
+On NATS (and on the in-process broker, which models it) `Defer` naks the message in place rather than republishing a copy, so `MessageMetadata::delivery_count` advances on every deferred hop even though `retry_count` does not, except on an external NATS stream (below). That gives the handler a deferral count without having to track one in the message body:
 
 ```rust,no_run
 async fn handle(&self, msg: Order, meta: MessageMetadata, _: &()) -> Outcome {
@@ -129,6 +133,8 @@ async fn handle(&self, msg: Order, meta: MessageMetadata, _: &()) -> Outcome {
     Outcome::Ack
 }
 ```
+
+On an [external NATS stream](/backends/nats#bind-to-an-externally-provisioned-stream) `retry_count` is derived from `delivery_count`, so a `Defer` raises it there too. A `Defer` alone is never dead-lettered, so keep this check to bound a handler that always defers.
 
 On backends where `Defer` re-sends the message (SQS) or where no delivery counter exists at all (RabbitMQ, Kafka, Redis Streams), `delivery_count` will not accumulate across deferrals — carry a deadline or a counter in the message body there. See [`retry_count` vs `delivery_count`](/concepts/handlers#retry_count-vs-delivery_count) for the full table.
 
@@ -221,7 +227,7 @@ A handler checks a "not-before" timestamp and returns `Outcome::Defer` on the fi
 | 2 | 0 | orders-hold-5s | Defer → orders-hold-5s (counter unchanged) |
 | 3 | 0 | orders-hold-5s | Ack ✓ |
 
-The retry counter stayed at 0 throughout. The `max_retries` budget was never consumed.
+The retry counter stayed at 0 throughout. The `max_retries` budget was never consumed. On an external NATS stream the counter would have risen with each deferral, because it is JetStream's redelivery count; see [Bind to an externally-provisioned stream](/backends/nats#bind-to-an-externally-provisioned-stream).
 
 **Scenario 4 — deserialization failure (bad bytes):**
 

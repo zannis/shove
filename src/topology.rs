@@ -948,15 +948,16 @@ impl TopologyBuilder {
         self
     }
 
-    /// Acknowledge that failed messages in this sequenced topic may be
-    /// permanently lost.
+    /// Acknowledge that failed messages in this topic may be permanently lost.
     ///
     /// By default, `build()` panics if a sequenced topic is missing a DLQ or
     /// hold queues, because that means rejected messages are silently
     /// discarded. Call this method to suppress those guards when message loss
     /// is acceptable (e.g. ephemeral metrics, best-effort notifications).
     ///
-    /// Has no effect on non-sequenced topics.
+    /// On a non-sequenced topic it silences the two warnings `build()` logs for
+    /// incomplete retry infrastructure: hold queues without a DLQ, and a DLQ
+    /// without hold queues. It changes nothing else about the topic.
     pub fn allow_message_loss(mut self) -> Self {
         self.allow_message_loss = true;
         self
