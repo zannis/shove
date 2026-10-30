@@ -1069,7 +1069,7 @@ where
                 if shutdown.is_cancelled() {
                     return Ok(());
                 }
-                attempts += 1;
+                attempts = attempts.saturating_add(1);
                 if let Some(max) = max_reconnect_attempts
                     && attempts >= max
                 {
@@ -1083,7 +1083,7 @@ where
                         "consumer on '{label}' exhausted {max} reconnect attempt(s): {e}"
                     )));
                 }
-                let delay = backoff.next().expect("backoff is infinite");
+                let delay = backoff.next_delay();
                 tracing::warn!(
                     label,
                     attempt = attempts,
