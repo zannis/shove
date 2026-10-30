@@ -195,7 +195,10 @@ impl SqsConsumerGroup {
             // still processing them one-at-a-time, reducing per-message API call overhead
             // and improving throughput when multiple consumers share the same queue.
             let options = if concurrent {
-                options
+                ConsumerOptions {
+                    prefetch_count: options.prefetch_count.max(1),
+                    ..options
+                }
             } else {
                 ConsumerOptions {
                     receive_batch_size: options.prefetch_count,
@@ -325,9 +328,10 @@ impl SqsConsumerGroup {
         options.max_pending_per_key = self.config.max_pending_per_key;
         options.max_message_size = self.config.max_message_size;
         options.consumer_group = Some(Arc::from(self.name.as_str()));
+        let consumer_index = self.consumers.len();
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
-        debug!(group = %self.name, consumer_index = self.consumers.len() - 1, "spawned SQS consumer");
+        debug!(group = %self.name, consumer_index, "spawned SQS consumer");
     }
 }
 

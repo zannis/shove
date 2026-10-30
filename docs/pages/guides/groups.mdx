@@ -46,7 +46,7 @@ Methods available on all backend configs (per-group; the registry-level default 
 - **`.with_prefetch_count(N)`** — number of unacknowledged messages the broker delivers to each consumer. Default: 10.
 - **`.with_max_retries(N)`** — retry budget per message. Default: 10.
 - **`.with_handler_timeout(Duration)`** — maximum time a handler may run before the message is retried. Default: 30s.
-- **`.with_concurrent_processing(bool)`** — when `true`, each consumer processes up to `prefetch_count` messages concurrently. When `false`, one message at a time. Default varies by backend (RabbitMQ defaults to `false`; InMemory defaults to sequential via prefetch clamping).
+- **`.with_concurrent_processing(bool)`** — when `true`, each consumer processes up to `prefetch_count` messages concurrently. When `false`, one message at a time. Defaults to `false` on every backend that has the flag. InMemory has no such flag: its consumers always process up to `prefetch_count` messages concurrently.
 
 ## Autoscaling — the signal
 
@@ -66,7 +66,15 @@ The autoscaler uses a `ThresholdStrategy` by default, wrapped in `Stabilized` to
 - **Scale down** when `messages_ready < capacity × scale_down_multiplier` (default: 0.5) and the condition has been sustained for `hysteresis_duration`.
 - A scaling action is not taken again until `cooldown_duration` (default: 30s) has elapsed since the last action.
 
-`capacity` is `active_consumers × prefetch_count`.
+`capacity` is `active_consumers × permits`, where `permits` is the number of messages one consumer holds in flight at once:
+
+- With `.with_concurrent_processing(true)`, `permits` is `prefetch_count`, raised to 1 when it is 0.
+- Without it, each consumer handles one message at a time, so `permits` is 1 whatever `prefetch_count` says. Four sequential consumers have a capacity of 4.
+- InMemory consumers always run `prefetch_count` permits, raised to 1 when it is 0.
+
+Every backend's autoscaler reports `permits` this way, so the same backlog scales a sequential group at the same point on all of them. A sequenced group always runs one consumer, so its capacity never changes a scaling outcome.
+
+If a backend cannot read the backlog, the poll fails and the group keeps its consumer count for that cycle. Apache Kafka fails the poll when the topic does not exist, when the broker answers the topic's metadata with an error such as `TOPIC_AUTHORIZATION_FAILED`, or when an offset request fails or comes back with an error for any partition's committed offset. The error is logged as `failed to fetch metrics for <group>`.
 
 ## AutoscalerConfig
 

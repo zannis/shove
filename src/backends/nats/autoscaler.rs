@@ -135,7 +135,7 @@ impl<S: NatsQueueStatsProvider> AutoscalerBackend for NatsAutoscalerBackend<S> {
     }
 
     async fn fetch_metrics(&self, group: &Self::GroupId) -> Result<ScalingMetrics> {
-        let (queue, prefetch, active) = {
+        let (queue, concurrent, prefetch, active) = {
             let mut reg = self.registry.lock().await;
             let g = reg
                 .groups_mut()
@@ -146,6 +146,7 @@ impl<S: NatsQueueStatsProvider> AutoscalerBackend for NatsAutoscalerBackend<S> {
             g.ensure_min();
             (
                 g.queue().to_owned(),
+                g.config().concurrent_processing(),
                 g.config().prefetch_count(),
                 g.active_consumers(),
             )
@@ -162,10 +163,11 @@ impl<S: NatsQueueStatsProvider> AutoscalerBackend for NatsAutoscalerBackend<S> {
             "fetched NATS metrics"
         );
 
-        Ok(ScalingMetrics::new(
+        Ok(ScalingMetrics::for_group(
             stats.messages_pending,
             stats.messages_ack_pending,
-            active as u16,
+            active,
+            concurrent,
             prefetch,
         ))
     }
@@ -275,19 +277,28 @@ mod tests {
         group
     }
 
-    fn make_single_group_registry(
-        min: u16,
-        max: u16,
-        prefetch: u16,
+    fn make_registry_with_config(
+        config: NatsConsumerGroupConfig,
         started: bool,
     ) -> Arc<Mutex<NatsConsumerGroupRegistry>> {
-        let config = NatsConsumerGroupConfig::new(min..=max).with_prefetch_count(prefetch);
         let group = make_test_group("test-queue", config, started);
 
         let mut groups = HashMap::new();
         groups.insert("test-group".to_string(), group);
 
         Arc::new(Mutex::new(NatsConsumerGroupRegistry::from_groups(groups)))
+    }
+
+    fn make_single_group_registry(
+        min: u16,
+        max: u16,
+        prefetch: u16,
+        started: bool,
+    ) -> Arc<Mutex<NatsConsumerGroupRegistry>> {
+        make_registry_with_config(
+            NatsConsumerGroupConfig::new(min..=max).with_prefetch_count(prefetch),
+            started,
+        )
     }
 
     #[tokio::test]
@@ -301,7 +312,12 @@ mod tests {
 
     #[tokio::test]
     async fn nats_backend_fetch_metrics() {
-        let registry = make_single_group_registry(1, 5, 10, true);
+        let registry = make_registry_with_config(
+            NatsConsumerGroupConfig::new(1..=5)
+                .with_prefetch_count(10)
+                .with_concurrent_processing(true),
+            true,
+        );
         let mut stats_provider = MockNatsStatsProvider::new();
         stats_provider.stats.insert(
             "test-queue".into(),

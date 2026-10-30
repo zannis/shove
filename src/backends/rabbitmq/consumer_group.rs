@@ -15,7 +15,7 @@ use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer::RabbitMqConsumer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally};
-use crate::error::Result;
+use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::{SequencedTopic, Topic};
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
@@ -172,6 +172,25 @@ fn pool_size_for(max_consumers: u16) -> usize {
     max.div_ceil(CHANNELS_PER_CONN)
 }
 
+/// The entry of `pool` the next consumer runs on: entries come in turn, and a
+/// pool with none yields `None`.
+fn next_in_pool<'a, T>(pool: &'a [T], counter: &AtomicUsize) -> Option<&'a T> {
+    counter
+        .fetch_add(1, Ordering::Relaxed)
+        .checked_rem(pool.len())
+        .and_then(|index| pool.get(index))
+}
+
+/// The AMQP connection the next consumer of the group runs on.
+fn next_connection<'a>(
+    pool: &'a [RabbitMqClient],
+    counter: &AtomicUsize,
+) -> Result<&'a RabbitMqClient> {
+    next_in_pool(pool, counter).ok_or_else(|| {
+        ShoveError::Connection("the consumer group has no AMQP connection to run on".into())
+    })
+}
+
 /// A named group of identical consumers all reading from the same queue.
 ///
 /// The group owns the concrete consumers and is responsible for scaling them
@@ -254,11 +273,14 @@ impl RabbitMqConsumerGroup {
 
         let pool_for_spawner = pool.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
-            let idx = next.fetch_add(1, Ordering::Relaxed) % pool_for_spawner.len();
+            let consumer = next_connection(&pool_for_spawner, &next)
+                .map(|client| RabbitMqConsumer::new(client.clone()));
             let handler = handler_factory();
-            let consumer = RabbitMqConsumer::new(pool_for_spawner[idx].clone());
             let options = if concurrent {
-                options
+                ConsumerOptions {
+                    prefetch_count: options.prefetch_count.max(1),
+                    ..options
+                }
             } else {
                 ConsumerOptions {
                     prefetch_count: 1,
@@ -269,7 +291,10 @@ impl RabbitMqConsumerGroup {
             let ctx = ctx.clone();
 
             tokio::spawn(async move {
-                let result = consumer.run_with_inner::<T, H>(handler, ctx, options).await;
+                let result = match consumer {
+                    Ok(consumer) => consumer.run_with_inner::<T, H>(handler, ctx, options).await,
+                    Err(e) => Err(e),
+                };
                 if let Err(e) = result {
                     ec.fetch_add(1, Ordering::Relaxed);
                     tracing::error!("consumer task exited with error: {e}");
@@ -331,14 +356,16 @@ impl RabbitMqConsumerGroup {
 
         let pool_for_spawner = pool.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
-            let idx = next.fetch_add(1, Ordering::Relaxed) % pool_for_spawner.len();
+            let consumer = next_connection(&pool_for_spawner, &next)
+                .map(|client| RabbitMqConsumer::new(client.clone()));
             let handler = handler_factory();
-            let consumer = RabbitMqConsumer::new(pool_for_spawner[idx].clone());
             let ec = ec_for_spawner.clone();
             let pc = pc_for_spawner.clone();
             let ctx = ctx.clone();
             tokio::spawn(async move {
-                let handles = match consumer.spawn_fifo_shards::<T, H>(handler, ctx, options) {
+                let handles = match consumer
+                    .and_then(|consumer| consumer.spawn_fifo_shards::<T, H>(handler, ctx, options))
+                {
                     Ok(h) => h,
                     Err(e) => {
                         ec.fetch_add(1, Ordering::Relaxed);
@@ -600,9 +627,10 @@ impl RabbitMqConsumerGroup {
         options.max_pending_per_key = self.config.max_pending_per_key;
         options.max_message_size = self.config.max_message_size;
         options.consumer_group = Some(Arc::from(self.name.as_str()));
+        let consumer_index = self.consumers.len();
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
-        debug!(group = %self.name, consumer_index = self.consumers.len() - 1, "spawned consumer");
+        debug!(group = %self.name, consumer_index, "spawned consumer");
     }
 }
 
@@ -610,6 +638,39 @@ impl RabbitMqConsumerGroup {
 mod tests {
     use super::*;
     use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
+
+    #[test]
+    fn the_pool_hands_out_its_entries_in_turn() {
+        let pool = ["a", "b", "c"];
+        let counter = AtomicUsize::new(0);
+        let order: Vec<&str> = (0..7)
+            .filter_map(|_| next_in_pool(&pool, &counter).copied())
+            .collect();
+        assert_eq!(order, ["a", "b", "c", "a", "b", "c", "a"]);
+    }
+
+    #[test]
+    fn a_counter_that_wrapped_still_picks_an_entry() {
+        let pool = ["a", "b", "c"];
+        let counter = AtomicUsize::new(usize::MAX);
+        assert_eq!(next_in_pool(&pool, &counter), Some(&"a"));
+        assert_eq!(next_in_pool(&pool, &counter), Some(&"a"));
+        assert_eq!(next_in_pool(&pool, &counter), Some(&"b"));
+    }
+
+    #[test]
+    fn an_empty_pool_hands_out_nothing() {
+        let pool: [u8; 0] = [];
+        assert_eq!(next_in_pool(&pool, &AtomicUsize::new(0)), None);
+    }
+
+    #[test]
+    fn an_empty_pool_has_no_connection_to_run_on() {
+        let err = next_connection(&[], &AtomicUsize::new(0))
+            .err()
+            .expect("a pool without connections has none to hand out");
+        assert!(matches!(err, ShoveError::Connection(_)), "got {err:?}");
+    }
 
     /// Build a `RabbitMqConsumerGroup` with a test spawner that simply waits on the
     /// cancellation token (no RabbitMQ connection needed).

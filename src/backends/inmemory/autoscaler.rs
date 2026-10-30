@@ -135,10 +135,12 @@ impl<S: InMemoryQueueStatsProvider> AutoscalerBackend for InMemoryAutoscalerBack
             "fetched in-memory metrics"
         );
 
-        Ok(ScalingMetrics::new(
+        // No sequential mode in-memory: every member runs `prefetch_count` permits.
+        Ok(ScalingMetrics::for_group(
             stats.messages_ready,
             stats.messages_in_flight,
-            active as u16,
+            active,
+            true,
             prefetch,
         ))
     }

@@ -46,13 +46,13 @@ done
 
 ### Consumer group registry
 
-`SqsConsumerGroupRegistry::new(client)` manages a pool of independent SQS poll workers. `registry.register` configures `WorkQueue` with `SqsConsumerGroupConfig::new(1..=5).with_prefetch_count(5)` — a capacity of `consumers × prefetch = 5–25` messages in-flight. `registry.start_all()` spawns the minimum number of consumers (1); the autoscaler adds workers as needed.
+`SqsConsumerGroupRegistry::new(client)` manages a pool of independent SQS poll workers. `registry.register` configures `WorkQueue` with `SqsConsumerGroupConfig::new(1..=5).with_prefetch_count(5)`. Each poll receives up to 5 messages, and because the example leaves `with_concurrent_processing` off, each consumer handles them one at a time: the group's capacity is `consumers × 1`, or 1–5 messages in progress. With `.with_concurrent_processing(true)` it becomes `consumers × prefetch = 5–25`. `registry.start_all()` spawns the minimum number of consumers (1); the autoscaler adds workers as needed.
 
 ### `SqsAutoscalerBackend` and `AutoscalerConfig`
 
 `SqsAutoscalerBackend::autoscaler(stats_provider, registry, config)` wires the autoscaler to the registry. It polls `SqsQueueStatsProvider::get_queue_stats` on each `poll_interval` (2 s) and computes:
 
-- `capacity = active_consumers × prefetch_count`
+- `capacity = active_consumers × permits`, where `permits` is `prefetch_count` with concurrent processing on and 1 with it off (see [Guides: Groups](/guides/groups#autoscaling--the-signal))
 - scale up when `messages_ready > capacity × scale_up_multiplier` (1.5)
 - scale down when `messages_ready < capacity × scale_down_multiplier` (0.3)
 
