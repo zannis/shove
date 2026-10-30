@@ -628,7 +628,11 @@ async fn retry_copy_preserves_binary_and_duplicate_headers() {
 
 /// Each `Defer` republishes a copy whose `Shove-Message-Id` is the
 /// publisher's id, carried as the copy's base, and one suffix: twenty defers
-/// leave the id one suffix long, and every hop's id is new.
+/// leave the id one suffix long, and every hop's id is new. Every copy after
+/// the first is made from a copy that carries a base already, and read back
+/// raw each carries one base id and one message id: the copy drops the ones
+/// it replaces, which a handler's map, keeping the last of a repeated key,
+/// would not show.
 #[tokio::test]
 async fn message_id_length_is_bounded_across_defers() {
     const DEFERS: usize = 20;
@@ -691,6 +695,22 @@ async fn message_id_length_is_bounded_across_defers() {
         ids.len(),
         "every hop's id is new: {ids:?}"
     );
+
+    let records = read_topic(&bootstrap, DEFER_TOPIC, DEFERS + 1).await;
+    for (hop, copy) in records.iter().enumerate().skip(1) {
+        assert_eq!(
+            texts_of(&copy.headers, "Shove-Base-Message-Id"),
+            [base.clone()],
+            "defer copy {hop} carries one base id: {:?}",
+            copy.headers
+        );
+        assert_eq!(
+            texts_of(&copy.headers, "Shove-Message-Id").len(),
+            1,
+            "defer copy {hop} carries one message id: {:?}",
+            copy.headers
+        );
+    }
 }
 
 /// A dead letter's `Shove-Death-Count` is one past the record's own and stays
