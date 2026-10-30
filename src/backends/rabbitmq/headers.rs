@@ -18,6 +18,15 @@ pub(crate) const RETRY_COUNT_KEY: &str = "x-retry-count";
 /// See [`MessageMetadata::headers`] for access from a handler.
 pub const MESSAGE_ID_KEY: &str = "x-message-id";
 
+/// Header the broker fills in when it dead-letters a message; read back for
+/// the dead-letter metadata.
+const DEATH_KEY: &str = "x-death";
+
+/// Header names this backend writes or reads back as its own. A new one belongs
+/// here: a test checks that `validate_headers` reserves every name in this list.
+#[cfg(test)]
+const INTERNAL_KEYS: &[&str] = &[RETRY_COUNT_KEY, MESSAGE_ID_KEY, DEATH_KEY];
+
 fn long_string_to_owned(s: &LongString) -> String {
     // Fast path for valid UTF-8 (common case) avoids the extra allocation
     // that from_utf8_lossy().into_owned() always incurs.
@@ -87,7 +96,7 @@ pub(crate) fn extract_dead_metadata(delivery: &Delivery) -> DeadMessageMetadata 
         .properties
         .headers()
         .as_ref()
-        .and_then(|headers| headers.inner().get("x-death"))
+        .and_then(|headers| headers.inner().get(DEATH_KEY))
         .and_then(|value| {
             if let AMQPValue::FieldArray(array) = value {
                 extract_first_death_entry(array)
@@ -146,6 +155,13 @@ mod tests {
     use lapin::BasicProperties;
     use lapin::message::Delivery;
     use lapin::types::{AMQPValue, FieldArray, FieldTable, LongString, ShortString};
+
+    use crate::publisher_internal::assert_internal_keys_reserved;
+
+    #[test]
+    fn every_internal_key_is_reserved_by_validate_headers() {
+        assert_internal_keys_reserved("RabbitMQ", INTERNAL_KEYS);
+    }
 
     fn make_delivery(headers: Option<FieldTable>, tag: u64, redelivered: bool) -> Delivery {
         let mut delivery = Delivery::mock(

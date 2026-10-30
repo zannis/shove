@@ -16,6 +16,10 @@ use crate::publisher_internal::{fnv1a_64, shard_for_key, validate_headers};
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
+/// Message attribute a sequenced topic's subscription filter policy routes a
+/// message to its shard queue by.
+pub(crate) const SHARD_ATTR: &str = "shard";
+
 /// Maximum number of messages in a single SNS PublishBatch call.
 const SNS_BATCH_LIMIT: usize = 10;
 
@@ -187,7 +191,7 @@ impl SnsPublisher {
                     .string_value(shard.to_string())
                     .build()
                     .map_err(|e| ShoveError::Validation(format!("invalid shard attribute: {e}")))?;
-                req = req.message_attributes("shard", shard_attr);
+                req = req.message_attributes(SHARD_ATTR, shard_attr);
             }
         }
 
@@ -373,7 +377,7 @@ impl SnsPublisher {
                             .map_err(|e| {
                                 ShoveError::Validation(format!("invalid shard attribute: {e}"))
                             })?;
-                        entry = entry.message_attributes("shard", shard_attr);
+                        entry = entry.message_attributes(SHARD_ATTR, shard_attr);
                     }
                 }
 

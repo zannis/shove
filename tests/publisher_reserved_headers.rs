@@ -1,33 +1,38 @@
-//! `publish_with_headers` refuses header names under the reserved `shove-`
-//! prefix, so a caller cannot forge the headers shove stamps itself.
+//! `publish_with_headers` refuses the header names a backend reserves for
+//! itself, so a caller cannot forge what shove stamps or overwrite what it
+//! writes.
 
-#![cfg(any(feature = "inmemory", feature = "kafka", feature = "nats"))]
+#![cfg(any(
+    feature = "inmemory",
+    feature = "kafka",
+    feature = "nats",
+    feature = "redis-streams"
+))]
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use shove::ShoveError;
 
-const FORGED: &str = "Shove-Retry-Count";
 const CALLER: &str = "x-trace-id";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Payload {
     id: String,
 }
 
-fn forged_headers() -> HashMap<String, String> {
-    HashMap::from([(FORGED.to_string(), "99".to_string())])
+fn forged_headers(name: &str) -> HashMap<String, String> {
+    HashMap::from([(name.to_string(), "99".to_string())])
 }
 
 fn caller_headers() -> HashMap<String, String> {
     HashMap::from([(CALLER.to_string(), "trace-1".to_string())])
 }
 
-fn assert_reserved(err: ShoveError) {
+fn assert_reserved(err: ShoveError, name: &str) {
     match err {
         ShoveError::Validation(message) => assert!(
-            message.contains(FORGED),
+            message.contains(name),
             "the error does not name the header: {message:?}"
         ),
         other => panic!("expected ShoveError::Validation, got {other:?}"),
@@ -42,6 +47,7 @@ mod inmemory {
 
     use super::{Payload, assert_reserved, caller_headers, forged_headers};
 
+    const FORGED: &str = "Shove-Retry-Count";
     const QUEUE: &str = "reserved-headers-inmemory";
 
     shove::define_topic!(ReservedTopic, Payload, TopologyBuilder::new(QUEUE).build());
@@ -64,11 +70,11 @@ mod inmemory {
                 &Payload {
                     id: "forged".into(),
                 },
-                forged_headers(),
+                forged_headers(FORGED),
             )
             .await
             .expect_err("a reserved header name is refused");
-        assert_reserved(err);
+        assert_reserved(err, FORGED);
         let queued = stats.get_queue_stats(QUEUE).await.expect("queue stats");
         assert_eq!(queued.messages_ready, 0, "the refused publish was enqueued");
 
@@ -103,6 +109,7 @@ mod kafka {
 
     use super::{CALLER, Payload, assert_reserved, caller_headers, forged_headers};
 
+    const FORGED: &str = "Shove-Retry-Count";
     const TOPIC: &str = "reserved-headers-kafka";
     const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -187,11 +194,11 @@ mod kafka {
                 &Payload {
                     id: "forged".into(),
                 },
-                forged_headers(),
+                forged_headers(FORGED),
             )
             .await
             .expect_err("a reserved header name is refused");
-        assert_reserved(err);
+        assert_reserved(err, FORGED);
         assert!(
             stored_headers(&bootstrap).await.is_empty(),
             "the refused publish reached the broker"
@@ -233,6 +240,7 @@ mod nats {
 
     use super::{CALLER, Payload, assert_reserved, caller_headers, forged_headers};
 
+    const FORGED: &str = "Shove-Retry-Count";
     const STREAM: &str = "reserved-headers-nats";
 
     shove::define_topic!(ReservedTopic, Payload, TopologyBuilder::new(STREAM).build());
@@ -272,11 +280,11 @@ mod nats {
                 &Payload {
                     id: "forged".into(),
                 },
-                forged_headers(),
+                forged_headers(FORGED),
             )
             .await
             .expect_err("a reserved header name is refused");
-        assert_reserved(err);
+        assert_reserved(err, FORGED);
         let stored = stream.info().await.expect("stream info").state.messages;
         assert_eq!(stored, 0, "the refused publish reached the stream");
 
@@ -302,6 +310,145 @@ mod nats {
         assert_eq!(
             message.headers.get(CALLER).map(|v| v.as_str()),
             Some("trace-1")
+        );
+        broker.close().await;
+    }
+}
+
+#[cfg(feature = "redis-streams")]
+mod redis {
+    use std::time::Duration;
+
+    use redis::{Client, Value, cmd};
+    use shove::redis::{RedisConfig, RedisMode};
+    use shove::topology::TopologyBuilder;
+    use shove::{Broker, Redis};
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
+
+    use super::{CALLER, Payload, assert_reserved, caller_headers, forged_headers};
+
+    const FORGED: &str = "payload";
+    const STREAM: &str = "reserved-headers-redis";
+
+    shove::define_topic!(ReservedTopic, Payload, TopologyBuilder::new(STREAM).build());
+
+    async fn connect(url: &str) -> Broker<Redis> {
+        let mut last = None;
+        for _ in 0..40 {
+            let config = RedisConfig::new(RedisMode::Standalone {
+                url: url.to_owned(),
+            })
+            .with_group("reserved-headers");
+            match Broker::<Redis>::new(config).await {
+                Ok(broker) => return broker,
+                Err(e) => {
+                    last = Some(e);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
+        panic!("connect to Redis at {url}: {last:?}")
+    }
+
+    fn text(value: &Value) -> String {
+        match value {
+            Value::BulkString(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            Value::SimpleString(text) => text.clone(),
+            other => panic!("expected a string, got {other:?}"),
+        }
+    }
+
+    /// Every field of every entry on the stream, in the order Redis stores
+    /// them and with duplicate field names kept.
+    async fn stored_entries(url: &str) -> Vec<Vec<(String, String)>> {
+        let client = Client::open(url).expect("open a raw Redis client");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("open a raw Redis connection");
+        let reply: Value = cmd("XRANGE")
+            .arg(STREAM)
+            .arg("-")
+            .arg("+")
+            .query_async(&mut conn)
+            .await
+            .expect("XRANGE the stream");
+        let Value::Array(entries) = reply else {
+            panic!("XRANGE did not reply with an array: {reply:?}");
+        };
+        entries
+            .into_iter()
+            .map(|entry| {
+                let Value::Array(parts) = entry else {
+                    panic!("expected an entry array, got {entry:?}");
+                };
+                let Some(Value::Array(fields)) = parts.into_iter().nth(1) else {
+                    panic!("an entry carries no field list");
+                };
+                fields
+                    .chunks_exact(2)
+                    .map(|pair| (text(&pair[0]), text(&pair[1])))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn publish_with_headers_rejects_payload() {
+        let container = RedisContainer::default()
+            .with_tag("7.0")
+            .start()
+            .await
+            .expect("start the Redis container");
+        let port = container
+            .get_host_port_ipv4(REDIS_PORT)
+            .await
+            .expect("get the Redis port");
+        let url = format!("redis://127.0.0.1:{port}/");
+        let broker = connect(&url).await;
+        broker
+            .topology()
+            .declare::<ReservedTopic>()
+            .await
+            .expect("declare the topic");
+        let publisher = broker.publisher().await.expect("create the publisher");
+        let honest = Payload {
+            id: "honest".into(),
+        };
+
+        let err = publisher
+            .publish_with_headers::<ReservedTopic>(&honest, forged_headers(FORGED))
+            .await
+            .expect_err("a header named payload is refused");
+        assert_reserved(err, FORGED);
+        assert!(
+            stored_entries(&url).await.is_empty(),
+            "the refused publish was written"
+        );
+
+        publisher
+            .publish_with_headers::<ReservedTopic>(&honest, caller_headers())
+            .await
+            .expect("a name outside the reserved set is published");
+        let stored = stored_entries(&url).await;
+        assert_eq!(stored.len(), 1, "{stored:?}");
+        let bodies: Vec<&str> = stored[0]
+            .iter()
+            .filter(|(field, _)| field == FORGED)
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(bodies.len(), 1, "one payload field per entry: {stored:?}");
+        assert_eq!(
+            serde_json::from_str::<Payload>(bodies[0]).expect("the stored payload decodes"),
+            honest
+        );
+        assert!(
+            stored[0]
+                .iter()
+                .any(|(field, value)| field == CALLER && value == "trace-1"),
+            "{stored:?}"
         );
         broker.close().await;
     }

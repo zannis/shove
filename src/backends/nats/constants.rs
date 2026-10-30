@@ -12,6 +12,18 @@ pub(super) const DEATH_COUNT_HEADER: &str = "Shove-Death-Count";
 /// mis-poisoning.
 pub(super) const SEQUENCE_KEY_HEADER: &str = "Shove-Sequence-Key";
 
+/// Header names this backend writes itself. A new one belongs here: a test
+/// checks that `validate_headers` reserves every name in this list.
+/// `Nats-Msg-Id` is left out on purpose: callers set it for deduplication.
+#[cfg(test)]
+const INTERNAL_HEADERS: &[&str] = &[
+    RETRY_COUNT_HEADER,
+    DEATH_REASON_HEADER,
+    ORIGINAL_QUEUE_HEADER,
+    DEATH_COUNT_HEADER,
+    SEQUENCE_KEY_HEADER,
+];
+
 /// Derives the durable consumer name from a queue name.
 ///
 /// JetStream WorkQueue retention permits only one non-filtered consumer per
@@ -27,4 +39,15 @@ pub(super) fn consumer_name(queue: &str) -> String {
 /// Derives the DLQ consumer name from a DLQ stream name.
 pub(super) fn dlq_consumer_name(dlq: &str) -> String {
     format!("{dlq}-consumer")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::INTERNAL_HEADERS;
+    use crate::publisher_internal::assert_internal_keys_reserved;
+
+    #[test]
+    fn every_internal_header_is_reserved_by_validate_headers() {
+        assert_internal_keys_reserved("NATS", INTERNAL_HEADERS);
+    }
 }
