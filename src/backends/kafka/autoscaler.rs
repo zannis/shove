@@ -53,13 +53,9 @@ pub trait KafkaQueueStatsProvider: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Fails with [`ShoveError::Topology`] when the broker has no topic
-    /// `queue`, describes it with an error such as `TOPIC_AUTHORIZATION_FAILED`,
-    /// or lists no partitions for it, and with [`ShoveError::Connection`] when
-    /// an offset query fails or the broker answers a partition's committed
-    /// offset with an error. A snapshot built from any of those answers would
-    /// read as an empty backlog and let the autoscaler shrink a group that has
-    /// work to do, so none of them yields a lag of zero.
+    /// Returns an error when the lag cannot be read. An implementation must not
+    /// answer a failed read with a lag of zero: the autoscaler reads zero lag as
+    /// an empty queue and shrinks the group.
     fn get_queue_stats(
         &self,
         queue: &str,
@@ -462,6 +458,13 @@ impl Drop for KafkaLagStatsProvider {
 }
 
 impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
+    /// # Errors
+    ///
+    /// Fails with [`ShoveError::Topology`] when the broker has no topic
+    /// `queue`, describes it with an error such as `TOPIC_AUTHORIZATION_FAILED`,
+    /// or lists no partitions for it, and with [`ShoveError::Connection`] when
+    /// an offset query fails or the broker answers a partition's committed
+    /// offset with an error. None of those answers yields a lag of zero.
     async fn get_queue_stats(
         &self,
         queue: &str,
