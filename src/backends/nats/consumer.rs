@@ -3,6 +3,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::Poll;
 use std::time::Duration;
 
 use async_nats::HeaderMap;
@@ -1103,14 +1104,98 @@ where
 // ---------------------------------------------------------------------------
 
 /// How long a worker's pull request waits on the server for messages. A pull
-/// that ends is replaced at once, so this only paces the pulls an idle topic
-/// costs and how often an idle worker probes its connection.
+/// that ends is replaced as soon as the worker has a free slot, so this only
+/// paces the pulls an idle topic costs, and it is how long an idle worker
+/// goes before it probes its connection.
 const PULL_EXPIRES: Duration = Duration::from_secs(30);
+
+/// How many pulls a worker keeps open at once. A second pull asks for the
+/// slots the worker's handlers free while the first pull's messages are still
+/// arriving or running, so the pipe does not empty between pulls. Each pull
+/// asks only for slots that are free, so the bound on the worker's in-flight
+/// messages is unchanged, and a worker with a single slot keeps a single
+/// pull.
+const MAX_OPEN_PULLS: usize = 2;
 
 /// One pull's deliveries, each paired with the processing slot reserved for
 /// it when the pull was sized. The pairing ends with whichever side runs out
 /// first, so no message is started without a slot.
 type Deliveries = stream::Zip<Batch, stream::Iter<std::vec::IntoIter<OwnedSemaphorePermit>>>;
+
+/// One open pull of a worker.
+struct Pull {
+    deliveries: Deliveries,
+    /// Whether it has delivered a message.
+    delivered: bool,
+    /// Whether it has ended, so [`next_event`] drops it.
+    ended: bool,
+}
+
+impl Pull {
+    fn new(batch: Batch, reserved: Vec<OwnedSemaphorePermit>) -> Self {
+        Self {
+            deliveries: batch.zip(stream::iter(reserved)),
+            delivered: false,
+            ended: false,
+        }
+    }
+}
+
+/// What [`next_event`] reports from a worker's open pulls.
+// Returned once per event and never stored, so boxing would only add an
+// allocation per message.
+#[allow(clippy::large_enum_variant)]
+enum PullEvent {
+    /// A message, or the status the server ended its pull with, with the
+    /// slot reserved for it.
+    Delivery(
+        std::result::Result<Message, async_nats::Error>,
+        OwnedSemaphorePermit,
+    ),
+    /// A pull ended. It is already dropped, so the slots it reserved and did
+    /// not fill are free again. `delivered` is whether it delivered a message.
+    Ended { delivered: bool },
+}
+
+/// The next event of a worker's open pulls, never ready while there are
+/// none. A pull that ends is dropped before its event is returned.
+fn next_event(pulls: &mut Vec<Pull>) -> impl Future<Output = PullEvent> + '_ {
+    std::future::poll_fn(move |cx| {
+        let mut ended = None;
+        for pull in pulls.iter_mut() {
+            match pull.deliveries.poll_next_unpin(cx) {
+                Poll::Ready(Some((delivery, slot))) => {
+                    pull.delivered |= delivery.is_ok();
+                    return Poll::Ready(PullEvent::Delivery(delivery, slot));
+                }
+                Poll::Ready(None) => {
+                    pull.ended = true;
+                    ended = Some(PullEvent::Ended {
+                        delivered: pull.delivered,
+                    });
+                    break;
+                }
+                Poll::Pending => {}
+            }
+        }
+        match ended {
+            Some(event) => {
+                pulls.retain(|pull| !pull.ended);
+                Poll::Ready(event)
+            }
+            None => Poll::Pending,
+        }
+    })
+}
+
+/// What a worker's pull loop does next.
+// Returned once per loop turn and never stored, like `PullEvent`.
+#[allow(clippy::large_enum_variant)]
+enum Step {
+    Stop,
+    Reserved(Result<Vec<OwnedSemaphorePermit>>),
+    Event(PullEvent),
+}
 
 /// The message tasks of one worker that have started and not finished, held
 /// retries included. The worker's `processing` flag, which tells a group's
@@ -1188,13 +1273,15 @@ async fn reserve_free_slots(slots: &Arc<Semaphore>) -> Result<Vec<OwnedSemaphore
     Ok(reserved)
 }
 
-/// The messages a pull has delivered and the worker has not started, taken
-/// without waiting for more.
-fn take_ready(deliveries: &mut Deliveries) -> Vec<Message> {
+/// The messages a worker's open pulls have delivered and the worker has not
+/// started, taken without waiting for more.
+fn take_ready(pulls: &mut [Pull]) -> Vec<Message> {
     let mut unstarted = Vec::new();
-    while let Some(Some((delivery, _slot))) = deliveries.next().now_or_never() {
-        if let Ok(msg) = delivery {
-            unstarted.push(msg);
+    for pull in pulls.iter_mut() {
+        while let Some(Some((delivery, _slot))) = pull.deliveries.next().now_or_never() {
+            if let Ok(msg) = delivery {
+                unstarted.push(msg);
+            }
         }
     }
     unstarted
@@ -1206,9 +1293,10 @@ fn take_ready(deliveries: &mut Deliveries) -> Vec<Message> {
 /// slots, and each pull asks the server for as many messages as the worker
 /// has free slots, reserving a slot for every message the pull may deliver.
 /// So each delivered message starts at once, and none waits on the client
-/// while its `ack_wait` runs. The durable needs no budget of its own for
-/// that, and a durable shove creates has none (`max_ack_pending: -1`) unless
-/// one is set: workers attached to one durable, from any number of
+/// while its `ack_wait` runs. Up to [`MAX_OPEN_PULLS`] pulls are open at once,
+/// each holding its own reserved slots. The durable needs no budget of its
+/// own for that, and a durable shove creates has none (`max_ack_pending: -1`)
+/// unless one is set: workers attached to one durable, from any number of
 /// processes, each keep up to their own `prefetch` in flight.
 ///
 /// A retry on a shove-owned stream is held un-acked for its delay and gives
@@ -1253,72 +1341,63 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
         ack_wait: Duration,
     ) -> Result<()> {
         let queue = self.topology.queue();
-        let probe_after = empty_windows_before_probe(PULL_EXPIRES);
-        let mut empty_windows: u32 = 0;
+        let mut pulls: Vec<Pull> = Vec::with_capacity(MAX_OPEN_PULLS);
+        let mut quiet_since = tokio::time::Instant::now();
         loop {
-            let Some(reserved) = self.unless_stopped(reserve_free_slots(&self.slots)).await else {
-                self.drain().await;
-                return Ok(());
+            let may_pull = pulls.len() < MAX_OPEN_PULLS;
+            let step = tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => Step::Stop,
+                reserved = reserve_free_slots(&self.slots), if may_pull => Step::Reserved(reserved),
+                event = next_event(&mut pulls), if !pulls.is_empty() => Step::Event(event),
             };
-            let reserved = reserved?;
-            let pull = consumer
-                .batch()
-                .max_messages(reserved.len())
-                .expires(PULL_EXPIRES)
-                .messages();
-            let Some(pull) = self.unless_stopped(pull).await else {
-                drop(reserved);
-                return self.stop(consumer, &[]).await;
-            };
-            let pull = pull.map_err(|e| {
-                ShoveError::Connection(format!("pull request on {queue} failed: {e}"))
-            })?;
-            // Scoped, so the slots the pull reserved and did not fill go back
-            // before anything below waits.
-            let delivered = {
-                let mut deliveries: Deliveries = pull.zip(stream::iter(reserved));
-                let mut delivered = false;
-                loop {
-                    let Some(item) = self.unless_stopped(deliveries.next()).await else {
-                        let unstarted = take_ready(&mut deliveries);
-                        drop(deliveries);
-                        return self.stop(consumer, &unstarted).await;
+            match step {
+                Step::Stop => return self.stop(consumer, pulls).await,
+                Step::Reserved(reserved) => {
+                    let reserved = reserved?;
+                    let request = consumer
+                        .batch()
+                        .max_messages(reserved.len())
+                        .expires(PULL_EXPIRES)
+                        .messages();
+                    let Some(batch) = self.unless_stopped(request).await else {
+                        drop(reserved);
+                        return self.stop(consumer, pulls).await;
                     };
-                    match item {
-                        None => break delivered,
-                        Some((Ok(msg), slot)) => {
-                            delivered = true;
-                            self.start(msg, slot, ack_wait);
-                        }
-                        Some((Err(e), _)) => {
-                            tracing::error!(error = %e, queue, "consumer stream error");
-                            metrics::record_backend_error(
-                                metrics::BackendLabel::Nats,
-                                metrics::BackendErrorKind::Consume,
-                            );
-                            return Err(ShoveError::Connection(format!(
-                                "consumer stream error on {queue}: {e}"
-                            )));
-                        }
-                    }
+                    let batch = batch.map_err(|e| {
+                        ShoveError::Connection(format!("pull request on {queue} failed: {e}"))
+                    })?;
+                    pulls.push(Pull::new(batch, reserved));
                 }
-            };
-            if delivered {
-                empty_windows = 0;
-                continue;
-            }
-            // A silent outage ends pulls exactly like an idle topic does: see
-            // `empty_windows_before_probe`.
-            empty_windows = empty_windows.saturating_add(1);
-            if empty_windows >= probe_after {
-                let Some(probe) = self.unless_stopped(consumer.get_info()).await else {
-                    self.drain().await;
-                    return Ok(());
-                };
-                probe.map_err(|e| {
-                    ShoveError::Connection(format!("liveness probe on {queue} failed: {e}"))
-                })?;
-                empty_windows = 0;
+                Step::Event(PullEvent::Delivery(Ok(msg), slot)) => {
+                    quiet_since = tokio::time::Instant::now();
+                    self.start(msg, slot, ack_wait);
+                }
+                Step::Event(PullEvent::Delivery(Err(e), _)) => {
+                    tracing::error!(error = %e, queue, "consumer stream error");
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::Nats,
+                        metrics::BackendErrorKind::Consume,
+                    );
+                    return Err(ShoveError::Connection(format!(
+                        "consumer stream error on {queue}: {e}"
+                    )));
+                }
+                Step::Event(PullEvent::Ended { delivered }) => {
+                    // A silent outage ends pulls exactly like an idle topic
+                    // does, so a worker that has seen nothing for a whole
+                    // pull's expiry probes its connection.
+                    if delivered || quiet_since.elapsed() < PULL_EXPIRES {
+                        continue;
+                    }
+                    let Some(probe) = self.unless_stopped(consumer.get_info()).await else {
+                        return self.stop(consumer, pulls).await;
+                    };
+                    probe.map_err(|e| {
+                        ShoveError::Connection(format!("liveness probe on {queue} failed: {e}"))
+                    })?;
+                    quiet_since = tokio::time::Instant::now();
+                }
             }
         }
     }
@@ -1334,10 +1413,13 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
         });
     }
 
-    /// Releases what the worker pulled and never started, then waits for the
-    /// tasks it did start.
-    async fn stop(&self, consumer: &PullConsumer, unstarted: &[Message]) -> Result<()> {
-        release_pulled(consumer, unstarted).await;
+    /// Releases what the worker's open pulls delivered and it never started,
+    /// then waits for the tasks it did start. The pulls are dropped first, so
+    /// the slots they reserved are free before the wait.
+    async fn stop(&self, consumer: &PullConsumer, mut pulls: Vec<Pull>) -> Result<()> {
+        let unstarted = take_ready(&mut pulls);
+        drop(pulls);
+        release_pulled(consumer, &unstarted).await;
         self.drain().await;
         Ok(())
     }
