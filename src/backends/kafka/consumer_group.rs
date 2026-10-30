@@ -749,6 +749,12 @@ impl KafkaConsumerGroup {
     ///
     /// FIFO replica count is fixed at 1 — Kafka uses partition-level ordering,
     /// so a single consumer task is sufficient.
+    ///
+    /// The group's task holds an abort guard on the shard task, so aborting
+    /// the group's task at a drain timeout aborts the shard and the handler
+    /// call it is awaiting. The record being handled stays uncommitted and is
+    /// redelivered, and the shard commits nothing after the group has
+    /// reported the timeout.
     pub fn new_fifo<T, H>(
         queue: impl Into<String>,
         client: KafkaClient,
@@ -786,6 +792,11 @@ impl KafkaConsumerGroup {
                         return;
                     }
                 };
+                // A dropped `JoinHandle` detaches its task; abort the shards with this wrapper.
+                let _shards: Vec<AbortOnDrop> = handles
+                    .iter()
+                    .map(|handle| AbortOnDrop(handle.abort_handle()))
+                    .collect();
                 for handle in handles {
                     match handle.await {
                         Ok(Ok(())) => {}
