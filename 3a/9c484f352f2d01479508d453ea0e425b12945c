@@ -1,0 +1,25 @@
+src/backends/kafka/msk_iam.rs
+  s_1001dc3147e1e5::t_a8761846d19e75 19-20
+  s_1001dc3147e1e5::t_9d7dfad9430638 117-119
+  s_1001dc3147e1e5::t_5bc8485766f8ac 76,79,81-83
+tests/kafka_msk_iam_integration.rs
+  s_1001dc3147e1e5::t_28a83a1caa4620 393,456-472
+  s_1001dc3147e1e5::t_63e6f8f4dddb0d 315,319,324-326,332,337-392
+  s_1001dc3147e1e5::t_f1f4b1ecc1f159 394
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3a9c484f352f2d01479508d453ea0e425b12945c",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
