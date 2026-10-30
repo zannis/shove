@@ -1,0 +1,23 @@
+docs/pages/backends/kafka.mdx
+  s_1001dc3147e1e5::t_51c3cd9dd61970 772-773
+  s_1001dc3147e1e5::t_909af2e5a802e3 719,722
+  s_1001dc3147e1e5::t_fd4b34d0a8a474 687
+  s_1001dc3147e1e5::t_5defce2d8860f3 682
+  s_1001dc3147e1e5::t_5486e34d8a6347 720-721,723-724
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "67f99cafa2544675a3e94e410d6aaa3f755c27f8",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
