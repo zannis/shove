@@ -363,6 +363,13 @@ pub mod kafka {
     #[cfg_attr(docsrs, doc(cfg(feature = "test-support")))]
     pub use crate::backends::kafka::prime_admin_oauth_token_for_test;
 
+    /// Test-only record (see the `test-support` feature) of the `client.id`
+    /// every consumer was created with, for tests that prove a member did not
+    /// reconnect.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::client_id_probe;
+
     /// Test-only probe (see the `test-support` feature) on the concurrent
     /// consumer's completion channel, for tests that prove a completion sat
     /// in the channel during a stall.

@@ -21,6 +21,9 @@ pub use client::{KafkaClient, KafkaCompression, KafkaConfig};
 pub use client::{KafkaSasl, KafkaTls};
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
+pub use consumer::client_id_probe;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
 pub use consumer::completion_probe;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]

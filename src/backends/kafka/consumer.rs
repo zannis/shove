@@ -3048,6 +3048,8 @@ fn create_stream_consumer(
     // rebalances across repeated join attempts can produce stale
     // "group generation id is not valid" commit errors.
     let client_id = format!("shove-{}", uuid::Uuid::new_v4().simple());
+    #[cfg(feature = "test-support")]
+    client_id_probe::record(&client_id);
     base.set("group.id", group_id)
         .set("client.id", &client_id)
         // Cooperative-sticky assignment performs incremental rebalance so that
@@ -3434,6 +3436,35 @@ pub mod per_record_probe {
 
     pub fn assigns_drained_at_receive_arm() -> usize {
         ASSIGNS_DRAINED_AT_RECEIVE_ARM.load(Ordering::SeqCst)
+    }
+}
+
+/// Test-only record (see the `test-support` feature) of the `client.id`
+/// every consumer this process created was given, in creation order. A
+/// reconnect creates a consumer, and with it a fresh id, so a test that must
+/// prove a member rode out a fault without reconnecting reads this. nextest
+/// runs each test in its own process, so the record belongs to that test's
+/// consumers alone.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod client_id_probe {
+    use std::sync::Mutex;
+
+    static CREATED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// The ids, in creation order.
+    pub fn created() -> Vec<String> {
+        CREATED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(super) fn record(client_id: &str) {
+        CREATED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(client_id.to_owned());
     }
 }
 
