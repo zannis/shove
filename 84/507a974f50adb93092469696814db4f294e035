@@ -1,0 +1,33 @@
+docs/pages/backends/kafka.mdx
+  s_1001dc3147e1e5::t_0e53d6f5c646b9 925-926
+  s_1001dc3147e1e5::t_7d00ab518c843a 516-517
+  s_1001dc3147e1e5::t_27e1ab130c27d9 325-329,332-351
+  s_1001dc3147e1e5::t_7aef324ee4e25a 197
+  s_1001dc3147e1e5::t_4a7e6d4219db13 656
+  s_1001dc3147e1e5::t_19f42d86ea0ca9 330-331
+  s_1001dc3147e1e5::t_233a520ec73d5a 695
+  s_1001dc3147e1e5::t_f5745e156f37de 671
+  s_1001dc3147e1e5::t_75b7e97d0ff36e 626-627
+  s_1001dc3147e1e5::t_603379854c039b 670
+src/backends/kafka/consumer.rs
+  s_1001dc3147e1e5::t_c030305d6f03fb 1515-1516
+  s_1001dc3147e1e5::t_2c8eb4b66f91ee 2495-2496
+tests/kafka_commit_policy_mock.rs
+  s_1001dc3147e1e5::t_0e37f7ea2959b5 37-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "84507a974f50adb93092469696814db4f294e035",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
