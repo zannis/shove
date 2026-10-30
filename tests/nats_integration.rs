@@ -7537,8 +7537,63 @@ async fn dlq_drain_stops_on_options_shutdown() {
     broker.close().await;
 }
 
+/// The drain also ends when the broker closes, with the token of its options
+/// still unfired.
+#[tokio::test]
+async fn dlq_drain_stops_when_the_broker_closes() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    let probe = DeadLetterProbe::new();
+    let shutdown = CancellationToken::new();
+    let drain = spawn_dlq_drain(
+        &client,
+        &probe,
+        ConsumerOptions::<Nats>::new().with_shutdown(shutdown.clone()),
+    );
+    wait_for_open_pull(&client, "nats-work-dlq", "nats-work-dlq-consumer").await;
+
+    broker.close().await;
+    assert!(
+        !shutdown.is_cancelled(),
+        "the token of the options is still unfired"
+    );
+    tokio::time::timeout(Duration::from_secs(10), drain)
+        .await
+        .expect("the drain stops when the broker closes")
+        .expect("the drain task does not panic")
+        .expect("the drain stops cleanly");
+}
+
+/// A drain whose DLQ stream is missing meets an error a reconnect cannot clear,
+/// and returns it at once.
+#[tokio::test]
+async fn dlq_drain_without_its_stream_returns_the_error() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        NatsConsumer::new(tb.client()).run_dlq_with_options::<WorkTopic, _>(
+            DeadLetterProbe::new(),
+            (),
+            ConsumerOptions::<Nats>::new(),
+        ),
+    )
+    .await
+    .expect("the drain returns without retrying")
+    .expect_err("a missing DLQ stream is an error");
+    assert!(
+        matches!(err, shove::ShoveError::Topology(_)),
+        "expected ShoveError::Topology, got {err:?}"
+    );
+    broker.close().await;
+}
+
 /// `with_broadcast_start` is read by a broadcast subscription alone, so the
-/// drain refuses it instead of dropping it silently.
+/// drain refuses it, since dropping it silently would hide the mistake.
 #[tokio::test]
 async fn dlq_drain_refuses_a_broadcast_start() {
     let tb = TestBroker::start().await;
