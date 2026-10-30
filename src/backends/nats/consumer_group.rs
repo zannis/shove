@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::nats::client::NatsClient;
+use crate::backends::nats::constants::UNBOUNDED_ACK_PENDING;
 use crate::backends::nats::consumer::{NatsConsumer, derive_ack_wait};
 use crate::backends::nats::topology::NatsTopologyDeclarer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
@@ -106,6 +107,14 @@ impl NatsConsumerGroupConfig {
         }
     }
 
+    /// Set how many messages each member handles at once with
+    /// `concurrent_processing(true)`; a sequential member handles one. A
+    /// member pulls no more messages than it can start, so this is also the
+    /// most it has delivered and un-acked, apart from retries held for their
+    /// delay, which are bounded at the same count on their own. Zero is
+    /// accepted for configuration compatibility and lowered to `1`, as
+    /// [`ConsumerOptions::with_prefetch_count`](crate::ConsumerOptions::with_prefetch_count)
+    /// does.
     pub fn with_prefetch_count(mut self, prefetch_count: u16) -> Self {
         self.prefetch_count = prefetch_count;
         self
@@ -126,12 +135,14 @@ impl NatsConsumerGroupConfig {
         self
     }
 
-    /// Override the aggregate JetStream `max_ack_pending` budget for the
-    /// group's durable consumer, instead of deriving it from
-    /// `prefetch_count × max_consumers` (or `max_consumers` in sequential
-    /// mode). Set this consistently with any external tuning of prefetch —
-    /// a value smaller than the group's live concurrency starves consumers
-    /// of ack slots.
+    /// Cap the JetStream `max_ack_pending` of the group's durable consumer.
+    ///
+    /// Unset, the durable is created unbounded (`-1`): each member already
+    /// bounds its own in-flight messages at its prefetch, so the group can
+    /// hold `prefetch_count × consumers` with concurrent processing on and
+    /// one per member without. A cap is shared by every member attached to
+    /// the durable, in every process, and a value below their combined
+    /// concurrency leaves members waiting for ack slots.
     ///
     /// Pass `-1` for an unbounded budget.
     ///
@@ -250,7 +261,7 @@ impl NatsConsumerGroup {
         H: MessageHandler<T> + 'static,
     {
         let concurrent = config.concurrent_processing;
-        let max_ack_pending = aggregate_max_ack_pending(&config);
+        let max_ack_pending = durable_max_ack_pending(&config);
         let error_count = Arc::new(AtomicUsize::new(0));
         let ec_for_spawner = error_count.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
@@ -611,7 +622,7 @@ impl NatsConsumerGroup {
         let processing = Arc::new(AtomicBool::new(false));
         let mut options = ConsumerOptions::defaults_with_shutdown(child_token.clone());
         options.max_retries = self.config.max_retries;
-        options.prefetch_count = self.config.prefetch_count;
+        options.prefetch_count = self.config.prefetch_count.max(1);
         options.processing = processing.clone();
         options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
         options.handler_timeout_outcome = self.config.handler_timeout_outcome.clone();
@@ -622,7 +633,11 @@ impl NatsConsumerGroup {
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         // Raw vec position of the new entry, not a liveness count.
-        debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");
+        debug!(
+            group = %self.queue,
+            consumer_index = self.consumers.len().saturating_sub(1),
+            "spawned consumer"
+        );
     }
 }
 
@@ -715,15 +730,14 @@ impl NatsConsumerGroupRegistry {
         let declarer = NatsTopologyDeclarer::new(client.clone());
         declarer.declare(topology).await?;
 
-        // Pre-establish the durable pull consumer with the aggregate
-        // ack budget — eliminates N-way `CONSUMER.CREATE` storms on
-        // reconnect (one per consumer task). Per-consumer code now
-        // uses `get_consumer` (read-only) to attach.
+        // Pre-establish the durable pull consumer once — eliminates N-way
+        // `CONSUMER.CREATE` storms on reconnect (one per consumer task).
+        // Per-consumer code uses `get_consumer` (read-only) to attach.
         //
         // `config.handler_timeout` was folded to `Set(resolved)` above, so
         // this resolves to exactly the effective timeout the group's
         // consumers will enforce.
-        let max_ack_pending = aggregate_max_ack_pending(&config);
+        let max_ack_pending = durable_max_ack_pending(&config);
         let ack_wait = derive_ack_wait(resolve_handler_timeout(config.handler_timeout, None));
         let consumer_name = super::constants::consumer_name(topology.queue());
         let filter_subjects = topology.nats_stream_subjects().unwrap_or(&[]);
@@ -876,24 +890,18 @@ impl NatsConsumerGroupRegistry {
     }
 }
 
-/// Aggregate `max_ack_pending` budget for a consumer-group config.
+/// The `max_ack_pending` of a group's durable consumer: the budget
+/// [`with_max_ack_pending`](NatsConsumerGroupConfig::with_max_ack_pending)
+/// set, or unbounded (`-1`).
 ///
-/// In concurrent mode every consumer holds up to `prefetch_count` messages
-/// in flight, so the group as a whole can have `prefetch_count × max_consumers`
-/// pending acks. In sequential mode each consumer holds at most 1, so the
-/// budget is `max_consumers`. Used both by the topology declarer (to size
-/// the durable JetStream consumer once) and by `NatsConsumerGroup::new` (to
-/// communicate the same value to spawned consumer tasks, even though they
-/// only `get_consumer` now and don't re-write the config).
-pub(crate) fn aggregate_max_ack_pending(config: &NatsConsumerGroupConfig) -> i64 {
-    if let Some(n) = config.max_ack_pending {
-        return n;
-    }
-    if config.concurrent_processing {
-        config.prefetch_count as i64 * config.max_consumers as i64
-    } else {
-        config.max_consumers as i64
-    }
+/// Every member bounds its own in-flight messages at its prefetch, so the
+/// durable needs no budget of its own, and a finite one would be shared by
+/// every member of every process attached to it. Used both by the topology
+/// declarer (to create the durable once) and by `NatsConsumerGroup::new` (to
+/// hand the same value to spawned consumer tasks, which only `get_consumer`
+/// and create the durable themselves only when it has gone missing).
+pub(crate) fn durable_max_ack_pending(config: &NatsConsumerGroupConfig) -> i64 {
+    config.max_ack_pending.unwrap_or(UNBOUNDED_ACK_PENDING)
 }
 
 // ---------------------------------------------------------------------------
@@ -1423,24 +1431,31 @@ mod tests {
     }
 
     #[test]
-    fn with_max_ack_pending_overrides_aggregate() {
+    fn with_max_ack_pending_caps_the_durable() {
         let config = NatsConsumerGroupConfig::new(1..=4)
             .with_concurrent_processing(true)
             .with_prefetch_count(10)
             .with_max_ack_pending(999);
         assert_eq!(config.max_ack_pending(), Some(999));
-        assert_eq!(aggregate_max_ack_pending(&config), 999);
+        assert_eq!(durable_max_ack_pending(&config), 999);
     }
 
+    /// Each member bounds its own in-flight messages, so a durable the group
+    /// creates has no budget of its own whatever the prefetch and mode.
     #[test]
-    fn aggregate_max_ack_pending_derives_when_unset() {
+    fn durable_max_ack_pending_is_unbounded_when_unset() {
         let sequential = NatsConsumerGroupConfig::new(1..=4);
-        assert_eq!(aggregate_max_ack_pending(&sequential), 4);
+        assert_eq!(durable_max_ack_pending(&sequential), -1);
 
         let concurrent = NatsConsumerGroupConfig::new(1..=4)
             .with_concurrent_processing(true)
             .with_prefetch_count(10);
-        assert_eq!(aggregate_max_ack_pending(&concurrent), 40);
+        assert_eq!(durable_max_ack_pending(&concurrent), -1);
+
+        let zero_prefetch = NatsConsumerGroupConfig::new(1..=4)
+            .with_concurrent_processing(true)
+            .with_prefetch_count(0);
+        assert_eq!(durable_max_ack_pending(&zero_prefetch), -1);
     }
 
     /// The config getter alone does not pin the fix: `spawn_one` has to copy
@@ -1459,6 +1474,26 @@ mod tests {
         let mut group = test_group_with_spawner(config, spawner);
         group.start();
         assert_eq!(*captured.lock().unwrap(), Some(Some(3)));
+        group.shutdown().await;
+    }
+
+    /// A zero prefetch reaches a member as one, the lowering
+    /// `ConsumerOptions::with_prefetch_count` documents.
+    #[tokio::test]
+    async fn spawn_one_lowers_a_zero_prefetch_to_one() {
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+            *cap.lock().unwrap() = Some(options.prefetch_count);
+            tokio::spawn(async move { options.shutdown.cancelled().await })
+        });
+        let config = NatsConsumerGroupConfig::new(1..=1)
+            .with_concurrent_processing(true)
+            .with_prefetch_count(0);
+        let mut group = test_group_with_spawner(config, spawner);
+        group.start();
+        assert_eq!(*captured.lock().unwrap(), Some(1));
         group.shutdown().await;
     }
 
@@ -1501,7 +1536,7 @@ mod tests {
     #[test]
     fn with_max_ack_pending_allows_unbounded_sentinel() {
         let config = NatsConsumerGroupConfig::new(1..=4).with_max_ack_pending(-1);
-        assert_eq!(aggregate_max_ack_pending(&config), -1);
+        assert_eq!(durable_max_ack_pending(&config), -1);
     }
 
     // -- handler timeout tri-state --

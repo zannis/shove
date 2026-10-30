@@ -141,7 +141,7 @@ Each backend's consumer group config has backend-specific knobs beyond the share
 
 **RabbitMQ (`rabbitmq::ConsumerGroupConfig`)** — adds `.with_concurrent_processing(bool)`. When `true`, each consumer processes up to `prefetch_count` messages concurrently. RabbitMQ's Single Active Consumer mode is enabled automatically for sequenced topics.
 
-**NATS (`nats::NatsConsumerGroupConfig`)** — adds `.with_concurrent_processing(bool)`; see `NatsConsumerGroupConfig` for further NATS-specific options. NATS pull consumers use the `max_ack_pending` setting derived from `prefetch_count`.
+**NATS (`nats::NatsConsumerGroupConfig`)** — adds `.with_concurrent_processing(bool)`; see `NatsConsumerGroupConfig` for further NATS-specific options. Each NATS member pulls only as many messages as `prefetch_count` lets it start, so the group's durable is created with `max_ack_pending` unbounded unless `with_max_ack_pending` sets a cap.
 
 **Kafka (`kafka::KafkaConsumerGroupConfig`)** — adds `.with_concurrent_processing(bool)`. Kafka's consumer-group protocol handles partition assignment across instances automatically.
 
