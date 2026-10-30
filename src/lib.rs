@@ -415,6 +415,13 @@ pub mod kafka {
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::final_commit_spawn_probe;
+
+    /// Test-only switch (see the `test-support` feature): refuses every dead
+    /// letter with an error no retry gets past, so a test can drive that
+    /// failure through the consume paths.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::dlq_publish_probe;
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::per_record_probe;

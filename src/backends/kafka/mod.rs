@@ -70,6 +70,10 @@ pub use consumer::fence_probe;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use consumer::final_commit_spawn_probe;
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use consumer::dlq_publish_probe;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use consumer::per_record_probe;

@@ -1217,6 +1217,13 @@ async fn publish_to_dlq(
         }
     };
 
+    #[cfg(feature = "test-support")]
+    if dlq_publish_probe::refused() {
+        return Err(ShoveError::Topology(format!(
+            "DLQ publish to '{dlq_topic}' refused by the test seam"
+        )));
+    }
+
     let dlq_headers = headers_for_dlq(headers, reason, topology.queue(), retry_count);
     client
         .publish_with_retry(
@@ -1228,6 +1235,28 @@ async fn publish_to_dlq(
             "DLQ publish",
         )
         .await
+}
+
+/// Test-only switch (see the `test-support` feature) on [`publish_to_dlq`]:
+/// it refuses every dead letter with the `ShoveError::Topology` a client
+/// whose producer cannot be built answers with, so a test can drive a
+/// publish failure that no retry gets past. nextest runs each test in its own
+/// process, so the switch belongs to that test's consumers alone.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod dlq_publish_probe {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static REFUSE: AtomicBool = AtomicBool::new(false);
+
+    /// Refuse, or with `false` allow again, every dead-letter publish.
+    pub fn refuse(refuse: bool) {
+        REFUSE.store(refuse, Ordering::SeqCst);
+    }
+
+    pub(super) fn refused() -> bool {
+        REFUSE.load(Ordering::SeqCst)
+    }
 }
 
 /// Whether a failed publish can never succeed: `publish_with_retry` answers
@@ -1663,11 +1692,12 @@ enum Staged<M> {
 /// otherwise rides the offset into the tracker, settled by the commit that
 /// covers it, as lost when the dead letter could not be published.
 ///
-/// `Err` is a dead letter that failed and may land later. Nothing is
-/// completed, so the record stays in flight and no commit passes it, and
-/// `pending` settles as survived. The caller ends the member with the
-/// error: the reconnect resumes from the committed position and the record
-/// is redelivered.
+/// `Err` is a dead letter that failed otherwise, the fault [`publish_fault`]
+/// makes of it. Nothing is completed, so the record stays in flight and no
+/// commit passes it, and `pending` settles as survived. The caller ends the
+/// member with the error: the reconnect a retryable one leads to resumes
+/// from the committed position and redelivers the record, and any other
+/// error ends the member with nothing committed.
 #[allow(clippy::too_many_arguments)]
 async fn dead_letter_and_complete(
     client: &KafkaClient,
@@ -1710,17 +1740,32 @@ async fn dead_letter_and_complete(
                 error = %e,
                 queue = topic,
                 reason,
-                "DLQ publish failed; the record stays uncommitted and is redelivered"
+                retryable = e.is_retryable(),
+                "DLQ publish failed; the record stays uncommitted"
             );
             pending.survived();
-            return Err(ShoveError::Connection(format!(
-                "DLQ publish on '{topic}' failed: {e}; the record stays uncommitted and the \
-                 member reconnects to redeliver it"
-            )));
+            return Err(publish_fault("DLQ publish", topic, e));
         }
     };
     signal_completion(completion, topic, discard);
     Ok(())
+}
+
+/// The member's fault for a republish or a dead letter that failed with `e`,
+/// one `is_unpublishable` does not cover. A retryable error becomes a
+/// `Connection` fault: the member reconnects, resumes from the committed
+/// position and is handed the record again. Any other error is the fault as
+/// it came, so the member ends with it, as `run_with_reconnect` ends on
+/// every error it cannot retry.
+fn publish_fault(what: &str, topic: &str, e: ShoveError) -> ShoveError {
+    if e.is_retryable() {
+        ShoveError::Connection(format!(
+            "{what} on '{topic}' failed: {e}; the record stays uncommitted and the member \
+             reconnects to redeliver it"
+        ))
+    } else {
+        e
+    }
 }
 
 /// Count and settle a message dropped before the handler on the concurrent
@@ -1771,8 +1816,10 @@ async fn discard_pre_handler(
 /// nothing: the record stays in flight, no commit passes it, and the error
 /// is reported over `fault`, which ends the member under either commit
 /// policy. The reconnect resumes from the committed position and the record
-/// is redelivered. A copy that can never be published goes to the DLQ under
-/// the death reason `republish_failed`.
+/// is redelivered. An error no retry gets past is reported as it came, so
+/// the member ends with it instead of reconnecting, see [`publish_fault`]. A
+/// copy that can never be published goes to the DLQ under the death reason
+/// `republish_failed`.
 #[allow(clippy::too_many_arguments)]
 async fn route_outcome(
     client: &KafkaClient,
@@ -1880,12 +1927,10 @@ async fn route_outcome(
                         error = %e,
                         queue = topic,
                         label,
-                        "delayed republish failed; the record stays uncommitted and is redelivered"
+                        retryable = e.is_retryable(),
+                        "delayed republish failed; the record stays uncommitted"
                     );
-                    let _ = fault.try_send(ShoveError::Connection(format!(
-                        "{label} on '{topic}' failed: {e}; the record stays uncommitted and the \
-                         member reconnects to redeliver it"
-                    )));
+                    let _ = fault.try_send(publish_fault(label, topic, e));
                 }
             }
         }
