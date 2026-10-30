@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::CStr;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -94,7 +95,8 @@ use super::startup;
 
 /// Consecutive quiet drains (see `PartitionTracker::drain_committable`) after
 /// which a re-offered commit is assumed to have landed, resolving the
-/// partition's dirty streak.
+/// partition's dirty streak. An accepted commit resolves it at once (see
+/// `PartitionTracker::resolve`); quiet drains are a second, slower way.
 ///
 /// Must be >= 2: at 1 this degenerates into "clear on the first quiet tick",
 /// which resets a genuinely wedged partition's streak on every iteration and
@@ -104,10 +106,9 @@ use super::startup;
 /// quiet drain back a full interval; the second may follow one iteration
 /// later) and 2 × `HOUSEKEEPING_INTERVAL` on an idle topic. Both windows
 /// comfortably exceed a healthy commit round trip (sub-ms here), so a wedged
-/// partition still trips the fence on schedule — though a coordinator whose
-/// rejection RTT exceeds the interval under continuous traffic can still
-/// out-age the streak; the pre-gate window was two loop iterations
-/// (microseconds), so this is strictly tighter, not a regression.
+/// partition still trips the fence on schedule. A loop that commits through
+/// a `CommitSlot` drains nothing while a commit is in flight, so a rejection
+/// slower than the interval cannot out-age the streak there.
 const QUIET_DRAINS_TO_RESOLVE: u32 = 2;
 
 /// Minimum spacing between offset commits issued by the concurrent receive
@@ -233,6 +234,10 @@ impl AsyncCommitGate {
 }
 
 struct PartitionTracker {
+    /// The epoch of the assignment this tracker was seeded under, see
+    /// `OffsetTracker::epochs`. A commit's answer settles on this tracker
+    /// only when the commit was drained under the same epoch.
+    epoch: u64,
     /// Next offset to commit (exclusive - Kafka convention): every offset
     /// delivered under this assignment below it has completed.
     next_to_commit: i64,
@@ -251,28 +256,28 @@ struct PartitionTracker {
     /// the commit position is one past it, which steps over any hole the
     /// broker never delivered.
     highest_delivered: i64,
-    /// Set when an async commit that included this partition was rejected
-    /// (e.g. during a rebalance). Makes the next `drain_committable` re-offer
-    /// the current `next_to_commit` even without new completions, so the
-    /// failed commit is retried instead of silently lost.
+    /// Set when a commit that included this partition was not accepted
+    /// (e.g. during a rebalance), or when a rebalance may have cost one.
+    /// Makes the next `drain_committable` re-offer the current
+    /// `next_to_commit` even without new completions, so the failed commit
+    /// is retried instead of silently lost.
     dirty: bool,
     /// When a *rejected commit* first raised `dirty` in the current
     /// unresolved streak. Only `mark_dirty` sets it; a rebalance-induced
     /// re-offer goes through `mark_dirty_resolved`, which clears it.
     ///
-    /// `commit_callback` only fires on failure (see its doc comment), so
-    /// there is no positive ack that a re-offered commit landed. Any
-    /// rebalance clears the streak instead — for a partition that moves, by
-    /// dropping this tracker (`OffsetTracker::remove`); for one this member
-    /// keeps, via `mark_dirty_resolved`. So a `dirty_since` that keeps aging
-    /// across repeated re-offers with no intervening rebalance is exactly the
-    /// "commits rejected, group never recovers" signature:
+    /// An accepted commit of the partition clears it (`resolve`), and so
+    /// does any rebalance: for a partition that moves, by dropping this
+    /// tracker (`OffsetTracker::remove`); for one this member keeps, via
+    /// `mark_dirty_resolved`. So a `dirty_since` that keeps aging across
+    /// repeated re-offers, none accepted and no rebalance between them, is
+    /// exactly the "commits rejected, group never recovers" signature:
     /// `PartitionTracker::stuck_for`.
     dirty_since: Option<Instant>,
     /// Consecutive `drain_committable` calls entered with `dirty == false`.
-    /// See `QUIET_DRAINS_TO_RESOLVE` — this is what lets a *recovered*
-    /// partition clear `dirty_since`, which a successful commit cannot do on
-    /// its own because it is silent.
+    /// See `QUIET_DRAINS_TO_RESOLVE`: a second way a *recovered* partition
+    /// clears `dirty_since`, beside the accepted commit that clears it at
+    /// once.
     quiet_drains: u32,
     /// Terminal discards awaiting the commit that retires them, keyed by the
     /// offset each depends on.
@@ -288,10 +293,11 @@ struct PartitionTracker {
 }
 
 impl PartitionTracker {
-    /// Seeds the tracker from the first offset delivered under this
-    /// assignment, which is also the first in-flight offset.
-    fn new(first_offset: i64) -> Self {
+    /// Seeds the tracker from the first offset delivered under the
+    /// assignment `epoch` names, which is also the first in-flight offset.
+    fn new(first_offset: i64, epoch: u64) -> Self {
         Self {
+            epoch,
             next_to_commit: first_offset,
             in_flight: BTreeSet::from([first_offset]),
             highest_delivered: first_offset,
@@ -374,6 +380,13 @@ impl PartitionTracker {
         self.dirty_since.get_or_insert(now);
     }
 
+    /// Ends the unresolved streak, because the coordinator accepted a
+    /// commit of this partition: a member whose commits land is not fenced.
+    /// A re-offer already flagged stays flagged.
+    fn resolve(&mut self) {
+        self.dirty_since = None;
+    }
+
     /// Flags this partition dirty because a rebalance may have dropped an
     /// in-flight commit, and clears any unresolved streak.
     ///
@@ -393,17 +406,15 @@ impl PartitionTracker {
     /// needs to be retried — see `dirty`), or None.
     ///
     /// Deliberately does **not** clear `dirty_since` on the *first* drain
-    /// that finds nothing to retry: `commit_callback` only fires on failure
-    /// (see its doc comment), so an async commit's round trip can easily
-    /// outlast one loop iteration — clearing on the first quiet tick would
-    /// let a genuinely wedged partition's streak get reset just before each
-    /// new failure lands, so it would never reach the fenced threshold.
+    /// that finds nothing to retry: the answer to a re-offer can outlast one
+    /// loop iteration, and clearing on the first quiet tick would let a
+    /// genuinely wedged partition's streak get reset just before each new
+    /// rejection lands, so it would never reach the fenced threshold.
     /// `QUIET_DRAINS_TO_RESOLVE` consecutive quiet drains, on the other
-    /// hand, are long enough that a re-offered commit must have landed, and
-    /// clearing there is what stops a *recovered* partition from aging into
-    /// a false fence (a successful commit is silent, so it cannot clear the
-    /// streak itself). A resolving rebalance also clears it, by dropping and
-    /// recreating this tracker — see `OffsetTracker::remove`.
+    /// hand, are long enough that a re-offered commit must have landed. The
+    /// accepted commit itself clears the streak at once (`resolve`), and a
+    /// resolving rebalance clears it by dropping and recreating this
+    /// tracker — see `OffsetTracker::remove`.
     /// The returned discards are the ones this commit position retires: their
     /// offsets are strictly below the (exclusive) commit offset, and each is
     /// returned with the offset it rides on, so a commit that is not
@@ -440,13 +451,13 @@ impl PartitionTracker {
     /// retires, whether or not an earlier drain offered the same position.
     ///
     /// `drain_committable` offers a position only on new progress or after
-    /// a rejected commit, which is right for the asynchronous cadence: a
+    /// a rejected commit, which is right for the running cadence: a
     /// position offered once is in flight, and offering it again would only
-    /// add a request. At shutdown that rule left a hole. The last
-    /// asynchronous commit may still be in flight, or a rebalance may have
-    /// dropped it without a callback, and with no new completion the final
-    /// `Sync` commit carried nothing. Re-offering every position makes that
-    /// commit carry every safe position, for the broker to confirm. A repeated commit
+    /// add a request. At shutdown that rule left a hole. The commit the stop
+    /// found in flight may have been rejected or gone unanswered, and with
+    /// no new completion the final `Sync` commit carried nothing.
+    /// Re-offering every position makes that commit carry every safe
+    /// position, for the broker to confirm. A repeated commit
     /// keeps the same logical position, though the coordinator still
     /// appends the request to `__consumer_offsets`, as the rebalance
     /// re-offer in `OffsetTracker::apply_rebalance_events` relies on; and
@@ -566,22 +577,20 @@ impl OffsetTracker {
     /// delivery belongs to: the seed begins a new epoch for the partition
     /// and gives it a fresh revoke token.
     fn track_received(&mut self, partition: i32, offset: i64) -> Assignment {
-        let seeded = match self.partitions.get_mut(&partition) {
+        let epoch = match self.partitions.get_mut(&partition) {
             Some(tracker) => {
                 tracker.track_received(offset);
-                false
+                tracker.epoch
             }
             None => {
+                let seeded = self.epochs.entry(partition).or_insert(0);
+                *seeded = seeded.wrapping_add(1);
+                let epoch = *seeded;
                 self.partitions
-                    .insert(partition, PartitionTracker::new(offset));
-                true
+                    .insert(partition, PartitionTracker::new(offset, epoch));
+                epoch
             }
         };
-        let epoch = self.epochs.entry(partition).or_insert(0);
-        if seeded {
-            *epoch = epoch.wrapping_add(1);
-        }
-        let epoch = *epoch;
         let revoked = self
             .assignments
             .lock()
@@ -602,9 +611,7 @@ impl OffsetTracker {
         match self.partitions.get_mut(&partition) {
             // A completion from the partition's current assignment, the one
             // its delivery was tracked under.
-            Some(tracker) if self.epochs.get(&partition) == Some(&epoch) => {
-                tracker.mark_complete(offset, discard)
-            }
+            Some(tracker) if tracker.epoch == epoch => tracker.mark_complete(offset, discard),
             // The partition was revoked while this delivery was in flight, so
             // this member will never commit the offset and whoever owns the
             // partition now will redeliver the message. Or the partition came
@@ -637,14 +644,50 @@ impl OffsetTracker {
         cancel_assignments(&self.assignments, &[partition]);
     }
 
-    /// Flags a partition to re-offer its current commit position on the next
-    /// drain, because an async commit that covered it was rejected. No-ops if
-    /// the partition's tracker is gone (revoked meanwhile) — a commit must
-    /// never be retried for a partition this member no longer owns.
-    fn mark_dirty(&mut self, partition: i32, now: Instant) {
-        if let Some(tracker) = self.partitions.get_mut(&partition) {
-            tracker.mark_dirty(now);
+    /// Settles a commit the coordinator accepted: every partition it carried
+    /// that is still under the assignment the commit was drained under ends
+    /// its unresolved streak, see `PartitionTracker::resolve`. The caller
+    /// confirms the discards the commit retired.
+    fn commit_accepted(&mut self, positions: &[CommitPosition]) {
+        for position in positions {
+            if let Some(tracker) = self.tracker_under(position) {
+                tracker.resolve();
+            }
         }
+    }
+
+    /// Settles a commit that did not land: the coordinator refused it,
+    /// librdkafka gave it up, or no thread could carry it. Every partition it
+    /// carried re-offers its current position on the next drain, and the
+    /// discards it would have retired ride that re-offer, so the commit that
+    /// finally lands retires them exactly once.
+    ///
+    /// Only on a partition still under the assignment the commit was drained
+    /// under. One revoked meanwhile is no longer this member's to commit, and
+    /// one revoked and handed back since is redelivered from its committed
+    /// position under the new assignment, which commits it on its own
+    /// account: the old commit's rejection starts no streak there, and its
+    /// discards settle as survived, the rule `remove` applies.
+    fn commit_rejected(
+        &mut self,
+        positions: &[CommitPosition],
+        discards: Vec<CoveredDiscard>,
+        now: Instant,
+    ) {
+        for position in positions {
+            if let Some(tracker) = self.tracker_under(position) {
+                tracker.mark_dirty(now);
+            }
+        }
+        self.re_pend(discards);
+    }
+
+    /// The tracker of `position`'s partition, while the partition is still
+    /// under the assignment the position was drained under.
+    fn tracker_under(&mut self, position: &CommitPosition) -> Option<&mut PartitionTracker> {
+        self.partitions
+            .get_mut(&position.partition)
+            .filter(|tracker| tracker.epoch == position.epoch)
     }
 
     /// Whether any partition has commit work pending (see
@@ -655,51 +698,36 @@ impl OffsetTracker {
             .any(PartitionTracker::has_committable)
     }
 
-    /// Applies all queued rebalance/commit-failure events from librdkafka's
-    /// callbacks. Cheap when the channel is empty (a single failed
-    /// `try_recv`), so callers run it every loop iteration. Returns whether
-    /// an assign event was among them: a partition this member is handed,
-    /// or handed back, keeps the pause flag librdkafka last gave it, so a
-    /// loop that pauses must re-apply its intent then (see the per-record
-    /// pause in the receive loop).
-    fn apply_rebalance_events(
-        &mut self,
-        rx: &std_mpsc::Receiver<RebalanceEvent>,
-        now: Instant,
-    ) -> bool {
+    /// Applies all queued rebalance events from librdkafka's callbacks.
+    /// Cheap when the channel is empty (a single failed `try_recv`), so
+    /// callers run it every loop iteration. Returns whether an assign event
+    /// was among them: a partition this member is handed, or handed back,
+    /// keeps the pause flag librdkafka last gave it, so a loop that pauses
+    /// must re-apply its intent then (see the per-record pause in the
+    /// receive loop).
+    fn apply_rebalance_events(&mut self, rx: &std_mpsc::Receiver<RebalanceEvent>) -> bool {
         let mut assigned = false;
         while let Ok(event) = rx.try_recv() {
             assigned |= matches!(event, RebalanceEvent::Assign(_));
-            match event {
-                RebalanceEvent::Assign(partitions) | RebalanceEvent::Revoke(partitions) => {
-                    for partition in partitions {
-                        self.remove(partition);
-                    }
-                    // Async commits in flight while the group rebalances can
-                    // be dropped by librdkafka without surfacing an error
-                    // (observed against a real broker: commits submitted
-                    // between the revoke and assign phases of a cooperative
-                    // rebalance vanish — no commit_callback ever fires).
-                    // Re-offer every retained partition's position once the
-                    // dust settles; re-committing an already-committed offset
-                    // keeps the same logical position, at the cost of one
-                    // more write to __consumer_offsets. The rebalance always ends with
-                    // an assign round, so the last re-offer lands after the
-                    // group is stable again.
-                    //
-                    // `mark_dirty_resolved`, not `mark_dirty`: a rebalance is
-                    // evidence the member is still talking to the coordinator,
-                    // which is the opposite of the fenced signature, so it must
-                    // clear the streak rather than start one.
-                    for tracker in self.partitions.values_mut() {
-                        tracker.mark_dirty_resolved();
-                    }
-                }
-                RebalanceEvent::CommitFailed(partitions) => {
-                    for partition in partitions {
-                        self.mark_dirty(partition, now);
-                    }
-                }
+            let (RebalanceEvent::Assign(partitions) | RebalanceEvent::Revoke(partitions)) = event;
+            for partition in partitions {
+                self.remove(partition);
+            }
+            // A commit made while the group rebalances can be refused with a
+            // rebalance in progress or a stale generation. Re-offer every
+            // retained partition's position once the dust settles;
+            // re-committing an already-committed offset keeps the same
+            // logical position, at the cost of one more write to
+            // __consumer_offsets. The rebalance always ends with an assign
+            // round, so the last re-offer lands after the group is stable
+            // again.
+            //
+            // `mark_dirty_resolved`, not `mark_dirty`: a rebalance is
+            // evidence the member is still talking to the coordinator,
+            // which is the opposite of the fenced signature, so it must
+            // clear the streak rather than start one.
+            for tracker in self.partitions.values_mut() {
+                tracker.mark_dirty_resolved();
             }
         }
         assigned
@@ -734,27 +762,52 @@ impl OffsetTracker {
     /// commit (the common case). Returning `Option` skips the C-heap (librdkafka
     /// FFI) allocation when there's nothing to do.
     ///
-    /// The second element carries the terminal discards this commit would
-    /// retire. A non-empty vec is what makes the caller commit with
-    /// `CommitMode::Sync`: the accounting needs a broker-confirmed commit, and
-    /// paying for one only when a terminal offset is in the batch keeps the
-    /// ordinary Ack-only path asynchronous.
-    fn drain_committable(&mut self) -> Option<(TopicPartitionList, Vec<CoveredDiscard>)> {
-        let mut tpl: Option<TopicPartitionList> = None;
-        let mut discards = Vec::new();
+    /// The commit carries, beside the list, each partition's position with
+    /// the epoch it was drained under and the terminal discards those
+    /// positions retire, so its answer settles on the assignment it was made
+    /// for, see `commit_accepted` and `commit_rejected`.
+    fn drain_committable(&mut self) -> Option<DrainedCommit> {
+        let mut drained: Option<DrainedCommit> = None;
         for (&partition, tracker) in &mut self.partitions {
-            if let Some((commit_offset, covered)) = tracker.drain_committable() {
-                discards.extend(covered.into_iter().map(|(offset, discard)| CoveredDiscard {
+            let Some((offset, covered)) = tracker.drain_committable() else {
+                continue;
+            };
+            let epoch = tracker.epoch;
+            let commit = drained.get_or_insert_with(DrainedCommit::default);
+            if let Err(e) =
+                commit
+                    .tpl
+                    .add_partition_offset(&self.topic, partition, Offset::Offset(offset))
+            {
+                // As in `drain_all`: a position the commit cannot carry is
+                // never confirmed by it, so its discards are not retired.
+                tracing::error!(
+                    queue = %self.topic,
                     partition,
                     offset,
+                    error = %e,
+                    "could not add the partition to the offset commit; its position is not committed"
+                );
+                for (_, discard) in covered {
+                    discard.survived();
+                }
+                continue;
+            }
+            commit.positions.push(CommitPosition {
+                partition,
+                offset,
+                epoch,
+            });
+            commit
+                .discards
+                .extend(covered.into_iter().map(|(offset, discard)| CoveredDiscard {
+                    partition,
+                    offset,
+                    epoch,
                     discard,
                 }));
-                tpl.get_or_insert_with(TopicPartitionList::new)
-                    .add_partition_offset(&self.topic, partition, Offset::Offset(commit_offset))
-                    .ok();
-            }
         }
-        tpl.map(|tpl| (tpl, discards))
+        drained.filter(|commit| !commit.positions.is_empty())
     }
 
     /// Every partition's current position for the final commit at shutdown,
@@ -800,26 +853,26 @@ impl OffsetTracker {
     /// Hands the discards of a commit that was not accepted back to their
     /// partitions, so the re-offer of the position carries them and the
     /// commit that finally lands retires them exactly once. A discard whose
-    /// partition was revoked meanwhile is settled as survived: the new owner
-    /// redelivers the message, the rule `remove` applies.
+    /// partition was revoked meanwhile, or revoked and handed back since, is
+    /// settled as survived: the partition's owner redelivers the message, the
+    /// rule `remove` applies.
     fn re_pend(&mut self, discards: Vec<CoveredDiscard>) {
         for covered in discards {
             match self.partitions.get_mut(&covered.partition) {
-                Some(tracker) => {
+                Some(tracker) if tracker.epoch == covered.epoch => {
                     tracker
                         .pending_discards
                         .insert(covered.offset, covered.discard);
                 }
-                None => covered.discard.survived(),
+                _ => covered.discard.survived(),
             }
         }
     }
 }
 
 /// The `(partition, offset)` pairs a commit carries, in partition order, for
-/// `FailedCommit::offsets`, the partitions a rejected per-record commit
-/// re-offers, and the shutdown diagnostics. Positions only: nothing of the
-/// records behind them.
+/// `FailedCommit::offsets` and the shutdown diagnostics. Positions only:
+/// nothing of the records behind them.
 fn committed_offsets(tpl: &TopicPartitionList) -> Vec<(i32, i64)> {
     let mut offsets: Vec<(i32, i64)> = tpl
         .elements()
@@ -833,13 +886,45 @@ fn committed_offsets(tpl: &TopicPartitionList) -> Vec<(i32, i64)> {
     offsets
 }
 
+/// One partition's position in a drained commit, with the epoch of the
+/// assignment it was drained under, see `OffsetTracker::track_received`.
+#[derive(Debug, Clone, Copy)]
+struct CommitPosition {
+    partition: i32,
+    offset: i64,
+    epoch: u64,
+}
+
+/// The `(partition, offset)` pairs `positions` carry, in partition order:
+/// what `committed_offsets` reads off a list, read off a drained commit.
+fn position_offsets(positions: &[CommitPosition]) -> Vec<(i32, i64)> {
+    let mut offsets: Vec<(i32, i64)> = positions
+        .iter()
+        .map(|position| (position.partition, position.offset))
+        .collect();
+    offsets.sort_unstable();
+    offsets
+}
+
+/// What one drain of the tracker hands the commit it builds: the list to
+/// commit, the positions it carries, and the discards those positions
+/// retire. See `OffsetTracker::drain_committable`.
+#[derive(Default)]
+struct DrainedCommit {
+    tpl: TopicPartitionList,
+    positions: Vec<CommitPosition>,
+    discards: Vec<CoveredDiscard>,
+}
+
 /// A terminal discard a drained commit position covers, with the
-/// coordinates it rides on, so a commit the coordinator does not accept can
-/// hand it back to the tracker (`OffsetTracker::re_pend`) instead of
-/// settling it. Settling delegates to the discard itself.
+/// coordinates it rides on and the epoch of the assignment it was drained
+/// under, so a commit the coordinator does not accept can hand it back to
+/// the tracker (`OffsetTracker::re_pend`) instead of settling it. Settling
+/// delegates to the discard itself.
 struct CoveredDiscard {
     partition: i32,
     offset: i64,
+    epoch: u64,
     discard: TerminalDiscard,
 }
 
@@ -1324,55 +1409,72 @@ impl Completion {
 
 /// Hand this delivery's offset to the tracker so it can be committed.
 ///
-/// Returns whether the offset was actually handed over. A full channel means
-/// it is never committed, so the message is redelivered from the last
+/// Returns whether the offset was actually handed over. When it was not, it
+/// is never committed, so the message is redelivered from the last
 /// committed position on the next rebalance or restart — callers about to
 /// assert the message is gone must not do so when this returns `false`.
+/// The channel refuses it in two ways. Closed, the receive loop has ended,
+/// which a fault does with sibling handlers still running, and the
+/// reconnect or the next owner redelivers the message; that is logged at
+/// debug. Full, the channel's bound is wrong, a logic bug logged at error.
 ///
 /// **`true` is not a broker acknowledgement**, and terminal accounting is
 /// therefore *not* settled here. It says only that the offset entered the
-/// in-process tracker; the commit can still fail, or be dropped outright by
-/// librdkafka mid-rebalance without any callback (see
-/// `OffsetTracker::apply_rebalance_events`), and a redelivered message is one
-/// `messages_discarded_total` promised no longer exists.
+/// in-process tracker; the commit can still fail, and a redelivered message
+/// is one `messages_discarded_total` promised no longer exists.
 ///
 /// So a `discard` handed in here travels with its offset into the tracker and
-/// is settled by the commit that covers it, which the receive loop issues with
-/// `CommitMode::Sync` precisely because a terminal offset is in the batch —
-/// rust-rdkafka's `Sync` waits for the broker to finish the commit, which is
-/// the positive signal hand-off cannot give. A commit that fails, or a
-/// partition revoked before one lands, settles as `survived`: undercounting an
-/// ambiguous retirement is safe, claiming one that did not happen is not.
+/// is settled by the commit that covers it, which the receive loop makes
+/// with `CommitMode::Sync` on a thread of its own and reads the answer of,
+/// see [`CommitSlot`]: rust-rdkafka's `Sync` waits for the broker to finish
+/// the commit, which is the positive signal hand-off cannot give. A commit
+/// that fails, or a partition revoked before one lands, settles as
+/// `survived`: undercounting an ambiguous retirement is safe, claiming one
+/// that did not happen is not.
 fn signal_completion(
     handle: CompletionHandle,
     queue: &str,
     discard: Option<TerminalDiscard>,
 ) -> bool {
     let (tx, partition, offset, epoch) = handle;
-    if let Err(e) = tx.try_send(Completion {
+    let refused = match tx.try_send(Completion {
         partition,
         offset,
         epoch,
         discard,
     }) {
-        #[cfg(feature = "test-support")]
-        completion_probe::REFUSED.fetch_add(1, Ordering::SeqCst);
-        tracing::error!(
-            queue,
-            partition,
-            offset,
-            "completion channel full — logic bug in offset tracker"
-        );
-        // The offset never reaches the tracker, so it is never committed and
-        // the message is redelivered — the opposite of retired.
-        if let Some(discard) = e.into_inner().discard {
-            discard.survived();
+        Ok(()) => {
+            #[cfg(feature = "test-support")]
+            completion_probe::QUEUED.fetch_add(1, Ordering::SeqCst);
+            return true;
         }
-        return false;
+        Err(mpsc::error::TrySendError::Closed(completion)) => {
+            tracing::debug!(
+                queue,
+                partition,
+                offset,
+                "completion arrived after its receive loop ended; the record is redelivered"
+            );
+            completion
+        }
+        Err(mpsc::error::TrySendError::Full(completion)) => {
+            #[cfg(feature = "test-support")]
+            completion_probe::REFUSED.fetch_add(1, Ordering::SeqCst);
+            tracing::error!(
+                queue,
+                partition,
+                offset,
+                "completion channel full — logic bug in offset tracker"
+            );
+            completion
+        }
+    };
+    // The offset never reaches the tracker, so it is never committed and
+    // the message is redelivered — the opposite of retired.
+    if let Some(discard) = refused.discard {
+        discard.survived();
     }
-    #[cfg(feature = "test-support")]
-    completion_probe::QUEUED.fetch_add(1, Ordering::SeqCst);
-    true
+    false
 }
 
 /// Test-only probe (see the `test-support` feature) on the completion
@@ -2414,19 +2516,11 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 // Rebalance plumbing
 // ---------------------------------------------------------------------------
 
-/// Consumer-group event forwarded from librdkafka's callbacks to the receive
-/// loop that owns the `OffsetTracker`.
+/// Consumer-group event forwarded from librdkafka's rebalance callback to
+/// the receive loop that owns the `OffsetTracker`.
 enum RebalanceEvent {
     Assign(Vec<i32>),
     Revoke(Vec<i32>),
-    /// An async offset commit was rejected — typically
-    /// `REBALANCE_IN_PROGRESS` or a stale generation while the group was
-    /// re-forming. `drain_committable` only yields on *new* completions, so
-    /// without an explicit retry the failed commit would never be resubmitted
-    /// and the partition's committed offset would stay stale until (if ever)
-    /// new traffic arrived. The listed partitions re-offer their current
-    /// commit position on the next drain.
-    CommitFailed(Vec<i32>),
 }
 
 /// `ConsumerContext` that forwards partition assign/revoke deltas to the
@@ -2494,6 +2588,15 @@ impl<C: ClientContext> ClientContext for RebalanceContext<C> {
     }
 }
 
+/// `commit_callback` keeps rdkafka's empty default. It never fires for a
+/// commit shove makes: rdkafka 0.39 sets no `offset_commit_cb`, and a manual
+/// commit carries no callback of its own, so librdkafka posts its result
+/// only to the reply queue of a synchronous commit (bundled librdkafka
+/// 2.12.1, `rdkafka_offset.c:387-411`, `rdkafka_cgrp.c:3871-3908`). The
+/// `EVENT_OFFSET_COMMIT` rust-rdkafka enables reaches only the commits
+/// librdkafka makes on its own account (`rdkafka_cgrp.c:4269-4278`). Every
+/// loop that commits therefore commits synchronously, on a thread of its own,
+/// and reads the answer back, see [`CommitSlot`].
 impl<C: ClientContext> ConsumerContext for RebalanceContext<C> {
     /// `pre_rebalance` (not `post_`) for both directions: pre and post
     /// receive the identical TPL delta (rdkafka's default `rebalance` builds
@@ -2545,27 +2648,6 @@ impl<C: ClientContext> ConsumerContext for RebalanceContext<C> {
         // reconnect teardown, or a consumer that keeps no tracker) — nothing
         // to notify.
         let _ = self.tx.send(event);
-    }
-
-    /// Async commit results surface here (the default impl is silent). A
-    /// commit rejected during a rebalance (stale generation,
-    /// `REBALANCE_IN_PROGRESS`) would otherwise be lost for good: the
-    /// tracker's `next_to_commit` has already advanced past the offsets in
-    /// the failed request, so no future drain re-offers them. Report the
-    /// failure to the loop so the affected partitions re-offer their current
-    /// position.
-    fn commit_callback(&self, result: KafkaResult<()>, offsets: &TopicPartitionList) {
-        if let Err(e) = result {
-            let partitions = self.partitions_for_topic(offsets);
-            tracing::warn!(
-                topic = %self.topic,
-                client_id = %self.client_id,
-                error = %e,
-                ?partitions,
-                "async offset commit failed; scheduling re-commit"
-            );
-            let _ = self.tx.send(RebalanceEvent::CommitFailed(partitions));
-        }
     }
 }
 
@@ -3039,15 +3121,17 @@ const COMMIT_FENCE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Test-only probe (see the `test-support` feature): the fence threshold the
 /// last concurrent receive loop started with, so a test can prove that a
 /// raised commit interval raised the threshold the loop judges commits by,
-/// and not only the helper the loop calls. nextest runs each test in its
-/// own process, so the value belongs to that test's consumers alone.
+/// and not only the helper the loop calls, and how many times a loop has
+/// found itself fenced. nextest runs each test in its own process, so the
+/// values belong to that test's consumers alone.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod fence_probe {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static FIRED: AtomicUsize = AtomicUsize::new(0);
 
     pub(super) fn record(threshold: Duration) {
         LAST_MS.store(
@@ -3056,12 +3140,21 @@ pub mod fence_probe {
         );
     }
 
+    pub(super) fn record_fired() {
+        FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// The threshold the last receive loop started with, `None` before any.
     pub fn last_threshold() -> Option<Duration> {
         match LAST_MS.load(Ordering::SeqCst) {
             0 => None,
             ms => Some(Duration::from_millis(ms)),
         }
+    }
+
+    /// How many times a receive loop ended because it found itself fenced.
+    pub fn fired() -> usize {
+        FIRED.load(Ordering::SeqCst)
     }
 }
 
@@ -3232,13 +3325,13 @@ pub(super) fn check_per_record_prefetch(
 /// close, on a dedicated thread that owns the consumer, waiting at most
 /// `deadline` for both.
 ///
-/// `consumer` must be the loop's last `Arc` of the handle: the thread drops
-/// it after the commit, which is where `rd_kafka_consumer_close` runs, and
-/// reports the commit's result and the close separately, each waited for
-/// inside `deadline`, so a close that outlives the deadline is logged and
-/// never read as a commit that missed it. The one other holder there can
-/// be is a per-record commit thread shutdown did not wait out (see
-/// [`commit_confirmed`]); then this thread's drop closes nothing, the
+/// `consumer` must be the loop's last handle on the consumer: the thread
+/// drops it after the commit, which is where `rd_kafka_consumer_close` runs,
+/// and reports the commit's result and the close separately, each waited
+/// for inside `deadline`, so a close that outlives the deadline is logged
+/// and never read as a commit that missed it. The one other holder there can
+/// be is a commit thread shutdown did not wait out (see
+/// [`stop_with_final_commit`]); then this thread's drop closes nothing, the
 /// thread says so, the loop logs that the close follows that commit, and
 /// the close runs when that thread drops its clone, off the runtime either
 /// way. `None` for `tpl` means
@@ -3250,7 +3343,7 @@ pub(super) fn check_per_record_prefetch(
 /// The `Err` is the [`CommitFailure`] the shutdown arm reports in
 /// `ShoveError::Commit`: the broker's answer, the deadline, or no thread.
 async fn final_commit_off_runtime(
-    consumer: Arc<KafkaStreamConsumer>,
+    consumer: LoopConsumer,
     tpl: Option<TopicPartitionList>,
     queue: &str,
     deadline: Duration,
@@ -3259,9 +3352,9 @@ async fn final_commit_off_runtime(
 }
 
 /// Spawn a detached OS thread named `name` running `body`, the spawner the
-/// final commit, a per-record commit and a consumer's close hand their work
-/// to. Under `test-support` it refuses while `final_commit_spawn_probe` says
-/// so, the way an exhausted host does.
+/// final commit, every other commit a loop makes (see [`spawn_commit`]) and
+/// a consumer's close hand their work to. Under `test-support` it refuses
+/// while `final_commit_spawn_probe` says so, the way an exhausted host does.
 fn spawn_named_thread(name: String, body: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
     #[cfg(feature = "test-support")]
     if final_commit_spawn_probe::refused() {
@@ -3289,8 +3382,7 @@ pub mod per_record_probe {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Entries into `commit_confirmed`: every per-record commit a loop
-    /// attempted, carried or not, and every commit of a sequenced consumer
-    /// that carried a discard.
+    /// attempted, carried or not.
     pub static COMMIT_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
     /// Assign events the rebalance callback queued for the loop, from any
     /// consumer in the process.
@@ -3320,8 +3412,8 @@ pub mod per_record_probe {
 }
 
 /// Test-only switch (see the `test-support` feature): refuses every thread
-/// the shutdown path asks for, and every per-record commit thread (see
-/// [`commit_confirmed`]), the way an exhausted host does, so an integration
+/// the shutdown path asks for, and every commit thread (see
+/// [`spawn_commit`]), the way an exhausted host does, so an integration
 /// test can drive the last-resort leak against a real broker and watch what
 /// the leaked member does, or prove that a commit no thread could carry is
 /// never taken as confirmed. nextest runs each test in its own process, so
@@ -3358,13 +3450,57 @@ trait FinalCommit: Send + 'static {
     }
 }
 
-impl FinalCommit for Arc<KafkaStreamConsumer> {
+impl FinalCommit for LoopConsumer {
     fn commit_sync(&self, tpl: &TopicPartitionList) -> KafkaResult<()> {
         self.commit(tpl, CommitMode::Sync)
     }
 
     fn is_last_handle(&self) -> bool {
         Arc::strong_count(self) == 1
+    }
+}
+
+/// A consume loop's own handle on its consumer: the standard consumer's and
+/// a sequenced consumer's, each the last holder in the ordinary case.
+///
+/// Dropping the last handle runs `rd_kafka_consumer_close`, which blocks
+/// until librdkafka has left the group: rust-rdkafka 0.39 polls until the
+/// consumer reports closed (`base_consumer.rs:766-780`), and a coordinator
+/// that does not answer the LeaveGroup holds it there. So this handle,
+/// dropped on a runtime thread, hands the consumer to a thread of its own
+/// instead, see [`close_off_runtime_or_leak`]. That covers every exit that
+/// does not go through the final commit, the loop's `Err` exits and its
+/// task aborted where it waits included. Dropped on any other thread, the
+/// final commit's included, it drops the consumer there.
+struct LoopConsumer {
+    consumer: ManuallyDrop<Arc<KafkaStreamConsumer>>,
+    queue: String,
+}
+
+impl LoopConsumer {
+    fn new(consumer: KafkaStreamConsumer, queue: &str) -> Self {
+        Self {
+            consumer: ManuallyDrop::new(Arc::new(consumer)),
+            queue: queue.to_string(),
+        }
+    }
+}
+
+impl std::ops::Deref for LoopConsumer {
+    type Target = Arc<KafkaStreamConsumer>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.consumer
+    }
+}
+
+impl Drop for LoopConsumer {
+    fn drop(&mut self) {
+        // SAFETY: `drop` runs once, and nothing reads the field after it.
+        let consumer = unsafe { ManuallyDrop::take(&mut self.consumer) };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            close_off_runtime_or_leak(consumer, &self.queue, &mut spawn_named_thread);
+        }
     }
 }
 
@@ -3545,16 +3681,19 @@ where
     })
 }
 
-/// Where a consumer goes when its final-commit thread could not be spawned.
+/// Where a consumer goes when its final-commit thread could not be spawned,
+/// and where a loop's own handle goes when it is dropped on a runtime
+/// thread (see [`LoopConsumer`]).
 ///
 /// The close blocks for as long as librdkafka takes to leave the group, so
 /// it must not run on the runtime thread, which is the one thing
-/// `final_commit_off_runtime` exists to prevent. A second, close-only
-/// thread is tried first: a failed spawn is often a momentary `EAGAIN`. If
-/// that fails too the handle is leaked, deliberately, and logged at error
-/// level: the process has just failed to create two threads and is degraded
-/// already, and the alternative is a runtime thread blocked for as long as
-/// a frozen coordinator keeps librdkafka retrying.
+/// `final_commit_off_runtime` exists to prevent. A close-only thread takes
+/// it; after a failed final-commit thread that is a second try, since a
+/// failed spawn is often a momentary `EAGAIN`. If the spawn fails the handle
+/// is leaked, deliberately, and logged at error level: the process is
+/// failing to create threads and is degraded already, and the alternative
+/// is a runtime thread blocked for as long as a frozen coordinator keeps
+/// librdkafka retrying.
 ///
 /// What the leak costs. The leaked instance keeps heartbeating, so while the
 /// process lives the member holds its partitions until `max.poll.interval.ms`
@@ -3581,7 +3720,7 @@ where
             tracing::error!(
                 queue,
                 error = %e,
-                "no thread for the consumer's close either; leaking the handle rather than closing \
+                "no thread for the consumer's close; leaking the handle rather than closing \
                  it on the runtime thread. The leaked consumer keeps heartbeating: its partitions \
                  stay assigned until max.poll.interval.ms passes without a poll, or until the \
                  process exits and the session timeout drops the member"
@@ -3638,71 +3777,56 @@ enum CommitAnswer {
     Cancelled(oneshot::Receiver<KafkaResult<()>>),
 }
 
-/// A commit shutdown found in flight, a per-record commit or a sequenced
-/// consumer's commit carrying a discard: its answer, the positions it
-/// carries, and what the loop settles once the answer arrives. The stop
-/// waits for it, for at most `PENDING_COMMIT_BUDGET`, before it drains the
-/// final position, so the final commit does not race the thread that
-/// carries the one in flight. An answer that does not come in time ends the
-/// stop with `ShoveError::Commit` of the `Deadline` kind carrying that
-/// budget, see [`stop_with_final_commit`].
+/// A commit on its thread whose answer the loop has not read yet: the
+/// answer, the positions the commit carries, and the discards it retires.
+/// It is the one commit a loop has in flight, see [`CommitSlot`], or the
+/// per-record commit shutdown cut short. The stop waits for it, for at most
+/// `PENDING_COMMIT_BUDGET`, before it drains the final position, so the
+/// final commit does not race the thread that carries the one in flight. An
+/// answer that does not come in time ends the stop with
+/// `ShoveError::Commit` of the `Deadline` kind carrying that budget, see
+/// [`stop_with_final_commit`].
 struct PendingCommit {
     answer: oneshot::Receiver<KafkaResult<()>>,
-    offsets: Vec<(i32, i64)>,
+    positions: Vec<CommitPosition>,
     discards: Vec<CoveredDiscard>,
 }
 
-/// Commit `tpl` synchronously on a thread of its own and wait for the
-/// coordinator's answer while the loop keeps polling: the commit every
-/// completion triggers under `CommitPolicy::PerRecord`, and the commit of a
-/// sequenced consumer that carries a terminal discard (see
-/// `FifoState::commit_due`).
+/// Commit `tpl` synchronously on a thread of its own, and return at once
+/// with the receiver its answer arrives on.
 ///
-/// Why a thread, and why synchronous. An asynchronous commit reports its
-/// answer through `commit_callback`, which rust-rdkafka serves only inside
-/// a `recv()` poll, and the loop would have to tell that answer apart from
-/// a fetched record inside the same poll. A synchronous commit answers
-/// directly. It blocks for the round trip, so it does not run on the
-/// runtime thread, and it is not a `spawn_blocking` task either: one of
-/// those holds the runtime's shutdown for as long as librdkafka waits, which
-/// is the reason the final commit has a thread of its own too. The spawn
-/// costs microseconds against a coordinator round trip of milliseconds, and
-/// the loop always waits for the thread, so there is one per member at a
-/// time.
+/// Why a thread, and why synchronous. An asynchronous commit reports nothing
+/// back: rust-rdkafka 0.39 sets no `offset_commit_cb`, so the result of a
+/// manual asynchronous commit reaches no callback and no queue (bundled
+/// librdkafka 2.12.1, `rdkafka_offset.c:387-403`, `rdkafka_cgrp.c:3871-3908`;
+/// see the doc on `RebalanceContext`'s `ConsumerContext` impl). A
+/// synchronous commit returns the coordinator's answer. It blocks for the
+/// round trip, so it does not run on the runtime thread, and it is not a
+/// `spawn_blocking` task either: one of those holds the runtime's shutdown
+/// for as long as librdkafka waits, which is the reason the final commit
+/// has a thread of its own too. The spawn costs microseconds against a
+/// coordinator round trip of milliseconds, and a loop has at most one such
+/// commit in flight.
 ///
-/// The wait is a select that keeps calling `recv()`, as the permit wait
-/// does: under `PerRecord` the assignment is paused while a commit is
-/// unconfirmed (see the receive loop), so `recv()` yields nothing of it and
-/// serves the rebalance callbacks and the poll budget instead. A record it
-/// does yield is put back with the pause widened: under `PerRecord` it
-/// belongs to a partition assigned during the pause, as it does during a
-/// sequenced consumer's wait on its record, and a sequenced commit made
-/// with nothing paused takes its pause from the first record that arrives.
-/// The wait ends on the answer, on shutdown, or on a fault a handler task
-/// reports over `fault_rx`, when the loop has handler tasks. The answer is
-/// librdkafka's result for the whole commit operation, which it waits for
-/// without a timeout of its own (bundled librdkafka 2.12.1,
-/// `rdkafka_offset.c:403-406`): a request unanswered for `socket.timeout.ms`
-/// is retried up to two times (`rdkafka_buf.c:161-162`,
-/// `rdkafka_proto.h:47`, `rdkafka_request.c:1784-1787`), and a commit with
-/// no coordinator waits for one up to `session.timeout.ms`
-/// (`rdkafka_cgrp.c:3744-3746`), so the wait can run for several socket
-/// timeouts before the commit comes back as rejected. A spawn failure leaves
-/// the loop's `Arc` where it is: the clone is dropped here, which closes
-/// nothing while the loop holds its own. The thread drops its clone before
-/// it answers, so once the answer is in the loop's `Arc` is the last again.
-async fn commit_confirmed(
+/// The answer is librdkafka's result for the whole commit operation, which
+/// it waits for without a timeout of its own (`rdkafka_offset.c:403-406`):
+/// a request unanswered for `socket.timeout.ms` is retried up to two times
+/// (`rdkafka_buf.c:161-162`, `rdkafka_proto.h:47`,
+/// `rdkafka_request.c:1784-1787`), and a commit with no coordinator waits
+/// for one up to `session.timeout.ms` (`rdkafka_cgrp.c:3744-3746`), so the
+/// answer can take several socket timeouts to come back as a rejection.
+///
+/// The thread drops its clone of the handle before it answers, so once the
+/// answer is in the caller's handle is the last again. A spawn failure
+/// commits nothing and is the `Err`; the clone is dropped here then, which
+/// closes nothing while the caller holds its own.
+fn spawn_commit(
     consumer: &Arc<KafkaStreamConsumer>,
     tpl: TopicPartitionList,
-    shutdown: &CancellationToken,
-    fault_rx: Option<&mut mpsc::Receiver<ShoveError>>,
     queue: &str,
-    paused: &mut bool,
-) -> Result<CommitAnswer> {
-    #[cfg(feature = "test-support")]
-    per_record_probe::COMMIT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+) -> std::io::Result<oneshot::Receiver<KafkaResult<()>>> {
     let (done_tx, done_rx) = oneshot::channel::<KafkaResult<()>>();
-    let handed = hand_to_new_thread(
+    hand_to_new_thread(
         &mut spawn_named_thread,
         format!("shove-kafka-commit {queue}"),
         (Arc::clone(consumer), tpl),
@@ -3713,20 +3837,189 @@ async fn commit_confirmed(
             // Nobody may be listening any more; that is the fault case.
             let _ = done_tx.send(result);
         },
-    );
-    if let Err((_consumer_and_tpl, e)) = handed {
-        tracing::error!(
-            queue,
-            error = %e,
-            "could not spawn the commit thread; nothing commits, the position is re-offered"
-        );
-        return Ok(CommitAnswer::Rejected(KafkaError::ConsumerCommit(
-            RDKafkaErrorCode::Fail,
-        )));
+    )
+    .map(|()| done_rx)
+    .map_err(|(_consumer_and_tpl, e)| e)
+}
+
+/// The commits a receive loop makes under `CommitPolicy::Interval`, and a
+/// sequenced consumer's: at most one in flight, made with [`spawn_commit`]
+/// while the loop goes on, and spaced by the gate.
+///
+/// The loop reads the answer back, as it reads a completion: a select arm
+/// wakes on it, see [`commit_answer`], and the top of every pass, and of
+/// every pass of a wait that commits, takes one that came meanwhile. An
+/// accepted commit confirms the discards it retires and ends the streak of
+/// every partition it carried. A rejected one, or one no thread could
+/// carry, hands its discards back and marks its partitions dirty, so the
+/// next drain re-offers their positions, and the fence judges the streak;
+/// see `OffsetTracker::commit_accepted` and `OffsetTracker::commit_rejected`.
+/// No drain runs while a commit is in flight, which keeps the in-flight
+/// count at one however fast the loop completes records.
+///
+/// `rd_kafka_commit_queue` would deliver an asynchronous commit's answer to
+/// a queue the loop drains, but rust-rdkafka 0.39 wraps neither that call
+/// nor a queue of the application's own (its `NativeQueue` is crate-private),
+/// so it would take raw FFI for the queue's creation, polling, wake-up and
+/// teardown order against the client; a commit on a thread takes none.
+struct CommitSlot {
+    gate: AsyncCommitGate,
+    in_flight: Option<PendingCommit>,
+}
+
+impl CommitSlot {
+    fn new(policy: CommitPolicy) -> Self {
+        Self {
+            gate: AsyncCommitGate::new(policy),
+            in_flight: None,
+        }
     }
+
+    /// Drain the tracker and commit what it offers, when the gate is due and
+    /// no commit is in flight. The gate is marked once the commit is on its
+    /// thread.
+    fn commit_due(
+        &mut self,
+        consumer: &Arc<KafkaStreamConsumer>,
+        tracker: &mut OffsetTracker,
+        queue: &str,
+        now: Instant,
+    ) {
+        if self.in_flight.is_some() || !self.gate.due(now) {
+            return;
+        }
+        let Some(DrainedCommit {
+            tpl,
+            positions,
+            discards,
+        }) = tracker.drain_committable()
+        else {
+            return;
+        };
+        match spawn_commit(consumer, tpl, queue) {
+            Ok(answer) => {
+                self.gate.mark(Instant::now());
+                self.in_flight = Some(PendingCommit {
+                    answer,
+                    positions,
+                    discards,
+                });
+            }
+            Err(e) => {
+                tracing::error!(
+                    queue,
+                    error = %e,
+                    "could not spawn the commit thread; nothing commits, the position is re-offered"
+                );
+                let now = Instant::now();
+                tracker.commit_rejected(&positions, discards, now);
+                self.gate.mark_rejected(now);
+            }
+        }
+    }
+
+    /// Settle the answer of the commit in flight, if it has come.
+    fn settle_arrived(&mut self, tracker: &mut OffsetTracker, queue: &str) {
+        let answer = match self
+            .in_flight
+            .as_mut()
+            .map(|pending| pending.answer.try_recv())
+        {
+            None | Some(Err(oneshot::error::TryRecvError::Empty)) => return,
+            Some(Ok(result)) => Some(result),
+            Some(Err(oneshot::error::TryRecvError::Closed)) => None,
+        };
+        self.settle(answer, tracker, queue);
+    }
+
+    /// Settle the commit in flight on `answer`: its result, or `None` when
+    /// its thread ended without one, which is taken as a rejection since the
+    /// position is not known to have landed.
+    fn settle(
+        &mut self,
+        answer: Option<KafkaResult<()>>,
+        tracker: &mut OffsetTracker,
+        queue: &str,
+    ) {
+        let Some(PendingCommit {
+            positions,
+            discards,
+            ..
+        }) = self.in_flight.take()
+        else {
+            return;
+        };
+        let error = match answer {
+            Some(Ok(())) => {
+                tracker.commit_accepted(&positions);
+                for discard in discards {
+                    discard.confirm();
+                }
+                return;
+            }
+            Some(Err(e)) => e.to_string(),
+            None => "the commit thread ended without a result".to_string(),
+        };
+        tracing::warn!(
+            queue,
+            error = %error,
+            offsets = ?position_offsets(&positions),
+            "offset commit rejected; re-offering the position"
+        );
+        let now = Instant::now();
+        tracker.commit_rejected(&positions, discards, now);
+        self.gate.mark_rejected(now);
+    }
+}
+
+/// The answer of `in_flight`, or a future that never resolves when nothing
+/// is in flight: the select arm a loop that commits through a
+/// [`CommitSlot`] wakes on. The arm's handler settles what it reads at once,
+/// since a oneshot receiver polled again after it answered panics.
+async fn commit_answer(in_flight: Option<&mut PendingCommit>) -> Option<KafkaResult<()>> {
+    match in_flight {
+        Some(pending) => (&mut pending.answer).await.ok(),
+        None => std::future::pending().await,
+    }
+}
+
+/// Commit `tpl` synchronously on a thread of its own (see [`spawn_commit`])
+/// and wait for the coordinator's answer while the loop keeps polling: the
+/// commit every completion triggers under `CommitPolicy::PerRecord`.
+///
+/// The wait is a select that keeps calling `recv()`, as the permit wait
+/// does: the assignment is paused while a commit is unconfirmed (see the
+/// receive loop), so `recv()` yields nothing of it and serves the rebalance
+/// callbacks and the poll budget instead. A record it does yield belongs to
+/// a partition assigned during the pause, and is put back with the pause
+/// widened. The wait ends on the answer, on shutdown, or on a fault a
+/// handler task reports over `fault_rx`. A spawn failure is a rejection:
+/// nothing commits, and the position is re-offered.
+async fn commit_confirmed(
+    consumer: &Arc<KafkaStreamConsumer>,
+    tpl: TopicPartitionList,
+    shutdown: &CancellationToken,
+    fault_rx: Option<&mut mpsc::Receiver<ShoveError>>,
+    queue: &str,
+    paused: &mut bool,
+) -> Result<CommitAnswer> {
+    #[cfg(feature = "test-support")]
+    per_record_probe::COMMIT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+    let mut answer = match spawn_commit(consumer, tpl, queue) {
+        Ok(answer) => answer,
+        Err(e) => {
+            tracing::error!(
+                queue,
+                error = %e,
+                "could not spawn the commit thread; nothing commits, the position is re-offered"
+            );
+            return Ok(CommitAnswer::Rejected(KafkaError::ConsumerCommit(
+                RDKafkaErrorCode::Fail,
+            )));
+        }
+    };
     let fault = handler_fault(fault_rx);
     tokio::pin!(fault);
-    let mut answer = done_rx;
     loop {
         tokio::select! {
             biased;
@@ -3778,7 +4071,7 @@ async fn commit_confirmed(
 /// retryable, so `run_with_reconnect` returns it, and a group's spawner
 /// counts it under `errors`.
 async fn stop_with_final_commit(
-    consumer: Arc<KafkaStreamConsumer>,
+    consumer: LoopConsumer,
     tracker: &mut OffsetTracker,
     // `&mut`, because the receiver is not `Sync` and a shared borrow held
     // across this future's awaits would make the future `!Send`.
@@ -3792,17 +4085,17 @@ async fn stop_with_final_commit(
     // slice. With nothing in flight the final commit has the whole deadline,
     // as in 0.15.
     let mut final_deadline = SHUTDOWN_COMMIT_DEADLINE;
-    // A commit the shutdown cut short is settled first, so the final commit
-    // does not race the thread that carries it. An accepted answer confirms
-    // what rode on it, and the final commit then carries the position again,
-    // as every final commit does; a rejection hands what rode on it back to
-    // the final commit; and no answer inside the share ends the stop here:
-    // the commit is still in flight on its thread, so a second commit would
-    // race it and the close cannot run until that thread drops its clone of
-    // the handle. This loop's handle goes to a thread of its own, as always,
-    // and the stop is reported as a `Commit` of the `Deadline` kind carrying
-    // the share, which says the member leaves its group once that commit
-    // returns.
+    // The commit the stop found in flight is settled first, so the final
+    // commit does not race the thread that carries it. An accepted answer
+    // confirms what rode on it, and the final commit then carries the
+    // position again, as every final commit does; a rejection hands what
+    // rode on it back to the final commit; and no answer inside the share
+    // ends the stop here: the commit is still in flight on its thread, so a
+    // second commit would race it and the close cannot run until that thread
+    // drops its clone of the handle. This loop's handle goes to a thread of
+    // its own, as always, and the stop is reported as a `Commit` of the
+    // `Deadline` kind carrying the share, which says the member leaves its
+    // group once that commit returns.
     if let Some(pending) = pending_commit {
         let started = Instant::now();
         match tokio::time::timeout(PENDING_COMMIT_BUDGET, pending.answer).await {
@@ -3817,16 +4110,13 @@ async fn stop_with_final_commit(
                     ?answer,
                     "the commit in flight at shutdown was not accepted; re-offering its position in the final commit"
                 );
-                tracker.re_pend(pending.discards);
-                let now = Instant::now();
-                for (partition, _) in &pending.offsets {
-                    tracker.mark_dirty(*partition, now);
-                }
+                tracker.commit_rejected(&pending.positions, pending.discards, Instant::now());
             }
             Err(_elapsed) => {
+                let offsets = position_offsets(&pending.positions);
                 tracing::warn!(
                     queue,
-                    offsets = ?pending.offsets,
+                    ?offsets,
                     budget = ?PENDING_COMMIT_BUDGET,
                     "the commit in flight at shutdown had no answer within its share of the deadline; stopping without a second commit, the member leaves the group once it returns"
                 );
@@ -3839,19 +4129,18 @@ async fn stop_with_final_commit(
                 }
                 return Err(ShoveError::Commit(Box::new(FailedCommit {
                     topic: queue.to_string(),
-                    offsets: pending.offsets,
+                    offsets,
                     kind: CommitFailure::Deadline(PENDING_COMMIT_BUDGET),
                 })));
             }
         }
         final_deadline = SHUTDOWN_COMMIT_DEADLINE.saturating_sub(started.elapsed());
     }
-    tracker.apply_rebalance_events(rebalance_rx, Instant::now());
-    // Every partition's current position, whether or not an earlier
-    // asynchronous drain offered it: the final `Sync` commit offers every
-    // safe position, including one an in-flight asynchronous commit may not
-    // have landed, for the broker to confirm. See
-    // `PartitionTracker::drain_all`.
+    tracker.apply_rebalance_events(rebalance_rx);
+    // Every partition's current position, whether or not an earlier drain
+    // offered it: the final `Sync` commit offers every safe position,
+    // including one a rejected commit left to re-offer, for the broker to
+    // confirm. See `PartitionTracker::drain_all`.
     let (tpl, discards) = match tracker.drain_all() {
         Some((tpl, discards)) => (Some(tpl), discards),
         None => (None, Vec::new()),
@@ -4024,9 +4313,9 @@ struct BatchFlushCtx<'a> {
 /// call into `rd_kafka_commit(…, 0)` that waits a full broker round trip, and
 /// at the default 250 ms `max_batch_age` this fires ~4×/s — enough to park a
 /// runtime worker often enough to starve co-scheduled tasks. The single-message
-/// path can use `CommitMode::Async` because it has the `commit_callback`
-/// machinery to pick up failures; a batch commit has to report its error to the
-/// caller, so it stays synchronous and moves off the runtime instead.
+/// path commits on a thread of its own and reads the answer back on a later
+/// pass (see [`CommitSlot`]); a batch commit reports its error to the flush
+/// that made it, so it waits for the answer here instead.
 async fn commit_batch_end(
     consumer: &Arc<KafkaStreamConsumer>,
     queue: &str,
@@ -4697,19 +4986,12 @@ enum Flushed {
 /// including members that gain a partition and lose nothing, and with an empty
 /// delta — so treating a bare "something happened" as invalidation throws away
 /// batches that were never at risk, redelivering them as duplicate writes.
-///
-/// `CommitFailed` is deliberately excluded: it is not a rebalance, and the
-/// batch path commits synchronously (see [`commit_batch_end`]) so it surfaces
-/// its own commit errors to the caller rather than through this channel.
 fn drain_batch_rebalance_events(rx: &std_mpsc::Receiver<RebalanceEvent>) -> BTreeSet<i32> {
     let mut affected = BTreeSet::new();
-    while let Ok(event) = rx.try_recv() {
-        match event {
-            RebalanceEvent::Assign(partitions) | RebalanceEvent::Revoke(partitions) => {
-                affected.extend(partitions);
-            }
-            RebalanceEvent::CommitFailed(_) => {}
-        }
+    while let Ok(RebalanceEvent::Assign(partitions) | RebalanceEvent::Revoke(partitions)) =
+        rx.try_recv()
+    {
+        affected.extend(partitions);
     }
     affected
 }
@@ -4981,6 +5263,8 @@ fn fenced_error(
     partition: i32,
     fence_timeout: Duration,
 ) -> ShoveError {
+    #[cfg(feature = "test-support")]
+    fence_probe::record_fired();
     metrics::record_backend_error(
         metrics::BackendLabel::Kafka,
         metrics::BackendErrorKind::Connection,
@@ -5000,69 +5284,30 @@ fn fenced_error(
     ))
 }
 
-/// Commit a drained position under `CommitPolicy::Interval`, and mark the
-/// gate.
-///
-/// A commit that retires a message a no-DLQ topic will never see again
-/// carries its discards, and `messages_discarded_total` may only move once
-/// that is true: `Sync` waits for the broker to finish the commit, the
-/// positive signal the async path cannot give. Every other commit is
-/// asynchronous. The gate is marked after the commit call, with a fresh
-/// instant, so a slow `Sync` round trip does not eat the window.
-fn commit_interval(
-    consumer: &KafkaStreamConsumer,
-    tpl: &TopicPartitionList,
-    discards: Vec<CoveredDiscard>,
-    gate: &mut AsyncCommitGate,
-) -> Result<()> {
-    if discards.is_empty() {
-        consumer
-            .commit(tpl, CommitMode::Async)
-            .map_err(|e| map_kafka_error("commit failed", e))?;
-    } else {
-        let committed = consumer.commit(tpl, CommitMode::Sync);
-        match &committed {
-            Ok(()) => {
-                for discard in discards {
-                    discard.confirm();
-                }
-            }
-            Err(_) => {
-                // Ambiguous: the message may or may not be retired, so do
-                // not claim it was.
-                for discard in discards {
-                    discard.survived();
-                }
-            }
-        }
-        committed.map_err(|e| map_kafka_error("commit failed", e))?;
-    }
-    gate.mark(Instant::now());
-    Ok(())
-}
-
 /// The receive loop's offset bookkeeping under `CommitPolicy::Interval`,
 /// lent to [`acquire_permit_while_polling`] so the wait does on every pass
-/// what a pass of the loop does: it takes in the completions, applies the
-/// rebalance events, checks the fence and makes the commit the gate allows.
+/// what a pass of the loop does: it takes in the completions and the answer
+/// of the commit in flight, applies the rebalance events, checks the fence
+/// and makes the commit the gate allows.
 struct IntervalCommits<'a> {
     tracker: &'a mut OffsetTracker,
     completion_rx: &'a mut mpsc::Receiver<Completion>,
     // `&mut`, because the receiver is not `Sync` and a shared borrow held
     // across the wait's awaits would make the future `!Send`.
     rebalance_rx: &'a mut std_mpsc::Receiver<RebalanceEvent>,
-    gate: &'a mut AsyncCommitGate,
+    slot: &'a mut CommitSlot,
     fence_timeout: Duration,
     group_id: &'a str,
 }
 
 impl IntervalCommits<'_> {
-    fn settle(&mut self, consumer: &KafkaStreamConsumer, queue: &str) -> Result<()> {
+    fn settle(&mut self, consumer: &Arc<KafkaStreamConsumer>, queue: &str) -> Result<()> {
         while let Ok(completion) = self.completion_rx.try_recv() {
             self.tracker.mark_complete(completion);
         }
+        self.slot.settle_arrived(self.tracker, queue);
+        self.tracker.apply_rebalance_events(self.rebalance_rx);
         let now = Instant::now();
-        self.tracker.apply_rebalance_events(self.rebalance_rx, now);
         if let Some(partition) = self.tracker.fenced(now, self.fence_timeout) {
             return Err(fenced_error(
                 queue,
@@ -5071,11 +5316,7 @@ impl IntervalCommits<'_> {
                 self.fence_timeout,
             ));
         }
-        if self.gate.due(now)
-            && let Some((tpl, discards)) = self.tracker.drain_committable()
-        {
-            commit_interval(consumer, &tpl, discards, self.gate)?;
-        }
+        self.slot.commit_due(consumer, self.tracker, queue, now);
         Ok(())
     }
 }
@@ -5107,22 +5348,22 @@ const PERMIT_WAIT_GRACE: Duration = Duration::from_secs(1);
 /// inside a `select!` whose `recv()` arm is armed once [`PERMIT_WAIT_GRACE`]
 /// has run out. From then on the member stays inside the interval because
 /// that arm is polled again on every wake of the wait: the housekeeping
-/// tick and the commit gate's deadline under `CommitPolicy::Interval`, and
-/// the wake rust-rdkafka sends a pending `recv()` at half the poll interval
-/// (`stream_consumer.rs:238-263`). Those polls serve the rebalance callbacks
-/// and the results of commits made before the wait. A record `recv()`
-/// yields meanwhile comes from a partition that is not paused; it is put
-/// back (see [`put_back`]) and the assignment is paused, so it arrives
-/// again, in order, once a permit frees and the loop resumes.
+/// tick, the commit gate's deadline and the answer of the commit in flight
+/// under `CommitPolicy::Interval`, and the wake rust-rdkafka sends a pending
+/// `recv()` at half the poll interval (`stream_consumer.rs:238-263`). Those
+/// polls serve the rebalance callbacks. A record `recv()` yields meanwhile
+/// comes from a partition that is not paused; it is put back (see
+/// [`put_back`]) and the assignment is paused, so it arrives again, in
+/// order, once a permit frees and the loop resumes.
 ///
 /// `commits`, under `CommitPolicy::Interval`, has the wait commit as the
 /// loop does: positions completed before the wait, and the ones a rebalance
-/// re-offers during it, are committed however long the wait runs, and the
-/// record in hand stays in flight, so no commit passes it. The wait wakes
-/// for that on the gate's deadline and on the housekeeping tick, as the loop
-/// does. Under `CommitPolicy::PerRecord` the loop holds its permit whenever
-/// it takes a record, so the wait only ever finds a free one, and commits
-/// nothing.
+/// or a rejected commit re-offers during it, are committed however long the
+/// wait runs, and the record in hand stays in flight, so no commit passes
+/// it. The wait wakes for that on the gate's deadline, on the answer of the
+/// commit in flight and on the housekeeping tick, as the loop does. Under
+/// `CommitPolicy::PerRecord` the loop holds its permit whenever it takes a
+/// record, so the wait only ever finds a free one, and commits nothing.
 ///
 /// `Ok(None)` means shutdown fired first: it is read before the permit, and
 /// the caller reads it once more with the permit in hand, see the receive
@@ -5133,7 +5374,7 @@ const PERMIT_WAIT_GRACE: Duration = Duration::from_secs(1);
 #[allow(clippy::too_many_arguments)]
 async fn acquire_permit_while_polling(
     semaphore: &Arc<tokio::sync::Semaphore>,
-    consumer: &KafkaStreamConsumer,
+    consumer: &Arc<KafkaStreamConsumer>,
     shutdown: &CancellationToken,
     fault_rx: Option<&mut mpsc::Receiver<ShoveError>>,
     queue: &str,
@@ -5154,10 +5395,12 @@ async fn acquire_permit_while_polling(
             commits.settle(consumer, queue)?;
         }
         let now = Instant::now();
-        let commit_deadline = commits.as_ref().map_or(now, |c| c.gate.deadline(now));
-        let committable = commits
-            .as_ref()
-            .is_some_and(|c| c.tracker.has_committable());
+        let commit_deadline = commits.as_ref().map_or(now, |c| c.slot.gate.deadline(now));
+        let in_flight = commits.as_ref().is_some_and(|c| c.slot.in_flight.is_some());
+        let committable = !in_flight
+            && commits
+                .as_ref()
+                .is_some_and(|c| c.tracker.has_committable());
         tokio::select! {
             biased;
             // Shutdown and the fault are read before the permit. An in-place
@@ -5177,6 +5420,13 @@ async fn acquire_permit_while_polling(
             () = &mut grace, if !polling => polling = true,
             _ = housekeeping.tick(), if commits.is_some() => {}
             _ = tokio::time::sleep_until(commit_deadline), if committable => {}
+            answer = commit_answer(
+                commits.as_mut().and_then(|c| c.slot.in_flight.as_mut()),
+            ), if in_flight => {
+                if let Some(commits) = commits.as_mut() {
+                    commits.slot.settle(answer, commits.tracker, queue);
+                }
+            }
             received = consumer.recv(), if polling => {
                 let msg = received.map_err(|e| {
                     tracing::error!(error = %e, queue, "consumer recv error");
@@ -5332,13 +5582,11 @@ struct FifoLoop<T: Topic, H: MessageHandler<T>> {
 struct FifoState {
     tracker: OffsetTracker,
     rebalance_rx: std_mpsc::Receiver<RebalanceEvent>,
-    commit_gate: AsyncCommitGate,
+    /// The commit gate and the one commit in flight, see [`CommitSlot`].
+    commits: CommitSlot,
     /// Whether the loop holds its assignment paused: a wait on the record in
-    /// hand pauses it, and so does a record that arrives while a commit
-    /// awaits its answer. The next pass resumes it.
+    /// hand pauses it. The next pass resumes it.
     paused: bool,
-    /// A commit shutdown cut short, see `PendingCommit`.
-    pending_commit: Option<PendingCommit>,
 }
 
 /// The record a sequenced consumer has in hand, read once off its message.
@@ -5423,10 +5671,11 @@ fn pause_for_wait(consumer: &KafkaStreamConsumer, paused: &mut bool) -> Result<(
 ///
 /// Every pass of the wait makes the commit the gate allows, as a pass of the
 /// receive loop does, and the wait wakes for it as the loop does: on the
-/// gate's deadline and on the housekeeping tick. The positions acked before
-/// the wait, and the ones a rebalance re-offers during it, are then
-/// committed however long the wait runs; the record in hand stays in
-/// flight, so no commit passes it.
+/// gate's deadline, on the answer of the commit in flight and on the
+/// housekeeping tick. The positions acked before the wait, and the ones a
+/// rebalance or a rejected commit re-offers during it, are then committed
+/// however long the wait runs; the record in hand stays in flight, so no
+/// commit passes it.
 async fn fifo_wait(
     consumer: &Arc<KafkaStreamConsumer>,
     queue: &str,
@@ -5441,15 +5690,19 @@ async fn fifo_wait(
     let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        state.commit_due(consumer, shutdown, queue).await?;
+        state.commit_due(consumer, queue)?;
         let now = Instant::now();
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return Ok(FifoWait::Stop),
             _ = revoked.cancelled() => return Ok(FifoWait::Revoked),
             _ = housekeeping.tick() => {}
-            _ = tokio::time::sleep_until(state.commit_gate.deadline(now)),
-                if state.tracker.has_committable() => {}
+            _ = tokio::time::sleep_until(state.commits.gate.deadline(now)),
+                if state.commits.in_flight.is_none() && state.tracker.has_committable() => {}
+            answer = commit_answer(state.commits.in_flight.as_mut()),
+                if state.commits.in_flight.is_some() => {
+                state.commits.settle(answer, &mut state.tracker, queue);
+            }
             received = consumer.recv() => {
                 let msg = received.map_err(|e| {
                     tracing::error!(error = %e, queue, "FIFO consumer recv error");
@@ -5484,9 +5737,7 @@ impl FifoState {
     /// revoked during a wait and handed back later arrives paused, and
     /// nothing else would resume it.
     fn apply_rebalance_events(&mut self, consumer: &KafkaStreamConsumer) -> Result<()> {
-        let assigned = self
-            .tracker
-            .apply_rebalance_events(&self.rebalance_rx, Instant::now());
+        let assigned = self.tracker.apply_rebalance_events(&self.rebalance_rx);
         if assigned && !self.paused {
             consumer
                 .resume_assignment()
@@ -5497,14 +5748,9 @@ impl FifoState {
 
     /// The top of every pass: the rebalance events, the commit the gate
     /// allows, and the end of the pause the last record's wait left behind.
-    async fn settle(
-        &mut self,
-        consumer: &Arc<KafkaStreamConsumer>,
-        shutdown: &CancellationToken,
-        queue: &str,
-    ) -> Result<()> {
-        self.commit_due(consumer, shutdown, queue).await?;
-        if self.paused && self.pending_commit.is_none() {
+    fn settle(&mut self, consumer: &Arc<KafkaStreamConsumer>, queue: &str) -> Result<()> {
+        self.commit_due(consumer, queue)?;
+        if self.paused {
             consumer
                 .resume_assignment()
                 .map_err(|e| map_kafka_error("resume failed", e))?;
@@ -5513,71 +5759,26 @@ impl FifoState {
         Ok(())
     }
 
-    /// The rebalance events, then the commit the gate allows: at the top of
-    /// every pass, and on every pass of a wait on the record in hand, so a
-    /// position acked before the wait and one a rebalance re-offers during
-    /// it are committed however long the wait runs.
+    /// The answer of the commit in flight if it came, the rebalance events,
+    /// then the commit the gate allows: at the top of every pass, and on
+    /// every pass of a wait on the record in hand, so a position acked
+    /// before the wait and one a rebalance or a rejected commit re-offers
+    /// during it are committed however long the wait runs.
     ///
     /// Commits are spaced as the standard consumer spaces them, at most once
-    /// per `ASYNC_COMMIT_INTERVAL`, see [`AsyncCommitGate`]. A commit that
-    /// retires a discarded record must be broker-acknowledged before the
-    /// discard counts, so it is synchronous, on a thread of its own, and
-    /// waited for while the loop keeps polling, see [`commit_confirmed`];
-    /// every other commit is asynchronous. A rejected one is re-offered with
-    /// its discards on a later pass. A commit the shutdown cut short is left
-    /// in `pending_commit` for the stop, and no commit follows it.
-    async fn commit_due(
-        &mut self,
-        consumer: &Arc<KafkaStreamConsumer>,
-        shutdown: &CancellationToken,
-        queue: &str,
-    ) -> Result<()> {
+    /// per `ASYNC_COMMIT_INTERVAL`, and made as it makes them under
+    /// `CommitPolicy::Interval`: one at a time, synchronously on a thread of
+    /// its own while the loop goes on, see [`CommitSlot`]. A discard rides
+    /// the commit that retires its record and counts once the broker
+    /// accepted it. A rejected commit is re-offered with its discards on a
+    /// later pass, for as long as rejections last: the sequenced consumer
+    /// has no fenced consumer detector. The commit in flight when the loop
+    /// stops is the stop's to settle.
+    fn commit_due(&mut self, consumer: &Arc<KafkaStreamConsumer>, queue: &str) -> Result<()> {
+        self.commits.settle_arrived(&mut self.tracker, queue);
         self.apply_rebalance_events(consumer)?;
-        let now = Instant::now();
-        if self.pending_commit.is_none()
-            && self.commit_gate.due(now)
-            && let Some((tpl, discards)) = self.tracker.drain_committable()
-        {
-            if discards.is_empty() {
-                consumer
-                    .commit(&tpl, CommitMode::Async)
-                    .map_err(|e| map_kafka_error("commit failed", e))?;
-                self.commit_gate.mark(Instant::now());
-            } else {
-                let offsets = committed_offsets(&tpl);
-                match commit_confirmed(consumer, tpl, shutdown, None, queue, &mut self.paused)
-                    .await?
-                {
-                    CommitAnswer::Confirmed => {
-                        for discard in discards {
-                            discard.confirm();
-                        }
-                        self.commit_gate.mark(Instant::now());
-                    }
-                    CommitAnswer::Rejected(e) => {
-                        tracing::warn!(
-                            queue,
-                            error = %e,
-                            ?offsets,
-                            "offset commit rejected; re-offering the position"
-                        );
-                        self.tracker.re_pend(discards);
-                        let now = Instant::now();
-                        for (partition, _) in offsets {
-                            self.tracker.mark_dirty(partition, now);
-                        }
-                        self.commit_gate.mark_rejected(now);
-                    }
-                    CommitAnswer::Cancelled(answer) => {
-                        self.pending_commit = Some(PendingCommit {
-                            answer,
-                            offsets,
-                            discards,
-                        });
-                    }
-                }
-            }
-        }
+        self.commits
+            .commit_due(consumer, &mut self.tracker, queue, Instant::now());
         Ok(())
     }
 
@@ -5597,7 +5798,8 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
     /// One connection: subscribe and consume until a stop or a fault. A stop
     /// ends with the final commit and the consumer's close on a thread of
     /// their own; a fault closes the consumer off the runtime thread too,
-    /// with nothing committed. A dead letter that failed with an error no
+    /// with nothing committed, and so does an abort of the member's task,
+    /// see [`LoopConsumer`]. A dead letter that failed with an error no
     /// retry gets past ends as a stop does, the final commit carrying what
     /// was acked before it, and then returns that error, so
     /// `run_with_reconnect` ends the member on it.
@@ -5607,49 +5809,45 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
         // The map the rebalance callback cancels revoked partitions' tokens
         // in; the tracker below shares it. See `AssignmentTokens`.
         let assignments = AssignmentTokens::default();
-        let consumer = Arc::new(create_stream_consumer(
-            self.client.base_config(),
-            &self.group_id,
-            self.auto_offset_reset,
-            self.max_poll_interval_ms,
+        let consumer = LoopConsumer::new(
+            create_stream_consumer(
+                self.client.base_config(),
+                &self.group_id,
+                self.auto_offset_reset,
+                self.max_poll_interval_ms,
+                queue,
+                rebalance_tx,
+                assignments.clone(),
+                #[cfg(feature = "kafka-msk-iam")]
+                self.client.msk_context(),
+            )?,
             queue,
-            rebalance_tx,
-            assignments.clone(),
-            #[cfg(feature = "kafka-msk-iam")]
-            self.client.msk_context(),
-        )?);
+        );
         let mut state = FifoState {
             tracker: OffsetTracker::with_assignments(self.queue.clone(), assignments),
             rebalance_rx,
-            commit_gate: AsyncCommitGate::new(CommitPolicy::Interval(ASYNC_COMMIT_INTERVAL)),
+            commits: CommitSlot::new(CommitPolicy::Interval(ASYNC_COMMIT_INTERVAL)),
             paused: false,
-            pending_commit: None,
         };
         let ended = match consumer.subscribe(&[queue]) {
             Ok(()) => self.consume(&consumer, &mut state).await,
             Err(e) => Err(map_kafka_error("failed to subscribe", e)),
         };
-        match ended {
-            Ok(fault) => {
-                let pending_commit = state.pending_commit.take();
-                let stopped = stop_with_final_commit(
-                    consumer,
-                    &mut state.tracker,
-                    &mut state.rebalance_rx,
-                    pending_commit,
-                    queue,
-                )
-                .await;
-                // The fault outranks the stop's result; the stop logs its own failure.
-                match fault {
-                    Some(e) => Err(e),
-                    None => stopped,
-                }
-            }
-            Err(e) => {
-                close_off_runtime_or_leak(consumer, queue, &mut spawn_named_thread);
-                Err(e)
-            }
+        // An `Err` drops `consumer` on the way out, off the runtime thread.
+        let fault = ended?;
+        let pending_commit = state.commits.in_flight.take();
+        let stopped = stop_with_final_commit(
+            consumer,
+            &mut state.tracker,
+            &mut state.rebalance_rx,
+            pending_commit,
+            queue,
+        )
+        .await;
+        // The fault outranks the stop's result; the stop logs its own failure.
+        match fault {
+            Some(e) => Err(e),
+            None => stopped,
         }
     }
 
@@ -5669,7 +5867,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
         let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
         housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            state.settle(consumer, &self.shutdown, queue).await?;
+            state.settle(consumer, queue)?;
             let now = Instant::now();
             tokio::select! {
                 // The stop first: a stop that landed during the last
@@ -5682,8 +5880,12 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                 _ = housekeeping.tick() => {}
                 // Wakes the loop when the commit gate's window expires with
                 // a position to commit, so it lands on a topic gone idle.
-                _ = tokio::time::sleep_until(state.commit_gate.deadline(now)),
-                    if state.tracker.has_committable() => {}
+                _ = tokio::time::sleep_until(state.commits.gate.deadline(now)),
+                    if state.commits.in_flight.is_none() && state.tracker.has_committable() => {}
+                answer = commit_answer(state.commits.in_flight.as_mut()),
+                    if state.commits.in_flight.is_some() => {
+                    state.commits.settle(answer, &mut state.tracker, queue);
+                }
                 received = consumer.recv() => {
                     let msg = received.map_err(|e| {
                         tracing::error!(error = %e, queue, "FIFO consumer recv error");
@@ -5870,9 +6072,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                     }
                     // An outage can last: commit between its retries, as a
                     // hold does, see `fifo_wait`.
-                    state
-                        .commit_due(consumer, &self.shutdown, &self.queue)
-                        .await?;
+                    state.commit_due(consumer, &self.queue)?;
                 }
                 // A deployment fault, not an outage: stop instead of waiting
                 // on it.
@@ -6326,17 +6526,22 @@ impl KafkaConsumer {
                 // The map the rebalance callback cancels revoked partitions'
                 // tokens in; the tracker below shares it. See `AssignmentTokens`.
                 let assignments = AssignmentTokens::default();
-                let consumer = create_stream_consumer(
-                    client.base_config(),
-                    &group_id,
-                    auto_offset_reset,
-                    max_poll_interval_ms,
+                // Every exit that does not reach the final commit, a failed
+                // subscribe included, closes it off the runtime thread.
+                let consumer = LoopConsumer::new(
+                    create_stream_consumer(
+                        client.base_config(),
+                        &group_id,
+                        auto_offset_reset,
+                        max_poll_interval_ms,
+                        queue,
+                        rebalance_tx,
+                        assignments.clone(),
+                        #[cfg(feature = "kafka-msk-iam")]
+                        client.msk_context(),
+                    )?,
                     queue,
-                    rebalance_tx,
-                    assignments.clone(),
-                    #[cfg(feature = "kafka-msk-iam")]
-                    client.msk_context(),
-                )?;
+                );
                 consumer
                     .subscribe(&[queue])
                     .map_err(|e| map_kafka_error("failed to subscribe", e))?;
@@ -6347,7 +6552,6 @@ impl KafkaConsumer {
                 // owns the tracker directly — saves two async-lock acquisitions per
                 // message (drain at top + track_received in the message branch).
                 let mut tracker = OffsetTracker::with_assignments(queue_owned.clone(), assignments);
-                let consumer = Arc::new(consumer);
                 // One slot per sender that can hold a completion while this
                 // loop is not draining. The `prefetch_count` permit holders
                 // are `prefetch_count` of them. The loop itself is one more:
@@ -6389,16 +6593,16 @@ impl KafkaConsumer {
                 // reads, and the loop body only runs when a select arm
                 // completes. A no-op when nothing is pending.
                 let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
-                let mut commit_gate = AsyncCommitGate::new(commit_policy);
+                // The commit gate, and the commit in flight: under `Interval`
+                // the one the loop has on its thread, see `CommitSlot`; under
+                // `PerRecord` only the one shutdown cut short, set on the
+                // pass that then takes the shutdown arm.
+                let mut commits = CommitSlot::new(commit_policy);
                 // External-topic pause discipline, see the check below the
                 // commit gate: whether the assignment is paused, and a permit
                 // acquired to end the pause, kept for the next record.
                 let mut paused = false;
                 let mut spare_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
-                // A per-record commit shutdown found in flight, see
-                // `PendingCommit`; only ever set on the pass that then takes
-                // the shutdown arm.
-                let mut pending_commit: Option<PendingCommit> = None;
 
                 // The receive loop runs inside one block so that every exit
                 // it takes lands on the tail below it: a clean shutdown
@@ -6420,8 +6624,9 @@ impl KafkaConsumer {
                     while let Ok(completion) = completion_rx.try_recv() {
                         tracker.mark_complete(completion);
                     }
+                    commits.settle_arrived(&mut tracker, queue);
+                    let assigned = tracker.apply_rebalance_events(&rebalance_rx);
                     let now = Instant::now();
-                    let assigned = tracker.apply_rebalance_events(&rebalance_rx, now);
                     #[cfg(feature = "test-support")]
                     if per_record && assigned {
                         per_record_probe::RECONCILED_AT_TOP_OF_PASS.fetch_add(1, Ordering::SeqCst);
@@ -6433,101 +6638,100 @@ impl KafkaConsumer {
                     // The gate spaces commits out (see `ASYNC_COMMIT_INTERVAL`):
                     // ungated, this drain committed on nearly every iteration —
                     // roughly once per message at speed — piling up in-flight
-                    // async commits that `rd_kafka_consumer_close` later drains
-                    // one reply at a time (tens of seconds after a large fast
-                    // corpus). `drain_committable` is only *called* when due, so
-                    // its side effects (dirty/quiet-drain accounting, pending
-                    // discards) stay tied to actual commit offers. Only a drain
-                    // that offered a commit consumes the window — and `mark`
-                    // runs *after* the commit call with a fresh instant, so a
-                    // slow `Sync` round trip on the discard path cannot eat the
-                    // window and turn these back into back-to-back blocking
-                    // commits.
-                    if commit_gate.due(now)
-                        && let Some((tpl, discards)) = tracker.drain_committable()
+                    // commits that `rd_kafka_consumer_close` later drains one
+                    // reply at a time (tens of seconds after a large fast
+                    // corpus). `drain_committable` is only *called* when due and
+                    // with no commit in flight, so its side effects
+                    // (dirty/quiet-drain accounting, pending discards) stay tied
+                    // to actual commit offers. Only a drain that offered a
+                    // commit consumes the window.
+                    if !per_record {
+                        // On a thread of its own, the loop going on meanwhile;
+                        // the answer is read back on a later pass, see
+                        // `CommitSlot`.
+                        commits.commit_due(&consumer, &mut tracker, queue, now);
+                    } else if commits.in_flight.is_none()
+                        && commits.gate.due(now)
+                        && let Some(DrainedCommit {
+                            tpl,
+                            positions,
+                            discards,
+                        }) = tracker.drain_committable()
                     {
-                        if per_record {
-                            // Every completion is committed before the next
-                            // record is handed out, and only a confirmed
-                            // commit counts: the position is committed
-                            // synchronously on a thread of its own and the
-                            // loop waits for the coordinator's answer while
-                            // it keeps polling, see `commit_confirmed`. The
-                            // assignment has been paused since the record
-                            // was handed out, so nothing is taken meanwhile.
-                            // A rejected commit is re-offered as an
-                            // asynchronous rejection is, through the dirty
-                            // flag, with its discards handed back so the
-                            // commit that lands retires them; the fence
-                            // judges the streak, and the gate spaces the
-                            // re-offers so the loop polls between them. The
-                            // assignment stays paused until a commit is
-                            // accepted, see the resume below.
-                            let offsets = committed_offsets(&tpl);
-                            match commit_confirmed(
-                                &consumer,
-                                tpl,
-                                &shutdown,
-                                Some(&mut fault_rx),
-                                queue,
-                                &mut paused,
-                            )
-                            .await?
-                            {
-                                CommitAnswer::Confirmed => {
-                                    for discard in discards {
-                                        discard.confirm();
-                                    }
-                                    commit_gate.mark(Instant::now());
+                        // Every completion is committed before the next
+                        // record is handed out, and only a confirmed
+                        // commit counts: the position is committed
+                        // synchronously on a thread of its own and the
+                        // loop waits for the coordinator's answer while
+                        // it keeps polling, see `commit_confirmed`. The
+                        // assignment has been paused since the record
+                        // was handed out, so nothing is taken meanwhile.
+                        // A rejected commit is re-offered as under
+                        // `Interval`, through the dirty flag, with its
+                        // discards handed back so the commit that lands
+                        // retires them; the fence judges the streak, and
+                        // the gate spaces the re-offers so the loop polls
+                        // between them. The assignment stays paused until
+                        // a commit is accepted, see the resume below.
+                        match commit_confirmed(
+                            &consumer,
+                            tpl,
+                            &shutdown,
+                            Some(&mut fault_rx),
+                            queue,
+                            &mut paused,
+                        )
+                        .await?
+                        {
+                            CommitAnswer::Confirmed => {
+                                tracker.commit_accepted(&positions);
+                                for discard in discards {
+                                    discard.confirm();
                                 }
-                                CommitAnswer::Rejected(e) => {
-                                    tracing::warn!(
+                                commits.gate.mark(Instant::now());
+                            }
+                            CommitAnswer::Rejected(e) => {
+                                tracing::warn!(
+                                    queue,
+                                    error = %e,
+                                    offsets = ?position_offsets(&positions),
+                                    "offset commit rejected; re-offering the position"
+                                );
+                                let now = Instant::now();
+                                tracker.commit_rejected(&positions, discards, now);
+                                commits.gate.mark_rejected(now);
+                                // A rejected position holds the next
+                                // record back whatever brought the loop
+                                // here. A record taken paused the
+                                // assignment already; a position
+                                // re-offered after a rebalance was
+                                // committed with nothing paused, and its
+                                // rejection pauses the same way, until a
+                                // re-offer is accepted.
+                                if !paused {
+                                    consumer
+                                        .pause_assignment()
+                                        .map_err(|e| map_kafka_error("pause failed", e))?;
+                                    paused = true;
+                                    tracing::info!(
                                         queue,
-                                        error = %e,
-                                        ?offsets,
-                                        "offset commit rejected; re-offering the position"
+                                        "offset commit rejected; assignment paused until a re-offer is accepted"
                                     );
-                                    tracker.re_pend(discards);
-                                    let now = Instant::now();
-                                    for (partition, _) in offsets {
-                                        tracker.mark_dirty(partition, now);
-                                    }
-                                    commit_gate.mark_rejected(now);
-                                    // A rejected position holds the next
-                                    // record back whatever brought the loop
-                                    // here. A record taken paused the
-                                    // assignment already; a position
-                                    // re-offered after a rebalance was
-                                    // committed with nothing paused, and its
-                                    // rejection pauses the same way, until a
-                                    // re-offer is accepted.
-                                    if !paused {
-                                        consumer
-                                            .pause_assignment()
-                                            .map_err(|e| map_kafka_error("pause failed", e))?;
-                                        paused = true;
-                                        tracing::info!(
-                                            queue,
-                                            "offset commit rejected; assignment paused until a re-offer is accepted"
-                                        );
-                                    }
-                                }
-                                CommitAnswer::Cancelled(answer) => {
-                                    // Shutdown fired during the wait. The
-                                    // commit is still in flight on its
-                                    // thread; the shutdown arm, which this
-                                    // pass reaches next, waits for its answer
-                                    // and settles what rides on it before
-                                    // the final commit.
-                                    pending_commit = Some(PendingCommit {
-                                        answer,
-                                        offsets,
-                                        discards,
-                                    });
                                 }
                             }
-                        } else {
-                            commit_interval(&consumer, &tpl, discards, &mut commit_gate)?;
+                            CommitAnswer::Cancelled(answer) => {
+                                // Shutdown fired during the wait. The
+                                // commit is still in flight on its
+                                // thread; the shutdown arm, which this
+                                // pass reaches next, waits for its answer
+                                // and settles what rides on it before
+                                // the final commit.
+                                commits.in_flight = Some(PendingCommit {
+                                    answer,
+                                    positions,
+                                    discards,
+                                });
+                            }
                         }
                     }
 
@@ -6542,7 +6746,7 @@ impl KafkaConsumer {
                     // partition and the permit is back in hand; a rejected
                     // commit keeps `has_committable` true until its re-offer
                     // lands, so no record is taken behind an unconfirmed
-                    // position. A commit shutdown cut short is pending, not
+                    // position. A commit shutdown cut short is in flight, not
                     // committable, and nothing resumes behind it either: the
                     // shutdown arm wins the next select, and the resume would
                     // only hand librdkafka a fetch to purge. A pause purges
@@ -6552,7 +6756,7 @@ impl KafkaConsumer {
                     if per_record
                         && paused
                         && spare_permit.is_some()
-                        && pending_commit.is_none()
+                        && commits.in_flight.is_none()
                         && !tracker.has_committable()
                     {
                         consumer
@@ -6629,7 +6833,7 @@ impl KafkaConsumer {
                                 consumer,
                                 &mut tracker,
                                 &mut rebalance_rx,
-                                pending_commit.take(),
+                                commits.in_flight.take(),
                                 queue,
                             )
                             .await;
@@ -6659,9 +6863,11 @@ impl KafkaConsumer {
                         // redelivery bound (see the completion arm below) from
                         // the gate interval to HOUSEKEEPING_INTERVAL. Disabled
                         // when nothing is committable, so an idle consumer does
-                        // not wake every interval; no busy-spin when past due,
-                        // because the top-of-loop drain then commits and
-                        // `mark` pushes the deadline forward. Cost note:
+                        // not wake every interval, and while a commit is in
+                        // flight, whose answer arm below wakes the loop
+                        // instead; no busy-spin when past due, because the
+                        // top-of-loop drain then commits and `mark` pushes the
+                        // deadline forward. Cost note:
                         // select! evaluates this expression (a `Sleep`
                         // construct-and-drop plus the `has_committable` scan)
                         // on every pass, even when the precondition disables
@@ -6669,8 +6875,15 @@ impl KafkaConsumer {
                         // enabled, and the whole thing displaced a per-message
                         // commit FFI call — the e2e cell's throughput went UP
                         // ~26k -> ~30.5k msg/s with the gate in place.
-                        _ = tokio::time::sleep_until(commit_gate.deadline(now)),
-                            if tracker.has_committable() => {}
+                        _ = tokio::time::sleep_until(commits.gate.deadline(now)),
+                            if commits.in_flight.is_none() && tracker.has_committable() => {}
+                        // The answer of the commit in flight, settled at once:
+                        // a rejection marks its partitions to re-offer, so the
+                        // wake above is due once the gate allows it.
+                        answer = commit_answer(commits.in_flight.as_mut()),
+                            if commits.in_flight.is_some() => {
+                            commits.settle(answer, &mut tracker, queue);
+                        }
                         // Handler completions must wake the loop even when no new
                         // message arrives: with only the recv() arm, the offsets of
                         // the last in-flight batch sat uncommitted until the *next*
@@ -6753,7 +6966,7 @@ impl KafkaConsumer {
                             // `reconcile_pause_after_assign`.
                             #[cfg_attr(not(feature = "test-support"), allow(unused_variables))]
                             let assigned =
-                                tracker.apply_rebalance_events(&rebalance_rx, Instant::now());
+                                tracker.apply_rebalance_events(&rebalance_rx);
                             #[cfg(feature = "test-support")]
                             if per_record && assigned {
                                 per_record_probe::ASSIGNS_DRAINED_AT_RECEIVE_ARM
@@ -7064,7 +7277,7 @@ impl KafkaConsumer {
                                         tracker: &mut tracker,
                                         completion_rx: &mut completion_rx,
                                         rebalance_rx: &mut rebalance_rx,
-                                        gate: &mut commit_gate,
+                                        slot: &mut commits,
                                         fence_timeout,
                                         group_id: &group_id,
                                     });
@@ -7347,7 +7560,8 @@ impl KafkaConsumer {
                 // uncommitted and is redelivered on restart, or by the
                 // reconnect a retryable error leads to. The spare permit, if
                 // one was held, went with the block's state, so the drain
-                // cannot wait on it.
+                // cannot wait on it, and so did the consumer, whose close runs
+                // on a thread of its own, see `LoopConsumer`.
                 let Err(e) = ended else { return Ok(()) };
                 tail_cancel.cancel();
                 let _ = tail_semaphore.acquire_many(prefetch_count as u32).await;
@@ -7904,8 +8118,9 @@ impl KafkaConsumer {
     /// returns `Ok(())`.
     ///
     /// Either `RetryStrategy` is accepted, and both retry in place. Offsets
-    /// are committed asynchronously at most every 500 ms, synchronously when
-    /// a discarded record rides on the commit, and once more at the stop.
+    /// are committed at most every 500 ms, one commit at a time on a thread
+    /// of its own while the consumer goes on, and once more at the stop. A
+    /// commit the coordinator rejects is re-offered.
     pub async fn run_fifo<T, H>(
         &self,
         handler: H,
@@ -9187,13 +9402,35 @@ mod offset_tracker_tests {
     /// terminal discards — asserting the side channel stays empty keeps them
     /// honest about that.
     fn drain_tpl(tracker: &mut OffsetTracker) -> Option<TopicPartitionList> {
-        tracker.drain_committable().map(|(tpl, discards)| {
+        tracker.drain_committable().map(|drained| {
             assert!(
-                discards.is_empty(),
+                drained.discards.is_empty(),
                 "no terminal discards were attached in this test"
             );
-            tpl
+            drained.tpl
         })
+    }
+
+    /// What a rejected commit of `partition` does to the tracker: the
+    /// commit's answer as `CommitSlot::settle` hands it over, for a commit
+    /// drained under the partition's current assignment.
+    fn reject(tracker: &mut OffsetTracker, partition: i32, now: Instant) {
+        let position = position_of(tracker, partition);
+        tracker.commit_rejected(&[position], Vec::new(), now);
+    }
+
+    /// `partition`'s current assignment as a drained commit names it; the
+    /// offset plays no part in settling an answer.
+    fn position_of(tracker: &OffsetTracker, partition: i32) -> CommitPosition {
+        CommitPosition {
+            partition,
+            offset: 0,
+            epoch: tracker
+                .partitions
+                .get(&partition)
+                .map(|tracker| tracker.epoch)
+                .expect("the partition is tracked"),
+        }
     }
 
     /// An offset the broker never delivered - a compacted record, or a
@@ -9224,7 +9461,7 @@ mod offset_tracker_tests {
     /// Saturating keeps the commit path free of unchecked arithmetic.
     #[test]
     fn position_saturates_at_the_maximum_offset() {
-        let mut tracker = PartitionTracker::new(i64::MAX);
+        let mut tracker = PartitionTracker::new(i64::MAX, 1);
         tracker.mark_complete(i64::MAX, None);
         assert_eq!(tracker.position(), i64::MAX);
     }
@@ -9437,10 +9674,11 @@ mod offset_tracker_tests {
         }
     }
 
-    /// The shutdown drain re-offers the position an asynchronous drain has
-    /// already offered: the last asynchronous commit may still be in flight,
-    /// and with no new completion `drain_committable` would give the final
-    /// `Sync` commit nothing to confirm.
+    /// The shutdown drain re-offers the position a running drain has already
+    /// offered: the commit that carried it may have been rejected at the
+    /// stop or gone unanswered, and with no new completion
+    /// `drain_committable` would give the final `Sync` commit nothing to
+    /// confirm.
     #[test]
     fn the_shutdown_drain_re_offers_a_position_an_earlier_drain_offered() {
         let mut tracker = OffsetTracker::new("q".to_string());
@@ -9455,7 +9693,7 @@ mod offset_tracker_tests {
 
         assert!(
             tracker.drain_committable().is_none(),
-            "nothing new completed, so the asynchronous drain offers nothing"
+            "nothing new completed, so the running drain offers nothing"
         );
 
         let (again, discards) = tracker
@@ -9488,7 +9726,7 @@ mod offset_tracker_tests {
     }
 
     /// The discards below the offered position ride the shutdown drain, so
-    /// the final commit's result settles them as an asynchronous one would.
+    /// the final commit's result settles them as a running commit's would.
     #[test]
     fn the_shutdown_drain_hands_out_the_discards_its_positions_retire() {
         let mut tracker = OffsetTracker::new("q".to_string());
@@ -9656,7 +9894,7 @@ mod offset_tracker_tests {
         );
 
         tracker.mark_complete(Completion::plain(0, 0));
-        let (tpl, discards) = tracker
+        let DrainedCommit { tpl, discards, .. } = tracker
             .drain_committable()
             .expect("the gap filled, so 0 and 1 commit together");
         assert_eq!(committed_offset(&tpl, 0), Some(2));
@@ -9670,15 +9908,14 @@ mod offset_tracker_tests {
         }
     }
 
-    /// An Ack-only batch reports no discards, which is what lets the receive
-    /// loop keep committing asynchronously in the common case.
+    /// An Ack-only batch reports no discards: nothing rides its commit.
     #[test]
     fn a_batch_without_terminal_outcomes_reports_no_discards() {
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
         tracker.mark_complete(Completion::plain(0, 0));
-        let (_, discards) = tracker.drain_committable().expect("offset 0 commits");
-        assert!(discards.is_empty());
+        let drained = tracker.drain_committable().expect("offset 0 commits");
+        assert!(drained.discards.is_empty());
     }
 
     /// A partition revoked before its commit lands takes the pending discard
@@ -9706,14 +9943,17 @@ mod offset_tracker_tests {
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
         tracker.mark_complete(terminal(0));
-        let (_, discards) = tracker.drain_committable().expect("offset 0 commits");
-        assert_eq!(discards.len(), 1);
-        assert_eq!((discards[0].partition, discards[0].offset), (0, 0));
+        let drained = tracker.drain_committable().expect("offset 0 commits");
+        assert_eq!(drained.discards.len(), 1);
+        assert_eq!(
+            (drained.discards[0].partition, drained.discards[0].offset),
+            (0, 0)
+        );
 
         // The commit was rejected: hand the discard back and re-offer.
-        tracker.re_pend(discards);
-        tracker.mark_dirty(0, Instant::now());
-        let (tpl, discards) = tracker.drain_committable().expect("the re-offer");
+        tracker.commit_rejected(&drained.positions, drained.discards, Instant::now());
+        let DrainedCommit { tpl, discards, .. } =
+            tracker.drain_committable().expect("the re-offer");
         assert_eq!(committed_offset(&tpl, 0), Some(1), "the same position");
         assert_eq!(discards.len(), 1, "the discard rides the re-offer");
 
@@ -9732,55 +9972,72 @@ mod offset_tracker_tests {
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
         tracker.mark_complete(terminal(0));
-        let (_, discards) = tracker.drain_committable().expect("offset 0 commits");
+        let drained = tracker.drain_committable().expect("offset 0 commits");
         tracker.remove(0);
-        tracker.re_pend(discards);
+        tracker.re_pend(drained.discards);
         assert!(
             tracker.drain_committable().is_none(),
             "nothing is tracked for the revoked partition"
         );
     }
 
-    /// `commit_callback` reports a rejected asynchronous commit as a
-    /// `CommitFailed` event naming the topic's partitions only, and an
-    /// accepted one as nothing: what the loop then marks dirty is exactly
-    /// the partitions it offered.
+    /// The answer to a commit drained under an earlier assignment settles
+    /// nothing on the current one. The partition moves away and comes back
+    /// while the commit is in flight, and its first record is delivered
+    /// again, from the position nothing committed past. The old commit's
+    /// rejection then re-offers nothing for the new assignment and starts no
+    /// streak on it, and its discard is settled as survived instead of
+    /// riding the new assignment's commits: the record it rode on is being
+    /// handled again.
     #[test]
-    fn commit_callback_reports_a_rejection_for_the_topics_partitions_only() {
+    fn an_answer_drained_under_an_earlier_assignment_settles_nothing_on_the_current_one() {
         let (tx, rx) = std_mpsc::channel();
-        let ctx = RebalanceContext {
-            inner: DefaultClientContext,
-            topic: "q".to_string(),
-            client_id: "shove-test".to_string(),
-            tx,
-            assignments: AssignmentTokens::default(),
-        };
-        let mut tpl = TopicPartitionList::new();
-        tpl.add_partition_offset("q", 3, Offset::Offset(7)).unwrap();
-        tpl.add_partition_offset("other", 1, Offset::Offset(2))
-            .unwrap();
-        tpl.add_partition_offset("q", 0, Offset::Offset(9)).unwrap();
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        tracker.mark_complete(terminal(0));
+        let drained = tracker.drain_committable().expect("offset 0 commits");
 
-        ConsumerContext::commit_callback(&ctx, Ok(()), &tpl);
-        assert!(rx.try_recv().is_err(), "an accepted commit reports nothing");
+        tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
+        tx.send(RebalanceEvent::Assign(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx);
+        let again = tracker.track_received(0, 0);
+        let now = Instant::now();
+        tracker.commit_rejected(&drained.positions, drained.discards, now);
 
-        ConsumerContext::commit_callback(
-            &ctx,
-            Err(KafkaError::ConsumerCommit(
-                RDKafkaErrorCode::IllegalGeneration,
-            )),
-            &tpl,
+        assert!(
+            tracker.drain_committable().is_none(),
+            "the old assignment's rejection re-offers nothing for the new one"
         );
-        let Ok(RebalanceEvent::CommitFailed(mut partitions)) = rx.try_recv() else {
-            panic!("a rejected commit reports CommitFailed");
-        };
-        partitions.sort_unstable();
         assert_eq!(
-            partitions,
-            vec![0, 3],
-            "the other topic's partition is not ours"
+            tracker.fenced(now + Duration::from_secs(120), Duration::from_secs(60)),
+            None,
+            "and starts no streak on it"
         );
-        assert!(rx.try_recv().is_err(), "one event per rejection");
+        tracker.mark_complete(Completion::under(again.epoch, 0, 0));
+        let redelivered = tracker
+            .drain_committable()
+            .expect("the new assignment commits its own delivery");
+        assert!(
+            redelivered.discards.is_empty(),
+            "the old discard was settled as survived, not re-pended on the new assignment"
+        );
+    }
+
+    /// An accepted commit ends its partitions' streak at once: a member
+    /// whose commits land is not fenced, whatever came before.
+    #[test]
+    fn an_accepted_commit_ends_the_streak() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        let t0 = Instant::now();
+        reject(&mut tracker, 0, t0);
+        let drained = tracker.drain_committable().expect("the re-offer");
+        tracker.commit_accepted(&drained.positions);
+        assert_eq!(
+            tracker.fenced(t0 + Duration::from_secs(61), Duration::from_secs(60)),
+            None,
+            "the accepted re-offer resolved the streak"
+        );
     }
 
     /// A completion arriving for a partition this member no longer tracks is
@@ -9867,7 +10124,7 @@ mod offset_tracker_tests {
     /// short-circuiting past the removal and pinning the position there.
     #[test]
     fn a_stale_completion_removes_its_in_flight_entry() {
-        let mut partition = PartitionTracker::new(10);
+        let mut partition = PartitionTracker::new(10, 1);
         partition.mark_complete(10, None);
         assert_eq!(
             partition.drain_committable().map(|(next, _)| next),
@@ -9895,21 +10152,19 @@ mod offset_tracker_tests {
         );
     }
 
-    /// A failed async commit (CommitFailed event) makes the partition
-    /// re-offer its current commit position on the next drain even though no
-    /// new completions arrived — and only once (the flag clears).
+    /// A rejected commit makes the partition re-offer its current commit
+    /// position on the next drain even though no new completions arrived —
+    /// and only once (the flag clears).
     #[test]
     fn commit_failed_re_offers_current_position_once() {
-        let (tx, rx) = std_mpsc::channel();
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
         tracker.mark_complete(Completion::plain(0, 0));
         let tpl = drain_tpl(&mut tracker).expect("initial commit");
         assert_eq!(committed_offset(&tpl, 0), Some(1));
 
-        // The async commit of offset 1 was rejected mid-rebalance.
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, Instant::now());
+        // The commit of offset 1 was rejected mid-rebalance.
+        reject(&mut tracker, 0, Instant::now());
         let tpl = drain_tpl(&mut tracker)
             .expect("failed commit must be re-offered without new completions");
         assert_eq!(committed_offset(&tpl, 0), Some(1));
@@ -9920,28 +10175,27 @@ mod offset_tracker_tests {
         );
     }
 
-    /// The drain reports an assign event and nothing else: a revoke or a
-    /// rejected commit is not what makes a per-record loop re-apply its
-    /// pause, a partition handed to this member is.
+    /// The drain reports an assign event and nothing else: a revoke is not
+    /// what makes a per-record loop re-apply its pause, a partition handed
+    /// to this member is.
     #[test]
     fn apply_rebalance_events_reports_only_an_assign() {
         let (tx, rx) = std_mpsc::channel();
         let mut tracker = OffsetTracker::new("q".to_string());
         tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        assert!(!tracker.apply_rebalance_events(&rx, Instant::now()));
+        assert!(!tracker.apply_rebalance_events(&rx));
         tx.send(RebalanceEvent::Assign(vec![0])).unwrap();
-        assert!(tracker.apply_rebalance_events(&rx, Instant::now()));
+        assert!(tracker.apply_rebalance_events(&rx));
         assert!(
-            !tracker.apply_rebalance_events(&rx, Instant::now()),
+            !tracker.apply_rebalance_events(&rx),
             "an empty channel reports nothing"
         );
     }
 
     /// Any rebalance event re-offers every retained partition's current
-    /// position: async commits in flight during the rebalance can be dropped
-    /// by librdkafka without an error, so positions are re-asserted once the
-    /// group settles.
+    /// position: a commit made during the rebalance can be refused with a
+    /// rebalance in progress, so positions are re-asserted once the group
+    /// settles.
     #[test]
     fn rebalance_event_re_offers_retained_partition_positions() {
         let (tx, rx) = std_mpsc::channel();
@@ -9952,9 +10206,9 @@ mod offset_tracker_tests {
         assert_eq!(committed_offset(&tpl, 4), Some(1));
 
         // Another member joins: partitions 0-3 move away; the commit of
-        // (4, 1) submitted during the rebalance may have been dropped.
+        // (4, 1) submitted during the rebalance may have been refused.
         tx.send(RebalanceEvent::Revoke(vec![0, 1, 2, 3])).unwrap();
-        tracker.apply_rebalance_events(&rx, Instant::now());
+        tracker.apply_rebalance_events(&rx);
         let tpl = drain_tpl(&mut tracker).expect("retained partition must re-offer its position");
         assert_eq!(committed_offset(&tpl, 4), Some(1));
 
@@ -9973,11 +10227,11 @@ mod offset_tracker_tests {
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
         tracker.mark_complete(Completion::plain(0, 0));
-        let _ = drain_tpl(&mut tracker).expect("initial commit");
+        let drained = tracker.drain_committable().expect("initial commit");
 
         tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, Instant::now());
+        tracker.apply_rebalance_events(&rx);
+        tracker.commit_rejected(&drained.positions, drained.discards, Instant::now());
         assert!(
             drain_tpl(&mut tracker).is_none(),
             "no retry for a revoked partition"
@@ -9996,7 +10250,7 @@ mod offset_tracker_tests {
 
         tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
         tx.send(RebalanceEvent::Assign(vec![1])).unwrap();
-        tracker.apply_rebalance_events(&rx, Instant::now());
+        tracker.apply_rebalance_events(&rx);
 
         tracker.mark_complete(Completion::plain(0, 5));
         tracker.mark_complete(Completion::plain(1, 7));
@@ -10027,7 +10281,7 @@ mod offset_tracker_tests {
         // the first record under the new assignment is offset 7 again.
         tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
         tx.send(RebalanceEvent::Assign(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, Instant::now());
+        tracker.apply_rebalance_events(&rx);
         let second = tracker.track_received(0, 7);
         assert_ne!(first.epoch, second.epoch, "a reassign begins a new epoch");
 
@@ -10071,7 +10325,7 @@ mod offset_tracker_tests {
         // partition again.
         tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
         tx.send(RebalanceEvent::Assign(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, Instant::now());
+        tracker.apply_rebalance_events(&rx);
         let again = tracker.track_received(0, 0);
         assert!(
             !again.revoked.is_cancelled(),
@@ -10081,7 +10335,7 @@ mod offset_tracker_tests {
 
         // The tracker's own path, the backstop, when it drains a revoke.
         tx.send(RebalanceEvent::Revoke(vec![1])).unwrap();
-        tracker.apply_rebalance_events(&rx, Instant::now());
+        tracker.apply_rebalance_events(&rx);
         assert!(
             other.revoked.is_cancelled(),
             "the tracker cancels as the backstop"
@@ -10107,12 +10361,10 @@ mod offset_tracker_tests {
     /// budget — must not trip the fenced check.
     #[test]
     fn fenced_is_none_within_threshold() {
-        let (tx, rx) = std_mpsc::channel();
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
         let t0 = Instant::now();
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, t0);
+        reject(&mut tracker, 0, t0);
 
         assert_eq!(
             tracker.fenced(t0 + Duration::from_secs(59), Duration::from_secs(60)),
@@ -10125,20 +10377,17 @@ mod offset_tracker_tests {
     /// trips the fenced check on the affected partition.
     #[test]
     fn fenced_fires_after_sustained_unresolved_commit_failures() {
-        let (tx, rx) = std_mpsc::channel();
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
         let t0 = Instant::now();
 
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, t0);
+        reject(&mut tracker, 0, t0);
 
         // Every re-offer fails again immediately — no gap wide enough to
         // resolve the streak, and no revoke/assign ever arrives.
         let t1 = t0 + Duration::from_secs(30);
         let _ = drain_tpl(&mut tracker);
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, t1);
+        reject(&mut tracker, 0, t1);
 
         let t2 = t0 + Duration::from_secs(61);
         assert_eq!(
@@ -10155,16 +10404,13 @@ mod offset_tracker_tests {
     /// passed.
     #[test]
     fn fenced_honours_a_raised_threshold() {
-        let (tx, rx) = std_mpsc::channel();
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
         let t0 = Instant::now();
 
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, t0);
+        reject(&mut tracker, 0, t0);
         let _ = drain_tpl(&mut tracker);
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, t0 + Duration::from_secs(30));
+        reject(&mut tracker, 0, t0 + Duration::from_secs(30));
 
         let raised = fence_threshold_over(COMMIT_FENCE_TIMEOUT, Duration::from_secs(30));
         assert_eq!(raised, Duration::from_secs(120));
@@ -10186,20 +10432,18 @@ mod offset_tracker_tests {
         );
     }
 
-    /// A *single* quiet drain does not resolve the streak: `commit_callback`
-    /// only fires on failure, so silence one iteration after a re-offer is
-    /// not yet evidence of success — a genuinely wedged partition looks
-    /// identical at this point, and its next failure callback may not land
-    /// for another iteration.
+    /// A *single* quiet drain does not resolve the streak: the answer to a
+    /// re-offer can outlast one iteration, so silence one iteration after a
+    /// re-offer is not yet evidence of success — a genuinely wedged
+    /// partition looks identical at this point, and its next rejection may
+    /// not land for another iteration.
     #[test]
     fn fenced_streak_survives_a_single_quiet_drain() {
-        let (tx, rx) = std_mpsc::channel();
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
         let t0 = Instant::now();
 
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, t0);
+        reject(&mut tracker, 0, t0);
         let _ = drain_tpl(&mut tracker); // re-offers the failed commit
         let _ = drain_tpl(&mut tracker); // 1st quiet drain: not yet resolved
 
@@ -10211,9 +10455,9 @@ mod offset_tracker_tests {
     }
 
     /// A partition whose re-offered commit actually landed must NOT age into
-    /// a fence. Success is silent (`commit_callback` fires only on failure),
-    /// so `QUIET_DRAINS_TO_RESOLVE` consecutive quiet drains are what stand
-    /// in for the missing positive ack.
+    /// a fence. The accepted answer resolves the streak at once (see
+    /// `an_accepted_commit_ends_the_streak`); `QUIET_DRAINS_TO_RESOLVE`
+    /// consecutive quiet drains resolve it too, without one.
     ///
     /// Regression: `dirty_since` was previously only ever cleared by a
     /// resolving rebalance, so a single transient rejection on an otherwise
@@ -10222,13 +10466,11 @@ mod offset_tracker_tests {
     /// so nothing intervened.
     #[test]
     fn fenced_does_not_fire_after_a_transient_failure_recovers() {
-        let (tx, rx) = std_mpsc::channel();
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
         let t0 = Instant::now();
 
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, t0);
+        reject(&mut tracker, 0, t0);
         let _ = drain_tpl(&mut tracker); // re-offers; this one succeeds
 
         // Two consecutive quiet drains: the re-offer must have landed.
@@ -10254,13 +10496,11 @@ mod offset_tracker_tests {
     /// instantly.
     #[test]
     fn fenced_measures_a_later_failure_from_its_own_start() {
-        let (tx, rx) = std_mpsc::channel();
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
         let t0 = Instant::now();
 
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, t0);
+        reject(&mut tracker, 0, t0);
         let _ = drain_tpl(&mut tracker);
         for _ in 0..QUIET_DRAINS_TO_RESOLVE {
             let _ = drain_tpl(&mut tracker);
@@ -10268,8 +10508,7 @@ mod offset_tracker_tests {
 
         // An unrelated rejection an hour later.
         let t1 = t0 + Duration::from_secs(3_600);
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, t1);
+        reject(&mut tracker, 0, t1);
 
         assert_eq!(
             tracker.fenced(t1 + Duration::from_secs(30), Duration::from_secs(60)),
@@ -10292,14 +10531,13 @@ mod offset_tracker_tests {
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
         let t0 = Instant::now();
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, t0);
+        reject(&mut tracker, 0, t0);
 
         let t1 = t0 + Duration::from_secs(90);
         assert_eq!(tracker.fenced(t1, Duration::from_secs(60)), Some(0));
 
         tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, t1);
+        tracker.apply_rebalance_events(&rx);
         tracker.track_received(0, 42);
 
         assert_eq!(
@@ -10329,12 +10567,11 @@ mod offset_tracker_tests {
 
         // Partition 1 churns in and out for five minutes while partition 0
         // stays put. No commit is ever rejected.
-        for i in 0..60 {
-            let at = t0 + Duration::from_secs(5 * i);
+        for _ in 0..60 {
             tx.send(RebalanceEvent::Revoke(vec![1])).unwrap();
-            tracker.apply_rebalance_events(&rx, at);
+            tracker.apply_rebalance_events(&rx);
             tx.send(RebalanceEvent::Assign(vec![])).unwrap();
-            tracker.apply_rebalance_events(&rx, at);
+            tracker.apply_rebalance_events(&rx);
             let _ = tracker.drain_committable();
             tracker.track_received(1, 0);
         }
@@ -10356,13 +10593,12 @@ mod offset_tracker_tests {
         tracker.track_received(0, 0);
         let t0 = Instant::now();
 
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, t0);
+        reject(&mut tracker, 0, t0);
 
         // A rebalance at t0+30s retains partition 0 and resolves the streak.
         let t1 = t0 + Duration::from_secs(30);
         tx.send(RebalanceEvent::Assign(vec![])).unwrap();
-        tracker.apply_rebalance_events(&rx, t1);
+        tracker.apply_rebalance_events(&rx);
         assert_eq!(
             tracker.fenced(t0 + Duration::from_secs(61), Duration::from_secs(60)),
             None,
@@ -10370,8 +10606,7 @@ mod offset_tracker_tests {
         );
 
         // Commits start being rejected again right after.
-        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx, t1);
+        reject(&mut tracker, 0, t1);
         assert_eq!(
             tracker.fenced(t1 + Duration::from_secs(61), Duration::from_secs(60)),
             Some(0),
@@ -10404,7 +10639,7 @@ mod offset_tracker_tests {
         drain_tpl(&mut tracker).expect("gap filled, commit offered");
         assert!(!tracker.has_committable(), "drained clean");
 
-        tracker.mark_dirty(0, Instant::now());
+        reject(&mut tracker, 0, Instant::now());
         assert!(tracker.has_committable(), "rejected commit awaits re-offer");
     }
 }
@@ -10575,20 +10810,6 @@ mod batch_rebalance_tests {
     fn drain_is_empty_when_nothing_happened() {
         let (_tx, rx) = std_mpsc::channel::<RebalanceEvent>();
         assert!(drain_batch_rebalance_events(&rx).is_empty());
-    }
-
-    /// `CommitFailed` is not a rebalance. The batch path commits
-    /// synchronously and surfaces its own errors, so letting this event
-    /// abandon the batch would discard it for no reason at all.
-    #[test]
-    fn commit_failed_is_not_a_rebalance() {
-        let (tx, rx) = std_mpsc::channel();
-        tx.send(RebalanceEvent::CommitFailed(vec![0, 1])).unwrap();
-
-        assert!(
-            drain_batch_rebalance_events(&rx).is_empty(),
-            "a failed commit says nothing about partition ownership"
-        );
     }
 
     #[test]

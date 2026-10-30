@@ -88,6 +88,10 @@ const WAIT_COMMIT_GROUP: &str = "kafka-fifo-in-place-wait-commit-fifo";
 /// the hold.
 const WAIT_COMMIT_HOLD: Duration = Duration::from_secs(30);
 
+const REOFFER_TOPIC: &str = "kafka-fifo-in-place-reoffer";
+const REOFFER_DLQ: &str = "kafka-fifo-in-place-reoffer-dlq";
+const REOFFER_GROUP: &str = "kafka-fifo-in-place-reoffer-fifo";
+
 const REVOKE_TOPIC: &str = "kafka-fifo-in-place-revoke";
 const REVOKE_DLQ: &str = "kafka-fifo-in-place-revoke-dlq";
 const REVOKE_GROUP: &str = "kafka-fifo-in-place-revoke-fifo";
@@ -187,6 +191,18 @@ shove::define_sequenced_topic!(
         .sequenced(SequenceFailure::Skip)
         .routing_shards(1)
         .hold_queue(WAIT_COMMIT_HOLD)
+        .dlq()
+        .build()
+);
+
+shove::define_sequenced_topic!(
+    ReofferTopic,
+    Order,
+    |_order: &Order| KEY.to_string(),
+    TopologyBuilder::new(REOFFER_TOPIC)
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(ORDER_HOLD)
         .dlq()
         .build()
 );
@@ -325,6 +341,18 @@ impl Mock {
 
     fn restore_produce(&self) {
         self.api().clear_request_errors(RDKafkaApiKey::Produce);
+    }
+
+    /// Refuse every OffsetCommit with an error librdkafka neither retries
+    /// nor rejoins the group over, until `accept_commits`.
+    fn reject_commits(&self) {
+        let errors = vec![RDKafkaRespErr::RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED; 512];
+        self.api()
+            .request_errors(RDKafkaApiKey::OffsetCommit, &errors);
+    }
+
+    fn accept_commits(&self) {
+        self.api().clear_request_errors(RDKafkaApiKey::OffsetCommit);
     }
 }
 
@@ -744,6 +772,53 @@ async fn fifo_commits_acked_positions_during_a_hold() {
         Some(3),
         "nothing is committed past the held record"
     );
+}
+
+/// A sequenced consumer re-offers a commit the coordinator rejects. The mock
+/// refuses every OffsetCommit for 2 s and then accepts them. The three
+/// records are acked inside that window, so every commit their acks make is
+/// refused, and no record arrives after it. The position still reaches the
+/// end of what was acked, through a re-offer, before the stop.
+#[tokio::test]
+async fn fifo_rejected_commit_is_reoffered() {
+    const REFUSING: Duration = Duration::from_secs(2);
+    let mock = Mock::start(&[REOFFER_TOPIC, REOFFER_DLQ]);
+    let bootstrap = mock.bootstrap();
+    produce(&bootstrap, REOFFER_TOPIC, &["A1", "A2", "A3"]).await;
+    mock.reject_commits();
+
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let consumer = Running::fifo::<ReofferTopic>(&bootstrap, &handler).await;
+    consumer
+        .wait_until(
+            || handler.count() == 3,
+            DELIVERY_TIMEOUT,
+            "the three records reaching the handler",
+        )
+        .await;
+    tokio::time::sleep(REFUSING).await;
+    assert_eq!(
+        committed_position(&bootstrap, REOFFER_TOPIC, REOFFER_GROUP).await,
+        None,
+        "every commit inside the window was refused"
+    );
+
+    mock.accept_commits();
+    wait_for_committed_position(
+        &bootstrap,
+        REOFFER_TOPIC,
+        REOFFER_GROUP,
+        3,
+        DELIVERY_TIMEOUT,
+        "the refused position re-offered once the coordinator accepts it",
+    )
+    .await;
+    assert_eq!(
+        handler.ids(),
+        ["A1", "A2", "A3"],
+        "no record was handed out again"
+    );
+    consumer.stop().await;
 }
 
 /// A hold longer than `max.poll.interval.ms` keeps the member in its group:
