@@ -56,13 +56,14 @@ use super::publisher::{PublishResult, header_value, publish_with_retry};
 
 /// JetStream redelivers any message not acked within `ack_wait`, a clock that
 /// starts at delivery. A consumer takes delivery only of what it can start at
-/// once: a worker pulls no more messages than it has free slots, and a FIFO
-/// shard's durable delivers one at a time. So the clock measures the handler
-/// and its settlement, and the 3x margin over the handler timeout lets a
-/// handler run to its limit with room to settle. A copy's publish and a
-/// retry's hold renew the clock with progress acks instead of drawing on the
-/// margin. Floor at the JetStream default (30s) so short handler timeouts
-/// don't tighten redelivery below the server default.
+/// once: a worker pulls no more messages than it has free slots, a FIFO
+/// shard's durable delivers one at a time, and a DLQ drain pulls one dead
+/// letter at a time. So the clock measures the handler and its settlement, and
+/// the 3x margin over the handler timeout lets a handler run to its limit with
+/// room to settle. A copy's publish and a retry's hold renew the clock with
+/// progress acks instead of drawing on the margin. Floor at the JetStream
+/// default (30s) so short handler timeouts don't tighten redelivery below the
+/// server default.
 pub(super) fn derive_ack_wait(handler_timeout: Duration) -> Duration {
     handler_timeout
         .saturating_mul(3)
