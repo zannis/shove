@@ -1,23 +1,51 @@
 src/backends/nats/broadcast.rs
   s_1001dc3147e1e5::t_e115dc0b2292cf 40-45,51-52,59,83-86,89-94,360-433,446,450,464,490-494
+  s_1001dc3147e1e5::t_ab79032786e904 490-494
+  s_1001dc3147e1e5::t_6abe583c19d6b9 51-52
+  s_1001dc3147e1e5::t_83fc938982051c 93
+  s_1001dc3147e1e5::t_a2466f8ca6c473 40-45
+  s_1001dc3147e1e5::t_98f2140f0b133d 83-86,89-92
+  s_1001dc3147e1e5::t_2ed4b27533bbc0 360-433,446,450,464
+  s_1001dc3147e1e5::t_49566fcc11e8b6 59,94
 src/backend/batch_consumer.rs
   s_1001dc3147e1e5::t_e115dc0b2292cf 61
+  s_1001dc3147e1e5::t_07d2a4535483ef 61
 src/backends/nats/topology.rs
   s_1001dc3147e1e5::t_e115dc0b2292cf 3,6,13,16-71,123-132,148-156,160,171-185,229-233,251-253,318-408
+  s_1001dc3147e1e5::t_d67655a4a1c765 3,6,13,16-71
+  s_1001dc3147e1e5::t_923e22f8f8aed0 123-132,148-156,160,171-185,229-233,251-253
+  s_1001dc3147e1e5::t_fd83141415311c 318-408
 tests/metrics_nats_unconfirmed_ack.rs
   s_1001dc3147e1e5::t_e115dc0b2292cf 1-298
+  s_1001dc3147e1e5::t_539047e307afec 1-298
 tests/nats_broadcast_integration.rs
   s_1001dc3147e1e5::t_e115dc0b2292cf 435-642
+  s_1001dc3147e1e5::t_654933b0c7b34b 435-541
+  s_1001dc3147e1e5::t_5a1814fe9984ea 542-642
 docs/pages/backends/nats.mdx
   s_1001dc3147e1e5::t_e115dc0b2292cf 126-129,347,354
+  s_1001dc3147e1e5::t_03fe91859afcde 126-129,347,354
 docs/pages/concepts/broadcast.mdx
   s_1001dc3147e1e5::t_e115dc0b2292cf 109-110
+  s_1001dc3147e1e5::t_04ffef44de1fd6 109-110
 src/metrics.rs
   s_1001dc3147e1e5::t_e115dc0b2292cf 546
+  s_1001dc3147e1e5::t_90545d63bd5324 546
 docs/pages/ops/backends.mdx
   s_1001dc3147e1e5::t_e115dc0b2292cf 53,55
+  s_1001dc3147e1e5::t_03fe91859afcde 53,55
 src/backends/nats/consumer.rs
   s_1001dc3147e1e5::t_e115dc0b2292cf 20-21,604-636,794,810,876,886,890,1974,1980-1987,2979,3002
+  s_1001dc3147e1e5::t_64e647b53ef84a 3002
+  s_1001dc3147e1e5::t_8c7772083fc760 604-636
+  s_1001dc3147e1e5::t_5eec66a26f7f2b 810
+  s_1001dc3147e1e5::t_0dfeac90a4f1a8 886,890
+  s_1001dc3147e1e5::t_04f9541b1f7334 794
+  s_1001dc3147e1e5::t_dfe5018c77d954 876
+  s_1001dc3147e1e5::t_060ecd2d29d8ea 21
+  s_1001dc3147e1e5::t_f2ed60df184c7c 1974,1980-1987
+  s_1001dc3147e1e5::t_84bbcc751f870f 2979
+  s_1001dc3147e1e5::t_78ad6c990834ad 20
 tests/nats_integration.rs
   s_1001dc3147e1e5::t_e115dc0b2292cf 735-883,7606-7693,7695-7696,7698,7700,7704-7705
   s_1001dc3147e1e5::t_acbf0e4d2495ff 7694
@@ -25,6 +53,9 @@ tests/nats_integration.rs
   s_1001dc3147e1e5::t_12fae1da63a966 7699
   s_1001dc3147e1e5::t_792be51ab57268 7701-7703
   s_1001dc3147e1e5::t_7652c442d9449a 7706
+  s_1001dc3147e1e5::t_fd80c638da45c8 735-879
+  s_15738d063649d8::t_7ec705bc30e831 880-883
+  s_1001dc3147e1e5::t_490ef3bff7917a 7606-7693,7695-7706
 ---
 {
   "schema_version": "authorship/3.0.0",
@@ -36,6 +67,14 @@ tests/nats_integration.rs
       "agent_id": {
         "tool": "claude",
         "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_15738d063649d8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b185d55-8392-4565-840a-ce026d0108d7",
         "model": "claude-opus-5-5"
       },
       "human_author": "zannis <zkalampoukis@gmail.com>"
