@@ -148,9 +148,17 @@ impl<B: Backend> BatchConsumerOptions<B> {
         self
     }
 
-    /// Abandon a `handle_batch` call that runs longer than this and treat the
-    /// batch as [`Outcome::Retry`]. Default
+    /// Bound a `handle_batch` call to this long. Default
     /// [`DEFAULT_HANDLER_TIMEOUT`](crate::DEFAULT_HANDLER_TIMEOUT).
+    ///
+    /// The limit bounds a call that yields. Once it passes, the call is
+    /// dropped at its next `.await` that yields, and the batch is treated as
+    /// [`Outcome::Retry`], or as
+    /// [`with_handler_timeout_outcome`](Self::with_handler_timeout_outcome)
+    /// chooses. Every backend runs the timer on the task that polls the call,
+    /// so a call that holds its thread, with blocking work that never yields,
+    /// is not stopped, and one that runs past the limit and then returns
+    /// without yielding keeps the outcome it returned.
     ///
     /// # Panics
     ///

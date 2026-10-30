@@ -218,8 +218,9 @@ pub struct ConsumerOptions<B: Backend> {
     ///
     /// [`ConsumerSupervisor`]: crate::consumer_supervisor::ConsumerSupervisor
     pub concurrent_processing: bool,
-    /// Maximum time a handler may spend processing a single message.
-    /// If the handler exceeds this duration the message is retried.
+    /// Maximum time a handler that yields may spend processing a single
+    /// message. See [`with_handler_timeout`](Self::with_handler_timeout) for
+    /// what happens to a handler that runs past it.
     ///
     /// Default: [`DEFAULT_HANDLER_TIMEOUT`] (30 s). Set to `None` to disable.
     pub handler_timeout: Option<Duration>,
@@ -478,8 +479,23 @@ impl<B: Backend> ConsumerOptions<B> {
         self
     }
 
-    /// Set the handler timeout. If a handler exceeds this duration the message
-    /// is retried automatically. Panics if `timeout` is zero.
+    /// Set the handler timeout. Panics if `timeout` is zero.
+    ///
+    /// The timeout bounds a handler that yields. Once it passes, the handler
+    /// is dropped at its next `.await` that yields, and the message is retried
+    /// automatically, or settled as
+    /// [`with_handler_timeout_outcome`](Self::with_handler_timeout_outcome)
+    /// chooses. A handler that holds its thread, with blocking work that never
+    /// yields, is not stopped by the timeout on any backend.
+    ///
+    /// Kafka, Redis Streams, the in-memory backend and NATS, apart from the
+    /// NATS and Redis broadcast subscribers, run the timer on the task that
+    /// polls the handler. A handler there that runs past the timeout and then
+    /// returns without yielding keeps the outcome it returned. RabbitMQ,
+    /// SNS/SQS and those two broadcast subscribers poll the handler in a task
+    /// of its own and run the timer beside it: on a multi-threaded runtime the
+    /// message settles as timed out once the timeout passes, and the handler
+    /// runs on until it yields or returns.
     ///
     /// On the Redis backend the timeout also drives crash recovery: a
     /// background sidecar reclaims entries that have been pending longer
