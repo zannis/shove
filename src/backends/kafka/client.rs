@@ -2369,6 +2369,10 @@ mod tests {
             .await
             .expect_err("no attempt is no publish");
         assert!(matches!(err, ShoveError::Validation(_)), "got {err:?}");
+        assert!(
+            client.producer.built().is_none(),
+            "the refused publish built a producer"
+        );
     }
 
     // -- a fatal producer error --
