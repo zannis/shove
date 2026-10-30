@@ -121,7 +121,7 @@ shove::define_topic!(
 );
 ```
 
-`NatsStreamConfig::default()` is WorkQueue / unbounded / single-replica, so set only the fields you need. On re-declare, **mutable** changes (`max_age`, `max_bytes`, `max_messages`, `num_replicas`) are applied to the existing stream; **immutable** ones (`retention`, storage) make `declare()` fail loudly rather than silently no-op - recreate the stream, or hand ownership to infra with `external()` if you need to change those.
+`NatsStreamConfig::default()` is WorkQueue / unbounded / single-replica, so set only the fields you need. On re-declare, **mutable** changes (`max_age`, `max_bytes`, `max_messages`, `num_replicas`) are applied to the existing stream; changes JetStream refuses, a storage change or a retention change to or from `WorkQueue`, make `declare()` fail loudly - recreate the stream, or hand ownership to infra with `external()` if you need to make one.
 
 The stream's duplicate window is the shorter of 120 s and `max_age`, so a stream that keeps its messages for less than two minutes declares with a window that age allows, where JetStream would refuse a longer one.
 
@@ -158,7 +158,7 @@ This is `RetryStrategy::InPlace`, implied by `external()`; [Outcomes](/concepts/
 
 A consumer attaches to the durable `{queue}-consumer` as it finds it, and creates it only when nothing has. JetStream stops redelivering a message after the durable's `max_deliver` deliveries and tells no consumer, so a message that is redelivered that often waits on the stream for good and is never dead-lettered. On an external stream a retry is a redelivery, and a message runs out of retries on delivery `max_retries + 1`, so a consumer refuses to attach, with a `ShoveError::Topology`, when `0 < max_deliver <= max_retries`. Any other cap draws a warning on attach, on every stream, naming the cap, since a `Defer`, an `ack_wait` expiry or a failed ack redelivers a message as well. Lift a cap in place with `nats consumer edit <stream> <durable> --max-deliver=-1`.
 
-That check covers a single consumer's attach and the attach of a group's workers. A consumer group upserts its durable at every registration from its own config, which sets no `max_deliver`, so registering a group lifts a cap the durable had, and a cap set afterwards is judged when a worker next attaches. The durables of FIFO shards and of a DLQ drain are attached without the check, so a cap on one of them goes unreported.
+That check covers a single consumer's attach and the attach of a group's workers. A consumer group upserts its durable at every registration from its own config, which sets no `max_deliver`, so registering a group lifts a cap the durable had, and a cap set afterwards is judged when a worker next attaches. The durables of FIFO shards and of a DLQ drain are attached without the check, so a cap on one of them goes unreported. A batch consumer is attached without it too, because `max_deliver` is the bound its redelivery runs to.
 
 `external()` and `nats_stream_config()` are mutually exclusive - and both are incompatible with `nats_subjects()` and `sequenced()`, which configure stream *creation* that external mode skips. `build()` panics if they are combined.
 `nats_external_stream()` remains for one release as a deprecated alias of `external()`.
