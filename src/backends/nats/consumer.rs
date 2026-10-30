@@ -2848,12 +2848,13 @@ fn ingest_batch_message<T: Topic>(
 
 /// Retire one pre-handler drop: DLQ publish then ack, Nak for redelivery if
 /// the publish fails. Mirrors the single-message path's oversize/deserialize
-/// arms, progress acks included while the publish runs; like them it does no
-/// terminal accounting (`record_failed` already counted the drop, and
-/// pre-handler drops are not part of the terminal-discard contract on any
-/// backend). Acks are per message, so a later batch redelivery can never
-/// replay a message that was individually acked, and the DLQ cannot collect
-/// duplicate copies of it.
+/// arms, progress acks included while the publish runs. Like them it counts
+/// only the failure `record_failed` already recorded, no discard: the NATS
+/// consume paths do not yet settle a discard for a pre-handler drop, as the
+/// completeness statement on `metrics::record_terminal` lists, so
+/// `messages_discarded_total` is a lower bound here. Acks are per message, so
+/// a later batch redelivery can never replay a message that was individually
+/// acked, and the DLQ cannot collect duplicate copies of it.
 async fn settle_poison(ctx: &NatsBatchCtx, msg: &Message, reason: &str) {
     let dead_letter = publish_to_dlq(&ctx.client, ctx.topology, msg, reason);
     if let Err(dlq_err) = renewing(msg, ctx.ack_wait, dead_letter).await {
@@ -3296,8 +3297,9 @@ impl<T: Topic> BatchIntake<T> {
 
     /// The client connected again. The server may have lost the open pull's
     /// request with the old connection, so the messages it had delivered go
-    /// into the batch in hand, the pull is dropped, and the next one is sent
-    /// at once.
+    /// into the batch in hand and the pull is dropped. The next pull goes out
+    /// as after any pull: at once if the batch in hand is empty, and
+    /// otherwise once that batch starts its flush.
     async fn on_reconnect(&mut self) {
         if !self.reconnects.reconnected(&self.ctx.client, self.queue) {
             return;
@@ -3742,9 +3744,10 @@ impl NatsConsumer {
     /// and pulls again, and only a failed probe spends a reconnect attempt.
     /// Any other status is a connection error that spends one. When the
     /// client reconnects the consumer reads what the open pull had delivered
-    /// into the batch in hand, drops the pull and pulls again at once, since
-    /// a server that restarted or failed over has lost the request without a
-    /// word.
+    /// into the batch in hand and drops the pull, since a server that
+    /// restarted or failed over has lost the request without a word. It pulls
+    /// again as after any pull: at once if the batch in hand is empty, and
+    /// otherwise once that batch starts its flush.
     ///
     /// # The durable and `max_ack_pending`
     ///
@@ -4181,8 +4184,8 @@ mod guarded_tests {
         }
     }
 
-    /// The caller polls the call itself: no child task is spawned for it, so a
-    /// message costs one task and not two.
+    /// The caller polls the call itself, with no child task spawned for it,
+    /// so a message costs a single task.
     #[tokio::test]
     async fn a_guarded_call_runs_on_the_callers_task() {
         tokio::spawn(async {

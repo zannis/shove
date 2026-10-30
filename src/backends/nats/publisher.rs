@@ -34,6 +34,11 @@ const MAX_PUBLISH_ATTEMPTS: u32 = 3;
 /// and the generator reseeds from the OS now and then, so a publish makes no
 /// call to the OS of its own. The id is a plain string, so a retry copy's
 /// `-r{n}` and a dead letter's `-dlq` extend it as they extend any id.
+///
+/// `rand`'s `ThreadRng` is not reseeded on `fork`, so a child process forked
+/// from a thread that has drawn ids repeats the ids that thread draws next,
+/// and JetStream drops the later publish of a pair inside its duplicate
+/// window.
 fn new_message_id() -> Uuid {
     Builder::from_random_bytes(rand::random()).into_uuid()
 }
