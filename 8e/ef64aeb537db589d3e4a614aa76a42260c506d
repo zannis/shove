@@ -1,0 +1,46 @@
+docs/pages/guides/observability.mdx
+  s_1001dc3147e1e5::t_5b8294e8d4660e 97,99
+  s_1001dc3147e1e5::t_1ee788cf2273d4 106
+docs/pages/backends/kafka.mdx
+  s_1001dc3147e1e5::t_20a254d64d8f37 617
+  s_1001dc3147e1e5::t_927765c42d61c9 903-904
+  s_1001dc3147e1e5::t_cd7ac1be409f50 543,552-558
+  s_1001dc3147e1e5::t_0fe0f462f942a4 181-182,189
+  s_1001dc3147e1e5::t_513d3c37ec7493 222-224
+  s_1001dc3147e1e5::t_edd6fbd23b40d2 505-507
+  s_1001dc3147e1e5::t_3daede3204a6fb 689-690
+  s_1001dc3147e1e5::t_42e229df675c37 188,190-194
+  s_1001dc3147e1e5::t_22ce42c5b37556 700-704
+  s_75dc8c8d29ca8f::t_237c27e0538485 559
+src/metrics.rs
+  s_1001dc3147e1e5::t_b90093f3eb6523 225-226
+docs/pages/guides/sequenced.mdx
+  s_1001dc3147e1e5::t_7a8a19b40908e6 141
+src/backends/kafka/consumer_group.rs
+  s_1001dc3147e1e5::t_8dd623858204e3 182-185
+  s_1001dc3147e1e5::t_2de150807832a4 154-159
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8eef64aeb537db589d3e4a614aa76a42260c506d",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_75dc8c8d29ca8f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1b902fc7-53eb-4627-a926-3bc86aa1e117",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

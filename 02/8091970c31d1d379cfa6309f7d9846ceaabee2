@@ -1,0 +1,28 @@
+docs/pages/guides/observability.mdx
+  s_1001dc3147e1e5::t_25fde1f439b13e 97
+src/metrics.rs
+  s_1001dc3147e1e5::t_68bc24582dd80c 225-227
+docs/pages/backends/kafka.mdx
+  s_1001dc3147e1e5::t_fbca94d945c786 554-558
+  s_1001dc3147e1e5::t_cfe06d0ed89528 705-709
+src/backends/kafka/consumer.rs
+  s_1001dc3147e1e5::t_06c9ef064c4c0b 5097-5114
+src/consumer.rs
+  s_1001dc3147e1e5::t_95b74630360390 260-265
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "028091970c31d1d379cfa6309f7d9846ceaabee2",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
