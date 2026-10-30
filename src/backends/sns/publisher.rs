@@ -156,6 +156,20 @@ fn shard_attribute(shard: u16) -> Result<MessageAttributeValue> {
         .map_err(|e| ShoveError::Validation(format!("invalid shard attribute: {e}")))
 }
 
+/// The attributes of a published message: the caller's, then the shard
+/// attribute of a sequenced message. The shard attribute goes last so a caller
+/// attribute of the same name cannot replace it and misroute the message.
+fn message_attributes(
+    caller: Option<HashMap<String, MessageAttributeValue>>,
+    shard: Option<u16>,
+) -> Result<HashMap<String, MessageAttributeValue>> {
+    let mut attributes = caller.unwrap_or_default();
+    if let Some(shard) = shard {
+        attributes.insert(SHARD_ATTR.to_string(), shard_attribute(shard)?);
+    }
+    Ok(attributes)
+}
+
 /// One `PublishBatch` entry per payload. An entry's id is its index, so a
 /// rejected entry maps back to its record. On a sequenced topic `routing_keys`
 /// holds one key per payload: the key is the entry's message group, and with
@@ -234,22 +248,13 @@ impl SnsPublisher {
             req = req
                 .message_group_id(gid)
                 .message_deduplication_id(content_dedup_id(payload));
-
-            if let Some(shards) = routing_shards {
-                let shard = shard_for_key(gid, shards);
-                let shard_attr = MessageAttributeValue::builder()
-                    .data_type("String")
-                    .string_value(shard.to_string())
-                    .build()
-                    .map_err(|e| ShoveError::Validation(format!("invalid shard attribute: {e}")))?;
-                req = req.message_attributes(SHARD_ATTR, shard_attr);
-            }
         }
 
-        if let Some(attrs) = attributes {
-            for (k, v) in attrs {
-                req = req.message_attributes(k, v);
-            }
+        let shard = group_id
+            .zip(routing_shards)
+            .map(|(gid, shards)| shard_for_key(gid, shards));
+        for (name, value) in message_attributes(attributes, shard)? {
+            req = req.message_attributes(name, value);
         }
 
         req.send().await.map_err(|e| {
@@ -779,6 +784,49 @@ mod tests {
                     .is_none_or(|attributes| attributes.is_empty())
             );
         }
+    }
+
+    fn caller_attributes(pairs: &[(&str, &str)]) -> HashMap<String, MessageAttributeValue> {
+        hashmap_to_message_attributes(
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+        )
+        .expect("the caller attributes build")
+    }
+
+    fn value<'a>(
+        attributes: &'a HashMap<String, MessageAttributeValue>,
+        name: &str,
+    ) -> Option<&'a str> {
+        attributes
+            .get(name)
+            .and_then(|attribute| attribute.string_value())
+    }
+
+    #[test]
+    fn the_shard_attribute_cannot_be_replaced_by_a_caller_attribute() {
+        let caller = caller_attributes(&[(SHARD_ATTR, "99"), ("x-trace-id", "trace-1")]);
+        let attributes = message_attributes(Some(caller), Some(1)).expect("the attributes compose");
+        assert_eq!(value(&attributes, SHARD_ATTR), Some("1"));
+        assert_eq!(value(&attributes, "x-trace-id"), Some("trace-1"));
+        assert_eq!(attributes.len(), 2);
+    }
+
+    #[test]
+    fn a_message_carries_the_attributes_it_was_given() {
+        let none = message_attributes(None, None).expect("the attributes compose");
+        assert!(none.is_empty());
+
+        let caller = caller_attributes(&[("x-trace-id", "trace-1")]);
+        let unsequenced = message_attributes(Some(caller), None).expect("the attributes compose");
+        assert_eq!(value(&unsequenced, "x-trace-id"), Some("trace-1"));
+        assert_eq!(unsequenced.len(), 1);
+
+        let sequenced = message_attributes(None, Some(3)).expect("the attributes compose");
+        assert_eq!(value(&sequenced, SHARD_ATTR), Some("3"));
+        assert_eq!(sequenced.len(), 1);
     }
 
     #[test]
