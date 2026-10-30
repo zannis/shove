@@ -29,7 +29,7 @@ use crate::backend::batch_consumer::{
     BatchConsumerOptionsInner, BatchSettlement, settle_batch_outcome,
 };
 use crate::consumer::{DEFAULT_HANDLER_TIMEOUT, RetryStrategy, validate_message_size};
-use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
+use crate::consumer_supervisor::{AbortOnDrop, SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::Result;
 use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -984,19 +984,21 @@ enum Guarded<T> {
 
 /// Runs `fut` in a child task, so a panic inside it ends that task and not the
 /// caller, and gives up on it after `timeout`. Records no metric.
+///
+/// The child is aborted when the call times out and when the caller is
+/// dropped, as an aborted FIFO shard or DLQ drain is. A bare `JoinHandle` would
+/// detach it to run on with no limit.
 async fn guarded<F>(fut: F, timeout: Option<Duration>) -> Guarded<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     let mut join = tokio::spawn(fut);
+    let _abort = AbortOnDrop(join.abort_handle());
     let joined = match timeout {
         Some(limit) => match tokio::time::timeout(limit, &mut join).await {
             Ok(joined) => joined,
-            Err(_) => {
-                join.abort();
-                return Guarded::TimedOut(limit);
-            }
+            Err(_) => return Guarded::TimedOut(limit),
         },
         None => join.await,
     };
@@ -3455,6 +3457,44 @@ mod guarded_tests {
         let limit = Duration::from_secs(5);
         let call = guarded(std::future::pending::<()>(), Some(limit)).await;
         assert!(matches!(call, Guarded::TimedOut(at) if at == limit));
+    }
+
+    /// Sets its flag when the call it was moved into is dropped.
+    struct Dropped(Arc<AtomicBool>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// A caller that is aborted or dropped takes the call along, however long
+    /// the call would have run and with no limit to cut it off.
+    #[tokio::test]
+    async fn dropping_the_caller_aborts_the_call() {
+        let gone = Arc::new(AtomicBool::new(false));
+        let held = Dropped(Arc::clone(&gone));
+        let mut caller = Box::pin(guarded(
+            async move {
+                let _held = held;
+                std::future::pending::<()>().await;
+            },
+            None,
+        ));
+        assert!(
+            caller.as_mut().now_or_never().is_none(),
+            "the call is still running"
+        );
+        assert!(!gone.load(Ordering::Acquire));
+
+        drop(caller);
+        for _ in 0..100 {
+            if gone.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(gone.load(Ordering::Acquire), "the call outlived its caller");
     }
 }
 
