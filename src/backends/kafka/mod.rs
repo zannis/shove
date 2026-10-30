@@ -45,9 +45,8 @@ pub fn shutdown_commit_deadline_for_test() -> std::time::Duration {
 }
 
 /// Test-only seam (see the `test-support` feature): the share of that
-/// deadline a `CommitPolicy::PerRecord` commit found in flight at shutdown
-/// is waited for, so a test asserts against the constant rather than a
-/// hand-derived fraction.
+/// deadline a commit found in flight at shutdown is waited for, so a test
+/// asserts against the constant rather than a hand-derived fraction.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn pending_commit_budget_for_test() -> std::time::Duration {

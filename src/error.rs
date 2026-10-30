@@ -58,18 +58,19 @@ pub enum ShoveError {
     /// The Kafka receive loop returns this from its shutdown arm when the
     /// synchronous commit it issues after the handler drain returns an
     /// error, misses the shutdown deadline, or has no thread to run on.
-    /// Under `CommitPolicy::PerRecord` it also returns this for the commit
-    /// in flight when the stop landed, when that commit has no answer within
-    /// its share of the deadline; no final commit follows it. The member
-    /// ends with this error instead of a clean exit: a group run counts it
-    /// under [`SupervisorOutcome::errors`](crate::SupervisorOutcome::errors),
-    /// so [`exit_code`](crate::SupervisorOutcome::exit_code) is `1`, and the
+    /// Under either commit policy, and on a sequenced consumer, it also
+    /// returns this for the commit in flight when the stop landed, when that
+    /// commit has no answer within its share of the deadline; no final
+    /// commit follows it. The member ends with this error instead of a clean
+    /// exit: a group run counts it under
+    /// [`SupervisorOutcome::errors`](crate::SupervisorOutcome::errors), so
+    /// [`exit_code`](crate::SupervisorOutcome::exit_code) is `1`, and the
     /// run otherwise ends as before. It is not retryable, so a consumer that
     /// reconnects on transient errors returns it instead.
     ///
     /// The next member of the group resumes each partition from the last
-    /// position the broker accepted, which an earlier asynchronous commit
-    /// may have advanced past some of the records this commit covered; the
+    /// position the broker accepted, which an earlier commit may have
+    /// advanced past some of the records this commit covered; the
     /// records from that position on are redelivered, which is at-least-once
     /// delivery made visible. The error is not raised for a position the
     /// member never tried to commit: an acknowledged offset on a partition a
@@ -97,9 +98,8 @@ pub enum ShoveError {
 }
 
 /// An offset commit at shutdown that was not confirmed, the final commit
-/// or under `CommitPolicy::PerRecord` the commit in flight when the stop
-/// landed: what the commit carried and why it was not confirmed. The
-/// payload of [`ShoveError::Commit`].
+/// or the commit in flight when the stop landed: what the commit carried
+/// and why it was not confirmed. The payload of [`ShoveError::Commit`].
 ///
 /// `#[non_exhaustive]`: read the fields, and match with `..`, so a field
 /// can be added later.
@@ -144,12 +144,13 @@ pub enum CommitFailure {
     /// from one, so it is safe to log and to return as is.
     #[error("rejected: {0}")]
     Rejected(String),
-    /// The commit had no answer within the time it carries: the shutdown
-    /// deadline for a final commit, its share of that deadline for a
-    /// `CommitPolicy::PerRecord` commit found in flight at the stop, or the
-    /// time waited when the commit thread ended without reporting. The
-    /// result is unknown: the detached commit thread may still land it after
-    /// the consumer has returned.
+    /// The commit had no answer within the time it carries: what is left of
+    /// the shutdown deadline for a final commit, all of it when no commit was
+    /// in flight, its share of that deadline for a commit
+    /// found in flight at the stop, under either commit policy and on a
+    /// sequenced consumer, or the time waited when the commit thread ended
+    /// without reporting. The result is unknown: the detached commit thread
+    /// may still land it after the consumer has returned.
     #[error("no answer after waiting {0:?}; the result is unknown")]
     Deadline(Duration),
     /// No thread could be spawned to run the commit, so this commit was

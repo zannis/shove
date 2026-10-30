@@ -34,6 +34,12 @@
 //! are shove-owned, because a republish writes into its topic, and are
 //! created through the mock API as well.
 //!
+//! The final section runs a sequenced consumer against the same mock: a
+//! streak of rejected commits fences it, and it reconnects once the close
+//! that error exit makes has had its LeaveGroup answered; and a stop that
+//! finds its commit in flight unanswered reports the share of the shutdown
+//! deadline it waited, as the standard consumer's does under `Interval`.
+//!
 //! `test-support` gates the seams this file reads; both Kafka coverage rows
 //! enable it, so the suite runs in each.
 
@@ -60,7 +66,6 @@ use rdkafka::producer::{
 use rdkafka::types::{RDKafkaApiKey, RDKafkaMockCluster, RDKafkaRespErr};
 use rdkafka::{ClientConfig, Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
-use shove::ShoveError;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
 use shove::consumer_group::ConsumerGroupConfig;
@@ -68,13 +73,15 @@ use shove::handler::MessageHandler;
 use shove::kafka::{
     CommitPolicy, KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroup,
     KafkaConsumerGroupConfig, fence_probe, final_commit_spawn_probe,
-    housekeeping_interval_for_test, per_record_probe, shutdown_commit_deadline_for_test,
+    housekeeping_interval_for_test, pending_commit_budget_for_test, per_record_probe,
+    shutdown_commit_deadline_for_test,
 };
 use shove::markers::Kafka;
 use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
 use shove::topic::Topic;
-use shove::topology::TopologyBuilder;
+use shove::topology::{SequenceFailure, TopologyBuilder};
+use shove::{CommitFailure, SequencedTopic, ShoveError};
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -278,12 +285,20 @@ impl Mock {
     /// Hold the answer to the next OffsetCommit for `delay`, then answer it
     /// with `err`: a rejection that arrives late, when `err` is one.
     fn answer_next_offset_commit_late(&self, delay: Duration, err: RDKafkaRespErr) {
+        self.answer_next_late(RDKafkaApiKey::OffsetCommit, delay, err);
+    }
+
+    /// Hold the answer to the next request of `api_key` for `delay`, then
+    /// answer it with `err`. The broker's own stack for `api_key` then
+    /// shadows the cluster-wide one `request_errors` pushes onto, so a test
+    /// uses one of the two per API key.
+    fn answer_next_late(&self, api_key: RDKafkaApiKey, delay: Duration, err: RDKafkaRespErr) {
         let delay_ms = c_int::try_from(delay.as_millis()).expect("delay fits a C int");
         let err = unsafe {
             rd_kafka_mock_broker_push_request_error_rtts(
                 self.cluster,
                 BROKER_ID,
-                i16::from(RDKafkaApiKey::OffsetCommit),
+                i16::from(api_key),
                 1,
                 err as c_int,
                 delay_ms,
@@ -294,6 +309,12 @@ impl Mock {
             RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR,
             "push the delayed answer onto the mock broker"
         );
+    }
+
+    /// Accept every OffsetCommit from here on, dropping what is left of a
+    /// `reject_commits` refusal.
+    fn accept_commits(&self) {
+        self.api().clear_request_errors(RDKafkaApiKey::OffsetCommit);
     }
 
     /// Answer the next `count` Produce requests with `err`, whichever client
@@ -3221,4 +3242,904 @@ async fn a_rebalance_completes_while_a_record_waits_for_a_permit() {
         .expect("B stops clean");
     stop_a.cancel();
     let _ = run_a.await.expect("A's task completes");
+}
+
+// ---------------------------------------------------------------------------
+// Commit answers under `Interval`, and a consumer closed off the runtime
+// ---------------------------------------------------------------------------
+
+/// How long a test holds the coordinator's answer to the LeaveGroup a
+/// closing member sends: the close waits for it, so a close run on the
+/// runtime thread would hold that thread this long.
+const CLOSE_HOLD: Duration = Duration::from_secs(3);
+/// The longest the ticker may stop for on a runtime nothing blocks. Far
+/// above a scheduling hiccup, far below `CLOSE_HOLD`.
+const TICK_STALL: Duration = Duration::from_secs(1);
+
+/// Ticks every 10 ms on the runtime it is spawned on, so a test on a
+/// current-thread runtime can tell whether anything held that thread: a
+/// blocking call on it stops the ticks for as long as it blocks.
+struct Ticker {
+    ticks: Arc<Mutex<Vec<Instant>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Ticker {
+    fn start() -> Self {
+        let ticks = Arc::new(Mutex::new(Vec::new()));
+        let recorded = ticks.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                recorded
+                    .lock()
+                    .expect("ticker mutex poisoned")
+                    .push(Instant::now());
+            }
+        });
+        Self { ticks, task }
+    }
+
+    /// The longest the ticks stopped for between `since` and now.
+    fn longest_gap_since(&self, since: Instant) -> Duration {
+        let ticks = self.ticks.lock().expect("ticker mutex poisoned");
+        let mut previous = since;
+        let mut longest = Duration::ZERO;
+        for &tick in ticks.iter().filter(|&&tick| tick >= since) {
+            longest = longest.max(tick.saturating_duration_since(previous));
+            previous = tick;
+        }
+        longest.max(Instant::now().saturating_duration_since(previous))
+    }
+}
+
+impl Drop for Ticker {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Under `Interval` a commit the coordinator rejects is re-offered. The mock
+/// refuses every OffsetCommit for 2 s and then accepts them. The three
+/// records are handled inside that window, so every commit their
+/// completions make is refused, and no record arrives after it. The
+/// position still reaches the end of what was handled, through a re-offer,
+/// with no reconnect and no record handled twice.
+#[tokio::test]
+async fn interval_rejected_commit_is_reoffered() {
+    const REFUSING: Duration = Duration::from_secs(2);
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    produce(&bootstrap, &["o1", "o2", "o3"]).await;
+    mock.track_requests();
+    mock.reject_commits(512);
+
+    let handler = Acking::default();
+    let h = handler.clone();
+    let (run, shutdown) = start(connect(&bootstrap).await, h, |token| {
+        options(CommitPolicy::Interval(Duration::from_millis(500)), token)
+    });
+    wait_until(
+        || handler.count() == 3,
+        DELIVERY_TIMEOUT,
+        "three records reaching the handler",
+    )
+    .await;
+    wait_until(
+        || mock.offset_commit_requests() >= 1,
+        DELIVERY_TIMEOUT,
+        "a commit reaching the broker",
+    )
+    .await;
+    let assigns = per_record_probe::assigns_queued();
+    tokio::time::sleep(REFUSING).await;
+    assert_eq!(
+        committed_position(&bootstrap).await,
+        None,
+        "every commit inside the window was refused"
+    );
+
+    mock.accept_commits();
+    wait_for_committed_position(&bootstrap, 3, DELIVERY_TIMEOUT).await;
+    assert_eq!(
+        handler.ids(),
+        ["o1", "o2", "o3"],
+        "the position was re-offered, and no record was handed out again"
+    );
+    assert_eq!(
+        per_record_probe::assigns_queued(),
+        assigns,
+        "the re-offer landed on the same connection, without a reconnect"
+    );
+
+    shutdown.cancel();
+    run.await
+        .expect("the run task completes")
+        .expect("a clean stop");
+}
+
+/// Under `Interval` a commit the coordinator keeps rejecting, with no
+/// rebalance resolving it, fences the member. Every OffsetCommit is refused,
+/// so the streak the first rejection starts never clears; at the threshold
+/// the member reconnects, and the new connection is handed both records
+/// again from the position nothing committed past. The floor is lowered
+/// through the group config's test seam, and the default interval keeps the
+/// threshold at it.
+#[tokio::test]
+async fn interval_sustained_rejection_fences() {
+    const FLOOR: Duration = Duration::from_secs(5);
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    produce(&bootstrap, &["o1", "o2"]).await;
+    mock.track_requests();
+    mock.reject_commits(512);
+
+    let handler = Acking::default();
+    let h = handler.clone();
+    let (broker, run, token) = start_group(
+        connect(&bootstrap).await,
+        h,
+        KafkaConsumerGroupConfig::new(1..=1)
+            .with_prefetch_count(1)
+            .with_commit_fence_floor_for_test(FLOOR),
+    )
+    .await;
+
+    wait_until(
+        || handler.count() == 2,
+        DELIVERY_TIMEOUT,
+        "both records reaching the handler",
+    )
+    .await;
+    let first_delivery = handler.arrived_at(0);
+    assert_eq!(
+        fence_probe::last_threshold(),
+        Some(FLOOR),
+        "the default interval judges rejected commits by the floor"
+    );
+
+    wait_until(
+        || fence_probe::fired() >= 1,
+        FLOOR + DELIVERY_TIMEOUT,
+        "the fence firing on the rejected streak",
+    )
+    .await;
+    wait_until(
+        || handler.count() >= 3,
+        DELIVERY_TIMEOUT,
+        "the reconnected member receiving the first record again",
+    )
+    .await;
+    let until_fence = handler
+        .arrived_at(2)
+        .saturating_duration_since(first_delivery);
+    assert!(
+        until_fence >= FLOOR,
+        "the fence waits out its floor, fired after {until_fence:?}"
+    );
+    assert_eq!(
+        &handler.ids()[..3],
+        &["o1".to_string(), "o2".to_string(), "o1".to_string()],
+        "the reconnect replays from the position nothing committed past"
+    );
+    assert!(
+        mock.offset_commit_requests() >= 3,
+        "the rejected commit was re-offered before the fence, requests: {}",
+        mock.offset_commit_requests()
+    );
+    assert_eq!(
+        committed_position(&bootstrap).await,
+        None,
+        "no commit was accepted"
+    );
+
+    // The stop's final commit is refused like every other, so the member
+    // reports that one refusal under `errors` instead of ending clean.
+    token.cancel();
+    let outcome = run.await.expect("the run task completes");
+    assert_eq!(outcome.errors, 1, "{outcome:?}");
+    assert_eq!(outcome.panics, 0, "{outcome:?}");
+    assert!(!outcome.timed_out, "{outcome:?}");
+    broker.close().await;
+}
+
+/// A rejected commit that carries a discard keeps the member, and is never
+/// made on the runtime thread. The topic declares no DLQ, so `o1`'s
+/// `Reject` discards it, and the commit that retires it must be confirmed
+/// before the discard counts. The mock holds the answer to that commit for
+/// 2 s and then refuses it, holds the re-offer's answer for 1 s and refuses
+/// it too, and accepts the one after. The runtime is current-thread, and a
+/// ticker on it keeps ticking through the held answers. No reconnect
+/// happens, each record is handled once, and `messages_discarded_total`
+/// counts nothing while a refusal is held or once it has landed, and `o1`
+/// once, after the re-offer the broker accepted and before the stop.
+#[cfg(feature = "metrics")]
+#[tokio::test(flavor = "current_thread")]
+async fn rejected_discard_commit_keeps_the_member() {
+    const HELD: Duration = Duration::from_secs(2);
+    /// How long the re-offer's refusal is held: the first refusal has
+    /// landed by then, and nothing may count the discard meanwhile.
+    const RE_OFFER_HELD: Duration = Duration::from_secs(1);
+    let snapshotter = install_recorder();
+    // A snapshot drains the counters it reads, so the reads add up here.
+    let discarded = std::cell::Cell::new(0u64);
+    let discarded_so_far = || {
+        discarded.set(discarded.get() + discarded_total(&snapshotter, TOPIC));
+        discarded.get()
+    };
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    produce(&bootstrap, &["o1", "o2"]).await;
+    mock.track_requests();
+    let refused = RDKafkaRespErr::RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED;
+    mock.answer_next_offset_commit_late(HELD, refused);
+    mock.answer_next_offset_commit_late(RE_OFFER_HELD, refused);
+
+    let handler = Recorder::new(|id, _| {
+        if id == "o1" {
+            Outcome::Reject
+        } else {
+            Outcome::Ack
+        }
+    });
+    let client = connect(&bootstrap).await;
+    let ticker = Ticker::start();
+    // Before the member starts: on this one thread, a commit that blocked it
+    // would block this task too, so a mark taken after the record reached
+    // the handler could come after the block.
+    let started_at = Instant::now();
+    let (run, shutdown) = start_on::<OrdersTopic, _>(client, handler.clone(), |token| {
+        options(CommitPolicy::Interval(Duration::from_millis(500)), token)
+    });
+    wait_until(
+        || handler.count() >= 1,
+        DELIVERY_TIMEOUT,
+        "o1 reaching the handler",
+    )
+    .await;
+    let assigns = per_record_probe::assigns_queued();
+
+    wait_until(
+        || mock.offset_commit_requests() >= 1,
+        DELIVERY_TIMEOUT,
+        "the commit retiring o1 reaching the broker",
+    )
+    .await;
+    assert_eq!(
+        discarded_so_far(),
+        0,
+        "the discard does not count while the refusal of its commit is held"
+    );
+    wait_until(
+        || mock.offset_commit_requests() >= 2,
+        HELD + DELIVERY_TIMEOUT,
+        "the refused commit being re-offered",
+    )
+    .await;
+    assert_eq!(
+        discarded_so_far(),
+        0,
+        "the refused commit counted no discard"
+    );
+
+    wait_for_committed_position(&bootstrap, 2, RE_OFFER_HELD + DELIVERY_TIMEOUT).await;
+    wait_until(
+        || discarded_so_far() >= 1,
+        DELIVERY_TIMEOUT,
+        "the accepted re-offer counting the discard",
+    )
+    .await;
+    assert_eq!(
+        discarded_so_far(),
+        1,
+        "the discard is counted once, on the re-offer the broker accepted"
+    );
+    let stall = ticker.longest_gap_since(started_at);
+    assert!(
+        stall < TICK_STALL,
+        "the commit waited for its answer off the runtime thread, the ticker stopped for {stall:?}"
+    );
+    assert!(
+        mock.offset_commit_requests() >= 3,
+        "the two held rejections and the accepted re-offer, requests: {}",
+        mock.offset_commit_requests()
+    );
+    assert_eq!(
+        per_record_probe::assigns_queued(),
+        assigns,
+        "the rejected commits did not tear the member down"
+    );
+    assert_eq!(handler.ids(), ["o1", "o2"], "each record is handled once");
+
+    shutdown.cancel();
+    run.await
+        .expect("the run task completes")
+        .expect("a clean stop");
+    assert_eq!(
+        discarded_so_far(),
+        1,
+        "the stop's final commit counts the discard no second time"
+    );
+}
+
+/// A member that ends on an error closes its consumer off the runtime
+/// thread, and has left its group when the error is returned. Its record's
+/// dead letter cannot be published, which ends the loop, and its one
+/// reconnect attempt is spent at once, so the run returns the error. The
+/// close waits for the coordinator to answer the member's LeaveGroup, which
+/// the mock holds as a coordinator gone quiet would, and the run returns
+/// only once that answer is in. A ticker on the same current-thread runtime
+/// keeps ticking through the close.
+#[tokio::test(flavor = "current_thread")]
+async fn error_exit_closes_off_runtime() {
+    const EXIT_TOPIC: &str = "kafka-error-exit-close";
+    const EXIT_DLQ: &str = "kafka-error-exit-close-dlq";
+    shove::define_topic!(
+        ExitTopic,
+        Order,
+        TopologyBuilder::new(EXIT_TOPIC).dlq().build()
+    );
+
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    for topic in [EXIT_TOPIC, EXIT_DLQ] {
+        mock.api()
+            .create_topic(topic, 1, 1)
+            .expect("create the topic through the mock API");
+    }
+    produce_on(&bootstrap, EXIT_TOPIC, &["A"]).await;
+    mock.refuse_produce(RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN, SENDS_PER_PUBLISH);
+    mock.track_requests();
+    mock.answer_next_late(
+        RDKafkaApiKey::LeaveGroup,
+        CLOSE_HOLD,
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR,
+    );
+
+    let handler = Recorder::new(|_, _| Outcome::Reject);
+    let ticker = Ticker::start();
+    let (run, _shutdown) =
+        start_on::<ExitTopic, _>(connect(&bootstrap).await, handler.clone(), |token| {
+            one_permit(token).with_max_reconnect_attempts(1)
+        });
+    wait_until(
+        || handler.count() >= 1,
+        DELIVERY_TIMEOUT,
+        "A reaching the handler",
+    )
+    .await;
+    let failing_at = Instant::now();
+    let result = tokio::time::timeout(DELIVERY_TIMEOUT, run)
+        .await
+        .expect("the member ends within the bound")
+        .expect("the run task completes");
+    let returned_after = failing_at.elapsed();
+    assert!(
+        matches!(&result, Err(ShoveError::Connection(_))),
+        "the failed dead letter ends the member once its reconnect is spent: {result:?}"
+    );
+
+    assert!(
+        returned_after >= CLOSE_HOLD,
+        "the run returns once the held LeaveGroup is answered, returned after {returned_after:?}"
+    );
+    assert!(
+        mock.requests_of(RDKafkaApiKey::LeaveGroup) >= 1,
+        "the member left its group before the run returned"
+    );
+    let stall = ticker.longest_gap_since(failing_at);
+    assert!(
+        stall < TICK_STALL,
+        "the close waited for the held LeaveGroup off the runtime thread, the ticker stopped for {stall:?}"
+    );
+}
+
+/// A member whose task is aborted closes its consumer off the runtime thread
+/// too. The record's commit has landed, so nothing is in flight when the
+/// abort drops the receive loop where it waits; the close it leaves behind
+/// waits for the held LeaveGroup answer while a ticker on the same
+/// current-thread runtime keeps ticking.
+#[tokio::test(flavor = "current_thread")]
+async fn an_aborted_member_closes_off_runtime() {
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    produce(&bootstrap, &["o1"]).await;
+    mock.track_requests();
+    mock.answer_next_late(
+        RDKafkaApiKey::LeaveGroup,
+        CLOSE_HOLD,
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR,
+    );
+
+    let handler = Acking::default();
+    let h = handler.clone();
+    let ticker = Ticker::start();
+    let (run, _shutdown) = start(connect(&bootstrap).await, h, |token| {
+        options(CommitPolicy::Interval(Duration::from_millis(500)), token)
+    });
+    wait_for_committed_position(&bootstrap, 1, DELIVERY_TIMEOUT).await;
+
+    let aborted_at = Instant::now();
+    run.abort();
+    let _ = run.await;
+    tokio::time::sleep(CLOSE_HOLD + TICK_STALL).await;
+    assert!(
+        mock.requests_of(RDKafkaApiKey::LeaveGroup) >= 1,
+        "the aborted member's close reached the coordinator"
+    );
+    let stall = ticker.longest_gap_since(aborted_at);
+    assert!(
+        stall < TICK_STALL,
+        "the close waited for the held LeaveGroup off the runtime thread, the ticker stopped for {stall:?}"
+    );
+    assert_eq!(handler.ids(), ["o1"]);
+}
+
+/// Holds the answer to the next OffsetCommit and, once that request has
+/// reached the broker, takes the broker down, as a coordinator that drops
+/// off the network would: the connection carrying the commit closes with no
+/// answer, and the commit's retry waits for a broker that does not come
+/// back. The commit then has no answer for the whole share of the shutdown
+/// deadline a stop gives it. A held answer alone would not do: the
+/// heartbeat queued behind it times out after the 10 s session timeout and
+/// fails the connection, and the retried commit is answered long before
+/// the 15 s share has run out.
+async fn take_the_broker_down_under_a_commit(mock: &Mock) {
+    mock.delay_next_offset_commit_answer(pending_commit_budget_for_test());
+    wait_until(
+        || mock.offset_commit_requests() >= 1,
+        DELIVERY_TIMEOUT,
+        "the record's commit reaching the broker",
+    )
+    .await;
+    mock.api()
+        .broker_down(BROKER_ID)
+        .expect("take the mock broker down");
+}
+
+/// What a stop that gave up on its commit in flight reports: the `Deadline`
+/// kind carrying the share of the shutdown deadline, and the position the
+/// unanswered commit carried, after waiting out the share and inside the
+/// deadline.
+fn assert_the_share_was_waited_out(
+    result: Result<(), ShoveError>,
+    topic: &str,
+    took: Duration,
+    share: Duration,
+) {
+    let err = result.expect_err("the stop reports the commit it could not finish");
+    let ShoveError::Commit(failed) = &err else {
+        panic!("a Commit error naming the unanswered commit: {err:?}");
+    };
+    assert_eq!(failed.topic, topic);
+    assert_eq!(
+        failed.offsets,
+        [(0, 1)],
+        "the position the commit in flight carried"
+    );
+    assert_eq!(
+        failed.kind,
+        CommitFailure::Deadline(share),
+        "the Deadline kind carrying the share of the shutdown deadline"
+    );
+    assert!(
+        took >= share - Duration::from_millis(500) && took < shutdown_commit_deadline_for_test(),
+        "the stop waits out its share and ends inside the deadline, took {took:?}"
+    );
+}
+
+/// A stop that finds an `Interval` commit in flight, with no answer inside
+/// the share of the shutdown deadline it is given, ends with
+/// `ShoveError::Commit` of the `Deadline` kind carrying that share, and
+/// makes no second commit. The broker goes down under the record's commit,
+/// see [`take_the_broker_down_under_a_commit`], and the stop fires then.
+#[tokio::test]
+async fn an_interval_stop_with_its_commit_unanswered_reports_the_pending_share() {
+    let share = pending_commit_budget_for_test();
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    produce(&bootstrap, &["o1"]).await;
+    mock.track_requests();
+
+    let handler = Acking::default();
+    let h = handler.clone();
+    let (run, shutdown) = start(connect(&bootstrap).await, h, |token| {
+        options(CommitPolicy::Interval(Duration::from_millis(500)), token)
+    });
+    take_the_broker_down_under_a_commit(&mock).await;
+    let stopped_at = Instant::now();
+    shutdown.cancel();
+    let result = run.await.expect("the run task completes");
+    let took = stopped_at.elapsed();
+
+    assert_the_share_was_waited_out(result, TOPIC, took, share);
+    assert_eq!(
+        mock.offset_commit_requests(),
+        1,
+        "no second commit races the one in flight"
+    );
+    assert_eq!(handler.ids(), ["o1"]);
+}
+
+/// A completion that reaches the channel after its receive loop ended is not
+/// a full channel, and is never counted as one. Two permits: `A`'s dead
+/// letter cannot be published, which ends the loop while `B`'s handler is
+/// still running, and `B` finishes after the loop is gone. The member
+/// reconnects, `A` is dead-lettered, and `B` is handled again, because its
+/// first completion reached no tracker.
+#[tokio::test]
+async fn a_completion_after_a_fault_is_not_counted_as_refused() {
+    use shove::kafka::completion_probe;
+
+    const LATE_TOPIC: &str = "kafka-completion-after-fault";
+    const LATE_DLQ: &str = "kafka-completion-after-fault-dlq";
+    const LATE_GROUP: &str = "kafka-completion-after-fault-consumer";
+    /// Long enough that `A`'s failed dead letter ends the loop first: its
+    /// three sends fail inside about half a second.
+    const B_RUNS: Duration = Duration::from_secs(3);
+    shove::define_topic!(
+        LateTopic,
+        Order,
+        TopologyBuilder::new(LATE_TOPIC).dlq().build()
+    );
+
+    /// Rejects `A`, and acks `B` once it has run for `B_RUNS`.
+    #[derive(Clone, Default)]
+    struct SlowB {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SlowB {
+        fn times_seen(&self, id: &str) -> usize {
+            self.seen
+                .lock()
+                .expect("handler mutex poisoned")
+                .iter()
+                .filter(|seen| *seen == id)
+                .count()
+        }
+    }
+
+    impl MessageHandler<LateTopic> for SlowB {
+        type Context = ();
+        async fn handle(&self, msg: Order, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.seen
+                .lock()
+                .expect("handler mutex poisoned")
+                .push(msg.id.clone());
+            if msg.id == "A" {
+                return Outcome::Reject;
+            }
+            tokio::time::sleep(B_RUNS).await;
+            Outcome::Ack
+        }
+    }
+
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    for topic in [LATE_TOPIC, LATE_DLQ] {
+        mock.api()
+            .create_topic(topic, 1, 1)
+            .expect("create the topic through the mock API");
+    }
+    produce_on(&bootstrap, LATE_TOPIC, &["A", "B"]).await;
+    mock.refuse_produce(RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN, SENDS_PER_PUBLISH);
+
+    let handler = SlowB::default();
+    let (run, shutdown) =
+        start_on::<LateTopic, _>(connect(&bootstrap).await, handler.clone(), |token| {
+            ConsumerOptions::<Kafka>::new()
+                .with_prefetch_count(2)
+                .with_concurrent_processing(true)
+                .with_shutdown(token)
+        });
+    wait_until(
+        || handler.times_seen("B") >= 2,
+        B_RUNS + DELIVERY_TIMEOUT,
+        "B handed to the handler again after the reconnect",
+    )
+    .await;
+    wait_for_position(
+        &bootstrap,
+        LATE_TOPIC,
+        LATE_GROUP,
+        2,
+        B_RUNS + DELIVERY_TIMEOUT,
+        "A dead-lettered and B acked after the reconnect",
+    )
+    .await;
+    shutdown.cancel();
+    run.await
+        .expect("the run task completes")
+        .expect("a clean stop");
+
+    assert!(
+        handler.times_seen("A") >= 2,
+        "A came back through the reconnect"
+    );
+    assert_eq!(
+        completion_probe::refused(),
+        0,
+        "B's completion after the loop ended is not counted as refused"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The sequenced consumer's commit answers
+// ---------------------------------------------------------------------------
+
+const SEQUENCED_TOPIC: &str = "kafka-commit-policy-mock-sequenced";
+const SEQUENCED_DLQ: &str = "kafka-commit-policy-mock-sequenced-dlq";
+/// The group a sequenced consumer of the topic joins: `{queue}-fifo`.
+const SEQUENCED_GROUP: &str = "kafka-commit-policy-mock-sequenced-fifo";
+
+shove::define_sequenced_topic!(
+    SequencedOrders,
+    Order,
+    |order: &Order| order.id.clone(),
+    TopologyBuilder::new(SEQUENCED_TOPIC)
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_millis(50))
+        .dlq()
+        .build()
+);
+
+/// One mock broker with the sequenced topic and its DLQ created as well,
+/// and `ids` produced onto the topic.
+async fn sequenced_mock(ids: &[&str]) -> (Mock, String) {
+    let mock = Mock::start();
+    for topic in [SEQUENCED_TOPIC, SEQUENCED_DLQ] {
+        mock.api()
+            .create_topic(topic, 1, 1)
+            .expect("create the topic through the mock API");
+    }
+    let bootstrap = mock.bootstrap();
+    produce_on(&bootstrap, SEQUENCED_TOPIC, ids).await;
+    (mock, bootstrap)
+}
+
+/// Starts one sequenced member on the topic through
+/// `KafkaConsumerGroup::new_fifo`, whose config carries the fence floor
+/// seam, and returns the group and the token that stops it.
+async fn start_sequenced_group(
+    bootstrap: &str,
+    handler: &Recorder,
+    fence_floor: Duration,
+) -> (KafkaConsumerGroup, CancellationToken) {
+    let token = CancellationToken::new();
+    let h = handler.clone();
+    let mut group = KafkaConsumerGroup::new_fifo::<SequencedOrders, _>(
+        SEQUENCED_TOPIC,
+        connect(bootstrap).await,
+        KafkaConsumerGroupConfig::new(1..=1).with_commit_fence_floor_for_test(fence_floor),
+        token.clone(),
+        move || h.clone(),
+        (),
+    );
+    group.start();
+    (group, token)
+}
+
+/// A sequenced member whose commits keep being rejected, with no rebalance
+/// resolving them, is fenced and reconnects, as the standard consumer is.
+/// Every OffsetCommit is refused, so the streak the first rejection starts
+/// never clears; at the threshold the member reconnects, and the new
+/// connection is handed the first record again from the position nothing
+/// committed past. The floor is lowered through the group config's test
+/// seam, and the sequenced consumer's fixed 500 ms interval keeps the
+/// threshold at it.
+#[tokio::test]
+async fn a_sequenced_member_whose_commits_keep_being_rejected_is_fenced() {
+    const FLOOR: Duration = Duration::from_secs(5);
+    let (mock, bootstrap) = sequenced_mock(&["o1", "o2"]).await;
+    mock.track_requests();
+    mock.reject_commits(512);
+
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let (mut group, token) = start_sequenced_group(&bootstrap, &handler, FLOOR).await;
+    wait_until(
+        || handler.count() == 2,
+        DELIVERY_TIMEOUT,
+        "both records reaching the handler",
+    )
+    .await;
+    let first_delivery = handler.deliveries()[0].at;
+
+    wait_until(
+        || fence_probe::fired() >= 1,
+        FLOOR + DELIVERY_TIMEOUT,
+        "the fence firing on the rejected streak",
+    )
+    .await;
+    assert_eq!(
+        fence_probe::last_threshold(),
+        Some(FLOOR),
+        "the sequenced consumer judges rejected commits by the floor"
+    );
+    wait_until(
+        || handler.count() >= 3,
+        DELIVERY_TIMEOUT,
+        "the reconnected member receiving the first record again",
+    )
+    .await;
+    let until_fence = handler.deliveries()[2]
+        .at
+        .saturating_duration_since(first_delivery);
+    assert!(
+        until_fence >= FLOOR,
+        "the fence waits out its floor, fired after {until_fence:?}"
+    );
+    assert_eq!(
+        handler.ids()[..3],
+        ["o1", "o2", "o1"],
+        "the reconnect replays from the position nothing committed past"
+    );
+    assert!(
+        mock.offset_commit_requests() >= 3,
+        "the rejected commit was re-offered before the fence, requests: {}",
+        mock.offset_commit_requests()
+    );
+    assert_eq!(
+        committed_position_on(&bootstrap, SEQUENCED_TOPIC, SEQUENCED_GROUP, 0).await,
+        None,
+        "no commit was accepted"
+    );
+
+    token.cancel();
+    group.shutdown().await;
+}
+
+/// A sequenced member that ends a connection on an error waits for its
+/// consumer's close, off the runtime thread, before it reconnects. The fence
+/// ends the connection, and the mock holds the answer to the LeaveGroup the
+/// close sends: the reconnect's JoinGroup reaches the broker only once that
+/// answer is in. A ticker on the same current-thread runtime keeps ticking
+/// through the close.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sequenced_error_exit_closes_before_it_reconnects() {
+    const FLOOR: Duration = Duration::from_secs(5);
+    let (mock, bootstrap) = sequenced_mock(&["o1"]).await;
+    mock.track_requests();
+    mock.reject_commits(512);
+    mock.answer_next_late(
+        RDKafkaApiKey::LeaveGroup,
+        CLOSE_HOLD,
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR,
+    );
+
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let ticker = Ticker::start();
+    // Before the member starts: on this one thread, a close that blocked it
+    // would block this task too.
+    let started_at = Instant::now();
+    let (mut group, token) = start_sequenced_group(&bootstrap, &handler, FLOOR).await;
+    wait_until(
+        || fence_probe::fired() >= 1,
+        FLOOR + DELIVERY_TIMEOUT,
+        "the fence ending the connection",
+    )
+    .await;
+    wait_until(
+        || handler.count() >= 2,
+        CLOSE_HOLD + DELIVERY_TIMEOUT,
+        "the reconnected member receiving o1 again",
+    )
+    .await;
+
+    let left = *mock
+        .request_timestamps(RDKafkaApiKey::LeaveGroup)
+        .first()
+        .expect("the close sent a LeaveGroup");
+    let rejoined = mock
+        .request_timestamps(RDKafkaApiKey::JoinGroup)
+        .into_iter()
+        .find(|&joined| joined > left)
+        .expect("the reconnect sent a JoinGroup after the LeaveGroup");
+    let gap = Duration::from_micros(u64::try_from(rejoined - left).expect("arrival order"));
+    assert!(
+        gap >= CLOSE_HOLD,
+        "the reconnect waits for the close, which waits for the held LeaveGroup answer: gap {gap:?}"
+    );
+    let stall = ticker.longest_gap_since(started_at);
+    assert!(
+        stall < TICK_STALL,
+        "the close waited for the held LeaveGroup off the runtime thread, the ticker stopped for {stall:?}"
+    );
+
+    token.cancel();
+    group.shutdown().await;
+}
+
+/// The text of every event logged in this process, as `field=value` pairs,
+/// for a test that reads what a run only logs. Installed as the global
+/// subscriber: one per test process, which nextest gives every test.
+#[derive(Clone, Default)]
+struct Logged(Arc<Mutex<Vec<String>>>);
+
+impl Logged {
+    fn install() -> Self {
+        use tracing::subscriber::set_global_default;
+        use tracing_subscriber::layer::SubscriberExt;
+        let logged = Self::default();
+        set_global_default(tracing_subscriber::registry().with(logged.clone()))
+            .expect("install the log capture");
+        logged
+    }
+
+    fn lines(&self) -> Vec<String> {
+        self.0.lock().expect("log mutex poisoned").clone()
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Logged {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        use tracing::field::Field;
+        let mut line = String::new();
+        event.record(&mut |field: &Field, value: &dyn std::fmt::Debug| {
+            line.push_str(&format!("{}={value:?} ", field.name()));
+        });
+        self.0.lock().expect("log mutex poisoned").push(line);
+    }
+}
+
+/// The same stop on a sequenced consumer: its commit in flight has no
+/// answer inside the share, so the member ends with `ShoveError::Commit` of
+/// the `Deadline` kind carrying it, and no second commit is made.
+/// `run_fifo_until_timeout` counts that error under `errors` and logs it,
+/// so the kind is read from the log.
+#[tokio::test]
+async fn a_sequenced_stop_with_its_commit_unanswered_reports_the_pending_share() {
+    let logged = Logged::install();
+    let share = pending_commit_budget_for_test();
+    let (mock, bootstrap) = sequenced_mock(&["o1"]).await;
+    mock.track_requests();
+
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let stop = CancellationToken::new();
+    let signal = stop.clone().cancelled_owned();
+    let client = connect(&bootstrap).await;
+    let h = handler.clone();
+    let run = tokio::spawn(async move {
+        KafkaConsumer::new(client)
+            .run_fifo_until_timeout::<SequencedOrders, _, _>(
+                h,
+                (),
+                ConsumerOptions::<Kafka>::new(),
+                signal,
+                shutdown_commit_deadline_for_test() + DELIVERY_TIMEOUT,
+            )
+            .await
+    });
+    take_the_broker_down_under_a_commit(&mock).await;
+    let stopped_at = Instant::now();
+    stop.cancel();
+    let outcome = run.await.expect("the run task completes");
+    let took = stopped_at.elapsed();
+
+    assert_eq!(
+        (outcome.errors, outcome.panics, outcome.timed_out),
+        (1, 0, false),
+        "the stop ends the member with its error: {outcome:?}"
+    );
+    let kind = CommitFailure::Deadline(share).to_string();
+    let reported = logged
+        .lines()
+        .into_iter()
+        .filter(|line| line.contains("offset commit at shutdown"))
+        .collect::<Vec<_>>();
+    assert!(
+        !reported.is_empty() && reported.iter().all(|line| line.contains(&kind)),
+        "the member's error is the Deadline kind carrying the share, `{kind}`: {reported:?}"
+    );
+    assert!(
+        took >= share - Duration::from_millis(500) && took < shutdown_commit_deadline_for_test(),
+        "the stop waits out its share and ends inside the deadline, took {took:?}"
+    );
+    assert_eq!(
+        mock.offset_commit_requests(),
+        1,
+        "no second commit races the one in flight"
+    );
+    assert_eq!(handler.ids(), ["o1"]);
 }

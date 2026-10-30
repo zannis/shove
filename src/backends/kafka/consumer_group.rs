@@ -146,11 +146,17 @@ impl KafkaAutoOffsetReset {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitPolicy {
-    /// Asynchronously, at most once per interval: completions are tracked
-    /// in memory and the position is committed when the window reopens, so
-    /// a crash replays about one interval of completed records. The
-    /// default, with a 500 ms interval. The interval must be positive and
-    /// at most one hour.
+    /// At most once per interval, while the consumer goes on: completions
+    /// are tracked in memory and the position is committed when the window
+    /// reopens, so a crash replays about one interval of completed records.
+    /// The default, with a 500 ms interval. The interval must be positive
+    /// and at most one hour.
+    ///
+    /// One commit is in flight at a time, made synchronously on a thread of
+    /// its own, and the consumer reads its answer back without waiting for
+    /// it. A commit the coordinator rejects is re-offered, and a member
+    /// whose commits keep being rejected with no rebalance resolving them
+    /// is treated as fenced and reconnects.
     ///
     /// A `Retry` or `Defer` whose republish fails, or a dead letter that
     /// fails, and may succeed later ends the member with a connection error,
@@ -443,12 +449,13 @@ impl KafkaConsumerGroupConfig {
     /// [`CommitPolicy::Interval`]: both setters write the one policy slot,
     /// so the last call wins.
     ///
-    /// Completions are tracked in memory and committed asynchronously at most
-    /// once per interval, so a longer interval trades coordinator requests
-    /// for a wider replay window after a crash or a rebalance. The final
-    /// commit at shutdown is synchronous whatever the interval. The fenced
-    /// consumer detector's threshold grows with the interval, because the
-    /// streak it watches can only clear on a commit drain.
+    /// Completions are tracked in memory and committed at most once per
+    /// interval, one commit at a time while the consumer goes on, so a
+    /// longer interval trades coordinator requests for a wider replay window
+    /// after a crash or a rebalance. The final commit at shutdown is
+    /// synchronous whatever the interval. The fenced consumer detector's
+    /// threshold grows with the interval, because a rejected position is
+    /// re-offered only once per interval.
     ///
     /// Standard groups only. A FIFO group commits on the fixed 500 ms
     /// default and never reads the setting; `register_fifo` refuses a config
@@ -502,11 +509,11 @@ impl KafkaConsumerGroupConfig {
         self
     }
 
-    /// Test-only seam (see the `test-support` feature): judge the group's
-    /// concurrent members' rejected commits by this floor instead of the
-    /// pinned sixty seconds, so a test can watch the fenced consumer
-    /// detector fire in seconds. The threshold still grows with the commit
-    /// interval above the floor.
+    /// Test-only seam (see the `test-support` feature): judge the rejected
+    /// commits of the group's members, concurrent and sequenced, by this
+    /// floor instead of the pinned sixty seconds, so a test can watch the
+    /// fenced consumer detector fire in seconds. The threshold still grows
+    /// with the commit interval above the floor.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn with_commit_fence_floor_for_test(mut self, floor: Duration) -> Self {
