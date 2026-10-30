@@ -1,0 +1,20 @@
+tests/nats_integration.rs
+  s_1001dc3147e1e5::t_8074afffbd827c 6461-6470
+  s_1001dc3147e1e5::t_be323d596fc7cd 6530-6534
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9b93ab0523c241eb0ca3ba0dcb60ff64f3da74da",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
