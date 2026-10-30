@@ -1,0 +1,22 @@
+tests/nats_batch_integration.rs
+  s_1001dc3147e1e5::t_75d865ab501de9 174-178
+  s_1001dc3147e1e5::t_7c28a4219f747f 2032-2050,2052-2106
+  s_1001dc3147e1e5::t_e4c0f7b6c7c424 173
+  s_1001dc3147e1e5::t_c4b38c2f35076b 2051
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f7ee0a4458c2a6e52de3469e23aa018a242854e6",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
