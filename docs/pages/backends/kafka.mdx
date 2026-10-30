@@ -122,6 +122,7 @@ A topic with more partitions is accepted as it is and logged with a warning.
 Several processes can declare the same topic at once.
 A declarer that finds the topic already at the count it asked for has nothing to do, including one that loses the race to expand it.
 The metadata of a topic that was just created can lag, so `declare` reads it again for up to a few seconds while the broker answers unknown topic or leader not available.
+A declarer whose expansion the controller refuses reads the count again, for the same few seconds, until it shows the count asked for, because the broker that answers can still report the old one.
 
 ### Retry and defer without hold queues
 
