@@ -1,0 +1,23 @@
+docs/pages/backends/nats.mdx
+  s_1001dc3147e1e5::t_410046c1d4bf71 124,161
+docs/pages/concepts/broadcast.mdx
+  s_1001dc3147e1e5::t_95d1f9b5f669fe 105
+src/backends/nats/consumer_group.rs
+  s_1001dc3147e1e5::t_38d8267bc0789a 1455,1510
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "db85b9df92c0ed3b07d2fb4fa51204cb97971ccb",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
