@@ -490,7 +490,9 @@ A dead letter carries the count the record reached in its `Shove-Retry-Count` he
 
 Once the budget is spent, or on a `Reject`, the record is dead-lettered and its `SequenceFailure` applies.
 A dead letter that cannot be published keeps the record uncommitted.
-The publish is tried again after 1 s, the wait doubling up to 30 s, while the consumer polls with its assignment paused, and nothing behind the record is handled meanwhile.
+Each publish attempt makes up to three sends, about 15 s in all against a broker that does not answer, and the consumer does not poll during it.
+Between attempts the consumer waits 1 s, the wait doubling up to 30 s with ±50 % jitter, and polls with its assignment paused.
+Nothing behind the record is handled meanwhile.
 No discard is counted for a record kept that way.
 The same holds for a record dropped before the handler and for a `FailAll` cascade.
 
@@ -531,10 +533,11 @@ See the [Basic example](/backends/kafka/examples/basic) for a full runnable walk
 `Outcome::Retry` and `Outcome::Defer` mark it complete only once the broker has acknowledged the delayed republish to the hold topic.
 Under `RetryStrategy::InPlace`, which an external topology implies and a shove-owned one may opt into, there is no republish.
 The offset is marked complete only when the in-place retry or defer ends in a terminal outcome.
-A sequenced consumer always retries in place, see [Sequenced delivery](#retries-in-place).
 That is an `Ack`, or a `Reject` or an exhausted retry budget that was dead-lettered or discarded.
 This closes the publish-then-commit race.
 A broker crash or process kill between handler return and republish redelivers the message on restart rather than silently dropping it.
+A sequenced consumer always retries in place.
+See [Retries in place](#retries-in-place).
 
 Under `CommitPolicy::Interval`, the default, completions are tracked in memory per partition and committed **asynchronously, at most once per commit interval**.
 The interval is 500 ms by default, configurable with `with_commit_interval` on `KafkaConsumerGroupConfig` or `ConsumerOptions::<Kafka>`.
@@ -595,7 +598,7 @@ What the policy does, condition by condition, with the source line as of this ch
 | The answer is late | The next record waits for it, and the member keeps polling meanwhile. | `src/backends/kafka/consumer.rs:3530`, the `recv()` arm of `commit_confirmed` | `a_late_answer_holds_the_next_record_while_the_member_keeps_polling` |
 | A `Retry` or `Defer` republish fails | The member ends with a connection error before the next record is handed out, and the reconnect redelivers the record. | `src/backends/kafka/consumer.rs:2024`, `run_delayed_republish` | `a_republish_that_fails_under_per_record_ends_the_member_before_the_next_record` |
 | A partition is handed back paused | A pass that drains the assign pauses or resumes it with the rest, and a record the receive arm takes covers it with its own pause and resume cycle. | `src/backends/kafka/consumer.rs:3387`, `reconcile_pause_after_assign`, and `src/backends/kafka/consumer.rs:5543-5556` | `a_partition_handed_back_paused_is_resumed_when_a_pass_drains_the_assign`, `a_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_the_assign` |
-| A stop finds a commit in flight | It is waited for up to `PENDING_COMMIT_BUDGET`; an accepted answer is followed by the final commit, a rejected one is re-offered by it, and no answer ends the stop with `ShoveError::Commit` of the `Deadline` kind. | `src/backends/kafka/consumer.rs:5243-5317`, the shutdown arm of `KafkaConsumer::run` | `a_stop_during_a_commit_waits_for_its_answer_and_leaves_the_group_before_returning`, `a_discard_behind_a_commit_rejected_at_the_stop_is_counted_once_by_the_final_commit`, `a_per_record_stop_against_a_frozen_coordinator_reports_the_commit_it_could_not_finish` |
+| A stop finds a commit in flight | It is waited for up to `PENDING_COMMIT_BUDGET`; an accepted answer is followed by the final commit, a rejected one is re-offered by it, and no answer ends the stop with `ShoveError::Commit` of the `Deadline` kind. | `src/backends/kafka/consumer.rs:3741-3783`, `stop_with_final_commit`, which the shutdown arm of `KafkaConsumer::run` calls | `a_stop_during_a_commit_waits_for_its_answer_and_leaves_the_group_before_returning`, `a_discard_behind_a_commit_rejected_at_the_stop_is_counted_once_by_the_final_commit`, `a_per_record_stop_against_a_frozen_coordinator_reports_the_commit_it_could_not_finish` |
 | A prefetch above one with concurrent processing on | Refused at `KafkaConsumer::run` and at `KafkaConsumerGroupRegistry::register`. | `src/backends/kafka/consumer.rs:2998`, `check_per_record_prefetch`, and `src/backends/kafka/consumer_group.rs:1221` | `run_rejects_per_record_commits_with_two_permits`, `register_rejects_per_record_commits_with_more_than_one_permit` |
 
 The commit position is derived from the offsets the broker actually delivered, never from a run of consecutive integers.
@@ -641,6 +644,8 @@ A local timeout after the request was sent does not prove that, because the brok
 Redelivery then starts from the last position the broker accepted for each partition, which an earlier asynchronous commit may have advanced.
 The error carries positions and the error text only, never a record's payload, key or headers.
 A consumer group counts the error once under `SupervisorOutcome::errors`, so `exit_code()` is 1 where it was 0 in 0.15.0.
+A sequenced member now makes the same final commit, so a final commit the broker refuses ends it with `ShoveError::Commit` too, where it ended clean in 0.16.0.
+A sequenced consumer group and `run_fifo_until_timeout` count it under `errors` the same way, and `run_fifo` logs it and returns `Ok(())`.
 Nothing else about the run changes: it still ends on its stop signal.
 A drain that times out while the commit is still waiting aborts the member instead.
 The run then reports `timed_out`, so `exit_code()` is 3 and no error is counted.
