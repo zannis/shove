@@ -5,6 +5,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 use crate::backends::sns::client::SnsClient;
+#[cfg(feature = "aws-sns-sqs")]
+use crate::backends::sns::publisher::SHARD_ATTR;
 use crate::error::{Result, ShoveError};
 use crate::topology::QueueTopology;
 
@@ -12,6 +14,13 @@ use crate::topology::QueueTopology;
 /// Messages that exceed this receive count are moved to the DLQ.
 #[cfg(feature = "aws-sns-sqs")]
 const DEFAULT_MAX_RECEIVE_COUNT: u32 = 10;
+
+/// Subscription filter policy that delivers only one shard's messages to its
+/// queue.
+#[cfg(feature = "aws-sns-sqs")]
+fn shard_filter_policy(shard: u16) -> String {
+    serde_json::json!({ SHARD_ATTR: [shard.to_string()] }).to_string()
+}
 
 /// Registry mapping queue names to SNS topic ARNs.
 ///
@@ -390,7 +399,7 @@ impl SnsTopologyDeclarer {
                 .await?;
 
             // Filter policy: only receive messages for this shard
-            let filter = serde_json::json!({ "shard": [i.to_string()] }).to_string();
+            let filter = shard_filter_policy(i);
 
             self.subscribe_sqs_to_sns(topic_arn, &arn, &url, Some(filter))
                 .await?;
@@ -477,6 +486,12 @@ mod tests {
     use crate::SequenceFailure;
     use crate::topology::TopologyBuilder;
     use std::time::Duration;
+
+    #[cfg(feature = "aws-sns-sqs")]
+    #[test]
+    fn a_shard_queue_subscribes_with_a_filter_on_the_shard_attribute() {
+        assert_eq!(shard_filter_policy(3), r#"{"shard":["3"]}"#);
+    }
 
     #[test]
     fn sns_topic_name_standard() {

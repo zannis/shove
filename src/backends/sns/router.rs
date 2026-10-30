@@ -5,6 +5,8 @@ use aws_sdk_sqs::types::{
 use std::time::Duration;
 use tracing::{debug, error, warn};
 
+#[cfg(test)]
+use crate::backends::sns::publisher::SHARD_ATTR;
 use crate::metrics;
 use crate::metrics::{BackendErrorKind, BackendLabel, record_backend_error};
 use crate::topology::QueueTopology;
@@ -12,6 +14,11 @@ use crate::topology::QueueTopology;
 /// Custom SQS message attribute used to track retry count across
 /// delete+re-send cycles. Takes precedence over `ApproximateReceiveCount`.
 pub(crate) const RETRY_COUNT_ATTR: &str = "x-retry-count";
+
+/// Message attribute names this backend writes itself. A new one belongs here:
+/// a test checks that `validate_headers` reserves every name in this list.
+#[cfg(test)]
+const INTERNAL_KEYS: &[&str] = &[RETRY_COUNT_ATTR, SHARD_ATTR];
 
 /// Delete a message from SQS (acknowledge).
 pub(crate) async fn route_ack(sqs: &aws_sdk_sqs::Client, queue_url: &str, receipt_handle: &str) {
@@ -592,7 +599,13 @@ pub(crate) fn extract_message_attributes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::publisher_internal::assert_internal_keys_reserved;
     use crate::topology::TopologyBuilder;
+
+    #[test]
+    fn every_internal_attribute_is_reserved_by_validate_headers() {
+        assert_internal_keys_reserved("SNS/SQS", INTERNAL_KEYS);
+    }
 
     #[test]
     fn retry_delay_escalates_with_hold_queues() {
