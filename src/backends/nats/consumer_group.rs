@@ -52,7 +52,7 @@ fn harvest_if_finished(
     true
 }
 
-/// Counts one more occurrence, stopping at the top instead of wrapping.
+/// Counts one more occurrence, saturating at the top.
 fn count_one(counter: &AtomicUsize) {
     // The closure always answers `Some`, so the update cannot fail.
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -1072,7 +1072,7 @@ mod tests {
     }
 
     #[test]
-    fn a_counter_stops_at_the_top_instead_of_wrapping() {
+    fn a_counter_saturates_at_the_top() {
         let counter = AtomicUsize::new(usize::MAX - 1);
         count_one(&counter);
         assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
