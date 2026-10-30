@@ -40,10 +40,11 @@
 //! commit in flight unanswered reports the share of the shutdown deadline it
 //! waited, as the standard consumer's does under `Interval`.
 //!
-//! The final section takes the broker down for a few seconds, which the
-//! member rides out on the client it started with, and stops a member whose
-//! handler holds its only permit past the poll interval, whose drain keeps
-//! polling through a rebalance.
+//! The final section takes the broker down for a few seconds, which a
+//! settled member rides out on the client it started with and a member fresh
+//! from a rebalance reconnects through, and stops a member whose handler
+//! holds its only permit past the poll interval, whose drain keeps polling
+//! through a rebalance.
 //!
 //! `test-support` gates the seams this file reads; both Kafka coverage rows
 //! enable it, so the suite runs in each.
@@ -4231,8 +4232,9 @@ async fn a_sequenced_stop_with_its_commit_unanswered_reports_the_pending_share()
 }
 
 // ---------------------------------------------------------------------------
-// A broker bounce ridden out on the client the member started with, and a
-// stop that keeps polling while a handler holds the permit
+// A broker bounce ridden out on the client the member started with, one soon
+// after a rebalance that reconnects, and a stop that keeps polling while a
+// handler holds the permit
 // ---------------------------------------------------------------------------
 
 /// A broker that goes away for a few seconds and comes back costs the member
@@ -4289,6 +4291,86 @@ async fn broker_bounce_does_not_rejoin() {
     run.await
         .expect("the run task completes")
         .expect("a clean stop");
+}
+
+/// A broker bounce soon after a rebalance ends a member's loop, and the
+/// member reconnects on a fresh client. The rebalance may have changed the
+/// assignment while a committed-offset fetch was pending, and librdkafka's
+/// only trace of a fetch that change stranded is a `__TRANSPORT`, the code a
+/// refused reconnect reports too (bundled librdkafka 2.12.1,
+/// `rdkafka_assignment.c:281-298`). Member A takes both partitions of the
+/// return topic, and B joins straight after, so the cooperative rebalance
+/// revokes one of A's partitions within seconds of A's assign; the bounce
+/// follows within seconds as well, inside the default `socket.timeout.ms`,
+/// 60 s. Red while every `__TRANSPORT` was ridden out, whatever the
+/// rebalance callback had served.
+#[tokio::test]
+async fn broker_bounce_soon_after_a_rebalance_reconnects() {
+    const BOUNCE: Duration = Duration::from_secs(3);
+    /// The bound for a wait that spans a rebalance: the mock coordinator
+    /// waits up to `session.timeout.ms` for its members to rejoin.
+    const REBALANCE_TIMEOUT: Duration = Duration::from_secs(60);
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    mock.api()
+        .create_topic(RETURN_TOPIC, 2, 1)
+        .expect("create the return topic through the mock API");
+    let (_release, released) = watch::channel(0);
+    let a = Holding::new(released.clone());
+    let (run_a, token_a) = start_on_return_topic(connect(&bootstrap).await, a.clone(), |token| {
+        ConsumerOptions::<Kafka>::new().with_shutdown(token)
+    });
+    for partition in RETURN_PARTITIONS {
+        produce_pinned(&bootstrap, &format!("a-{partition}"), partition).await;
+    }
+    wait_until(
+        || a.seen().len() == RETURN_PARTITIONS.len(),
+        DELIVERY_TIMEOUT,
+        "A handling a record of each partition",
+    )
+    .await;
+
+    let b = Holding::new(released);
+    let (run_b, token_b) = start_on_return_topic(connect(&bootstrap).await, b.clone(), |token| {
+        ConsumerOptions::<Kafka>::new().with_shutdown(token)
+    });
+    // Whichever partition moves to B, B has a record of it.
+    for partition in RETURN_PARTITIONS {
+        produce_pinned(&bootstrap, &format!("b-{partition}"), partition).await;
+    }
+    wait_until(
+        || !b.seen().is_empty(),
+        REBALANCE_TIMEOUT,
+        "B handling a record of the partition it took",
+    )
+    .await;
+    let before = client_id_probe::created();
+    assert_eq!(
+        before.len(),
+        2,
+        "one consumer per member before the bounce: {before:?}"
+    );
+
+    mock.api()
+        .broker_down(BROKER_ID)
+        .expect("take the mock broker down");
+    tokio::time::sleep(BOUNCE).await;
+    mock.api()
+        .broker_up(BROKER_ID)
+        .expect("bring the mock broker back");
+
+    wait_until(
+        || client_id_probe::created().len() > before.len(),
+        DELIVERY_TIMEOUT,
+        "a member reconnecting on a fresh client after the bounce",
+    )
+    .await;
+
+    // The reconnect rebalances the group, so a final commit may be refused.
+    token_a.cancel();
+    token_b.cancel();
+    let _ = run_a.await.expect("A's task completes");
+    let _ = run_b.await.expect("B's task completes");
 }
 
 /// A stop that finds a handler holding the only permit keeps the member
