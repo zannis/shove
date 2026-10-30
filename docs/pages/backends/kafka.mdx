@@ -172,7 +172,7 @@ Provision the topic before any publisher starts.
 How `Retry` and `Defer` are carried out is the consumer's **retry strategy**, `RetryStrategy::Republish` or `RetryStrategy::InPlace`, set with `with_retry_strategy` on `ConsumerOptions::<Kafka>` or `KafkaConsumerGroupConfig`.
 Ownership implies it: an external topology runs with `InPlace` and refuses `Republish`, because the republish would write into a topic infra owns.
 A shove-owned topology runs with `Republish` by default and may opt into `InPlace`, so a consumer that must not duplicate a retried record for the other groups on a fan-out topic can wait in place too.
-A FIFO consumer refuses `InPlace`, which it does not implement.
+A sequenced consumer accepts either strategy and always retries in place, so a later record of the key is never handled before the retried one; see [Sequenced delivery](#sequenced-delivery).
 
 | Outcome | `RetryStrategy::Republish`, the shove-owned default | `RetryStrategy::InPlace`, implied by an external topology |
 |---|---|---|
@@ -238,7 +238,8 @@ Unset throughput settings keep librdkafka's defaults.
 
 The client holds a single producer, built at the first publish.
 `publisher()` and the consumer's retry, defer, and DLQ republishes share it.
-A long linger also delays those republishes, and the offset commits gated on them for sequenced topics.
+A long linger also delays those republishes.
+A sequenced consumer handles nothing behind a record until that record's dead letter lands, so a long linger delays every partition the member holds while it dead-letters.
 Keep linger modest when consumers republish on the same client.
 
 ## Consume
@@ -295,7 +296,7 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
   The check runs again where the consumer starts.
   A value written to the public `kafka_commit_interval` field past the setter is refused there with `ShoveError::Topology`, never with a panic.
   A longer interval sends fewer OffsetCommit requests and widens the replay window after a crash or rebalance by the same amount.
-  Standard groups only: a FIFO consumer commits each message as it settles, so `register_fifo` refuses a config that sets an interval.
+  Standard groups only: a FIFO consumer commits on the fixed 500 ms default and never reads the setting, so `register_fifo` refuses a config that sets an interval.
   The DLQ drain commits each dead letter as it settles and refuses the setting on `ConsumerOptions::<Kafka>` for the same reason.
   See [Offset commit semantics](#offset-commit-semantics).
   The same setting is available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths.
@@ -466,6 +467,37 @@ Messages for the same key stay in order. Kafka uses partition-key routing: `T::s
 
 Ordering is partition-scoped: two messages with different keys may land on different partitions and be processed concurrently. The partition count is fixed at topic creation time and caps the maximum degree of parallelism across the consumer group.
 
+### Retries in place
+
+A `Retry` keeps the record at its offset.
+So do a `Defer`, which a sequenced consumer turns into a `Retry`, a handler timeout that resolves to either, and a handler panic.
+The consumer waits the attempt's hold delay, picked as in [Retry math](/concepts/outcomes#retry-math), or 1 s without hold queues.
+It then hands the same record back to the handler with `redelivered: true`.
+Nothing is published, so no copy lands behind later records of the key, and nothing behind the record is handled until it is acked or dead-lettered.
+Either `RetryStrategy` is accepted, and both retry in place.
+A member handles one record at a time across every partition it holds, so a hold delays the member's whole assignment, other keys included.
+
+During the wait the consumer pauses its assignment and keeps polling, so a hold longer than `max.poll.interval.ms` does not evict the member from its group.
+A record of a partition assigned during the wait is handed back to the broker and arrives again, in order, once the wait ends.
+A revoke of the held record's partition ends the wait with nothing committed for the record, and the partition's next owner is handed the record from the committed offset.
+A stop during the wait returns at once: the record stays uncommitted, nothing behind it is handled, and the next consumer of the group is handed the record first.
+
+The retry count lives in memory.
+It is seeded from the record's `Shove-Retry-Count` header on every delivery, and Kafka keeps no delivery count to add to it.
+Every new consumer incarnation therefore starts the count again: a restart, a rebalance or a crash during the ladder hands the record over with the count read from the header, and the hold ladder starts over.
+With long tiers and frequent restarts a record can block its partition indefinitely.
+A dead letter carries the count the record reached in its `Shove-Retry-Count` header.
+
+Once the budget is spent, or on a `Reject`, the record is dead-lettered and its `SequenceFailure` applies.
+A dead letter that cannot be published keeps the record uncommitted.
+The publish is tried again after 1 s, the wait doubling up to 30 s, while the consumer polls with its assignment paused, and nothing behind the record is handled meanwhile.
+No discard is counted for a record kept that way.
+The same holds for a record dropped before the handler and for a `FailAll` cascade.
+
+Offsets are committed asynchronously at most every 500 ms, the standard consumer's default interval.
+A commit that retires a record discarded with no DLQ is made synchronously, on a thread of its own, so the discard counts only once the broker accepted it.
+On a stop the consumer commits its final position synchronously and closes, as the standard consumer does; see [Offset commit semantics](#offset-commit-semantics).
+
 See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced example](/backends/kafka/examples/sequenced) for a runnable walkthrough.
 
 ## Consumer groups + autoscaling
@@ -497,6 +529,7 @@ See the [Basic example](/backends/kafka/examples/basic) for a full runnable walk
 `Outcome::Retry` and `Outcome::Defer` mark it complete only once the broker has acknowledged the delayed republish to the hold topic.
 Under `RetryStrategy::InPlace`, which an external topology implies and a shove-owned one may opt into, there is no republish.
 The offset is marked complete only when the in-place retry or defer ends in a terminal outcome.
+A sequenced consumer always retries in place, see [Sequenced delivery](#retries-in-place).
 That is an `Ack`, or a `Reject` or an exhausted retry budget that was dead-lettered or discarded.
 This closes the publish-then-commit race.
 A broker crash or process kill between handler return and republish redelivers the message on restart rather than silently dropping it.

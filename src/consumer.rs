@@ -44,7 +44,7 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 ///
 /// | Backend | In-place primitive | This version |
 /// |---|---|---|
-/// | Apache Kafka | pauses the assignment and waits in the handler's task, the count kept in memory | both strategies, set with `ConsumerOptions::<Kafka>::with_retry_strategy` or `KafkaConsumerGroupConfig::with_retry_strategy` |
+/// | Apache Kafka | pauses the assignment and waits in the handler's task, or in the receive loop of a sequenced consumer, the count kept in memory | both strategies, set with `ConsumerOptions::<Kafka>::with_retry_strategy` or `KafkaConsumerGroupConfig::with_retry_strategy`; a sequenced consumer accepts either and always retries in place |
 /// | NATS JetStream | naks with the tier's delay, the count from JetStream's `num_delivered` | `InPlace` on an external stream, `Republish` on a shove-owned one; the setter follows |
 /// | AWS SQS | extends the visibility timeout, the path the FIFO consumer already uses | later, additive; `declare` and every consumer entry point refuse `external()` |
 /// | RabbitMQ | `basic.nack` with requeue | later, additive; `declare` and every consumer entry point refuse `external()` |
@@ -67,9 +67,11 @@ pub enum RetryStrategy {
     /// Deliver the same record again after the tier's delay, with nothing
     /// published and the record at its position. How the wait and the count
     /// are carried is the backend's own primitive, in the table above: Kafka
-    /// waits inside the handler's task, holding its prefetch slot, with the
-    /// count kept in memory; NATS naks with the delay and reads the count from
-    /// the delivery info. Implied by an external topology.
+    /// waits inside the handler's task, holding its prefetch slot, or in the
+    /// receive loop of a sequenced consumer, with the count kept in memory;
+    /// NATS naks with the delay and reads the count from the delivery info.
+    /// Implied by an external topology, and the one shape a sequenced Kafka
+    /// consumer runs.
     ///
     /// On Kafka a stop during the wait completes nothing and hands no record
     /// fetched behind the waiting one to a handler; both are redelivered on
@@ -924,7 +926,9 @@ impl ConsumerOptions<Kafka> {
     /// coordinated registry path the equivalent is
     /// [`KafkaConsumerGroupConfig::with_commit_interval`](crate::kafka::KafkaConsumerGroupConfig::with_commit_interval).
     /// A FIFO consumer, a broadcast subscription and the DLQ drain refuse it
-    /// at their entry points, because none of them commits on an interval.
+    /// at their entry points, because none of them reads it: the FIFO
+    /// consumer commits on the fixed 500 ms default, and the other two do
+    /// not commit on an interval.
     ///
     /// # Panics
     ///
@@ -976,9 +980,9 @@ impl ConsumerOptions<Kafka> {
     /// place, a shove-owned one republishes. An external topology refuses
     /// `Republish` at the consumer's start with `ShoveError::Topology`,
     /// because the republish would write into a topic infra owns. A FIFO
-    /// consumer refuses `InPlace`, which it does not implement: it carries a
-    /// retry through the republish that keeps its per-key order. Read by the
-    /// direct and supervisor paths; for the coordinated registry path the
+    /// consumer accepts either and always retries in place, so a later
+    /// record of the key is never handled before the retried one. Read by
+    /// the direct and supervisor paths; for the coordinated registry path the
     /// equivalent is `KafkaConsumerGroupConfig::with_retry_strategy`.
     pub fn with_retry_strategy(mut self, strategy: RetryStrategy) -> Self {
         self.retry_strategy = Some(strategy);

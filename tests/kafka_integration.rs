@@ -7386,7 +7386,7 @@ async fn run_fifo_rejects_a_commit_interval() {
     assert!(
         msg.contains("kafka-seq-skip")
             && msg.contains("with_commit_interval")
-            && msg.contains("commits each message as it settles"),
+            && msg.contains("commits on the fixed default interval"),
         "message must name the topic and the refused setting: {msg}"
     );
 }

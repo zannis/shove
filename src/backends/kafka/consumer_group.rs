@@ -14,8 +14,7 @@ use tracing::{debug, info, warn};
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::kafka::client::KafkaClient;
 use crate::backends::kafka::consumer::{
-    KafkaConsumer, check_per_record_prefetch, reject_fifo_commit_policy, reject_fifo_in_place,
-    resolve_retry_strategy,
+    KafkaConsumer, check_per_record_prefetch, reject_fifo_commit_policy, resolve_retry_strategy,
 };
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
 use crate::consumer::RetryStrategy;
@@ -140,9 +139,10 @@ impl KafkaAutoOffsetReset {
 /// Set with `with_commit_policy` on [`KafkaConsumerGroupConfig`] or on
 /// `ConsumerOptions::<Kafka>`; `with_commit_interval(d)` on either is
 /// shorthand for `Interval(d)`. Unset keeps `Interval` at its 500 ms
-/// default. Standard consumers only: a FIFO consumer and the DLQ drain
-/// commit each message as it settles, and a broadcast subscription commits
-/// nothing, so each refuses a policy at its entry point.
+/// default. Standard consumers only: a FIFO consumer commits on the fixed
+/// 500 ms default, the DLQ drain commits each message as it settles, and a
+/// broadcast subscription commits nothing, so each refuses a policy at its
+/// entry point.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitPolicy {
@@ -443,9 +443,9 @@ impl KafkaConsumerGroupConfig {
     /// consumer detector's threshold grows with the interval, because the
     /// streak it watches can only clear on a commit drain.
     ///
-    /// Standard groups only. A FIFO group commits each message as it
-    /// settles, so it has no interval to set; `register_fifo` refuses a
-    /// config that sets one rather than ignore it.
+    /// Standard groups only. A FIFO group commits on the fixed 500 ms
+    /// default and never reads the setting; `register_fifo` refuses a config
+    /// that sets one rather than ignore it.
     ///
     /// # Panics
     ///
@@ -528,9 +528,10 @@ impl KafkaConsumerGroupConfig {
     /// Unset, the topology's ownership decides: an external topology runs in
     /// place, a shove-owned one republishes into the topic. An external
     /// topology refuses `Republish` when a member starts, because the
-    /// republish would write into a topic infra owns. `register_fifo` refuses
-    /// `InPlace`, which the FIFO consumer does not implement. For the direct
-    /// and supervisor paths the equivalent is
+    /// republish would write into a topic infra owns. `register_fifo`
+    /// accepts either: a sequenced consumer always retries in place, so a
+    /// later record of the key is never handled before the retried one. For
+    /// the direct and supervisor paths the equivalent is
     /// `ConsumerOptions::<Kafka>::with_retry_strategy`.
     pub fn with_retry_strategy(mut self, strategy: RetryStrategy) -> Self {
         self.retry_strategy = Some(strategy);
@@ -1294,9 +1295,6 @@ impl KafkaConsumerGroupRegistry {
         }
         if config.commit_policy().is_some() {
             return Err(reject_fifo_commit_policy(T::topology().queue()));
-        }
-        if config.retry_strategy() == Some(RetryStrategy::InPlace) {
-            return Err(reject_fifo_in_place(T::topology().queue()));
         }
 
         let mut config = config;
@@ -2378,33 +2376,32 @@ mod tests {
             );
         }
 
-        /// The in-place retry strategy is refused the same way: the FIFO
-        /// consumer carries a retry through the republish that keeps its
-        /// per-key order and has no in-place shape.
+        /// Either retry strategy passes `register_fifo`'s checks, because a
+        /// FIFO consumer always retries in place. The test registry has no
+        /// client, so a config the checks admit fails at the client lookup.
         #[tokio::test]
-        async fn register_fifo_rejects_in_place_retries() {
-            let config =
-                KafkaConsumerGroupConfig::new(1..=4).with_retry_strategy(RetryStrategy::InPlace);
+        async fn register_fifo_accepts_either_retry_strategy() {
+            for strategy in [RetryStrategy::InPlace, RetryStrategy::Republish] {
+                let config = KafkaConsumerGroupConfig::new(1..=4).with_retry_strategy(strategy);
 
-            let err = registry()
-                .register_fifo::<GuardLedger, _>(config, || NoopHandler, ())
-                .await
-                .expect_err("RetryStrategy::InPlace must be rejected on a FIFO consumer");
+                let err = registry()
+                    .register_fifo::<GuardLedger, _>(config, || NoopHandler, ())
+                    .await
+                    .expect_err("the test registry has no client");
 
-            let ShoveError::Topology(msg) = err else {
-                panic!("expected ShoveError::Topology, got {err:?}");
-            };
-            assert!(
-                msg.contains("kafka-fifo-concurrency-guard")
-                    && msg.contains("is sequenced")
-                    && msg.contains("RetryStrategy::InPlace"),
-                "message must name the topic and the refused setting: {msg}"
-            );
+                let ShoveError::Topology(msg) = err else {
+                    panic!("expected ShoveError::Topology, got {err:?}");
+                };
+                assert!(
+                    msg.contains("registry has no client"),
+                    "{strategy:?} must pass the checks and reach the client lookup: {msg}"
+                );
+            }
         }
 
-        /// A commit interval is refused the same way: a FIFO consumer commits
-        /// each message as it settles, so the setting would change nothing,
-        /// and a setting that changes nothing must not be accepted silently.
+        /// A commit interval is refused: a FIFO consumer commits on the fixed
+        /// default interval and never reads the setting, and a setting that
+        /// changes nothing must not be accepted silently.
         #[tokio::test]
         async fn register_fifo_rejects_commit_interval() {
             let config =
@@ -2422,12 +2419,12 @@ mod tests {
                 msg.contains("kafka-fifo-concurrency-guard")
                     && msg.contains("is sequenced")
                     && msg.contains("with_commit_interval")
-                    && msg.contains("commits each message as it settles"),
+                    && msg.contains("commits on the fixed default interval"),
                 "message must name the topic and the refused setting: {msg}"
             );
         }
 
-        /// A FIFO consumer commits each message as it settles, so a
+        /// A FIFO consumer commits on the fixed default interval, so a
         /// per-record policy would change nothing there and is refused like
         /// the interval is.
         #[tokio::test]
@@ -2447,7 +2444,7 @@ mod tests {
                 msg.contains("kafka-fifo-concurrency-guard")
                     && msg.contains("is sequenced")
                     && msg.contains("with_commit_policy")
-                    && msg.contains("commits each message as it settles"),
+                    && msg.contains("commits on the fixed default interval"),
                 "message must name the topic and the refused setting: {msg}"
             );
         }
