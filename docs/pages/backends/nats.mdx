@@ -257,6 +257,7 @@ On either stop the drain finishes the dead letter in hand first, and it acks eve
 `handle_dead` runs under the handler timeout, 30 s by default, and a panic in it is caught.
 A call that panics or times out is logged and its dead letter is acked, and the drain goes on with the next one.
 `with_handler_timeout_outcome` has nothing to act on there, since the dead letter is acked either way.
+The drain pulls one dead letter at a time, so none waits behind a slow `handle_dead` for longer than the durable's `ack_wait` and gets handled twice.
 
 A dead letter over `max_message_size`, 10 MiB by default, never reaches `handle_dead`.
 The drain logs it with its size and acks it, which removes it from the DLQ stream.
