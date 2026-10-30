@@ -13,7 +13,7 @@ use crate::publisher_internal::{shard_for_key as shared_shard_for_key, validate_
 use crate::topic::Topic;
 
 use super::client::{RedisClient, RedisConnection};
-use super::constants::{DEFAULT_ROUTING_SHARDS, PAYLOAD_FIELD, X_SEQUENCE_KEY};
+use super::constants::{DEFAULT_ROUTING_SHARDS, INTERNAL_KEYS, PAYLOAD_FIELD, X_SEQUENCE_KEY};
 use super::topology::RedisTopologyDeclarer;
 
 // ---------------------------------------------------------------------------
@@ -70,6 +70,11 @@ impl RedisPublishError {
             error: ShoveError::Connection(format!("XADD to {stream} failed: {source}")),
             explicit_rejection,
         }
+    }
+
+    /// Whether the connection failed, so the cached one must not be reused.
+    fn is_connection_failure(&self) -> bool {
+        matches!(self.error, ShoveError::Connection(_))
     }
 }
 
@@ -130,9 +135,7 @@ impl RedisPublisher {
         };
 
         match conn {
-            Some(c) => xadd_on_conn(c, &stream, &payload, &headers, sequence_key.as_deref())
-                .await
-                .map_err(|e| RedisPublishError::xadd(&stream, e)),
+            Some(c) => xadd_on_conn(c, &stream, &payload, &headers, sequence_key.as_deref()).await,
             None => {
                 let mut owned = self
                     .cached_conn()
@@ -146,10 +149,13 @@ impl RedisPublisher {
                     sequence_key.as_deref(),
                 )
                 .await;
-                if result.is_err() {
+                if result
+                    .as_ref()
+                    .is_err_and(RedisPublishError::is_connection_failure)
+                {
                     self.invalidate_conn().await;
                 }
-                result.map_err(|e| RedisPublishError::xadd(&stream, e))
+                result
             }
         }
     }
@@ -170,10 +176,10 @@ impl RedisPublisher {
 
     /// Publish `msg` with caller-provided headers carried in the XADD entry.
     ///
-    /// Rejects headers using a reserved prefix (e.g. `x-retry-count`,
-    /// `x-message-id`, `x-sequence-key`) so a publisher cannot forge the
-    /// internal routing/accounting fields the consumer reads off the stream
-    /// entry — matching the other backends.
+    /// Rejects reserved header names (e.g. `x-retry-count`, `x-sequence-key`,
+    /// `payload`) so a publisher cannot forge the internal routing/accounting
+    /// fields or the message body the consumer reads off the stream entry —
+    /// matching the other backends.
     pub async fn publish_with_headers<T: Topic>(
         &self,
         msg: &T::Message,
@@ -254,13 +260,25 @@ impl PublisherImpl for RedisPublisher {
 // ---------------------------------------------------------------------------
 
 /// Execute a single XADD on an already-open connection.
+///
+/// A header named like a field the entry carries as its own would write that
+/// field twice, and the consumer keeps the later value, so it is refused with
+/// `ShoveError::Validation` before anything is sent.
 async fn xadd_on_conn(
     conn: &mut RedisConnection,
     stream: &str,
     payload: &str,
     headers: &HashMap<String, String>,
     sequence_key: Option<&str>,
-) -> redis::RedisResult<()> {
+) -> std::result::Result<(), RedisPublishError> {
+    if let Some(name) = headers
+        .keys()
+        .find(|name| INTERNAL_KEYS.contains(&name.as_str()))
+    {
+        return Err(RedisPublishError::unresolved(ShoveError::Validation(
+            format!("header '{name}' collides with a field the stream entry carries as its own"),
+        )));
+    }
     let mut cmd = redis::cmd("XADD");
     cmd.arg(stream).arg("*");
     cmd.arg(PAYLOAD_FIELD).arg(payload);
@@ -270,7 +288,10 @@ async fn xadd_on_conn(
     if let Some(seq_key) = sequence_key {
         cmd.arg(X_SEQUENCE_KEY).arg(seq_key);
     }
-    conn.query_redis::<redis::Value>(&mut cmd).await.map(|_| ())
+    conn.query_redis::<redis::Value>(&mut cmd)
+        .await
+        .map(|_| ())
+        .map_err(|e| RedisPublishError::xadd(stream, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +440,41 @@ mod tests {
         );
         assert_eq!(failure.unattempted(), &[1, 2]);
         assert_eq!(failure.to_republish(), &[1, 2]);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_header_naming_an_entry_field_is_refused_before_any_xadd() {
+        let (url, server) = start_ambiguous_xadd_server().await;
+        let client = RedisClient::connect(
+            RedisConfig::new(RedisMode::Standalone { url })
+                .with_response_timeout(Duration::from_secs(3)),
+        )
+        .await
+        .expect("connect to mock Redis");
+        let publisher = RedisPublisher::new(client);
+
+        for name in INTERNAL_KEYS {
+            let headers = HashMap::from([((*name).to_string(), "forged".to_string())]);
+            let failure = publisher
+                .publish_inner::<AmbiguousBatchTopic>(&1, headers, None)
+                .await
+                .expect_err("a header that names an entry field is refused");
+            assert!(
+                matches!(failure.error, ShoveError::Validation(_)),
+                "{name}: {:?}",
+                failure.error
+            );
+        }
+
+        // The mock answers only the first XADD it sees, so this one succeeding
+        // shows that none of the refused publishes sent one.
+        publisher
+            .publish_inner::<AmbiguousBatchTopic>(&1, HashMap::new(), None)
+            .await
+            .map_err(|failure| failure.error)
+            .expect("the first XADD the server sees is accepted");
 
         server.abort();
     }
