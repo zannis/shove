@@ -47,7 +47,7 @@ fn harvest_if_finished(
         && !e.is_cancelled()
     {
         tracing::error!(error = %e, group = %queue, "finished consumer task had panicked");
-        panic_count.fetch_add(1, Ordering::Relaxed);
+        count_one(panic_count);
     }
     true
 }
@@ -290,7 +290,7 @@ impl NatsConsumerGroup {
             tokio::spawn(async move {
                 let result = consumer.run_with_inner::<T, H>(handler, ctx, options).await;
                 if let Err(e) = result {
-                    ec.fetch_add(1, Ordering::Relaxed);
+                    count_one(&ec);
                     tracing::error!("consumer task exited with error: {e}");
                 }
             })
@@ -1078,6 +1078,23 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
         count_one(&counter);
         assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn a_harvested_panic_saturates_the_panic_count() {
+        let mut handle: JoinHandle<()> =
+            tokio::spawn(async { panic!("the consumer task panics on purpose") });
+        for _ in 0..200 {
+            if handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let panics = AtomicUsize::new(usize::MAX);
+
+        assert!(harvest_if_finished(&mut handle, &panics, "test-queue"));
+
+        assert_eq!(panics.load(Ordering::Relaxed), usize::MAX);
     }
 
     // -- start --
