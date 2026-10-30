@@ -1,6 +1,6 @@
 # NATS — Audited Consumer
 
-Use this when you need to confirm that audit trace IDs survive hold-queue retries on NATS. The handler returns `Outcome::Retry` on first delivery; both attempts emit an audit record with the same UUID, demonstrating that the `trace_id` propagates correctly through JetStream's header mechanism.
+Use this to see the `Audited` wrapper on NATS. The handler returns `Outcome::Retry` on first delivery, so the message is delivered twice and each delivery emits an audit record. The example publishes with `publish`, which sets no `x-trace-id` header, so the two records carry different `trace_id` values. To keep one `trace_id` across the attempts, publish with `publish_with_headers` and an `x-trace-id` header, as [Trace ID propagation](#trace-id-propagation) describes.
 
 ## Prerequisites
 
@@ -29,7 +29,7 @@ published payment
 }
 [handler] payment=PAY-001 amount=$49.99 attempt=2
 [audit] {
-  "trace_id": "550e8400-e29b-41d4-a716-446655440000",
+  "trace_id": "9b2f6c1e-3d7a-4c58-8e1f-a47d02c5b6d3",
   "outcome": "Ack",
   "duration_ms": 0,
   ...
@@ -37,7 +37,7 @@ published payment
 done
 ```
 
-The same UUID appears in both audit records. The 10-second run window allows the 5-second hold queue to fire and redeliver before shutdown.
+Each audit record has its own UUID, because the example sets no `x-trace-id`. The 10-second run window leaves room for the 5-second retry delay and the redelivery before shutdown.
 
 ## Source
 
@@ -65,7 +65,7 @@ The supervisor runs for 10 seconds — long enough for the 5-second hold queue T
 
 ## What to try next
 
-- Return `Outcome::Retry` for three consecutive attempts and confirm the `trace_id` stays the same across all three deliveries.
+- Publish with `publish_with_headers` and an `x-trace-id` header, return `Outcome::Retry` for three consecutive attempts, and confirm the `trace_id` stays the same across all three deliveries.
 - Add a `.with_max_retries(1)` to the consumer group config and make the handler always retry — observe the final delivery with `outcome: "Reject"` after the retry limit.
 - Replace `StdoutAuditHandler` with a struct that appends to a `Vec` and assert after shutdown that each payment has exactly two records (one retry, one ack).
 - See [Guides: Audit](/guides/audit) for the complete `AuditRecord` schema and production wiring patterns.

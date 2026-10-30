@@ -1,6 +1,6 @@
 # SQS — Audited Consumer
 
-Use this when you want to confirm that trace IDs survive the SQS hold-queue round-trip. The same UUID appears on both the initial `Outcome::Retry` delivery and the successful second attempt — exactly the property you need when correlating retries in a payment audit log or compliance record. The `AuditHandler` API is identical across backends.
+Use this to see the `Audited` wrapper on SQS. The handler returns `Outcome::Retry` on the first delivery, so the message is delivered twice and each delivery emits an audit record. The example publishes with `publish`, which sets no `x-trace-id` attribute, so the two records carry different `trace_id` values. Correlating retries in a payment audit log or compliance record takes an `x-trace-id` set at publish time, as [Trace ID propagation](#trace-id-propagation) describes. The `AuditHandler` API is identical across backends.
 
 ## Prerequisites
 
@@ -30,7 +30,7 @@ published payment
 }
 [handler] payment=PAY-001 amount=$49.99 attempt=2
 [audit] {
-  "trace_id": "550e8400-e29b-41d4-a716-446655440000",
+  "trace_id": "9b2f6c1e-3d7a-4c58-8e1f-a47d02c5b6d3",
   "outcome": "Ack",
   "duration_ms": 0,
   ...
@@ -38,7 +38,7 @@ published payment
 done
 ```
 
-The same `trace_id` UUID appears on both delivery attempts. The 15-second run window allows the hold-queue TTL (5 s) to expire before the second delivery arrives.
+Each delivery attempt has its own `trace_id`, because the example sets no `x-trace-id`. The 15-second run window allows the hold-queue TTL (5 s) to expire before the second delivery arrives.
 
 ## Source
 
