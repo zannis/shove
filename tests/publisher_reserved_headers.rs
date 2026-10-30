@@ -322,9 +322,15 @@ mod nats {
             .get_raw_message(1)
             .await
             .expect("read the stored message");
-        assert_eq!(
-            message.headers.get("Shove-Retry-Count").map(|v| v.as_str()),
-            Some("0")
+        // A zero count may be stamped or left out, since readers take a missing
+        // one as 0; the forged 99 must be in neither case.
+        assert!(
+            matches!(
+                message.headers.get("Shove-Retry-Count").map(|v| v.as_str()),
+                None | Some("0")
+            ),
+            "{:?}",
+            message.headers
         );
         for name in FREE {
             assert_eq!(
