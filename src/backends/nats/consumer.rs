@@ -1034,9 +1034,17 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 ///
 /// No task runs the call apart from the caller, so the call is dropped when it
 /// times out and when the caller is dropped, as an aborted FIFO shard or DLQ
-/// drain is, and a message costs the one task its caller already is. A call
-/// that blocks its thread without ever yielding cannot be cut off by the
-/// limit until it returns.
+/// drain is, and a message costs the one task its caller already is.
+///
+/// The limit bounds a call that yields: a call still running when it passes
+/// is dropped at its next yield, before the caller resumes. A call that holds
+/// its thread is not stopped while it does. One that runs past the limit and
+/// then returns without yielding is [`Guarded::Done`] with its own output,
+/// since the call is polled before the limit is checked.
+///
+/// A panic raised while a timed-out call is dropped, in the `Drop` of
+/// something the call holds, is not caught: it unwinds the caller, the
+/// message task, the FIFO shard or the DLQ drain.
 async fn guarded<F: Future>(fut: F, timeout: Option<Duration>) -> Guarded<F::Output> {
     let caught = AssertUnwindSafe(fut).catch_unwind();
     let caught = match timeout {
