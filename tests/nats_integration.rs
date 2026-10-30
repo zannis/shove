@@ -1784,7 +1784,7 @@ async fn sequenced_skip_continues_after_rejection() {
     broker.close().await;
 }
 
-/// CAF-84: `SequenceFailure::FailAll` must halt the failing sequence key on
+/// `SequenceFailure::FailAll` must halt the failing sequence key on
 /// NATS, not silently behave like `Skip`.
 ///
 /// Also covers the wire change this needed: NATS previously encoded only the

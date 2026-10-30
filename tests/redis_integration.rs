@@ -318,7 +318,7 @@ impl SequencedTopic for LedgerTopic {
     }
 }
 
-/// CAF-84: a sequenced topic configured `FailAll`, with a DLQ so the poisoned
+/// A sequenced topic configured `FailAll`, with a DLQ so the poisoned
 /// messages have somewhere to land.
 struct FailAllTopic;
 impl Topic for FailAllTopic {
@@ -896,7 +896,7 @@ async fn fifo_same_key_in_order() {
 }
 
 // ---------------------------------------------------------------------------
-// CAF-84: SequenceFailure::FailAll must poison the failing key on Redis
+// SequenceFailure::FailAll must poison the failing key on Redis
 // ---------------------------------------------------------------------------
 
 /// `FailAll` must halt the failing sequence key, not silently behave like

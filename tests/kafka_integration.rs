@@ -3060,7 +3060,7 @@ async fn sequenced_skip_continues_after_rejection() {
     broker.close().await;
 }
 
-/// CAF-84: `SequenceFailure::FailAll` must halt the failing sequence key on
+/// `SequenceFailure::FailAll` must halt the failing sequence key on
 /// Kafka, not silently behave like `Skip`.
 ///
 /// Kafka carries the sequence key as the record key, so unlike NATS this

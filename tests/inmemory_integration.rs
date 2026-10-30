@@ -1113,9 +1113,9 @@ async fn delivery_count_advances_across_defers_and_resets_on_retry() {
 /// `SequenceFailure::FailAll` documents that a key stays poisoned for the
 /// lifetime of the consumer task. InMemory used to clear its poison set
 /// whenever the shard buffer drained, which made it the only backend where a
-/// quiet moment silently un-poisoned a key — the exact divergence CAF-84 is
-/// about, and the worst place for it, since InMemory is what users assert
-/// against in their own tests.
+/// quiet moment silently un-poisoned a key — a divergence between backends,
+/// and the worst place for it, since InMemory is what users assert against in
+/// their own tests.
 #[tokio::test]
 async fn poison_survives_shard_drain() {
     // run_fifo — keep InMemoryConsumer for the consumer task.
