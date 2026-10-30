@@ -700,7 +700,7 @@ async fn message_id_length_is_bounded_across_defers() {
     for (hop, copy) in records.iter().enumerate().skip(1) {
         assert_eq!(
             texts_of(&copy.headers, "Shove-Base-Message-Id"),
-            [base.clone()],
+            std::slice::from_ref(base),
             "defer copy {hop} carries one base id: {:?}",
             copy.headers
         );

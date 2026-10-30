@@ -61,6 +61,13 @@ const OUTAGE_TOPIC: &str = "kafka-fifo-in-place-dlq-outage";
 const OUTAGE_DLQ: &str = "kafka-fifo-in-place-dlq-outage-dlq";
 const OUTAGE_GROUP: &str = "kafka-fifo-in-place-dlq-outage-fifo";
 
+const UNPUBLISHABLE_TOPIC: &str = "kafka-fifo-in-place-unpublishable";
+const UNPUBLISHABLE_DLQ: &str = "kafka-fifo-in-place-unpublishable-dlq";
+const UNPUBLISHABLE_GROUP: &str = "kafka-fifo-in-place-unpublishable-fifo";
+/// Bytes of padding that put a record past the `message.max.bytes` shove's
+/// producer runs with, librdkafka's 1 MB default.
+const OVERSIZE: usize = 1_200_000;
+
 const STOP_TOPIC: &str = "kafka-fifo-in-place-stop";
 const STOP_DLQ: &str = "kafka-fifo-in-place-stop-dlq";
 const STOP_GROUP: &str = "kafka-fifo-in-place-stop-fifo";
@@ -121,6 +128,18 @@ shove::define_sequenced_topic!(
     Order,
     |_order: &Order| KEY.to_string(),
     TopologyBuilder::new(OUTAGE_TOPIC)
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(ORDER_HOLD)
+        .dlq()
+        .build()
+);
+
+shove::define_sequenced_topic!(
+    UnpublishableTopic,
+    Order,
+    |_order: &Order| KEY.to_string(),
+    TopologyBuilder::new(UNPUBLISHABLE_TOPIC)
         .sequenced(SequenceFailure::Skip)
         .routing_shards(1)
         .hold_queue(ORDER_HOLD)
@@ -311,6 +330,27 @@ async fn produce(bootstrap: &str, topic: &str, ids: &[&str]) {
             .await
             .expect("produce to the mock cluster");
     }
+}
+
+/// Produces one record under `KEY` onto `topic` whose id is `prefix` padded
+/// past [`OVERSIZE`], through a producer whose `message.max.bytes` admits
+/// it; the mock broker sets no limit of its own. Returns the id.
+async fn produce_oversize(bootstrap: &str, topic: &str, prefix: &str) -> String {
+    let id = format!("{prefix}{}", "x".repeat(OVERSIZE));
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("message.max.bytes", "4000000")
+        .create()
+        .expect("mock producer for a large record");
+    let payload = serde_json::to_vec(&Order { id: id.clone() }).expect("encode the record");
+    producer
+        .send(
+            FutureRecord::to(topic).key(KEY).payload(&payload),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("produce the large record to the mock cluster");
+    id
 }
 
 /// Produces the record `id` onto `partition` of `topic`, keyed by its id.
@@ -833,6 +873,98 @@ async fn fifo_dlq_publish_failure_redelivers() {
         assert!(
             discarded.is_empty(),
             "a record kept through a DLQ outage is never counted as discarded: {discarded:?}"
+        );
+    }
+}
+
+/// A dead letter the producer can never publish is not tried again, so its
+/// partition is not blocked. The rejected record is past the
+/// `message.max.bytes` shove's producer runs with, so its dead letter is
+/// refused before it is sent. The record is discarded, committed and counted
+/// once in `messages_discarded_total`, and the record behind it is handled.
+#[tokio::test]
+async fn fifo_unpublishable_dead_letter_is_discarded_and_counted() {
+    #[cfg(feature = "metrics")]
+    let snapshotter = {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        recorder.install().expect("install the debugging recorder");
+        snapshotter
+    };
+
+    let mock = Mock::start(&[UNPUBLISHABLE_TOPIC, UNPUBLISHABLE_DLQ]);
+    let bootstrap = mock.bootstrap();
+    let big = produce_oversize(&bootstrap, UNPUBLISHABLE_TOPIC, "big-").await;
+    produce(&bootstrap, UNPUBLISHABLE_TOPIC, &["B"]).await;
+
+    let handler = Recorder::new(|id, _| {
+        if id.starts_with("big-") {
+            Outcome::Reject
+        } else {
+            Outcome::Ack
+        }
+    });
+    let consumer = Running::fifo::<UnpublishableTopic>(&bootstrap, &handler).await;
+    consumer
+        .wait_until(
+            || handler.count() == 2,
+            DELIVERY_TIMEOUT,
+            "B reaching the handler behind the unpublishable dead letter",
+        )
+        .await;
+    wait_for_committed_position(
+        &bootstrap,
+        UNPUBLISHABLE_TOPIC,
+        UNPUBLISHABLE_GROUP,
+        2,
+        DELIVERY_TIMEOUT,
+        "the discarded record and B committed",
+    )
+    .await;
+    tokio::time::sleep(SETTLE).await;
+    consumer.stop().await;
+
+    assert_eq!(
+        handler.ids(),
+        [big, "B".to_string()],
+        "the large record is handled once, and B behind it"
+    );
+    assert_eq!(
+        high_watermark(&bootstrap, UNPUBLISHABLE_DLQ).await,
+        0,
+        "no dead letter could be published"
+    );
+
+    #[cfg(feature = "metrics")]
+    {
+        let discarded: Vec<(String, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| {
+                key.key().name() == "shove_messages_discarded_total"
+                    && key
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "topic" && l.value() == UNPUBLISHABLE_TOPIC)
+            })
+            .map(|(key, _, _, value)| {
+                let reason = key
+                    .key()
+                    .labels()
+                    .find(|l| l.key() == "reason")
+                    .map_or_else(String::new, |l| l.value().to_string());
+                match value {
+                    DebugValue::Counter(n) => (reason, n),
+                    other => panic!("shove_messages_discarded_total is not a counter: {other:?}"),
+                }
+            })
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        assert_eq!(
+            discarded,
+            [("rejected".to_string(), 1)],
+            "the record whose dead letter can never be published is counted once as discarded"
         );
     }
 }
