@@ -9,7 +9,7 @@ use async_nats::jetstream::publish::PublishAck;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
-use uuid::Uuid;
+use uuid::{Builder, Uuid};
 
 use crate::backend::PublisherImpl;
 use crate::batch::BatchReport;
@@ -21,9 +21,27 @@ use crate::topic::Topic;
 use crate::{QueueTopology, ShoveError};
 
 use super::client::NatsClient;
-use super::constants::{COPY_OF_HEADER, RETRY_COUNT_HEADER, SEQUENCE_KEY_HEADER};
+use super::constants::{COPY_OF_HEADER, SEQUENCE_KEY_HEADER};
 
 const MAX_PUBLISH_ATTEMPTS: u32 = 3;
+
+/// The `Nats-Msg-Id` of a fresh publish: a version 4 UUID built from random
+/// bytes the thread-local CSPRNG draws.
+///
+/// JetStream de-duplicates on the id, so a party that can publish to the stream
+/// and predict an id could publish it ahead of the message and have the message
+/// dropped as a duplicate. A CSPRNG draw gives away nothing about the next one,
+/// and the generator reseeds from the OS now and then, so a publish makes no
+/// call to the OS of its own. The id is a plain string, so a retry copy's
+/// `-r{n}` and a dead letter's `-dlq` extend it as they extend any id.
+///
+/// `rand`'s `ThreadRng` is not reseeded on `fork`, so a child process forked
+/// from a thread that has drawn ids repeats the ids that thread draws next,
+/// and JetStream drops the later publish of a pair inside its duplicate
+/// window.
+fn new_message_id() -> Uuid {
+    Builder::from_random_bytes(rand::random()).into_uuid()
+}
 
 /// How long the original of a copy waits before it is redelivered when the
 /// copy's publish ended on a duplicate that could not be confirmed. The id
@@ -273,16 +291,21 @@ impl NatsPublisher {
 
     /// The headers a publish carries. A user header or sequence key NATS
     /// cannot carry is a `Validation` error, raised before anything is sent.
+    /// A fresh message has no `Shove-Retry-Count`: only a retry copy or a dead
+    /// letter carries one, and a missing count reads as zero.
     fn build_headers(
         extra: Option<&HashMap<String, String>>,
         seq_key: Option<&str>,
     ) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
+        let id = new_message_id();
         headers.insert(
             NATS_MESSAGE_ID,
-            header_value("Nats-Msg-Id", &Uuid::new_v4().to_string())?,
+            header_value(
+                "Nats-Msg-Id",
+                id.hyphenated().encode_lower(&mut Uuid::encode_buffer()),
+            )?,
         );
-        headers.insert(RETRY_COUNT_HEADER, HeaderValue::from(0u32));
 
         if let Some(extra) = extra {
             for (k, v) in extra {
@@ -525,8 +548,10 @@ impl PublisherImpl for NatsPublisher {
 
 #[cfg(test)]
 mod tests {
+    use super::super::constants::RETRY_COUNT_HEADER;
     use super::*;
     use jetstream::context::{PublishError, PublishErrorKind as K};
+    use uuid::{Variant, Version};
 
     /// A JetStream error response, as async-nats deserializes one off the wire.
     fn server_error() -> jetstream::Error {
@@ -693,6 +718,99 @@ mod tests {
                 &sent
             ),
             "a message that names no origin"
+        );
+    }
+
+    fn id_of(headers: &HeaderMap) -> String {
+        headers
+            .get(NATS_MESSAGE_ID)
+            .map(HeaderValue::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A fresh draw per publish: no id repeats across many publishes, whichever
+    /// threads make them.
+    #[test]
+    fn message_ids_are_unique_across_many_publishes() {
+        use std::collections::HashSet;
+
+        let mut seen = HashSet::new();
+        for _ in 0..50_000 {
+            let headers = NatsPublisher::build_headers(None, None).unwrap();
+            assert!(seen.insert(id_of(&headers)), "a publish repeated an id");
+        }
+
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..5_000)
+                        .map(|_| id_of(&NatsPublisher::build_headers(None, None).unwrap()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for thread in threads {
+            for id in thread.join().unwrap() {
+                assert!(seen.insert(id), "two threads took the same id");
+            }
+        }
+    }
+
+    /// An id is a lowercase hyphenated version 4 UUID, so a copy's `-r{n}` and
+    /// a dead letter's `-dlq` extend it as they extend any id.
+    #[test]
+    fn a_message_id_is_a_version_4_uuid() {
+        let id = id_of(&NatsPublisher::build_headers(None, None).unwrap());
+        let uuid = Uuid::parse_str(&id).unwrap();
+        assert_eq!(uuid.get_version(), Some(Version::Random));
+        assert_eq!(uuid.get_variant(), Variant::RFC4122);
+        assert_eq!(id, uuid.hyphenated().to_string());
+    }
+
+    /// An id gives away nothing about the next. Consecutive ids are no counter
+    /// step apart and open with no fixed prefix, so a party that can publish to
+    /// the stream cannot take an id ahead of a message.
+    #[test]
+    fn consecutive_message_ids_are_not_sequential_and_share_no_prefix() {
+        use std::collections::HashSet;
+
+        let ids: Vec<u128> = (0..256)
+            .map(|_| {
+                let id = id_of(&NatsPublisher::build_headers(None, None).unwrap());
+                Uuid::parse_str(&id).unwrap().as_u128()
+            })
+            .collect();
+        for pair in ids.windows(2) {
+            assert!(
+                pair[0].abs_diff(pair[1]) > u128::from(u64::MAX),
+                "{:032x} and {:032x} are close together",
+                pair[0],
+                pair[1]
+            );
+        }
+        let prefixes: HashSet<u128> = ids.iter().map(|id| id >> 64).collect();
+        assert_eq!(prefixes.len(), ids.len(), "two ids open alike");
+    }
+
+    /// A fresh message starts at retry count zero without saying so: every
+    /// reader of the header takes a missing one for zero.
+    #[test]
+    fn a_fresh_publish_stamps_no_retry_count() {
+        let headers = NatsPublisher::build_headers(None, None).unwrap();
+        assert!(headers.get(RETRY_COUNT_HEADER).is_none());
+
+        let mut extra = HashMap::new();
+        extra.insert("x-trace-id".to_string(), "t".to_string());
+        let headers = NatsPublisher::build_headers(Some(&extra), Some("key")).unwrap();
+        assert!(headers.get(RETRY_COUNT_HEADER).is_none());
+        assert_eq!(
+            headers.get("x-trace-id").map(HeaderValue::as_str),
+            Some("t")
+        );
+        assert_eq!(
+            headers.get(SEQUENCE_KEY_HEADER).map(HeaderValue::as_str),
+            Some("key")
         );
     }
 
