@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use crate::error::Result;
 use crate::topology::QueueTopology;
 
-use super::client::KafkaClient;
+use super::client::{ExistingTopic, KafkaClient, PartitionGrowth};
 use super::constants::{DEFAULT_PARTITIONS, DEFAULT_REPLICATION};
+use super::consumer_group::KafkaAutoOffsetReset;
 
 /// Merge declarer-level and per-topic config entries into one map: per-topic
 /// wins key-by-key; within a layer, the later entry wins. BTreeMap keeps the
@@ -65,13 +66,37 @@ fn warn_if_under_replicated_for_acks_all(queue: &str, replication: i32) {
     }
 }
 
+/// Warn when `declare` raised the partitions of a topic for a group that
+/// starts a partition with no committed offset at `latest`: records produced
+/// to a new partition before the group's members are assigned it are never
+/// read.
+fn warn_if_grown_under_latest(
+    queue: &str,
+    growth: PartitionGrowth,
+    reset: Option<KafkaAutoOffsetReset>,
+) {
+    if reset == Some(KafkaAutoOffsetReset::Latest) {
+        tracing::warn!(
+            queue,
+            from = growth.from,
+            to = growth.to,
+            "raised the partition count of a topic read by a consumer group that resets to \
+             `latest`: records produced to the new partitions before the group's members are \
+             assigned them are skipped"
+        );
+    }
+}
+
 pub struct KafkaTopologyDeclarer {
     client: KafkaClient,
     /// Minimum number of partitions for the main topic.
     /// When set (e.g. by consumer group registration), the partition count
     /// will be `max(default, min_partitions)` so that Kafka can distribute
-    /// load across all consumers.
+    /// load across all consumers. A sequenced topic ignores it.
     min_partitions: Option<i32>,
+    /// The `auto.offset.reset` of the group `declare` runs for, when the
+    /// registry knows it.
+    group_offset_reset: Option<KafkaAutoOffsetReset>,
     /// Replication factor applied to topics created by declaration (main, DLQ).
     /// `None` keeps the default of `1` (single-broker dev). Production
     /// clusters should set `3` (or whatever quorum the cluster sizes for).
@@ -92,6 +117,7 @@ impl KafkaTopologyDeclarer {
         Self {
             client,
             min_partitions: None,
+            group_offset_reset: None,
             replication_factor: None,
             topic_config: Vec::new(),
             retention_finite: false,
@@ -99,11 +125,27 @@ impl KafkaTopologyDeclarer {
         }
     }
 
-    /// Ensure the main topic has at least `n` partitions. Has no effect on an
-    /// `external()` topology, which shove never expands: `declare` then warns
-    /// when the topic has fewer partitions than `n`.
+    /// Ensure the main topic has at least `n` partitions. An existing topic
+    /// with fewer is expanded, and `declare` warns when the consumer group
+    /// registry that runs it resets to `latest`, because records produced to
+    /// the new partitions before the group is assigned them are skipped.
+    ///
+    /// Has no effect on an `external()` topology, which shove never expands:
+    /// `declare` then warns when the topic has fewer partitions than `n`.
+    /// Has no effect on a sequenced topology either, whose partition count is
+    /// its `routing_shards`: keys are routed over the partitions, so adding
+    /// one remaps them. `declare` never adds partitions to a sequenced topic,
+    /// and returns `ShoveError::Topology` for one that has fewer partitions
+    /// than `routing_shards`.
     pub fn with_min_partitions(mut self, n: i32) -> Self {
         self.min_partitions = Some(n);
+        self
+    }
+
+    /// The `auto.offset.reset` of the consumer group the registry declares
+    /// for, so that raising the partitions under a `latest` group can warn.
+    pub(crate) fn with_group_offset_reset(mut self, reset: Option<KafkaAutoOffsetReset>) -> Self {
+        self.group_offset_reset = reset;
         self
     }
 
@@ -200,9 +242,13 @@ impl KafkaTopologyDeclarer {
         } else {
             let partitions = self.effective_partitions(DEFAULT_PARTITIONS);
             let config = merge_topic_config(&self.topic_config, topology.kafka_topic_config());
-            self.client
-                .create_topic(queue, partitions, replication, &config)
+            let growth = self
+                .client
+                .create_topic(queue, partitions, replication, &config, ExistingTopic::Grow)
                 .await?;
+            if let Some(growth) = growth {
+                warn_if_grown_under_latest(queue, growth, self.group_offset_reset);
+            }
         }
 
         if let Some(dlq) = topology.dlq() {
@@ -217,7 +263,13 @@ impl KafkaTopologyDeclarer {
                 tracing::debug!(dlq, partitions, "bound to external Kafka dead-letter topic");
             } else {
                 self.client
-                    .create_topic(dlq, DEFAULT_PARTITIONS, replication, &[])
+                    .create_topic(
+                        dlq,
+                        DEFAULT_PARTITIONS,
+                        replication,
+                        &[],
+                        ExistingTopic::Grow,
+                    )
                     .await?;
             }
         }
@@ -238,16 +290,29 @@ impl KafkaTopologyDeclarer {
             ))
         })?;
 
-        let num_partitions = self.effective_partitions(seq.routing_shards() as i32);
+        // Keys route over the partitions, so the count is routing_shards; min_partitions has no say.
+        let num_partitions = i32::from(seq.routing_shards());
         let replication = self.effective_replication();
         let config = merge_topic_config(&self.topic_config, topology.kafka_topic_config());
         self.client
-            .create_topic(queue, num_partitions, replication, &config)
+            .create_topic(
+                queue,
+                num_partitions,
+                replication,
+                &config,
+                ExistingTopic::Keep,
+            )
             .await?;
 
         if let Some(dlq) = topology.dlq() {
             self.client
-                .create_topic(dlq, DEFAULT_PARTITIONS, replication, &[])
+                .create_topic(
+                    dlq,
+                    DEFAULT_PARTITIONS,
+                    replication,
+                    &[],
+                    ExistingTopic::Grow,
+                )
                 .await?;
         }
 
@@ -286,7 +351,8 @@ impl KafkaTopologyDeclarer {
 #[cfg(test)]
 mod tests {
     use super::{
-        merge_topic_config, under_replicated_for_acks_all, warn_if_under_replicated_for_acks_all,
+        KafkaAutoOffsetReset, PartitionGrowth, merge_topic_config, under_replicated_for_acks_all,
+        warn_if_grown_under_latest, warn_if_under_replicated_for_acks_all,
     };
 
     #[test]
@@ -368,6 +434,73 @@ mod tests {
             captured.0.lock().unwrap().as_slice(),
             &["kafka-rf1".to_string(), "@1".to_string()]
         );
+    }
+
+    /// The fields of every WARN event `f` emits, one `name=value` list per
+    /// event.
+    fn warnings(f: impl FnOnce()) -> Vec<String> {
+        use std::fmt::Debug;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Clone, Default)]
+        struct Warned(Arc<Mutex<Vec<String>>>);
+
+        struct Fields(Vec<String>);
+
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+                self.0.push(format!("{}={value:?}", field.name()));
+            }
+        }
+
+        impl<S: tracing::Subscriber> Layer<S> for Warned {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    let mut fields = Fields(Vec::new());
+                    event.record(&mut fields);
+                    self.0.lock().unwrap().push(fields.0.join(" "));
+                }
+            }
+        }
+
+        let warned = Warned::default();
+        with_default(tracing_subscriber::registry().with(warned.clone()), f);
+        warned.0.lock().unwrap().clone()
+    }
+
+    /// A topic raised under a `latest` group warns, with the topic and both
+    /// counts, because the group skips what is produced to the new
+    /// partitions before it is assigned them.
+    #[test]
+    fn growth_under_a_latest_group_warns_with_both_counts() {
+        let growth = PartitionGrowth { from: 4, to: 8 };
+
+        let warned = warnings(|| {
+            warn_if_grown_under_latest("orders", growth, Some(KafkaAutoOffsetReset::Latest));
+        });
+
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        for field in ["queue=\"orders\"", "from=4", "to=8"] {
+            assert!(warned[0].contains(field), "{field} missing from {warned:?}");
+        }
+    }
+
+    /// An `earliest` group reads the new partitions from their start, and a
+    /// registry that does not know the policy has nothing to warn about.
+    #[test]
+    fn growth_under_any_other_group_is_silent() {
+        let growth = PartitionGrowth { from: 4, to: 8 };
+
+        let warned = warnings(|| {
+            warn_if_grown_under_latest("orders", growth, Some(KafkaAutoOffsetReset::Earliest));
+            warn_if_grown_under_latest("orders", growth, Some(KafkaAutoOffsetReset::None));
+            warn_if_grown_under_latest("orders", growth, None);
+        });
+
+        assert!(warned.is_empty(), "{warned:?}");
     }
 
     fn cfg(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
