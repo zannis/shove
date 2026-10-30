@@ -1123,11 +1123,33 @@ const MAX_OPEN_PULLS: usize = 2;
 /// first, so no message is started without a slot.
 type Deliveries = stream::Zip<Batch, stream::Iter<std::vec::IntoIter<OwnedSemaphorePermit>>>;
 
+/// The statuses a pull can end with that clear on their own: the durable's
+/// waiting list was full, or its cluster leader changed. Any other status,
+/// such as a pull the durable's limits refuse (`Exceeded MaxRequestBatch`,
+/// `Exceeded MaxRequestExpires`, `Exceeded MaxRequestMaxBytes`), never
+/// clears, so it is the connection error that spends a reconnect attempt.
+const TRANSIENT_PULL_STATUSES: [&str; 2] = ["Exceeded MaxWaiting", "Leadership Change"];
+
+/// Whether `ended`, the error async-nats yields for a status that ends a
+/// pull, is a `409` with one of the [`TRANSIENT_PULL_STATUSES`]. async-nats
+/// renders it as `error while processing messages from the stream: {code},
+/// {description:?}`, and anything else reads as not transient.
+fn is_transient_pull_status(ended: &str) -> bool {
+    ended
+        .strip_prefix("error while processing messages from the stream: 409, ")
+        .is_some_and(|description| {
+            TRANSIENT_PULL_STATUSES
+                .iter()
+                .any(|status| description == format!("Some({status:?})"))
+        })
+}
+
 /// The base of the pause before a worker opens another pull after the server
-/// ended one with a status. [`Backoff`] jitters each pause by up to half the
-/// base either way, so the first is 50-150 ms. The base doubles with each
-/// further such pull, up to [`ENDED_PULL_PAUSE_MAX`], and only a delivery
-/// resets it. The pulls already open go on meanwhile.
+/// ended one with one of the [`TRANSIENT_PULL_STATUSES`]. [`Backoff`] jitters
+/// each pause by up to half the base either way, so the first is 50-150 ms.
+/// The base doubles with each further such pull, up to
+/// [`ENDED_PULL_PAUSE_MAX`], and only a delivery resets it. The pulls already
+/// open go on meanwhile.
 const ENDED_PULL_PAUSE: Duration = Duration::from_millis(100);
 
 /// The most the base of [`ENDED_PULL_PAUSE`] grows to, so a pause at the cap
@@ -1407,6 +1429,16 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                     self.start(msg, slot, ack_wait);
                 }
                 Step::Event(PullEvent::Delivery(Err(e), _)) => {
+                    if !is_transient_pull_status(&e.to_string()) {
+                        tracing::error!(error = %e, queue, "consumer stream error");
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::Nats,
+                            metrics::BackendErrorKind::Consume,
+                        );
+                        return Err(ShoveError::Connection(format!(
+                            "consumer stream error on {queue}: {e}"
+                        )));
+                    }
                     tracing::warn!(error = %e, queue, "the server ended a pull, probing the connection");
                     let Some(probe) = self.unless_stopped(consumer.get_info()).await else {
                         return self.stop(consumer, pulls).await;
@@ -3132,6 +3164,49 @@ mod worker_flow_tests {
         );
         drop(third);
         assert!(!processing.load(Ordering::Acquire));
+    }
+
+    /// The error async-nats yields for a status that ends a pull, as it
+    /// renders it.
+    fn ended_with(code: &str, description: Option<&str>) -> String {
+        format!(
+            "error while processing messages from the stream: {code}, {:?}",
+            description.map(str::to_string)
+        )
+    }
+
+    #[test]
+    fn only_a_full_waiting_list_or_a_leader_change_clears_on_its_own() {
+        assert!(is_transient_pull_status(&ended_with(
+            "409",
+            Some("Exceeded MaxWaiting")
+        )));
+        assert!(is_transient_pull_status(&ended_with(
+            "409",
+            Some("Leadership Change")
+        )));
+        for refused in [
+            "Exceeded MaxRequestBatch of 1",
+            "Exceeded MaxRequestExpires of 1s",
+            "Exceeded MaxRequestMaxBytes of 1",
+            "Message Size Exceeds MaxBytes",
+            "Consumer Deleted",
+            "Consumer is push based",
+        ] {
+            assert!(
+                !is_transient_pull_status(&ended_with("409", Some(refused))),
+                "{refused}"
+            );
+        }
+        assert!(!is_transient_pull_status(&ended_with("503", None)));
+        assert!(!is_transient_pull_status(&ended_with(
+            "400",
+            Some("Bad Request")
+        )));
+        assert!(
+            !is_transient_pull_status("Exceeded MaxWaiting"),
+            "text in another shape is not taken for the status"
+        );
     }
 
     /// A drain waits on the tasks themselves, so it ends once the last one

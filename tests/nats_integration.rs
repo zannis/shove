@@ -7084,3 +7084,70 @@ async fn an_unconfirmable_duplicate_copy_delays_the_original_and_never_loses_it(
     handle.await.unwrap().ok();
     broker.close().await;
 }
+
+shove::define_topic!(
+    LimitedTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-limited").dlq().build()
+);
+
+impl MessageHandler<LimitedTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+/// A durable whose limits refuse every pull the worker can make, here a
+/// `max_batch` below the worker's prefetch, ends the consumer with an error
+/// once its reconnect attempts are spent, rather than leaving it pulling and
+/// pausing forever.
+#[tokio::test]
+async fn a_durable_that_refuses_every_pull_ends_the_consumer() {
+    use async_nats::jetstream::consumer::AckPolicy;
+    use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<LimitedTopic>().await.unwrap();
+    client
+        .jetstream()
+        .get_stream("nats-limited")
+        .await
+        .unwrap()
+        .create_consumer(PullConsumerConfig {
+            durable_name: Some("nats-limited-consumer".to_string()),
+            ack_policy: AckPolicy::Explicit,
+            max_ack_pending: -1,
+            max_batch: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<LimitedTopic, _>(
+                CountingHandler::new(),
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_prefetch_count(2)
+                    .with_max_reconnect_attempts(2),
+            )
+            .await
+    });
+
+    let ended = tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the consumer ends once its reconnect attempts are spent")
+        .expect("the consumer task does not panic");
+    let error = ended.expect_err("a durable that refuses every pull is an error");
+    assert!(
+        error.to_string().contains("Exceeded MaxRequestBatch"),
+        "the error names the limit: {error}"
+    );
+    broker.close().await;
+}
