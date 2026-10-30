@@ -2570,18 +2570,25 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 /// assignment change after that bound, and a connection the coordinator
 /// drops after it, strand the fetch's partitions with the error ridden out.
 ///
-/// Every other code ends the loop, as it did before. That covers a fatal
-/// error, whether `MessageConsumptionFatal` or a `__FATAL` left
-/// untranslated (`rdkafka_event.h:77-91`), and `AutoOffsetReset`, see
+/// Every other code ends the loop. That covers a fatal error, whether
+/// `MessageConsumptionFatal` or a `__FATAL` left untranslated
+/// (`rdkafka_event.h:77-91`), and `AutoOffsetReset`, see
 /// [`map_kafka_error`]. It covers `PollExceeded`, raised once librdkafka has
 /// left the group for a member that did not poll in time
-/// (`rdkafka_cgrp.c:5162-5210`). It also covers what a committed-offset
-/// fetch, a coordinator lookup, a join or a fetch passes to the
-/// application: authorization, a missing topic, `__TIMED_OUT`,
-/// `NotCoordinator` and the like. librdkafka does not recover from those on
-/// its own: a committed-offset fetch that fails leaves its partitions
-/// unfetched until the assignment changes (`rdkafka_assignment.c:198-232`),
-/// and the reconnect that ends the loop fetches them again.
+/// (`rdkafka_cgrp.c:5162-5210`). It covers what a committed-offset fetch
+/// passes to the application, `__TIMED_OUT` and `NotCoordinator` among
+/// them: the fetch's partitions stay unfetched until the assignment
+/// changes, and librdkafka does not fetch them again on its own
+/// (`rdkafka_assignment.c:198-232`), so the reconnect that ends the loop
+/// fetches them. It covers an authorization a coordinator lookup or a fetch
+/// was refused, and a subscribed topic the cluster does not know.
+/// librdkafka reports each of those once and goes on retrying in silence
+/// (`rdkafka_fetcher.c:295-307`, `:344`, `rdkafka_cgrp.c:794-808`,
+/// `:5232-5262`), and only an operator clears one, with an ACL or the
+/// topic, so the loop ends where the error shows and every reconnect
+/// reports it again. And it covers the join and fetch errors librdkafka
+/// reports on every retry of a cause that persists, a refused join among
+/// them (`rdkafka_cgrp.c:2434-2441`, `rdkafka_fetcher.c:327-338`).
 fn recv_error_is_transient(gate: &TransportGate, error: &KafkaError) -> bool {
     match error {
         KafkaError::MessageConsumption(RDKafkaErrorCode::BrokerTransportFailure) => {
@@ -12400,8 +12407,11 @@ mod error_classifier_tests {
         )));
     }
 
-    /// The group's coordinator lookup or join was refused; every retry
-    /// meets the same refusal (`rdkafka_cgrp.c:794-807`).
+    /// The group's coordinator lookup or join was refused. librdkafka
+    /// reports a refused lookup once and retries it in silence, and a
+    /// refused join on every attempt; either way every retry meets the same
+    /// refusal until an operator grants the ACL (`rdkafka_cgrp.c:794-808`,
+    /// `:2434-2441`).
     #[test]
     fn a_group_authorization_failure_ends_the_loop() {
         assert!(!transient(consumption(
@@ -12409,8 +12419,9 @@ mod error_classifier_tests {
         )));
     }
 
-    /// A fetch the topic's ACL refused stops the partition's fetching
-    /// (`rdkafka_fetcher.c:295-308`).
+    /// A fetch the topic's ACL refused. librdkafka reports it once per
+    /// partition and goes on fetching in silence after a backoff, so only an
+    /// operator's ACL clears it (`rdkafka_fetcher.c:295-307`, `:344`).
     #[test]
     fn a_topic_authorization_failure_ends_the_loop() {
         assert!(!transient(consumption(
@@ -12418,8 +12429,9 @@ mod error_classifier_tests {
         )));
     }
 
-    /// A subscribed topic the cluster does not know
-    /// (`rdkafka_cgrp.c:5240-5262`).
+    /// A subscribed topic the cluster does not know. librdkafka reports it
+    /// once and keeps the subscription, so only an operator creating the
+    /// topic clears it (`rdkafka_cgrp.c:5232-5262`).
     #[test]
     fn an_unknown_topic_ends_the_loop() {
         assert!(!transient(consumption(

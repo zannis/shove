@@ -330,10 +330,12 @@ The consumer logs each of them at warn level and keeps polling on the same clien
 An outage shorter than `session.timeout.ms`, 10 s, therefore costs the member nothing but the wait: it keeps its place in its group, and nothing is rebalanced.
 After a longer one the coordinator has dropped the member, and librdkafka rejoins the group on the same client once a broker answers.
 librdkafka reports an identical broker failure at most once every 30 s per broker, so a bounce logs a handful of lines.
-Every other receive error ends the member's connection, as it did before.
+Every other receive error ends the member's connection.
 That covers a fatal error, a missing committed offset under `KafkaAutoOffsetReset::None`, a poll interval the member outlasted, and the authorization, coordinator and fetch errors librdkafka passes on.
-librdkafka does not recover from those on its own: a committed-offset fetch the coordinator refused, for one, leaves its partitions unfetched until the assignment changes.
-A retryable one reconnects, which rejoins the group and fetches the committed offsets again, and a permanent one ends the member.
+A committed-offset fetch the coordinator refused leaves its partitions unfetched until the assignment changes, and librdkafka does not fetch them again on its own.
+An authorization a coordinator lookup or a fetch was refused, and a subscribed topic the cluster does not know, are reported once, and librdkafka goes on retrying them in silence.
+Only an operator clears either, with an ACL grant or the topic created, so the consumer ends its connection where the error shows, and every reconnect reports the error again.
+A retryable error reconnects, which rejoins the group and fetches the committed offsets again, and a permanent one ends the member.
 That holds for a group member, `KafkaConsumer::run`, `run_batch`, `run_fifo`, a broadcast subscription and `run_dlq`, and for every wait in them that polls.
 
 A committed-offset fetch can fail with the code a failed broker connection reports.
@@ -351,14 +353,16 @@ They stay so until those partitions are revoked or the member restarts.
 
 ### Pauses and rebalances
 
-A consumer pauses its whole assignment while it waits, and keeps polling meanwhile.
-It waits for a prefetch slot, for a commit under `CommitPolicy::PerRecord`, through a hold or a dead-letter retry on a sequenced consumer, through a schema registry wait, and through the drain at a stop.
+A consumer keeps polling while it waits: for a prefetch slot, for a commit under `CommitPolicy::PerRecord`, through a hold or a dead-letter retry on a sequenced consumer, through a schema registry wait, and through the drain at a stop.
+The wait for a prefetch slot and the drain at a stop leave the assignment as it is for their first second, and pause all of it once they put a record back after that.
+While every slot is held and a holder is a handler waiting in place, the consumer pauses it at once instead, see [Bind to an infra-owned topic](#bind-to-an-infra-owned-topic).
+The other waits run with the whole assignment paused.
 librdkafka keeps a pause flag per partition and keeps it across a revoke.
 A partition revoked while the consumer was paused and handed back later therefore arrives paused, and one assigned fresh arrives unpaused.
 On every assign it applies, under either commit policy and on every path that joins a group, the consumer re-applies its intent over the whole assignment.
-That intent is paused while it waits and resumed otherwise.
+That intent is paused while the consumer holds a pause, and resumed otherwise.
 It does the same when a schema registry wait ends.
-A returned partition therefore never stays paused behind a wait that is over, and a partition handed out during a wait is paused with the rest.
+A returned partition therefore never stays paused behind a wait that is over, and a partition handed out while the consumer holds a pause is paused with the rest.
 
 ### Fan-out — a second reader on the same topic
 
