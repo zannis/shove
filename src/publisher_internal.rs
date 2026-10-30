@@ -2,27 +2,78 @@ use std::collections::HashMap;
 
 use crate::error::{Result, ShoveError};
 
-/// Header prefixes reserved for internal use. Callers may not set headers
-/// that start with any of these via `Publisher::publish_with_headers`.
+/// How a reserved header name is matched, ASCII case-insensitively.
 #[allow(dead_code)] // Used by feature-gated backend publishers.
-const RESERVED_HEADER_PREFIXES: &[&str] =
-    &["x-retry-count", "x-message-id", "x-death", "x-sequence-key"];
+enum Reserved {
+    /// Every name that starts with this string.
+    Prefix(&'static str),
+    /// This name and no other, so a name that only resembles it stays free.
+    Exact(&'static str),
+}
+
+/// Header names callers may not set via `Publisher::publish_with_headers` on any
+/// backend: the names the backends stamp themselves or read back as their own.
+/// A name only one backend writes is that backend's to reserve, through the
+/// second argument of [`validate_headers`]. A test in each backend checks that
+/// every name it writes is covered, so a new internal name is added here or to
+/// that backend's own slice.
+#[allow(dead_code)] // Used by feature-gated backend publishers.
+const RESERVED_HEADERS: &[Reserved] = &[
+    Reserved::Prefix("shove-"),
+    Reserved::Prefix("x-retry-count"),
+    Reserved::Prefix("x-message-id"),
+    Reserved::Prefix("x-death"),
+    Reserved::Prefix("x-sequence-key"),
+    Reserved::Exact("x-original-queue"),
+];
 
 /// Rejects user-supplied headers that collide with internal header keys.
+///
+/// `backend_names` are exact names, matched ASCII case-insensitively like the
+/// shared list, that only the calling backend writes itself.
 #[allow(dead_code)] // Used by feature-gated backend publishers.
-pub(crate) fn validate_headers(headers: &HashMap<String, String>) -> Result<()> {
+pub(crate) fn validate_headers(
+    headers: &HashMap<String, String>,
+    backend_names: &[&str],
+) -> Result<()> {
     for key in headers.keys() {
         let key_lower = key.to_ascii_lowercase();
-        if RESERVED_HEADER_PREFIXES
+        for reserved in RESERVED_HEADERS {
+            let reason = match reserved {
+                Reserved::Prefix(prefix) if key_lower.starts_with(*prefix) => {
+                    "uses a reserved prefix"
+                }
+                Reserved::Exact(name) if key_lower == *name => "is a reserved name",
+                _ => continue,
+            };
+            return Err(ShoveError::Validation(format!("header '{key}' {reason}")));
+        }
+        if backend_names
             .iter()
-            .any(|prefix| key_lower.starts_with(*prefix))
+            .any(|name| key.eq_ignore_ascii_case(name))
         {
             return Err(ShoveError::Validation(format!(
-                "header '{key}' uses a reserved prefix"
+                "header '{key}' is a reserved name"
             )));
         }
     }
     Ok(())
+}
+
+/// Panics unless [`validate_headers`], given the `backend_names` the backend's
+/// publisher passes it, rejects every name in `keys`. Each backend's tests call
+/// it with the names that backend writes itself.
+#[cfg(test)]
+#[allow(dead_code)] // Used by feature-gated backend tests.
+pub(crate) fn assert_internal_keys_reserved(backend: &str, keys: &[&str], backend_names: &[&str]) {
+    assert!(!keys.is_empty(), "{backend} lists no internal names");
+    for key in keys {
+        let headers = HashMap::from([((*key).to_string(), "1".to_string())]);
+        assert!(
+            validate_headers(&headers, backend_names).is_err(),
+            "{backend} writes '{key}' itself but validate_headers lets a caller set it"
+        );
+    }
 }
 
 /// FNV-1a 64-bit hash. Stable across versions — used for sequence-key shard
@@ -58,33 +109,131 @@ mod tests {
         let mut h = HashMap::new();
         h.insert("x-trace-id".into(), "abc".into());
         h.insert("x-custom".into(), "value".into());
-        assert!(validate_headers(&h).is_ok());
+        assert!(validate_headers(&h, &[]).is_ok());
     }
 
     #[test]
     fn rejects_retry_count_header() {
         let mut h = HashMap::new();
         h.insert("x-retry-count".into(), "5".into());
-        assert!(validate_headers(&h).is_err());
+        assert!(validate_headers(&h, &[]).is_err());
     }
 
     #[test]
     fn rejects_message_id_header() {
         let mut h = HashMap::new();
         h.insert("X-Message-Id".into(), "fake".into());
-        assert!(validate_headers(&h).is_err());
+        assert!(validate_headers(&h, &[]).is_err());
     }
 
     #[test]
     fn rejects_death_header() {
         let mut h = HashMap::new();
         h.insert("x-death-reason".into(), "evil".into());
-        assert!(validate_headers(&h).is_err());
+        assert!(validate_headers(&h, &[]).is_err());
+    }
+
+    #[test]
+    fn shove_prefixed_headers_are_rejected() {
+        for name in [
+            "Shove-Retry-Count",
+            "Shove-Message-Id",
+            "Shove-Base-Message-Id",
+            "Shove-Death-Reason",
+            "Shove-Death-Count",
+            "Shove-Original-Queue",
+            "Shove-Sequence-Key",
+            "SHOVE-retry-count",
+            "shove-anything",
+        ] {
+            let headers = HashMap::from([(name.to_string(), "1".to_string())]);
+            match validate_headers(&headers, &[]) {
+                Err(ShoveError::Validation(message)) => {
+                    assert!(message.contains(name), "{message:?} does not name {name:?}");
+                }
+                other => panic!("{name:?} was not rejected: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn names_that_only_resemble_the_shove_prefix_are_accepted() {
+        for name in [
+            "shove",
+            "shove_retry_count",
+            "shoves-retry",
+            "x-shove-trace",
+        ] {
+            let headers = HashMap::from([(name.to_string(), "1".to_string())]);
+            assert!(
+                validate_headers(&headers, &[]).is_ok(),
+                "{name:?} was rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_exact_names_are_rejected() {
+        for name in ["x-original-queue", "X-Original-Queue"] {
+            let headers = HashMap::from([(name.to_string(), "1".to_string())]);
+            match validate_headers(&headers, &[]) {
+                Err(ShoveError::Validation(message)) => {
+                    assert!(message.contains(name), "{message:?} does not name {name:?}");
+                }
+                other => panic!("{name:?} was not rejected: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn names_that_only_resemble_a_reserved_exact_name_are_accepted() {
+        for name in ["x-original-queues", "x-original", "my-x-original-queue"] {
+            let headers = HashMap::from([(name.to_string(), "1".to_string())]);
+            assert!(
+                validate_headers(&headers, &[]).is_ok(),
+                "{name:?} was rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_and_shard_are_free_unless_a_backend_reserves_them() {
+        for name in ["payload", "Payload", "shard", "SHARD"] {
+            let headers = HashMap::from([(name.to_string(), "1".to_string())]);
+            assert!(
+                validate_headers(&headers, &[]).is_ok(),
+                "{name:?} was rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_backends_own_names_are_reserved_on_top_of_the_shared_list() {
+        for name in ["payload", "Payload", "PAYLOAD"] {
+            let headers = HashMap::from([(name.to_string(), "1".to_string())]);
+            match validate_headers(&headers, &["payload"]) {
+                Err(ShoveError::Validation(message)) => {
+                    assert!(message.contains(name), "{message:?} does not name {name:?}");
+                }
+                other => panic!("{name:?} was not rejected: {other:?}"),
+            }
+        }
+        // A name that only resembles the backend's, or belongs to another
+        // backend, stays free.
+        for name in ["payload-type", "shard"] {
+            let headers = HashMap::from([(name.to_string(), "1".to_string())]);
+            assert!(
+                validate_headers(&headers, &["payload"]).is_ok(),
+                "{name:?} was rejected"
+            );
+        }
+        let shared = HashMap::from([("Shove-Retry-Count".to_string(), "1".to_string())]);
+        assert!(validate_headers(&shared, &["payload"]).is_err());
     }
 
     #[test]
     fn empty_headers_ok() {
-        assert!(validate_headers(&HashMap::new()).is_ok());
+        assert!(validate_headers(&HashMap::new(), &[]).is_ok());
     }
 
     #[test]

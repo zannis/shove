@@ -118,9 +118,7 @@ impl NatsPublisher {
         }
 
         // After the user headers: the sequence key drives FailAll poisoning, so
-        // a caller must not be able to overwrite it. (`validate_headers` guards
-        // the `x-` internal names shared with the other backends, but not the
-        // `Shove-` names this backend uses.)
+        // a caller must not be able to overwrite it.
         if let Some(key) = seq_key {
             headers.insert(SEQUENCE_KEY_HEADER, key);
         }
@@ -155,7 +153,7 @@ impl NatsPublisher {
         message: &T::Message,
         extra_headers: HashMap<String, String>,
     ) -> Result<()> {
-        validate_headers(&extra_headers)?;
+        validate_headers(&extra_headers, &[])?;
         let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
         let (subject, seq_key) = Self::resolve_subject_and_key::<T>(topology, message);

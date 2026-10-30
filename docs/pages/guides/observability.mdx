@@ -258,7 +258,7 @@ Available log levels used by `shove`:
 `MessageMetadata::headers` is a `HashMap<String, String>` carrying broker-level headers that survive hold-queue hops. Notable headers:
 
 - **`x-trace-id`** — used by `Audited` as the `trace_id` on audit records. Publishers do not set it automatically; if absent on delivery, `Audited` generates a fresh UUID per message. Set it explicitly via `publish_with_headers` (shown below) when you want a trace ID that connects to upstream/downstream systems. Once set, it is preserved across retries — hold-queue hops forward headers.
-- **`x-shove-retry-count`** — the internal retry counter maintained by `shove`'s consumer routing layer.
+- **`x-retry-count`** on RabbitMQ, Redis, SNS/SQS and the in-process broker, and **`Shove-Retry-Count`** on Kafka and NATS — the internal retry counter maintained by `shove`'s consumer routing layer. Read it as `metadata.retry_count`. Both names are reserved (see [Reserved header names](#reserved-header-names)).
 - Backend-specific identifiers (see the table below).
 
 To set `x-trace-id` at publish time:
@@ -273,6 +273,22 @@ publisher.publish_with_headers::<Orders>(&msg, headers).await?;
 ```
 
 The consumer surfaces this via `metadata.headers.get("x-trace-id")` in the handler. The audit wrapper reads it automatically.
+
+### Reserved header names
+
+`publish_with_headers` refuses a reserved header name. It returns `ShoveError::Validation` naming the header, and nothing is published. Names match in any letter case. Most reserved names apply to every backend. Two belong to the one backend that writes them and stay free on the others.
+
+| Reserved name | Match | Backends |
+|---|---|---|
+| `shove-` | starts with | all |
+| `x-retry-count`, `x-message-id`, `x-death`, `x-sequence-key` | starts with | all |
+| `x-original-queue` | exactly | all |
+| `payload` | exactly | Redis |
+| `shard` | exactly | SNS/SQS |
+
+These are the names a backend stamps itself or reads back as its own: the retry count, the message id, the dead-letter reason, count and original queue, and the sequence key, plus two fields only one backend has. Those are the `payload` field of a Redis stream entry and the `shard` attribute that routes a sequenced SNS message to its queue. A caller-supplied header with one of these names could override the value `shove` stamps. A name that only resembles a reserved one, such as `payload-type` or `x-shove-trace`, is accepted. So is `payload` on every backend but Redis and `shard` on every backend but SNS/SQS.
+
+This is a behaviour change for callers that set a reserved name. Earlier versions accepted the `shove-` names and `x-original-queue` on every backend, `payload` on Redis and `shard` on SNS/SQS, and sent them. A caller that still sets one now gets the error, so rename the header to a name outside the list, such as `x-source`. A handler that republishes a delivery's `metadata.headers` must drop the reserved names first, because Kafka and NATS deliveries include the `Shove-*` headers that shove stamps itself.
 
 ## Connecting to OpenTelemetry
 

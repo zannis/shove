@@ -22,6 +22,17 @@ pub(super) const ORIGINAL_QUEUE_HEADER: &str = "Shove-Original-Queue";
 pub(super) const DEATH_COUNT_HEADER: &str = "Shove-Death-Count";
 pub(super) const MESSAGE_ID_HEADER: &str = "Shove-Message-Id";
 
+/// Header names this backend writes itself. A new one belongs here: a test
+/// checks that `validate_headers` reserves every name in this list.
+#[cfg(test)]
+const INTERNAL_HEADERS: &[&str] = &[
+    RETRY_COUNT_HEADER,
+    DEATH_REASON_HEADER,
+    ORIGINAL_QUEUE_HEADER,
+    DEATH_COUNT_HEADER,
+    MESSAGE_ID_HEADER,
+];
+
 // ---------------------------------------------------------------------------
 // Group ID derivations
 // ---------------------------------------------------------------------------
@@ -281,6 +292,12 @@ pub(super) const FETCH_WAIT_MAX_MS: u32 = 50;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::publisher_internal::assert_internal_keys_reserved;
+
+    #[test]
+    fn every_internal_header_is_reserved_by_validate_headers() {
+        assert_internal_keys_reserved("Kafka", INTERNAL_HEADERS, &[]);
+    }
 
     #[test]
     fn group_id_derivations_are_canonical() {
