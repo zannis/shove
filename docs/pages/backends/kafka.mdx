@@ -521,6 +521,16 @@ group
 
 The autoscaler measures consumer lag (the offset gap between the latest produced message and the latest committed offset) and adjusts the number of active consumers within the `min..=max` range.
 
+A lag poll asks the broker for the start offsets and then the end offsets of every partition in two batched rounds, each sending one request per partition leader, so the cost of a poll follows the number of leaders and stays flat as the partition count grows.
+The poll fails, and the group keeps its member count for that cycle, when the topic does not exist, when the broker answers the topic's metadata with an error such as `TOPIC_AUTHORIZATION_FAILED`, or when an offset request fails.
+None of those answers is read as a lag of zero.
+The autoscaler logs the failure as `failed to fetch metrics for <group>`.
+
+The autoscaler sizes each member by the messages it holds in flight at once.
+With `with_concurrent_processing` off, the default, a member handles one message at a time and counts as one permit whatever `with_prefetch_count` says.
+With `with_concurrent_processing(true)`, a member counts as `prefetch_count` permits, raised to 1 when it is 0.
+See [capacity](/guides/groups#autoscaling--the-signal) for how the permits enter the scaling thresholds.
+
 Note: consumer-group rebalances occur during scale-up and scale-down events. Rebalances cause a brief delivery pause while Kafka reassigns partitions. Plan for this when setting autoscale bounds and drain timeouts.
 
 See the [Basic example](/backends/kafka/examples/basic) for a full runnable walkthrough.

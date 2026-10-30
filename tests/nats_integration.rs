@@ -3173,6 +3173,46 @@ shove::define_topic!(
     TopologyBuilder::new("nats-autoscaling").build()
 );
 
+/// The per-member capacity the autoscaler reads for a group registered with
+/// `config`, from the real JetStream stats.
+async fn reported_member_permits(config: NatsConsumerGroupConfig) -> u16 {
+    use shove::AutoscalerBackend as _;
+    use shove::nats::{NatsAutoscalerBackend, NatsConsumerGroupRegistry};
+
+    let tb = TestBroker::start().await;
+    let mut registry = NatsConsumerGroupRegistry::new(tb.client());
+    registry
+        .register::<WorkTopic, _>(config, CountingHandler::new, ())
+        .await
+        .expect("register the group");
+    registry.start_all();
+    let registry = Arc::new(Mutex::new(registry));
+
+    let backend = NatsAutoscalerBackend::new(tb.client(), registry.clone());
+    let metrics = backend
+        .fetch_metrics(&"nats-work".to_string())
+        .await
+        .expect("fetch_metrics");
+    assert_eq!(metrics.active_consumers, 1);
+
+    registry.lock().await.shutdown_all().await;
+    metrics.prefetch_count
+}
+
+#[tokio::test]
+async fn sequential_group_capacity_is_one_per_member() {
+    let config = NatsConsumerGroupConfig::new(1..=3).with_prefetch_count(10);
+    assert_eq!(reported_member_permits(config).await, 1);
+}
+
+#[tokio::test]
+async fn concurrent_group_capacity_is_the_prefetch_per_member() {
+    let config = NatsConsumerGroupConfig::new(1..=3)
+        .with_prefetch_count(10)
+        .with_concurrent_processing(true);
+    assert_eq!(reported_member_permits(config).await, 10);
+}
+
 /// Autoscaling lifecycle: slow handlers + burst → `enable_autoscaling` →
 /// clean drain. Mirrors `autoscaling_scales_up_and_drains_clean` from
 /// `kafka_integration.rs` but drives the NATS backend's `spawn_autoscaler`

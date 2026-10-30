@@ -1360,6 +1360,74 @@ async fn autoscaler_scales_up_under_backlog() {
     registry.lock().await.shutdown_all().await;
 }
 
+// ---------------------------------------------------------------------------
+// Autoscaler capacity — the permits one member runs with
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct PingAcker;
+
+impl MessageHandler<GroupTopic> for PingAcker {
+    type Context = ();
+    async fn handle(&self, _: Ping, _: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+}
+
+/// The capacity the autoscaler reads for a group registered with `config`,
+/// from the real in-process broker's stats.
+async fn reported_prefetch(config: InMemoryConsumerGroupConfig) -> u16 {
+    use shove::AutoscalerBackend as _;
+
+    let client = InMemoryBroker::new();
+    let registry = Arc::new(Mutex::new(InMemoryConsumerGroupRegistry::new(
+        client.clone(),
+    )));
+    {
+        let mut reg = registry.lock().await;
+        reg.register::<GroupTopic, _>(config, || PingAcker, ())
+            .await
+            .unwrap();
+        reg.start_all();
+    }
+
+    let backend = InMemoryAutoscalerBackend::new(client, registry.clone());
+    let metrics = backend
+        .fetch_metrics(&"group-int".to_string())
+        .await
+        .unwrap();
+    assert_eq!(metrics.active_consumers, 1);
+
+    registry.lock().await.shutdown_all().await;
+    metrics.prefetch_count
+}
+
+/// The in-memory consumer has no concurrency flag: each member runs
+/// `prefetch_count` permits.
+#[tokio::test]
+async fn group_capacity_is_the_prefetch_per_member() {
+    let reported =
+        reported_prefetch(InMemoryConsumerGroupConfig::new(1..=3).with_prefetch_count(4)).await;
+    assert_eq!(reported, 4);
+}
+
+/// A prefetch of one is how an in-memory group handles one message at a time.
+#[tokio::test]
+async fn sequential_group_capacity_is_one_per_member() {
+    let reported =
+        reported_prefetch(InMemoryConsumerGroupConfig::new(1..=3).with_prefetch_count(1)).await;
+    assert_eq!(reported, 1);
+}
+
+/// A zero prefetch is raised to one permit by the consumer, so it is
+/// reported as one rather than as a group with no capacity.
+#[tokio::test]
+async fn zero_prefetch_group_capacity_is_one_per_member() {
+    let reported =
+        reported_prefetch(InMemoryConsumerGroupConfig::new(1..=3).with_prefetch_count(0)).await;
+    assert_eq!(reported, 1);
+}
+
 #[tokio::test]
 async fn consumer_group_distributes_load_across_workers() {
     let broker = Broker::<InMemory>::new(InMemoryConfig::default())

@@ -145,6 +145,10 @@ pub struct ScalingMetrics {
     pub messages_ready: u64,
     pub messages_in_flight: u64,
     pub active_consumers: u16,
+    /// Messages one active consumer holds in flight at once. The built-in
+    /// backends report the group's effective permits: the configured prefetch
+    /// (at least `1`) when the group processes concurrently, `1` when it
+    /// processes one message at a time.
     pub prefetch_count: u16,
 }
 
@@ -165,7 +169,46 @@ impl ScalingMetrics {
 
     /// Total message capacity across all active consumers.
     pub fn capacity(&self) -> u64 {
-        self.active_consumers as u64 * self.prefetch_count as u64
+        u64::from(self.active_consumers).saturating_mul(u64::from(self.prefetch_count))
+    }
+}
+
+#[cfg(any(
+    feature = "kafka",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "redis-streams",
+    feature = "inmemory",
+    feature = "aws-sns-sqs"
+))]
+impl ScalingMetrics {
+    /// The snapshot a backend reports for a consumer group, shared so that no
+    /// backend sizes its members differently.
+    ///
+    /// `prefetch_count` carries the permits one member actually runs with: the
+    /// group's `prefetch_count` when it processes concurrently, `1` when it
+    /// processes one message at a time, and never `0`, so a group is never
+    /// sized to no capacity. Sizing sequential members by their configured
+    /// prefetch would overstate capacity by that factor and skew both scaling
+    /// thresholds.
+    pub(crate) fn for_group(
+        messages_ready: u64,
+        messages_in_flight: u64,
+        active_consumers: usize,
+        concurrent_processing: bool,
+        prefetch_count: u16,
+    ) -> Self {
+        let permits = if concurrent_processing {
+            prefetch_count.max(1)
+        } else {
+            1
+        };
+        Self::new(
+            messages_ready,
+            messages_in_flight,
+            u16::try_from(active_consumers).unwrap_or(u16::MAX),
+            permits,
+        )
     }
 }
 
@@ -697,6 +740,67 @@ mod tests {
     fn scaling_metrics_capacity_zero_consumers() {
         let m = ScalingMetrics::new(0, 0, 0, 10);
         assert_eq!(m.capacity(), 0);
+    }
+
+    #[cfg(any(
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq",
+        feature = "redis-streams",
+        feature = "inmemory",
+        feature = "aws-sns-sqs"
+    ))]
+    mod for_group {
+        use super::*;
+
+        #[test]
+        fn a_sequential_group_runs_one_permit_per_member() {
+            let m = ScalingMetrics::for_group(100, 7, 4, false, 10);
+            assert_eq!(m.prefetch_count, 1);
+            assert_eq!(m.capacity(), 4);
+            assert_eq!(m.messages_ready, 100);
+            assert_eq!(m.messages_in_flight, 7);
+            assert_eq!(m.active_consumers, 4);
+        }
+
+        #[test]
+        fn a_concurrent_group_runs_its_prefetch_per_member() {
+            let m = ScalingMetrics::for_group(0, 0, 4, true, 10);
+            assert_eq!(m.prefetch_count, 10);
+            assert_eq!(m.capacity(), 40);
+        }
+
+        #[test]
+        fn a_zero_prefetch_is_raised_to_one_permit() {
+            assert_eq!(
+                ScalingMetrics::for_group(0, 0, 2, true, 0).prefetch_count,
+                1
+            );
+            assert_eq!(
+                ScalingMetrics::for_group(0, 0, 2, false, 0).prefetch_count,
+                1
+            );
+        }
+
+        #[test]
+        fn a_member_count_beyond_u16_saturates() {
+            let m = ScalingMetrics::for_group(0, 0, usize::from(u16::MAX) + 5, true, 10);
+            assert_eq!(m.active_consumers, u16::MAX);
+        }
+
+        #[test]
+        fn sequential_capacity_scales_the_thresholds_per_member() {
+            // 30 ready on 2 sequential members: capacity 2, up-threshold 4.
+            let mut strategy = ThresholdStrategy::default();
+            let sequential = ScalingMetrics::for_group(30, 0, 2, false, 10);
+            assert_eq!(
+                strategy.evaluate("g", &sequential),
+                ScalingDecision::ScaleUp(1)
+            );
+            // The same backlog on 2 concurrent members: capacity 20, holds.
+            let concurrent = ScalingMetrics::for_group(30, 0, 2, true, 10);
+            assert_eq!(strategy.evaluate("g", &concurrent), ScalingDecision::Hold);
+        }
     }
 
     #[test]

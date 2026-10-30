@@ -213,7 +213,7 @@ impl<S: RedisQueueStatsProvider> AutoscalerBackend for RedisAutoscalerBackend<S>
     }
 
     async fn fetch_metrics(&self, group: &Self::GroupId) -> Result<ScalingMetrics> {
-        let (queue, prefetch, active) = {
+        let (queue, concurrent, prefetch, active) = {
             let reg = self.registry.lock().await;
             let g = reg
                 .groups()
@@ -221,6 +221,7 @@ impl<S: RedisQueueStatsProvider> AutoscalerBackend for RedisAutoscalerBackend<S>
                 .ok_or_else(|| ShoveError::Topology(format!("group not found: {group}")))?;
             (
                 g.queue().to_owned(),
+                g.config().concurrent_processing(),
                 g.config().prefetch_count(),
                 g.active_consumers(),
             )
@@ -237,10 +238,11 @@ impl<S: RedisQueueStatsProvider> AutoscalerBackend for RedisAutoscalerBackend<S>
             "fetched Redis metrics"
         );
 
-        Ok(ScalingMetrics::new(
+        Ok(ScalingMetrics::for_group(
             stats.messages_ready,
             stats.messages_in_flight,
-            active as u16,
+            active,
+            concurrent,
             prefetch,
         ))
     }
@@ -439,15 +441,21 @@ mod tests {
             g
         }
 
-        fn make_registry(started: bool) -> Arc<Mutex<RedisConsumerGroupRegistry>> {
-            let group = test_group_with_spawner(
-                "test-queue",
-                RedisConsumerGroupConfig::new(1..=4).with_prefetch_count(10),
-                started,
-            );
+        fn make_registry_with_config(
+            config: RedisConsumerGroupConfig,
+            started: bool,
+        ) -> Arc<Mutex<RedisConsumerGroupRegistry>> {
+            let group = test_group_with_spawner("test-queue", config, started);
             let mut groups = HashMap::new();
             groups.insert("test-queue".to_string(), group);
             Arc::new(Mutex::new(RedisConsumerGroupRegistry::from_groups(groups)))
+        }
+
+        fn make_registry(started: bool) -> Arc<Mutex<RedisConsumerGroupRegistry>> {
+            make_registry_with_config(
+                RedisConsumerGroupConfig::new(1..=4).with_prefetch_count(10),
+                started,
+            )
         }
 
         #[tokio::test]
@@ -474,7 +482,12 @@ mod tests {
             );
             let backend = RedisAutoscalerBackend::with_stats_provider(
                 MockStats { stats },
-                make_registry(true),
+                make_registry_with_config(
+                    RedisConsumerGroupConfig::new(1..=4)
+                        .with_prefetch_count(10)
+                        .with_concurrent_processing(true),
+                    true,
+                ),
             );
             let m = backend
                 .fetch_metrics(&"test-queue".to_string())
