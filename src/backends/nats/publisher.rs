@@ -133,7 +133,7 @@ pub(super) async fn publish_with_retry(
                                 );
                                 return Err(PublishFailure::Unconfirmed(e));
                             }
-                            let delay = backoff.next().unwrap_or(Duration::from_secs(2));
+                            let delay = backoff.next_delay();
                             tracing::warn!(attempt, error = %e, "{label} was not confirmed, retrying");
                             tokio::time::sleep(delay).await;
                         }
@@ -150,7 +150,7 @@ pub(super) async fn publish_with_retry(
                         ))
                         .into());
                     }
-                    let delay = backoff.next().unwrap_or(Duration::from_secs(2));
+                    let delay = backoff.next_delay();
                     tracing::warn!(attempt, error = %e, "{label} ack failed, retrying");
                     tokio::time::sleep(delay).await;
                 }
@@ -166,7 +166,7 @@ pub(super) async fn publish_with_retry(
                     ))
                     .into());
                 }
-                let delay = backoff.next().unwrap_or(Duration::from_secs(2));
+                let delay = backoff.next_delay();
                 tracing::warn!(attempt, error = %e, "{label} failed, retrying");
                 tokio::time::sleep(delay).await;
             }

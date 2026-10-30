@@ -298,7 +298,7 @@ impl NatsConsumerGroup {
 
         Self {
             queue: queue.into(),
-            consumers: Vec::with_capacity(config.max_consumers as usize),
+            consumers: Vec::with_capacity(usize::from(config.max_consumers)),
             config,
             spawner,
             group_token,

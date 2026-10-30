@@ -1360,11 +1360,6 @@ fn ended_pull_backoff() -> Backoff {
     Backoff::new(ENDED_PULL_PAUSE, ENDED_PULL_PAUSE_MAX)
 }
 
-/// The next pause from `backoff`, whose iterator never ends.
-fn next_pause(backoff: &mut Backoff) -> Duration {
-    backoff.next().unwrap_or(ENDED_PULL_PAUSE_MAX)
-}
-
 /// `None` when `shutdown` fires before `work` finishes.
 async fn unless_stopped<F: Future>(shutdown: &CancellationToken, work: F) -> Option<F::Output> {
     tokio::select! {
@@ -1411,7 +1406,7 @@ async fn ended_pull(
     tracing::warn!(error = %status, queue, "the server ended a pull, probing the connection");
     match unless_stopped(shutdown, consumer.get_info()).await {
         None => EndedPull::Stopped,
-        Some(Ok(_)) => EndedPull::Pause(next_pause(backoff)),
+        Some(Ok(_)) => EndedPull::Pause(backoff.next_delay()),
         Some(Err(probe_err)) => {
             metrics::record_backend_error(
                 metrics::BackendLabel::Nats,
