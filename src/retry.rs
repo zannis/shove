@@ -62,13 +62,21 @@ fn nanos_to_duration(nanos: f64) -> Duration {
     Duration::new(secs, sub_nanos as u32)
 }
 
+impl Backoff {
+    /// The next delay. The sequence never ends, so this is [`Iterator::next`]
+    /// without the `Option`.
+    pub(crate) fn next_delay(&mut self) -> Duration {
+        let delay = self.jittered();
+        self.current = self.current.saturating_mul(2).min(self.max);
+        delay
+    }
+}
+
 impl Iterator for Backoff {
     type Item = Duration;
 
     fn next(&mut self) -> Option<Duration> {
-        let delay = self.jittered();
-        self.current = (self.current * 2).min(self.max);
-        Some(delay)
+        Some(self.next_delay())
     }
 }
 
@@ -109,6 +117,19 @@ mod tests {
                 "delay {delay:?} not in [{lo:?}, {hi:?}] for base {base:?}"
             );
         }
+    }
+
+    /// The base doubles with saturation: a base at `Duration::MAX` stays at
+    /// the cap instead of overflowing the multiplication.
+    #[test]
+    fn backoff_at_the_largest_duration_stays_there() {
+        let mut b = Backoff {
+            current: Duration::MAX,
+            max: Duration::MAX,
+            randomization_factor: 0.0,
+        };
+        assert_eq!(b.next(), Some(Duration::MAX));
+        assert_eq!(b.next(), Some(Duration::MAX));
     }
 
     #[test]
