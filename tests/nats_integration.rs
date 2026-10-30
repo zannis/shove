@@ -7834,3 +7834,68 @@ async fn fifo_group_drain_timeout_stops_shards() {
     );
     broker.close().await;
 }
+
+/// Dropping a direct `run_fifo` call takes its shard tasks down with it, and
+/// the handler call each is awaiting. The handler never finishes and nothing
+/// settles its message: the message stays in the stream, un-acked.
+#[tokio::test]
+async fn run_fifo_stops_its_shards_when_dropped() {
+    const WORK: Duration = Duration::from_secs(3);
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqAbortTopic>().await.unwrap();
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<SeqAbortTopic>(&OrderMessage {
+            order_id: "A".into(),
+            amount: 0,
+        })
+        .await
+        .unwrap();
+
+    let handler = SlowFifoHandler {
+        work: WORK,
+        started: WaitableCounter::new(),
+        finished: WaitableCounter::new(),
+    };
+    let consumer = NatsConsumer::new(client.clone());
+    let run = {
+        let handler = handler.clone();
+        tokio::spawn(async move {
+            consumer
+                .run_fifo::<SeqAbortTopic, _>(handler, (), ConsumerOptions::<Nats>::new())
+                .await
+        })
+    };
+    assert!(
+        handler.started.wait_for(1, TIMEOUT).await,
+        "the handler is running"
+    );
+
+    run.abort();
+    assert!(
+        run.await
+            .expect_err("the aborted call is cancelled")
+            .is_cancelled(),
+        "the call ended some other way"
+    );
+
+    // Past the point where the handler would have returned, and a shard that
+    // survived the abort would have acked the message.
+    tokio::time::sleep(WORK + Duration::from_secs(1)).await;
+    assert_eq!(
+        handler.finished.get(),
+        0,
+        "the handler ran on after its shard was dropped"
+    );
+    assert_eq!(
+        stream_messages(&client, "nats-fifo-abort").await,
+        1,
+        "a shard settled its message after its run_fifo call was dropped"
+    );
+    broker.close().await;
+}

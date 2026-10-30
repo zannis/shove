@@ -229,7 +229,7 @@ The delay before each attempt doubles from about a second up to a 30 s ceiling a
 When a group's drain timeout runs out with a handler still going, the group aborts its shard tasks along with its own task, and each shard aborts the handler call it is awaiting.
 The message a shard was handling is then left un-acked, and JetStream redelivers it once its `ack_wait` expires.
 No shard settles a message after the group has reported the timeout, and no handler keeps running past it.
-A supervisor that aborts its shards at its drain timeout does the same.
+A supervisor that aborts its shards at its drain timeout does the same, and so does dropping or aborting a direct `NatsConsumer::run_fifo` call.
 
 See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced example](/backends/nats/examples/sequenced) for a runnable walkthrough.
 
