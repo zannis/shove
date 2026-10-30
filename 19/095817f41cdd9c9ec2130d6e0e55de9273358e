@@ -1,0 +1,52 @@
+docs/pages/guides/retries.mdx
+  s_1001dc3147e1e5::t_b86d482167aae5 120
+  s_1001dc3147e1e5::t_f2e0814d3d3137 122
+  s_1001dc3147e1e5::t_507f051f4e13aa 138
+  s_1001dc3147e1e5::t_44426b5f091af1 32-33
+  s_1001dc3147e1e5::t_703b4c51a2e902 111
+  s_1001dc3147e1e5::t_3d9c6621eaf0c7 137
+  s_1001dc3147e1e5::t_8a815823f61c92 230
+  s_1001dc3147e1e5::t_6acec82b550b59 110
+docs/pages/concepts/broadcast.mdx
+  s_1001dc3147e1e5::t_33efe7c0c3e9e4 55
+  s_1001dc3147e1e5::t_a7395bc6d609dd 51
+src/metadata.rs
+  s_1001dc3147e1e5::t_69d831642fc810 84-88
+src/consumer.rs
+  s_1001dc3147e1e5::t_1f1c0d1159580f 506-509
+docs/pages/concepts/handlers.mdx
+  s_1001dc3147e1e5::t_48b63b4cc02992 146
+  s_1001dc3147e1e5::t_f36c51b93f7cbe 140
+  s_1001dc3147e1e5::t_8e6418b91e0a0d 134
+src/outcome.rs
+  s_1001dc3147e1e5::t_fb7db125f544b3 109-112
+  s_1001dc3147e1e5::t_af49c053acedd8 80-84
+  s_1001dc3147e1e5::t_a96ad37987aa17 74-76,79
+  s_1001dc3147e1e5::t_74629084aea1ba 85-86
+src/routing.rs
+  s_1001dc3147e1e5::t_cdc4ebd6734e74 34-36
+src/topology.rs
+  s_1001dc3147e1e5::t_daa39e0cd6275d 951,958-960
+docs/pages/concepts/outcomes.mdx
+  s_1001dc3147e1e5::t_50dc09042c2d06 89,92
+  s_1001dc3147e1e5::t_dc98a6911f6451 15
+  s_1001dc3147e1e5::t_71e060e711380c 90-91,94
+README.md
+  s_1001dc3147e1e5::t_3f5b312f9a4282 108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "19095817f41cdd9c9ec2130d6e0e55de9273358e",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
