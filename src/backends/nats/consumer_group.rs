@@ -52,6 +52,14 @@ fn harvest_if_finished(
     true
 }
 
+/// Counts one more occurrence, stopping at the top instead of wrapping.
+fn count_one(counter: &AtomicUsize) {
+    // The closure always answers `Some`, so the update cannot fail.
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_add(1))
+    });
+}
+
 // ---------------------------------------------------------------------------
 // NatsConsumerGroupConfig
 // ---------------------------------------------------------------------------
@@ -340,7 +348,7 @@ impl NatsConsumerGroup {
                 {
                     Ok(h) => h,
                     Err(e) => {
-                        ec.fetch_add(1, Ordering::Relaxed);
+                        count_one(&ec);
                         tracing::error!("FIFO registration failed: {e}");
                         return;
                     }
@@ -350,12 +358,12 @@ impl NatsConsumerGroup {
                     match handle.await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
-                            ec.fetch_add(1, Ordering::Relaxed);
+                            count_one(&ec);
                             tracing::error!("sequenced shard exited with error: {e}");
                         }
                         Err(e) if e.is_cancelled() => {}
                         Err(e) => {
-                            pc.fetch_add(1, Ordering::Relaxed);
+                            count_one(&pc);
                             tracing::error!("sequenced shard panicked: {e}");
                         }
                     }
@@ -1061,6 +1069,15 @@ mod tests {
 
     fn default_config() -> NatsConsumerGroupConfig {
         NatsConsumerGroupConfig::new(1..=4)
+    }
+
+    #[test]
+    fn a_counter_stops_at_the_top_instead_of_wrapping() {
+        let counter = AtomicUsize::new(usize::MAX - 1);
+        count_one(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+        count_one(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
     }
 
     // -- start --
