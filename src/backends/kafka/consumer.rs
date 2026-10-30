@@ -5094,17 +5094,24 @@ const PERMIT_WAIT_GRACE: Duration = Duration::from_secs(1);
 ///
 /// The record in hand is decoded and tracked, and every permit is held: by
 /// running handlers, by handlers waiting out an in-place delay, or by
-/// republishes waiting out their hold. A bare `acquire_owned().await` here
-/// would stop the loop calling `recv()`, and rust-rdkafka keeps the member
-/// inside `max.poll.interval.ms` only while a `recv()` is pending. A hold, or
-/// a running holder that turns into an in-place wait afterwards, would then
-/// park the loop for the whole delay, and a park past the limit has the
-/// member evicted. So the permit is acquired inside a `select!` that also
-/// polls once [`PERMIT_WAIT_GRACE`] has run out, which serves the rebalance
-/// callbacks and the results of commits made before the wait. A record
-/// `recv()` yields meanwhile comes from a partition that is not paused; it
-/// is put back (see [`put_back`]) and the assignment is paused, so it
-/// arrives again, in order, once a permit frees and the loop resumes.
+/// republishes waiting out their hold. librdkafka counts the member as
+/// polling only when a `recv()` actually polls its queue
+/// (`rd_kafka_app_polled`, bundled librdkafka 2.12.1, `rdkafka_int.h:1219`;
+/// rust-rdkafka 0.39 polls it with a zero timeout,
+/// `stream_consumer.rs:125-131`). A bare `acquire_owned().await` here would
+/// poll nothing, so a hold, or a running holder that turns into an in-place
+/// wait afterwards, would park the loop for the whole delay, and a park past
+/// `max.poll.interval.ms` has the member evicted. So the permit is acquired
+/// inside a `select!` whose `recv()` arm is armed once [`PERMIT_WAIT_GRACE`]
+/// has run out. From then on the member stays inside the interval because
+/// that arm is polled again on every wake of the wait: the housekeeping
+/// tick and the commit gate's deadline under `CommitPolicy::Interval`, and
+/// the wake rust-rdkafka sends a pending `recv()` at half the poll interval
+/// (`stream_consumer.rs:238-263`). Those polls serve the rebalance callbacks
+/// and the results of commits made before the wait. A record `recv()`
+/// yields meanwhile comes from a partition that is not paused; it is put
+/// back (see [`put_back`]) and the assignment is paused, so it arrives
+/// again, in order, once a permit frees and the loop resumes.
 ///
 /// `commits`, under `CommitPolicy::Interval`, has the wait commit as the
 /// loop does: positions completed before the wait, and the ones a rebalance

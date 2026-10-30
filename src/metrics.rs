@@ -222,8 +222,9 @@ pub(crate) enum FailReason {
     /// A `Retry` or `Defer` republish was refused in a way no later send can
     /// get past, too large for the producer or the broker or invalid to the
     /// broker, so the message was dead-lettered under the death reason
-    /// `republish_failed` instead. Emitted after the handler ran, by Kafka
-    /// only.
+    /// `republish_failed` instead, or discarded when its dead letter could
+    /// not be published either. Emitted after the handler ran, once per
+    /// delivery, by Kafka only.
     RepublishFailed,
 }
 
