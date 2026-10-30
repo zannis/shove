@@ -1279,6 +1279,110 @@ fn next_pause(backoff: &mut Backoff) -> Duration {
     backoff.next().unwrap_or(ENDED_PULL_PAUSE_MAX)
 }
 
+/// `None` when `shutdown` fires before `work` finishes.
+async fn unless_stopped<F: Future>(shutdown: &CancellationToken, work: F) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => None,
+        out = work => Some(out),
+    }
+}
+
+/// What a consumer does about a pull the server ended with a status.
+enum EndedPull {
+    /// The status clears on its own and the connection answered the probe:
+    /// pause this long before the next pull.
+    Pause(Duration),
+    /// The status, or the failed probe after it, is a connection error that
+    /// spends a reconnect attempt.
+    Fail(ShoveError),
+    /// A stop landed during the probe.
+    Stopped,
+}
+
+/// Judges `status`, which ended a pull of `consumer` on `queue`. One of the
+/// [`TRANSIENT_PULL_STATUSES`] gets a probe of the connection and the next
+/// pause of `backoff`, and any other status is a connection error. `kind`
+/// names the consumer in the error it logs and returns.
+async fn ended_pull(
+    consumer: &PullConsumer,
+    queue: &str,
+    kind: &str,
+    status: &async_nats::Error,
+    backoff: &mut Backoff,
+    shutdown: &CancellationToken,
+) -> EndedPull {
+    if !is_transient_pull_status(&status.to_string()) {
+        tracing::error!(error = %status, queue, "{kind} stream error");
+        metrics::record_backend_error(
+            metrics::BackendLabel::Nats,
+            metrics::BackendErrorKind::Consume,
+        );
+        return EndedPull::Fail(ShoveError::Connection(format!(
+            "{kind} stream error on {queue}: {status}"
+        )));
+    }
+    tracing::warn!(error = %status, queue, "the server ended a pull, probing the connection");
+    match unless_stopped(shutdown, consumer.get_info()).await {
+        None => EndedPull::Stopped,
+        Some(Ok(_)) => EndedPull::Pause(next_pause(backoff)),
+        Some(Err(probe_err)) => {
+            metrics::record_backend_error(
+                metrics::BackendLabel::Nats,
+                metrics::BackendErrorKind::Consume,
+            );
+            EndedPull::Fail(ShoveError::Connection(format!(
+                "a pull on {queue} ended with `{status}`, and the connection probe failed: {probe_err}"
+            )))
+        }
+    }
+}
+
+/// Watches a consumer's client for reconnects. The server may have lost the
+/// requests of the consumer's open pulls with the old connection, so a
+/// consumer drops its pulls on a reconnect and pulls again.
+struct ReconnectWatch {
+    changes: watch::Receiver<()>,
+    /// Cleared once the client is gone for good, which ends the watch.
+    watching: bool,
+    /// The connection the consumer's open pulls were sent on.
+    connection: u64,
+}
+
+impl ReconnectWatch {
+    fn new(client: &NatsClient) -> Self {
+        let mut changes = client.connection_changes();
+        changes.borrow_and_update();
+        Self {
+            changes,
+            watching: true,
+            connection: client.connections(),
+        }
+    }
+
+    /// The next change of the client's connection, never ready once the
+    /// client is gone for good. Cancel-safe.
+    async fn next_change(&mut self) {
+        if self.watching && self.changes.changed().await.is_ok() {
+            return;
+        }
+        self.watching = false;
+        std::future::pending().await
+    }
+
+    /// Whether `client` is on a new connection since the consumer's open
+    /// pulls were sent. If so, the pulls sent from now on are on it.
+    fn reconnected(&mut self, client: &NatsClient, queue: &str) -> bool {
+        let now = client.connections();
+        if now == self.connection {
+            return false;
+        }
+        self.connection = now;
+        tracing::info!(queue, "the client reconnected, pulling again");
+        true
+    }
+}
+
 /// One open pull of a worker.
 struct Pull {
     deliveries: Deliveries,
@@ -1349,8 +1453,8 @@ fn next_event(pulls: &mut Vec<Pull>) -> impl Future<Output = PullEvent> + '_ {
 #[allow(clippy::large_enum_variant)]
 enum Step {
     Stop,
-    /// The client connected again, or, when `false`, it is gone for good.
-    Connected(bool),
+    /// The client's connection changed.
+    Connected,
     Resume,
     Reserved(Result<Vec<OwnedSemaphorePermit>>),
     Event(PullEvent),
@@ -1520,15 +1624,6 @@ struct Worker<T: Topic, H: MessageHandler<T>> {
 }
 
 impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
-    /// `None` when shutdown fires before `work` finishes.
-    async fn unless_stopped<F: Future>(&self, work: F) -> Option<F::Output> {
-        tokio::select! {
-            biased;
-            _ = self.shutdown.cancelled() => None,
-            out = work => Some(out),
-        }
-    }
-
     /// Pulls and starts messages on `consumer` until shutdown, which releases
     /// what the worker pulled and never started ([`release_pulled`]) and waits
     /// for its tasks, or until the connection to the server fails.
@@ -1542,38 +1637,29 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
         let mut quiet_since = tokio::time::Instant::now();
         let mut pause: Option<Pin<Box<tokio::time::Sleep>>> = None;
         let mut pause_backoff = ended_pull_backoff();
-        let mut connected = self.client.connection_changes();
-        connected.borrow_and_update();
-        let mut connection = self.client.connections();
-        let mut watching = true;
+        let mut reconnects = ReconnectWatch::new(&self.client);
         loop {
             let may_pull = pulls.len() < MAX_OPEN_PULLS && pause.is_none();
             let step = tokio::select! {
                 biased;
                 _ = self.shutdown.cancelled() => Step::Stop,
-                changed = connected.changed(), if watching => Step::Connected(changed.is_ok()),
+                () = reconnects.next_change() => Step::Connected,
                 () = sleep_over(&mut pause), if pause.is_some() => Step::Resume,
                 reserved = reserve_free_slots(&self.slots), if may_pull => Step::Reserved(reserved),
                 event = next_event(&mut pulls), if !pulls.is_empty() => Step::Event(event),
             };
             match step {
                 Step::Stop => return self.stop(consumer, pulls).await,
-                Step::Connected(false) => watching = false,
-                Step::Connected(true) => {
-                    let now = self.client.connections();
-                    if now == connection {
+                Step::Connected => {
+                    if !reconnects.reconnected(&self.client, queue) {
                         continue;
                     }
-                    connection = now;
-                    // The server may have lost these pulls' requests with the old connection.
-                    tracing::info!(queue, "the client reconnected, pulling again");
                     for (msg, slot) in take_ready(&mut pulls) {
                         self.start(msg, slot, ack_wait);
                     }
                     pulls.clear();
                     pause = None;
-                    if self
-                        .unless_stopped(sweep_waiting_list(consumer))
+                    if unless_stopped(&self.shutdown, sweep_waiting_list(consumer))
                         .await
                         .is_none()
                     {
@@ -1589,7 +1675,7 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                         .max_messages(reserved.len())
                         .expires(PULL_EXPIRES)
                         .messages();
-                    let Some(batch) = self.unless_stopped(request).await else {
+                    let Some(batch) = unless_stopped(&self.shutdown, request).await else {
                         drop(reserved);
                         return self.stop(consumer, pulls).await;
                     };
@@ -1604,31 +1690,23 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                     self.start(msg, slot, ack_wait);
                 }
                 Step::Event(PullEvent::Delivery(Err(e), _)) => {
-                    if !is_transient_pull_status(&e.to_string()) {
-                        tracing::error!(error = %e, queue, "consumer stream error");
-                        metrics::record_backend_error(
-                            metrics::BackendLabel::Nats,
-                            metrics::BackendErrorKind::Consume,
-                        );
-                        return Err(ShoveError::Connection(format!(
-                            "consumer stream error on {queue}: {e}"
-                        )));
+                    let ended = ended_pull(
+                        consumer,
+                        queue,
+                        "consumer",
+                        &e,
+                        &mut pause_backoff,
+                        &self.shutdown,
+                    )
+                    .await;
+                    match ended {
+                        EndedPull::Pause(delay) => {
+                            quiet_since = tokio::time::Instant::now();
+                            pause = Some(Box::pin(tokio::time::sleep(delay)));
+                        }
+                        EndedPull::Fail(failure) => return Err(failure),
+                        EndedPull::Stopped => return self.stop(consumer, pulls).await,
                     }
-                    tracing::warn!(error = %e, queue, "the server ended a pull, probing the connection");
-                    let Some(probe) = self.unless_stopped(consumer.get_info()).await else {
-                        return self.stop(consumer, pulls).await;
-                    };
-                    if let Err(probe_err) = probe {
-                        metrics::record_backend_error(
-                            metrics::BackendLabel::Nats,
-                            metrics::BackendErrorKind::Consume,
-                        );
-                        return Err(ShoveError::Connection(format!(
-                            "a pull on {queue} ended with `{e}`, and the connection probe failed: {probe_err}"
-                        )));
-                    }
-                    quiet_since = tokio::time::Instant::now();
-                    pause = Some(Box::pin(tokio::time::sleep(next_pause(&mut pause_backoff))));
                 }
                 Step::Event(PullEvent::Ended { delivered }) => {
                     if delivered {
@@ -1638,7 +1716,8 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                     if quiet_since.elapsed() < PULL_EXPIRES {
                         continue;
                     }
-                    let Some(probe) = self.unless_stopped(consumer.get_info()).await else {
+                    let Some(probe) = unless_stopped(&self.shutdown, consumer.get_info()).await
+                    else {
                         return self.stop(consumer, pulls).await;
                     };
                     probe.map_err(|e| {
@@ -1895,10 +1974,12 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
         if let Ok(hold) = self.holds.try_acquire() {
             return Some(hold);
         }
-        let hold = self
-            .unless_stopped(renewing(msg, ack_wait, self.holds.acquire()))
-            .await?
-            .ok()?;
+        let hold = unless_stopped(
+            &self.shutdown,
+            renewing(msg, ack_wait, self.holds.acquire()),
+        )
+        .await?
+        .ok()?;
         if let Err(e) = msg.ack_with(AckKind::Progress).await {
             tracing::warn!(error = %e, "failed to renew the ack_wait of a retry that waited for a hold slot");
         }
@@ -2890,8 +2971,8 @@ struct Poison {
 enum IntakeEvent {
     /// The consumer was told to stop.
     Stop,
-    /// The client connected again, or, when `false`, it is gone for good.
-    Connected(bool),
+    /// The client's connection changed.
+    Connected,
     /// The pause after a refused pull is over.
     Resume,
     /// The batch read ahead is due a renewal of its `ack_wait`.
@@ -2956,9 +3037,7 @@ struct BatchIntake<T: Topic> {
     shutdown: CancellationToken,
     poison_slots: Arc<Semaphore>,
     poison_tasks: Arc<BusyTasks>,
-    connected: watch::Receiver<()>,
-    watching: bool,
-    connection: u64,
+    reconnects: ReconnectWatch,
     /// The pull that is filling `forming`. None before the first request, in
     /// the pause after a refused one, and once the pull is over.
     pull: Option<Batch>,
@@ -3011,15 +3090,6 @@ impl<T: Topic> BatchIntake<T> {
         (batch.messages, batch.acks)
     }
 
-    /// `None` when a stop landed before `work` finished.
-    async fn unless_stopped<F: Future>(&self, work: F) -> Option<F::Output> {
-        tokio::select! {
-            biased;
-            () = self.shutdown.cancelled() => None,
-            out = work => Some(out),
-        }
-    }
-
     /// Sends the request for the next batch. A request that cannot be sent
     /// fails the consumer.
     async fn open_pull(&mut self) {
@@ -3029,7 +3099,7 @@ impl<T: Topic> BatchIntake<T> {
             .max_messages(self.size)
             .expires(self.max_batch_age)
             .messages();
-        let Some(requested) = self.unless_stopped(request).await else {
+        let Some(requested) = unless_stopped(&self.shutdown, request).await else {
             return;
         };
         match requested {
@@ -3054,9 +3124,7 @@ impl<T: Topic> BatchIntake<T> {
         tokio::select! {
             biased;
             () = self.shutdown.cancelled(), if !self.stopping => IntakeEvent::Stop,
-            changed = self.connected.changed(), if self.watching && !halted => {
-                IntakeEvent::Connected(changed.is_ok())
-            }
+            () = self.reconnects.next_change(), if !halted => IntakeEvent::Connected,
             () = sleep_over(&mut self.pause), if self.pause.is_some() && !halted => {
                 IntakeEvent::Resume
             }
@@ -3077,8 +3145,7 @@ impl<T: Topic> BatchIntake<T> {
     async fn on_event(&mut self, event: IntakeEvent, flushing: bool) {
         match event {
             IntakeEvent::Stop => self.stop(flushing).await,
-            IntakeEvent::Connected(false) => self.watching = false,
-            IntakeEvent::Connected(true) => self.on_reconnect().await,
+            IntakeEvent::Connected => self.on_reconnect().await,
             IntakeEvent::Resume => self.pause = None,
             IntakeEvent::Renew => self.renew_read_ahead().await,
             IntakeEvent::Permit(Ok(slot)) => {
@@ -3161,7 +3228,7 @@ impl<T: Topic> BatchIntake<T> {
             }
         };
         // A publish can block while the client reconnects.
-        self.unless_stopped(renewals).await;
+        unless_stopped(&self.shutdown, renewals).await;
         self.renew_later();
     }
 
@@ -3178,7 +3245,7 @@ impl<T: Topic> BatchIntake<T> {
         if self.empty_windows < self.probe_after {
             return;
         }
-        match self.unless_stopped(self.consumer.get_info()).await {
+        match unless_stopped(&self.shutdown, self.consumer.get_info()).await {
             None => {}
             Some(Ok(_)) => self.empty_windows = 0,
             Some(Err(e)) => {
@@ -3196,38 +3263,23 @@ impl<T: Topic> BatchIntake<T> {
     /// precedes the next pull. Any other status is a connection error that
     /// spends a reconnect attempt.
     async fn on_status(&mut self, status: async_nats::Error) {
-        let queue = self.queue;
         self.pull = None;
-        if !is_transient_pull_status(&status.to_string()) {
-            tracing::error!(error = %status, queue, "batch pull stream error");
-            metrics::record_backend_error(
-                metrics::BackendLabel::Nats,
-                metrics::BackendErrorKind::Consume,
-            );
-            self.fail(ShoveError::Connection(format!(
-                "batch pull stream error on {queue}: {status}"
-            )))
-            .await;
-            return;
-        }
-        tracing::warn!(error = %status, queue, "the server ended a pull, probing the connection");
-        match self.unless_stopped(self.consumer.get_info()).await {
-            None => {}
-            Some(Ok(_)) => {
+        let ended = ended_pull(
+            &self.consumer,
+            self.queue,
+            "batch pull",
+            &status,
+            &mut self.pause_backoff,
+            &self.shutdown,
+        )
+        .await;
+        match ended {
+            EndedPull::Pause(delay) => {
                 self.empty_windows = 0;
-                let pause = next_pause(&mut self.pause_backoff);
-                self.pause = Some(Box::pin(tokio::time::sleep(pause)));
+                self.pause = Some(Box::pin(tokio::time::sleep(delay)));
             }
-            Some(Err(probe_err)) => {
-                metrics::record_backend_error(
-                    metrics::BackendLabel::Nats,
-                    metrics::BackendErrorKind::Consume,
-                );
-                self.fail(ShoveError::Connection(format!(
-                    "a pull on {queue} ended with `{status}`, and the connection probe failed: {probe_err}"
-                )))
-                .await;
-            }
+            EndedPull::Fail(failure) => self.fail(failure).await,
+            EndedPull::Stopped => {}
         }
     }
 
@@ -3236,12 +3288,9 @@ impl<T: Topic> BatchIntake<T> {
     /// into the batch in hand, the pull is dropped, and the next one is sent
     /// at once.
     async fn on_reconnect(&mut self) {
-        let now = self.ctx.client.connections();
-        if now == self.connection {
+        if !self.reconnects.reconnected(&self.ctx.client, self.queue) {
             return;
         }
-        self.connection = now;
-        tracing::info!(queue = self.queue, "the client reconnected, pulling again");
         if let Some(mut stale) = self.pull.take() {
             while let Some(Some(Ok(msg))) = stale.next().now_or_never() {
                 self.on_message(msg);
@@ -3249,8 +3298,7 @@ impl<T: Topic> BatchIntake<T> {
         }
         self.pause = None;
         self.empty_windows = 0;
-        self.unless_stopped(sweep_waiting_list(&self.consumer))
-            .await;
+        unless_stopped(&self.shutdown, sweep_waiting_list(&self.consumer)).await;
     }
 
     /// Stops reading. The batch in hand is left to flush, unless a flush is in
@@ -3441,8 +3489,7 @@ impl<T: NotSequenced, H: BatchMessageHandler<T>> BatchRun<T, H> {
     async fn run_attached(self: &Arc<Self>) -> Result<()> {
         let (consumer, size, ack_wait) = self.attach().await?;
         let queue = self.topology.queue();
-        let mut connected = self.client.connection_changes();
-        connected.borrow_and_update();
+        let reconnects = ReconnectWatch::new(&self.client);
         let mut intake = BatchIntake::<T> {
             consumer,
             ctx: Arc::new(NatsBatchCtx {
@@ -3460,9 +3507,7 @@ impl<T: NotSequenced, H: BatchMessageHandler<T>> BatchRun<T, H> {
             shutdown: self.shutdown.clone(),
             poison_slots: Arc::clone(&self.poison_slots),
             poison_tasks: Arc::clone(&self.poison_tasks),
-            connected,
-            watching: true,
-            connection: self.client.connections(),
+            reconnects,
             pull: None,
             got_message: false,
             forming: Forming::with_capacity(size.min(PREALLOC_CAP)),
