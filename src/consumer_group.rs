@@ -310,11 +310,10 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         // reaches them.
         consumer_token.cancel();
 
-        // Autoscaler task (and its registry Arc clone) is now gone: sole owner.
+        // The joined task's clone is gone, so a failed reclaim means another clone leaked.
         let Some(inner) = reclaim_registry(registry) else {
             tracing::error!(
-                "the autoscaler task still holds the consumer group registry after it was \
-                 joined; the consumers are cancelled but cannot be drained"
+                "a registry clone outlived the autoscaler task; consumers cancelled but not drained"
             );
             return SupervisorOutcome {
                 errors: 1,
