@@ -73,7 +73,7 @@ impl<S: SqsQueueStatsProviderTrait> AutoscalerBackend for SqsAutoscalerBackend<S
     }
 
     async fn fetch_metrics(&self, group: &Self::GroupId) -> Result<ScalingMetrics> {
-        let (queue, prefetch, active) = {
+        let (queue, concurrent, prefetch, active) = {
             let reg = self.registry.lock().await;
             let g = reg
                 .groups()
@@ -81,6 +81,7 @@ impl<S: SqsQueueStatsProviderTrait> AutoscalerBackend for SqsAutoscalerBackend<S
                 .ok_or_else(|| ShoveError::Topology(format!("group not found: {group}")))?;
             (
                 g.queue().to_owned(),
+                g.config().concurrent_processing(),
                 g.config().prefetch_count(),
                 g.active_consumers(),
             )
@@ -97,10 +98,11 @@ impl<S: SqsQueueStatsProviderTrait> AutoscalerBackend for SqsAutoscalerBackend<S
             "fetched SQS metrics"
         );
 
-        Ok(ScalingMetrics::new(
+        Ok(ScalingMetrics::for_group(
             stats.messages_ready,
             stats.messages_not_visible,
-            active as u16,
+            active,
+            concurrent,
             prefetch,
         ))
     }
@@ -151,6 +153,7 @@ mod tests {
     use super::*;
     use crate::TopologyBuilder;
     use crate::autoscaler::{Autoscaler, Stabilized, ThresholdStrategy};
+    use crate::backends::sns::consumer_group::SqsConsumerGroupConfig;
     use crate::backends::sns::stats::SqsQueueStats;
     use crate::error::ShoveError;
     use crate::sns::SqsConsumerGroup;
@@ -186,8 +189,18 @@ mod tests {
         prefetch: u16,
         started: bool,
     ) -> Arc<Mutex<SqsConsumerGroupRegistry>> {
+        make_registry_with_config(
+            SqsConsumerGroupConfig::new(min..=max).with_prefetch_count(prefetch),
+            started,
+        )
+        .await
+    }
+
+    async fn make_registry_with_config(
+        config: SqsConsumerGroupConfig,
+        started: bool,
+    ) -> Arc<Mutex<SqsConsumerGroupRegistry>> {
         use crate::backends::sns::client::SnsClient;
-        use crate::backends::sns::consumer_group::SqsConsumerGroupConfig;
         use crate::backends::sns::topology::QueueRegistry;
         use crate::handler::MessageHandler;
         use crate::topic::Topic;
@@ -220,7 +233,7 @@ mod tests {
         let mut group = SqsConsumerGroup::new::<T, H>(
             "test-group",
             "test-queue",
-            SqsConsumerGroupConfig::new(min..=max).with_prefetch_count(prefetch),
+            config,
             client.clone(),
             Arc::new(QueueRegistry::new()),
             token.clone(),
@@ -245,7 +258,13 @@ mod tests {
 
     #[tokio::test]
     async fn sqs_backend_fetch_metrics() {
-        let registry = make_single_group_registry(1, 5, 10, true).await;
+        let registry = make_registry_with_config(
+            SqsConsumerGroupConfig::new(1..=5)
+                .with_prefetch_count(10)
+                .with_concurrent_processing(true),
+            true,
+        )
+        .await;
         let mut stats_provider = MockSqsStatsProvider::new();
         stats_provider.stats.insert(
             "test-queue".into(),

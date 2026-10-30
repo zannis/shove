@@ -2319,6 +2319,53 @@ impl<T: Topic> MessageHandler<T> for StickyHandler {
 }
 
 // ---------------------------------------------------------------------------
+// Autoscaler capacity — the permits one member runs with
+// ---------------------------------------------------------------------------
+
+/// The per-member capacity the autoscaler reads for a group registered with
+/// `config`, from the real SQS queue attributes.
+async fn reported_member_permits(config: SqsConsumerGroupConfig) -> u16 {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+
+    let mut registry = SqsConsumerGroupRegistry::new(setup.sns_client.clone());
+    let (handler, _release) = StickyHandler::new();
+    registry
+        .register::<WorkTopic, _>(config, move || handler.clone(), ())
+        .await
+        .expect("register should succeed");
+    registry.start_all();
+    let registry = Arc::new(Mutex::new(registry));
+
+    let backend = SqsAutoscalerBackend::new(
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone()),
+        registry.clone(),
+    );
+    let metrics = backend
+        .fetch_metrics(&"sqs-work".to_string())
+        .await
+        .expect("fetch_metrics");
+    assert_eq!(metrics.active_consumers, 1);
+
+    registry.lock().await.shutdown_all().await;
+    metrics.prefetch_count
+}
+
+#[tokio::test]
+async fn sequential_group_capacity_is_one_per_member() {
+    let config = SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(10);
+    assert_eq!(reported_member_permits(config).await, 1);
+}
+
+#[tokio::test]
+async fn concurrent_group_capacity_is_the_prefetch_per_member() {
+    let config = SqsConsumerGroupConfig::new(1..=3)
+        .with_prefetch_count(10)
+        .with_concurrent_processing(true);
+    assert_eq!(reported_member_permits(config).await, 10);
+}
+
+// ---------------------------------------------------------------------------
 // Autoscaler Tests
 // ---------------------------------------------------------------------------
 

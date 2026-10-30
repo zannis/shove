@@ -23,7 +23,8 @@ use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
 
 use shove::consumer_group::ConsumerGroupConfig;
 use shove::redis::{
-    RedisConfig, RedisConsumer, RedisConsumerGroupConfig, RedisMode, RedisQueueStatsProvider,
+    RedisClient, RedisConfig, RedisConsumer, RedisConsumerGroupConfig, RedisMode,
+    RedisQueueStatsProvider,
 };
 use shove::{
     BroadcastStart, Broker, ConsumerOptions, JsonCodec, MessageHandler, MessageMetadata, Outcome,
@@ -3401,6 +3402,112 @@ async fn autoscaler_scales_up_under_load() {
     registry.lock().await.shutdown_all().await;
 
     assert!(scaled, "autoscaler failed to scale up under load");
+}
+
+// ---------------------------------------------------------------------------
+// Autoscaler capacity — the permits one member runs with
+// ---------------------------------------------------------------------------
+
+struct SequentialCapacityTopic;
+impl Topic for SequentialCapacityTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-capacity-seq").build())
+    }
+}
+
+struct ConcurrentCapacityTopic;
+impl Topic for ConcurrentCapacityTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-capacity-conc").build())
+    }
+}
+
+#[derive(Clone)]
+struct Acker;
+
+impl<T: Topic> MessageHandler<T> for Acker {
+    type Context = ();
+    async fn handle(&self, _: T::Message, _: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+}
+
+/// A client on the shared container, retried like [`connect_with_retry`]:
+/// testcontainers can return before Redis accepts connections.
+async fn client_with_retry(redis_group: &str) -> RedisClient {
+    use shove::Backend;
+
+    let url = redis_url().await;
+    let start = std::time::Instant::now();
+    loop {
+        let cfg = RedisConfig::new(RedisMode::Standalone {
+            url: url.to_owned(),
+        })
+        .with_group(redis_group);
+        match <Redis as Backend>::connect(cfg).await {
+            Ok(client) => return client,
+            Err(e) if start.elapsed() >= Duration::from_secs(30) => {
+                panic!("connect to Redis at {url}: {e}")
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+}
+
+/// The per-member capacity the autoscaler reads for a group registered with
+/// `config` on `T`, from the real Redis stats.
+async fn reported_member_permits<T: Topic + 'static>(
+    config: RedisConsumerGroupConfig,
+    redis_group: &str,
+) -> u16 {
+    use shove::AutoscalerBackend as _;
+    use shove::redis::{RedisAutoscalerBackend, RedisConsumerGroupRegistry};
+
+    let client = client_with_retry(redis_group).await;
+
+    let mut registry = RedisConsumerGroupRegistry::new(client.clone());
+    registry
+        .register::<T, Acker>(config, || Acker, ())
+        .await
+        .expect("register");
+    registry.start_all();
+    let registry = Arc::new(tokio::sync::Mutex::new(registry));
+
+    let backend = RedisAutoscalerBackend::new(client, registry.clone());
+    let metrics = backend
+        .fetch_metrics(&T::topology().queue().to_string())
+        .await
+        .expect("fetch_metrics");
+    assert_eq!(metrics.active_consumers, 1);
+
+    registry.lock().await.shutdown_all().await;
+    metrics.prefetch_count
+}
+
+#[tokio::test]
+async fn sequential_group_capacity_is_one_per_member() {
+    let config = RedisConsumerGroupConfig::new(1..=3).with_prefetch_count(10);
+    let reported =
+        reported_member_permits::<SequentialCapacityTopic>(config, "redis-int-capacity-seq-grp")
+            .await;
+    assert_eq!(reported, 1);
+}
+
+#[tokio::test]
+async fn concurrent_group_capacity_is_the_prefetch_per_member() {
+    let config = RedisConsumerGroupConfig::new(1..=3)
+        .with_prefetch_count(10)
+        .with_concurrent_processing(true);
+    let reported =
+        reported_member_permits::<ConcurrentCapacityTopic>(config, "redis-int-capacity-conc-grp")
+            .await;
+    assert_eq!(reported, 10);
 }
 
 // ---------------------------------------------------------------------------

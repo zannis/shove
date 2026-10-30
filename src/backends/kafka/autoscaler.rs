@@ -5,10 +5,12 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use rdkafka::ClientConfig;
+use rdkafka::Offset;
 use rdkafka::TopicPartitionList;
 use rdkafka::consumer::{BaseConsumer, Consumer as RdkafkaConsumer};
 use rdkafka::error::KafkaResult;
 use rdkafka::metadata::Metadata;
+use rdkafka::types::RDKafkaRespErr;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -48,6 +50,15 @@ pub trait KafkaQueueStatsProvider: Send + Sync {
     /// committed or because its commit falls outside the partition's retained
     /// range: `earliest` starts at the low watermark, `latest` at the high
     /// watermark (zero lag).
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`ShoveError::Topology`] when the broker has no topic
+    /// `queue`, describes it with an error such as `TOPIC_AUTHORIZATION_FAILED`,
+    /// or lists no partitions for it, and with [`ShoveError::Connection`] when
+    /// an offset query fails. A snapshot built from any of those answers would
+    /// read as an empty backlog and let the autoscaler shrink a group that has
+    /// work to do, so none of them yields a lag of zero.
     fn get_queue_stats(
         &self,
         queue: &str,
@@ -55,6 +66,13 @@ pub trait KafkaQueueStatsProvider: Send + Sync {
         reset: KafkaAutoOffsetReset,
     ) -> impl Future<Output = Result<KafkaQueueStats>> + Send;
 }
+
+/// Attempts at reading the group's committed offsets: the coordinator can
+/// answer `NotCoordinator` while it is still being elected.
+const COMMITTED_OFFSETS_ATTEMPTS: u32 = 5;
+
+/// The wait after the n-th failed attempt is n times this.
+const COMMITTED_OFFSETS_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Messages between `from` and the high watermark, clamped to `0..=u64::MAX`.
 /// Widened to `i128` because `high - from` can exceed `i64` at the watermark
@@ -99,6 +117,127 @@ fn aggregate_lag(
         .fold(0u64, |total, (committed, low, high)| {
             total.saturating_add(partition_lag(committed, low, high, reset))
         })
+}
+
+/// One topic of a metadata answer, reduced to what the lag read needs.
+struct TopicAnswer<'a> {
+    name: &'a str,
+    error: Option<RDKafkaRespErr>,
+    partitions: Vec<i32>,
+}
+
+/// The partitions of `queue` in a metadata answer.
+///
+/// A topic the broker does not have, or one it could not describe, comes back
+/// with an error and no partitions, and a broker can list partitions beside a
+/// topic error too. Neither says anything about lag, so each is an error here:
+/// an empty partition list would sum to a lag of zero.
+fn queue_partitions<'a>(
+    queue: &str,
+    answer: impl IntoIterator<Item = TopicAnswer<'a>>,
+) -> Result<Vec<i32>> {
+    let topic = answer
+        .into_iter()
+        .find(|topic| topic.name == queue)
+        .ok_or_else(|| {
+            ShoveError::Topology(format!("the metadata answer has no topic named {queue}"))
+        })?;
+    if let Some(code) = topic.error {
+        return Err(ShoveError::Topology(format!(
+            "metadata for topic {queue} returned {code:?}"
+        )));
+    }
+    if topic.partitions.is_empty() {
+        return Err(ShoveError::Topology(format!(
+            "topic {queue} has no partitions"
+        )));
+    }
+    Ok(topic.partitions)
+}
+
+/// The offsets the broker reports for `partitions` at `at`, one per partition
+/// in the same order: [`Offset::Beginning`] asks for the start of each log,
+/// [`Offset::End`] for its end. One `ListOffsets` request goes to each
+/// partition leader whatever the partition count.
+fn list_offsets(
+    consumer: &StatsConsumer,
+    topic: &str,
+    partitions: &[i32],
+    at: Offset,
+    timeout: Duration,
+) -> Result<Vec<i64>> {
+    let mut query = TopicPartitionList::new();
+    for &partition in partitions {
+        query
+            .add_partition_offset(topic, partition, at)
+            .map_err(|e| {
+                ShoveError::Topology(format!("cannot ask for {topic}/{partition} offsets: {e}"))
+            })?;
+    }
+    let answer = consumer.offsets_for_times(query, timeout).map_err(|e| {
+        ShoveError::Connection(format!("failed to fetch watermarks for {topic}: {e}"))
+    })?;
+    partitions
+        .iter()
+        .map(|&partition| {
+            let unanswered = || {
+                ShoveError::Connection(format!(
+                    "the broker gave no {at:?} offset for {topic}/{partition}"
+                ))
+            };
+            let element = answer
+                .find_partition(topic, partition)
+                .ok_or_else(unanswered)?;
+            element.error().map_err(|e| {
+                ShoveError::Connection(format!(
+                    "failed to fetch watermarks for {topic}/{partition}: {e}"
+                ))
+            })?;
+            let raw = element.offset().to_raw().ok_or_else(unanswered)?;
+            // An unanswered partition still holds the marker that was asked.
+            if Some(raw) == at.to_raw() {
+                return Err(unanswered());
+            }
+            Ok(raw)
+        })
+        .collect()
+}
+
+/// `(low, high)` from the start and end offsets of one partition, as
+/// librdkafka's `rd_kafka_query_watermark_offsets` settles them: the smaller
+/// is the low, and a partition whose start offset is missing (a negative
+/// answer) takes the end offset as its low.
+fn settle_watermarks(start: i64, end: i64) -> (i64, i64) {
+    let (low, high) = if start < end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    if low < 0 && high >= 0 {
+        (high, high)
+    } else {
+        (low, high)
+    }
+}
+
+/// `(low, high)` watermarks of each of `partitions`, in the same order, from
+/// two batched rounds: the start offsets of every partition, then their end
+/// offsets. Each pair equals what librdkafka's `fetch_watermarks` returns for
+/// that partition, which asks the same two questions of one partition per call
+/// and so costs a pair of requests per partition on a serial path.
+fn batched_watermarks(
+    consumer: &StatsConsumer,
+    topic: &str,
+    partitions: &[i32],
+    timeout: Duration,
+) -> Result<Vec<(i64, i64)>> {
+    let starts = list_offsets(consumer, topic, partitions, Offset::Beginning, timeout)?;
+    let ends = list_offsets(consumer, topic, partitions, Offset::End, timeout)?;
+    Ok(starts
+        .into_iter()
+        .zip(ends)
+        .map(|(start, end)| settle_watermarks(start, end))
+        .collect())
 }
 
 /// Stats-only `BaseConsumer` that carries whichever `ClientContext` matches the
@@ -154,16 +293,18 @@ impl StatsConsumer {
         }
     }
 
-    fn fetch_watermarks(
+    /// Despite the name, an `Offset::Beginning` or `Offset::End` marker in
+    /// place of a timestamp asks for the start or end offset of the partition:
+    /// librdkafka sends it as the `ListOffsets` earliest or latest timestamp.
+    fn offsets_for_times(
         &self,
-        topic: &str,
-        partition: i32,
+        timestamps: TopicPartitionList,
         timeout: Duration,
-    ) -> KafkaResult<(i64, i64)> {
+    ) -> KafkaResult<TopicPartitionList> {
         match self {
-            Self::Default(c) => c.fetch_watermarks(topic, partition, timeout),
+            Self::Default(c) => c.offsets_for_times(timestamps, timeout),
             #[cfg(feature = "kafka-msk-iam")]
-            Self::MskIam(c) => c.fetch_watermarks(topic, partition, timeout),
+            Self::MskIam(c) => c.offsets_for_times(timestamps, timeout),
         }
     }
 
@@ -307,11 +448,14 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
                     .map_err(|e| {
                         ShoveError::Connection(format!("failed to fetch metadata for {q}: {e}"))
                     })?;
-                let topic_metadata = metadata
-                    .topics()
-                    .first()
-                    .ok_or_else(|| ShoveError::Topology(format!("no metadata for topic {q}")))?;
-                Ok(topic_metadata.partitions().iter().map(|p| p.id()).collect())
+                queue_partitions(
+                    &q,
+                    metadata.topics().iter().map(|topic| TopicAnswer {
+                        name: topic.name(),
+                        error: topic.error(),
+                        partitions: topic.partitions().iter().map(|p| p.id()).collect(),
+                    }),
+                )
             })
             .await
             .map_err(|e| ShoveError::Topology(format!("metadata task failed: {e}")))??
@@ -331,65 +475,50 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
         // code used std::thread::sleep, which could pin a worker for up to
         // 5 seconds under coordinator-election races).
         let committed = {
-            let mut last_err = None;
-            let mut result = None;
-            for attempt in 0..5u32 {
+            let mut attempt = 1u32;
+            loop {
                 let c = Arc::clone(&consumer);
                 let tpl_clone = tpl.clone();
-                let r = tokio::task::spawn_blocking(move || {
+                let result = tokio::task::spawn_blocking(move || {
                     c.committed_offsets(tpl_clone, Duration::from_secs(5))
                 })
                 .await
                 .map_err(|e| ShoveError::Topology(format!("committed task failed: {e}")))?;
-                match r {
-                    Ok(c) => {
-                        result = Some(c);
-                        break;
+                match result {
+                    Ok(committed) => break committed,
+                    Err(e) if attempt >= COMMITTED_OFFSETS_ATTEMPTS => {
+                        return Err(ShoveError::Connection(format!(
+                            "failed to get committed offsets for {queue}: {e}"
+                        )));
                     }
-                    Err(e) => {
-                        last_err = Some(e);
-                        if attempt < 4 {
-                            tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1)))
-                                .await;
-                        }
+                    Err(_) => {
+                        tokio::time::sleep(COMMITTED_OFFSETS_BACKOFF.saturating_mul(attempt)).await;
+                        attempt = attempt.saturating_add(1);
                     }
                 }
             }
-            result.ok_or_else(|| {
-                ShoveError::Connection(format!(
-                    "failed to get committed offsets for {queue}: {}",
-                    last_err.unwrap()
-                ))
-            })?
         };
 
-        // Per-partition watermark fetch is still serial (perf-K-12 — rdkafka
-        // doesn't expose a batched end-watermarks API; staying serial here).
         let total_lag: u64 = {
             let c = Arc::clone(&consumer);
             let q = queue.clone();
             tokio::task::spawn_blocking(move || -> Result<u64> {
-                let mut per_partition = Vec::with_capacity(partitions.len());
-                for pid in partitions {
-                    let (low, high) = c
-                        .fetch_watermarks(&q, pid, Duration::from_secs(5))
-                        .map_err(|e| {
-                            ShoveError::Connection(format!(
-                                "failed to fetch watermarks for {q}/{pid}: {e}"
-                            ))
-                        })?;
-                    // Both a partition absent from the committed TPL and an
-                    // `Offset::Invalid` entry mean "the group has never
-                    // committed here" — map both to `None`.
-                    let committed_offset =
-                        committed
-                            .find_partition(&q, pid)
-                            .and_then(|elem| match elem.offset() {
-                                rdkafka::Offset::Offset(o) => Some(o),
+                let watermarks = batched_watermarks(&c, &q, &partitions, Duration::from_secs(5))?;
+                let per_partition = partitions
+                    .iter()
+                    .zip(watermarks)
+                    .map(|(&pid, (low, high))| {
+                        // Both a partition absent from the committed TPL and an
+                        // `Offset::Invalid` entry mean "the group has never
+                        // committed here" — map both to `None`.
+                        let committed_offset = committed.find_partition(&q, pid).and_then(|elem| {
+                            match elem.offset() {
+                                Offset::Offset(o) => Some(o),
                                 _ => None,
-                            });
-                    per_partition.push((committed_offset, low, high));
-                }
+                            }
+                        });
+                        (committed_offset, low, high)
+                    });
                 Ok(aggregate_lag(per_partition, reset))
             })
             .await
@@ -460,7 +589,7 @@ impl<S: KafkaQueueStatsProvider> AutoscalerBackend for KafkaAutoscalerBackend<S>
     }
 
     async fn fetch_metrics(&self, group: &Self::GroupId) -> Result<ScalingMetrics> {
-        let (queue, group_id, prefetch, active, reset) = {
+        let (queue, group_id, concurrent, prefetch, active, reset) = {
             let mut reg = self.registry.lock().await;
             let g = reg
                 .groups_mut()
@@ -472,6 +601,7 @@ impl<S: KafkaQueueStatsProvider> AutoscalerBackend for KafkaAutoscalerBackend<S>
             (
                 g.queue().to_owned(),
                 g.group_id().to_owned(),
+                g.config().concurrent_processing(),
                 g.config().prefetch_count(),
                 g.active_consumers(),
                 g.config()
@@ -494,10 +624,11 @@ impl<S: KafkaQueueStatsProvider> AutoscalerBackend for KafkaAutoscalerBackend<S>
             "fetched Kafka metrics"
         );
 
-        Ok(ScalingMetrics::new(
+        Ok(ScalingMetrics::for_group(
             stats.messages_pending,
             stats.messages_in_flight,
-            active as u16,
+            active,
+            concurrent,
             prefetch,
         ))
     }
@@ -551,9 +682,12 @@ mod tests {
     use std::time::Duration;
 
     use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+    use crate::backends::kafka::client::KafkaConfig;
     use crate::backends::kafka::constants::consumer_group_id;
     use crate::backends::kafka::consumer_group::{KafkaConsumerGroup, KafkaConsumerGroupConfig};
     use crate::supervision::RespawnSupervisor;
+    use rdkafka::mocking::MockCluster;
+    use rdkafka::producer::{DefaultProducerContext, FutureProducer, FutureRecord};
     use tokio_util::sync::CancellationToken;
 
     struct MockKafkaStatsProvider {
@@ -711,6 +845,259 @@ mod tests {
         assert_eq!(aggregate_lag(vec![], KafkaAutoOffsetReset::Earliest), 0);
     }
 
+    // -- the metadata answer for the queue --
+
+    fn answer<'a>(
+        name: &'a str,
+        error: Option<RDKafkaRespErr>,
+        partitions: &[i32],
+    ) -> TopicAnswer<'a> {
+        TopicAnswer {
+            name,
+            error,
+            partitions: partitions.to_vec(),
+        }
+    }
+
+    #[test]
+    fn queue_partitions_lists_the_partitions_of_the_named_topic() {
+        let partitions = queue_partitions(
+            "orders",
+            [
+                answer("payments", None, &[0]),
+                answer("orders", None, &[0, 1, 2]),
+            ],
+        )
+        .expect("a healthy topic names its partitions");
+        assert_eq!(partitions, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn queue_partitions_refuses_an_answer_about_another_topic() {
+        let err = queue_partitions("orders", [answer("payments", None, &[0, 1])])
+            .expect_err("an answer for another topic says nothing about this one");
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+        assert!(err.to_string().contains("orders"), "{err}");
+    }
+
+    #[test]
+    fn queue_partitions_refuses_an_answer_without_topics() {
+        let err = queue_partitions("orders", [])
+            .expect_err("an empty answer says nothing about the topic");
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn queue_partitions_refuses_a_topic_error_even_beside_partitions() {
+        let err = queue_partitions(
+            "orders",
+            [answer(
+                "orders",
+                Some(RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED),
+                &[0, 1],
+            )],
+        )
+        .expect_err("an errored topic answers nothing about its partitions");
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("TOPIC_AUTHORIZATION_FAILED"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn queue_partitions_refuses_a_topic_without_partitions() {
+        let err = queue_partitions("orders", [answer("orders", None, &[])])
+            .expect_err("a topic with no partitions has no lag to sum");
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+    }
+
+    // -- start and end offsets settle into watermarks as librdkafka does --
+
+    #[test]
+    fn settle_watermarks_keeps_a_healthy_pair() {
+        assert_eq!(settle_watermarks(10, 40), (10, 40));
+        assert_eq!(settle_watermarks(5, 5), (5, 5));
+    }
+
+    #[test]
+    fn settle_watermarks_orders_a_swapped_pair() {
+        assert_eq!(settle_watermarks(40, 10), (10, 40));
+    }
+
+    #[test]
+    fn settle_watermarks_takes_the_end_for_a_missing_start() {
+        assert_eq!(settle_watermarks(-1, 40), (40, 40));
+        assert_eq!(settle_watermarks(40, -1), (40, 40));
+    }
+
+    // -- lag reads against a mock cluster --
+
+    const MOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// A mock cluster holding `topic` with `counts.len()` partitions, the
+    /// partition at index `i` holding `counts[i]` records.
+    async fn mock_holding(
+        topic: &str,
+        counts: &[usize],
+    ) -> MockCluster<'static, DefaultProducerContext> {
+        let mock = MockCluster::new(1).expect("mock cluster");
+        let partitions = i32::try_from(counts.len()).expect("partition count");
+        mock.create_topic(topic, partitions, 1).expect("mock topic");
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", mock.bootstrap_servers())
+            .set("enable.idempotence", "false")
+            .create()
+            .expect("mock producer");
+        for (partition, &count) in (0..).zip(counts) {
+            for n in 0..count {
+                producer
+                    .send(
+                        FutureRecord::to(topic)
+                            .partition(partition)
+                            .key("k")
+                            .payload(&format!("record-{n}")),
+                        MOCK_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|(e, _)| e)
+                    .expect("produce to the mock cluster");
+            }
+        }
+        mock
+    }
+
+    async fn lag_provider_on(
+        mock: &MockCluster<'static, DefaultProducerContext>,
+    ) -> KafkaLagStatsProvider {
+        let client = KafkaClient::connect(&KafkaConfig::new(mock.bootstrap_servers()))
+            .await
+            .expect("connect to the mock cluster");
+        KafkaLagStatsProvider::new(client)
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_stats_are_an_error() {
+        let mock = MockCluster::new(1).expect("mock cluster");
+        let provider = lag_provider_on(&mock).await;
+
+        let err = provider
+            .get_queue_stats(
+                "no-such-topic",
+                "no-such-topic-consumer",
+                KafkaAutoOffsetReset::Earliest,
+            )
+            .await
+            .expect_err("a topic the broker does not have has no lag to report");
+
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+        assert!(err.to_string().contains("no-such-topic"), "{err}");
+    }
+
+    /// The mock lists the four partitions beside the topic error, as a real
+    /// broker can for a topic the principal may not describe; trusting them
+    /// would read an invalid snapshot as a lag of zero.
+    #[tokio::test]
+    async fn a_topic_level_metadata_error_refuses_the_lag_read() {
+        let mock = MockCluster::new(1).expect("mock cluster");
+        mock.create_topic("errored", 4, 1).expect("mock topic");
+        mock.topic_error(
+            "errored",
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+        )
+        .expect("inject the topic error");
+        let provider = lag_provider_on(&mock).await;
+
+        let err = provider
+            .get_queue_stats(
+                "errored",
+                "errored-consumer",
+                KafkaAutoOffsetReset::Earliest,
+            )
+            .await
+            .expect_err("an errored topic has no lag to report");
+
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("TOPIC_AUTHORIZATION_FAILED"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lag_sums_every_partition_of_a_mock_topic() {
+        let counts = [3usize, 0, 5, 1, 0, 2];
+        let mock = mock_holding("lag-sum", &counts).await;
+        let provider = lag_provider_on(&mock).await;
+        let total: u64 = counts.iter().map(|&c| c as u64).sum();
+
+        let from_start = provider
+            .get_queue_stats(
+                "lag-sum",
+                "lag-sum-consumer",
+                KafkaAutoOffsetReset::Earliest,
+            )
+            .await
+            .expect("lag from the start of the log");
+        let from_tail = provider
+            .get_queue_stats("lag-sum", "lag-sum-consumer", KafkaAutoOffsetReset::Latest)
+            .await
+            .expect("lag from the tail of the log");
+
+        assert_eq!(from_start.messages_pending, total);
+        assert_eq!(from_tail.messages_pending, 0);
+    }
+
+    fn stats_consumer_on(bootstrap: String) -> StatsConsumer {
+        let mut cfg = ClientConfig::new();
+        cfg.set("bootstrap.servers", bootstrap)
+            .set("group.id", "watermark-group");
+        StatsConsumer::create(
+            cfg,
+            #[cfg(feature = "kafka-msk-iam")]
+            None,
+        )
+        .expect("stats consumer")
+    }
+
+    #[test]
+    fn batched_watermarks_match_per_partition_watermarks() {
+        let counts = [0usize, 3, 1, 0, 7, 2, 0, 5, 4, 0, 9, 1];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mock = rt.block_on(mock_holding("watermarks", &counts));
+        let partitions: Vec<i32> = (0..).take(counts.len()).collect();
+
+        let batched = batched_watermarks(
+            &stats_consumer_on(mock.bootstrap_servers()),
+            "watermarks",
+            &partitions,
+            MOCK_TIMEOUT,
+        )
+        .expect("batched watermarks");
+
+        let reference: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", mock.bootstrap_servers())
+            .set("group.id", "watermark-reference")
+            .create()
+            .expect("reference consumer");
+        let per_partition: Vec<(i64, i64)> = partitions
+            .iter()
+            .map(|&p| {
+                reference
+                    .fetch_watermarks("watermarks", p, MOCK_TIMEOUT)
+                    .expect("per-partition watermarks")
+            })
+            .collect();
+
+        assert_eq!(batched, per_partition);
+        let highs: Vec<i64> = batched.iter().map(|&(_, high)| high).collect();
+        let produced: Vec<i64> = counts.iter().map(|&c| c as i64).collect();
+        assert_eq!(highs, produced, "the high watermark is the record count");
+    }
+
     type TestSpawner = Arc<dyn Fn(ConsumerOptions) -> tokio::task::JoinHandle<()> + Send + Sync>;
 
     fn make_test_group(
@@ -745,19 +1132,28 @@ mod tests {
         group
     }
 
-    fn make_single_group_registry(
-        min: u16,
-        max: u16,
-        prefetch: u16,
+    fn make_registry_with_config(
+        config: KafkaConsumerGroupConfig,
         started: bool,
     ) -> Arc<Mutex<KafkaConsumerGroupRegistry>> {
-        let config = KafkaConsumerGroupConfig::new(min..=max).with_prefetch_count(prefetch);
         let group = make_test_group("test-queue", config, started);
 
         let mut groups = HashMap::new();
         groups.insert("test-group".to_string(), group);
 
         Arc::new(Mutex::new(KafkaConsumerGroupRegistry::from_groups(groups)))
+    }
+
+    fn make_single_group_registry(
+        min: u16,
+        max: u16,
+        prefetch: u16,
+        started: bool,
+    ) -> Arc<Mutex<KafkaConsumerGroupRegistry>> {
+        make_registry_with_config(
+            KafkaConsumerGroupConfig::new(min..=max).with_prefetch_count(prefetch),
+            started,
+        )
     }
 
     #[tokio::test]
@@ -771,7 +1167,12 @@ mod tests {
 
     #[tokio::test]
     async fn kafka_backend_fetch_metrics() {
-        let registry = make_single_group_registry(1, 5, 10, true);
+        let registry = make_registry_with_config(
+            KafkaConsumerGroupConfig::new(1..=5)
+                .with_prefetch_count(10)
+                .with_concurrent_processing(true),
+            true,
+        );
         let mut stats_provider = MockKafkaStatsProvider::new();
         stats_provider.stats.insert(
             "test-queue".into(),
@@ -791,6 +1192,45 @@ mod tests {
         assert_eq!(metrics.messages_in_flight, 7);
         assert_eq!(metrics.active_consumers, 1);
         assert_eq!(metrics.prefetch_count, 10);
+    }
+
+    /// What the autoscaler reads as the per-member capacity of a group
+    /// registered with `config`, with lag from a real stats provider on a mock
+    /// cluster.
+    async fn reported_member_permits(config: KafkaConsumerGroupConfig) -> u16 {
+        let mock = mock_holding("test-queue", &[0; 4]).await;
+        let backend = KafkaAutoscalerBackend::with_stats_provider(
+            lag_provider_on(&mock).await,
+            make_registry_with_config(config, true),
+        );
+        let metrics = backend
+            .fetch_metrics(&"test-group".to_string())
+            .await
+            .expect("fetch_metrics");
+        assert_eq!(metrics.active_consumers, 1);
+        metrics.prefetch_count
+    }
+
+    #[tokio::test]
+    async fn sequential_group_capacity_is_one_per_member() {
+        let config = KafkaConsumerGroupConfig::new(1..=5).with_prefetch_count(10);
+        assert_eq!(reported_member_permits(config).await, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_group_capacity_is_the_prefetch_per_member() {
+        let config = KafkaConsumerGroupConfig::new(1..=5)
+            .with_prefetch_count(10)
+            .with_concurrent_processing(true);
+        assert_eq!(reported_member_permits(config).await, 10);
+    }
+
+    #[tokio::test]
+    async fn zero_prefetch_group_capacity_is_one_per_member() {
+        let config = KafkaConsumerGroupConfig::new(1..=5)
+            .with_prefetch_count(0)
+            .with_concurrent_processing(true);
+        assert_eq!(reported_member_permits(config).await, 1);
     }
 
     #[tokio::test]

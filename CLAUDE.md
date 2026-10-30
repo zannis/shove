@@ -93,6 +93,12 @@ there rather than restating the table in a third place.
   (`TerminalDiscard`, `RejectSettlement`, `reject_settlement`) — not only its
   batch path — so a cleanup narrowing that trio's gate must check the
   single-message caller first, per the module's own doc comment.
+- **Autoscaler capacity** — `src/autoscaler.rs::ScalingMetrics::for_group`: the
+  one constructor every backend's `fetch_metrics` builds its snapshot through.
+  It turns a group's `concurrent_processing` and `prefetch_count` into the
+  per-member permits the scaling thresholds multiply by the member count (the
+  prefetch, at least 1, when concurrent; 1 when sequential). A new backend
+  builds its snapshot with it, so the sizing rule lives in one place.
 
 ## Build / test / lint commands
 

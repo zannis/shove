@@ -5595,6 +5595,96 @@ async fn lag_stats_provider_reports_pending_messages() {
     broker.close().await;
 }
 
+/// The lag read asks every partition for its start and end offset in batched
+/// requests; a six-partition topic holding keyed records must still sum to the
+/// number of records published.
+#[tokio::test]
+async fn lag_stats_provider_sums_every_partition_of_a_multi_partition_topic() {
+    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
+
+    shove::define_sequenced_topic!(
+        SixPartitionLagTopic,
+        OrderMessage,
+        |msg: &OrderMessage| msg.order_id.clone(),
+        TopologyBuilder::new("kafka-lag-six-partitions")
+            .sequenced(SequenceFailure::Skip)
+            .routing_shards(6)
+            .hold_queue(Duration::from_millis(200))
+            .dlq()
+            .build()
+    );
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<SixPartitionLagTopic>()
+        .await
+        .unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    for i in 0..24u64 {
+        publisher
+            .publish::<SixPartitionLagTopic>(&OrderMessage {
+                order_id: format!("order-{i}"),
+                amount: i,
+            })
+            .await
+            .unwrap();
+    }
+
+    let stats_provider = KafkaLagStatsProvider::new(tb.client());
+    let from_start = stats_provider
+        .get_queue_stats(
+            "kafka-lag-six-partitions",
+            "kafka-lag-six-partitions-fifo",
+            KafkaAutoOffsetReset::Earliest,
+        )
+        .await
+        .expect("lag from the start of the log");
+    let from_tail = stats_provider
+        .get_queue_stats(
+            "kafka-lag-six-partitions",
+            "kafka-lag-six-partitions-fifo",
+            KafkaAutoOffsetReset::Latest,
+        )
+        .await
+        .expect("lag from the tail of the log");
+
+    assert_eq!(from_start.messages_pending, 24);
+    assert_eq!(from_tail.messages_pending, 0);
+
+    broker.close().await;
+}
+
+/// On a real broker with its default topic auto-creation, a lag read of a topic
+/// the broker does not have is an error, and the second read shows that the
+/// first created nothing.
+#[tokio::test]
+async fn lag_stats_provider_refuses_an_unknown_topic() {
+    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
+
+    let tb = TestBroker::start().await;
+    let stats_provider = KafkaLagStatsProvider::new(tb.client());
+
+    for attempt in 0..2 {
+        let err = stats_provider
+            .get_queue_stats(
+                "kafka-lag-no-such-topic",
+                "kafka-lag-no-such-topic-consumer",
+                KafkaAutoOffsetReset::Earliest,
+            )
+            .await
+            .expect_err("a topic the broker does not have has no lag to report");
+        assert!(
+            matches!(err, ShoveError::Topology(_)),
+            "attempt {attempt}: got {err:?}"
+        );
+    }
+
+    tb.broker().close().await;
+}
+
 #[tokio::test]
 async fn lag_stats_provider_reports_zero_after_consumption() {
     use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};

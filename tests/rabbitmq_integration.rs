@@ -2000,6 +2000,62 @@ async fn defer_without_hold_queue_requeues() {
     ctx.cleanup().await;
 }
 
+// --- Autoscaler capacity: the permits one member runs with ---
+
+/// The per-member capacity the autoscaler reads for a group registered with
+/// `config`, from the real management API. The API answers once the broker has
+/// published the queue's first stats, so the read is retried until it does.
+async fn reported_member_permits(config: RabbitMqConsumerGroupConfig) -> u16 {
+    use shove::AutoscalerBackend as _;
+    use tokio::sync::Mutex;
+
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let mut registry = ConsumerGroupRegistry::new(client.clone());
+    let handler = CountingHandler::new();
+    registry
+        .register::<ScalableWork, _>(config, move || handler.clone(), ())
+        .await
+        .unwrap();
+    registry.start_all();
+    let registry = Arc::new(Mutex::new(registry));
+
+    let backend = RabbitMqAutoscalerBackend::new(&ctx.mgmt_config(), registry.clone()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let metrics = loop {
+        match backend.fetch_metrics(&"test-scalable".to_string()).await {
+            Ok(metrics) => break metrics,
+            Err(e) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the management API never reported the queue: {e}"
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    };
+    assert_eq!(metrics.active_consumers, 1);
+
+    registry.lock().await.shutdown_all().await;
+    client.shutdown().await;
+    ctx.cleanup().await;
+    metrics.prefetch_count
+}
+
+#[tokio::test]
+async fn sequential_group_capacity_is_one_per_member() {
+    let config = RabbitMqConsumerGroupConfig::new(1..=3).with_prefetch_count(10);
+    assert_eq!(reported_member_permits(config).await, 1);
+}
+
+#[tokio::test]
+async fn concurrent_group_capacity_is_the_prefetch_per_member() {
+    let config = RabbitMqConsumerGroupConfig::new(1..=3)
+        .with_prefetch_count(10)
+        .with_concurrent_processing(true);
+    assert_eq!(reported_member_permits(config).await, 10);
+}
+
 // --- Autoscaler scales up under load ---
 
 #[tokio::test]
