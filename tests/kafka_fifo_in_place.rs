@@ -35,7 +35,7 @@ use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
 use shove::topic::Topic;
 use shove::topology::{SequenceFailure, TopologyBuilder};
-use shove::{SequencedTopic, ShoveError};
+use shove::{SequencedTopic, SupervisorOutcome};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -44,6 +44,10 @@ use tokio_util::sync::CancellationToken;
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a test watches for a delivery that must not come.
 const SETTLE: Duration = Duration::from_millis(500);
+/// How long a stop may take before `run_fifo_until_timeout` aborts the
+/// consumer and reports it timed out: room for the final commit and the
+/// close.
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// The sequence key every record of a test carries.
 const KEY: &str = "acct-1";
 
@@ -59,11 +63,13 @@ const OUTAGE_GROUP: &str = "kafka-fifo-in-place-dlq-outage-fifo";
 
 const STOP_TOPIC: &str = "kafka-fifo-in-place-stop";
 const STOP_DLQ: &str = "kafka-fifo-in-place-stop-dlq";
+const STOP_GROUP: &str = "kafka-fifo-in-place-stop-fifo";
 /// Long enough that the stop always lands inside the hold.
 const STOP_HOLD: Duration = Duration::from_secs(30);
 
 const REVOKE_TOPIC: &str = "kafka-fifo-in-place-revoke";
 const REVOKE_DLQ: &str = "kafka-fifo-in-place-revoke-dlq";
+const REVOKE_GROUP: &str = "kafka-fifo-in-place-revoke-fifo";
 /// Far longer than the rebalance a joining member starts, so the revoke
 /// always lands inside the hold.
 const REVOKE_HOLD: Duration = Duration::from_secs(90);
@@ -75,6 +81,8 @@ const REBALANCE_TIMEOUT: Duration = Duration::from_secs(60);
 const EVICT_TOPIC: &str = "kafka-fifo-in-place-evict";
 #[cfg(feature = "test-support")]
 const EVICT_DLQ: &str = "kafka-fifo-in-place-evict-dlq";
+#[cfg(feature = "test-support")]
+const EVICT_GROUP: &str = "kafka-fifo-in-place-evict-fifo";
 /// The shortest `max.poll.interval.ms` librdkafka admits: it refuses a value
 /// below `session.timeout.ms`, which shove pins at 10 s.
 #[cfg(feature = "test-support")]
@@ -342,6 +350,16 @@ async fn committed_position(
     topic: &'static str,
     group: &'static str,
 ) -> Option<i64> {
+    committed_position_of(bootstrap, topic, group, 0).await
+}
+
+/// [`committed_position`] on `partition`.
+async fn committed_position_of(
+    bootstrap: &str,
+    topic: &'static str,
+    group: &'static str,
+    partition: i32,
+) -> Option<i64> {
     let bootstrap = bootstrap.to_owned();
     tokio::task::spawn_blocking(move || {
         let probe: BaseConsumer = ClientConfig::new()
@@ -350,13 +368,13 @@ async fn committed_position(
             .create()
             .expect("probe consumer");
         let mut tpl = TopicPartitionList::new();
-        tpl.add_partition(topic, 0);
+        tpl.add_partition(topic, partition);
         probe
             .committed_offsets(tpl, Duration::from_secs(5))
             .expect("read the committed offsets")
             .elements()
             .iter()
-            .find(|e| e.partition() == 0)
+            .find(|e| e.partition() == partition)
             .and_then(|e| match e.offset() {
                 Offset::Offset(offset) => Some(offset),
                 _ => None,
@@ -398,10 +416,13 @@ async fn read_ids(bootstrap: &str, topic: &str, count: usize) -> Vec<String> {
     ids
 }
 
-/// A sequenced consumer running on its own task, on a fresh client.
+/// A sequenced consumer running on its own task, on a fresh client, through
+/// `run_fifo_until_timeout`: its outcome counts a consumer task that ended
+/// with an error, a final commit the broker refused included, which
+/// `run_fifo` only logs.
 struct Running {
-    shutdown: CancellationToken,
-    task: JoinHandle<Result<(), ShoveError>>,
+    stop: CancellationToken,
+    task: JoinHandle<SupervisorOutcome>,
 }
 
 impl Running {
@@ -410,15 +431,21 @@ impl Running {
         T: SequencedTopic<Message = Order>,
     {
         let client = connect(bootstrap).await;
-        let shutdown = CancellationToken::new();
-        let options = ConsumerOptions::<Kafka>::new().with_shutdown(shutdown.clone());
+        let stop = CancellationToken::new();
+        let signal = stop.clone().cancelled_owned();
         let handler = handler.clone();
         let task = tokio::spawn(async move {
             KafkaConsumer::new(client)
-                .run_fifo::<T, _>(handler, (), options)
+                .run_fifo_until_timeout::<T, _, _>(
+                    handler,
+                    (),
+                    ConsumerOptions::<Kafka>::new(),
+                    signal,
+                    STOP_TIMEOUT,
+                )
                 .await
         });
-        Self { shutdown, task }
+        Self { stop, task }
     }
 
     /// Waits for `done`, failing at once if the consumer ends first.
@@ -434,15 +461,22 @@ impl Running {
         .await;
     }
 
-    /// Stops the consumer and returns how long the stop took.
+    /// Stops the consumer, fails unless it ended clean, final commit
+    /// included, and returns how long the stop took.
     async fn stop(self) -> Duration {
         let started = Instant::now();
-        self.shutdown.cancel();
-        self.task
-            .await
-            .expect("the consumer task joins")
-            .expect("the consumer stops clean");
+        let outcome = self.stop_outcome().await;
+        assert!(
+            outcome.is_clean(),
+            "the consumer stops clean, its final commit accepted: {outcome:?}"
+        );
         started.elapsed()
+    }
+
+    /// Stops the consumer and returns what its run reported.
+    async fn stop_outcome(self) -> SupervisorOutcome {
+        self.stop.cancel();
+        self.task.await.expect("the consumer task joins")
     }
 }
 
@@ -581,6 +615,11 @@ async fn fifo_hold_longer_than_max_poll_interval_does_not_evict() {
 
     token.cancel();
     group.shutdown().await;
+    assert_eq!(
+        committed_position(&bootstrap, EVICT_TOPIC, EVICT_GROUP).await,
+        Some(2),
+        "the member still in its group commits both records"
+    );
 }
 
 /// A dead letter that cannot be published keeps its record. The DLQ topic
@@ -662,6 +701,11 @@ async fn fifo_dlq_publish_failure_redelivers() {
         1,
         "A is dead-lettered once"
     );
+    assert_eq!(
+        committed_position(&bootstrap, OUTAGE_TOPIC, OUTAGE_GROUP).await,
+        Some(2),
+        "A is committed once dead-lettered, and B once acked"
+    );
 
     #[cfg(feature = "metrics")]
     {
@@ -726,6 +770,11 @@ async fn fifo_shutdown_mid_hold_loses_nothing() {
         ["A"],
         "nothing behind the held record is handled once the stop lands"
     );
+    assert_eq!(
+        committed_position(&bootstrap, STOP_TOPIC, STOP_GROUP).await,
+        Some(0),
+        "the stop's final commit lands at the held record and not past it"
+    );
 
     let second = Recorder::new(|_, _| Outcome::Ack);
     let restarted = Running::fifo::<StopTopic>(&bootstrap, &second).await;
@@ -749,6 +798,11 @@ async fn fifo_shutdown_mid_hold_loses_nothing() {
         seen[0].retry_count, 0,
         "the count starts again from the record's headers: {seen:?}"
     );
+    assert_eq!(
+        committed_position(&bootstrap, STOP_TOPIC, STOP_GROUP).await,
+        Some(2),
+        "both records are committed once the restarted consumer acked them"
+    );
 }
 
 /// A revoke of the held record's partition ends the hold with nothing
@@ -761,6 +815,8 @@ async fn fifo_shutdown_mid_hold_loses_nothing() {
 /// handler afterwards. Which partition moves is the assignor's choice. When
 /// it is the held record's, the revoke ends A's hold and A goes on to the
 /// head of the partition it kept; otherwise A keeps holding its record.
+/// Neither member commits a partition past the head it holds: B commits the
+/// moved head once it acked it, and A's kept partition stays at its head.
 #[tokio::test]
 async fn fifo_revoke_mid_hold_leaves_the_record_to_its_next_owner() {
     let mock = Mock::start(&[REVOKE_DLQ]);
@@ -842,6 +898,26 @@ async fn fifo_revoke_mid_hold_leaves_the_record_to_its_next_owner() {
         "B handles the moved partition's head once"
     );
 
+    // B stops with the group stable, so its final commit must land. A stops
+    // inside the rebalance B's departure starts, and the coordinator may
+    // refuse A's final commit with a rebalance in progress, which the Kafka
+    // page documents for a stop that meets a rebalance; only the position A
+    // commits matters here.
     member_b.stop().await;
-    member_a.stop().await;
+    let a_outcome = member_a.stop_outcome().await;
+    assert!(
+        a_outcome.panics == 0 && !a_outcome.timed_out,
+        "A stops without a panic and inside its bound: {a_outcome:?}"
+    );
+    let kept = 1 - moved;
+    assert_eq!(
+        committed_position_of(&bootstrap, REVOKE_TOPIC, REVOKE_GROUP, moved).await,
+        Some(1),
+        "the moved partition is committed past its head once, by B"
+    );
+    let kept_committed = committed_position_of(&bootstrap, REVOKE_TOPIC, REVOKE_GROUP, kept).await;
+    assert!(
+        matches!(kept_committed, None | Some(0)),
+        "A never commits its kept partition past the head it still holds: {kept_committed:?}"
+    );
 }
