@@ -9941,9 +9941,10 @@ mod offset_tracker_tests {
 
     // -- broadcast start position --
 
-    /// The groupless path ignores exactly one error, the coordinator lookup
-    /// its inert group id provokes under a restrictive ACL; every other code
-    /// still ends the connection.
+    /// The groupless path ignores exactly one error of its own, the
+    /// coordinator lookup its inert group id provokes under a restrictive
+    /// ACL; every other code is left to the table every receive loop reads,
+    /// `recv_error_is_transient`.
     #[test]
     fn only_group_authorization_is_ignorable_on_the_groupless_path() {
         assert!(is_ignorable_groupless_error(
@@ -9958,7 +9959,7 @@ mod offset_tracker_tests {
         ] {
             assert!(
                 !is_ignorable_groupless_error(&other),
-                "{other:?} must keep ending the connection"
+                "{other:?} is no answer to the inert group id"
             );
         }
     }
@@ -12154,7 +12155,8 @@ mod error_classifier_tests {
     }
 
     /// The transient direction stays transient: a broker that is merely
-    /// unreachable is a `Connection` error and the reconnect loop owns it.
+    /// unreachable maps to a `Connection` error, so a call that does end
+    /// on it, such as a failed subscribe, reconnects.
     #[test]
     fn an_unreachable_broker_stays_transient() {
         let e = KafkaError::MessageConsumption(RDKafkaErrorCode::BrokerTransportFailure);
@@ -12162,6 +12164,175 @@ mod error_classifier_tests {
             map_kafka_error("recv", e),
             ShoveError::Connection(_)
         ));
+    }
+
+    // -- the receive loops' table, `recv_error_is_transient` --
+
+    fn consumption(code: RDKafkaErrorCode) -> KafkaError {
+        KafkaError::MessageConsumption(code)
+    }
+
+    /// A broker connection that failed or could not be made: librdkafka
+    /// reconnects on its own (`rdkafka_broker.c:616-625`).
+    #[test]
+    fn a_broker_transport_failure_is_ridden_out() {
+        assert!(recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::BrokerTransportFailure
+        )));
+    }
+
+    /// A broker name that did not resolve: the next connect attempt
+    /// resolves it again (`rdkafka_broker.c:1127-1139`).
+    #[test]
+    fn a_name_that_did_not_resolve_is_ridden_out() {
+        assert!(recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::Resolve
+        )));
+    }
+
+    /// Every broker down at once: librdkafka re-bootstraps and its brokers
+    /// keep reconnecting (`rdkafka_broker.c:369-388`).
+    #[test]
+    fn every_broker_down_is_ridden_out() {
+        assert!(recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::AllBrokersDown
+        )));
+    }
+
+    /// A fatal error ends the loop, whatever code it carries.
+    #[test]
+    fn a_fatal_error_ends_the_loop() {
+        assert!(!recv_error_is_transient(
+            &KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::FencedInstanceId)
+        ));
+        assert!(!recv_error_is_transient(
+            &KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::BrokerTransportFailure)
+        ));
+    }
+
+    /// A `__FATAL` librdkafka did not translate to its underlying code
+    /// (`rdkafka_event.h:77-91`) ends the loop too.
+    #[test]
+    fn an_untranslated_fatal_error_ends_the_loop() {
+        assert!(!recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::Fatal
+        )));
+    }
+
+    /// No committed offset under the `error` reset policy: the reconnect
+    /// meets the same answer, see `map_kafka_error`.
+    #[test]
+    fn a_missing_offset_under_the_error_policy_ends_the_loop() {
+        assert!(!recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::AutoOffsetReset
+        )));
+    }
+
+    /// librdkafka raises it once it has left the group for a member that
+    /// did not poll in time (`rdkafka_cgrp.c:5162-5210`).
+    #[test]
+    fn an_exceeded_poll_interval_ends_the_loop() {
+        assert!(!recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::PollExceeded
+        )));
+    }
+
+    /// A committed-offset fetch that timed out leaves its partitions
+    /// unfetched (`rdkafka_assignment.c:281-298`).
+    #[test]
+    fn a_timed_out_offset_fetch_ends_the_loop() {
+        assert!(!recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::OperationTimedOut
+        )));
+    }
+
+    /// A committed-offset fetch the coordinator refused leaves its
+    /// partitions unfetched until the assignment changes
+    /// (`rdkafka_assignment.c:198-232`, `:301-326`).
+    #[test]
+    fn a_moved_coordinator_ends_the_loop() {
+        assert!(!recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::NotCoordinator
+        )));
+    }
+
+    /// The same, for a coordinator that is not available yet.
+    #[test]
+    fn an_unavailable_coordinator_ends_the_loop() {
+        assert!(!recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::CoordinatorNotAvailable
+        )));
+    }
+
+    /// The group's coordinator lookup or join was refused; every retry
+    /// meets the same refusal (`rdkafka_cgrp.c:794-807`).
+    #[test]
+    fn a_group_authorization_failure_ends_the_loop() {
+        assert!(!recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::GroupAuthorizationFailed
+        )));
+    }
+
+    /// A fetch the topic's ACL refused stops the partition's fetching
+    /// (`rdkafka_fetcher.c:295-308`).
+    #[test]
+    fn a_topic_authorization_failure_ends_the_loop() {
+        assert!(!recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::TopicAuthorizationFailed
+        )));
+    }
+
+    /// A subscribed topic the cluster does not know
+    /// (`rdkafka_cgrp.c:5240-5262`).
+    #[test]
+    fn an_unknown_topic_ends_the_loop() {
+        assert!(!recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::UnknownTopicOrPartition
+        )));
+    }
+
+    /// A TLS handshake that failed for any reason but a disconnect, which
+    /// librdkafka reports as `__TRANSPORT` (`rdkafka_ssl.c:644-686`).
+    #[test]
+    fn a_tls_failure_ends_the_loop() {
+        assert!(!recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::SSL
+        )));
+    }
+
+    /// A SASL authentication the broker refused
+    /// (`rdkafka_request.c:3425-3433`).
+    #[test]
+    fn an_authentication_failure_ends_the_loop() {
+        assert!(!recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::Authentication
+        )));
+    }
+
+    /// A fetch error librdkafka passes on and retries without end
+    /// (`rdkafka_fetcher.c:327-342`).
+    #[test]
+    fn a_fetch_error_ends_the_loop() {
+        assert!(!recv_error_is_transient(&consumption(
+            RDKafkaErrorCode::MessageSizeTooLarge
+        )));
+    }
+
+    /// The end of a partition, which shove never asks librdkafka to report
+    /// (`enable.partition.eof` keeps its default, off).
+    #[test]
+    fn a_partition_end_ends_the_loop() {
+        assert!(!recv_error_is_transient(&KafkaError::PartitionEOF(0)));
+    }
+
+    /// The table matches the consumption errors `recv()` returns
+    /// (rust-rdkafka 0.39, `base_consumer.rs:241-257`), not a code on its
+    /// own.
+    #[test]
+    fn a_transient_code_outside_a_consumption_error_ends_the_loop() {
+        assert!(!recv_error_is_transient(&KafkaError::Global(
+            RDKafkaErrorCode::BrokerTransportFailure
+        )));
     }
 }
 
