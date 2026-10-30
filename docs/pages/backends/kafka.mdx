@@ -720,8 +720,8 @@ A member whose task is aborted closes off the runtime thread as well, but nothin
 The wait for the handlers at a stop can fail too: on a receive error that ends a consumer, see [Broker outages](#broker-outages), or on a put-back or a pause librdkafka refuses.
 The stop then ends as an error exit does, with no final commit: the consumer closes with nothing committed, and every record completed since the last accepted commit is redelivered.
 The close comes before the handlers finish, so the member leaves its group while they may still run, and the stop returns once every one of them has finished.
-The stop has already fired, so a retryable error reconnects nothing, and the stop ends as a clean one: `run` returns `Ok(())`.
-A permanent error is returned.
+The consumer logs the failure at error level and ends with it: `run` returns that error, a `ShoveError::Connection` for a refused put-back or pause, and a group run counts the member under `errors`.
+Nothing reconnects, because the stop has already fired.
 
 A final commit the broker does not confirm ends the member with `ShoveError::Commit` instead of a clean exit.
 The error reads `offset commit at shutdown`, because the commit it names can be the one in flight when the stop landed.
@@ -770,7 +770,7 @@ What that means for replay:
   When the final commit is rejected or hits its deadline, redelivery starts from the last position the broker accepted, and the member reports that with `ShoveError::Commit`.
   A commit request librdkafka abandoned on a coordinator reconnect can also be applied after the final one, as the commit section above describes.
   A coordinator hiccup overlapping the shutdown can therefore replay a few records.
-  A stop whose wait for the handlers failed makes no final commit, so every record completed since the last accepted commit is redelivered, even when `run` returns `Ok(())`.
+  A stop whose wait for the handlers failed makes no final commit, so every record completed since the last accepted commit is redelivered, and the member ends with the error that failed the wait.
   A partition revoked during that wait is redelivered from its last accepted commit too.
 
 `Outcome::Reject` routes to the DLQ (if configured) and commits the offset; the original is not redelivered. Messages that exhaust `max_retries` follow the same DLQ-then-commit path.

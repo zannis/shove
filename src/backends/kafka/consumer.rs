@@ -4564,10 +4564,37 @@ async fn stop_with_final_commit(
 /// failed and every redelivery would escalate to a reconnect.
 const SEEK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Raised by a consume loop whose own stop failed after the stop had fired:
+/// the standard consumer's wait for its handlers at a stop polls, and a
+/// receive error that ends a consumer, or a put-back or pause librdkafka
+/// refuses, ends that wait with no final commit. [`run_with_reconnect`]
+/// then returns the error that ended the attempt instead of reading it as
+/// the stop.
+#[derive(Default)]
+pub(super) struct StopFailed(AtomicBool);
+
+impl StopFailed {
+    fn raise(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn raised(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Runs `f`, the attempt that connects a consumer and runs its loop, and
+/// runs it again after a retryable error, under backoff and
+/// `max_reconnect_attempts`. An `Ok` ends the run, and so does an error that
+/// is not retryable, which is returned. Once `shutdown` has fired, a
+/// retryable error ends the run with `Ok(())`, unless the attempt raised
+/// `stop_failed`: the error is then the stop's own failure, and it is
+/// returned.
 pub(super) async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
     label: &str,
     max_reconnect_attempts: Option<u32>,
+    stop_failed: Option<&StopFailed>,
     mut f: F,
 ) -> Result<()>
 where
@@ -4589,6 +4616,9 @@ where
                     return Err(e);
                 }
                 if shutdown.is_cancelled() {
+                    if stop_failed.is_some_and(StopFailed::raised) {
+                        return Err(e);
+                    }
                     return Ok(());
                 }
                 attempts = attempts.saturating_add(1);
@@ -6956,7 +6986,10 @@ impl KafkaConsumer {
         let schema_message_index: Option<Arc<[i32]>> =
             options.schema_message_index.clone().map(Arc::from);
 
-        run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, || {
+        let stop_failed = StopFailed::default();
+        let stop_failed = &stop_failed;
+        let max_attempts = options.max_reconnect_attempts;
+        run_with_reconnect(&shutdown, queue, max_attempts, Some(stop_failed), || {
             let handler = handler.clone();
             let ctx = ctx.clone();
             let client = client.clone();
@@ -7280,7 +7313,7 @@ impl KafkaConsumer {
                             // A spare permit would otherwise deadlock the drain below.
                             drop(spare_permit.take());
                             // Polls throughout, so a long handler costs no eviction.
-                            let drained = acquire_permit_while_polling(
+                            let drained = match acquire_permit_while_polling(
                                 &semaphore,
                                 u32::from(prefetch_count),
                                 consumer,
@@ -7290,7 +7323,22 @@ impl KafkaConsumer {
                                 &mut paused,
                                 None,
                             )
-                            .await?;
+                            .await
+                            {
+                                Ok(drained) => drained,
+                                Err(e) => {
+                                    tracing::error!(
+                                        queue,
+                                        error = %e,
+                                        "the stop's wait for its handlers failed; closing without \
+                                         the final commit, so every record completed since the last \
+                                         accepted commit is redelivered, and the run ends with this \
+                                         error"
+                                    );
+                                    stop_failed.raise();
+                                    return Err(e);
+                                }
+                            };
                             drop(drained);
                             // Every task has exited. A task that ended on a
                             // cancelled wait may not have cleared the busy
@@ -8235,7 +8283,7 @@ impl KafkaConsumer {
             "Kafka batch consumer started"
         );
 
-        run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, || {
+        run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, None, || {
             let handler = handler.clone();
             let ctx = ctx.clone();
             let client = client.clone();
@@ -8779,9 +8827,13 @@ impl KafkaConsumer {
         );
         let max_reconnect_attempts = options.max_reconnect_attempts;
         let shard_task = tokio::spawn(async move {
-            run_with_reconnect(&fifo.shutdown, &fifo.queue, max_reconnect_attempts, || {
-                Arc::clone(&fifo).run_connection()
-            })
+            run_with_reconnect(
+                &fifo.shutdown,
+                &fifo.queue,
+                max_reconnect_attempts,
+                None,
+                || Arc::clone(&fifo).run_connection(),
+            )
             .await
         });
         Ok(vec![shard_task])
@@ -9022,7 +9074,7 @@ impl KafkaConsumer {
             "Kafka broadcast subscription starting"
         );
 
-        run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, || {
+        run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, None, || {
             let handler = handler.clone();
             let ctx = ctx.clone();
             let client = client.clone();
@@ -9666,7 +9718,7 @@ impl KafkaConsumer {
 
         tracing::info!(dlq, group_id = dlq_group_id, "Kafka DLQ consumer started");
 
-        run_with_reconnect(&shutdown, dlq, None, || {
+        run_with_reconnect(&shutdown, dlq, None, None, || {
             let handler = handler.clone();
             let ctx = ctx.clone();
             let client_clone = client.clone();
@@ -14147,7 +14199,7 @@ mod reconnect_tests {
     async fn resets_budget_after_healthy_run() {
         let shutdown = CancellationToken::new();
         let calls = AtomicU32::new(0);
-        let result = run_with_reconnect(&shutdown, "test", Some(2), || {
+        let result = run_with_reconnect(&shutdown, "test", Some(2), None, || {
             let n = calls.fetch_add(1, AtomicOrdering::SeqCst) + 1;
             async move {
                 if n <= 5 {
@@ -14170,7 +14222,7 @@ mod reconnect_tests {
     async fn exhausts_budget_on_consecutive_fast_failures() {
         let shutdown = CancellationToken::new();
         let calls = AtomicU32::new(0);
-        let result = run_with_reconnect(&shutdown, "test", Some(2), || {
+        let result = run_with_reconnect(&shutdown, "test", Some(2), None, || {
             calls.fetch_add(1, AtomicOrdering::SeqCst);
             async move { Err(ShoveError::Connection("boom".to_string())) }
         })
@@ -14178,6 +14230,41 @@ mod reconnect_tests {
 
         assert!(result.is_err(), "expected exhaustion error, got {result:?}");
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    /// An attempt whose own stop failed, as the standard consumer's wait for
+    /// its handlers can at a stop, ends the run with that error although it
+    /// is retryable and the stop has fired.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_stop_ends_the_run_with_its_error() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let stop_failed = StopFailed::default();
+        let result = run_with_reconnect(&shutdown, "test", None, Some(&stop_failed), || {
+            stop_failed.raise();
+            async { Err(ShoveError::Connection("put-back seek failed".to_string())) }
+        })
+        .await;
+
+        assert!(
+            matches!(&result, Err(ShoveError::Connection(msg)) if msg == "put-back seek failed"),
+            "the stop's failure is returned: {result:?}"
+        );
+    }
+
+    /// The same error with nothing raised, from an attempt that ended on an
+    /// error the stop raced, still ends the run with `Ok(())`.
+    #[tokio::test(start_paused = true)]
+    async fn a_retryable_error_once_the_stop_has_fired_ends_the_run_clean() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let stop_failed = StopFailed::default();
+        let result = run_with_reconnect(&shutdown, "test", None, Some(&stop_failed), || async {
+            Err(ShoveError::Connection("boom".to_string()))
+        })
+        .await;
+
+        assert!(result.is_ok(), "expected a clean end, got {result:?}");
     }
 }
 
