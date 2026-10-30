@@ -7179,8 +7179,9 @@ async fn a_worker_pulls_again_once_its_connection_comes_back() {
         .start()
         .await
         .expect("failed to start NATS container");
+    let host = container.get_host().await.expect("failed to get host");
     let client =
-        NatsClient::connect_with_retry(&NatsConfig::new(format!("nats://127.0.0.1:{port}")), 10)
+        NatsClient::connect_with_retry(&NatsConfig::new(format!("nats://{host}:{port}")), 10)
             .await
             .expect("failed to connect to NATS");
     let broker = Broker::<Nats>::from_client(client.clone());
