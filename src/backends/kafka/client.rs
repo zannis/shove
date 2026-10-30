@@ -569,10 +569,55 @@ impl ProducerCell {
     }
 }
 
+/// A publish's hold on the client's producer. However the publish ends,
+/// finished or cancelled mid-send, its reference goes through
+/// [`release_producer`].
+struct ProducerLease {
+    // Fields drop in declaration order, so `_release` holds the reference
+    // that can be the last one.
+    producer: Arc<KafkaProducerInner>,
+    _release: ReleaseOnDrop,
+}
+
+impl ProducerLease {
+    fn new(producer: Arc<KafkaProducerInner>) -> Self {
+        Self {
+            _release: ReleaseOnDrop(Some(Arc::clone(&producer))),
+            producer,
+        }
+    }
+}
+
+impl std::ops::Deref for ProducerLease {
+    type Target = KafkaProducerInner;
+
+    fn deref(&self) -> &KafkaProducerInner {
+        &self.producer
+    }
+}
+
+/// Hands its reference to [`release_producer`] when dropped.
+struct ReleaseOnDrop(Option<Arc<KafkaProducerInner>>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        if let Some(producer) = self.0.take() {
+            release_producer(producer);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RELEASED_PRODUCERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Drops a reference to a producer. Dropping the last one destroys the
 /// producer, which joins its threads and waits on its queue in librdkafka,
 /// so that drop runs on a blocking thread.
 fn release_producer(producer: Arc<KafkaProducerInner>) {
+    #[cfg(test)]
+    RELEASED_PRODUCERS.with(|released| released.set(released.get().saturating_add(1)));
     let Some(last) = Arc::into_inner(producer) else {
         return;
     };
@@ -777,7 +822,7 @@ impl KafkaClient {
     /// never requests a producer id. After `shutdown` the build is refused.
     /// A producer librdkafka raised a fatal error on is dropped by the
     /// publish that met it, so the call after builds a new one.
-    async fn producer(&self) -> Result<Arc<KafkaProducerInner>> {
+    async fn producer(&self) -> Result<ProducerLease> {
         let slot = self.producer.current();
         let producer = slot
             .get_or_try_init(|| async {
@@ -799,7 +844,7 @@ impl KafkaClient {
                 .map(Arc::new)
             })
             .await?;
-        Ok(Arc::clone(producer))
+        Ok(ProducerLease::new(Arc::clone(producer)))
     }
 
     /// Drops `producer` from the client when librdkafka raised a fatal error
@@ -873,9 +918,8 @@ impl KafkaClient {
             .publish_with_retry(topic, key, headers, payload, max_attempts, label)
             .await;
         if result.is_err() {
-            self.discard_if_fatal(&producer);
+            self.discard_if_fatal(&producer.producer);
         }
-        release_producer(producer);
         result
     }
 
@@ -894,9 +938,8 @@ impl KafkaClient {
         };
         let report = producer.publish_in_order(topic, records, label).await;
         if report.first_err().is_some() {
-            self.discard_if_fatal(&producer);
+            self.discard_if_fatal(&producer.producer);
         }
-        release_producer(producer);
         report
     }
 
@@ -2174,6 +2217,28 @@ mod tests {
                 "attempt {attempt}: the cell is not empty"
             );
         }
+    }
+
+    fn released_producers() -> usize {
+        RELEASED_PRODUCERS.with(std::cell::Cell::get)
+    }
+
+    /// A publish cancelled mid-send still hands its producer reference to
+    /// `release_producer`, so a producer the client already discarded is
+    /// never destroyed on the runtime thread that dropped the publish.
+    #[tokio::test]
+    async fn a_cancelled_publish_releases_its_producer() {
+        let client = client().await;
+        drop(client.producer().await.expect("nothing is needed to build"));
+        let before = released_producers();
+
+        let publish =
+            client.publish_with_retry("orders", None, OwnedHeaders::new(), b"{}", 1, "test");
+        tokio::time::timeout(Duration::from_millis(200), publish)
+            .await
+            .expect_err("no broker answers, so the publish is still waiting");
+
+        assert_eq!(released_producers().saturating_sub(before), 1);
     }
 
     /// Zero attempts is a caller error, refused before anything is sent.
