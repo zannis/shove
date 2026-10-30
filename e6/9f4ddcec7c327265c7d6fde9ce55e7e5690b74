@@ -1,0 +1,27 @@
+src/batch_consumer.rs
+  s_1001dc3147e1e5::t_df2f52ad5868ef 151,154-161
+  s_1001dc3147e1e5::t_c6f50919a5050b 162
+docs/pages/concepts/outcomes.mdx
+  s_1001dc3147e1e5::t_01ccc1a4dafd59 84
+src/consumer.rs
+  s_1001dc3147e1e5::t_b243455fd024a7 221-223
+  s_1001dc3147e1e5::t_5ca8898d96373a 482-498
+src/backends/nats/consumer.rs
+  s_1001dc3147e1e5::t_43a48eb96bb1e0 1037-1047
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e69f4ddcec7c327265c7d6fde9ce55e7e5690b74",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
