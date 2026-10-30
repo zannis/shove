@@ -1125,10 +1125,11 @@ const MAX_OPEN_PULLS: usize = 2;
 type Deliveries = stream::Zip<Batch, stream::Iter<std::vec::IntoIter<OwnedSemaphorePermit>>>;
 
 /// The statuses a pull can end with that clear on their own: the durable's
-/// waiting list was full, or its cluster leader changed. Any other status,
+/// waiting list was full, or its cluster leader changed. Any other status is
+/// the connection error that spends a reconnect attempt. Some never clear,
 /// such as a pull the durable's limits refuse (`Exceeded MaxRequestBatch`,
-/// `Exceeded MaxRequestExpires`, `Exceeded MaxRequestMaxBytes`), never
-/// clears, so it is the connection error that spends a reconnect attempt.
+/// `Exceeded MaxRequestExpires`, `Exceeded MaxRequestMaxBytes`), and a
+/// graceful `Server Shutdown` is counted with them.
 const TRANSIENT_PULL_STATUSES: [&str; 2] = ["Exceeded MaxWaiting", "Leadership Change"];
 
 /// Whether `ended`, the error async-nats yields for a status that ends a

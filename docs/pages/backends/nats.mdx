@@ -182,6 +182,7 @@ A worker with a single slot, which is every sequential member and any prefetch o
 Concurrent processing with a larger prefetch restores pipelining.
 When the server refuses a pull because the durable's waiting list is full (`Exceeded MaxWaiting`), or ends one on a cluster leader change, the worker probes its connection, and only a failed probe counts as a connection error and spends a reconnect attempt.
 Any other status that ends a pull, such as a pull the durable's limits refuse (`Exceeded MaxRequestBatch`, `Exceeded MaxRequestExpires` or `Exceeded MaxRequestMaxBytes`), is a connection error that spends one, so `with_max_reconnect_attempts` ends a consumer whose durable can never take its pulls.
+A graceful server shutdown ends its pulls with `Server Shutdown`, which is counted the same way, so a small `with_max_reconnect_attempts` can end a consumer during a rolling restart.
 After a refused pull or a leader change, the worker waits before it opens its next pull, and the pulls it already has open go on meanwhile.
 The wait is jittered by up to half either way around a base that starts at 100 ms and doubles with each further such pull up to 5 s, so the first wait is 50 to 150 ms and one at the cap is 2.5 to 7.5 s.
 Only a delivery resets it.
