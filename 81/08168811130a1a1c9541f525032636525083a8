@@ -1,0 +1,28 @@
+src/backends/nats/broadcast.rs
+  s_1001dc3147e1e5::t_6e3973a88fa018 91-92,95-101
+  s_1001dc3147e1e5::t_36e603c7450a13 775,909-957
+  s_1001dc3147e1e5::t_0b7fec825cca6f 388
+  s_1001dc3147e1e5::t_d97e454e8ea2c0 377
+  s_1001dc3147e1e5::t_9a10769e043e34 497-498
+  s_1001dc3147e1e5::t_07e78d4f972d99 730-748,750-751,760,765-774
+  s_1001dc3147e1e5::t_2e8eaaee964db7 432,437
+  s_1001dc3147e1e5::t_5feb62bb39c74b 776
+docs/pages/concepts/broadcast.mdx
+  s_1001dc3147e1e5::t_5d3f6d96ec1338 109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8108168811130a1a1c9541f525032636525083a8",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
