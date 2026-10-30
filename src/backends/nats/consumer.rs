@@ -29,7 +29,7 @@ use crate::backend::batch_consumer::{
     BatchConsumerOptionsInner, BatchSettlement, settle_batch_outcome,
 };
 use crate::consumer::{DEFAULT_HANDLER_TIMEOUT, RetryStrategy, validate_message_size};
-use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
+use crate::consumer_supervisor::{AbortOnDrop, SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::Result;
 use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -37,11 +37,11 @@ use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::routing::{
-    PoisonedKeys, RetryDecision, decide_retry, handler_timeout_outcome, hold_delay,
+    DRAIN_GRACE, PoisonedKeys, RetryDecision, decide_retry, handler_timeout_outcome, hold_delay,
 };
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::QueueTopology;
-use crate::{DEFAULT_MAX_MESSAGE_SIZE, Nats, ShoveError};
+use crate::{Nats, ShoveError};
 
 use super::client::NatsClient;
 use super::constants::{
@@ -59,10 +59,12 @@ use super::publisher::{PublishResult, header_value, publish_with_retry};
 /// once: a worker pulls no more messages than it has free slots, and a FIFO
 /// shard's durable delivers one at a time. So the clock measures the handler
 /// and its settlement, and the 3x margin over the handler timeout lets a
-/// handler run to its limit with room to settle. A copy's publish and a
-/// retry's hold renew the clock with progress acks instead of drawing on the
-/// margin. Floor at the JetStream default (30s) so short handler timeouts
-/// don't tighten redelivery below the server default.
+/// handler run to its limit with room to settle. A DLQ drain asks for one dead
+/// letter per pull and reads at most two ahead of its call, so a dead letter
+/// waits behind at most two calls, which the margin covers as well. A copy's
+/// publish and a retry's hold renew the clock with progress acks instead of
+/// drawing on the margin. Floor at the JetStream default (30s) so short
+/// handler timeouts don't tighten redelivery below the server default.
 pub(super) fn derive_ack_wait(handler_timeout: Duration) -> Duration {
     handler_timeout
         .saturating_mul(3)
@@ -526,6 +528,32 @@ fn dlq_fail_reason(reason: &str) -> metrics::FailReason {
     }
 }
 
+/// A token that fires when `first` or `second` does. It is a child of `first`,
+/// so `first` reaches it in the same step, and a task forwards `second` to it
+/// a scheduling step later. The guard ends that task, so hold it as long as the
+/// token is in use.
+fn cancelled_by_either(
+    first: &CancellationToken,
+    second: &CancellationToken,
+) -> (CancellationToken, AbortOnDrop) {
+    let merged = first.child_token();
+    let forward = tokio::spawn({
+        let (second, merged) = (second.clone(), merged.clone());
+        async move {
+            second.cancelled().await;
+            merged.cancel();
+        }
+    });
+    (merged, AbortOnDrop(forward.abort_handle()))
+}
+
+/// Acks a dead letter the DLQ drain is done with.
+async fn ack_dead_letter(msg: &Message, dlq: &str) {
+    if let Err(e) = msg.ack().await {
+        tracing::error!(error = %e, dlq, "failed to ack DLQ message");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sequenced settlement
 // ---------------------------------------------------------------------------
@@ -966,14 +994,59 @@ async fn release_pulled(consumer: &PullConsumer, unstarted: &[Message]) {
 // Handler invocation
 // ---------------------------------------------------------------------------
 
+/// Guards that abort the tasks of `handles` when dropped. A dropped
+/// `JoinHandle` detaches its task, so a caller that awaits shard tasks holds
+/// these to take them down with it when it is aborted or dropped itself.
+pub(super) fn abort_on_drop<T>(handles: &[tokio::task::JoinHandle<T>]) -> Vec<AbortOnDrop> {
+    handles
+        .iter()
+        .map(|handle| AbortOnDrop(handle.abort_handle()))
+        .collect()
+}
+
+/// How a [`guarded`] call ended.
+enum Guarded<T> {
+    Done(T),
+    /// The call panicked; the error is the task's `JoinError`.
+    Panicked(tokio::task::JoinError),
+    /// The call outlasted this limit and was aborted.
+    TimedOut(Duration),
+}
+
+/// Runs `fut` in a child task, so a panic inside it ends that task while the
+/// caller carries on, and gives up on it after `timeout`. Records no metric.
+///
+/// The child is aborted when the call times out and when the caller is
+/// dropped, as an aborted FIFO shard or DLQ drain is. A bare `JoinHandle` would
+/// detach it to run on with no limit.
+async fn guarded<F>(fut: F, timeout: Option<Duration>) -> Guarded<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let mut join = tokio::spawn(fut);
+    let _abort = AbortOnDrop(join.abort_handle());
+    let joined = match timeout {
+        Some(limit) => match tokio::time::timeout(limit, &mut join).await {
+            Ok(joined) => joined,
+            Err(_) => return Guarded::TimedOut(limit),
+        },
+        None => join.await,
+    };
+    match joined {
+        Ok(output) => Guarded::Done(output),
+        Err(e) => Guarded::Panicked(e),
+    }
+}
+
 /// Wraps a handler future with optional timeout, emitting inflight/consumed/duration metrics.
 /// Returns `Outcome::Retry` on timeout or panic.
 ///
-/// The future is run inside a child `tokio::spawn` so a panic inside the
-/// user's handler is caught here (as `JoinError::is_panic`) and surfaced as
-/// `Outcome::Retry` with metrics recorded — without this, the spawned task
-/// aborts before the metric calls and panicked handlers disappear from the
-/// consumed/latency series even though the caller still requeues them.
+/// The future runs under [`guarded`], so a panic inside the user's handler is
+/// caught there and surfaced as `Outcome::Retry` with metrics recorded.
+/// Without this, the spawned task would abort before the metric calls and
+/// panicked handlers would disappear from the consumed/latency series even
+/// though the caller still requeues them.
 async fn invoke_handler<F>(
     fut: F,
     timeout: Option<Duration>,
@@ -986,29 +1059,18 @@ where
 {
     let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
-    let mut join = tokio::spawn(fut);
-    let outcome = match timeout {
-        Some(duration) => match tokio::time::timeout(duration, &mut join).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "handler task panicked, retrying message");
-                Outcome::Retry
-            }
-            Err(_) => {
-                join.abort();
-                let resolved = handler_timeout_outcome(timeout_outcome);
-                tracing::warn!(outcome = ?resolved, "handler timed out after {duration:?}");
-                metrics::record_failed(topic, group, metrics::FailReason::Timeout);
-                resolved
-            }
-        },
-        None => match join.await {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::warn!(error = %e, "handler task panicked, retrying message");
-                Outcome::Retry
-            }
-        },
+    let outcome = match guarded(fut, timeout).await {
+        Guarded::Done(outcome) => outcome,
+        Guarded::Panicked(e) => {
+            tracing::warn!(error = %e, "handler task panicked, retrying message");
+            Outcome::Retry
+        }
+        Guarded::TimedOut(limit) => {
+            let resolved = handler_timeout_outcome(timeout_outcome);
+            tracing::warn!(outcome = ?resolved, "handler timed out after {limit:?}");
+            metrics::record_failed(topic, group, metrics::FailReason::Timeout);
+            resolved
+        }
     };
     let elapsed = start.elapsed().as_secs_f64();
     metrics::record_consumed(topic, group, &outcome);
@@ -1069,7 +1131,7 @@ where
                 if shutdown.is_cancelled() {
                     return Ok(());
                 }
-                attempts += 1;
+                attempts = attempts.saturating_add(1);
                 if let Some(max) = max_reconnect_attempts
                     && attempts >= max
                 {
@@ -1083,13 +1145,13 @@ where
                         "consumer on '{label}' exhausted {max} reconnect attempt(s): {e}"
                     )));
                 }
-                let delay = backoff.next().expect("backoff is infinite");
+                let delay = backoff.next_delay();
                 tracing::warn!(
                     label,
                     attempt = attempts,
                     ?max_reconnect_attempts,
                     error = %e,
-                    delay_ms = delay.as_millis() as u64,
+                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                     "consumer error, reconnecting"
                 );
                 tokio::select! {
@@ -1118,6 +1180,43 @@ const PULL_EXPIRES: Duration = Duration::from_secs(30);
 /// messages is unchanged, and a worker with a single slot keeps a single
 /// pull.
 const MAX_OPEN_PULLS: usize = 2;
+
+/// The idle heartbeat of the DLQ drain's pulls, the one `messages()` sets, so
+/// a dead connection still ends the drain's stream with an error.
+const DLQ_PULL_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// The longest expiry a pull request can carry, which it holds as an `i64` of
+/// nanoseconds.
+const MAX_PULL_EXPIRES: Duration = Duration::from_nanos(i64::MAX.unsigned_abs());
+
+/// How long the DLQ drain holds each pull open.
+///
+/// async-nats renews a pull of its own accord once the pull is as old as its
+/// expiry plus 5 s with no request since, and a `handle_dead` call makes none
+/// while it runs. A pull that expires inside a long call is therefore renewed
+/// behind it, and brings the next dead letter in early. So the pull is held
+/// open for as long as a call may run: the handler timeout, or the durable's
+/// `ack_wait` without one, since a call longer than that loses its own dead
+/// letter to redelivery anyway. The worker's [`PULL_EXPIRES`] is the floor.
+///
+/// A call within that bound ends before the renewal can fire when it starts
+/// within 5 s of the pull being sent, as it does while dead letters are
+/// waiting. One that starts late in an idle pull can outlast the renewal and
+/// bring one dead letter in, and a reconnect during a call brings in another.
+/// The client stops there, at two.
+fn dlq_pull_expires(handler_timeout: Option<Duration>, ack_wait: Duration) -> Duration {
+    handler_timeout
+        .unwrap_or(ack_wait)
+        .max(PULL_EXPIRES)
+        .min(MAX_PULL_EXPIRES)
+}
+
+/// How long a consumer that leaves without a stop waits for the message tasks
+/// it started: the default handler timeout plus the grace the other backends
+/// give their shutdown drains, so a handler held to the default has settled
+/// its message by the time the consumer returns. A task still running after
+/// that goes on, and settles its message when it finishes.
+const EXIT_DRAIN_TIMEOUT: Duration = DEFAULT_HANDLER_TIMEOUT.saturating_add(DRAIN_GRACE);
 
 /// One pull's deliveries, each paired with the processing slot reserved for
 /// it when the pull was sized. The pairing ends with whichever side runs out
@@ -1295,6 +1394,12 @@ impl BusyTasks {
             }
             finished.await;
         }
+    }
+
+    /// [`idle`](Self::idle) for at most `limit`. `false` when a counted task is
+    /// still running at the end of it.
+    async fn idle_within(&self, limit: Duration) -> bool {
+        tokio::time::timeout(limit, self.idle()).await.is_ok()
     }
 }
 
@@ -1542,6 +1647,30 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
             "shutdown signal received, draining in-flight tasks"
         );
         self.busy.idle().await;
+    }
+
+    /// Waits, for at most [`EXIT_DRAIN_TIMEOUT`], for the tasks the worker
+    /// started, when the consumer leaves any other way than a stop, which has
+    /// drained them already.
+    async fn drain_on_exit(&self) {
+        let running = self.busy.running();
+        if running == 0 {
+            return;
+        }
+        let queue = self.topology.queue();
+        tracing::info!(
+            queue,
+            running,
+            "the consumer is exiting, waiting for in-flight tasks"
+        );
+        if !self.busy.idle_within(EXIT_DRAIN_TIMEOUT).await {
+            tracing::warn!(
+                queue,
+                running = self.busy.running(),
+                timeout = ?EXIT_DRAIN_TIMEOUT,
+                "tasks were still running when the wait ended; each settles its message as it finishes"
+            );
+        }
     }
 
     /// Size-checks and decodes `msg`, runs the handler on it and settles its
@@ -1847,7 +1976,7 @@ impl NatsConsumer {
             _topic: PhantomData,
         });
 
-        run_with_reconnect(
+        let result = run_with_reconnect(
             &options.shutdown,
             queue,
             options.max_reconnect_attempts,
@@ -1932,7 +2061,10 @@ impl NatsConsumer {
                 }
             },
         )
-        .await
+        .await;
+
+        worker.drain_on_exit().await;
+        result
     }
 
     pub async fn run_fifo<T, H>(
@@ -2013,6 +2145,7 @@ impl NatsConsumer {
         let handles = self
             .spawn_fifo_shards::<T, H>(handler, ctx, options)
             .await?;
+        let _shards = abort_on_drop(&handles);
         for handle in handles {
             match handle.await {
                 Ok(Ok(())) => {}
@@ -2225,7 +2358,70 @@ impl NatsConsumer {
         Ok(shard_tasks)
     }
 
+    /// Drains the dead letters of topic `T` into [`MessageHandler::handle_dead`]
+    /// with the default options. It runs until the client is closed, or until
+    /// it meets an error that a reconnect cannot clear, such as a DLQ stream
+    /// that does not exist, which it returns.
+    ///
+    /// It asks for one dead letter per pull and holds each pull open for the
+    /// handler timeout, 30 s at least, or for the durable's `ack_wait` when
+    /// there is none. The client reads at most two dead letters ahead of a
+    /// running call, and none ahead of a call that starts within 5 s of its pull
+    /// and ends within that time.
+    ///
+    /// [`run_dlq_with_options`](Self::run_dlq_with_options) takes the options of
+    /// a consumer.
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        let options = ConsumerOptions::defaults_with_shutdown(self.client.shutdown_token());
+        self.run_dlq_with_inner::<T, H>(handler, ctx, options).await
+    }
+
+    /// [`run_dlq`](Self::run_dlq) with the options of a consumer. The drain
+    /// reads these:
+    ///
+    /// - `with_shutdown` ends the drain once the dead letter in hand has
+    ///   settled, and so does closing the client, whatever the token holds.
+    /// - `with_max_message_size` gates the dead letters. One over the limit is
+    ///   logged with its size and acked without reaching `handle_dead`.
+    /// - `with_handler_timeout` bounds `handle_dead`, sets how long each pull
+    ///   stays open, and a panic in the call is caught. The dead letter is
+    ///   acked whatever the call came to, so `with_handler_timeout_outcome` has
+    ///   nothing to act on.
+    /// - `with_consumer_group` labels the size sample of the drain.
+    /// - `with_max_reconnect_attempts` bounds its consecutive reconnects.
+    ///
+    /// The drain records `shove_message_size_bytes` for each dead letter. A
+    /// `handle_dead` call moves no consumed, in-flight, duration or failed
+    /// metric. The one other series the drain touches is
+    /// `shove_backend_errors_total{backend="nats", kind="consume"}`, which counts
+    /// a stream error or a closed stream.
+    ///
+    /// A `with_broadcast_start` is refused, as on every entry point that does
+    /// not read it.
+    pub async fn run_dlq_with_options<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: crate::ConsumerOptions<Nats>,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        self.run_dlq_with_inner::<T, H>(handler, ctx, options.into_inner())
+            .await
+    }
+
+    pub(crate) async fn run_dlq_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+    ) -> Result<()>
     where
         T: Topic,
         H: MessageHandler<T>,
@@ -2234,23 +2430,28 @@ impl NatsConsumer {
         let dlq = topology.dlq().ok_or_else(|| {
             ShoveError::Topology("run_dlq requires a DLQ to be configured".into())
         })?;
+        options.refuse_broadcast_start(topology.queue(), "NatsConsumer::run_dlq")?;
 
         let dlq_consumer_name = super::constants::dlq_consumer_name(dlq);
-        let shutdown = self.client.shutdown_token();
+        // The options' token goes first, so a stop through it reaches the drain at once.
+        let (shutdown, _forwarder) =
+            cancelled_by_either(&options.shutdown, &self.client.shutdown_token());
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
         let client = self.client.clone();
-        // `shove_message_size_bytes` labels a DLQ drain with the SOURCE topic,
-        // not the DLQ stream name, and with no consumer group — `run_dlq`
-        // takes no `ConsumerOptions`, so there is no group to carry, and the
-        // internal `{dlq}-consumer` durable is not one. Redis already drains
-        // its DLQ through `run_stream_loop`, which labels every metric
-        // `topology.queue()` whichever stream it reads; a DLQ name here would
-        // make `topic` mean two different things depending on the backend, and
-        // would stop a per-topic size profile summing across the main and DLQ
-        // paths. The DLQ drain stays distinguishable through the metrics that
-        // exist to name it, not by overloading `topic`.
+        let max_message_size = options.max_message_size;
+        let handler_timeout = options.handler_timeout;
+        let ack_wait = derive_ack_wait(handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT));
+        // `shove_message_size_bytes` labels a DLQ drain with the SOURCE topic and
+        // the consumer group its options carry. The internal `{dlq}-consumer`
+        // durable supplies no label. Redis already drains its DLQ through
+        // `run_stream_loop`, which labels every metric `topology.queue()`
+        // whichever stream it reads; a DLQ name here would make `topic` mean two
+        // different things depending on the backend, and would stop a per-topic
+        // size profile summing across the main and DLQ paths. The metrics that
+        // exist to name the DLQ side keep the drain distinguishable.
         let topic: Arc<str> = Arc::from(topology.queue());
+        let group: Option<Arc<str>> = options.consumer_group.clone();
 
         tracing::info!(
             dlq,
@@ -2258,13 +2459,14 @@ impl NatsConsumer {
             "NATS DLQ consumer started"
         );
 
-        run_with_reconnect(&shutdown, dlq, None, || {
+        run_with_reconnect(&shutdown, dlq, options.max_reconnect_attempts, || {
             let handler = handler.clone();
             let ctx = ctx.clone();
             let client = client.clone();
             let shutdown = shutdown.clone();
             let dlq_consumer_name = dlq_consumer_name.clone();
             let topic = topic.clone();
+            let group = group.clone();
             async move {
                 let stream = client
                     .jetstream()
@@ -2278,10 +2480,7 @@ impl NatsConsumer {
                         PullConsumerConfig {
                             durable_name: Some(dlq_consumer_name.clone()),
                             ack_policy: AckPolicy::Explicit,
-                            // run_dlq has no handler-timeout knob; give the
-                            // DLQ durable the same margin a default-timeout
-                            // consumer gets.
-                            ack_wait: derive_ack_wait(DEFAULT_HANDLER_TIMEOUT),
+                            ack_wait,
                             ..Default::default()
                         },
                     )
@@ -2292,83 +2491,113 @@ impl NatsConsumer {
                         ))
                     })?;
 
-                let mut messages = pull_consumer.messages().await.map_err(|e| {
-                    ShoveError::Connection(format!("failed to get DLQ message stream: {e}"))
-                })?;
+                // One letter per pull, held open as long as a call may run (see dlq_pull_expires).
+                let expires =
+                    dlq_pull_expires(handler_timeout, pull_consumer.cached_info().config.ack_wait);
+                let mut messages = pull_consumer
+                    .stream()
+                    .max_messages_per_batch(1)
+                    .expires(expires)
+                    .heartbeat(DLQ_PULL_HEARTBEAT)
+                    .messages()
+                    .await
+                    .map_err(|e| {
+                        ShoveError::Connection(format!("failed to get DLQ message stream: {e}"))
+                    })?;
 
                 loop {
-                    tokio::select! {
+                    // Biased, so no letter is taken once shutdown fired.
+                    let item = tokio::select! {
+                        biased;
                         _ = shutdown.cancelled() => {
                             tracing::info!(dlq, "shutdown signal received, stopping DLQ consumer");
                             return Ok(());
                         }
-                        item = messages.next() => {
-                            let msg = match item {
-                                Some(Ok(msg)) => msg,
-                                Some(Err(e)) => {
-                                    tracing::error!(error = %e, dlq, "DLQ consumer stream error");
-                                    metrics::record_backend_error(
-                                        metrics::BackendLabel::Nats,
-                                        metrics::BackendErrorKind::Consume,
-                                    );
-                                    return Err(ShoveError::Connection(
-                                        format!("DLQ consumer stream error on {dlq}: {e}"),
-                                    ));
-                                }
-                                None => {
-                                    tracing::warn!(dlq, "DLQ consumer stream closed");
-                                    metrics::record_backend_error(
-                                        metrics::BackendLabel::Nats,
-                                        metrics::BackendErrorKind::Consume,
-                                    );
-                                    return Err(ShoveError::Connection(
-                                        format!("DLQ consumer stream closed for {dlq}"),
-                                    ));
-                                }
-                            };
+                        item = messages.next() => item,
+                    };
+                    let msg = match item {
+                        Some(Ok(msg)) => msg,
+                        Some(Err(e)) => {
+                            tracing::error!(error = %e, dlq, "DLQ consumer stream error");
+                            metrics::record_backend_error(
+                                metrics::BackendLabel::Nats,
+                                metrics::BackendErrorKind::Consume,
+                            );
+                            return Err(ShoveError::Connection(format!(
+                                "DLQ consumer stream error on {dlq}: {e}"
+                            )));
+                        }
+                        None => {
+                            tracing::warn!(dlq, "DLQ consumer stream closed");
+                            metrics::record_backend_error(
+                                metrics::BackendLabel::Nats,
+                                metrics::BackendErrorKind::Consume,
+                            );
+                            return Err(ShoveError::Connection(format!(
+                                "DLQ consumer stream closed for {dlq}"
+                            )));
+                        }
+                    };
 
-                            // Before the size gate, exactly as on the main loop: the
-                            // histogram describes what arrived on the wire, so the
-                            // payload the gate is about to discard is precisely the
-                            // sample an operator sizing `max_message_size` needs.
-                            metrics::record_message_size(&topic, None, msg.payload.len());
+                    // Before the size gate, exactly as on the main loop: the
+                    // histogram describes what arrived on the wire, so the
+                    // payload the gate is about to discard is precisely the
+                    // sample an operator sizing `max_message_size` needs.
+                    metrics::record_message_size(&topic, group.as_deref(), msg.payload.len());
 
-                            // Discard oversized DLQ messages
-                            if msg.payload.len() > DEFAULT_MAX_MESSAGE_SIZE {
-                                tracing::warn!(
-                                    bytes = msg.payload.len(),
-                                    max = DEFAULT_MAX_MESSAGE_SIZE,
+                    if let Err(e) = validate_message_size(msg.payload.len(), max_message_size) {
+                        tracing::warn!(
+                            error = %e,
+                            bytes = msg.payload.len(),
+                            dlq,
+                            "oversized DLQ message — discarding"
+                        );
+                        ack_dead_letter(&msg, dlq).await;
+                        continue;
+                    }
+
+                    let payload: T::Message =
+                        match <T::Codec as crate::Codec<T::Message>>::decode_owned(
+                            msg.payload.clone(),
+                        ) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
                                     dlq,
-                                    "oversized DLQ message — discarding"
+                                    "failed to deserialize DLQ message, acking anyway"
                                 );
-                                let _ = msg.ack().await;
+                                ack_dead_letter(&msg, dlq).await;
                                 continue;
                             }
+                        };
 
-                            // Deserialize payload; on failure, log and ack anyway
-                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode_owned(msg.payload.clone()) {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        dlq,
-                                        "failed to deserialize DLQ message, acking anyway"
-                                    );
-                                    let _ = msg.ack().await;
-                                    continue;
-                                }
-                            };
-
-                            let metadata = extract_dead_metadata(&msg);
-
-                            handler.handle_dead(payload, metadata, ctx.as_ref()).await;
-
-                            // Always ack after handle_dead completes
-                            if let Err(e) = msg.ack().await {
-                                tracing::error!(error = %e, dlq, "failed to ack DLQ message");
-                            }
-                        }
+                    let metadata = extract_dead_metadata(&msg);
+                    let dead_handler = Arc::clone(&handler);
+                    let dead_ctx = Arc::clone(&ctx);
+                    let call = guarded(
+                        async move {
+                            dead_handler
+                                .handle_dead(payload, metadata, dead_ctx.as_ref())
+                                .await;
+                        },
+                        handler_timeout,
+                    )
+                    .await;
+                    match call {
+                        Guarded::Done(()) => {}
+                        Guarded::Panicked(e) => tracing::warn!(
+                            error = %e,
+                            dlq,
+                            "handle_dead panicked, acking the dead letter anyway"
+                        ),
+                        Guarded::TimedOut(limit) => tracing::warn!(
+                            ?limit,
+                            dlq,
+                            "handle_dead timed out, acking the dead letter anyway"
+                        ),
                     }
+                    ack_dead_letter(&msg, dlq).await;
                 }
             }
         })
@@ -3262,6 +3491,182 @@ mod worker_flow_tests {
         );
         drop(second);
         assert!(idle.as_mut().now_or_never().is_some());
+    }
+
+    /// An exit waits for the tasks it leaves behind, up to its bound.
+    #[tokio::test(start_paused = true)]
+    async fn an_exit_wait_gives_up_on_a_task_that_never_ends() {
+        let busy = BusyTasks::new(Arc::new(AtomicBool::new(false)));
+        let task = busy.enter();
+        assert!(
+            !busy.idle_within(EXIT_DRAIN_TIMEOUT).await,
+            "the wait ends at its bound with the task still running"
+        );
+        assert_eq!(busy.running(), 1);
+        drop(task);
+        assert!(busy.idle_within(EXIT_DRAIN_TIMEOUT).await);
+    }
+}
+
+/// [`guarded`]: the call guard under every handler invocation.
+#[cfg(test)]
+mod guarded_tests {
+    use super::*;
+
+    async fn panics() {
+        panic!("the call panics on purpose");
+    }
+
+    #[tokio::test]
+    async fn a_returning_call_hands_back_its_output() {
+        assert!(matches!(guarded(async { 7 }, None).await, Guarded::Done(7)));
+        let limit = Some(Duration::from_secs(1));
+        assert!(matches!(
+            guarded(async { 7 }, limit).await,
+            Guarded::Done(7)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_panic_is_reported_to_the_caller() {
+        assert!(matches!(
+            guarded(panics(), None).await,
+            Guarded::Panicked(_)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_past_its_limit_is_cut_off() {
+        let limit = Duration::from_secs(5);
+        let call = guarded(std::future::pending::<()>(), Some(limit)).await;
+        assert!(matches!(call, Guarded::TimedOut(at) if at == limit));
+    }
+
+    /// Sets its flag when the call it was moved into is dropped.
+    struct Dropped(Arc<AtomicBool>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// A caller that is aborted or dropped takes the call along, however long
+    /// the call would have run and with no limit to cut it off.
+    #[tokio::test]
+    async fn dropping_the_caller_aborts_the_call() {
+        let gone = Arc::new(AtomicBool::new(false));
+        let held = Dropped(Arc::clone(&gone));
+        let mut caller = Box::pin(guarded(
+            async move {
+                let _held = held;
+                std::future::pending::<()>().await;
+            },
+            None,
+        ));
+        assert!(
+            caller.as_mut().now_or_never().is_none(),
+            "the call is still running"
+        );
+        assert!(!gone.load(Ordering::Acquire));
+
+        drop(caller);
+        for _ in 0..100 {
+            if gone.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(gone.load(Ordering::Acquire), "the call outlived its caller");
+    }
+}
+
+/// [`dlq_pull_expires`]: how long the DLQ drain holds each pull open.
+#[cfg(test)]
+mod dlq_pull_tests {
+    use super::*;
+
+    const ACK_WAIT: Duration = Duration::from_secs(90);
+
+    #[test]
+    fn a_short_timeout_keeps_the_worker_expiry() {
+        assert_eq!(
+            dlq_pull_expires(Some(Duration::from_secs(5)), ACK_WAIT),
+            PULL_EXPIRES
+        );
+        assert_eq!(dlq_pull_expires(Some(PULL_EXPIRES), ACK_WAIT), PULL_EXPIRES);
+    }
+
+    #[test]
+    fn a_longer_timeout_sets_the_expiry() {
+        for secs in [31, 120, 3600] {
+            let timeout = Duration::from_secs(secs);
+            assert_eq!(dlq_pull_expires(Some(timeout), ACK_WAIT), timeout);
+        }
+    }
+
+    #[test]
+    fn no_timeout_leaves_the_ack_wait_as_the_longest_call() {
+        assert_eq!(dlq_pull_expires(None, ACK_WAIT), ACK_WAIT);
+        assert_eq!(
+            dlq_pull_expires(None, Duration::from_secs(10)),
+            PULL_EXPIRES,
+            "the worker expiry is the floor"
+        );
+    }
+
+    #[test]
+    fn an_absurd_timeout_is_held_to_what_a_pull_can_carry() {
+        let expires = dlq_pull_expires(Some(Duration::MAX), ACK_WAIT);
+        assert_eq!(expires, MAX_PULL_EXPIRES);
+        assert!(
+            i64::try_from(expires.as_nanos()).is_ok(),
+            "the request carries the expiry as an i64 of nanoseconds"
+        );
+    }
+}
+
+/// [`cancelled_by_either`]: the token the DLQ drain stops on.
+#[cfg(test)]
+mod either_token_tests {
+    use super::*;
+
+    async fn fires(token: &CancellationToken) -> bool {
+        tokio::time::timeout(Duration::from_secs(1), token.cancelled())
+            .await
+            .is_ok()
+    }
+
+    /// The first token reaches the merged one in the same step, so a stop
+    /// requested through it takes effect before anything else runs.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_token_fires_it_at_once() {
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        let (merged, _guard) = cancelled_by_either(&first, &second);
+        assert!(!fires(&merged).await, "nothing has fired yet");
+        first.cancel();
+        assert!(merged.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_second_token_fires_it_through_the_forwarder() {
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        let (merged, _guard) = cancelled_by_either(&first, &second);
+        second.cancel();
+        assert!(fires(&merged).await);
+        assert!(!first.is_cancelled(), "the first token is left alone");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_guard_ends_only_the_forwarding() {
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        let (merged, guard) = cancelled_by_either(&first, &second);
+        drop(guard);
+        tokio::task::yield_now().await;
+        second.cancel();
+        assert!(!fires(&merged).await, "no task is left to forward it");
+        first.cancel();
+        assert!(merged.is_cancelled(), "the first token needs no task");
     }
 }
 

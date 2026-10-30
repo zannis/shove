@@ -200,6 +200,12 @@ A held message, a retry waiting for a hold, and a message whose retry copy or de
 On a stop or a scale-down, the messages a worker pulled and never started are nak'd without delay, so another consumer takes them at once.
 A message held for a retry at that point is left un-acked, and is redelivered once its `ack_wait` expires.
 
+A consumer that leaves any other way than a stop waits for the message tasks it started before it returns.
+That covers a consumer that has spent its reconnect attempts, one that hit an error a reconnect cannot clear, and one that was told to shut down while it waited to reconnect.
+The wait ends after 35 s, the default handler timeout plus a 5 s grace.
+A task still running then goes on, and settles its message when it finishes.
+An error that sends the consumer to reconnect does not wait: the tasks it started keep their slots, so the worker pulls only what it can start.
+
 ## Sequenced delivery
 
 Messages for the same key stay in order. NATS uses subject-based shard routing: the publisher derives a subject suffix from `T::sequence_key()` and routes to a dedicated shard subject. Each shard consumer is configured with `max_ack_pending: 1`, meaning at most one message per shard is in-flight at a time. Messages for the same key are never processed concurrently.
@@ -220,7 +226,53 @@ Until then it holds its shard: every message behind it, other keys included, wai
 A dead letter whose publish fails keeps the message un-acked, and the publish is retried until it lands.
 The delay before each attempt doubles from about a second up to a 30 s ceiling and is jittered by up to half either way, so attempts at the ceiling come 15 to 45 s apart.
 
+When a group's drain timeout runs out with a handler still going, the group aborts its shard tasks along with its own task, and each shard aborts the handler call it is awaiting.
+The message a shard was handling is then left un-acked, and JetStream redelivers it once its `ack_wait` expires.
+No shard settles a message after the group has reported the timeout, and no handler keeps running past it.
+A supervisor that aborts its shards at its drain timeout does the same, and so does dropping or aborting a direct `NatsConsumer::run_fifo` call.
+
 See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced example](/backends/nats/examples/sequenced) for a runnable walkthrough.
+
+## Draining the DLQ
+
+`NatsConsumer::run_dlq` reads the dead-letter stream of a topic into `handle_dead`.
+It runs until the broker is closed, or until it meets an error that a reconnect cannot clear, such as a DLQ stream that does not exist, which it returns.
+`run_dlq_with_options` takes the options of a consumer, and also stops once the token given to `with_shutdown` fires:
+
+```rust,no_run
+let stop = CancellationToken::new();
+consumer
+    .run_dlq_with_options::<OrderTopic, _>(
+        AlertingHandler,
+        (),
+        ConsumerOptions::<Nats>::new()
+            .with_shutdown(stop.clone())
+            .with_handler_timeout(Duration::from_secs(10))
+            .with_max_message_size(1_000_000),
+    )
+    .await?;
+```
+
+On either stop the drain finishes the dead letter in hand first, and it acks every dead letter once it is done with it.
+`handle_dead` runs under the handler timeout, 30 s by default, and a panic in it is caught.
+A call that panics or times out is logged and its dead letter is acked, and the drain goes on with the next one.
+`with_handler_timeout_outcome` has nothing to act on there, since the dead letter is acked either way.
+The drain asks for one dead letter per pull and holds each pull open for the handler timeout, 30 s at least, or for the durable's `ack_wait` when there is no handler timeout.
+The client renews a pull of its own accord once the pull is as old as its expiry plus 5 s, and again when the connection comes back, and a renewal during a call brings the next dead letter in behind it.
+Holding the pull open keeps that from happening to a call that starts within 5 s of its pull, as one does while dead letters are waiting, and ends within the timeout.
+A call that starts late in an idle pull can still outlast the renewal, a reconnect during a call renews too, and the client reads no further ahead than two dead letters.
+A dead letter therefore waits behind at most two calls, which the durable's `ack_wait`, three times the handler timeout, covers.
+With no handler timeout nothing bounds a call, and one that outlasts the `ack_wait` has its own dead letter redelivered.
+
+A dead letter over `max_message_size`, 10 MiB by default, never reaches `handle_dead`.
+The drain logs it with its size and acks it, which removes it from the DLQ stream.
+A dead letter the codec cannot decode is logged and acked the same way.
+Neither one counts in `shove_messages_discarded_total`.
+`with_max_reconnect_attempts` bounds the consecutive reconnects of the drain, as it does for any consumer.
+
+The drain records `shove_message_size_bytes` for every dead letter, under the source topic and the `consumer_group` of its options, `default` when it has none.
+A `handle_dead` call moves none of `shove_messages_consumed_total`, `shove_messages_inflight`, `shove_message_processing_duration_seconds` and `shove_messages_failed_total`, since the dead letter was counted when the main consumer retired it.
+The one other series the drain touches is `shove_backend_errors_total{backend="nats",kind="consume"}`, which counts a stream error or a closed stream.
 
 ## Consumer groups + autoscaling
 
