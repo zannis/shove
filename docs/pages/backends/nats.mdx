@@ -181,7 +181,7 @@ A worker keeps up to two pulls open, each for slots that are free, so a pull for
 A worker with a single slot, which is every sequential member and any prefetch of one, pulls each message once the one before it is settled, and so pays one pull round trip per message.
 Concurrent processing with a larger prefetch restores pipelining.
 When the server ends a pull with a status, such as `Exceeded MaxWaiting` or a cluster leader change, the worker probes its connection, and only a failed probe counts as a connection error and spends a reconnect attempt.
-After such a pull, or one the server cut short with nothing delivered, the worker opens its next pull after a pause that starts at 100 ms and doubles up to 5 s while pulls keep ending that way, and the pulls it already has open go on meanwhile.
+After such a pull, the worker opens its next pull after a pause that starts at 100 ms and doubles up to 5 s while pulls keep ending that way, and the pulls it already has open go on meanwhile.
 
 The durable a group or a consumer creates therefore has no ack budget of its own: `max_ack_pending` is `-1` unless `with_max_ack_pending` sets a cap.
 Workers attached to one durable, from any number of processes, each keep up to their own prefetch in flight, and a cap is shared by all of them.
