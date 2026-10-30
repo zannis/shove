@@ -495,6 +495,8 @@ No discard is counted for a record kept that way.
 The same holds for a record dropped before the handler and for a `FailAll` cascade.
 
 Offsets are committed asynchronously at most every 500 ms, the standard consumer's default interval.
+That goes on during a hold, a dead-letter retry and a schema registry stall, so the positions acked before the wait, and the ones a rebalance re-offers during it, are committed however long the wait runs.
+No commit passes the record being waited on.
 A commit that retires a record discarded with no DLQ is made synchronously, on a thread of its own, so the discard counts only once the broker accepted it.
 On a stop the consumer commits its final position synchronously and closes, as the standard consumer does; see [Offset commit semantics](#offset-commit-semantics).
 

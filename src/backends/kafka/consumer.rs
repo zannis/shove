@@ -5193,22 +5193,36 @@ fn pause_for_wait(consumer: &KafkaStreamConsumer, paused: &mut bool) -> Result<(
 /// once more when the delay runs out: a revoke reaches the token inside a
 /// `recv()` poll, which can be the poll right before the delay's, see
 /// `after_wait`.
+///
+/// Every pass of the wait makes the commit the gate allows, as a pass of the
+/// receive loop does, and the wait wakes for it as the loop does: on the
+/// gate's deadline and on the housekeeping tick. The positions acked before
+/// the wait, and the ones a rebalance re-offers during it, are then
+/// committed however long the wait runs; the record in hand stays in
+/// flight, so no commit passes it.
 async fn fifo_wait(
-    consumer: &KafkaStreamConsumer,
+    consumer: &Arc<KafkaStreamConsumer>,
     queue: &str,
     delay: Duration,
     shutdown: &CancellationToken,
     revoked: &CancellationToken,
-    paused: &mut bool,
+    state: &mut FifoState,
 ) -> Result<FifoWait> {
-    pause_for_wait(consumer, paused)?;
+    pause_for_wait(consumer, &mut state.paused)?;
     let elapsed = tokio::time::sleep(delay);
     tokio::pin!(elapsed);
+    let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
+    housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        state.commit_due(consumer, shutdown, queue).await?;
+        let now = Instant::now();
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return Ok(FifoWait::Stop),
             _ = revoked.cancelled() => return Ok(FifoWait::Revoked),
+            _ = housekeeping.tick() => {}
+            _ = tokio::time::sleep_until(state.commit_gate.deadline(now)),
+                if state.tracker.has_committable() => {}
             received = consumer.recv() => {
                 let msg = received.map_err(|e| {
                     tracing::error!(error = %e, queue, "FIFO consumer recv error");
@@ -5256,6 +5270,26 @@ impl FifoState {
 
     /// The top of every pass: the rebalance events, the commit the gate
     /// allows, and the end of the pause the last record's wait left behind.
+    async fn settle(
+        &mut self,
+        consumer: &Arc<KafkaStreamConsumer>,
+        shutdown: &CancellationToken,
+        queue: &str,
+    ) -> Result<()> {
+        self.commit_due(consumer, shutdown, queue).await?;
+        if self.paused && self.pending_commit.is_none() {
+            consumer
+                .resume_assignment()
+                .map_err(|e| map_kafka_error("resume failed", e))?;
+            self.paused = false;
+        }
+        Ok(())
+    }
+
+    /// The rebalance events, then the commit the gate allows: at the top of
+    /// every pass, and on every pass of a wait on the record in hand, so a
+    /// position acked before the wait and one a rebalance re-offers during
+    /// it are committed however long the wait runs.
     ///
     /// Commits are spaced as the standard consumer spaces them, at most once
     /// per `ASYNC_COMMIT_INTERVAL`, see [`AsyncCommitGate`]. A commit that
@@ -5264,8 +5298,8 @@ impl FifoState {
     /// waited for while the loop keeps polling, see [`commit_confirmed`];
     /// every other commit is asynchronous. A rejected one is re-offered with
     /// its discards on a later pass. A commit the shutdown cut short is left
-    /// in `pending_commit` for the stop, which the next select takes.
-    async fn settle(
+    /// in `pending_commit` for the stop, and no commit follows it.
+    async fn commit_due(
         &mut self,
         consumer: &Arc<KafkaStreamConsumer>,
         shutdown: &CancellationToken,
@@ -5273,7 +5307,8 @@ impl FifoState {
     ) -> Result<()> {
         self.apply_rebalance_events(consumer)?;
         let now = Instant::now();
-        if self.commit_gate.due(now)
+        if self.pending_commit.is_none()
+            && self.commit_gate.due(now)
             && let Some((tpl, discards)) = self.tracker.drain_committable()
         {
             if discards.is_empty() {
@@ -5312,16 +5347,9 @@ impl FifoState {
                             offsets,
                             discards,
                         });
-                        return Ok(());
                     }
                 }
             }
-        }
-        if self.paused {
-            consumer
-                .resume_assignment()
-                .map_err(|e| map_kafka_error("resume failed", e))?;
-            self.paused = false;
         }
         Ok(())
     }
@@ -5402,6 +5430,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
         // positions they re-offer are committed without a record to wait
         // for.
         let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
+        housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             state.settle(consumer, &self.shutdown, queue).await?;
             let now = Instant::now();
@@ -5435,7 +5464,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
     /// left to its partition's next owner, or kept uncommitted for a stop.
     async fn record(
         &self,
-        consumer: &KafkaStreamConsumer,
+        consumer: &Arc<KafkaStreamConsumer>,
         state: &mut FifoState,
         msg: &BorrowedMessage<'_>,
     ) -> Result<FifoPass> {
@@ -5537,7 +5566,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
     #[cfg_attr(not(feature = "kafka-schema-registry"), allow(unused_variables))]
     async fn decode(
         &self,
-        consumer: &KafkaStreamConsumer,
+        consumer: &Arc<KafkaStreamConsumer>,
         state: &mut FifoState,
         record: &FifoRecord<'_>,
     ) -> Result<Staged<T::Message>> {
@@ -5599,6 +5628,11 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                         AfterWait::Stop => return Ok(Staged::Stop),
                         AfterWait::Revoked => return Ok(Staged::Revoked),
                     }
+                    // An outage can last: commit between its retries, as a
+                    // hold does, see `fifo_wait`.
+                    state
+                        .commit_due(consumer, &self.shutdown, &self.queue)
+                        .await?;
                 }
                 // A deployment fault, not an outage: stop instead of waiting
                 // on it.
@@ -5621,7 +5655,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
     /// dead-letters the record and poisons its key under `FailAll`.
     async fn handle(
         &self,
-        consumer: &KafkaStreamConsumer,
+        consumer: &Arc<KafkaStreamConsumer>,
         state: &mut FifoState,
         record: &FifoRecord<'_>,
         first: T::Message,
@@ -5700,7 +5734,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                         delay,
                         &self.shutdown,
                         &record.revoked,
-                        &mut state.paused,
+                        state,
                     )
                     .await?
                     {
@@ -5731,7 +5765,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
     /// because the record is redelivered.
     async fn dead_letter(
         &self,
-        consumer: &KafkaStreamConsumer,
+        consumer: &Arc<KafkaStreamConsumer>,
         state: &mut FifoState,
         record: &FifoRecord<'_>,
         reason: &str,
@@ -5773,7 +5807,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                 delay,
                 &self.shutdown,
                 &record.revoked,
-                &mut state.paused,
+                state,
             )
             .await?
             {
