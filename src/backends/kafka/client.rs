@@ -2118,7 +2118,7 @@ mod tests {
     /// A client whose producer reads its CA from a stalled FIFO.
     #[cfg(all(feature = "kafka-ssl", unix))]
     async fn client_whose_producer_build_stalls(hold: Duration) -> (KafkaClient, StalledCa) {
-        let ca = StalledCa::new("producer", hold);
+        let ca = StalledCa::new(&format!("producer-{}", hold.as_millis()), hold);
         let client = client_whose_producer_config_sets(&[
             ("security.protocol", "ssl"),
             ("ssl.ca.location", ca.path.as_str()),
