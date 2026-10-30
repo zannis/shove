@@ -86,7 +86,7 @@ group
 
 ## Token rotation
 
-Tokens are signed locally — no network call to AWS per refresh. librdkafka schedules a refresh at ~20% of the remaining lifetime (so ~3 minutes before expiry for a 15-minute token). The refresh callback runs on librdkafka's internal poll thread; shove bridges it to the async AWS signer via a Tokio runtime handle captured at `connect()` time.
+A token is a presigned URL that shove signs in-process, but each refresh asks the AWS credential chain for credentials again, so its cost depends on the source: static keys from the environment or a profile need no network call, while IMDS, ECS, IRSA (STS) and SSO credentials take a round trip per refresh. librdkafka refreshes a token once 80% of its lifetime has passed, about 3 minutes before expiry for a 15-minute token. The refresh callback runs on whichever thread polls the client: the producer's polling thread, or a consumer's `recv()` on a Tokio worker. shove mints each token on a dedicated signer thread that drives its own Tokio runtime, so the callback works under any runtime flavour, `current_thread` included. The signer gives each token 5 seconds and cancels the attempt past that; the refresh then fails, and librdkafka keeps any token it still holds and retries 10 seconds later.
 
 Do not set `sasl.oauthbearer.config` manually. The shove integration owns this property.
 
