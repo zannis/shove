@@ -500,6 +500,11 @@ Messages for the same key stay in order. Kafka uses partition-key routing: `T::s
 
 Ordering is partition-scoped: two messages with different keys may land on different partitions and be processed concurrently. The partition count is the topology's `routing_shards`, fixed at topic creation time, and caps the maximum degree of parallelism across the consumer group. `declare` never adds partitions to a sequenced topic, see [Partitions of an existing topic](#partitions-of-an-existing-topic).
 
+A sequenced consumer group handles its records on one shard task.
+When the group's drain timeout runs out with a handler still going, the group aborts the shard task along with its own task, and the handler call the shard is awaiting goes with it.
+A handler still running when the abort reaches the shard is dropped with it: its record stays uncommitted, and the next member to take its partition receives it again.
+A handler that finishes in the moment between the report and the abort can still have its record committed.
+
 See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced example](/backends/kafka/examples/sequenced) for a runnable walkthrough.
 
 ## Consumer groups + autoscaling
