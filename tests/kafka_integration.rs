@@ -711,7 +711,6 @@ async fn publish_raw_to(brokers: &str, topic: &str, partition: i32, payload: &[u
 
 /// The group's committed offset on one partition, or `None` when it has
 /// never committed there.
-#[cfg(feature = "test-support")]
 fn committed_offset(brokers: &str, group: &str, topic: &str, partition: i32) -> Option<i64> {
     use rdkafka::consumer::{BaseConsumer, Consumer as _};
     use rdkafka::{Offset, TopicPartitionList};
@@ -7363,6 +7362,113 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
     assert!(outcome.is_clean(), "outcome was {outcome:?}");
     assert_eq!(handler.counter.get(), 5);
 
+    broker.close().await;
+}
+
+shove::define_sequenced_topic!(
+    SeqAbortTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("kafka-fifo-abort")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_millis(200))
+        .dlq()
+        .build()
+);
+
+/// Starts, works for `work`, then finishes and acks.
+#[derive(Clone)]
+struct SlowFifoHandler {
+    work: Duration,
+    started: WaitableCounter,
+    finished: WaitableCounter,
+}
+
+impl MessageHandler<SeqAbortTopic> for SlowFifoHandler {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.started.increment();
+        tokio::time::sleep(self.work).await;
+        self.finished.increment();
+        Outcome::Ack
+    }
+}
+
+/// A FIFO group whose drain times out aborts its shard task with it, and the
+/// shard takes the handler call it is awaiting along. The handler never
+/// finishes, and the shard commits nothing after the timeout was reported:
+/// the group has no committed offset on the topic.
+#[tokio::test]
+async fn fifo_group_drain_timeout_stops_the_shard() {
+    const WORK: Duration = Duration::from_secs(3);
+    const TOPIC: &str = "kafka-fifo-abort";
+    const GROUP: &str = "kafka-fifo-abort-fifo";
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<SeqAbortTopic>().await.unwrap();
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<SeqAbortTopic>(&OrderMessage {
+            order_id: "A".into(),
+            amount: 0,
+        })
+        .await
+        .unwrap();
+
+    let handler = SlowFifoHandler {
+        work: WORK,
+        started: WaitableCounter::new(),
+        finished: WaitableCounter::new(),
+    };
+    let mut group = broker.consumer_group();
+    group
+        .register_fifo::<SeqAbortTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::default()),
+            {
+                let h = handler.clone();
+                move || h.clone()
+            },
+        )
+        .await
+        .unwrap();
+
+    let signal = {
+        let started = handler.started.clone();
+        async move {
+            started.wait_for(1, TIMEOUT).await;
+        }
+    };
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_millis(500))
+        .await;
+    assert!(
+        outcome.timed_out,
+        "the handler outlasts the drain (started {}): {outcome:?}",
+        handler.started.get()
+    );
+    assert_eq!(
+        (outcome.errors, outcome.panics),
+        (0, 0),
+        "an aborted shard counts as neither an error nor a panic"
+    );
+
+    // Past the point where the handler would have returned, and a shard that
+    // survived the abort would have acked and committed the record.
+    tokio::time::sleep(WORK + Duration::from_secs(1)).await;
+    assert_eq!(
+        committed_offset(tb.brokers(), GROUP, TOPIC, 0),
+        None,
+        "a shard committed after the drain timeout was reported"
+    );
+    assert_eq!(
+        handler.finished.get(),
+        0,
+        "the handler ran on after its shard was aborted"
+    );
     broker.close().await;
 }
 
