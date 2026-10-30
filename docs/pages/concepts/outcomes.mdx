@@ -12,7 +12,7 @@ The `Outcome` enum has four variants, each mapped to a distinct delivery action:
 
 **`Reject`** — a permanent failure. The message is malformed, violates a business rule, or references data that will never exist. No amount of waiting will fix it. The consumer routes the message to the DLQ if one is configured, or discards it with a warning log if not. The message is never retried.
 
-**`Defer`** — the message is not failed, just not yet ready. The consumer routes it to `hold_queues[0]` (the shortest delay) without incrementing the retry counter. This does not burn the retry budget. See [Defer — the special case](#defer--the-special-case) below.
+**`Defer`** — the message is not failed, just not yet ready. The consumer routes it to `hold_queues[0]` (the shortest delay) without incrementing the retry counter. This does not burn the retry budget, except on an external NATS stream, where the retry count is JetStream's redelivery count (see [Bind to an externally-provisioned stream](/backends/nats#bind-to-an-externally-provisioned-stream)). See [Defer — the special case](#defer--the-special-case) below.
 
 ## At-least-once and idempotency
 
@@ -37,6 +37,38 @@ With hold queues configured at `[5s, 30s, 120s]` and `max_retries = 10`:
 
 The topic topology defines the hold queues; the consumer options define `max_retries`. See [Retries, Hold Queues & DLQs](/guides/retries) for a deeper dive.
 
+## With no hold queues
+
+The tier formula above needs at least one hold queue.
+A topology that declares none gives `Retry` and `Defer` no delay to pick.
+For the single-message consumers of a shared queue, each backend then redelivers the message in its own way:
+
+| Backend | Redelivered | Warning logged |
+|---|---|---|
+| Apache Kafka | After a fixed 1 s, the record is republished into the topic, with the retry count incremented for a `Retry`. Under `RetryStrategy::InPlace` the handler's task waits 1 s and hands the same record back. | None |
+| NATS JetStream | After a fixed 1 s. On a shove-owned stream a `Retry` holds the original un-acked and then publishes a copy with the count incremented. A `Defer`, and both outcomes on an external stream, nak with a 1 s delay. | None |
+| RabbitMQ | With no delay, by `basic.nack` with requeue. The delivery keeps its retry count, so a `Retry` never spends `max_retries`. | Every `Retry` and `Defer` |
+| Redis Streams | With no delay: the entry is added back to its stream and the original is acknowledged. | Every `Retry` and `Defer` |
+| AWS SQS | With no delay: the message is re-sent with a delay of 0 seconds and the original is deleted. A FIFO queue sets the visibility timeout to 0 instead. | Every `Retry` and `Defer` |
+| In-process | With no delay: the message is queued again. | Every `Defer`; a `Retry` logs nothing |
+
+Every backend in the table except RabbitMQ still increments the retry count on a `Retry`, so `max_retries` ends the loop at the DLQ as usual.
+On RabbitMQ the requeued delivery is the original message with its count unchanged, so a handler that keeps returning `Retry` receives it again without limit and `max_retries` never routes it to the DLQ.
+Declare a hold queue to give a `Retry` a budget there.
+
+The 1 s wait on Kafka and NATS has no setting.
+Declare a hold queue to choose the delay.
+[Kafka](/backends/kafka#retry-and-defer-without-hold-queues) and [NATS](/backends/nats#retry-and-defer-without-hold-queues) describe the two backends in more detail.
+
+The warnings in the table are logged each time the consumer takes the fallback.
+Building a topology that declares a DLQ and no hold queues also logs one warning at build time, whichever backend it runs on.
+The warning links back to this section and is described in [Configuring hold queues](/guides/retries#configuring-hold-queues).
+It is skipped for a sequenced topology and for one that calls `allow_message_loss()`.
+
+Two other consumers never take this fallback.
+A broadcast subscription discards a `Retry` and waits 1 s before it redelivers a `Defer`, on every backend that supports broadcast; see [Broadcast](/concepts/broadcast#best-effort-is-the-contract-not-a-limitation).
+A batch consumer redelivers the whole batch for a `Retry` or a `Defer`, with no per-batch retry budget; see [`BatchConsumer`](https://docs.rs/shove/latest/shove/struct.BatchConsumer.html#method.run).
+
 ## Reject vs Retry
 
 Choose `Reject` when the message will never succeed regardless of when it is retried: a malformed payload, a business-rule violation, a foreign-key constraint that will never be satisfied. Retrying those messages wastes resources and burns through the retry budget before the inevitable DLQ routing.
@@ -54,10 +86,14 @@ When in doubt, ask: "Would this handler succeed if I called it again in five min
 - An upstream API that returned 429 (rate limited); the payload is valid, just the timing is wrong.
 
 `Defer` routes the message to `hold_queues[0]` (shortest delay) with the same retry count. It does not increment the counter and will never trigger DLQ routing as a result of deferral alone.
+The exception is an external NATS stream.
+There the retry count is JetStream's redelivery count (`num_delivered - 1`), so each deferral is a redelivery that raises it, and a later `Retry` is dead-lettered as soon as the count has reached `max_retries`.
+A `Defer` itself is still never dead-lettered.
+See [Bind to an externally-provisioned stream](/backends/nats#bind-to-an-externally-provisioned-stream).
 
-One caution: because `Defer` never increments the retry counter, a handler that always defers will loop the message between the main queue and `hold_queues[0]` indefinitely. There is no built-in circuit breaker. Ensure your handler has a condition that eventually resolves to `Ack`, `Retry`, or `Reject`.
+One caution: because `Defer` never increments the retry counter, a handler that always defers will loop the message between the main queue and `hold_queues[0]` indefinitely. There is no built-in circuit breaker. An [external NATS stream](/backends/nats#bind-to-an-externally-provisioned-stream) raises the retry count with each deferral, but a `Defer` is never dead-lettered, so the loop does not end there either. Ensure your handler has a condition that eventually resolves to `Ack`, `Retry`, or `Reject`.
 
-If no hold queues are configured on the topic, `Defer` falls back to broker nack-with-requeue and logs a warning.
+If no hold queues are configured on the topic, `Defer` redelivers through the fallback of its backend: a fixed 1 s wait on Kafka and NATS, no delay elsewhere. See [With no hold queues](#with-no-hold-queues).
 
 How a consumer carries out `Retry` and `Defer` is its `RetryStrategy`: `Republish`, an incremented copy after the tier's delay, or `InPlace`, the same record delivered again after the tier's delay with nothing published.
 `InPlace` says what is not done, a replacement publish; how the record comes back is the broker's own primitive, in the table below: Kafka waits inside the handler's task and hands the record back, NATS lets JetStream redeliver after a delayed `Nak`.

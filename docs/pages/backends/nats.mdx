@@ -93,6 +93,22 @@ path and query are part of the address and are sent to the server.
 
 `topology().declare::<T>()` provisions JetStream streams for the topic: the main stream, plus a DLQ stream when `.dlq()` is configured. Sequenced topics declare a single main stream with subject shards (`{queue}.shard.{N}`). Durable consumers are not created here — the consumer runtime creates them on demand when you start consuming. The call is idempotent and safe to invoke on every startup: it reconciles an existing stream to the configured shape (via `create_or_update_stream`) rather than leaving a stale config in place.
 
+### Retry and defer without hold queues
+
+NATS has no hold streams, so `hold_queue(Duration)` sets only how long a `Retry` or a `Defer` waits before the message comes back.
+With none declared, the consumer waits a fixed 1 s for both outcomes, and the delay has no setting.
+Declare a hold queue to choose it.
+
+On a shove-owned stream a `Retry` holds the original un-acked for 1 s, then publishes a copy with the retry count incremented in its header and acks the original.
+A `Defer` naks the message with a 1 s delay and leaves the header unchanged.
+On an external stream both outcomes nak with the 1 s delay, and the retry count is JetStream's redelivery count, as [described below](#bind-to-an-externally-provisioned-stream).
+A `Retry` spends `max_retries` in every case, so the usual DLQ routing applies once the budget is spent.
+
+NATS logs no warning for a `Retry` or a `Defer` without hold queues.
+Building a topology that declares a DLQ and no hold queues logs one warning at build time, which links to [With no hold queues](/concepts/outcomes#with-no-hold-queues).
+That page lists the fallback of every backend.
+A sequenced topology and one that calls `allow_message_loss()` get no such warning.
+
 ## Stream management
 
 By default `declare::<T>()` creates the main stream with shove's defaults — `WorkQueue` retention, file storage, a single replica, and **no size or age limit**. Two NATS-specific `TopologyBuilder` options change how the stream is bounded and who owns it.

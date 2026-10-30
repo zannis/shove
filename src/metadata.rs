@@ -81,9 +81,11 @@ pub struct MessageMetadata {
     /// }
     /// ```
     ///
-    /// On an external NATS stream the loop above is not needed: `retry_count`
-    /// is derived from this count there, so a `Defer` consumes the retry
-    /// budget and the record reaches the DLQ at `max_retries` on its own.
+    /// On an external NATS stream `retry_count` is derived from this count, so
+    /// a `Defer` consumes retry budget there: the next `Retry` is dead-lettered
+    /// once the count has reached `max_retries`. A `Defer` alone is never
+    /// dead-lettered, so the check above still bounds a handler that always
+    /// defers.
     ///
     /// ## Per-backend availability
     ///
