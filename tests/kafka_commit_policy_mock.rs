@@ -34,11 +34,16 @@
 //! are shove-owned, because a republish writes into its topic, and are
 //! created through the mock API as well.
 //!
-//! The final section runs a sequenced consumer against the same mock: a
-//! streak of rejected commits fences it, and it reconnects once the close
-//! that error exit makes has had its LeaveGroup answered; and a stop that
-//! finds its commit in flight unanswered reports the share of the shutdown
-//! deadline it waited, as the standard consumer's does under `Interval`.
+//! A section runs a sequenced consumer against the same mock: a streak of
+//! rejected commits fences it, and it reconnects once the close that error
+//! exit makes has had its LeaveGroup answered; and a stop that finds its
+//! commit in flight unanswered reports the share of the shutdown deadline it
+//! waited, as the standard consumer's does under `Interval`.
+//!
+//! The final section takes the broker down for a few seconds, which the
+//! member rides out on the client it started with, and stops a member whose
+//! handler holds its only permit past the poll interval, whose drain keeps
+//! polling through a rebalance.
 //!
 //! `test-support` gates the seams this file reads; both Kafka coverage rows
 //! enable it, so the suite runs in each.
