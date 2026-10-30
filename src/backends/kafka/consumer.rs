@@ -3089,7 +3089,7 @@ fn check_fifo_options(queue: &str, options: &ConsumerOptions) -> Result<()> {
 /// The error every FIFO entry point returns for options that set a commit
 /// policy, through `with_commit_policy` or its shorthand
 /// `with_commit_interval`: a FIFO consumer commits on the fixed default
-/// interval (see `FifoState::settle`), so neither an interval nor a
+/// interval (see `FifoState::commit_due`), so neither an interval nor a
 /// per-record policy would be read by anything, and a setting that changes
 /// nothing is refused rather than silently dropped. `spawn_fifo_shards`
 /// applies it, so the direct, supervisor and registry paths all refuse
@@ -3591,7 +3591,7 @@ struct PendingCommit {
 /// coordinator's answer while the loop keeps polling: the commit every
 /// completion triggers under `CommitPolicy::PerRecord`, and the commit of a
 /// sequenced consumer that carries a terminal discard (see
-/// `FifoState::settle`).
+/// `FifoState::commit_due`).
 ///
 /// Why a thread, and why synchronous. An asynchronous commit reports its
 /// answer through `commit_callback`, which rust-rdkafka serves only inside
@@ -3614,18 +3614,18 @@ struct PendingCommit {
 /// sequenced consumer's wait on its record, and a sequenced commit made
 /// with nothing paused takes its pause from the first record that arrives.
 /// The wait ends on the answer, on shutdown, or on a fault a handler task
-/// reports over `fault_rx`, when the loop has handler tasks. The answer is librdkafka's result for the whole
-/// commit operation, which it waits for without a timeout of its own
-/// (bundled librdkafka 2.12.1, `rdkafka_offset.c:403-406`): a request
-/// unanswered for `socket.timeout.ms` is retried up to two times
-/// (`rdkafka_buf.c:161-162`, `rdkafka_proto.h:47`,
-/// `rdkafka_request.c:1784-1787`), and a commit with no coordinator waits
-/// for one up to `session.timeout.ms` (`rdkafka_cgrp.c:3744-3746`), so the
-/// wait can run for several socket timeouts before the commit comes back
-/// as rejected. A spawn failure leaves the loop's `Arc` where it is: the
-/// clone is dropped here, which closes nothing while the loop holds its own.
-/// The thread drops its clone before it answers, so once the answer is in
-/// the loop's `Arc` is the last again.
+/// reports over `fault_rx`, when the loop has handler tasks. The answer is
+/// librdkafka's result for the whole commit operation, which it waits for
+/// without a timeout of its own (bundled librdkafka 2.12.1,
+/// `rdkafka_offset.c:403-406`): a request unanswered for `socket.timeout.ms`
+/// is retried up to two times (`rdkafka_buf.c:161-162`,
+/// `rdkafka_proto.h:47`, `rdkafka_request.c:1784-1787`), and a commit with
+/// no coordinator waits for one up to `session.timeout.ms`
+/// (`rdkafka_cgrp.c:3744-3746`), so the wait can run for several socket
+/// timeouts before the commit comes back as rejected. A spawn failure leaves
+/// the loop's `Arc` where it is: the clone is dropped here, which closes
+/// nothing while the loop holds its own. The thread drops its clone before
+/// it answers, so once the answer is in the loop's `Arc` is the last again.
 async fn commit_confirmed(
     consumer: &Arc<KafkaStreamConsumer>,
     tpl: TopicPartitionList,
