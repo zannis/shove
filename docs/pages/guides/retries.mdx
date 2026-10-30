@@ -54,9 +54,9 @@ The hold queue selected on each retry attempt is `hold_queues[min(retry_count, l
 
 Hold-queue names are derived from the queue name and delay: `{queue}-hold-{N}s`. For the example above, the queues are `orders-hold-5s`, `orders-hold-30s`, and `orders-hold-120s`.
 
-If no hold queues are configured but the handler returns `Outcome::Retry`, the consumer falls back to broker-level nack-with-requeue (immediate redelivery, no delay). This is usually not what you want — configure at least one hold queue for any topic where transient failures are expected.
+If no hold queues are configured, `Outcome::Retry` has no delay tier to pick and each backend falls back to its own redelivery. Kafka and NATS wait a fixed 1 s. RabbitMQ, Redis Streams, SQS and the in-process broker redeliver with no delay. [With no hold queues](/concepts/outcomes#with-no-hold-queues) lists the mechanism and the warnings per backend. Configure at least one hold queue for any topic where transient failures are expected: a 1 s wait, or none at all, rarely gives a failing dependency time to recover.
 
-If a topic has hold queues but no DLQ, a warning is logged at build time: messages that exhaust `max_retries` will be silently discarded. If a topic has a DLQ but no hold queues, another warning is logged: retries will use broker redelivery with no delay.
+If a topic has hold queues but no DLQ, a warning is logged at build time: messages that exhaust `max_retries` will be silently discarded. If a topic has a DLQ but no hold queues, another build-time warning says retries will use broker redelivery with no delay. The builder is shared by every backend, so that wording describes RabbitMQ, Redis Streams, SQS and the in-process broker; Kafka and NATS wait 1 s.
 
 ## max\_retries
 
@@ -132,7 +132,7 @@ async fn handle(&self, msg: Order, meta: MessageMetadata, _: &()) -> Outcome {
 
 On backends where `Defer` re-sends the message (SQS) or where no delivery counter exists at all (RabbitMQ, Kafka, Redis Streams), `delivery_count` will not accumulate across deferrals — carry a deadline or a counter in the message body there. See [`retry_count` vs `delivery_count`](/concepts/handlers#retry_count-vs-delivery_count) for the full table.
 
-If no hold queues are configured, `Defer` falls back to nack-with-requeue (broker-level immediate redelivery) and a warning is logged.
+If no hold queues are configured, `Defer` falls back the way `Retry` does, with the retry counter left unchanged: Kafka and NATS wait a fixed 1 s, and RabbitMQ, Redis Streams, SQS and the in-process broker redeliver with no delay. Those four log a warning for each deferral; Kafka and NATS log nothing. See [With no hold queues](/concepts/outcomes#with-no-hold-queues).
 
 On **sequenced consumers**, `Defer` is not supported because it would block all subsequent messages for the same key indefinitely. If a handler returns `Defer` on a sequenced consumer, it is treated as `Retry` and a warning is logged.
 

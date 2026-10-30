@@ -1,6 +1,36 @@
 use serde::{Deserialize, Serialize};
 
 /// What a handler instructs the consumer to do with a message after processing.
+///
+/// # Without hold queues
+///
+/// [`Retry`](Outcome::Retry) and [`Defer`](Outcome::Defer) take their delay
+/// from the topology's hold queues. A topology that declares none gives them
+/// no delay to pick, and each backend redelivers in its own way:
+///
+/// - **Kafka**: after a fixed 1 s the record is republished into the topic,
+///   with the retry count incremented for a `Retry`. Under
+///   `RetryStrategy::InPlace` the handler's task waits 1 s and hands the same
+///   record back. No warning is logged.
+/// - **NATS JetStream**: after a fixed 1 s. On a shove-owned stream a `Retry`
+///   holds the original un-acked and then publishes a copy with the count
+///   incremented. A `Defer`, and both outcomes on an external stream, nak with
+///   a 1 s delay. No warning is logged.
+/// - **RabbitMQ**: no delay; the delivery is nacked with requeue. It keeps its
+///   retry count, so a `Retry` never spends `max_retries`. A warning is logged
+///   for a `Retry` and for a `Defer`.
+/// - **Redis Streams**: no delay; the entry is added back to its stream and the
+///   original is acknowledged. A warning is logged for a `Retry` and for a
+///   `Defer`.
+/// - **AWS SQS**: no delay; the message is re-sent with a delay of 0 seconds
+///   and the original is deleted. A FIFO queue sets the visibility timeout to 0
+///   instead. A warning is logged for a `Retry` and for a `Defer`.
+/// - **In-process**: no delay. A warning is logged for a `Defer` and none for
+///   a `Retry`.
+///
+/// A `Retry` still increments the retry count on every backend except
+/// RabbitMQ. The 1 s wait on Kafka and NATS has no setting; declare a hold
+/// queue to choose the delay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Outcome {
     /// Processed successfully. Remove from queue.
@@ -16,8 +46,10 @@ pub enum Outcome {
     /// [`ConsumerOptions::max_retries`](crate::ConsumerOptions::max_retries)
     /// is exhausted, at which point the message is routed to the DLQ.
     ///
-    /// If no hold queues are configured, the message is nacked with requeue
-    /// (broker-level redelivery with no delay).
+    /// If no hold queues are configured, Kafka and NATS redeliver after a
+    /// fixed 1 s and the other backends redeliver with no delay. The
+    /// mechanism, the retry-count effect and the warnings are listed per
+    /// backend under "Without hold queues" on [`Outcome`].
     Retry,
 
     /// Permanent failure. Route to DLQ without retrying.
@@ -57,8 +89,11 @@ pub enum Outcome {
     /// breaker. Ensure your handler has a condition that eventually resolves
     /// to `Ack`, `Retry`, or `Reject`.
     ///
-    /// If no hold queues are configured, falls back to nack-with-requeue
-    /// (broker-level redelivery with no delay) and a warning is logged.
+    /// If no hold queues are configured, `Defer` falls back the way
+    /// [`Retry`](Outcome::Retry) does, with the retry counter left unchanged.
+    /// Kafka and NATS redeliver after a fixed 1 s and the other backends
+    /// redeliver with no delay. Which backends log a warning is listed under
+    /// "Without hold queues" on [`Outcome`].
     ///
     /// # Sequenced (FIFO) consumers
     ///

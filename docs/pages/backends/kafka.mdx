@@ -103,6 +103,21 @@ Producer topic auto-creation defaults to off (`allow.auto.create.topics=false`),
 A publish to a topic nobody declared fails with a `Connection` error after the produce timeout, and the topic stays absent.
 Set [`KafkaConfig::with_producer_auto_create_topics(true)`](https://docs.rs/shove/latest/shove/kafka/struct.KafkaConfig.html#method.with_producer_auto_create_topics) to allow creation on first publish when the broker enables `auto.create.topics.enable=true`.
 
+### Retry and defer without hold queues
+
+Kafka has no hold topics, so `hold_queue(Duration)` sets only how long a `Retry` or a `Defer` waits before the record comes back.
+With none declared, the consumer waits a fixed 1 s for both outcomes under both retry strategies, and the delay has no setting.
+Declare a hold queue to choose it.
+
+Under `RetryStrategy::Republish`, the default on a shove-owned topology, the consumer waits 1 s and republishes the record into the topic.
+A `Retry` carries the retry count incremented by one in its header, and a `Defer` carries it unchanged.
+Under `RetryStrategy::InPlace` the handler's task waits 1 s holding its prefetch slot and hands the same record back, with the count kept in memory.
+A `Retry` spends `max_retries` under either strategy, so the usual DLQ routing applies once the budget is spent.
+
+Kafka logs no warning for a `Retry` or a `Defer` without hold queues.
+Building a topology that declares a DLQ and no hold queues logs a warning that says retries have no delay; on Kafka they wait 1 s.
+[With no hold queues](/concepts/outcomes#with-no-hold-queues) lists the fallback of every backend.
+
 ### Bind to an infra-owned topic
 
 Sometimes infra owns the topic: a Terraform module, a platform team's provisioning job, or a cluster whose credentials carry no Create or Alter permission.
