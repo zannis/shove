@@ -1,0 +1,30 @@
+docs/pages/concepts/broadcast.mdx
+  s_1001dc3147e1e5::t_04ffef44de1fd6 109-110
+src/backends/nats/broadcast.rs
+  s_1001dc3147e1e5::t_ab79032786e904 490-494
+  s_1001dc3147e1e5::t_6abe583c19d6b9 51-52
+  s_1001dc3147e1e5::t_83fc938982051c 93
+  s_1001dc3147e1e5::t_a2466f8ca6c473 40-45
+  s_1001dc3147e1e5::t_98f2140f0b133d 83-86,89-92
+  s_1001dc3147e1e5::t_2ed4b27533bbc0 360-433,446,450,464
+  s_1001dc3147e1e5::t_49566fcc11e8b6 59,94
+tests/nats_broadcast_integration.rs
+  s_1001dc3147e1e5::t_654933b0c7b34b 435-541
+  s_1001dc3147e1e5::t_5a1814fe9984ea 542-642
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2fffa9afaf02f4eec64008e038e1988fc24f6c4a",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
