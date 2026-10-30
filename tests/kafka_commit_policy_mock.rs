@@ -3632,8 +3632,9 @@ async fn a_completion_after_a_fault_is_not_counted_as_refused() {
     const LATE_TOPIC: &str = "kafka-completion-after-fault";
     const LATE_DLQ: &str = "kafka-completion-after-fault-dlq";
     const LATE_GROUP: &str = "kafka-completion-after-fault-consumer";
-    /// Long enough that `A`'s failed dead letter ends the loop first.
-    const B_RUNS: Duration = Duration::from_secs(2);
+    /// Long enough that `A`'s failed dead letter ends the loop first: its
+    /// three sends fail inside about half a second.
+    const B_RUNS: Duration = Duration::from_secs(3);
     shove::define_topic!(
         LateTopic,
         Order,

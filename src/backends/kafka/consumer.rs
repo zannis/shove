@@ -10019,7 +10019,7 @@ mod offset_tracker_tests {
             .expect("the new assignment commits its own delivery");
         assert!(
             redelivered.discards.is_empty(),
-            "the old discard was settled as survived, not re-pended on the new assignment"
+            "the old discard was settled as survived and left off the new assignment"
         );
     }
 
