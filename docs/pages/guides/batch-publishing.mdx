@@ -53,7 +53,7 @@ Brokers fail differently, and `shove` reports what each one actually knows rathe
 
 | Backend | Shape | What that means |
 | --- | --- | --- |
-| Kafka | **sparse** | Every record is submitted independently, so `failed()` names exactly the rejected ones and `unattempted()` is empty. |
+| Kafka | **sparse**, or **prefix** on a sequenced topic | On a topic without a sequence key every record is submitted independently, so `failed()` names exactly the rejected ones and `unattempted()` is empty. On a sequenced topic the records are sent in slice order and the first failure decides the report: `failed()` is that one index and `unattempted()` is everything after it, so a re-publish of `to_republish()` stores copies of the failed record and every record after it in slice order. |
 | SNS | **sparse** | Rejected entries are named per 10-entry chunk. A chunk that errors as a whole, and every later chunk, becomes `unattempted()`. |
 | NATS | **sparse + tail** | Ack failures are exact over the submitted prefix; if submission breaks partway, the rest of the batch is `unattempted()`. |
 | RabbitMQ | **prefix on a NACK, tail otherwise** | Every record is submitted, then confirms are awaited in order. A NACK stops the call: `failed()` is that one index, `unattempted()` is everything after it. A `basic_publish` or confirm *error* names nothing as rejected — see the rule below. |
@@ -67,6 +67,8 @@ This is why the payload is a **set of indices** rather than "the index of the fi
 ## Duplicates over loss
 
 A record whose fate is genuinely unknown — submitted to the broker but never confirmed — is reported as `unattempted`, never as succeeded. RabbitMQ hits this when a `basic_publish` fails partway through a batch: earlier messages are on the channel, but nothing has confirmed them, and the client cannot tell whether the broker received them.
+
+A sequenced Kafka batch reports records as `unattempted` on purpose: a record after the first failure may already be stored, ahead of the failed record, and it is re-published anyway so that its copy lands after the failed record's copy.
 
 `shove` always resolves that ambiguity toward re-publishing. **So make your consumers idempotent** — that is the one thing a `to_republish()` retry loop asks of you.
 

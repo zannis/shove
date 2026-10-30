@@ -178,6 +178,17 @@ pub(super) const PRODUCER_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// finishes after the wait is not flushed.
 pub(super) const PRODUCER_BUILD_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
+/// How long the client waits before it builds a producer again after a
+/// fatal error on one that never delivered a record. Such a producer usually
+/// met a fault its successor meets too, such as a principal that may not
+/// request a producer id, so the wait doubles for each one in a row, up to
+/// [`PRODUCER_REBUILD_WAIT_MAX`]. A producer that delivered is replaced at
+/// once.
+pub(super) const PRODUCER_REBUILD_WAIT: Duration = Duration::from_secs(1);
+
+/// The longest wait before a producer is built again after a fatal error.
+pub(super) const PRODUCER_REBUILD_WAIT_MAX: Duration = Duration::from_secs(60);
+
 /// The topic a `ping` asks the broker about. Metadata has to name a topic or
 /// ask for all of them, and a probe repeated for the life of the process must
 /// not ask for all of them. The topic need not exist: any answer from a

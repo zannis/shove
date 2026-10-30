@@ -8,7 +8,9 @@ use axum::response::{IntoResponse as _, Response};
 use axum::{
     Json, Router, extract::Path, extract::State, http::HeaderMap, http::StatusCode, routing::get,
 };
+use shove::SequencedTopic as _;
 use shove::schema_registry::{SchemaId, SchemaRegistry, SchemaRegistryAuth, SchemaRegistryError};
+use shove::topology::{SequenceFailure, TopologyBuilder};
 
 #[derive(Clone)]
 struct MockState {
@@ -1000,4 +1002,142 @@ async fn a_cancellation_during_the_negative_cache_step_leaves_no_inflight_entry(
         calls.load(Ordering::SeqCst) > calls_after_first,
         "the second call reached the registry rather than a retained entry"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A sequenced batch through a publisher that frames with the registry
+// ---------------------------------------------------------------------------
+
+const LEDGER_BATCH: u32 = 8;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct LedgerEntry {
+    account: String,
+    seq: u32,
+}
+
+shove::define_sequenced_topic!(
+    LedgerTopic,
+    LedgerEntry,
+    |entry: &LedgerEntry| entry.account.clone(),
+    TopologyBuilder::new("sr-ledger")
+        .sequenced(SequenceFailure::Skip)
+        .allow_message_loss()
+        .build()
+);
+
+/// `GET /subjects/{subject}/versions/latest`, answering a lookup later the
+/// earlier it arrived, so concurrent lookups finish in reverse order.
+async fn reverse_order_latest(
+    State(s): State<MockState>,
+    Path(subject): Path<String>,
+) -> Json<serde_json::Value> {
+    let arrival = s.calls.fetch_add(1, Ordering::SeqCst);
+    let later = LEDGER_BATCH.saturating_sub(u32::try_from(arrival).expect("a small count"));
+    tokio::time::sleep(std::time::Duration::from_millis(40) * later).await;
+    Json(serde_json::json!({
+        "subject": subject,
+        "version": 1,
+        "id": 42,
+        "schema": "{}",
+    }))
+}
+
+async fn spawn_reverse_order_latest_mock() -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = MockState {
+        calls: calls.clone(),
+    };
+    let app = Router::new()
+        .route(
+            "/subjects/{subject}/versions/latest",
+            get(reverse_order_latest),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), calls)
+}
+
+/// A sequenced batch resolves the subject's schema id once, before any
+/// record is sent, and the records are stored in slice order. Records that
+/// each looked the id up for themselves, against a registry answering
+/// concurrent lookups in reverse, would be stored in the order the answers
+/// came back.
+#[tokio::test]
+async fn a_sequenced_batch_resolves_the_schema_id_once_and_keeps_slice_order() {
+    use rdkafka::Message as _;
+    use rdkafka::consumer::{Consumer as _, StreamConsumer};
+    use rdkafka::mocking::MockCluster;
+    use rdkafka::{Offset, TopicPartitionList};
+    use shove::kafka::{KafkaClient, KafkaConfig, KafkaPublisherConfig};
+    use shove::{Broker, Kafka, Topic as _};
+
+    let topic = LedgerTopic::topology().queue();
+    let mock = MockCluster::new(1).expect("mock cluster");
+    mock.create_topic(topic, 1, 1).expect("mock topic");
+    let client = KafkaClient::connect(&KafkaConfig::new(mock.bootstrap_servers()))
+        .await
+        .expect("connect to the mock cluster");
+    let (url, lookups) = spawn_reverse_order_latest_mock().await;
+    let broker = Broker::<Kafka>::from_client(client);
+    let publisher = broker
+        .publisher_with(
+            KafkaPublisherConfig::new().with_schema_registry(SchemaRegistry::builder(url).build()),
+        )
+        .await
+        .expect("publisher");
+    let batch: Vec<LedgerEntry> = (0..LEDGER_BATCH)
+        .map(|seq| LedgerEntry {
+            account: "acct-1".into(),
+            seq,
+        })
+        .collect();
+
+    publisher
+        .publish_batch::<LedgerTopic>(&batch)
+        .await
+        .expect("every record is stored");
+
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        1,
+        "one lookup for the whole batch"
+    );
+    let consumer: StreamConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", mock.bootstrap_servers())
+        .set("group.id", "sr-ledger-read-back")
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("read-back consumer");
+    let mut assignment = TopicPartitionList::new();
+    assignment
+        .add_partition_offset(topic, 0, Offset::Beginning)
+        .expect("name the partition");
+    consumer.assign(&assignment).expect("assign the partition");
+    let expected = batch.len();
+    let mut stored = Vec::with_capacity(expected);
+    while stored.len() < expected {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(10), consumer.recv())
+            .await
+            .expect("every record is read back")
+            .expect("read a stored record");
+        let frame = message.payload().expect("a stored record has a payload");
+        assert_eq!(
+            frame.get(..5),
+            Some(&[0, 0, 0, 0, 42][..]),
+            "framed with the one resolved id"
+        );
+        let entry: LedgerEntry =
+            serde_json::from_slice(frame.get(5..).expect("a body after the frame"))
+                .expect("decode a stored record");
+        stored.push(entry.seq);
+    }
+    assert_eq!(
+        stored,
+        (0..LEDGER_BATCH).collect::<Vec<u32>>(),
+        "stored in slice order"
+    );
+    broker.close().await;
 }

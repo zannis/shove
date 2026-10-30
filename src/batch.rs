@@ -52,8 +52,9 @@ pub struct BatchFailure {
 impl BatchFailure {
     /// Indices the backend attempted and explicitly reported as rejected.
     ///
-    /// Sparse on Kafka, SNS, and NATS; a single index on the prefix backends
-    /// (RabbitMQ, InMemory, and Redis when Redis returned an explicit error).
+    /// Sparse on SNS, NATS, and Kafka without a sequence key; a single index
+    /// on the prefix backends (RabbitMQ, InMemory, Redis when Redis returned
+    /// an explicit error, and Kafka on a sequenced topic).
     /// See the table on
     /// [`Publisher::publish_batch`](crate::publisher::Publisher::publish_batch).
     pub fn failed(&self) -> &[usize] {
@@ -62,6 +63,10 @@ impl BatchFailure {
 
     /// Indices that were never submitted, or were submitted without a
     /// resolution the backend could confirm.
+    ///
+    /// On a sequenced Kafka topic every index after the first failure is
+    /// here, records the broker confirmed included, so that a re-publish
+    /// stores their copies after the failed record's copy.
     ///
     /// Ambiguous records land here rather than in
     /// [`succeeded`](Self::succeeded) — re-publishing risks a duplicate, not
@@ -80,6 +85,10 @@ impl BatchFailure {
     }
 
     /// How many records the backend confirmed. Always `>= 1`.
+    ///
+    /// On a sequenced Kafka topic it counts only the records before the first
+    /// failure, all of them confirmed; a record the broker confirmed after
+    /// the failure is in [`unattempted`](Self::unattempted) instead.
     ///
     /// Both halves of the batch invariant hold:
     ///
