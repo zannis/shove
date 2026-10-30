@@ -461,7 +461,7 @@ impl KafkaPublisher {
         message: &T::Message,
         extra_headers: HashMap<String, String>,
     ) -> Result<()> {
-        validate_headers(&extra_headers)?;
+        validate_headers(&extra_headers, &[])?;
         let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
         let (topic, key) = Self::resolve_topic_and_key::<T>(topology, message);

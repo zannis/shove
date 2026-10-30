@@ -185,7 +185,7 @@ impl RedisPublisher {
         msg: &T::Message,
         headers: HashMap<String, String>,
     ) -> Result<()> {
-        validate_headers(&headers)?;
+        validate_headers(&headers, INTERNAL_KEYS)?;
         self.publish_inner::<T>(msg, headers, None)
             .await
             .map_err(|e| e.error)
@@ -396,26 +396,33 @@ mod tests {
         Ok(())
     }
 
-    async fn start_ambiguous_xadd_server() -> (String, tokio::task::JoinHandle<()>) {
+    /// A mock Redis that answers the first XADD it sees and drops the
+    /// connection on every later one. Also returns how many connections it
+    /// has accepted.
+    async fn start_ambiguous_xadd_server() -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>)
+    {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock Redis server");
         let address = listener.local_addr().expect("mock Redis address");
         let xadds = Arc::new(AtomicUsize::new(0));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::clone(&connections);
         let server = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
                 let xadds = Arc::clone(&xadds);
                 tokio::spawn(async move {
                     let _ = serve_mock_redis_connection(stream, xadds).await;
                 });
             }
         });
-        (format!("redis://{address}/"), server)
+        (format!("redis://{address}/"), server, connections)
     }
 
     #[tokio::test]
     async fn ambiguous_xadd_response_is_unattempted_not_failed() {
-        let (url, server) = start_ambiguous_xadd_server().await;
+        let (url, server, _) = start_ambiguous_xadd_server().await;
         let client = RedisClient::connect(
             RedisConfig::new(RedisMode::Standalone { url })
                 .with_response_timeout(Duration::from_secs(3)),
@@ -446,7 +453,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_header_naming_an_entry_field_is_refused_before_any_xadd() {
-        let (url, server) = start_ambiguous_xadd_server().await;
+        let (url, server, _) = start_ambiguous_xadd_server().await;
         let client = RedisClient::connect(
             RedisConfig::new(RedisMode::Standalone { url })
                 .with_response_timeout(Duration::from_secs(3)),
@@ -475,6 +482,52 @@ mod tests {
             .await
             .map_err(|failure| failure.error)
             .expect("the first XADD the server sees is accepted");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn publish_with_headers_reserves_the_stream_entry_fields_before_any_io() {
+        let (url, server, connections) = start_ambiguous_xadd_server().await;
+        let client = RedisClient::connect(
+            RedisConfig::new(RedisMode::Standalone { url })
+                .with_response_timeout(Duration::from_secs(3)),
+        )
+        .await
+        .expect("connect to mock Redis");
+        let publisher = RedisPublisher::new(client);
+        let connected = connections.load(Ordering::SeqCst);
+
+        for name in INTERNAL_KEYS {
+            let headers = HashMap::from([((*name).to_string(), "forged".to_string())]);
+            let err = publisher
+                .publish_with_headers::<AmbiguousBatchTopic>(&1, headers)
+                .await
+                .expect_err("a name the stream entry carries as its own is refused");
+            assert!(
+                matches!(&err, ShoveError::Validation(message) if message.contains(name)),
+                "{name}: {err:?}"
+            );
+        }
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            connected,
+            "a refused publish dialled a connection"
+        );
+
+        // Redis writes neither `shard` nor a `payload-type`, so both stay free.
+        let headers = HashMap::from([
+            ("shard".to_string(), "1".to_string()),
+            ("payload-type".to_string(), "json".to_string()),
+        ]);
+        publisher
+            .publish_with_headers::<AmbiguousBatchTopic>(&1, headers)
+            .await
+            .expect("names Redis does not write are published");
+        assert!(
+            connections.load(Ordering::SeqCst) > connected,
+            "the accepted publish dialled no connection"
+        );
 
         server.abort();
     }

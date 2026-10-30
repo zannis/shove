@@ -1,12 +1,14 @@
 //! `publish_with_headers` refuses the header names a backend reserves for
 //! itself, so a caller cannot forge what shove stamps or overwrite what it
-//! writes.
+//! writes, and leaves free the names a backend does not write. `payload` is
+//! Redis's and `shard` is SNS's; on the other backends both are ordinary.
 
 #![cfg(any(
     feature = "inmemory",
     feature = "kafka",
     feature = "nats",
-    feature = "redis-streams"
+    feature = "redis-streams",
+    feature = "aws-sns-sqs"
 ))]
 
 use std::collections::HashMap;
@@ -25,8 +27,17 @@ fn forged_headers(name: &str) -> HashMap<String, String> {
     HashMap::from([(name.to_string(), "99".to_string())])
 }
 
-fn caller_headers() -> HashMap<String, String> {
-    HashMap::from([(CALLER.to_string(), "trace-1".to_string())])
+/// What a caller's header `name` is valued as.
+fn value_of(name: &str) -> String {
+    format!("{name}-value")
+}
+
+/// One header per name, each valued by [`value_of`].
+fn caller_headers(names: &[&str]) -> HashMap<String, String> {
+    names
+        .iter()
+        .map(|name| ((*name).to_string(), value_of(name)))
+        .collect()
 }
 
 fn assert_reserved(err: ShoveError, name: &str) {
@@ -45,9 +56,11 @@ mod inmemory {
     use shove::topology::TopologyBuilder;
     use shove::{Broker, InMemory};
 
-    use super::{Payload, assert_reserved, caller_headers, forged_headers};
+    use super::{CALLER, Payload, assert_reserved, caller_headers, forged_headers};
 
     const FORGED: &str = "Shove-Retry-Count";
+    /// Free on this backend, `payload` and `shard` included.
+    const FREE: [&str; 3] = [CALLER, "payload", "shard"];
     const QUEUE: &str = "reserved-headers-inmemory";
 
     shove::define_topic!(ReservedTopic, Payload, TopologyBuilder::new(QUEUE).build());
@@ -83,7 +96,7 @@ mod inmemory {
                 &Payload {
                     id: "honest".into(),
                 },
-                caller_headers(),
+                caller_headers(&FREE),
             )
             .await
             .expect("a name outside the reserved prefix is published");
@@ -107,9 +120,11 @@ mod kafka {
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::kafka::apache::{self, Kafka as KafkaContainer};
 
-    use super::{CALLER, Payload, assert_reserved, caller_headers, forged_headers};
+    use super::{CALLER, Payload, assert_reserved, caller_headers, forged_headers, value_of};
 
     const FORGED: &str = "Shove-Retry-Count";
+    /// Free on this backend, `payload` and `shard` included.
+    const FREE: [&str; 3] = [CALLER, "payload", "shard"];
     const TOPIC: &str = "reserved-headers-kafka";
     const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -209,7 +224,7 @@ mod kafka {
                 &Payload {
                     id: "honest".into(),
                 },
-                caller_headers(),
+                caller_headers(&FREE),
             )
             .await
             .expect("a name outside the reserved prefix is published");
@@ -220,11 +235,13 @@ mod kafka {
             Some("0"),
             "{stored:?}"
         );
-        assert_eq!(
-            stored[0].get(CALLER).map(String::as_str),
-            Some("trace-1"),
-            "{stored:?}"
-        );
+        for name in FREE {
+            assert_eq!(
+                stored[0].get(name),
+                Some(&value_of(name)),
+                "{name}: {stored:?}"
+            );
+        }
         broker.close().await;
     }
 }
@@ -238,9 +255,11 @@ mod nats {
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::nats::{Nats as NatsContainer, NatsServerCmd};
 
-    use super::{CALLER, Payload, assert_reserved, caller_headers, forged_headers};
+    use super::{CALLER, Payload, assert_reserved, caller_headers, forged_headers, value_of};
 
     const FORGED: &str = "Shove-Retry-Count";
+    /// Free on this backend, `payload` and `shard` included.
+    const FREE: [&str; 3] = [CALLER, "payload", "shard"];
     const STREAM: &str = "reserved-headers-nats";
 
     shove::define_topic!(ReservedTopic, Payload, TopologyBuilder::new(STREAM).build());
@@ -293,7 +312,7 @@ mod nats {
                 &Payload {
                     id: "honest".into(),
                 },
-                caller_headers(),
+                caller_headers(&FREE),
             )
             .await
             .expect("a name outside the reserved prefix is published");
@@ -307,10 +326,13 @@ mod nats {
             message.headers.get("Shove-Retry-Count").map(|v| v.as_str()),
             Some("0")
         );
-        assert_eq!(
-            message.headers.get(CALLER).map(|v| v.as_str()),
-            Some("trace-1")
-        );
+        for name in FREE {
+            assert_eq!(
+                message.headers.get(name).map(|v| v.as_str()),
+                Some(value_of(name).as_str()),
+                "{name}"
+            );
+        }
         broker.close().await;
     }
 }
@@ -327,9 +349,11 @@ mod redis {
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
 
-    use super::{CALLER, Payload, assert_reserved, caller_headers, forged_headers};
+    use super::{CALLER, Payload, assert_reserved, caller_headers, forged_headers, value_of};
 
     const FORGED: &str = "payload";
+    /// Free on this backend: `shard` is SNS's, not a field of a stream entry.
+    const FREE: [&str; 2] = [CALLER, "shard"];
     const STREAM: &str = "reserved-headers-redis";
 
     shove::define_topic!(ReservedTopic, Payload, TopologyBuilder::new(STREAM).build());
@@ -429,7 +453,7 @@ mod redis {
         );
 
         publisher
-            .publish_with_headers::<ReservedTopic>(&honest, caller_headers())
+            .publish_with_headers::<ReservedTopic>(&honest, caller_headers(&FREE))
             .await
             .expect("a name outside the reserved set is published");
         let stored = stored_entries(&url).await;
@@ -444,12 +468,188 @@ mod redis {
             serde_json::from_str::<Payload>(bodies[0]).expect("the stored payload decodes"),
             honest
         );
-        assert!(
-            stored[0]
-                .iter()
-                .any(|(field, value)| field == CALLER && value == "trace-1"),
-            "{stored:?}"
+        for name in FREE {
+            assert!(
+                stored[0]
+                    .iter()
+                    .any(|(field, value)| field == name && *value == value_of(name)),
+                "{name}: {stored:?}"
+            );
+        }
+        broker.close().await;
+    }
+}
+
+#[cfg(feature = "aws-sns-sqs")]
+mod sns {
+    use std::time::Duration;
+
+    use aws_sdk_sqs::types::Message;
+    use shove::SequencedTopic as _;
+    use shove::sns::{SnsClient, SnsConfig};
+    use shove::topology::{SequenceFailure, TopologyBuilder};
+    use shove::{Broker, Sqs};
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::localstack::LocalStack;
+    use tokio::time::Instant;
+
+    use super::{CALLER, Payload, assert_reserved, caller_headers, forged_headers, value_of};
+
+    const FORGED: &str = "shard";
+    /// Free on this backend: `payload` is Redis's, not an SNS attribute.
+    const FREE: [&str; 2] = [CALLER, "payload"];
+    const QUEUE: &str = "reserved-headers-sns";
+    const SHARDS: u16 = 2;
+
+    shove::define_sequenced_topic!(
+        ReservedTopic,
+        Payload,
+        |msg: &Payload| msg.id.clone(),
+        TopologyBuilder::new(QUEUE)
+            .sequenced(SequenceFailure::Skip)
+            .routing_shards(SHARDS)
+            .hold_queue(Duration::from_secs(1))
+            .dlq()
+            .build()
+    );
+
+    async fn sdk_config(endpoint: &str) -> aws_config::SdkConfig {
+        aws_config::from_env()
+            .region(aws_config::Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .load()
+            .await
+    }
+
+    async fn start_localstack() -> (testcontainers::ContainerAsync<LocalStack>, String) {
+        // nextest runs each test in its own process, so nothing else reads the
+        // environment while it is written.
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        let auth_token = std::env::var("LOCALSTACK_AUTH_TOKEN")
+            .expect("LOCALSTACK_AUTH_TOKEN must be set to run the SNS/SQS tests");
+        let container = LocalStack::default()
+            .with_env_var("LOCALSTACK_AUTH_TOKEN", auth_token)
+            .start()
+            .await
+            .expect("start the LocalStack container");
+        let port = container
+            .get_host_port_ipv4(4566)
+            .await
+            .expect("get the LocalStack port");
+        let endpoint = format!("http://localhost:{port}");
+
+        let config = sdk_config(&endpoint).await;
+        let sns = aws_sdk_sns::Client::new(&config);
+        let sqs = aws_sdk_sqs::Client::new(&config);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !(sns.list_topics().send().await.is_ok() && sqs.list_queues().send().await.is_ok()) {
+            assert!(
+                Instant::now() < deadline,
+                "LocalStack was not ready within 30s at {endpoint}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        (container, endpoint)
+    }
+
+    /// Every message that reaches a shard queue within `window`, tagged with
+    /// the shard its queue serves.
+    async fn delivered(
+        sqs: &aws_sdk_sqs::Client,
+        queues: &[String],
+        window: Duration,
+    ) -> Vec<(usize, Message)> {
+        let deadline = Instant::now() + window;
+        let mut found = Vec::new();
+        while Instant::now() < deadline {
+            for (shard, url) in queues.iter().enumerate() {
+                let reply = sqs
+                    .receive_message()
+                    .queue_url(url)
+                    .max_number_of_messages(10)
+                    .wait_time_seconds(1)
+                    .message_attribute_names("All")
+                    .send()
+                    .await
+                    .expect("receive from a shard queue");
+                found.extend(reply.messages().iter().cloned().map(|m| (shard, m)));
+            }
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn publish_with_headers_rejects_shard() {
+        let (_container, endpoint) = start_localstack().await;
+        let client = SnsClient::new(&SnsConfig {
+            region: Some("us-east-1".into()),
+            endpoint_url: Some(endpoint.clone()),
+        })
+        .await
+        .expect("create the SNS client");
+        let broker = Broker::<Sqs>::from_client(client.clone());
+        broker
+            .topology()
+            .declare::<ReservedTopic>()
+            .await
+            .expect("declare the topic");
+        let publisher = broker.publisher().await.expect("create the publisher");
+        let mut queues = Vec::new();
+        for shard in 0..SHARDS {
+            let name = format!("{QUEUE}-seq-{shard}");
+            queues.push(
+                client
+                    .queue_registry()
+                    .get(&name)
+                    .await
+                    .unwrap_or_else(|| panic!("shard queue {name} is registered")),
+            );
+        }
+        let sqs = aws_sdk_sqs::Client::new(&sdk_config(&endpoint).await);
+        let honest = Payload {
+            id: "acct-1".into(),
+        };
+
+        let err = publisher
+            .publish_with_headers::<ReservedTopic>(&honest, forged_headers(FORGED))
+            .await
+            .expect_err("a header named shard is refused");
+        assert_reserved(err, FORGED);
+
+        publisher
+            .publish_with_headers::<ReservedTopic>(&honest, caller_headers(&FREE))
+            .await
+            .expect("names SNS does not write are published");
+
+        // The accepted message reaches exactly one shard queue, the one whose
+        // filter policy matches the `shard` attribute shove wrote. The refused
+        // publish reaches none.
+        let delivered = delivered(&sqs, &queues, Duration::from_secs(8)).await;
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        let (shard, message) = &delivered[0];
+        let attributes = message
+            .message_attributes()
+            .expect("the message carries attributes");
+        assert_eq!(
+            attributes.get(FORGED).and_then(|a| a.string_value()),
+            Some(shard.to_string().as_str()),
+            "{attributes:?}"
         );
+        for name in FREE {
+            assert_eq!(
+                attributes.get(name).and_then(|a| a.string_value()),
+                Some(value_of(name).as_str()),
+                "{name}: {attributes:?}"
+            );
+        }
+        let body: Payload = serde_json::from_str(message.body().expect("the message has a body"))
+            .expect("the body decodes");
+        assert_eq!(body, honest);
         broker.close().await;
     }
 }

@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn every_internal_header_is_reserved_by_validate_headers() {
-        assert_internal_keys_reserved("Kafka", INTERNAL_HEADERS);
+        assert_internal_keys_reserved("Kafka", INTERNAL_HEADERS, &[]);
     }
 
     #[test]

@@ -153,7 +153,7 @@ impl NatsPublisher {
         message: &T::Message,
         extra_headers: HashMap<String, String>,
     ) -> Result<()> {
-        validate_headers(&extra_headers)?;
+        validate_headers(&extra_headers, &[])?;
         let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
         let (subject, seq_key) = Self::resolve_subject_and_key::<T>(topology, message);

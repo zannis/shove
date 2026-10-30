@@ -83,7 +83,7 @@ impl InMemoryPublisher {
         message: &T::Message,
         headers: HashMap<String, String>,
     ) -> Result<()> {
-        validate_headers(&headers)?;
+        validate_headers(&headers, &[])?;
         self.publish_one::<T>(message, headers).await
     }
 

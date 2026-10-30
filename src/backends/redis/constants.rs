@@ -13,9 +13,9 @@ pub(super) const X_DEATH_COUNT: &str = "x-death-count";
 pub(super) const X_ORIGINAL_QUEUE: &str = "x-original-queue";
 
 /// Stream entry fields shove writes itself or reads back as its own. They stay
-/// out of the user-visible headers, and no caller header may carry one of these
-/// names. A new field belongs here: a test checks that `validate_headers`
-/// reserves every name in this list.
+/// out of the user-visible headers, and the publisher refuses a caller header
+/// with any of these names, both in `publish_with_headers` and where it builds
+/// the XADD. A new field belongs here.
 pub(super) const INTERNAL_KEYS: &[&str] = &[
     PAYLOAD_FIELD,
     X_RETRY_COUNT,
@@ -39,14 +39,3 @@ pub(super) const AUTOCLAIM_COUNT: usize = 100;
 pub(super) const REQUEUE_POLL_MS: u64 = 500;
 /// Maximum number of entries to fetch per ZRANGEBYSCORE call in the requeuer.
 pub(super) const REQUEUE_BATCH_SIZE: i64 = 200;
-
-#[cfg(test)]
-mod tests {
-    use super::INTERNAL_KEYS;
-    use crate::publisher_internal::assert_internal_keys_reserved;
-
-    #[test]
-    fn every_internal_key_is_reserved_by_validate_headers() {
-        assert_internal_keys_reserved("Redis", INTERNAL_KEYS);
-    }
-}

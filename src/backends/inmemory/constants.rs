@@ -26,6 +26,6 @@ mod tests {
 
     #[test]
     fn every_internal_key_is_reserved_by_validate_headers() {
-        assert_internal_keys_reserved("InMemory", INTERNAL_KEYS);
+        assert_internal_keys_reserved("InMemory", INTERNAL_KEYS, &[]);
     }
 }
