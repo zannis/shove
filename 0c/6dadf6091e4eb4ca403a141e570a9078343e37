@@ -1,0 +1,43 @@
+src/backends/nats/publisher.rs
+  s_1001dc3147e1e5::t_7fd0d85d3a34e6 121
+src/publisher_internal.rs
+  s_1001dc3147e1e5::t_be56c9e3095ce2 8-14
+  s_1001dc3147e1e5::t_d1aecc13a5b717 90-118,120-125
+  s_1001dc3147e1e5::t_6a1189960a87a8 119
+tests/publisher_reserved_headers.rs
+  s_1001dc3147e1e5::t_a53ab37e31a7ef 1-277
+  s_1001dc3147e1e5::t_e065a390a95377 278-280
+  s_35f295f8ab688a::t_067ca987ea435a 281-308
+docs/design/sequence-failure-parity.md
+  s_1001dc3147e1e5::t_f6c79a1e8e1f3a 132-133
+src/publisher.rs
+  s_1001dc3147e1e5::t_a9b7460a5dc942 32-41
+docs/pages/guides/observability.mdx
+  s_1001dc3147e1e5::t_067c797bd6940b 277-278,280,282
+  s_1001dc3147e1e5::t_b1b31b227474b5 281
+  s_1001dc3147e1e5::t_fc0f37fd036938 279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0c6dadf6091e4eb4ca403a141e570a9078343e37",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_35f295f8ab688a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ae37c1de7cd194a08",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
