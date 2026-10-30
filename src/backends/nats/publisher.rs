@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_nats::HeaderMap;
@@ -11,6 +9,7 @@ use async_nats::jetstream::publish::PublishAck;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
+use uuid::{Builder, Uuid};
 
 use crate::backend::PublisherImpl;
 use crate::batch::BatchReport;
@@ -26,52 +25,18 @@ use super::constants::{COPY_OF_HEADER, SEQUENCE_KEY_HEADER};
 
 const MAX_PUBLISH_ATTEMPTS: u32 = 3;
 
-/// The source of the `Nats-Msg-Id` of every fresh publish of a process: a
-/// 64-bit prefix drawn at random once, then a counter, both in fixed-width hex
-/// as `{prefix}-{counter}`.
+/// The `Nats-Msg-Id` of a fresh publish: a version 4 UUID built from random
+/// bytes the thread-local CSPRNG draws.
 ///
-/// JetStream de-duplicates on the id, so no two publishes of a process may
-/// share one, and two processes meet only if they drew the same prefix. A step
-/// of the counter is an atomic add, where a UUID costs a random draw per
-/// publish. The id is a plain string, so a retry copy's `-r{n}` and a dead
-/// letter's `-dlq` extend it as they extend any id.
-struct MessageIds {
-    prefix: u64,
-    next: AtomicU64,
+/// JetStream de-duplicates on the id, so a party that can publish to the stream
+/// and predict an id could publish it ahead of the message and have the message
+/// dropped as a duplicate. A CSPRNG draw gives away nothing about the next one,
+/// and the generator reseeds from the OS now and then, so a publish makes no
+/// call to the OS of its own. The id is a plain string, so a retry copy's
+/// `-r{n}` and a dead letter's `-dlq` extend it as they extend any id.
+fn new_message_id() -> Uuid {
+    Builder::from_random_bytes(rand::random()).into_uuid()
 }
-
-impl MessageIds {
-    fn new() -> Self {
-        Self::with_prefix(rand::random())
-    }
-
-    fn with_prefix(prefix: u64) -> Self {
-        Self::starting_at(prefix, 0)
-    }
-
-    fn starting_at(prefix: u64, first: u64) -> Self {
-        Self {
-            prefix,
-            next: AtomicU64::new(first),
-        }
-    }
-
-    /// The next id. A counter that has run out is an error, never a step back
-    /// to an id already used.
-    fn next_id(&self) -> Result<String> {
-        let counter = self
-            .next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| {
-                ShoveError::Unknown(
-                    "this process has used every message id under its prefix; restart it".into(),
-                )
-            })?;
-        Ok(format!("{:016x}-{counter:016x}", self.prefix))
-    }
-}
-
-static MESSAGE_IDS: LazyLock<MessageIds> = LazyLock::new(MessageIds::new);
 
 /// How long the original of a copy waits before it is redelivered when the
 /// copy's publish ended on a duplicate that could not be confirmed. The id
@@ -328,9 +293,13 @@ impl NatsPublisher {
         seq_key: Option<&str>,
     ) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
+        let id = new_message_id();
         headers.insert(
             NATS_MESSAGE_ID,
-            header_value("Nats-Msg-Id", &MESSAGE_IDS.next_id()?)?,
+            header_value(
+                "Nats-Msg-Id",
+                id.hyphenated().encode_lower(&mut Uuid::encode_buffer()),
+            )?,
         );
 
         if let Some(extra) = extra {
@@ -577,6 +546,7 @@ mod tests {
     use super::super::constants::RETRY_COUNT_HEADER;
     use super::*;
     use jetstream::context::{PublishError, PublishErrorKind as K};
+    use uuid::{Variant, Version};
 
     /// A JetStream error response, as async-nats deserializes one off the wire.
     fn server_error() -> jetstream::Error {
@@ -754,9 +724,8 @@ mod tests {
             .to_string()
     }
 
-    /// Every publish of a process takes the next counter value under the
-    /// process's prefix, so no id repeats, and a second prefix cannot meet the
-    /// first.
+    /// A fresh draw per publish: no id repeats across many publishes, whichever
+    /// threads make them.
     #[test]
     fn message_ids_are_unique_across_many_publishes() {
         use std::collections::HashSet;
@@ -781,41 +750,42 @@ mod tests {
                 assert!(seen.insert(id), "two threads took the same id");
             }
         }
+    }
 
-        let (first, second) = (MessageIds::with_prefix(1), MessageIds::with_prefix(2));
-        let mut both = HashSet::new();
-        for _ in 0..20_000 {
-            assert!(both.insert(first.next_id().unwrap()));
-            assert!(both.insert(second.next_id().unwrap()));
+    /// An id is a lowercase hyphenated version 4 UUID, so a copy's `-r{n}` and
+    /// a dead letter's `-dlq` extend it as they extend any id.
+    #[test]
+    fn a_message_id_is_a_version_4_uuid() {
+        let id = id_of(&NatsPublisher::build_headers(None, None).unwrap());
+        let uuid = Uuid::parse_str(&id).unwrap();
+        assert_eq!(uuid.get_version(), Some(Version::Random));
+        assert_eq!(uuid.get_variant(), Variant::RFC4122);
+        assert_eq!(id, uuid.hyphenated().to_string());
+    }
+
+    /// An id gives away nothing about the next. Consecutive ids are no counter
+    /// step apart and open with no fixed prefix, so a party that can publish to
+    /// the stream cannot take an id ahead of a message.
+    #[test]
+    fn consecutive_message_ids_are_not_sequential_and_share_no_prefix() {
+        use std::collections::HashSet;
+
+        let ids: Vec<u128> = (0..256)
+            .map(|_| {
+                let id = id_of(&NatsPublisher::build_headers(None, None).unwrap());
+                Uuid::parse_str(&id).unwrap().as_u128()
+            })
+            .collect();
+        for pair in ids.windows(2) {
+            assert!(
+                pair[0].abs_diff(pair[1]) > u128::from(u64::MAX),
+                "{:032x} and {:032x} are close together",
+                pair[0],
+                pair[1]
+            );
         }
-    }
-
-    /// An id is the prefix and the counter in fixed-width hex, so a copy's
-    /// `-r{n}` and `-dlq` suffixes extend it without ambiguity.
-    #[test]
-    fn a_message_id_is_the_prefix_then_the_counter() {
-        let ids = MessageIds::with_prefix(0xabc);
-        assert_eq!(ids.next_id().unwrap(), "0000000000000abc-0000000000000000");
-        assert_eq!(ids.next_id().unwrap(), "0000000000000abc-0000000000000001");
-
-        let live = id_of(&NatsPublisher::build_headers(None, None).unwrap());
-        let (prefix, counter) = live.split_once('-').unwrap();
-        assert_eq!(prefix.len(), 16);
-        assert_eq!(counter.len(), 16);
-        assert!(
-            live.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'),
-            "{live}"
-        );
-    }
-
-    /// A counter that has run out is an error. It never wraps around to an id
-    /// the process already used.
-    #[test]
-    fn an_exhausted_counter_is_an_error_not_a_repeat() {
-        let ids = MessageIds::starting_at(7, u64::MAX - 1);
-        assert_eq!(ids.next_id().unwrap(), "0000000000000007-fffffffffffffffe");
-        assert!(matches!(ids.next_id(), Err(ShoveError::Unknown(_))));
-        assert!(matches!(ids.next_id(), Err(ShoveError::Unknown(_))));
+        let prefixes: HashSet<u128> = ids.iter().map(|id| id >> 64).collect();
+        assert_eq!(prefixes.len(), ids.len(), "two ids open alike");
     }
 
     /// A fresh message starts at retry count zero without saying so: every
