@@ -877,9 +877,10 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 /// time for the naks.
 const SWEEP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Has the server sweep the durable's waiting list once a stopping
-/// consumer's pull subscription is dropped, so neither a nak that follows
-/// nor a newly published message is spent on that subscription's request.
+/// Has the server sweep the durable's waiting list once a consumer has
+/// dropped a pull subscription, on a stop or after a reconnect, so neither a
+/// nak that follows nor a newly published message is spent on that
+/// subscription's request.
 ///
 /// The server keeps the request on the waiting list until it next sweeps the
 /// list, and a delivery made before then goes to an inbox nobody reads, or,
@@ -894,11 +895,11 @@ async fn sweep_waiting_list(consumer: &PullConsumer) {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!(
             error = %e,
-            "failed to clear a stopped consumer's pull request before releasing its messages"
+            "failed to clear dropped pull requests from the durable's waiting list"
         ),
         Err(_) => tracing::warn!(
             timeout = ?SWEEP_TIMEOUT,
-            "timed out clearing a stopped consumer's pull request before releasing its messages"
+            "timed out clearing dropped pull requests from the durable's waiting list"
         ),
     }
 }
@@ -1235,6 +1236,8 @@ fn next_event(pulls: &mut Vec<Pull>) -> impl Future<Output = PullEvent> + '_ {
 #[allow(clippy::large_enum_variant)]
 enum Step {
     Stop,
+    /// The client connected again, or, when `false`, it is gone for good.
+    Connected(bool),
     Resume,
     Reserved(Result<Vec<OwnedSemaphorePermit>>),
     Event(PullEvent),
@@ -1324,13 +1327,14 @@ async fn reserve_free_slots(slots: &Arc<Semaphore>) -> Result<Vec<OwnedSemaphore
 }
 
 /// The messages a worker's open pulls have delivered and the worker has not
-/// started, taken without waiting for more.
-fn take_ready(pulls: &mut [Pull]) -> Vec<Message> {
+/// started, each with the slot reserved for it, taken without waiting for
+/// more.
+fn take_ready(pulls: &mut [Pull]) -> Vec<(Message, OwnedSemaphorePermit)> {
     let mut unstarted = Vec::new();
     for pull in pulls.iter_mut() {
-        while let Some(Some((delivery, _slot))) = pull.deliveries.next().now_or_never() {
+        while let Some(Some((delivery, slot))) = pull.deliveries.next().now_or_never() {
             if let Ok(msg) = delivery {
-                unstarted.push(msg);
+                unstarted.push((msg, slot));
             }
         }
     }
@@ -1395,17 +1399,45 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
         let mut quiet_since = tokio::time::Instant::now();
         let mut pause: Option<Pin<Box<tokio::time::Sleep>>> = None;
         let mut pause_backoff = ended_pull_backoff();
+        let mut connected = self.client.connection_changes();
+        connected.borrow_and_update();
+        let mut connection = self.client.connections();
+        let mut watching = true;
         loop {
             let may_pull = pulls.len() < MAX_OPEN_PULLS && pause.is_none();
             let step = tokio::select! {
                 biased;
                 _ = self.shutdown.cancelled() => Step::Stop,
+                changed = connected.changed(), if watching => Step::Connected(changed.is_ok()),
                 () = pause_over(&mut pause), if pause.is_some() => Step::Resume,
                 reserved = reserve_free_slots(&self.slots), if may_pull => Step::Reserved(reserved),
                 event = next_event(&mut pulls), if !pulls.is_empty() => Step::Event(event),
             };
             match step {
                 Step::Stop => return self.stop(consumer, pulls).await,
+                Step::Connected(false) => watching = false,
+                Step::Connected(true) => {
+                    let now = self.client.connections();
+                    if now == connection {
+                        continue;
+                    }
+                    connection = now;
+                    // The server may have lost these pulls' requests with the old connection.
+                    tracing::info!(queue, "the client reconnected, pulling again");
+                    for (msg, slot) in take_ready(&mut pulls) {
+                        self.start(msg, slot, ack_wait);
+                    }
+                    pulls.clear();
+                    pause = None;
+                    if self
+                        .unless_stopped(sweep_waiting_list(consumer))
+                        .await
+                        .is_none()
+                    {
+                        return self.stop(consumer, pulls).await;
+                    }
+                    quiet_since = tokio::time::Instant::now();
+                }
                 Step::Resume => pause = None,
                 Step::Reserved(reserved) => {
                     let reserved = reserved?;
@@ -1490,7 +1522,10 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
     /// then waits for the tasks it did start. The pulls are dropped first, so
     /// the slots they reserved are free before the wait.
     async fn stop(&self, consumer: &PullConsumer, mut pulls: Vec<Pull>) -> Result<()> {
-        let unstarted = take_ready(&mut pulls);
+        let unstarted: Vec<Message> = take_ready(&mut pulls)
+            .into_iter()
+            .map(|(msg, _slot)| msg)
+            .collect();
         drop(pulls);
         release_pulled(consumer, &unstarted).await;
         self.drain().await;

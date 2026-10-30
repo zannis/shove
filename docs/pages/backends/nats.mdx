@@ -185,6 +185,7 @@ Any other status that ends a pull, such as a pull the durable's limits refuse (`
 After a refused pull or a leader change, the worker waits before it opens its next pull, and the pulls it already has open go on meanwhile.
 The wait is jittered by up to half either way around a base that starts at 100 ms and doubles with each further such pull up to 5 s, so the first wait is 50 to 150 ms and one at the cap is 2.5 to 7.5 s.
 Only a delivery resets it.
+When the client reconnects, a worker starts any message its open pulls had already delivered, drops those pulls, and pulls again at once, because a server that restarted, failed over or swept the old connection's requests has lost them without a word.
 
 The durable a group or a consumer creates therefore has no ack budget of its own: `max_ack_pending` is `-1` unless `with_max_ack_pending` sets a cap.
 Workers attached to one durable, from any number of processes, each keep up to their own prefetch in flight, and a cap is shared by all of them.

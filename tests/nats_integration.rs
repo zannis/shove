@@ -7151,3 +7151,112 @@ async fn a_durable_that_refuses_every_pull_ends_the_consumer() {
     );
     broker.close().await;
 }
+
+/// A free host port, for a container whose port must survive a restart.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    listener
+        .local_addr()
+        .expect("read the bound address")
+        .port()
+}
+
+/// An idle worker's pull is lost when the server is killed and restarts: a
+/// killed server never answers its waiting pulls, as a stopping one does with
+/// `409 Server Shutdown`. Once the client has reconnected, the worker pulls
+/// again at once, so a message published after the restart is handled
+/// straight away, well inside the 35 s the lost pull would otherwise hold the
+/// worker's slot for.
+#[tokio::test]
+async fn a_worker_pulls_again_once_its_connection_comes_back() {
+    use testcontainers::core::ContainerPort;
+
+    let port = free_port();
+    let cmd = NatsServerCmd::default().with_jetstream();
+    let container = NatsContainer::default()
+        .with_cmd(&cmd)
+        .with_mapped_port(port, ContainerPort::Tcp(4222))
+        .start()
+        .await
+        .expect("failed to start NATS container");
+    let client =
+        NatsClient::connect_with_retry(&NatsConfig::new(format!("nats://127.0.0.1:{port}")), 10)
+            .await
+            .expect("failed to connect to NATS");
+    let broker = Broker::<Nats>::from_client(client.clone());
+    broker.topology().declare::<IdleTopic>().await.unwrap();
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<IdleTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+    wait_for_open_pull(&client, "nats-idle", "nats-idle-consumer").await;
+    let opened = Instant::now();
+
+    // SIGKILL with no SIGTERM first: a stop, even a zero-timeout one, lets
+    // the server answer its waiting pulls before it goes.
+    let killed = tokio::process::Command::new("docker")
+        .args(["kill", container.id()])
+        .output()
+        .await
+        .expect("docker kill runs");
+    assert!(
+        killed.status.success(),
+        "docker kill failed: {}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    container.start().await.expect("the server starts again");
+    let deadline = Instant::now() + TIMEOUT;
+    while !client.is_connected() {
+        assert!(Instant::now() < deadline, "the client never reconnected");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let reconnected = opened.elapsed();
+
+    let publisher = broker.publisher().await.unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    while let Err(e) = publisher
+        .publish::<IdleTopic>(&SimpleMessage {
+            id: "after-the-restart".into(),
+            content: String::new(),
+        })
+        .await
+    {
+        assert!(
+            Instant::now() < deadline,
+            "JetStream never took the publish: {e}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let published = Instant::now();
+    assert!(
+        handler.counter.wait_for(1, Duration::from_secs(10)).await,
+        "the message published {reconnected:?} after the pull opened, once the client was back, \
+         waited more than 10 s: the worker kept its slot on the lost pull"
+    );
+    assert!(
+        published.elapsed() < Duration::from_secs(10),
+        "the message was handled {:?} after its publish",
+        published.elapsed()
+    );
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("the consumer stops in time")
+        .expect("the consumer task does not panic")
+        .expect("the consumer stops cleanly");
+    broker.close().await;
+}
