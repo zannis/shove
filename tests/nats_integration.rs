@@ -881,6 +881,96 @@ async fn redeclare_keeps_operator_replicas() {
     broker.close().await;
 }
 
+shove::define_topic!(
+    TunedBroadcastTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-bcast-tuned").broadcast().build()
+);
+shove::define_topic!(
+    ConfiguredBroadcastTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-bcast-configured")
+        .broadcast()
+        .nats_stream_config(NatsStreamConfig {
+            retention: NatsRetention::Limits,
+            max_age: None,
+            max_bytes: Some(2_000_000),
+            max_messages: None,
+            num_replicas: 1,
+        })
+        .build()
+);
+
+/// The stream of a `.broadcast()` topology without a `nats_stream_config`
+/// keeps its tuning on re-declare like any other stream shove creates, and one
+/// whose topology carries a config has it applied in full.
+#[tokio::test]
+async fn redeclaring_a_broadcast_stream_keeps_the_tuning_its_topology_leaves_out() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<TunedBroadcastTopic>()
+        .await
+        .unwrap();
+    broker
+        .topology()
+        .declare::<ConfiguredBroadcastTopic>()
+        .await
+        .unwrap();
+    operator_tunes(&client, "nats-bcast-tuned").await;
+    operator_tunes(&client, "nats-bcast-configured").await;
+
+    broker
+        .topology()
+        .declare::<TunedBroadcastTopic>()
+        .await
+        .unwrap();
+    broker
+        .topology()
+        .declare::<ConfiguredBroadcastTopic>()
+        .await
+        .unwrap();
+
+    let tuned = stream_config(&client, "nats-bcast-tuned").await;
+    assert_eq!(tuned.max_bytes, 5_000_000, "keeps max_bytes");
+    assert_eq!(tuned.max_messages, 1_000, "keeps max_messages");
+    assert_eq!(tuned.max_age, Duration::from_secs(90), "keeps max_age");
+    assert_eq!(
+        tuned.duplicate_window,
+        Duration::from_secs(90),
+        "keeps a window its max_age allows"
+    );
+    assert_eq!(
+        tuned.description.as_deref(),
+        Some("tuned by the operator"),
+        "keeps its description"
+    );
+    assert_eq!(tuned.num_replicas, 1, "keeps its replicas");
+    assert_eq!(
+        tuned.retention,
+        RetentionPolicy::Interest,
+        "stays what shove declared"
+    );
+
+    let configured = stream_config(&client, "nats-bcast-configured").await;
+    assert_eq!(configured.max_bytes, 2_000_000, "the config sets max_bytes");
+    assert_eq!(configured.max_messages, -1, "the config sets max_messages");
+    assert_eq!(
+        configured.max_age,
+        Duration::ZERO,
+        "the config sets max_age"
+    );
+    assert_eq!(
+        configured.description, None,
+        "the config sets the stream whole"
+    );
+    assert_eq!(configured.retention, RetentionPolicy::Limits);
+
+    broker.close().await;
+}
+
 // ===========================================================================
 // Basic publish & consume
 // ===========================================================================
