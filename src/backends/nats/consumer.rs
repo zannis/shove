@@ -1150,7 +1150,7 @@ where
                     attempt = attempts,
                     ?max_reconnect_attempts,
                     error = %e,
-                    delay_ms = delay.as_millis() as u64,
+                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                     "consumer error, reconnecting"
                 );
                 tokio::select! {
