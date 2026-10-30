@@ -1,0 +1,19 @@
+tests/kafka_integration.rs
+  s_1001dc3147e1e5::t_bd08f7042b9931 760-790,5592,5611-5617,5667-5673,5727,5788-5794
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5d824697283c6fa158e064a62c3abbd52bccf447",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
