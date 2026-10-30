@@ -1364,32 +1364,69 @@ async fn autoscaler_scales_up_under_backlog() {
 // Autoscaler capacity — the permits one member runs with
 // ---------------------------------------------------------------------------
 
+/// Holds every message it is handed until released and counts how many it
+/// holds at once.
 #[derive(Clone)]
-struct PingAcker;
+struct HoldingHandler {
+    held: Arc<AtomicUsize>,
+    release: CancellationToken,
+}
 
-impl MessageHandler<GroupTopic> for PingAcker {
+impl MessageHandler<GroupTopic> for HoldingHandler {
     type Context = ();
     async fn handle(&self, _: Ping, _: MessageMetadata, _: &()) -> Outcome {
+        self.held.fetch_add(1, Ordering::SeqCst);
+        self.release.cancelled().await;
         Outcome::Ack
     }
 }
 
-/// The capacity the autoscaler reads for a group registered with `config`,
-/// from the real in-process broker's stats.
-async fn reported_prefetch(config: InMemoryConsumerGroupConfig) -> u16 {
+/// The number of messages one member of a group registered with `config`
+/// holds at once, and the per-member capacity the autoscaler reads for it from
+/// the real in-process broker.
+///
+/// The queue holds more messages than any prefetch under test, so the member
+/// holds as many as it has permits. The count is read once the member has
+/// reached `expected` and has had time to take more.
+async fn held_and_reported(config: InMemoryConsumerGroupConfig, expected: usize) -> (usize, u16) {
     use shove::AutoscalerBackend as _;
 
     let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
     let registry = Arc::new(Mutex::new(InMemoryConsumerGroupRegistry::new(
         client.clone(),
     )));
+    let handler = HoldingHandler {
+        held: Arc::new(AtomicUsize::new(0)),
+        release: CancellationToken::new(),
+    };
     {
+        let handler = handler.clone();
         let mut reg = registry.lock().await;
-        reg.register::<GroupTopic, _>(config, || PingAcker, ())
+        reg.register::<GroupTopic, _>(config, move || handler.clone(), ())
             .await
             .unwrap();
         reg.start_all();
     }
+
+    let publisher = broker.publisher().await.unwrap();
+    for i in 0..12u32 {
+        publisher.publish::<GroupTopic>(&Ping(i)).await.unwrap();
+    }
+
+    let held = handler.held.clone();
+    assert!(
+        poll_until(
+            move || held.load(Ordering::SeqCst) >= expected,
+            Duration::from_secs(3)
+        )
+        .await,
+        "the member held {} messages, expected {expected}",
+        handler.held.load(Ordering::SeqCst)
+    );
+    // A member with more permits would take more messages in this time.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let held = handler.held.load(Ordering::SeqCst);
 
     let backend = InMemoryAutoscalerBackend::new(client, registry.clone());
     let metrics = backend
@@ -1398,34 +1435,35 @@ async fn reported_prefetch(config: InMemoryConsumerGroupConfig) -> u16 {
         .unwrap();
     assert_eq!(metrics.active_consumers, 1);
 
+    handler.release.cancel();
     registry.lock().await.shutdown_all().await;
-    metrics.prefetch_count
+    (held, metrics.prefetch_count)
 }
 
 /// The in-memory consumer has no concurrency flag: each member runs
-/// `prefetch_count` permits.
+/// `prefetch_count` permits, and the autoscaler reports as many.
 #[tokio::test]
 async fn group_capacity_is_the_prefetch_per_member() {
-    let reported =
-        reported_prefetch(InMemoryConsumerGroupConfig::new(1..=3).with_prefetch_count(4)).await;
-    assert_eq!(reported, 4);
+    let config = InMemoryConsumerGroupConfig::new(1..=3).with_prefetch_count(4);
+    assert_eq!(held_and_reported(config, 4).await, (4, 4));
 }
 
-/// A prefetch of one is how an in-memory group handles one message at a time.
+/// A prefetch of one is how an in-memory group handles one message at a time:
+/// the member holds one message and the autoscaler reports one permit. A
+/// larger prefetch cannot be sequential here, since there is no flag to turn
+/// concurrency off.
 #[tokio::test]
 async fn sequential_group_capacity_is_one_per_member() {
-    let reported =
-        reported_prefetch(InMemoryConsumerGroupConfig::new(1..=3).with_prefetch_count(1)).await;
-    assert_eq!(reported, 1);
+    let config = InMemoryConsumerGroupConfig::new(1..=3).with_prefetch_count(1);
+    assert_eq!(held_and_reported(config, 1).await, (1, 1));
 }
 
 /// A zero prefetch is raised to one permit by the consumer, so it is
 /// reported as one rather than as a group with no capacity.
 #[tokio::test]
 async fn zero_prefetch_group_capacity_is_one_per_member() {
-    let reported =
-        reported_prefetch(InMemoryConsumerGroupConfig::new(1..=3).with_prefetch_count(0)).await;
-    assert_eq!(reported, 1);
+    let config = InMemoryConsumerGroupConfig::new(1..=3).with_prefetch_count(0);
+    assert_eq!(held_and_reported(config, 1).await, (1, 1));
 }
 
 #[tokio::test]
