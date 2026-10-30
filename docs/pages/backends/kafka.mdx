@@ -286,7 +286,7 @@ The flush gives records still queued up to 5 s to be delivered, and a record tha
 The flush runs on a blocking thread, so a broker that never answers holds `close` for those 5 s and leaves the runtime free.
 
 `run_until_timeout` on a consumer group starts draining when its signal future resolves or when the client's shutdown token is cancelled first.
-In the second case it aborts the task that runs the signal future instead of leaving it running.
+In the second case it aborts the task that runs the signal future and waits for it to finish.
 
 ## Consume
 
