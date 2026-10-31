@@ -17490,19 +17490,25 @@ mod consumer_config_tests {
 mod stream_consumer_build_tests {
     use super::*;
     use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
 
-    /// A client config whose CA file is a FIFO in a fresh temp dir. Opening
-    /// the FIFO for writing blocks until librdkafka's constructor opens it
-    /// for reading, so the writer wakes exactly when the build is inside the
-    /// native call, holds it there for `hold`, then hands it bytes OpenSSL
-    /// rejects. Returns the temp dir to remove and the writer to join once
-    /// the build has returned.
+    /// How long the writer waits for the build to open the FIFO, which it
+    /// does within milliseconds.
+    const READER_BOUND: Duration = Duration::from_secs(10);
+
+    /// A client config whose CA file is a FIFO in a fresh temp dir. The
+    /// writer opens the FIFO once librdkafka's constructor has opened it for
+    /// reading, so it wakes exactly when the build is inside the native call,
+    /// holds it there for `hold`, then hands it bytes OpenSSL rejects. A
+    /// build that never opens the FIFO leaves the writer with an error after
+    /// `READER_BOUND`, so joining it never hangs. Returns the temp dir to
+    /// remove and the writer to join once the build has returned.
     fn config_whose_ca_read_stalls(
         hold: Duration,
     ) -> (
         ClientConfig,
         std::path::PathBuf,
-        std::thread::JoinHandle<()>,
+        std::thread::JoinHandle<std::io::Result<()>>,
     ) {
         let dir = std::env::temp_dir().join(format!(
             "shove-consumer-fifo-{}-{}",
@@ -17516,13 +17522,9 @@ mod stream_consumer_build_tests {
         let created = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
         assert_eq!(created, 0, "mkfifo failed");
         let writer = std::thread::spawn(move || {
-            let mut fifo = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&fifo)
-                .expect("open the FIFO for writing");
+            let mut fifo = open_once_read(&fifo, READER_BOUND)?;
             std::thread::sleep(hold);
             fifo.write_all(b"not a certificate\n")
-                .expect("write the FIFO");
         });
         let mut config = ClientConfig::new();
         config
@@ -17530,6 +17532,32 @@ mod stream_consumer_build_tests {
             .set("security.protocol", "ssl")
             .set("ssl.ca.location", ca.as_str());
         (config, dir, writer)
+    }
+
+    /// Opens `fifo` for writing once a reader has it open, for at most
+    /// `bound`. A blocking open would wait for a reader with no bound, so
+    /// the open does not block and is tried again while no reader has it.
+    fn open_once_read(fifo: &std::path::Path, bound: Duration) -> std::io::Result<std::fs::File> {
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(fifo)
+            {
+                // ENXIO: no reader has the FIFO open yet.
+                Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                    if started.elapsed() >= bound {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("the build did not open its CA file within {bound:?}"),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                opened => return opened,
+            }
+        }
     }
 
     /// librdkafka's constructor blocks while it reads the CA file, so a
@@ -17559,9 +17587,10 @@ mod stream_consumer_build_tests {
             None,
         );
         let (built, ticked) = tokio::join!(build, tick);
-        writer.join().expect("the FIFO writer thread");
+        let wrote = writer.join().expect("the FIFO writer thread");
         let _ = std::fs::remove_dir_all(&dir);
 
+        wrote.expect("the writer held the build on its CA file");
         assert!(
             ticked < Duration::from_millis(150),
             "a 10 ms timer waited {ticked:?}"
