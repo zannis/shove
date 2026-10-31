@@ -3900,8 +3900,46 @@ fn consumer_config(
     Ok(base)
 }
 
+/// The consumer a consume loop reads with, built on a blocking thread:
+/// librdkafka's constructor is synchronous and may block on TLS material,
+/// so it never runs on a runtime thread. Every loop builds its consumer
+/// here, on every connection.
 #[allow(clippy::too_many_arguments)]
-fn create_stream_consumer(
+async fn create_stream_consumer(
+    base: ClientConfig,
+    group_id: &str,
+    auto_offset_reset: KafkaAutoOffsetReset,
+    max_poll_interval_ms: u32,
+    fetch_queue: &FetchQueueTuning,
+    topic: &str,
+    rebalance_tx: std_mpsc::Sender<RebalanceEvent>,
+    assignments: AssignmentTokens,
+    #[cfg(feature = "kafka-msk-iam")] msk_context: Option<MskIamContext>,
+) -> Result<KafkaStreamConsumer> {
+    let group_id = group_id.to_owned();
+    let fetch_queue = *fetch_queue;
+    let topic = topic.to_owned();
+    tokio::task::spawn_blocking(move || {
+        build_stream_consumer(
+            base,
+            &group_id,
+            auto_offset_reset,
+            max_poll_interval_ms,
+            &fetch_queue,
+            &topic,
+            rebalance_tx,
+            assignments,
+            #[cfg(feature = "kafka-msk-iam")]
+            msk_context,
+        )
+    })
+    .await
+    .map_err(|e| ShoveError::Connection(format!("consumer build task failed: {e}")))?
+}
+
+/// [`create_stream_consumer`]'s build, on its blocking thread.
+#[allow(clippy::too_many_arguments)]
+fn build_stream_consumer(
     base: ClientConfig,
     group_id: &str,
     auto_offset_reset: KafkaAutoOffsetReset,
@@ -8244,7 +8282,8 @@ async fn run_serial_connection<L: SerialLoop>(serial: &L) -> Result<()> {
             assignments.clone(),
             #[cfg(feature = "kafka-msk-iam")]
             connection.client.msk_context(),
-        )?,
+        )
+        .await?,
         queue,
     );
     let mut state = FifoState {
@@ -9251,7 +9290,8 @@ impl KafkaConsumer {
                         assignments.clone(),
                         #[cfg(feature = "kafka-msk-iam")]
                         client.msk_context(),
-                    )?,
+                    )
+                    .await?,
                     queue,
                 );
                 if let Err(e) = consumer.subscribe(&[queue]) {
@@ -10437,7 +10477,8 @@ impl KafkaConsumer {
                         assignments.clone(),
                         #[cfg(feature = "kafka-msk-iam")]
                         client.msk_context(),
-                    )?,
+                    )
+                    .await?,
                     queue,
                 );
                 if let Err(e) = consumer.subscribe(&[queue]) {
@@ -11341,7 +11382,8 @@ impl KafkaConsumer {
                     AssignmentTokens::default(),
                     #[cfg(feature = "kafka-msk-iam")]
                     client.msk_context(),
-                )?);
+                )
+                .await?);
 
                 // A schema registry deployment fault met inside a handler's
                 // task (a deferred redelivery decodes there) ends the
@@ -15106,6 +15148,7 @@ mod stop_drain_tests {
                 #[cfg(feature = "kafka-msk-iam")]
                 None,
             )
+            .await
             .expect("creating a consumer needs no broker"),
         );
         consumer
@@ -17294,6 +17337,93 @@ mod consumer_config_tests {
                 if msg.contains("with_queued_max_messages_kbytes") && msg.contains("1..=2097151")),
             "{err:?}"
         );
+    }
+}
+
+/// [`create_stream_consumer`]: every consume loop builds its consumer
+/// through it, and librdkafka's constructor runs off the runtime thread.
+#[cfg(all(test, feature = "kafka-ssl", unix))]
+mod stream_consumer_build_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// A client config whose CA file is a FIFO in a fresh temp dir. Opening
+    /// the FIFO for writing blocks until librdkafka's constructor opens it
+    /// for reading, so the writer wakes exactly when the build is inside the
+    /// native call, holds it there for `hold`, then hands it bytes OpenSSL
+    /// rejects. Returns the temp dir to remove and the writer to join once
+    /// the build has returned.
+    fn config_whose_ca_read_stalls(
+        hold: Duration,
+    ) -> (
+        ClientConfig,
+        std::path::PathBuf,
+        std::thread::JoinHandle<()>,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "shove-consumer-fifo-{}-{}",
+            std::process::id(),
+            hold.as_millis()
+        ));
+        std::fs::create_dir_all(&dir).expect("create the temp dir");
+        let fifo = dir.join("ca.pem");
+        let ca = fifo.to_str().expect("utf-8 path").to_string();
+        let path = std::ffi::CString::new(ca.as_str()).expect("no NUL");
+        let created = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(created, 0, "mkfifo failed");
+        let writer = std::thread::spawn(move || {
+            let mut fifo = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fifo)
+                .expect("open the FIFO for writing");
+            std::thread::sleep(hold);
+            fifo.write_all(b"not a certificate\n")
+                .expect("write the FIFO");
+        });
+        let mut config = ClientConfig::new();
+        config
+            .set("bootstrap.servers", "127.0.0.1:1")
+            .set("security.protocol", "ssl")
+            .set("ssl.ca.location", ca.as_str());
+        (config, dir, writer)
+    }
+
+    /// librdkafka's constructor blocks while it reads the CA file, so a
+    /// consumer is built off the runtime: a 10 ms timer on the same
+    /// current-thread runtime fires while the constructor is held on the
+    /// FIFO for 300 ms. The build's failure keeps its type.
+    #[tokio::test]
+    async fn building_a_consumer_leaves_the_runtime_free() {
+        let (config, dir, writer) = config_whose_ca_read_stalls(Duration::from_millis(300));
+        let (rebalance_tx, _rebalance_rx) = std_mpsc::channel();
+        let fetch_queue = FetchQueueTuning::default();
+        let started = tokio::time::Instant::now();
+        let tick = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            started.elapsed()
+        };
+        let build = create_stream_consumer(
+            config,
+            "build-off-runtime",
+            KafkaAutoOffsetReset::Earliest,
+            MAX_POLL_INTERVAL_MS,
+            &fetch_queue,
+            "build-off-runtime",
+            rebalance_tx,
+            AssignmentTokens::default(),
+            #[cfg(feature = "kafka-msk-iam")]
+            None,
+        );
+        let (built, ticked) = tokio::join!(build, tick);
+        writer.join().expect("the FIFO writer thread");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            ticked < Duration::from_millis(150),
+            "a 10 ms timer waited {ticked:?}"
+        );
+        let err = built.err().expect("the FIFO bytes are not a certificate");
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
     }
 }
 
