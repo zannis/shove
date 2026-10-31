@@ -597,7 +597,22 @@ impl OffsetTracker {
     /// delivery belongs to: the seed begins a new epoch for the partition
     /// and gives it a fresh revoke token.
     fn track_received(&mut self, partition: i32, offset: i64) -> Assignment {
-        let epoch = match self.partitions.get_mut(&partition) {
+        let epoch = self.track_epoch(partition, offset);
+        let revoked = self
+            .assignments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(partition)
+            .or_default()
+            .clone();
+        Assignment { epoch, revoked }
+    }
+
+    /// [`track_received`](Self::track_received) with no revoke token: the
+    /// delivery's epoch alone, for the batch loop, which runs no wait a
+    /// revoke must reach.
+    fn track_epoch(&mut self, partition: i32, offset: i64) -> u64 {
+        match self.partitions.get_mut(&partition) {
             Some(tracker) => {
                 tracker.track_received(offset);
                 tracker.epoch
@@ -610,15 +625,7 @@ impl OffsetTracker {
                     .insert(partition, PartitionTracker::new(offset, epoch));
                 epoch
             }
-        };
-        let revoked = self
-            .assignments
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(partition)
-            .or_default()
-            .clone();
-        Assignment { epoch, revoked }
+        }
     }
 
     fn mark_complete(&mut self, completion: Completion) {
@@ -4842,7 +4849,7 @@ struct BatchFlushCtx<'a> {
 /// flight, and the pause a polling wait left behind.
 ///
 /// Every record that joins a span is tracked, see
-/// `OffsetTracker::track_received`, and a flush retires its span there once
+/// `OffsetTracker::track_epoch`, and a flush retires its span there once
 /// it is done with the records, see `OffsetTracker::retire_span`. An acked
 /// span commits the way the standard consumer commits under
 /// `CommitPolicy::Interval`: through [`CommitSlot`], one commit at a time on
@@ -5135,7 +5142,7 @@ struct BatchBuffer<T: Topic> {
     /// which is what an `Ack` commits.
     end: HashMap<i32, i64>,
     /// The assignment each partition of the span was tracked under, see
-    /// `OffsetTracker::track_received`. A rebalance that moves a partition
+    /// `OffsetTracker::track_epoch`. A rebalance that moves a partition
     /// the span holds abandons the span, so one epoch covers each.
     epochs: HashMap<i32, u64>,
 }
@@ -8895,13 +8902,7 @@ impl KafkaConsumer {
             let schema_message_index = schema_message_index.clone();
             async move {
                 let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
-                // The map the rebalance callback cancels revoked partitions'
-                // tokens in; the tracker below shares it. See `AssignmentTokens`.
                 let assignments = AssignmentTokens::default();
-                // Closed on a thread of its own on every exit, and waited
-                // for: through the final commit on a stop, through
-                // `close_without_commit` on an `Err`, a failed subscribe
-                // included. An abort leaves it to `LoopConsumer`'s drop.
                 let consumer = LoopConsumer::new(
                     create_stream_consumer(
                         client.base_config(),
@@ -9069,10 +9070,7 @@ impl KafkaConsumer {
                                     apply_batch_rebalance(&consumer, queue, &mut buffer, &mut state)?
                                 {
                                     deadline = None;
-                                    // The abandoned span's partition is sought back
-                                    // below this record, which the broker delivers
-                                    // again behind the rewound ones; the copy in
-                                    // hand would be handled twice, and ahead of them.
+                                    // Rewound below this record: the broker delivers it again.
                                     if rewound.contains(&partition) {
                                         continue;
                                     }
@@ -9095,7 +9093,7 @@ impl KafkaConsumer {
                                 // deadline with the span is what guarantees such an
                                 // all-dropped window still reaches `flush_batch`.
                                 if let Err(e) = validate_message_size(payload_slice.len(), max_message_size) {
-                                    let epoch = state.tracker.track_received(partition, offset).epoch;
+                                    let epoch = state.tracker.track_epoch(partition, offset);
                                     buffer.extend_span(partition, offset, epoch);
                                     if deadline.is_none() {
                                         deadline = Some(Box::pin(tokio::time::sleep(max_batch_age)));
@@ -9224,7 +9222,7 @@ impl KafkaConsumer {
                                         drop(decoded);
                                         continue;
                                     }
-                                    let epoch = state.tracker.track_received(partition, offset).epoch;
+                                    let epoch = state.tracker.track_epoch(partition, offset);
                                     buffer.extend_span(partition, offset, epoch);
                                     if deadline.is_none() {
                                         deadline = Some(Box::pin(tokio::time::sleep(max_batch_age)));
@@ -9279,12 +9277,6 @@ impl KafkaConsumer {
                 }
                 .await;
 
-                // A stop ends with the final commit, of every position the
-                // flushes retired, and the consumer's close, both on a thread
-                // of their own. Every other exit closes the consumer on a
-                // thread of its own too, with nothing committed, and waits for
-                // the close before it returns the error, see
-                // `close_without_commit`.
                 match ended {
                     Ok(()) => {
                         let pending_commit = state.commits.in_flight.take();
@@ -12423,7 +12415,7 @@ mod batch_buffer_tests {
         let mut tracker = OffsetTracker::new("batch-buffer-test".into());
         let mut buf = buffer();
         for offset in 10..13 {
-            let epoch = tracker.track_received(0, offset).epoch;
+            let epoch = tracker.track_epoch(0, offset);
             buf.extend_span(0, offset, epoch);
         }
         buf.retire(&mut tracker, &buf.end, false);
