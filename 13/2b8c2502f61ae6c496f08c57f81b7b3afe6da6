@@ -1,0 +1,21 @@
+src/consumer.rs
+  s_1001dc3147e1e5::t_a33be0c74e3e70 553-556
+  s_1001dc3147e1e5::t_10442382fa7287 610-613
+  s_1001dc3147e1e5::t_25ec4b1eadcfa7 490-493
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "132b8c2502f61ae6c496f08c57f81b7b3afe6da6",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
