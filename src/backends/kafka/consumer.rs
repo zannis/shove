@@ -11603,7 +11603,7 @@ impl KafkaConsumer {
                             // Nothing to commit and nothing to delete: the
                             // subscription exists only in this consumer handle,
                             // which the tail closes once this future resolves.
-                            let _ = semaphore.acquire_many(prefetch_count as u32).await;
+                            let _ = semaphore.acquire_many(u32::from(prefetch_count)).await;
                             return Ok(());
                         }
 
