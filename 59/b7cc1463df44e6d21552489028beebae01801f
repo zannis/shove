@@ -1,0 +1,24 @@
+src/backends/kafka/consumer.rs
+  s_1001dc3147e1e5::t_fb15e437c8acb0 11380-11388,11390-11395
+  s_1001dc3147e1e5::t_330d8eb9a2c315 15164-15177
+  s_1001dc3147e1e5::t_0e9c2489e00f27 8278-8283,8285-8290
+  s_1001dc3147e1e5::t_d0e79ff760f6cb 3905-3910,3922,3939
+  s_1001dc3147e1e5::t_14cc1ead39f5b5 9283-9288,9290-9295
+  s_1001dc3147e1e5::t_5bd2798ec8e50e 10467-10472,10474-10479
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "59b7cc1463df44e6d21552489028beebae01801f",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
