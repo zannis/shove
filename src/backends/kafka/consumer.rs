@@ -2527,8 +2527,9 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 /// an error is logged, see [`log_transient_recv_error`], and the loop goes
 /// on polling on the same client. Every other error ends the loop with the
 /// error [`map_kafka_error`] makes of it. Every `recv()` arm reads this one
-/// table, through the gate of the consumer it polls: each consume loop's,
-/// and each wait's that polls.
+/// table: each consume loop's, and each wait's that polls. `gate` is the
+/// gate of the consumer the arm polls, or `None` in the stop's drain, see
+/// below.
 ///
 /// The codes ridden out, with the bundled librdkafka 2.12.1 source behind
 /// each:
@@ -2569,7 +2570,11 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 /// `__TRANSPORT` or `__RESOLVE`, because a fetch may have been pending when
 /// that change landed. A revoke of an assignment librdkafka reports lost is
 /// never such a change, see [`AssignmentChange::LostRevoke`]. The reconnect
-/// fetches the committed offsets again.
+/// fetches the committed offsets again. The stop's drain passes no gate, see
+/// [`acquire_permit_while_polling`], and rides out every `__TRANSPORT` and
+/// `__RESOLVE`: the gate's one remedy is that reconnect, which a stop never
+/// makes, so ending the drain on one would only cost the stop its final
+/// commit.
 /// The gate is blind to a coordinator that holds a fetch unanswered for
 /// longer than `socket.timeout.ms` while the application is handed no
 /// error: an assignment change after that bound, and a connection the
@@ -2595,11 +2600,17 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 /// reports it again. And it covers the join and fetch errors librdkafka
 /// reports on every retry of a cause that persists, a refused join among
 /// them (`rdkafka_cgrp.c:2434-2441`, `rdkafka_fetcher.c:327-338`).
-fn recv_error_is_transient(gate: &TransportGate, error: &KafkaError) -> bool {
+fn recv_error_is_transient<'a>(
+    gate: impl Into<Option<&'a TransportGate>>,
+    error: &KafkaError,
+) -> bool {
     match error {
         KafkaError::MessageConsumption(
             RDKafkaErrorCode::BrokerTransportFailure | RDKafkaErrorCode::Resolve,
         ) => {
+            let Some(gate) = gate.into() else {
+                return true;
+            };
             let rides_out = gate.rides_out(std::time::Instant::now());
             if !rides_out {
                 tracing::warn!(
@@ -2925,7 +2936,7 @@ impl KafkaStreamConsumer {
     }
 
     /// The gate this consumer's rebalance callback stamps, which every
-    /// `recv()` arm hands [`recv_error_is_transient`].
+    /// `recv()` arm but the stop's drain hands [`recv_error_is_transient`].
     fn transport_gate(&self) -> &TransportGate {
         match self {
             Self::Default(c) => &c.context().transport_gate,
@@ -5820,7 +5831,9 @@ const PERMIT_WAIT_GRACE: Duration = Duration::from_secs(1);
 /// permit may never free if the holder is the task that faulted. The drain
 /// passes neither: it runs once the stop has fired, and a fault reported
 /// during it leaves its record uncommitted, as the stop leaves every record
-/// whose handler did not complete.
+/// whose handler did not complete. A stop never reconnects, so the drain
+/// reads no gate and rides out every `__TRANSPORT` and `__RESOLVE`, see
+/// [`recv_error_is_transient`].
 #[allow(clippy::too_many_arguments)]
 async fn acquire_permit_while_polling(
     semaphore: &Arc<tokio::sync::Semaphore>,
@@ -5832,6 +5845,8 @@ async fn acquire_permit_while_polling(
     paused: &mut bool,
     mut commits: Option<IntervalCommits<'_>>,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    // No token means the drain, whose stop has fired.
+    let gate = shutdown.map(|_| consumer.transport_gate());
     let stop = stop_requested(shutdown);
     tokio::pin!(stop);
     let fault = handler_fault(fault_rx);
@@ -5882,7 +5897,7 @@ async fn acquire_permit_while_polling(
             received = consumer.recv(), if polling => {
                 let msg = match received {
                     Ok(msg) => msg,
-                    Err(e) if recv_error_is_transient(consumer.transport_gate(), &e) => {
+                    Err(e) if recv_error_is_transient(gate, &e) => {
                         log_transient_recv_error(queue, &e);
                         continue;
                     }
@@ -12731,6 +12746,28 @@ mod error_classifier_tests {
         );
     }
 
+    /// The stop's drain reads no gate: it rides out a `__TRANSPORT` and a
+    /// `__RESOLVE` whatever change came before them, because a stop never
+    /// reconnects, and the rest of the table reads as it does everywhere.
+    #[test]
+    fn the_stops_drain_rides_out_a_failed_connection_or_resolve() {
+        let drain = None::<&TransportGate>;
+        for code in [
+            RDKafkaErrorCode::BrokerTransportFailure,
+            RDKafkaErrorCode::Resolve,
+            RDKafkaErrorCode::AllBrokersDown,
+        ] {
+            assert!(
+                recv_error_is_transient(drain, &consumption(code)),
+                "{code:?} is ridden out"
+            );
+        }
+        assert!(!recv_error_is_transient(
+            drain,
+            &consumption(RDKafkaErrorCode::GroupAuthorizationFailed)
+        ));
+    }
+
     /// The bound is the consumer's `socket.timeout.ms`: the value its config
     /// sets, or librdkafka's default.
     #[test]
@@ -12745,6 +12782,141 @@ mod error_classifier_tests {
             socket_timeout(&config).expect("the configured value"),
             Duration::from_millis(1500)
         );
+    }
+}
+
+/// The stop's drain, `acquire_permit_while_polling` with no shutdown token,
+/// on a real consumer.
+#[cfg(test)]
+mod stop_drain_tests {
+    use super::*;
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    /// The fields of one event, read for the warning a ridden-out receive
+    /// error logs, see [`log_transient_recv_error`].
+    #[derive(Default)]
+    struct Fields {
+        ridden_out: bool,
+        error: Option<String>,
+    }
+
+    impl Visit for Fields {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            match field.name() {
+                "message" => {
+                    self.ridden_out =
+                        format!("{value:?}").starts_with("broker connection error ridden out");
+                }
+                "error" => self.error = Some(format!("{value:?}")),
+                _ => {}
+            }
+        }
+    }
+
+    /// Collects the error of every ridden-out receive error the current
+    /// thread logs.
+    #[derive(Clone, Default)]
+    struct RiddenOut(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for RiddenOut {
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            if let (true, Some(error)) = (fields.ridden_out, fields.error) {
+                self.0.lock().unwrap().push(error);
+            }
+        }
+    }
+
+    impl RiddenOut {
+        fn any(&self, code: &str) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|error| error.contains(code))
+        }
+    }
+
+    /// The drain rides out a failed broker connection while the consumer's
+    /// gate is armed, and takes the last permit once the handler holding it
+    /// ends: a stop never reconnects, so ending the drain on the failure
+    /// would only cost the stop its final commit. The consumer points at a
+    /// port nothing listens on, so librdkafka's first connection is refused
+    /// at once, and the handler ends only once the drain has ridden that
+    /// failure out.
+    #[tokio::test]
+    async fn the_drain_rides_out_a_failed_connection_through_an_armed_gate() {
+        let ridden_out = RiddenOut::default();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(ridden_out.clone()),
+        );
+        let mut config = ClientConfig::new();
+        config.set("bootstrap.servers", "127.0.0.1:1");
+        let (rebalance_tx, _rebalance_rx) = std_mpsc::channel();
+        let consumer = Arc::new(
+            create_stream_consumer(
+                config,
+                "stop-drain",
+                KafkaAutoOffsetReset::Earliest,
+                MAX_POLL_INTERVAL_MS,
+                "stop-drain",
+                rebalance_tx,
+                AssignmentTokens::default(),
+                #[cfg(feature = "kafka-msk-iam")]
+                None,
+            )
+            .expect("creating a consumer needs no broker"),
+        );
+        consumer
+            .subscribe(&["stop-drain"])
+            .expect("subscribing needs no broker");
+        let now = std::time::Instant::now();
+        consumer
+            .transport_gate()
+            .changed(AssignmentChange::Assign, now);
+        consumer
+            .transport_gate()
+            .changed(AssignmentChange::Revoke, now);
+
+        let semaphore = Arc::new(Semaphore::new(1));
+        let handler = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("a fresh semaphore has its permit");
+        let handler_ends = tokio::spawn({
+            let ridden_out = ridden_out.clone();
+            async move {
+                while !ridden_out.any("BrokerTransportFailure") {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                drop(handler);
+            }
+        });
+        let mut paused = false;
+        let drained = tokio::time::timeout(
+            Duration::from_secs(30),
+            acquire_permit_while_polling(
+                &semaphore,
+                1,
+                &consumer,
+                None,
+                None,
+                "stop-drain",
+                &mut paused,
+                None,
+            ),
+        )
+        .await
+        .expect("the drain ends once the handler does");
+
+        assert!(
+            matches!(&drained, Ok(Some(_))),
+            "the drain rides the failure out and takes the permit: {drained:?}"
+        );
+        handler_ends.await.expect("the handler ends");
     }
 }
 
