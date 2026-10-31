@@ -64,7 +64,9 @@
 //! The final section runs a broadcast subscription against the same mock:
 //! whether it stops or ends on an error, it closes its consumer on a thread
 //! of its own, and with no thread to be had the handle is leaked rather than
-//! closed on the runtime thread.
+//! closed on the runtime thread. Its assignment refresh, held by a probe as
+//! a slow metadata answer would hold it, leaves delivery running, is due
+//! again one interval after it ends, and is waited for by a stop.
 //!
 //! `test-support` gates the seams this file reads. The Kafka coverage row
 //! enables it and runs this suite; the schema-registry row compiles the
@@ -101,9 +103,10 @@ use shove::consumer_group::ConsumerGroupConfig;
 use shove::handler::MessageHandler;
 use shove::kafka::{
     CommitPolicy, KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroup,
-    KafkaConsumerGroupConfig, client_id_probe, commit_gate_probe, fence_probe,
-    final_commit_spawn_probe, housekeeping_interval_for_test, pending_commit_budget_for_test,
-    per_record_probe, permit_wait_probe, put_back_probe, shutdown_commit_deadline_for_test,
+    KafkaConsumerGroupConfig, broadcast_refresh_probe, client_id_probe, commit_gate_probe,
+    fence_probe, final_commit_spawn_probe, housekeeping_interval_for_test,
+    pending_commit_budget_for_test, per_record_probe, permit_wait_probe, put_back_probe,
+    shutdown_commit_deadline_for_test,
 };
 use shove::markers::Kafka;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -5683,4 +5686,127 @@ async fn a_broadcast_subscription_ending_on_an_error_never_closes_its_consumer_o
         "the failed fetch ended the subscription with its error: {outcome:?}"
     );
     assert_the_consumer_was_leaked(&mock).await;
+}
+
+/// How long the probe holds each assignment refresh of a broadcast
+/// subscription in the tests below: longer than the interval between two,
+/// as one metadata request may take, which the loop bounds at 10 s.
+const SLOW_REFRESH: Duration = Duration::from_secs(6);
+/// Far above the interval after which a refresh is due.
+const REFRESH_DUE: Duration = Duration::from_secs(30);
+
+/// A broadcast subscription goes on delivering while its assignment refresh
+/// waits on a slow metadata answer: a record published once the refresh has
+/// started reaches the handler before the refresh ends.
+#[tokio::test]
+async fn a_broadcast_subscription_delivers_while_its_refresh_waits_on_the_broker() {
+    broadcast_refresh_probe::delay_refreshes(SLOW_REFRESH);
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let (mock, subscriber) =
+        live_broadcast_subscription(&handler, ConsumerOptions::<Kafka>::new()).await;
+    wait_until(
+        || broadcast_refresh_probe::started() >= 1,
+        REFRESH_DUE,
+        "the first assignment refresh starting",
+    )
+    .await;
+
+    produce_on(&mock.bootstrap(), BROADCAST_TOPIC, &["during"]).await;
+    while handler.times_seen("during") == 0 {
+        assert_eq!(
+            broadcast_refresh_probe::ended(),
+            0,
+            "the record published while the refresh ran was held until the refresh ended"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending(), BROADCAST_DRAIN)
+        .await;
+    assert_eq!(
+        (outcome.errors, outcome.panics, outcome.timed_out),
+        (0, 0, false),
+        "the stop ends the subscription cleanly: {outcome:?}"
+    );
+}
+
+/// The next refresh is due one interval after the last one ended, so a
+/// refresh slower than the interval is not followed by another at once.
+/// The second refresh runs without the delay, so the stop does not wait on
+/// it.
+#[tokio::test]
+async fn a_broadcast_refresh_is_due_an_interval_after_the_last_one_ended() {
+    broadcast_refresh_probe::delay_refreshes(SLOW_REFRESH);
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let (_mock, subscriber) =
+        live_broadcast_subscription(&handler, ConsumerOptions::<Kafka>::new()).await;
+    wait_until(
+        || broadcast_refresh_probe::ended() >= 1,
+        REFRESH_DUE + SLOW_REFRESH,
+        "the first assignment refresh ending",
+    )
+    .await;
+    let ended_at = Instant::now();
+    broadcast_refresh_probe::delay_refreshes(Duration::ZERO);
+
+    wait_until(
+        || broadcast_refresh_probe::started() >= 2,
+        REFRESH_DUE,
+        "the second assignment refresh starting",
+    )
+    .await;
+    let gap = ended_at.elapsed();
+    let interval = broadcast_refresh_probe::interval();
+    assert!(
+        gap >= interval - Duration::from_millis(250),
+        "the second refresh started {gap:?} after the first ended, inside the {interval:?} \
+         interval"
+    );
+
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending(), BROADCAST_DRAIN)
+        .await;
+    assert_eq!(
+        (outcome.errors, outcome.panics, outcome.timed_out),
+        (0, 0, false),
+        "the stop ends the subscription cleanly: {outcome:?}"
+    );
+}
+
+/// A stop that lands while a refresh waits on its metadata answer waits for
+/// that refresh, so the refresh's thread never outlives the subscription,
+/// and the subscription still ends cleanly.
+#[tokio::test]
+async fn a_stop_during_a_broadcast_refresh_waits_for_the_refresh() {
+    broadcast_refresh_probe::delay_refreshes(SLOW_REFRESH);
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let (_mock, subscriber) =
+        live_broadcast_subscription(&handler, ConsumerOptions::<Kafka>::new()).await;
+    wait_until(
+        || broadcast_refresh_probe::started() >= 1,
+        REFRESH_DUE,
+        "the first assignment refresh starting",
+    )
+    .await;
+
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending(), BROADCAST_DRAIN)
+        .await;
+    assert_eq!(
+        (outcome.errors, outcome.panics, outcome.timed_out),
+        (0, 0, false),
+        "the stop ends the subscription cleanly: {outcome:?}"
+    );
+    assert_eq!(
+        (
+            broadcast_refresh_probe::started(),
+            broadcast_refresh_probe::ended()
+        ),
+        (1, 1),
+        "the subscription ended before the refresh it had in flight"
+    );
 }

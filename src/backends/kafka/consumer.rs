@@ -2553,10 +2553,117 @@ impl<T: Topic, H: MessageHandler<T>> Dispatch<T, H> {
 /// use for their own metadata round trips.
 const BROADCAST_ASSIGN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often an assign-only broadcast subscriber checks for partitions added
-/// after it connected. Manual assignments do not participate in rebalances, so
-/// metadata growth has to be reflected explicitly.
+/// How long an assign-only broadcast subscriber waits, after its initial
+/// assignment and after each check ends, before it checks for partitions
+/// added after it connected. Manual assignments do not participate in
+/// rebalances, so metadata growth has to be reflected explicitly.
 const BROADCAST_ASSIGN_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The answer of the broadcast assignment refresh in `slot`, never ready
+/// while the slot is empty.
+async fn refresh_answer<T>(
+    slot: &mut Option<tokio::task::JoinHandle<T>>,
+) -> std::result::Result<T, tokio::task::JoinError> {
+    match slot {
+        Some(refresh) => refresh.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// What one broadcast assignment refresh comes to. The partitions it added
+/// are logged. A refresh that failed leaves the existing assignment valid,
+/// so it is logged and the next one tries again, instead of a reconnect at
+/// the tail that would open a delivery gap on every partition. A refresh
+/// task that ended without an answer is the connection's error.
+fn settle_broadcast_refresh(
+    queue: &str,
+    refreshed: std::result::Result<Result<usize>, tokio::task::JoinError>,
+) -> Result<()> {
+    match refreshed {
+        Ok(Ok(0)) => Ok(()),
+        Ok(Ok(added)) => {
+            tracing::info!(
+                queue,
+                added,
+                "broadcast subscription extended its partition assignment"
+            );
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                queue,
+                "broadcast assignment refresh failed; keeping the current assignment"
+            );
+            Ok(())
+        }
+        Err(e) => Err(ShoveError::Connection(format!(
+            "broadcast assignment refresh task panicked: {e}"
+        ))),
+    }
+}
+
+/// Test-only probe (see the `test-support` feature) on the broadcast loop's
+/// assignment refresh. Two counters count the refreshes that have started
+/// and ended, and a delay a test sets holds each refresh that starts after
+/// it, on the refresh's own thread and before its metadata request, as a
+/// slow metadata answer would. The broker answers a connection's requests
+/// in order, so a metadata answer slowed at the broker would hold the
+/// fetches queued behind it as well; the delay holds the refresh alone.
+/// nextest runs each test in its own process, so the counters start at zero
+/// and the delay at none.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod broadcast_refresh_probe {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    static DELAY: Mutex<Duration> = Mutex::new(Duration::ZERO);
+    static STARTED: AtomicUsize = AtomicUsize::new(0);
+    static ENDED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Hold every refresh that starts from here on for `delay`.
+    pub fn delay_refreshes(delay: Duration) {
+        *DELAY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = delay;
+    }
+
+    /// Refreshes started so far.
+    pub fn started() -> usize {
+        STARTED.load(Ordering::SeqCst)
+    }
+
+    /// Refreshes ended so far, whatever they answered.
+    pub fn ended() -> usize {
+        ENDED.load(Ordering::SeqCst)
+    }
+
+    /// How long after a refresh ends the next one is due.
+    pub fn interval() -> Duration {
+        super::BROADCAST_ASSIGN_REFRESH_INTERVAL
+    }
+
+    /// Counts a refresh in and holds it for the delay; the guard counts it
+    /// out when it drops.
+    pub(super) fn enter() -> Refreshing {
+        STARTED.fetch_add(1, Ordering::SeqCst);
+        let delay = *DELAY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::thread::sleep(delay);
+        Refreshing
+    }
+
+    pub(super) struct Refreshing;
+
+    impl Drop for Refreshing {
+        fn drop(&mut self) {
+            ENDED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
 
 /// Whether a `recv` error on the groupless broadcast path is the one error
 /// its inert `group.id` can provoke and nothing else.
@@ -3741,6 +3848,8 @@ impl KafkaStreamConsumer {
         start: Option<BroadcastStart>,
         timeout: Duration,
     ) -> Result<usize> {
+        #[cfg(feature = "test-support")]
+        let _refreshing = broadcast_refresh_probe::enter();
         let metadata = self
             .fetch_metadata(Some(topic), timeout)
             .map_err(|e| map_kafka_error(&format!("failed to refresh metadata for {topic}"), e))?;
@@ -11456,14 +11565,17 @@ impl KafkaConsumer {
                 // `interval`'s first tick is immediate. The initial assignment
                 // above is already the authoritative metadata snapshot.
                 assignment_refresh.tick().await;
+                let mut refresh: Option<tokio::task::JoinHandle<Result<usize>>> = None;
 
                 let tail_cancel = task_cancel.clone();
                 let tail_semaphore = semaphore.clone();
                 let tail_processing = processing.clone();
                 // The loop borrows the consumer, which the tail below closes.
                 let loop_consumer = &consumer;
+                let loop_refresh = &mut refresh;
                 let ended: Result<()> = async move {
                 let consumer = loop_consumer;
+                let refresh = loop_refresh;
                 let stop = shutdown.cancelled();
                 tokio::pin!(stop);
                 let mut stream = RecvStream::new(consumer);
@@ -11488,44 +11600,24 @@ impl KafkaConsumer {
                             return Err(e);
                         }
 
-                        _ = assignment_refresh.tick() => {
+                        refreshed = refresh_answer(refresh), if refresh.is_some() => {
+                            *refresh = None;
+                            // Its deadline may have passed meanwhile; restarted, refreshes never run back to back.
+                            assignment_refresh.reset();
+                            settle_broadcast_refresh(queue, refreshed)?;
+                            continue;
+                        }
+
+                        _ = assignment_refresh.tick(), if refresh.is_none() => {
                             let refresh_consumer = Arc::clone(consumer);
                             let refresh_topic = queue.to_string();
-                            // Awaited here, so no record arriving first can drop it mid-call.
-                            let refresh = tokio::task::spawn_blocking(move || {
+                            *refresh = Some(tokio::task::spawn_blocking(move || {
                                 refresh_consumer.refresh_broadcast_partitions(
                                     &refresh_topic,
                                     start,
                                     BROADCAST_ASSIGN_TIMEOUT,
                                 )
-                            })
-                            .await;
-                            match refresh {
-                                Ok(Ok(added)) if added > 0 => {
-                                    tracing::info!(
-                                        queue,
-                                        added,
-                                        "broadcast subscription extended its partition assignment"
-                                    );
-                                }
-                                Ok(Ok(_)) => {}
-                                Ok(Err(e)) => {
-                                    // The existing assignment remains valid.
-                                    // Retry on the next tick instead of
-                                    // reconnecting at the tail and creating an
-                                    // avoidable delivery gap on every partition.
-                                    tracing::warn!(
-                                        error = %e,
-                                        queue,
-                                        "broadcast assignment refresh failed; keeping the current assignment"
-                                    );
-                                }
-                                Err(e) => {
-                                    return Err(ShoveError::Connection(format!(
-                                        "broadcast assignment refresh task panicked: {e}"
-                                    )));
-                                }
-                            }
+                            }));
                             continue;
                         }
 
@@ -11891,13 +11983,23 @@ impl KafkaConsumer {
                 }
                 }
                 .await;
-                // Every exit passes through here, and closes the consumer
-                // first, on a thread of its own and waited for, see
-                // `close_without_commit`. A fatal exit then has the child
-                // token end the handler tasks' redelivery waits, the permit
-                // drain proves each has released its permit, and only then is
-                // the busy flag cleared. Nothing is committed on this path at
-                // any time.
+                // Every exit passes through here. A refresh in flight holds a
+                // handle on the consumer, so it is waited for first, and the
+                // consumer is then closed on a thread of its own and waited
+                // for, see `close_without_commit`. A fatal exit then has the
+                // child token end the handler tasks' redelivery waits, the
+                // permit drain proves each has released its permit, and only
+                // then is the busy flag cleared. Nothing is committed on this
+                // path at any time.
+                if let Some(in_flight) = refresh.take()
+                    && let Err(e) = settle_broadcast_refresh(queue, in_flight.await)
+                {
+                    tracing::error!(
+                        error = %e,
+                        queue,
+                        "the assignment refresh in flight when the broadcast subscription ended failed"
+                    );
+                }
                 close_without_commit(consumer, queue, SHUTDOWN_COMMIT_DEADLINE).await;
                 let Err(e) = ended else { return Ok(()) };
                 tail_cancel.cancel();
