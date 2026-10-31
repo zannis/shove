@@ -749,10 +749,12 @@ A drain that times out while the commit is still waiting aborts the member inste
 The run then reports `timed_out`, so `exit_code()` is 3 and no error is counted.
 A member the autoscaler retires on scale-down makes the same final commit.
 The rebalance that retirement starts, or another member's stop, can make the coordinator refuse it with a rebalance in progress or a stale generation.
-Such a refusal is tried again inside the same 20 s, under either commit policy and on the sequenced and the batch consumer.
+A refusal with a rebalance in progress is tried again inside the same 20 s, under either commit policy and on the sequenced and the batch consumer, and so is a stale generation librdkafka meets while it rejoins the group.
 The consumer polls for 500 ms with its assignment paused, so the rebalance can complete, and commits every position it still holds again; a partition the rebalance revoked meanwhile is left out.
 It tries again for as long as more than 2 s of the deadline are left, so members that stop together do not routinely end with a refused commit.
-A refusal still standing then counts under `errors` like any other.
+A stale generation reported outside a rebalance is not tried again: with that refusal librdkafka gives the member's assignment up as lost, so nothing is left to commit under it.
+The member then ends with `ShoveError::Commit` of the `Rejected` kind, carrying the positions the refused commit held.
+A refusal still standing counts under `errors` like any other, and each partition's next owner replays from the last position the broker accepted.
 A member with nothing to commit has no commit to fail and still ends clean.
 An acknowledged offset on a partition a rebalance revoked before the stop is not part of the final commit and raises no error.
 Its tracker went with the partition, and the new owner picks the record up.

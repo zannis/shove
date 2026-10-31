@@ -3069,6 +3069,16 @@ impl KafkaStreamConsumer {
         }
     }
 
+    /// Whether librdkafka has given this member's assignment up as lost,
+    /// see [`FinalCommit::assignment_lost`].
+    fn assignment_lost(&self) -> bool {
+        match self {
+            Self::Default(c) => c.assignment_lost(),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.assignment_lost(),
+        }
+    }
+
     /// Stop fetching from every partition this member currently holds.
     ///
     /// Used by the receive loop of an infra-owned topic while every prefetch
@@ -3903,6 +3913,15 @@ trait FinalCommit: Send + 'static {
     fn is_last_handle(&self) -> bool {
         true
     }
+
+    /// Whether librdkafka has given the member's assignment up as lost. A
+    /// commit refused for a stale generation outside a rebalance does that
+    /// before its answer comes back (bundled librdkafka 2.12.1,
+    /// `rdkafka_cgrp.c:4007-4018`): nothing is left to commit under the
+    /// assignment, so the refusal is not tried again.
+    fn assignment_lost(&self) -> bool {
+        false
+    }
 }
 
 impl FinalCommit for LoopConsumer {
@@ -3912,6 +3931,10 @@ impl FinalCommit for LoopConsumer {
 
     fn is_last_handle(&self) -> bool {
         Arc::strong_count(self) == 1
+    }
+
+    fn assignment_lost(&self) -> bool {
+        self.consumer.assignment_lost()
     }
 }
 
@@ -3993,7 +4016,10 @@ impl Drop for LoopConsumer {
 /// rebalances closes nothing: the thread hands the consumer back over the
 /// result's channel, see [`FinalCommitted::Rebalancing`], so the stop can
 /// poll for the rebalance and commit again. A hand-back nobody waits for any
-/// more, past the deadline, closes the consumer on the thread after all.
+/// more, past the deadline, closes the consumer on the thread after all. A
+/// refusal that left the assignment lost, see
+/// [`FinalCommit::assignment_lost`], is not handed back: there is nothing to
+/// commit again, and it ends as any other refusal does.
 async fn final_commit_on_thread<C, S>(
     consumer: C,
     tpl: Option<TopicPartitionList>,
@@ -4019,7 +4045,9 @@ where
                 None => Ok(()),
             };
             let result = match result {
-                Err(error) if retry && is_rebalance_refusal(&error) => {
+                Err(error)
+                    if retry && is_rebalance_refusal(&error) && !consumer.assignment_lost() =>
+                {
                     // Unsent, the hand-back drops here, which closes the
                     // consumer on this thread.
                     drop(committed_tx.send(Committed::HandedBack(consumer, error)));
@@ -4658,7 +4686,10 @@ async fn answer_while_polling(
 /// rebalance waits on, and drains the rebalance events, so a partition the
 /// rebalance revoked leaves the next try. Another member's stop, or the
 /// autoscaler retiring one, starts such a rebalance, so members that stop
-/// together do not routinely end with a refused commit.
+/// together do not routinely end with a refused commit. A stale generation
+/// outside a rebalance is the exception: librdkafka gives the assignment up
+/// as lost with that refusal, so it is not tried again, and the stop ends
+/// with it as `ShoveError::Commit`, see [`FinalCommit::assignment_lost`].
 ///
 /// `Err` is `ShoveError::Commit`: a final commit the broker did not confirm,
 /// or a commit in flight that had no answer in time. `Commit` is not
@@ -14668,9 +14699,15 @@ mod final_commit_thread_tests {
         /// `None` for a commit that lands; the broker's error otherwise.
         answer: Option<KafkaError>,
         close_release: Option<std_mpsc::Receiver<()>>,
+        /// What `assignment_lost` answers once the commit has run.
+        lost: bool,
     }
 
     impl FinalCommit for DropProbe {
+        fn assignment_lost(&self) -> bool {
+            self.lost
+        }
+
         fn commit_sync(&self, tpl: &TopicPartitionList) -> KafkaResult<()> {
             let offsets = tpl
                 .elements()
@@ -14781,6 +14818,22 @@ mod final_commit_thread_tests {
                 events,
                 answer,
                 close_release: None,
+                lost: false,
+            },
+            seen,
+        )
+    }
+
+    /// A probe whose commit is refused with `error` and leaves the
+    /// assignment lost, as a stale generation outside a rebalance does.
+    fn probe_losing_its_assignment(error: KafkaError) -> (DropProbe, std_mpsc::Receiver<Event>) {
+        let (events, seen) = std_mpsc::channel();
+        (
+            DropProbe {
+                events,
+                answer: Some(error),
+                close_release: None,
+                lost: true,
             },
             seen,
         )
@@ -14797,6 +14850,7 @@ mod final_commit_thread_tests {
                 events,
                 answer: None,
                 close_release: Some(release),
+                lost: false,
             },
             seen,
         )
@@ -15174,6 +15228,41 @@ mod final_commit_thread_tests {
                 "the handle came back whole, and closes where it is dropped: {events:?}"
             );
         }
+    }
+
+    /// A refusal for a stale generation that left the assignment lost is not
+    /// handed back, even with a try again asked for: nothing is left to
+    /// commit under it, so the thread closes the consumer after the commit
+    /// and the refusal is reported as `Rejected`.
+    #[tokio::test]
+    async fn a_refusal_that_left_the_assignment_lost_is_not_handed_back() {
+        let (probe, seen) = probe_losing_its_assignment(KafkaError::ConsumerCommit(
+            RDKafkaErrorCode::IllegalGeneration,
+        ));
+        let committed = final_commit_on_thread(
+            probe,
+            Some(one_offset()),
+            "orders",
+            SHUTDOWN_COMMIT_DEADLINE,
+            true,
+            &mut real_spawner(),
+        )
+        .await;
+        assert!(
+            matches!(
+                committed,
+                FinalCommitted::Ended(Err(CommitFailure::Rejected(_)))
+            ),
+            "a refusal that lost the assignment is reported as Rejected"
+        );
+        let events = events_until_the_drop(&seen);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::Commit { .. }, Event::Drop { .. }]
+            ),
+            "the commit, then the close on the thread: {events:?}"
+        );
     }
 
     /// A refusal while the group rebalances with no try again asked for,

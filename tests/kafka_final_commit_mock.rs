@@ -363,15 +363,60 @@ async fn a_rejected_commit_error_carries_no_record_payload_or_key() {
     }
 }
 
+/// Runs one direct consumer on the topic, delivers the marked record and
+/// waits for its asynchronous commit, then delivers a second record, whose
+/// position the hour-long commit gate leaves uncommitted, applies
+/// `before_stop` to the mock cluster, stops the consumer and returns what
+/// `run` returned with how long the stop took. The final commit is the only
+/// commit to carry the second record's position, 2.
+async fn stop_a_consumer_with_a_record_left_to_commit(
+    mock: &MockCluster<'static, DefaultProducerContext>,
+    before_stop: impl FnOnce(&MockCluster<'static, DefaultProducerContext>),
+) -> (Result<(), ShoveError>, Duration) {
+    let client = connect(mock).await;
+    let handler = AckingHandler::default();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let token = shutdown.clone();
+    let consumer = KafkaConsumer::new(client);
+    let run = tokio::spawn(async move {
+        consumer
+            .run::<OrdersTopic, _>(
+                h,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(token)
+                    .with_commit_interval(COMMIT_GATE),
+            )
+            .await
+    });
+
+    deliver_one_record_and_wait_for_its_commit(mock, &handler).await;
+    produce_marked_record(&mock.bootstrap_servers()).await;
+    wait_until(
+        || handler.count() == 2,
+        DELIVERY_TIMEOUT,
+        "the second record reaching the handler",
+    )
+    .await;
+
+    before_stop(mock);
+    let stopped_at = Instant::now();
+    shutdown.cancel();
+    let result = run.await.expect("the run task completes");
+    (result, stopped_at.elapsed())
+}
+
 /// A final commit the coordinator refuses with a rebalance in progress, as a
 /// commit made while another member's leave rebalances the group is, is
 /// tried again once the consumer has polled with its assignment paused,
-/// inside the shutdown deadline. The second try lands and the member ends
-/// clean, where it ended with `ShoveError::Commit` before.
+/// inside the shutdown deadline. The second try commits the position the
+/// refused one carried, and the member ends clean, where it ended with
+/// `ShoveError::Commit` before.
 #[tokio::test]
 async fn a_final_commit_refused_while_the_group_rebalances_is_tried_again() {
     let mock = mock_cluster();
-    let (result, took) = stop_a_consumer_after_one_record(&mock, |mock| {
+    let (result, took) = stop_a_consumer_with_a_record_left_to_commit(&mock, |mock| {
         mock.request_errors(
             RDKafkaApiKey::OffsetCommit,
             &[RDKafkaRespErr::RD_KAFKA_RESP_ERR_REBALANCE_IN_PROGRESS],
@@ -389,17 +434,21 @@ async fn a_final_commit_refused_while_the_group_rebalances_is_tried_again() {
     );
     assert_eq!(
         committed_position(&mock.bootstrap_servers()).await,
-        Some(1),
-        "the acknowledged record's position is the group's"
+        Some(2),
+        "the second try commits the position the refused one carried"
     );
 }
 
-/// A final commit refused for a stale generation is tried again the same
-/// way, and the member ends clean.
+/// A final commit refused for a stale generation outside a rebalance makes
+/// librdkafka give the member's assignment up as lost, so nothing is left
+/// to commit under it. The refusal is not tried again: the member ends with
+/// `ShoveError::Commit` of the `Rejected` kind carrying the position the
+/// refused commit held, which stays uncommitted, where trying again would
+/// have found nothing to commit and ended clean.
 #[tokio::test]
-async fn a_final_commit_refused_for_a_stale_generation_is_tried_again() {
+async fn a_final_commit_refused_for_a_stale_generation_ends_the_consumer_with_the_rejected_kind() {
     let mock = mock_cluster();
-    let (result, took) = stop_a_consumer_after_one_record(&mock, |mock| {
+    let (result, _took) = stop_a_consumer_with_a_record_left_to_commit(&mock, |mock| {
         mock.request_errors(
             RDKafkaApiKey::OffsetCommit,
             &[RDKafkaRespErr::RD_KAFKA_RESP_ERR_ILLEGAL_GENERATION],
@@ -407,15 +456,29 @@ async fn a_final_commit_refused_for_a_stale_generation_is_tried_again() {
     })
     .await;
 
-    assert!(result.is_ok(), "the member ends clean: {result:?}");
+    let Err(ShoveError::Commit(failed)) = &result else {
+        panic!("a stale-generation refusal ends with ShoveError::Commit: {result:?}");
+    };
+    assert_eq!(failed.topic, TOPIC);
+    assert_eq!(
+        failed.offsets,
+        [(0, 2)],
+        "the position the refused commit carried"
+    );
+    let CommitFailure::Rejected(text) = &failed.kind else {
+        panic!(
+            "a refused commit is reported as Rejected: {:?}",
+            failed.kind
+        );
+    };
     assert!(
-        took < shutdown_commit_deadline(),
-        "the retry stays inside the shutdown deadline, took {took:?}"
+        text.contains("IllegalGeneration"),
+        "the broker's answer is carried: {text}"
     );
     assert_eq!(
         committed_position(&mock.bootstrap_servers()).await,
         Some(1),
-        "the acknowledged record's position is the group's"
+        "the refused position stays uncommitted"
     );
 }
 
