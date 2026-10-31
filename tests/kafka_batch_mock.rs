@@ -4,12 +4,15 @@
 //! and needs no Docker. The mock lets a test refuse, delay or drop one kind
 //! of request without touching the others.
 //!
-//! The first two tests move a partition away from a member whose batch spans
+//! The first tests move a partition away from a member whose batch spans
 //! it, by starting a second member in the same group: the cooperative
 //! rebalance revokes one of the first member's two partitions. A record the
-//! member holds when it learns of the revoke, and a batch whose age deadline
-//! fires with the revoke still undrained, must not reach its handler ahead
-//! of, or beside, the records the rebalance hands back or away.
+//! member holds when it learns of the revoke, a batch whose age deadline
+//! fires with the revoke still undrained, and a rejected batch whose dead
+//! letters are still landing when the revoke comes must not reach a handler
+//! ahead of, or beside, the records the rebalance hands back or away, and
+//! nothing of the revoked partition may be committed by the member that
+//! lost it.
 //!
 //! The rest refuse or delay what a flush depends on. A commit refused with a
 //! rebalance in progress is re-offered, a dead-lettered batch's included,
@@ -63,6 +66,7 @@ use shove::outcome::Outcome;
 use shove::topic::Topic;
 use shove::topology::TopologyBuilder;
 use shove::{CommitFailure, ShoveError};
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -292,7 +296,7 @@ async fn committed_position(
     .expect("probe task")
 }
 
-/// Polls the broker until `group`'s committed position on `partition` of
+/// Polls the broker until `group`'s committed position on partition 0 of
 /// `topic` is `expected`, failing once `timeout` has passed.
 async fn wait_for_position(
     bootstrap: &str,
@@ -302,15 +306,29 @@ async fn wait_for_position(
     timeout: Duration,
     what: &str,
 ) {
+    wait_for_position_on(bootstrap, topic, group, 0, expected, timeout, what).await;
+}
+
+/// [`wait_for_position`] on `partition`.
+async fn wait_for_position_on(
+    bootstrap: &str,
+    topic: &'static str,
+    group: &'static str,
+    partition: i32,
+    expected: i64,
+    timeout: Duration,
+    what: &str,
+) {
     let deadline = Instant::now() + timeout;
     loop {
-        let committed = committed_position(bootstrap, topic, group, 0).await;
+        let committed = committed_position(bootstrap, topic, group, partition).await;
         if committed == Some(expected) {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "{what}: the committed position is {committed:?}, not {expected}, after {timeout:?}"
+            "{what}: the committed position of partition {partition} is {committed:?}, not \
+             {expected}, after {timeout:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -402,11 +420,31 @@ impl<T: Topic<Message = Order>> BatchMessageHandler<T> for Recorder {
     }
 }
 
+/// A [`Recorder`] that holds each flush, once recorded, until `release` is
+/// set, so its member commits nothing of what it was handed for as long as
+/// a test needs.
+#[derive(Clone)]
+struct Holding {
+    recorder: Recorder,
+    release: watch::Receiver<bool>,
+}
+
+impl<T: Topic<Message = Order>> BatchMessageHandler<T> for Holding {
+    type Context = ();
+    async fn handle_batch(&self, messages: Vec<(Order, MessageMetadata)>, ctx: &()) -> Outcome {
+        let outcome = BatchMessageHandler::<T>::handle_batch(&self.recorder, messages, ctx).await;
+        let mut release = self.release.clone();
+        // A sender gone releases too: the test is over.
+        let _ = release.wait_for(|released| *released).await;
+        outcome
+    }
+}
+
 /// Starts a batch consumer of `T` with `handler`, on the options `options`
 /// builds over the stop token's, and returns its run task and that token.
 fn start_batch<T>(
     client: KafkaClient,
-    handler: Recorder,
+    handler: impl BatchMessageHandler<T, Context = ()>,
     options: impl FnOnce(BatchConsumerOptions) -> BatchConsumerOptions,
 ) -> (
     tokio::task::JoinHandle<Result<(), ShoveError>>,
@@ -1101,6 +1139,158 @@ async fn batch_reject_with_slow_dlq_stays_in_group() {
         "no rebalance: the member stayed in its group through the slow dead letters"
     );
     assert_eq!(handler.flushes().len(), 1, "the batch is handled once");
+}
+
+/// A member rejects a batch spanning both partitions of a topic while the
+/// DLQ holds every produce answer for four seconds, so the dead letters take
+/// eight rounds and the member polls between them. A second member joins
+/// during that wait, and the rebalance revokes one of the first member's
+/// partitions: the mock coordinator runs each of the two rounds a
+/// cooperative rebalance takes a second short of the session timeout, so
+/// the wait has to outlast about twenty seconds. The wait ends, the flush reads the revoke, and the batch is
+/// abandoned: nothing of the revoked partition is committed, the second
+/// member is handed it from the committed offset, the first member is
+/// handed the partition it kept again from its start, and every record ends
+/// up committed with no discard counted. The second member holds its
+/// flushes until the first member's batch is over, so a commit of the
+/// revoked partition by the first member would show.
+#[tokio::test]
+async fn a_rebalance_during_the_dead_letter_wait_commits_nothing_of_the_revoked_partition() {
+    const TOPIC: &str = "kafka-batch-mock-dlq-wait-rebalance";
+    const DLQ: &str = "kafka-batch-mock-dlq-wait-rebalance-dlq";
+    const GROUP: &str = "kafka-batch-mock-dlq-wait-rebalance-consumer";
+    const PER_PARTITION: usize = 64;
+    /// Under the producer's 5 s message timeout, so a held answer is late
+    /// and never a failure.
+    const DLQ_LATENCY: Duration = Duration::from_secs(4);
+    shove::define_topic!(WaitTopic, Order, TopologyBuilder::new(TOPIC).dlq().build());
+
+    #[cfg(feature = "metrics")]
+    let snapshotter = install_recorder();
+    let mock = Mock::start();
+    mock.create_topic(TOPIC, 2);
+    mock.create_topic(DLQ, 1);
+    let bootstrap = mock.bootstrap();
+    let records = produce_on_both(&producer(&bootstrap), TOPIC, PER_PARTITION).await;
+    let letters = i64::try_from(records.len()).expect("a count");
+    let per_partition: Vec<i64> = (0..i64::try_from(PER_PARTITION).expect("a count")).collect();
+    // More held answers than the dead letters can ever send requests.
+    mock.answer_late(RDKafkaApiKey::Produce, DLQ_LATENCY, records.len());
+
+    // A rejects the batch it holds when B joins, and acks what it is
+    // handed after.
+    let a = Recorder::new(|flush| {
+        if flush == 0 {
+            Outcome::Reject
+        } else {
+            Outcome::Ack
+        }
+    });
+    let (run_a, token_a) = start_batch::<WaitTopic>(connect(&bootstrap).await, a.clone(), |o| {
+        o.with_max_batch_size(records.len())
+            .with_max_batch_age(Duration::from_secs(5))
+    });
+    wait_until(
+        || a.flushes().len() == 1,
+        DELIVERY_TIMEOUT,
+        "A's batch reaching its handler",
+    )
+    .await;
+    assert_eq!(
+        a.flushes()[0].len(),
+        records.len(),
+        "A's batch spans every record of both partitions"
+    );
+
+    let (release, released) = watch::channel(false);
+    let b = Recorder::acking();
+    let holding = Holding {
+        recorder: b.clone(),
+        release: released,
+    };
+    let (run_b, token_b) = start_batch::<WaitTopic>(connect(&bootstrap).await, holding, |o| {
+        o.with_max_batch_age(Duration::from_millis(200))
+            .with_handler_timeout(DELIVERY_TIMEOUT)
+    });
+    wait_until(
+        || !b.handled().is_empty(),
+        DELIVERY_TIMEOUT,
+        "the rebalance handing B a partition",
+    )
+    .await;
+    let landed = high_watermark(&bootstrap, DLQ, 0).await;
+    assert!(
+        landed < letters,
+        "the rebalance reached A while its dead letters were still landing, the premise of the \
+         test: {landed} of {letters} had landed"
+    );
+    let moved = b.handled()[0].partition;
+    let kept = 1 - moved;
+
+    // The flush that waited for the dead letters ends once they have landed.
+    // Abandoned to the revoke, it has A handed the partition it kept again;
+    // committed past the revoke, it moves the revoked partition's position.
+    let deadline = Instant::now() + DELIVERY_TIMEOUT;
+    let committed_moved = loop {
+        let committed = committed_position(&bootstrap, TOPIC, GROUP, moved).await;
+        if committed.is_some() || a.flushes().len() >= 2 {
+            break committed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "A's flush ending did not happen within {DELIVERY_TIMEOUT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        committed_moved, None,
+        "A committed nothing of the partition the rebalance revoked during its wait"
+    );
+
+    let _ = release.send(true);
+    for partition in [moved, kept] {
+        wait_for_position_on(
+            &bootstrap,
+            TOPIC,
+            GROUP,
+            partition,
+            i64::try_from(PER_PARTITION).expect("a count"),
+            DELIVERY_TIMEOUT,
+            "every record handled after the rebalance committed",
+        )
+        .await;
+    }
+    stop_in_turn((run_a, token_a), (run_b, token_b)).await;
+
+    assert_eq!(
+        b.handled_on(moved)
+            .iter()
+            .map(|h| h.offset)
+            .collect::<Vec<_>>(),
+        per_partition,
+        "B is handed the revoked partition from the committed offset, each record once"
+    );
+    let a_after: Vec<Handled> = a.flushes()[1..].concat();
+    assert!(
+        a_after.iter().all(|h| h.partition == kept),
+        "A is handed nothing of the revoked partition after the rebalance: {a_after:?}"
+    );
+    assert_eq!(
+        a_after.iter().map(|h| h.offset).collect::<Vec<_>>(),
+        per_partition,
+        "A is handed the partition it kept again from its start, each record once"
+    );
+    assert_eq!(
+        high_watermark(&bootstrap, DLQ, 0).await,
+        letters,
+        "the rejected batch is dead-lettered once"
+    );
+    #[cfg(feature = "metrics")]
+    assert_eq!(
+        discarded_total(&snapshotter, TOPIC),
+        0,
+        "a batch abandoned to a rebalance counts no discard"
+    );
 }
 
 /// A rejected batch's dead letters land, and the commit they ride reaches
