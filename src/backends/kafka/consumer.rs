@@ -3902,10 +3902,12 @@ fn consumer_config(
     Ok(base)
 }
 
-/// The consumer a consume loop reads with, built on a blocking thread:
-/// librdkafka's constructor is synchronous and may block on TLS material,
-/// so it never runs on a runtime thread. Every loop builds its consumer
-/// here, on every connection.
+/// The consumer a consume loop of `topic` reads with, built on a blocking
+/// thread: librdkafka's constructor is synchronous and may block on TLS
+/// material, so it never runs on a runtime thread. Every loop builds its
+/// consumer here, on every connection. It comes back as the loop's own
+/// [`LoopConsumer`], so a loop dropped while it waits for the build still
+/// closes the consumer off the runtime thread.
 #[allow(clippy::too_many_arguments)]
 async fn create_stream_consumer(
     base: ClientConfig,
@@ -3917,7 +3919,7 @@ async fn create_stream_consumer(
     rebalance_tx: std_mpsc::Sender<RebalanceEvent>,
     assignments: AssignmentTokens,
     #[cfg(feature = "kafka-msk-iam")] msk_context: Option<MskIamContext>,
-) -> Result<KafkaStreamConsumer> {
+) -> Result<LoopConsumer> {
     let group_id = group_id.to_owned();
     let fetch_queue = *fetch_queue;
     let topic = topic.to_owned();
@@ -3934,6 +3936,7 @@ async fn create_stream_consumer(
             #[cfg(feature = "kafka-msk-iam")]
             msk_context,
         )
+        .map(|consumer| LoopConsumer::new(consumer, &topic))
     })
     .await
     .map_err(|e| ShoveError::Connection(format!("consumer build task failed: {e}")))?
@@ -8272,22 +8275,19 @@ async fn run_serial_connection<L: SerialLoop>(serial: &L) -> Result<()> {
     // The map the rebalance callback cancels revoked partitions' tokens
     // in; the tracker below shares it. See `AssignmentTokens`.
     let assignments = AssignmentTokens::default();
-    let consumer = LoopConsumer::new(
-        create_stream_consumer(
-            connection.client.base_config(),
-            connection.group_id,
-            connection.auto_offset_reset,
-            connection.max_poll_interval_ms,
-            &connection.fetch_queue,
-            queue,
-            rebalance_tx,
-            assignments.clone(),
-            #[cfg(feature = "kafka-msk-iam")]
-            connection.client.msk_context(),
-        )
-        .await?,
+    let consumer = create_stream_consumer(
+        connection.client.base_config(),
+        connection.group_id,
+        connection.auto_offset_reset,
+        connection.max_poll_interval_ms,
+        &connection.fetch_queue,
         queue,
-    );
+        rebalance_tx,
+        assignments.clone(),
+        #[cfg(feature = "kafka-msk-iam")]
+        connection.client.msk_context(),
+    )
+    .await?;
     let mut state = FifoState {
         tracker: OffsetTracker::with_assignments(queue.to_string(), assignments),
         rebalance_rx,
@@ -9280,22 +9280,19 @@ impl KafkaConsumer {
                 // for: through the final commit on a stop, through
                 // `close_without_commit` on an `Err`, a failed subscribe
                 // included. An abort leaves it to `LoopConsumer`'s drop.
-                let consumer = LoopConsumer::new(
-                    create_stream_consumer(
-                        client.base_config(),
-                        &group_id,
-                        auto_offset_reset,
-                        max_poll_interval_ms,
-                        &fetch_queue,
-                        queue,
-                        rebalance_tx,
-                        assignments.clone(),
-                        #[cfg(feature = "kafka-msk-iam")]
-                        client.msk_context(),
-                    )
-                    .await?,
+                let consumer = create_stream_consumer(
+                    client.base_config(),
+                    &group_id,
+                    auto_offset_reset,
+                    max_poll_interval_ms,
+                    &fetch_queue,
                     queue,
-                );
+                    rebalance_tx,
+                    assignments.clone(),
+                    #[cfg(feature = "kafka-msk-iam")]
+                    client.msk_context(),
+                )
+                .await?;
                 if let Err(e) = consumer.subscribe(&[queue]) {
                     let e = map_kafka_error("failed to subscribe", e);
                     close_without_commit(consumer, queue, SHUTDOWN_COMMIT_DEADLINE).await;
@@ -10467,22 +10464,19 @@ impl KafkaConsumer {
             async move {
                 let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
                 let assignments = AssignmentTokens::default();
-                let consumer = LoopConsumer::new(
-                    create_stream_consumer(
-                        client.base_config(),
-                        &group_id,
-                        auto_offset_reset,
-                        max_poll_interval_ms,
-                        &fetch_queue,
-                        queue,
-                        rebalance_tx,
-                        assignments.clone(),
-                        #[cfg(feature = "kafka-msk-iam")]
-                        client.msk_context(),
-                    )
-                    .await?,
+                let consumer = create_stream_consumer(
+                    client.base_config(),
+                    &group_id,
+                    auto_offset_reset,
+                    max_poll_interval_ms,
+                    &fetch_queue,
                     queue,
-                );
+                    rebalance_tx,
+                    assignments.clone(),
+                    #[cfg(feature = "kafka-msk-iam")]
+                    client.msk_context(),
+                )
+                .await?;
                 if let Err(e) = consumer.subscribe(&[queue]) {
                     let e = map_kafka_error("failed to subscribe", e);
                     close_without_commit(consumer, queue, SHUTDOWN_COMMIT_DEADLINE).await;
@@ -11383,25 +11377,22 @@ impl KafkaConsumer {
                 // Closed on a thread of its own on every exit, and waited
                 // for, see `close_without_commit`; a failed assign included.
                 // An abort leaves it to `LoopConsumer`'s drop.
-                let consumer = LoopConsumer::new(
-                    create_stream_consumer(
-                        client.base_config(),
-                        &group_id,
-                        // Inert: every partition is assigned at an explicit
-                        // offset below, so librdkafka never consults the reset
-                        // policy. `Latest` states the intent anyway.
-                        KafkaAutoOffsetReset::Latest,
-                        MAX_POLL_INTERVAL_MS,
-                        &fetch_queue,
-                        queue,
-                        rebalance_tx,
-                        AssignmentTokens::default(),
-                        #[cfg(feature = "kafka-msk-iam")]
-                        client.msk_context(),
-                    )
-                    .await?,
+                let consumer = create_stream_consumer(
+                    client.base_config(),
+                    &group_id,
+                    // Inert: every partition is assigned at an explicit offset
+                    // below, so librdkafka never consults the reset policy.
+                    // `Latest` states the intent anyway.
+                    KafkaAutoOffsetReset::Latest,
+                    MAX_POLL_INTERVAL_MS,
+                    &fetch_queue,
                     queue,
-                );
+                    rebalance_tx,
+                    AssignmentTokens::default(),
+                    #[cfg(feature = "kafka-msk-iam")]
+                    client.msk_context(),
+                )
+                .await?;
 
                 // A schema registry deployment fault met inside a handler's
                 // task (a deferred redelivery decodes there) ends the
@@ -15170,22 +15161,20 @@ mod stop_drain_tests {
         let mut config = ClientConfig::new();
         config.set("bootstrap.servers", "127.0.0.1:1");
         let (rebalance_tx, _rebalance_rx) = std_mpsc::channel();
-        let consumer = Arc::new(
-            create_stream_consumer(
-                config,
-                "stop-drain",
-                KafkaAutoOffsetReset::Earliest,
-                MAX_POLL_INTERVAL_MS,
-                &FetchQueueTuning::default(),
-                "stop-drain",
-                rebalance_tx,
-                AssignmentTokens::default(),
-                #[cfg(feature = "kafka-msk-iam")]
-                None,
-            )
-            .await
-            .expect("creating a consumer needs no broker"),
-        );
+        let consumer = create_stream_consumer(
+            config,
+            "stop-drain",
+            KafkaAutoOffsetReset::Earliest,
+            MAX_POLL_INTERVAL_MS,
+            &FetchQueueTuning::default(),
+            "stop-drain",
+            rebalance_tx,
+            AssignmentTokens::default(),
+            #[cfg(feature = "kafka-msk-iam")]
+            None,
+        )
+        .await
+        .expect("creating a consumer needs no broker");
         consumer
             .subscribe(&["stop-drain"])
             .expect("subscribing needs no broker");
