@@ -4584,8 +4584,8 @@ impl FinalCommit for LoopConsumer {
 }
 
 /// A consume loop's own handle on its consumer: the standard consumer's, a
-/// sequenced consumer's, the batch consumer's and the DLQ drain's, each the
-/// last holder in the ordinary case.
+/// sequenced consumer's, the batch consumer's, the DLQ drain's and the
+/// broadcast subscription's, each the last holder in the ordinary case.
 ///
 /// Dropping the last handle runs `rd_kafka_consumer_close`, which blocks
 /// until librdkafka has left the group: rust-rdkafka 0.39 polls until the
@@ -11252,9 +11252,10 @@ impl KafkaConsumer {
     /// start - the tail unless `with_broadcast_start` says otherwise - with no
     /// `subscribe()` and no commit anywhere in the loop. Nothing is written to
     /// the broker at any point in its life, so there is nothing to tear down
-    /// when it ends and nothing to reap when the process dies without ending it
-    /// — which is why the teardown here is "drop the consumer handle" and not a
-    /// cleanup path that has to be reached. See
+    /// when it ends and nothing to reap when the process dies without ending
+    /// it. The teardown is the consumer handle's close, which every exit the
+    /// loop takes runs on a thread of its own and waits for, see
+    /// [`close_without_commit`]; an abort leaves it to [`LoopConsumer`]. See
     /// [`broadcast_group_id`](super::constants::broadcast_group_id) for why a
     /// `group.id` string is nonetheless configured, why it is a fixed one, and
     /// why `with_group_id` may replace it.
@@ -11368,22 +11369,28 @@ impl KafkaConsumer {
                 // wired into the shared context never fire; the receiver is
                 // dropped deliberately, as in the DLQ loop.
                 let (rebalance_tx, _) = std_mpsc::channel::<RebalanceEvent>();
-                let consumer = Arc::new(create_stream_consumer(
-                    client.base_config(),
-                    &group_id,
-                    // Inert: every partition is assigned at an explicit offset
-                    // below, so librdkafka never consults the reset policy.
-                    // `Latest` states the intent anyway.
-                    KafkaAutoOffsetReset::Latest,
-                    MAX_POLL_INTERVAL_MS,
-                    &fetch_queue,
+                // Closed on a thread of its own on every exit, and waited
+                // for, see `close_without_commit`; a failed assign included.
+                // An abort leaves it to `LoopConsumer`'s drop.
+                let consumer = LoopConsumer::new(
+                    create_stream_consumer(
+                        client.base_config(),
+                        &group_id,
+                        // Inert: every partition is assigned at an explicit
+                        // offset below, so librdkafka never consults the reset
+                        // policy. `Latest` states the intent anyway.
+                        KafkaAutoOffsetReset::Latest,
+                        MAX_POLL_INTERVAL_MS,
+                        &fetch_queue,
+                        queue,
+                        rebalance_tx,
+                        AssignmentTokens::default(),
+                        #[cfg(feature = "kafka-msk-iam")]
+                        client.msk_context(),
+                    )
+                    .await?,
                     queue,
-                    rebalance_tx,
-                    AssignmentTokens::default(),
-                    #[cfg(feature = "kafka-msk-iam")]
-                    client.msk_context(),
-                )
-                .await?);
+                );
 
                 // A schema registry deployment fault met inside a handler's
                 // task (a deferred redelivery decodes there) ends the
@@ -11410,9 +11417,9 @@ impl KafkaConsumer {
                 // never subscribes, so it has no assignor and librdkafka reports
                 // rebalance protocol NONE, under which the eager `assign()` is
                 // accepted. Pinned by `kafka_broadcast_leaves_no_consumer_group`.
-                let assign_consumer = consumer.clone();
+                let assign_consumer = Arc::clone(&consumer);
                 let assign_topic = queue.to_string();
-                let partitions = tokio::task::spawn_blocking(move || {
+                let assigned = match tokio::task::spawn_blocking(move || {
                     assign_consumer.assign_all_partitions_at(
                         &assign_topic,
                         start,
@@ -11420,9 +11427,19 @@ impl KafkaConsumer {
                     )
                 })
                 .await
-                .map_err(|e| {
-                    ShoveError::Connection(format!("broadcast assign task panicked: {e}"))
-                })??;
+                {
+                    Ok(assigned) => assigned,
+                    Err(e) => Err(ShoveError::Connection(format!(
+                        "broadcast assign task panicked: {e}"
+                    ))),
+                };
+                let partitions = match assigned {
+                    Ok(partitions) => partitions,
+                    Err(e) => {
+                        close_without_commit(consumer, queue, SHUTDOWN_COMMIT_DEADLINE).await;
+                        return Err(e);
+                    }
+                };
 
                 tracing::info!(
                     queue,
@@ -11441,10 +11458,13 @@ impl KafkaConsumer {
                 let tail_cancel = task_cancel.clone();
                 let tail_semaphore = semaphore.clone();
                 let tail_processing = processing.clone();
+                // The loop borrows the consumer, which the tail below closes.
+                let loop_consumer = &consumer;
                 let ended: Result<()> = async move {
+                let consumer = loop_consumer;
                 let stop = shutdown.cancelled();
                 tokio::pin!(stop);
-                let mut stream = RecvStream::new(&consumer);
+                let mut stream = RecvStream::new(consumer);
                 loop {
                     let (payload, headers, coordinates) = tokio::select! {
                         biased;
@@ -11453,7 +11473,7 @@ impl KafkaConsumer {
                             tracing::info!(queue, "shutdown signal received, draining in-flight handlers");
                             // Nothing to commit and nothing to delete: the
                             // subscription exists only in this consumer handle,
-                            // which is dropped when this future resolves.
+                            // which the tail closes once this future resolves.
                             let _ = semaphore.acquire_many(prefetch_count as u32).await;
                             return Ok(());
                         }
@@ -11467,7 +11487,7 @@ impl KafkaConsumer {
                         }
 
                         _ = assignment_refresh.tick() => {
-                            let refresh_consumer = Arc::clone(&consumer);
+                            let refresh_consumer = Arc::clone(consumer);
                             let refresh_topic = queue.to_string();
                             // Awaited here, so no record arriving first can drop it mid-call.
                             let refresh = tokio::task::spawn_blocking(move || {
@@ -11608,7 +11628,7 @@ impl KafkaConsumer {
                                             }
                                             Ok(RegistryDecode::Unavailable { id, error }) => {
                                                 if !stall
-                                                    .wait(&consumer, &shutdown, Some(&mut fault_rx), &topic, group.as_deref(), queue, id, &error)
+                                                    .wait(consumer, &shutdown, Some(&mut fault_rx), &topic, group.as_deref(), queue, id, &error)
                                                     .await?
                                                 {
                                                     break Staged::Stop;
@@ -11624,7 +11644,7 @@ impl KafkaConsumer {
                                             }
                                         }
                                     };
-                                    stall.end(&consumer)?;
+                                    stall.end(consumer)?;
                                     staged
                                 }
                                 None => {
@@ -11869,13 +11889,17 @@ impl KafkaConsumer {
                 }
                 }
                 .await;
-                // Every fatal exit passes through here: the child token ends
-                // the handler task's redelivery wait, the permit drain proves
-                // it has released its permit, and only then is the busy flag
-                // cleared. Nothing is committed on this path at any time.
+                // Every exit passes through here, and closes the consumer
+                // first, on a thread of its own and waited for, see
+                // `close_without_commit`. A fatal exit then has the child
+                // token end the handler tasks' redelivery waits, the permit
+                // drain proves each has released its permit, and only then is
+                // the busy flag cleared. Nothing is committed on this path at
+                // any time.
+                close_without_commit(consumer, queue, SHUTDOWN_COMMIT_DEADLINE).await;
                 let Err(e) = ended else { return Ok(()) };
                 tail_cancel.cancel();
-                let _ = tail_semaphore.acquire_many(prefetch_count as u32).await;
+                let _ = tail_semaphore.acquire_many(u32::from(prefetch_count)).await;
                 tail_processing.store(false, Ordering::Release);
                 Err(e)
             }
