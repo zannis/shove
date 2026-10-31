@@ -40,9 +40,8 @@ use crate::backend::batch_consumer::{
 use crate::backend::broadcast::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_broadcast_outcome};
 use crate::batch_consumer::BatchConsumerOptions as GenericBatchConsumerOptions;
 use crate::broadcast::BroadcastStart;
-use crate::consumer::RetryStrategy;
-use crate::consumer::validate_message_size;
-use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
+use crate::consumer::{DEFAULT_HANDLER_TIMEOUT, RetryStrategy, validate_message_size};
+use crate::consumer_supervisor::{AbortOnDrop, SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{CommitFailure, FailedCommit, Result};
 use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -53,15 +52,12 @@ use crate::routing::{PoisonedKeys, RetryDecision, decide_retry, handler_timeout_
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{HoldQueue, Kafka, ShoveError};
-// These four are only read back by `batch_consumer_options_tests` below, to
-// pin that `BatchConsumerOptions` (now a `pub type` alias of the generic
-// `BatchConsumerOptions<Kafka>`) still defaults to the same shared constants
-// the type used to hardcode directly.
+// These three, with `DEFAULT_HANDLER_TIMEOUT` above, are only read back by
+// `batch_consumer_options_tests` below, to pin that `BatchConsumerOptions` (now
+// a `pub type` alias of the generic `BatchConsumerOptions<Kafka>`) still
+// defaults to the same shared constants the type used to hardcode directly.
 #[cfg(test)]
-use crate::{
-    DEFAULT_HANDLER_TIMEOUT, DEFAULT_KAFKA_MAX_BATCH_AGE, DEFAULT_KAFKA_MAX_BATCH_SIZE,
-    DEFAULT_MAX_MESSAGE_SIZE,
-};
+use crate::{DEFAULT_KAFKA_MAX_BATCH_AGE, DEFAULT_KAFKA_MAX_BATCH_SIZE, DEFAULT_MAX_MESSAGE_SIZE};
 
 #[cfg(feature = "kafka-msk-iam")]
 use super::msk_iam::MskIamContext;
@@ -3055,18 +3051,6 @@ impl KafkaStreamConsumer {
         }
     }
 
-    pub(super) fn commit_message(
-        &self,
-        msg: &BorrowedMessage<'_>,
-        mode: CommitMode,
-    ) -> KafkaResult<()> {
-        match self {
-            Self::Default(c) => c.commit_message(msg, mode),
-            #[cfg(feature = "kafka-msk-iam")]
-            Self::MskIam(c) => c.commit_message(msg, mode),
-        }
-    }
-
     /// Rewinds the given partitions to the offsets in `tpl` so the next
     /// `recv()` re-delivers from there. Used by the batch consumer to
     /// redeliver an entire un-acked batch instead of silently skipping past
@@ -4011,8 +3995,8 @@ impl FinalCommit for LoopConsumer {
 }
 
 /// A consume loop's own handle on its consumer: the standard consumer's, a
-/// sequenced consumer's and the batch consumer's, each the last holder in
-/// the ordinary case.
+/// sequenced consumer's, the batch consumer's and the DLQ drain's, each the
+/// last holder in the ordinary case.
 ///
 /// Dropping the last handle runs `rd_kafka_consumer_close`, which blocks
 /// until librdkafka has left the group: rust-rdkafka 0.39 polls until the
@@ -4439,8 +4423,9 @@ fn spawn_commit(
 }
 
 /// The commits a receive loop makes under `CommitPolicy::Interval`, a
-/// sequenced consumer's and the batch consumer's: at most one in flight,
-/// made with [`spawn_commit`] while the loop goes on, and spaced by the gate.
+/// sequenced consumer's, the batch consumer's and the DLQ drain's: at most one
+/// in flight, made with [`spawn_commit`] while the loop goes on, and spaced by
+/// the gate.
 ///
 /// The loop reads the answer back, as it reads a completion: a select arm
 /// wakes on it, see [`commit_answer`], and the top of every pass, and of
@@ -4569,8 +4554,9 @@ impl CommitSlot {
 
     /// The commit step of a pass, the same in every loop that commits
     /// through a slot: the concurrent receive loop, its permit wait, a
-    /// sequenced consumer's pass and waits, and the batch loop's pass and
-    /// schema registry stall. It settles the answer of the
+    /// sequenced consumer's pass and waits, the batch loop's pass and schema
+    /// registry stall, and the DLQ drain's pass and registry waits. It
+    /// settles the answer of the
     /// commit in flight if it came, applies the rebalance events, ends the
     /// member with [`fenced_error`] once a partition's commits have been
     /// rejected for `fence.threshold` with nothing resolving them (see
@@ -4769,8 +4755,9 @@ async fn answer_while_polling(
 /// position synchronously and close the consumer, both on a thread of their
 /// own, see [`final_commit_off_runtime`]. The standard consumer calls it
 /// once its handler tasks have drained, the sequenced consumer once its
-/// record in hand is left behind, and the batch consumer once its stop has
-/// flushed the batch in hand.
+/// record in hand is left behind, the batch consumer once its stop has
+/// flushed the batch in hand, and the DLQ drain once its dead letter in hand
+/// is finished with or left behind.
 ///
 /// A final commit the coordinator refuses while the group rebalances, see
 /// [`is_rebalance_refusal`], is tried again while more than
@@ -6402,7 +6389,7 @@ struct BatchRebalance {
 
 /// Drains librdkafka's rebalance events, returning the partitions of this
 /// consumer's topic whose ownership changed, and whether an assign was among
-/// them. The DLQ drain, which keeps no batch, reads only the latter.
+/// them.
 ///
 /// Only a partition the in-flight batch actually spans invalidates it, so the
 /// caller intersects this set with the batch (see
@@ -7841,6 +7828,506 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
         };
         state.complete(record, discard);
         Ok(FifoPass::Next)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DLQ drain
+// ---------------------------------------------------------------------------
+
+/// A token that fires when `first` or `second` does. It is a child of `first`,
+/// so a stop through `first` reaches it in the same step, and a task forwards
+/// `second` to it, at once when `second` has fired already. The guard ends that
+/// task, so hold it as long as the token is in use.
+fn cancelled_by_either(
+    first: &CancellationToken,
+    second: &CancellationToken,
+) -> (CancellationToken, AbortOnDrop) {
+    let merged = first.child_token();
+    if second.is_cancelled() {
+        merged.cancel();
+    }
+    let forward = tokio::spawn({
+        let (second, merged) = (second.clone(), merged.clone());
+        async move {
+            second.cancelled().await;
+            merged.cancel();
+        }
+    });
+    (merged, AbortOnDrop(forward.abort_handle()))
+}
+
+/// What every connection of one DLQ drain reads: the handler, the client and
+/// the settings `KafkaConsumer::run_dlq_with_inner` resolved once.
+struct DlqDrain<T: Topic, H: MessageHandler<T>> {
+    handler: H,
+    ctx: H::Context,
+    client: KafkaClient,
+    /// The dead-letter topic the drain reads, and commits on.
+    dlq: &'static str,
+    /// The drain's group, `{dlq}-consumer` or `{group}-dlq`.
+    group_id: String,
+    /// The source topic and the group its consumers carry, which label the
+    /// drain's metrics: the size sample of every dead letter and a registry
+    /// wait.
+    topic: Arc<str>,
+    group: Option<Arc<str>>,
+    /// Fires on the token of the options or on the client's, see
+    /// [`cancelled_by_either`].
+    shutdown: CancellationToken,
+    max_message_size: Option<usize>,
+    /// The bound on one `handle_dead` call.
+    handler_timeout: Duration,
+    /// The fenced consumer detector's threshold, see [`fence_threshold_over`].
+    fence_timeout: Duration,
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_registry: Option<Arc<SchemaRegistry>>,
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_enforcement: SchemaEnforcement,
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_accepted: Vec<Arc<str>>,
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_message_index: Option<Vec<i32>>,
+    #[cfg(feature = "kafka-schema-registry")]
+    lookup_bound: Duration,
+    _topic: PhantomData<fn() -> T>,
+}
+
+/// What one connection of a DLQ drain keeps between dead letters: the
+/// sequenced consumer's bookkeeping, see [`FifoState`]. A dead letter is in
+/// flight from the moment it is taken until it is finished with, so the
+/// commit position never passes the one in hand, and a revoke drops the
+/// partition's entry with nothing committed for it.
+struct DrainState {
+    tracker: OffsetTracker,
+    rebalance_rx: std_mpsc::Receiver<RebalanceEvent>,
+    /// The commit gate and the one commit in flight, see [`CommitSlot`].
+    commits: CommitSlot,
+    /// The fenced consumer detector's threshold, see [`fence_threshold_over`].
+    fence_timeout: Duration,
+    /// The drain's group, which the fence's error names.
+    group_id: String,
+    /// Whether a registry wait left the assignment paused. The next pass
+    /// resumes it.
+    paused: bool,
+}
+
+/// The dead letter a drain has in hand, read once off its message.
+struct DrainRecord<'m> {
+    partition: i32,
+    offset: i64,
+    /// The epoch of the assignment the dead letter was taken under, see
+    /// `OffsetTracker::track_received`.
+    epoch: u64,
+    /// Cancelled by a revoke of the dead letter's partition, which ends a
+    /// registry wait on it, see `AssignmentTokens`.
+    #[cfg(feature = "kafka-schema-registry")]
+    revoked: CancellationToken,
+    payload: &'m [u8],
+    headers: Arc<HashMap<String, String>>,
+    coordinates: RecordCoordinates,
+}
+
+/// Whether the drain goes on to the next dead letter or stops.
+enum DrainPass {
+    Next,
+    Stop,
+}
+
+impl DrainState {
+    /// Applies the rebalance events librdkafka queued, then re-applies the
+    /// drain's pause intent if an assign was among them, see
+    /// [`reconcile_pause_after_assign`]: a partition revoked during a registry
+    /// wait and handed back once the wait is over arrives paused, and nothing
+    /// else would resume it.
+    fn apply_rebalance_events(&mut self, consumer: &KafkaStreamConsumer) -> Result<()> {
+        let assigned = self.tracker.apply_rebalance_events(&self.rebalance_rx);
+        reconcile_pause_after_assign(consumer, self.paused, assigned)
+    }
+
+    /// The top of every pass: the commit the gate allows, and the end of the
+    /// pause the last registry wait left behind.
+    fn settle(&mut self, consumer: &Arc<KafkaStreamConsumer>, queue: &str) -> Result<()> {
+        self.commit_due(consumer, queue)?;
+        if self.paused {
+            consumer
+                .resume_assignment()
+                .map_err(|e| map_kafka_error("resume failed", e))?;
+            self.paused = false;
+        }
+        Ok(())
+    }
+
+    /// The commit step the sequenced consumer runs, see
+    /// [`FifoState::commit_due`], at the top of every pass and on every pass of
+    /// a registry wait, so a position completed before the wait and one a
+    /// rebalance or a rejected commit re-offers during it are committed
+    /// however long the wait runs. The commit in flight when the drain stops
+    /// is the stop's to settle.
+    fn commit_due(&mut self, consumer: &Arc<KafkaStreamConsumer>, queue: &str) -> Result<()> {
+        let fence = Fence {
+            threshold: self.fence_timeout,
+            group_id: &self.group_id,
+        };
+        let assigned = self.commits.pass(
+            consumer,
+            &mut self.tracker,
+            &self.rebalance_rx,
+            fence,
+            queue,
+        )?;
+        reconcile_pause_after_assign(consumer, self.paused, assigned)
+    }
+
+    /// The dead letter in hand is finished with: `handle_dead` returned, was
+    /// cut short, or never ran because the dead letter was dropped before it.
+    /// The drain keeps no discard accounting, so none rides on the commit.
+    fn complete(&mut self, record: &DrainRecord<'_>) {
+        self.tracker.mark_complete(Completion {
+            partition: record.partition,
+            offset: record.offset,
+            epoch: record.epoch,
+            discard: None,
+        });
+    }
+}
+
+impl<T: Topic, H: MessageHandler<T>> DlqDrain<T, H> {
+    /// One connection: subscribe and drain until a stop or a fault. A stop
+    /// ends with the final commit and the consumer's close on a thread of
+    /// their own; a fault closes the consumer on a thread of its own too, with
+    /// nothing committed, and waits for the close before it returns the error,
+    /// see [`close_without_commit`]. An abort of the drain's task leaves the
+    /// close to [`LoopConsumer`].
+    async fn run_connection(&self) -> Result<()> {
+        let dlq = self.dlq;
+        let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
+        // The map the rebalance callback cancels revoked partitions' tokens
+        // in; the tracker below shares it. See `AssignmentTokens`.
+        let assignments = AssignmentTokens::default();
+        // The drain hard-codes `earliest` for its group, and that group id is
+        // stable across restarts. librdkafka consults the policy only for a
+        // group with no usable committed offset, so a fresh drain starts at
+        // the earliest retained offset and a tail-only join can never skip a
+        // dead letter the operator opted in to keep, while a restarted drain
+        // resumes from its commit. The main consumer's `auto_offset_reset`
+        // override never reaches here: `check_dlq_options` refuses it for the
+        // drain.
+        let consumer = LoopConsumer::new(
+            create_stream_consumer(
+                self.client.base_config(),
+                &self.group_id,
+                KafkaAutoOffsetReset::Earliest,
+                MAX_POLL_INTERVAL_MS,
+                dlq,
+                rebalance_tx,
+                assignments.clone(),
+                #[cfg(feature = "kafka-msk-iam")]
+                self.client.msk_context(),
+            )?,
+            dlq,
+        );
+        let mut state = DrainState {
+            tracker: OffsetTracker::with_assignments(dlq.to_string(), assignments),
+            rebalance_rx,
+            commits: CommitSlot::new(CommitPolicy::Interval(ASYNC_COMMIT_INTERVAL)),
+            fence_timeout: self.fence_timeout,
+            group_id: self.group_id.clone(),
+            paused: false,
+        };
+        let ended = match consumer.subscribe(&[dlq]) {
+            Ok(()) => self.consume(&consumer, &mut state).await,
+            Err(e) => Err(map_kafka_error("failed to subscribe to DLQ", e)),
+        };
+        if let Err(e) = ended {
+            close_without_commit(consumer, dlq, SHUTDOWN_COMMIT_DEADLINE).await;
+            return Err(e);
+        }
+        let pending_commit = state.commits.in_flight.take();
+        stop_with_final_commit(
+            consumer,
+            &mut state.tracker,
+            &mut state.rebalance_rx,
+            pending_commit,
+            dlq,
+        )
+        .await
+    }
+
+    /// The receive loop. `Ok` is a stop: whatever dead letter was in hand is
+    /// left uncommitted unless it was finished with, and nothing behind it was
+    /// handed to the handler.
+    async fn consume(
+        &self,
+        consumer: &Arc<KafkaStreamConsumer>,
+        state: &mut DrainState,
+    ) -> Result<()> {
+        let dlq = self.dlq;
+        // Wakes an idle drain, so rebalance events are applied and the
+        // positions they re-offer are committed without a dead letter to wait
+        // for.
+        let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
+        housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            state.settle(consumer, dlq)?;
+            let now = Instant::now();
+            tokio::select! {
+                // The stop first: a stop that landed during the last dead
+                // letter's handler call is read before the next one is taken.
+                biased;
+                _ = self.shutdown.cancelled() => {
+                    tracing::info!(dlq, "shutdown signal received, stopping DLQ consumer");
+                    return Ok(());
+                }
+                _ = housekeeping.tick() => {}
+                // Wakes the loop when the commit gate's window expires with
+                // a position to commit, so it lands on a topic gone idle.
+                _ = tokio::time::sleep_until(state.commits.gate.deadline(now)),
+                    if state.commits.in_flight.is_none() && state.tracker.has_committable() => {}
+                answer = commit_answer(state.commits.in_flight.as_mut()),
+                    if state.commits.in_flight.is_some() => {
+                    state.commits.settle(answer, &mut state.tracker, dlq);
+                }
+                received = consumer.recv() => {
+                    let msg = match received {
+                        Ok(msg) => msg,
+                        Err(e) if recv_error_is_transient(consumer.transport_gate(), &e) => {
+                            log_transient_recv_error(dlq, &e);
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, dlq, "DLQ consumer recv error");
+                            return Err(map_kafka_error(
+                                &format!("DLQ consumer recv error on {dlq}"),
+                                e,
+                            ));
+                        }
+                    };
+                    match self.record(consumer, state, &msg).await? {
+                        DrainPass::Next => {}
+                        DrainPass::Stop => return Ok(()),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Takes one dead letter and carries it to its end: handed to
+    /// `handle_dead` and finished with whatever the call came to, dropped
+    /// before the handler, left to its partition's next owner, or kept
+    /// uncommitted for a stop.
+    async fn record(
+        &self,
+        consumer: &Arc<KafkaStreamConsumer>,
+        state: &mut DrainState,
+        msg: &BorrowedMessage<'_>,
+    ) -> Result<DrainPass> {
+        let dlq = self.dlq;
+        // The poll that delivered the dead letter may have queued the assign
+        // of its partition: applied before the dead letter is tracked, or the
+        // next pass would drop its tracker entry.
+        state.apply_rebalance_events(consumer)?;
+        let assignment = state.tracker.track_received(msg.partition(), msg.offset());
+        let record = DrainRecord {
+            partition: msg.partition(),
+            offset: msg.offset(),
+            epoch: assignment.epoch,
+            #[cfg(feature = "kafka-schema-registry")]
+            revoked: assignment.revoked,
+            // perf-K-5: decoded from the message itself, with no copy.
+            payload: msg.payload().unwrap_or_default(),
+            headers: extract_string_headers(msg),
+            coordinates: RecordCoordinates::of(msg),
+        };
+
+        // Before the size gate, exactly as on the main loop: the histogram
+        // describes what arrived on the wire, so the payload the gate is about
+        // to discard is precisely the sample an operator sizing
+        // `max_message_size` needs.
+        metrics::record_message_size(&self.topic, self.group.as_deref(), record.payload.len());
+
+        // sec-K-7: honor options.max_message_size (same as the main consumer)
+        // instead of the DEFAULT_MAX_MESSAGE_SIZE constant. None means no
+        // limit.
+        if let Some(max) = self.max_message_size
+            && record.payload.len() > max
+        {
+            tracing::warn!(
+                bytes = record.payload.len(),
+                max,
+                dlq,
+                "oversized DLQ message — discarding"
+            );
+            state.complete(&record);
+            return Ok(DrainPass::Next);
+        }
+
+        // Deserialize payload; on failure, log and commit anyway. With a
+        // schema registry configured, the registry decode stage runs in place
+        // of the direct codec decode. The DLQ consumer never re-publishes: an
+        // undecodable dead message is logged and committed past.
+        #[cfg(feature = "kafka-schema-registry")]
+        let staged = match self.schema_registry.as_ref() {
+            Some(registry) => {
+                self.decode_with_registry(consumer, state, &record, registry)
+                    .await?
+            }
+            None => self.decode_direct(record.payload),
+        };
+        #[cfg(not(feature = "kafka-schema-registry"))]
+        let staged = self.decode_direct(record.payload);
+        let message = match staged {
+            Staged::Ready(message) => message,
+            Staged::Drop(..) => {
+                state.complete(&record);
+                return Ok(DrainPass::Next);
+            }
+            Staged::Stop => return Ok(DrainPass::Stop),
+            Staged::Revoked => return Ok(DrainPass::Next),
+        };
+
+        let metadata = build_dead_metadata(&record.headers, record.coordinates);
+        let called = guarded(
+            self.handler.handle_dead(message, metadata, &self.ctx),
+            Some(self.handler_timeout),
+        )
+        .await;
+        match called {
+            Guarded::Done(()) => {}
+            Guarded::Panicked => tracing::warn!(
+                dlq,
+                partition = record.partition,
+                offset = record.offset,
+                "handle_dead panicked; committing the dead letter anyway"
+            ),
+            Guarded::TimedOut(limit) => tracing::warn!(
+                dlq,
+                partition = record.partition,
+                offset = record.offset,
+                ?limit,
+                "handle_dead timed out; committing the dead letter anyway"
+            ),
+        }
+        state.complete(&record);
+        Ok(DrainPass::Next)
+    }
+
+    /// Decodes a dead letter's payload with the topic's codec.
+    fn decode_direct(&self, payload: &[u8]) -> Staged<T::Message> {
+        match <T::Codec as crate::Codec<T::Message>>::decode(payload) {
+            Ok(message) => Staged::Ready(message),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    dlq = self.dlq,
+                    "failed to deserialize DLQ message, acking anyway"
+                );
+                Staged::Drop(metrics::FailReason::Deserialize, "deserialization_error")
+            }
+        }
+    }
+
+    /// Decodes a dead letter's payload through the schema registry. A registry
+    /// outage stalls the drain the same way it stalls a consumer, instead of
+    /// acking the dead message away unread; a stop mid-lookup ends the drain
+    /// with the dead message uncommitted, and so does a revoke of its
+    /// partition during the stall.
+    #[cfg(feature = "kafka-schema-registry")]
+    async fn decode_with_registry(
+        &self,
+        consumer: &Arc<KafkaStreamConsumer>,
+        state: &mut DrainState,
+        record: &DrainRecord<'_>,
+        registry: &Arc<SchemaRegistry>,
+    ) -> Result<Staged<T::Message>> {
+        let dlq = self.dlq;
+        let codec_name = <T::Codec as crate::Codec<T::Message>>::NAME;
+        // The drain holds the pause through a stall itself, see
+        // `RegistryStall::inside_pause`.
+        let mut stall = RegistryStall::inside_pause(true);
+        let staged = loop {
+            let decoded = match WireFormat::from_codec_name(codec_name) {
+                Some(format) => {
+                    let Some(decoded) = decode_or_shutdown(
+                        registry_decode::<T::Message, T::Codec>(
+                            registry,
+                            format,
+                            self.schema_enforcement,
+                            &self.schema_accepted,
+                            self.schema_message_index.as_deref(),
+                            self.lookup_bound,
+                            record.payload,
+                        ),
+                        &self.shutdown,
+                    )
+                    .await
+                    else {
+                        break Staged::Stop;
+                    };
+                    decoded
+                }
+                None => {
+                    tracing::error!(
+                        codec = codec_name,
+                        dlq,
+                        "codec has no Confluent wire format; acking dead message anyway"
+                    );
+                    Ok(RegistryDecode::Dlq("schema_unsupported_codec"))
+                }
+            };
+            match decoded {
+                Ok(RegistryDecode::Decoded(message)) => break Staged::Ready(message),
+                Ok(RegistryDecode::Dlq(reason)) => {
+                    tracing::error!(
+                        reason,
+                        dlq,
+                        "schema decode rejected dead message, acking anyway"
+                    );
+                    break Staged::Drop(metrics::FailReason::for_schema_reason(reason), reason);
+                }
+                Ok(RegistryDecode::Unavailable { id, error }) => {
+                    pause_for_wait(consumer, &mut state.paused)?;
+                    if !stall
+                        .wait(
+                            consumer,
+                            &self.shutdown,
+                            None,
+                            &self.topic,
+                            self.group.as_deref(),
+                            dlq,
+                            id,
+                            &error,
+                        )
+                        .await?
+                    {
+                        break Staged::Stop;
+                    }
+                    // The wait polled `recv()`, inside which a revoke of the
+                    // dead letter's partition cancels its token: read before
+                    // the decode is retried.
+                    match after_wait(&self.shutdown, Some(&record.revoked)) {
+                        AfterWait::Dispatch => {}
+                        AfterWait::Stop => break Staged::Stop,
+                        AfterWait::Revoked => break Staged::Revoked,
+                    }
+                    // An outage can last: commit between its retries.
+                    state.commit_due(consumer, dlq)?;
+                }
+                // A deployment fault, not an outage: stop instead of waiting
+                // on it.
+                Err(e @ ShoveError::Topology(_)) => return Err(e),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        dlq,
+                        "failed to deserialize DLQ message, acking anyway"
+                    );
+                    break Staged::Drop(metrics::FailReason::Deserialize, "deserialization_error");
+                }
+            }
+        };
+        stall.end(consumer)?;
+        Ok(staged)
     }
 }
 
@@ -10105,19 +10592,20 @@ impl KafkaConsumer {
     /// The drain hard-codes `earliest` for its group, and that policy applies
     /// only while the group has no usable committed offset: a fresh drain can
     /// never skip a dead letter the operator opted in to keep, and a restarted
-    /// drain resumes from its commit. It commits each dead letter as it
-    /// settles, so there is no commit policy to set: neither an interval nor
-    /// a per-record policy. Neither `with_auto_offset_reset` nor
-    /// `with_commit_policy` (or its shorthand `with_commit_interval`) would
-    /// change anything, and a setting that changes nothing is refused rather
-    /// than dropped: the FIFO consumer's policy, applied on every path. The
-    /// message names the entry point, as `refuse_broadcast_start` does.
+    /// drain resumes from its commit. It commits on the fixed default
+    /// interval, as the FIFO consumer does, so there is no commit policy to
+    /// set: neither an interval nor a per-record policy. Neither
+    /// `with_auto_offset_reset` nor `with_commit_policy` (or its shorthand
+    /// `with_commit_interval`) would change anything, and a setting that
+    /// changes nothing is refused rather than dropped: the FIFO consumer's
+    /// policy, applied on every path. The message names the entry point, as
+    /// `refuse_broadcast_start` does.
     fn check_dlq_options(queue: &str, dlq: &str, options: &ConsumerOptions) -> Result<()> {
         if options.kafka_commit_policy.is_some() {
             return Err(ShoveError::Topology(format!(
                 "topic '{queue}': `with_commit_policy` and `with_commit_interval` do not apply \
-                 to the dead-letter drain of '{dlq}', which commits each dead letter as it \
-                 settles; `KafkaConsumer::run_dlq` never reads them. Drop the call."
+                 to the dead-letter drain of '{dlq}', which commits on the fixed default \
+                 interval; `KafkaConsumer::run_dlq` never reads them. Drop the call."
             )));
         }
         if options.kafka_auto_offset_reset.is_some() {
@@ -10807,7 +11295,8 @@ impl KafkaConsumer {
     /// Public DLQ entrypoint with default options. Equivalent to
     /// [`run_dlq_with_options`](Self::run_dlq_with_options) with
     /// `ConsumerOptions::new()`; kept for callers who don't need to thread
-    /// per-consumer options into the DLQ loop.
+    /// per-consumer options into the DLQ loop. It runs until the client is
+    /// closed.
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
@@ -10821,6 +11310,54 @@ impl KafkaConsumer {
     /// loop. Use [`ConsumerOptions::<Kafka>::with_group_id`] here to drain the
     /// DLQ under a custom group (`{group}-dlq`) so two independent services
     /// draining the same DLQ topic do not compete for its partitions.
+    ///
+    /// The drain reads these options:
+    ///
+    /// - `with_shutdown` ends the drain once the dead letter in hand has
+    ///   settled, and so does closing the client, whatever the token holds.
+    /// - `with_handler_timeout` bounds each `handle_dead` call. When it is
+    ///   disabled with `without_handler_timeout`, the call is bounded by
+    ///   [`DEFAULT_HANDLER_TIMEOUT`](crate::DEFAULT_HANDLER_TIMEOUT).
+    /// - `with_max_message_size` gates the dead letters. One over the limit is
+    ///   logged and committed without reaching `handle_dead`.
+    /// - `with_group_id` rebases the drain's group, `{group}-dlq`.
+    /// - `with_consumer_group` labels the size sample of the drain.
+    /// - The schema registry options decode the dead letters through the
+    ///   registry.
+    ///
+    /// # Handler calls
+    ///
+    /// `handle_dead` runs on the drain's own task, one dead letter at a time,
+    /// under panic isolation and the handler timeout. A call that panics or
+    /// outlasts the timeout is logged at warn level and does not stop the
+    /// drain, and its dead letter is committed all the same, as it is after a
+    /// call that returns. Nothing polls while the call runs, so keep the
+    /// timeout below `max.poll.interval.ms`, five minutes. A `handle_dead`
+    /// call moves no consumed, in-flight, duration or failed metric under the
+    /// source topic. The series the drain does record are
+    /// `shove_message_size_bytes` for each dead letter, and
+    /// `shove_messages_failed_total{reason="schema_unavailable"}` for each
+    /// registry wait.
+    ///
+    /// # Commits
+    ///
+    /// The drain commits as the sequenced consumer does: at most once per
+    /// 500 ms, one commit at a time on a thread of its own while the drain
+    /// goes on, and offered again when the coordinator rejects it. Its
+    /// commits are fixed, so `with_commit_interval`, `with_commit_policy` and
+    /// `with_auto_offset_reset` are refused. A stop makes one synchronous
+    /// final commit of every position, and closes the consumer, both on a
+    /// thread of its own.
+    ///
+    /// # Errors
+    ///
+    /// A topology problem is returned before any dead letter is read: a DLQ
+    /// topic that does not exist on an external topology, or an option the
+    /// drain refuses. A stop whose final commit the broker does not confirm
+    /// returns `ShoveError::Commit`, as it does for every consume loop. A fault
+    /// the drain cannot ride out closes its consumer, waits for the close, and
+    /// reconnects; an error no reconnect gets past, such as a schema registry
+    /// deployment fault, ends the drain with that error.
     ///
     /// [`ConsumerOptions`]: crate::ConsumerOptions
     /// [`ConsumerOptions::<Kafka>::with_group_id`]: crate::ConsumerOptions::with_group_id
@@ -10865,299 +11402,73 @@ impl KafkaConsumer {
         // `ConsumerOptions::<Kafka>::with_group_id`) by rebasing the DLQ group
         // onto it as `{group}-dlq`, so a custom group does not re-collide on
         // the default `{dlq}-consumer`. `None` keeps that default.
-        let dlq_group_id = match options.kafka_group_id.as_deref() {
+        let group_id = match options.kafka_group_id.as_deref() {
             Some(base) => super::constants::dlq_group_id_from_base(base),
             None => super::constants::dlq_consumer_group_id(dlq),
         };
-        let shutdown = self.client.shutdown_token();
-        let handler = Arc::new(handler);
-        let ctx = Arc::new(ctx);
-        let client = self.client.clone();
-        // sec-K-7: respect the same max_message_size the main consumer uses
-        // rather than the DEFAULT_MAX_MESSAGE_SIZE constant.
-        let max_message_size = options.max_message_size;
-        // `shove_message_size_bytes` labels a DLQ drain with the SOURCE topic,
-        // not the DLQ name, and with whatever `consumer_group` the main loop
-        // for this topic would carry — never the internal `{dlq}-consumer`
-        // group id below. Two reasons the label must not switch to `dlq`:
-        // Redis already drains its DLQ through `run_stream_loop`, which
-        // labels every metric `topology.queue()` whichever stream it is
-        // reading, so a DLQ name here would make `topic` mean two different
-        // things depending on the backend; and a per-topic size profile is
-        // only summable across the main and DLQ paths if both carry the same
-        // label. The DLQ drain stays distinguishable through the metrics that
-        // exist to name it (`shove_messages_discarded_total`, the DLQ backlog
-        // gauge) rather than by overloading `topic` here.
-        let topic: Arc<str> = Arc::from(topology.queue());
-        let group: Option<Arc<str>> = options.consumer_group.clone();
-
-        #[cfg(feature = "kafka-schema-registry")]
-        let schema_registry = options.schema_registry.clone();
-        #[cfg(feature = "kafka-schema-registry")]
-        let schema_enforcement = options.schema_enforcement;
-        #[cfg(feature = "kafka-schema-registry")]
-        let schema_accepted: Arc<[Arc<str>]> = options
-            .schema_accepted_subjects
-            .clone()
-            .map(Arc::from)
-            .unwrap_or_else(|| Arc::from(vec![default_subject(dlq)]));
-        #[cfg(feature = "kafka-schema-registry")]
-        let schema_message_index: Option<Arc<[i32]>> =
-            options.schema_message_index.clone().map(Arc::from);
+        // The drain stops on the token of its options or on the client's, so
+        // closing the client ends a drain whose token nothing cancels. The
+        // token of the options goes first: a stop through it reaches the
+        // drain at once.
+        let (shutdown, _forwarder) =
+            cancelled_by_either(&options.shutdown, &self.client.shutdown_token());
+        let drain = DlqDrain::<T, H> {
+            handler,
+            ctx,
+            client: self.client.clone(),
+            dlq,
+            group_id,
+            // `shove_message_size_bytes` labels a DLQ drain with the SOURCE
+            // topic, not the DLQ name, and with whatever `consumer_group` the
+            // main loop for this topic would carry — never the internal
+            // `{dlq}-consumer` group id above. Two reasons the label must not
+            // switch to `dlq`: Redis already drains its DLQ through
+            // `run_stream_loop`, which labels every metric `topology.queue()`
+            // whichever stream it is reading, so a DLQ name here would make
+            // `topic` mean two different things depending on the backend; and
+            // a per-topic size profile is only summable across the main and
+            // DLQ paths if both carry the same label. The DLQ drain stays
+            // distinguishable through the metrics that exist to name it
+            // (`shove_messages_discarded_total`, the DLQ backlog gauge) rather
+            // than by overloading `topic` here.
+            topic: Arc::from(topology.queue()),
+            group: options.consumer_group.clone(),
+            shutdown,
+            max_message_size: options.max_message_size,
+            handler_timeout: options.handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT),
+            fence_timeout: fence_threshold_over(fence_floor(&options), ASYNC_COMMIT_INTERVAL),
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_registry: options.schema_registry.clone(),
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_enforcement: options.schema_enforcement,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_accepted: options
+                .schema_accepted_subjects
+                .clone()
+                .unwrap_or_else(|| vec![default_subject(dlq)]),
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: options.schema_message_index.clone(),
+            #[cfg(feature = "kafka-schema-registry")]
+            lookup_bound: registry_lookup_bound(MAX_POLL_INTERVAL_MS),
+            _topic: PhantomData,
+        };
 
         startup::verify(
-            &client,
+            &drain.client,
             topology,
             startup::Path::DeadLetterDrain,
-            &shutdown,
+            &drain.shutdown,
             None,
         )
         .await?;
 
-        tracing::info!(dlq, group_id = dlq_group_id, "Kafka DLQ consumer started");
+        tracing::info!(
+            dlq,
+            group_id = drain.group_id.as_str(),
+            "Kafka DLQ consumer started"
+        );
 
-        run_with_reconnect(&shutdown, dlq, None, None, || {
-            let handler = handler.clone();
-            let ctx = ctx.clone();
-            let client_clone = client.clone();
-            let shutdown = shutdown.clone();
-            let dlq_group_id = dlq_group_id.clone();
-            let topic = topic.clone();
-            let group = group.clone();
-            #[cfg(feature = "kafka-schema-registry")]
-            let schema_registry = schema_registry.clone();
-            #[cfg(feature = "kafka-schema-registry")]
-            let schema_accepted = schema_accepted.clone();
-            #[cfg(feature = "kafka-schema-registry")]
-            let schema_message_index = schema_message_index.clone();
-            async move {
-                // The drain hard-codes `earliest` for its group, and that
-                // group id is stable across restarts (`dlq_group_id` above).
-                // librdkafka consults the policy only for a group with no
-                // usable committed offset, so a fresh drain starts at the
-                // earliest retained offset and a tail-only join can never
-                // skip a dead letter the operator opted in to keep, while a
-                // restarted drain resumes from its commit. The main
-                // consumer's `auto_offset_reset` override never reaches
-                // here: `check_dlq_options` refuses it for the drain.
-                //
-                // The DLQ loop commits per message via commit_message and
-                // keeps no offset tracker. It drains the rebalance events for
-                // the assigns among them alone: the drain holds no pause of
-                // its own outside a registry stall, so every assign resumes
-                // the whole assignment, and a partition revoked during a
-                // stall and handed back after it does not stay paused; see
-                // `reconcile_pause_after_assign`.
-                let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
-                let consumer = create_stream_consumer(
-                    client_clone.base_config(),
-                    &dlq_group_id,
-                    KafkaAutoOffsetReset::Earliest,
-                    MAX_POLL_INTERVAL_MS,
-                    dlq,
-                    rebalance_tx,
-                    AssignmentTokens::default(),
-                    #[cfg(feature = "kafka-msk-iam")]
-                    client_clone.msk_context(),
-                )?;
-                consumer
-                    .subscribe(&[dlq])
-                    .map_err(|e| map_kafka_error("failed to subscribe to DLQ", e))?;
-                // Wakes an idle drain, so an assign is reconciled with no
-                // record to bring it.
-                let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
-                housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-                loop {
-                    reconcile_pause_after_assign(
-                        &consumer,
-                        false,
-                        drain_batch_rebalance_events(&rebalance_rx).assigned,
-                    )?;
-                    tokio::select! {
-                        _ = shutdown.cancelled() => {
-                            tracing::info!(dlq, "shutdown signal received, stopping DLQ consumer");
-                            return Ok(());
-                        }
-                        _ = housekeeping.tick() => {}
-                        msg_result = consumer.recv() => {
-                            let msg = match msg_result {
-                                Ok(msg) => msg,
-                                Err(e) if recv_error_is_transient(consumer.transport_gate(), &e) => {
-                                    log_transient_recv_error(dlq, &e);
-                                    continue;
-                                }
-                                Err(e) => {
-                                    tracing::error!(error = %e, dlq, "DLQ consumer recv error");
-                                    return Err(map_kafka_error(
-                                        &format!("DLQ consumer recv error on {dlq}"),
-                                        e,
-                                    ));
-                                }
-                            };
-                            // The poll that delivered the record may have
-                            // queued an assign; reconciled before a stall can
-                            // start on the record.
-                            reconcile_pause_after_assign(
-                                &consumer,
-                                false,
-                                drain_batch_rebalance_events(&rebalance_rx).assigned,
-                            )?;
-
-                            // perf-K-5: msg lives through commit_message at the end of this
-                            // iteration and we never spawn — decode from msg.payload() directly
-                            // instead of allocating a Vec<u8> copy.
-                            let payload_bytes = msg.payload().unwrap_or_default();
-                            let headers = extract_string_headers(&msg);
-
-                            // Before the size gate, exactly as on the main loop: the
-                            // histogram describes what arrived on the wire, so the
-                            // payload the gate is about to discard is precisely the
-                            // sample an operator sizing `max_message_size` needs.
-                            metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
-
-                            // sec-K-7: honor options.max_message_size (same as the main
-                            // consumer) instead of the DEFAULT_MAX_MESSAGE_SIZE constant.
-                            // None means no limit.
-                            if let Some(max) = max_message_size
-                                && payload_bytes.len() > max
-                            {
-                                tracing::warn!(
-                                    bytes = payload_bytes.len(),
-                                    max,
-                                    dlq,
-                                    "oversized DLQ message — discarding"
-                                );
-                                consumer.commit_message(&msg, CommitMode::Async).ok();
-                                continue;
-                            }
-
-                            // Deserialize payload; on failure, log and ack anyway.
-                            // With a schema registry configured, the registry decode
-                            // stage runs in place of the direct codec decode. The DLQ
-                            // consumer never re-publishes — an undecodable dead message
-                            // is logged and acked, exactly as before. Without a registry
-                            // the direct decode path is unchanged.
-                            #[cfg(feature = "kafka-schema-registry")]
-                            let payload: T::Message = if let Some(registry) = schema_registry.as_ref() {
-                                let codec_name = <T::Codec as crate::Codec<T::Message>>::NAME;
-                // A registry outage stalls the drain the same way it stalls
-                                // a consumer, instead of acking the dead message away
-                                // unread; a shutdown mid-lookup ends the drain with the
-                                // dead message uncommitted.
-                                let accepted: &[Arc<str>] = &schema_accepted;
-                                let message_index = schema_message_index.as_deref();
-                                let lookup_bound = registry_lookup_bound(MAX_POLL_INTERVAL_MS);
-                                let shutdown = &shutdown;
-                                let decode_once = || async move {
-                                    match WireFormat::from_codec_name(codec_name) {
-                                        Some(fmt) => {
-                                            decode_or_shutdown(
-                                                registry_decode::<T::Message, T::Codec>(
-                                                    registry,
-                                                    fmt,
-                                                    schema_enforcement,
-                                                    accepted,
-                                                    message_index,
-                                                    lookup_bound,
-                                                    payload_bytes,
-                                                ),
-                                                shutdown,
-                                            )
-                                            .await
-                                        }
-                                        None => {
-                                            tracing::error!(
-                                                codec = codec_name,
-                                                dlq,
-                                                "codec has no Confluent wire format; acking dead message anyway"
-                                            );
-                                            Some(Ok(RegistryDecode::Dlq("schema_unsupported_codec")))
-                                        }
-                                    }
-                                };
-                                let mut stall = RegistryStall::default();
-                                let staged = loop {
-                                    match decode_once().await {
-                                        None => break Staged::Stop,
-                                        Some(Ok(RegistryDecode::Decoded(m))) => break Staged::Ready(m),
-                                        Some(Ok(RegistryDecode::Dlq(reason))) => {
-                                            tracing::error!(
-                                                reason,
-                                                dlq,
-                                                "schema decode rejected dead message, acking anyway"
-                                            );
-                                            break Staged::Drop(metrics::FailReason::for_schema_reason(reason), reason);
-                                        }
-                                        Some(Ok(RegistryDecode::Unavailable { id, error })) => {
-                                            if !stall
-                                                .wait(&consumer, shutdown, None, &topic, group.as_deref(), dlq, id, &error)
-                                                .await?
-                                            {
-                                                break Staged::Stop;
-                                            }
-                                        }
-                                        Some(Err(e @ ShoveError::Topology(_))) => return Err(e),
-                                        Some(Err(e)) => {
-                                            tracing::error!(
-                                                error = %e,
-                                                dlq,
-                                                "failed to deserialize DLQ message, acking anyway"
-                                            );
-                                            break Staged::Drop(metrics::FailReason::Deserialize, "deserialization_error");
-                                        }
-                                    }
-                                };
-                                stall.end(&consumer)?;
-                                match staged {
-                                    Staged::Ready(m) => m,
-                                    Staged::Drop(..) => {
-                                        consumer.commit_message(&msg, CommitMode::Async).ok();
-                                        continue;
-                                    }
-                                    Staged::Stop | Staged::Revoked => continue,
-                                }
-                            } else {
-                                match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        tracing::error!(
-                                            error = %e,
-                                            dlq,
-                                            "failed to deserialize DLQ message, acking anyway"
-                                        );
-                                        consumer.commit_message(&msg, CommitMode::Async).ok();
-                                        continue;
-                                    }
-                                }
-                            };
-
-                            #[cfg(not(feature = "kafka-schema-registry"))]
-                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        dlq,
-                                        "failed to deserialize DLQ message, acking anyway"
-                                    );
-                                    consumer.commit_message(&msg, CommitMode::Async).ok();
-                                    continue;
-                                }
-                            };
-
-                            let metadata = build_dead_metadata(&headers, RecordCoordinates::of(&msg));
-                            handler.handle_dead(payload, metadata, ctx.as_ref()).await;
-
-                            if let Err(e) = consumer.commit_message(&msg, CommitMode::Async) {
-                                tracing::error!(error = %e, dlq, "failed to commit DLQ message");
-                            }
-                        }
-                    }
-                }
-            }
-        })
-        .await
+        run_with_reconnect(&drain.shutdown, dlq, None, None, || drain.run_connection()).await
     }
 }
 
@@ -14285,7 +14596,8 @@ mod stop_drain_tests {
     }
 }
 
-/// [`guarded`]: the call guard under every handler invocation.
+/// [`guarded`]: the call guard under every handler invocation, the DLQ
+/// drain's `handle_dead` included.
 #[cfg(test)]
 mod guarded_tests {
     use super::*;
@@ -14330,6 +14642,58 @@ mod guarded_tests {
         )
         .await;
         assert!(matches!(call, Guarded::Done(7)));
+    }
+}
+
+/// [`cancelled_by_either`]: the token the DLQ drain stops on.
+#[cfg(test)]
+mod either_token_tests {
+    use super::*;
+
+    async fn fires(token: &CancellationToken) -> bool {
+        tokio::time::timeout(Duration::from_secs(1), token.cancelled())
+            .await
+            .is_ok()
+    }
+
+    /// The first token reaches the merged one in the same step, so a stop
+    /// requested through it takes effect before anything else runs.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_token_fires_it_at_once() {
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        let (merged, _guard) = cancelled_by_either(&first, &second);
+        assert!(!fires(&merged).await, "nothing has fired yet");
+        first.cancel();
+        assert!(merged.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_second_token_fires_it_through_the_forwarder() {
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        let (merged, _guard) = cancelled_by_either(&first, &second);
+        second.cancel();
+        assert!(fires(&merged).await);
+        assert!(!first.is_cancelled(), "the first token is left alone");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_token_that_has_fired_already_fires_it_at_once() {
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        second.cancel();
+        let (merged, _guard) = cancelled_by_either(&first, &second);
+        assert!(merged.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_guard_ends_only_the_forwarding() {
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        let (merged, guard) = cancelled_by_either(&first, &second);
+        drop(guard);
+        tokio::task::yield_now().await;
+        second.cancel();
+        assert!(!fires(&merged).await, "no task is left to forward it");
+        first.cancel();
+        assert!(merged.is_cancelled(), "the first token needs no task");
     }
 }
 
@@ -14720,7 +15084,7 @@ mod broadcast_option_guard_tests {
         assert!(msg.contains("KafkaConsumer::run_dlq"), "{msg}");
     }
 
-    /// The DLQ drain commits each dead letter as it settles, so a commit
+    /// The DLQ drain commits on the fixed default interval, so a commit
     /// interval would be read by nothing: refused, the FIFO policy. The
     /// client's token is cancelled first so a regression fails fast instead
     /// of reconnecting forever, because the drain's loop passes no attempt
@@ -14746,7 +15110,7 @@ mod broadcast_option_guard_tests {
     }
 
     /// A per-record policy is refused on the same ground as the interval:
-    /// the drain commits each dead letter as it settles, so neither policy
+    /// the drain commits on the fixed default interval, so neither policy
     /// would change anything there.
     #[tokio::test]
     async fn run_dlq_rejects_a_per_record_commit_policy() {
@@ -14811,6 +15175,32 @@ mod broadcast_option_guard_tests {
             )
             .await
             .expect("the drain reads the group id and the size cap, so both pass its guards");
+    }
+
+    /// The token of the options stops the drain as the client's does: with
+    /// only the options' token fired, the drain returns from its first
+    /// `select!`, before the missing broker matters. The bound makes a
+    /// regression fail instead of reconnecting forever.
+    #[tokio::test]
+    async fn run_dlq_stops_on_the_token_of_its_options() {
+        let consumer = consumer().await;
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            consumer.run_dlq_with_options::<WithDlq, _>(
+                NoopHandler,
+                (),
+                crate::ConsumerOptions::<Kafka>::new().with_shutdown(shutdown),
+            ),
+        )
+        .await
+        .expect("a fired options token stops the drain")
+        .expect("the stop is clean");
+        assert!(
+            !consumer.client.shutdown_token().is_cancelled(),
+            "the client's token was never fired"
+        );
     }
 
     /// A broadcast subscription commits nothing, so a commit interval would
