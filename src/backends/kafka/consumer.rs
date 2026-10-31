@@ -1776,11 +1776,16 @@ pub mod permit_wait_probe {
 /// takes this waiter off the registry client's single-flight entry (see
 /// `SchemaRegistry::resolve`), and a fetch nobody waits on any more is
 /// dropped with it. Each caller decides what its loop does next; every one
-/// leaves the record in hand uncommitted.
+/// leaves the record in hand uncommitted. A stop that has fired already is
+/// read before the select is armed, so the decode is not polled and no
+/// waiter is registered with the token.
 async fn decode_or_shutdown<F, T>(decode: F, shutdown: &CancellationToken) -> Option<T>
 where
     F: Future<Output = T>,
 {
+    if shutdown.is_cancelled() {
+        return None;
+    }
     tokio::select! {
         biased;
         _ = shutdown.cancelled() => None,
@@ -7581,6 +7586,9 @@ struct FifoLoop<T: Topic, H: MessageHandler<T>> {
     /// The fenced consumer detector's threshold, see [`fence_threshold_over`],
     /// for the fixed default interval the loop commits on.
     fence_timeout: Duration,
+    /// A child of the options' token, the loop's own: the futures its waits
+    /// arm register with it alone, not with the token every loop of a group
+    /// shares.
     shutdown: CancellationToken,
     processing: Arc<AtomicBool>,
     max_retries: u32,
@@ -8996,7 +9004,8 @@ impl KafkaConsumer {
             let ctx = ctx.clone();
             let client = client.clone();
             let processing = processing.clone();
-            let shutdown = shutdown.clone();
+            // The connection's own token, so its waits do not contend on the shared one.
+            let shutdown = shutdown.child_token();
             let group_id = group_id.clone();
             let semaphore = semaphore.clone();
             let in_place_waiters = in_place_waiters.clone();
@@ -10242,7 +10251,8 @@ impl KafkaConsumer {
             let handler = handler.clone();
             let ctx = ctx.clone();
             let client = client.clone();
-            let shutdown = shutdown.clone();
+            // The connection's own token, so its waits do not contend on the shared one.
+            let shutdown = shutdown.child_token();
             let group_id = group_id.clone();
             let topic = topic.clone();
             let group = group.clone();
@@ -10847,7 +10857,7 @@ impl KafkaConsumer {
             max_poll_interval_ms,
             fetch_queue: options.kafka_fetch_queue,
             fence_timeout,
-            shutdown: options.shutdown.clone(),
+            shutdown: options.shutdown.child_token(),
             processing: options.processing.clone(),
             max_retries: options.max_retries,
             handler_timeout: options.handler_timeout,
@@ -11150,7 +11160,8 @@ impl KafkaConsumer {
             let ctx = ctx.clone();
             let client = client.clone();
             let processing = processing.clone();
-            let shutdown = shutdown.clone();
+            // The connection's own token, so its waits do not contend on the shared one.
+            let shutdown = shutdown.child_token();
             let group_id = group_id.clone();
             let semaphore = semaphore.clone();
             let topic = topic.clone();
