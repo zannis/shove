@@ -525,8 +525,10 @@ impl PartitionTracker {
 /// rebalance events only on its housekeeping ticks, under `Interval`, or not
 /// at all until that wait ends, so the callback is the one place a revoke
 /// reaches the wait from at once. `OffsetTracker::remove` cancels as a
-/// backstop when the loop drains the event. The mutex is held for a map
-/// operation only, never across an await. Loops that keep no tracker pass
+/// backstop when the loop drains the event. The batch loop takes a token
+/// only for a record its schema registry stall holds, see
+/// `OffsetTracker::assignment_token`. The mutex is held for a map operation
+/// only, never across an await. Loops that keep no tracker pass
 /// `create_stream_consumer` a map nothing reads.
 type AssignmentTokens = Arc<std::sync::Mutex<HashMap<i32, CancellationToken>>>;
 
@@ -599,19 +601,26 @@ impl OffsetTracker {
     /// and gives it a fresh revoke token.
     fn track_received(&mut self, partition: i32, offset: i64) -> Assignment {
         let epoch = self.track_epoch(partition, offset);
-        let revoked = self
-            .assignments
+        let revoked = self.assignment_token(partition);
+        Assignment { epoch, revoked }
+    }
+
+    /// The revoke token of `partition`'s current assignment, created on the
+    /// first ask, see `AssignmentTokens`. A cancelled token leaves the map,
+    /// so a wait that must see a revoke keeps the token it took instead of
+    /// asking again.
+    fn assignment_token(&self, partition: i32) -> CancellationToken {
+        self.assignments
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(partition)
             .or_default()
-            .clone();
-        Assignment { epoch, revoked }
+            .clone()
     }
 
     /// [`track_received`](Self::track_received) with no revoke token: the
-    /// delivery's epoch alone, for the batch loop, which runs no wait a
-    /// revoke must reach.
+    /// delivery's epoch alone, for the batch loop, whose only wait a revoke
+    /// must reach is a schema registry stall, which takes the token itself.
     fn track_epoch(&mut self, partition: i32, offset: i64) -> u64 {
         match self.partitions.get_mut(&partition) {
             Some(tracker) => {
@@ -4543,8 +4552,8 @@ impl CommitSlot {
 
     /// The commit step of a pass, the same in every loop that commits
     /// through a slot: the concurrent receive loop, its permit wait, a
-    /// sequenced consumer's pass and waits, and the batch loop's pass. It
-    /// settles the answer of the
+    /// sequenced consumer's pass and waits, and the batch loop's pass and
+    /// schema registry stall. It settles the answer of the
     /// commit in flight if it came, applies the rebalance events, ends the
     /// member with [`fenced_error`] once a partition's commits have been
     /// rejected for `fence.threshold` with nothing resolving them (see
@@ -5186,6 +5195,34 @@ impl BatchState {
     /// [`apply_batch_rebalance`], so the step finds none of its own; an
     /// assign among them would re-apply the loop's pause intent all the same.
     fn pass(&mut self, consumer: &Arc<KafkaStreamConsumer>, queue: &str) -> Result<()> {
+        self.commit_step(consumer, queue, self.paused)
+    }
+
+    /// The commit step a schema registry stall runs between its retries, as
+    /// a sequenced consumer's stall does, so the positions the flush ahead
+    /// of the stalled record retired, and the ones a rebalance or a rejected
+    /// commit re-offers meanwhile, are committed however long the outage
+    /// runs. No commit passes the stalled record, which is tracked only once
+    /// it decodes. The step drains the rebalance events the stall's polls
+    /// served. The buffer is empty through the stall, so they abandon no
+    /// batch, and the stall reads a revoke of its record's partition off the
+    /// record's token. The stall holds the whole assignment paused, so an
+    /// assign among the events pauses it again; `RegistryStall::end` lifts
+    /// that pause.
+    #[cfg(feature = "kafka-schema-registry")]
+    fn stall_pass(&mut self, consumer: &Arc<KafkaStreamConsumer>, queue: &str) -> Result<()> {
+        self.commit_step(consumer, queue, true)
+    }
+
+    /// [`CommitSlot::pass`], then `paused`, the pause intent the caller
+    /// holds, re-applied when the events held an assign, see
+    /// [`reconcile_pause_after_assign`].
+    fn commit_step(
+        &mut self,
+        consumer: &Arc<KafkaStreamConsumer>,
+        queue: &str,
+        paused: bool,
+    ) -> Result<()> {
         let fence = Fence {
             threshold: self.fence_threshold,
             group_id: &self.group_id,
@@ -5197,7 +5234,7 @@ impl BatchState {
             fence,
             queue,
         )?;
-        reconcile_pause_after_assign(consumer, self.paused, assigned)
+        reconcile_pause_after_assign(consumer, paused, assigned)
     }
 
     /// Resumes the assignment a polling wait paused, if it did.
@@ -5340,7 +5377,8 @@ struct BatchDecodeCtx<'a> {
 /// is over: a record to buffer, or a pre-handler drop to park. The wait loop
 /// resolves `Unavailable` by waiting and `Fatal` by returning, so neither
 /// reaches the buffering step, and this type says so where an `unreachable!`
-/// arm used to.
+/// arm used to. A wait that sees its record's partition revoked ends with no
+/// stage at all, and the record is left to the partition's next owner.
 enum BatchStaged<M> {
     Decoded(M),
     Dlq {
@@ -6908,9 +6946,10 @@ fn assigned_partitions(consumer: &KafkaStreamConsumer, queue: &str) -> Option<BT
 ///
 /// An assign among the events re-applies the loop's pause intent over the
 /// whole assignment, see [`reconcile_pause_after_assign`]: the batch loop
-/// holds no pause of its own, and every drain runs outside the polling
-/// waits, a registry stall included, which pauses the assignment only for
-/// its own wait and lifts that pause in `RegistryStall::end`. A partition
+/// holds no pause of its own, and this drain runs outside the polling
+/// waits. A registry stall pauses the assignment for its own wait only: its
+/// pass drains the events there and keeps that pause on an assign, see
+/// `BatchState::stall_pass`, and `RegistryStall::end` lifts it. A partition
 /// revoked during a stall and handed back after it would otherwise come back
 /// paused and stay so.
 ///
@@ -9578,6 +9617,8 @@ impl KafkaConsumer {
                                     // never acked.
                                     #[cfg(feature = "kafka-schema-registry")]
                                     let mut rewound = false;
+                                    #[cfg(feature = "kafka-schema-registry")]
+                                    let mut revoke_token: Option<CancellationToken> = None;
                                     // Loops only through the registry wait arm, which
                                     // the `kafka-schema-registry` feature adds.
                                     #[allow(clippy::never_loop)]
@@ -9614,6 +9655,10 @@ impl KafkaConsumer {
                                             // so partition order holds.
                                             #[cfg(feature = "kafka-schema-registry")]
                                             BatchDecode::Unavailable { id, error } => {
+                                                // Once, and before the flush, whose polls can serve a revoke.
+                                                let revoked = revoke_token
+                                                    .get_or_insert_with(|| state.tracker.assignment_token(partition))
+                                                    .clone();
                                                 if !buffer.is_empty() {
                                                     let flushed = flush_batch(
                                                         &flush_ctx,
@@ -9652,17 +9697,33 @@ impl KafkaConsumer {
                                                     tracing::info!(queue, "shutdown signal received during a schema registry wait, batch consumer stopped");
                                                     return Ok(());
                                                 }
+                                                // An outage can last: commit between its retries.
+                                                state.stall_pass(&consumer, queue)?;
+                                                // Read after the pass, whose drain backs up the callback's cancel.
+                                                if revoked.is_cancelled() {
+                                                    tracing::debug!(
+                                                        queue,
+                                                        partition,
+                                                        offset,
+                                                        "partition revoked during a schema registry wait; the record is left to its next owner"
+                                                    );
+                                                    break None;
+                                                }
                                             }
                                             #[cfg(feature = "kafka-schema-registry")]
                                             BatchDecode::Fatal(e) => return Err(e),
-                                            BatchDecode::Decoded(m) => break BatchStaged::Decoded(m),
+                                            BatchDecode::Decoded(m) => break Some(BatchStaged::Decoded(m)),
                                             BatchDecode::Dlq { reason, fail } => {
-                                                break BatchStaged::Dlq { reason, fail };
+                                                break Some(BatchStaged::Dlq { reason, fail });
                                             }
                                         }
                                     };
                                     #[cfg(feature = "kafka-schema-registry")]
                                     stall.end(&consumer)?;
+                                    // `None`: the stall saw its record's partition revoked.
+                                    let Some(decoded) = decoded else {
+                                        continue;
+                                    };
                                     #[cfg(feature = "kafka-schema-registry")]
                                     if rewound {
                                         // The registry answers again and the
