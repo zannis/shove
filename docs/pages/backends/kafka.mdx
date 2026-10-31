@@ -772,11 +772,11 @@ What that means for replay:
 - After a clean shutdown, a record whose handler returned a terminal outcome and whose offset reached the final commit is not redelivered.
   A record whose handler had not settled when shutdown fired stays uncommitted and is redelivered.
   A record the consumer had fetched but not yet handed to a handler is not handled during the drain, and is redelivered too.
+  A partition a rebalance revokes during the drain is left out of the final commit, so it replays from its last accepted commit.
   When the final commit is rejected or hits its deadline, redelivery starts from the last position the broker accepted, and the member reports that with `ShoveError::Commit`.
   A commit request librdkafka abandoned on a coordinator reconnect can also be applied after the final one, as the commit section above describes.
   A coordinator hiccup overlapping the shutdown can therefore replay a few records.
-  A stop whose wait for the handlers failed makes no final commit, so every record completed since the last accepted commit is redelivered, and the member ends with the error that failed the wait.
-  A partition revoked during that wait is redelivered from its last accepted commit too.
+- After a stop whose wait for the handlers failed, no final commit is made, so every record completed since the last accepted commit is redelivered, and the member ends with the error that failed the wait.
 
 `Outcome::Reject` routes to the DLQ (if configured) and commits the offset; the original is not redelivered. Messages that exhaust `max_retries` follow the same DLQ-then-commit path.
 A dead letter that fails and may land later commits nothing.
