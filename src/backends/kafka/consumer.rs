@@ -517,7 +517,11 @@ impl PartitionTracker {
 /// under its current assignment, shared between the tracker and the
 /// rebalance callback. `OffsetTracker::track_received` creates the token when
 /// it seeds the partition and hands a clone to the handler task, whose
-/// in-place wait or delayed republish selects on it.
+/// in-place wait selects on it. Under `RetryStrategy::Republish` the
+/// concurrent loop tracks with `OffsetTracker::track_watched` instead, which
+/// makes the token alike and hands out none: the one wait there, a delayed
+/// republish, takes it through a [`RevokeWatch`] once a hold needs it, and
+/// the loop reads the same entry after a wait it polled through.
 /// `RebalanceContext::pre_rebalance` cancels and removes the token on
 /// `Revoke`, synchronously, inside the `recv()` poll that reported the
 /// revoke: with one permit, held by such a wait, the loop is parked in
@@ -528,9 +532,20 @@ impl PartitionTracker {
 /// backstop when the loop drains the event. The batch loop takes a token
 /// only for a record its schema registry stall holds, see
 /// `OffsetTracker::assignment_token`. The mutex is held for a map operation
-/// only, never across an await. Loops that keep no tracker pass
-/// `create_stream_consumer` a map nothing reads.
-type AssignmentTokens = Arc<std::sync::Mutex<HashMap<i32, CancellationToken>>>;
+/// only, never across an await, and a token leaves the map before it is
+/// cancelled, so a token still in the map is one no revoke has reached.
+/// Loops that keep no tracker pass `create_stream_consumer` a map nothing
+/// reads.
+type AssignmentTokens = Arc<std::sync::Mutex<HashMap<i32, AssignmentToken>>>;
+
+/// A partition's revoke token, and the epoch of the assignment it belongs
+/// to, see `OffsetTracker::epochs`: a lookup through a [`RevokeWatch`] tells
+/// by the epoch whether the token is still the one of its record's
+/// assignment, or of a later one.
+struct AssignmentToken {
+    epoch: u64,
+    token: CancellationToken,
+}
 
 /// Cancel and forget the tokens of `partitions`, so every in-place wait on
 /// them ends with `InPlaceEnd::Revoked`. The lock is released before the
@@ -543,10 +558,48 @@ fn cancel_assignments(assignments: &AssignmentTokens, partitions: &[i32]) {
         partitions
             .iter()
             .filter_map(|partition| map.remove(partition))
+            .map(|entry| entry.token)
             .collect()
     };
     for token in revoked {
         token.cancel();
+    }
+}
+
+/// Where the receive loop, and a handler task of it, read the revoke of a
+/// record tracked through `OffsetTracker::track_watched`: the token of the
+/// record's assignment is looked up in [`AssignmentTokens`] only when it is
+/// needed, after a wait the loop polled through and when the task waits out
+/// a hold, so a record that needs neither costs no token of its own.
+#[derive(Clone, Copy)]
+struct RevokeWatch<'a> {
+    assignments: &'a AssignmentTokens,
+    partition: i32,
+    epoch: u64,
+}
+
+impl RevokeWatch<'_> {
+    /// The token a revoke of the record's assignment cancels, or `None` once
+    /// that assignment is over: revoked, or followed by a later one.
+    fn token(&self) -> Option<CancellationToken> {
+        self.assignments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.partition)
+            .filter(|entry| entry.epoch == self.epoch)
+            .map(|entry| entry.token.clone())
+    }
+
+    /// Whether the record's assignment still stands, which [`token`]
+    /// answers without a clone.
+    ///
+    /// [`token`]: Self::token
+    fn stands(&self) -> bool {
+        self.assignments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.partition)
+            .is_some_and(|entry| entry.epoch == self.epoch)
     }
 }
 
@@ -610,12 +663,49 @@ impl OffsetTracker {
     /// so a wait that must see a revoke keeps the token it took instead of
     /// asking again.
     fn assignment_token(&self, partition: i32) -> CancellationToken {
+        let epoch = self.assignment_epoch(partition);
         self.assignments
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(partition)
-            .or_default()
+            .or_insert_with(|| AssignmentToken {
+                epoch,
+                token: CancellationToken::new(),
+            })
+            .token
             .clone()
+    }
+
+    /// The epoch of `partition`'s current assignment: the one its tracker
+    /// was seeded under, or, with no tracker, the one its next seed opens,
+    /// as a batch stall's record not yet tracked has it.
+    fn assignment_epoch(&self, partition: i32) -> u64 {
+        match self.partitions.get(&partition) {
+            Some(tracker) => tracker.epoch,
+            None => self
+                .epochs
+                .get(&partition)
+                .copied()
+                .unwrap_or(0)
+                .wrapping_add(1),
+        }
+    }
+
+    /// [`track_received`](Self::track_received) with no revoke token handed
+    /// out: the delivery's epoch. The partition's token is made as
+    /// `assignment_token` makes it, and a revoke cancels it as it cancels one
+    /// handed out; a [`RevokeWatch`] for the epoch reads it later.
+    fn track_watched(&mut self, partition: i32, offset: i64) -> u64 {
+        let epoch = self.track_epoch(partition, offset);
+        self.assignments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(partition)
+            .or_insert_with(|| AssignmentToken {
+                epoch,
+                token: CancellationToken::new(),
+            });
+        epoch
     }
 
     /// [`track_received`](Self::track_received) with no revoke token: the
@@ -1435,8 +1525,9 @@ fn is_unpublishable(e: &ShoveError) -> bool {
 /// (Ack, DLQ-terminal Retry/Reject), or from inside the delayed-republish
 /// spawn for Retry/Defer **after** the republish has actually landed. This
 /// closes the at-least-once gap that existed when the outer task signaled
-/// completion before the delayed publish had been attempted.
-type CompletionHandle = (mpsc::Sender<Completion>, i32, i64, u64);
+/// completion before the delayed publish had been attempted. The sender is
+/// borrowed from the loop's shared state, see [`Dispatch`].
+type CompletionHandle<'a> = (&'a mpsc::Sender<Completion>, i32, i64, u64);
 
 /// A finished delivery handed back to the offset tracker.
 struct Completion {
@@ -1509,7 +1600,7 @@ impl Completion {
 /// `survived`: undercounting an ambiguous retirement is safe, claiming one
 /// that did not happen is not.
 fn signal_completion(
-    handle: CompletionHandle,
+    handle: CompletionHandle<'_>,
     queue: &str,
     discard: Option<TerminalDiscard>,
 ) -> bool {
@@ -1905,7 +1996,7 @@ async fn dead_letter_and_complete(
     reason: &str,
     retry_count: u32,
     pending: metrics::PendingDiscard,
-    completion: CompletionHandle,
+    completion: CompletionHandle<'_>,
 ) -> Result<()> {
     let has_dlq = topology.dlq().is_some();
     let published =
@@ -1999,7 +2090,7 @@ async fn discard_pre_handler(
         dlq_reason,
         retry_count,
         pending,
-        (completion_tx.clone(), partition, offset, epoch),
+        (completion_tx, partition, offset, epoch),
     )
     .await
 }
@@ -2034,12 +2125,12 @@ async fn route_outcome(
     retry_count: u32,
     max_retries: u32,
     hold_queues: &[HoldQueue],
-    completion: CompletionHandle,
+    completion: CompletionHandle<'_>,
     // A hold ends early on a graceful shutdown, instead of stalling
     // `acquire_many(prefetch)` until every delayed permit-holder finishes,
     // and on a revoke of the record's partition; see `run_delayed_republish`.
     shutdown: &CancellationToken,
-    revoked: &CancellationToken,
+    revoked: RevokeWatch<'_>,
     fault: &mpsc::Sender<ShoveError>,
 ) {
     match decide_retry(&outcome, retry_count, max_retries) {
@@ -2081,8 +2172,17 @@ async fn route_outcome(
             };
             let copy = headers_with_retry_count(headers, topic, count, hop);
             let delay = hold_delay(hold_queues, retry_count, increment);
+            let revoked = revoked.token();
             match run_delayed_republish(
-                client, topic, key, copy, payload, delay, shutdown, revoked, label,
+                client,
+                topic,
+                key,
+                copy,
+                payload,
+                delay,
+                shutdown,
+                revoked.as_ref(),
+                label,
             )
             .await
             {
@@ -2141,6 +2241,268 @@ fn terminal_fail_reason(reason: &str) -> metrics::FailReason {
     match reason {
         "rejected" => metrics::FailReason::Rejected,
         _ => metrics::FailReason::MaxRetriesExceeded,
+    }
+}
+
+/// What every handler task of one connection of the concurrent receive loop
+/// reads, built once per connection. Each task is handed it as one `Arc`, so
+/// dispatching a record clones that `Arc` and no handle of its own.
+struct Dispatch<T: Topic, H: MessageHandler<T>> {
+    handler: Arc<H>,
+    ctx: Arc<H::Context>,
+    client: KafkaClient,
+    topology: &'static QueueTopology,
+    topic: Arc<str>,
+    group: Option<Arc<str>>,
+    /// The consumer's busy flag.
+    processing: Arc<AtomicBool>,
+    /// The prefetch permits, `prefetch` of them.
+    semaphore: Arc<Semaphore>,
+    prefetch: u16,
+    /// Where a task hands its record's completion to the loop's tracker.
+    completions: mpsc::Sender<Completion>,
+    /// Where a task reports a fault that ends the loop, see `route_outcome`.
+    fault: mpsc::Sender<ShoveError>,
+    /// What every task's wait ends on: a child of the loop's stop, which the
+    /// loop's tail also cancels on a fatal exit.
+    shutdown: CancellationToken,
+    /// How many tasks wait out an in-place delay right now, see
+    /// `InPlaceWait`.
+    in_place_waiters: Arc<AtomicUsize>,
+    /// The revoke tokens of the loop's tracker, see [`RevokeWatch`].
+    assignments: AssignmentTokens,
+    max_retries: u32,
+    hold_queues: &'static [HoldQueue],
+    handler_timeout: Option<Duration>,
+    handler_timeout_outcome: Option<Outcome>,
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_registry: Option<Arc<SchemaRegistry>>,
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_enforcement: SchemaEnforcement,
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_accepted: Arc<[Arc<str>]>,
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_message_index: Option<Arc<[i32]>>,
+    #[cfg(feature = "kafka-schema-registry")]
+    lookup_bound: Duration,
+    _topic: PhantomData<fn() -> T>,
+}
+
+/// One record the receive loop hands a handler task, read off its message:
+/// the decoded message, what routing its outcome reads, and its permit.
+struct Dispatched<M> {
+    message: M,
+    metadata: MessageMetadata,
+    /// The wire bytes, which a redelivery decodes again and a copy carries.
+    payload: Vec<u8>,
+    key: Option<Bytes>,
+    headers: RecordHeaders,
+    coordinates: RecordCoordinates,
+    /// The epoch of the assignment the record was tracked under.
+    epoch: u64,
+    retry_count: u32,
+    /// Under `RetryStrategy::InPlace`, the revoke token every in-place wait
+    /// selects on. `None` under `Republish`, whose one wait, a delayed
+    /// republish, reads the revoke through a [`RevokeWatch`].
+    in_place: Option<CancellationToken>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl<T: Topic, H: MessageHandler<T>> Dispatch<T, H> {
+    /// The handler task of one record: the handler call, its in-place
+    /// redeliveries under `RetryStrategy::InPlace`, and the routing of the
+    /// outcome, the record's permit held throughout.
+    async fn run(self: Arc<Self>, record: Dispatched<T::Message>) {
+        let Dispatched {
+            message,
+            metadata,
+            payload,
+            key,
+            headers,
+            coordinates,
+            epoch,
+            retry_count,
+            in_place,
+            permit,
+        } = record;
+        let (partition, offset) = (coordinates.partition, coordinates.offset);
+        self.processing.store(true, Ordering::Release);
+
+        // Built inside the guard, so a handler that panics while it builds
+        // its future is caught as well.
+        let outcome = invoke_handler(
+            async {
+                self.handler
+                    .handle(message, metadata, self.ctx.as_ref())
+                    .await
+            },
+            self.handler_timeout,
+            self.handler_timeout_outcome.clone(),
+            &self.topic,
+            self.group.as_deref(),
+        )
+        .await;
+
+        // Under `RetryStrategy::InPlace` the Hold arms of `route_outcome`,
+        // which republish, are not taken: `Retry` and `Defer` are resolved
+        // here first, in place and holding the permit, and only a terminal
+        // outcome goes on to `route_outcome`.
+        let (outcome, retry_count) = match &in_place {
+            Some(revoked) => {
+                let decode = BatchDecodeCtx {
+                    queue: &self.topic,
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_registry: self.schema_registry.as_ref(),
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_enforcement: self.schema_enforcement,
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_accepted: self.schema_accepted.as_ref(),
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_message_index: self.schema_message_index.as_deref(),
+                    #[cfg(feature = "kafka-schema-registry")]
+                    registry_lookup_bound: self.lookup_bound,
+                };
+                match redeliver_in_place::<T, H>(
+                    &self.handler,
+                    &self.ctx,
+                    &decode,
+                    &payload,
+                    &headers.strings,
+                    coordinates,
+                    outcome,
+                    retry_count,
+                    self.max_retries,
+                    self.hold_queues,
+                    self.handler_timeout,
+                    self.handler_timeout_outcome.clone(),
+                    &self.topic,
+                    self.group.as_deref(),
+                    &self.shutdown,
+                    revoked,
+                    &self.in_place_waiters,
+                )
+                .await
+                {
+                    InPlaceEnd::Terminal { outcome, attempts } => (outcome, attempts),
+                    InPlaceEnd::Undecodable {
+                        reason,
+                        fail,
+                        attempts,
+                    } => {
+                        tracing::error!(
+                            queue = %self.topic,
+                            reason,
+                            "record no longer decodes for its in-place redelivery; dropping it as a pre-handler discard"
+                        );
+                        // The dead letter carries the attempts made in memory, as an
+                        // exhausted in-place retry does, not the count the record
+                        // arrived with.
+                        let mut dead_headers = headers;
+                        Arc::make_mut(&mut dead_headers.strings)
+                            .insert(RETRY_COUNT_HEADER.to_string(), attempts.to_string());
+                        if let Err(e) = discard_pre_handler(
+                            &self.client,
+                            self.topology,
+                            &self.topic,
+                            self.group.as_deref(),
+                            fail,
+                            reason,
+                            &payload,
+                            key.as_deref(),
+                            &dead_headers,
+                            &self.completions,
+                            partition,
+                            offset,
+                            epoch,
+                        )
+                        .await
+                        {
+                            // A full channel means a sibling already
+                            // reported a fault.
+                            let _ = self.fault.try_send(e);
+                        }
+                        drop(permit);
+                        self.release_busy();
+                        return;
+                    }
+                    InPlaceEnd::Cancelled => {
+                        // Nothing is completed: the offset stays
+                        // uncommitted and the loop's shutdown or fault arm
+                        // collects this permit, then clears the busy flag
+                        // itself once the drain proves every task has ended.
+                        drop(permit);
+                        return;
+                    }
+                    InPlaceEnd::Revoked => {
+                        // Nothing is completed: the partition's next owner
+                        // is handed the record from the committed offset.
+                        // The loop runs on, so the busy flag is cleared here
+                        // when no other task holds a permit.
+                        drop(permit);
+                        self.release_busy();
+                        return;
+                    }
+                    #[cfg(feature = "kafka-schema-registry")]
+                    InPlaceEnd::Fatal(e) => {
+                        tracing::error!(
+                            queue = %self.topic,
+                            error = %e,
+                            "schema registry deployment fault during an in-place redelivery; ending the consumer"
+                        );
+                        // Cleanup before the report: the loop's fault arm
+                        // drains every permit, and a permit still held here
+                        // would hold that drain up.
+                        drop(permit);
+                        self.release_busy();
+                        // A full channel means a sibling already reported
+                        // the same fault.
+                        let _ = self.fault.try_send(e);
+                        return;
+                    }
+                }
+            }
+            None => (outcome, retry_count),
+        };
+
+        // sec-K-8: the permit is held until route_outcome returns, a
+        // republish's hold delay included, so delayed work stays bounded by
+        // the prefetch limit.
+        //
+        // Completion signaling lives inside route_outcome: terminal outcomes
+        // signal at once; a republish signals only once the copy landed.
+        // Without this gating the offset would commit before the republish
+        // landed, silently dropping the message on republish failure.
+        route_outcome(
+            &self.client,
+            &self.topic,
+            self.group.as_deref(),
+            &payload,
+            key.as_deref(),
+            &headers,
+            outcome,
+            self.topology,
+            retry_count,
+            self.max_retries,
+            self.hold_queues,
+            (&self.completions, partition, offset, epoch),
+            &self.shutdown,
+            RevokeWatch {
+                assignments: &self.assignments,
+                partition,
+                epoch,
+            },
+            &self.fault,
+        )
+        .await;
+        drop(permit);
+        self.release_busy();
+    }
+
+    /// Clears the busy flag when no task holds a permit.
+    fn release_busy(&self) {
+        if self.semaphore.available_permits() == usize::from(self.prefetch) {
+            self.processing.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -2463,10 +2825,11 @@ enum Republished {
 ///
 /// The stop and the revoke of the record's partition, `revoked` (see
 /// `AssignmentTokens`), are read before the delay, and either one ends the
-/// wait with nothing published. A copy the old owner published after a
-/// revoke would run beside the record the partition's next owner is handed
-/// from the committed offset, two live copies each with a retry budget of
-/// its own.
+/// wait with nothing published. `None` is an assignment a revoke ended
+/// before the hold began, see [`RevokeWatch::token`]. A copy the old owner
+/// published after a revoke would run beside the record the partition's next
+/// owner is handed from the committed offset, two live copies each with a
+/// retry budget of its own.
 #[allow(clippy::too_many_arguments)]
 async fn run_delayed_republish(
     client: &KafkaClient,
@@ -2476,7 +2839,7 @@ async fn run_delayed_republish(
     payload: &[u8],
     delay: Duration,
     shutdown: &CancellationToken,
-    revoked: &CancellationToken,
+    revoked: Option<&CancellationToken>,
     label: &'static str,
 ) -> Republished {
     tokio::select! {
@@ -2490,7 +2853,7 @@ async fn run_delayed_republish(
             );
             return Republished::Abandoned;
         }
-        _ = revoked.cancelled() => {
+        () = revoke_of(revoked) => {
             tracing::debug!(
                 queue = topic,
                 label,
@@ -2507,6 +2870,14 @@ async fn run_delayed_republish(
     {
         Ok(()) => Republished::Landed,
         Err(e) => Republished::Failed(e),
+    }
+}
+
+/// Resolves once `revoked` is cancelled, and at once with none: an
+/// assignment that is over already.
+async fn revoke_of(revoked: Option<&CancellationToken>) {
+    if let Some(revoked) = revoked {
+        revoked.cancelled().await;
     }
 }
 
@@ -6736,9 +7107,17 @@ enum AfterWait {
 }
 
 fn after_wait(shutdown: &CancellationToken, revoked: Option<&CancellationToken>) -> AfterWait {
+    after_wait_on(shutdown, || {
+        revoked.is_some_and(CancellationToken::is_cancelled)
+    })
+}
+
+/// [`after_wait`] with the assignment read by `revoked`, and only once the
+/// stop has been read and has not fired.
+fn after_wait_on(shutdown: &CancellationToken, revoked: impl FnOnce() -> bool) -> AfterWait {
     if shutdown.is_cancelled() {
         AfterWait::Stop
-    } else if revoked.is_some_and(CancellationToken::is_cancelled) {
+    } else if revoked() {
         AfterWait::Revoked
     } else {
         AfterWait::Dispatch
@@ -8568,7 +8947,8 @@ impl KafkaConsumer {
                 // completions arrive via completion_tx/_rx. Drop the Mutex so the loop
                 // owns the tracker directly — saves two async-lock acquisitions per
                 // message (drain at top + track_received in the message branch).
-                let mut tracker = OffsetTracker::with_assignments(queue_owned.clone(), assignments);
+                let mut tracker =
+                    OffsetTracker::with_assignments(queue_owned.clone(), assignments.clone());
                 // One slot per sender that can hold a completion while this
                 // loop is not draining. The `prefetch_count` permit holders
                 // are `prefetch_count` of them. The loop itself is one more:
@@ -8603,6 +8983,40 @@ impl KafkaConsumer {
                 // and a fault lets the loop end every sibling's in-place wait
                 // without cancelling the token the group or supervisor owns.
                 let task_cancel = shutdown.child_token();
+                // What every handler task of this connection reads, one `Arc`
+                // per dispatched record; the loop reads it too. It holds the
+                // completion and fault senders for the loop's lifetime.
+                let dispatch = Arc::new(Dispatch::<T, H> {
+                    handler,
+                    ctx,
+                    client,
+                    topology,
+                    topic,
+                    group,
+                    processing,
+                    semaphore,
+                    prefetch: prefetch_count,
+                    completions: completion_tx,
+                    fault: fault_tx,
+                    shutdown: task_cancel,
+                    in_place_waiters,
+                    assignments,
+                    max_retries,
+                    hold_queues,
+                    handler_timeout,
+                    handler_timeout_outcome: handler_timeout_outcome_cfg,
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_registry,
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_enforcement,
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_accepted,
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_message_index,
+                    #[cfg(feature = "kafka-schema-registry")]
+                    lookup_bound,
+                    _topic: PhantomData,
+                });
 
                 // Periodic wake so rebalance events and commit retries are
                 // drained even when no messages or completions arrive: the
@@ -8629,12 +9043,30 @@ impl KafkaConsumer {
                 // permit included, so that state is dropped before the tail
                 // runs. It borrows the consumer, which the tail closes; the
                 // tail keeps its own handles.
-                let tail_cancel = task_cancel.clone();
-                let tail_semaphore = semaphore.clone();
-                let tail_processing = processing.clone();
+                let tail = Arc::clone(&dispatch);
                 let loop_consumer = &consumer;
                 let ended: Result<Stopped> = async move {
                 let consumer = loop_consumer;
+                // What the loop reads of the tasks' shared state itself.
+                let Dispatch {
+                    client,
+                    topic,
+                    group,
+                    processing,
+                    semaphore,
+                    in_place_waiters,
+                    completions: completion_tx,
+                    assignments,
+                    ..
+                } = &*dispatch;
+                #[cfg(feature = "kafka-schema-registry")]
+                let (schema_registry, schema_enforcement, schema_accepted, schema_message_index, lookup_bound) = (
+                    &dispatch.schema_registry,
+                    dispatch.schema_enforcement,
+                    &dispatch.schema_accepted,
+                    &dispatch.schema_message_index,
+                    dispatch.lookup_bound,
+                );
                 let fence = Fence {
                     threshold: fence_timeout,
                     group_id: &group_id,
@@ -8839,7 +9271,7 @@ impl KafkaConsumer {
                             drop(spare_permit.take());
                             // Polls throughout, so a long handler costs no eviction.
                             let waited = acquire_permit_while_polling(
-                                &semaphore,
+                                semaphore,
                                 u32::from(prefetch_count),
                                 consumer,
                                 None,
@@ -9038,7 +9470,26 @@ impl KafkaConsumer {
                                 );
                                 continue;
                             }
-                            let assignment = tracker.track_received(partition, offset);
+                            // Only an in-place wait selects on the record's
+                            // revoke token for its whole life, so only it
+                            // takes one; a republish's hold looks it up.
+                            let (epoch, in_place_token) = if in_place {
+                                let Assignment { epoch, revoked } =
+                                    tracker.track_received(partition, offset);
+                                (epoch, Some(revoked))
+                            } else {
+                                (tracker.track_watched(partition, offset), None)
+                            };
+                            let watch = RevokeWatch {
+                                assignments,
+                                partition,
+                                epoch,
+                            };
+                            let revoked = || {
+                                in_place_token
+                                    .as_ref()
+                                    .map_or_else(|| !watch.stands(), CancellationToken::is_cancelled)
+                            };
 
                             // Under `PerRecord` nothing may be taken until
                             // the commit of this record's completion is
@@ -9065,7 +9516,7 @@ impl KafkaConsumer {
                                 );
                             }
 
-                            metrics::record_message_size(&topic, group.as_deref(), payload_slice.len());
+                            metrics::record_message_size(topic, group.as_deref(), payload_slice.len());
 
                             // Reject oversized messages before deserialization
                             if let Err(e) = validate_message_size(payload_slice.len(), max_message_size) {
@@ -9075,19 +9526,19 @@ impl KafkaConsumer {
                                     "rejecting oversized message to DLQ"
                                 );
                                 discard_pre_handler(
-                                    &client,
+                                    client,
                                     topology,
-                                    &topic,
+                                    topic,
                                     group.as_deref(),
                                     metrics::FailReason::Oversize,
                                     &e.to_string(),
                                     payload_slice,
                                     key.as_deref(),
                                     &headers,
-                                    &completion_tx,
+                                    completion_tx,
                                     partition,
                                     offset,
-                                    assignment.epoch,
+                                    epoch,
                                 )
                                 .await?;
                                 continue;
@@ -9116,7 +9567,7 @@ impl KafkaConsumer {
                                                     registry,
                                                     fmt,
                                                     schema_enforcement,
-                                                    &schema_accepted,
+                                                    schema_accepted,
                                                     schema_message_index.as_deref(),
                                                     lookup_bound,
                                                     payload_slice,
@@ -9135,7 +9586,7 @@ impl KafkaConsumer {
                                                 ),
                                                 Ok(RegistryDecode::Unavailable { id, error }) => {
                                                     if !stall
-                                                        .wait(consumer, &shutdown, Some(&mut fault_rx), &topic, group.as_deref(), queue, id, &error)
+                                                        .wait(consumer, &shutdown, Some(&mut fault_rx), topic, group.as_deref(), queue, id, &error)
                                                         .await?
                                                     {
                                                         break Staged::Stop;
@@ -9145,7 +9596,7 @@ impl KafkaConsumer {
                                                     // its token: read before the decode is
                                                     // retried, or the record would reach the
                                                     // handler as the old owner's.
-                                                    match after_wait(&shutdown, Some(&assignment.revoked)) {
+                                                    match after_wait_on(&shutdown, revoked) {
                                                         AfterWait::Dispatch => {}
                                                         AfterWait::Stop => break Staged::Stop,
                                                         AfterWait::Revoked => break Staged::Revoked,
@@ -9186,19 +9637,19 @@ impl KafkaConsumer {
                                     Staged::Ready(m) => m,
                                     Staged::Drop(fail, reason) => {
                                         discard_pre_handler(
-                                            &client,
+                                            client,
                                             topology,
-                                            &topic,
+                                            topic,
                                             group.as_deref(),
                                             fail,
                                             reason,
                                             payload_slice,
                                             key.as_deref(),
                                             &headers,
-                                            &completion_tx,
+                                            completion_tx,
                                             partition,
                                             offset,
-                                            assignment.epoch,
+                                            epoch,
                                         )
                                         .await?;
                                         continue;
@@ -9230,19 +9681,19 @@ impl KafkaConsumer {
                                             "failed to deserialize message, sending to DLQ"
                                         );
                                         discard_pre_handler(
-                                            &client,
+                                            client,
                                             topology,
-                                            &topic,
+                                            topic,
                                             group.as_deref(),
                                             metrics::FailReason::Deserialize,
                                             "deserialization_error",
                                             payload_slice,
                                             key.as_deref(),
                                             &headers,
-                                            &completion_tx,
+                                            completion_tx,
                                             partition,
                                             offset,
-                                            assignment.epoch,
+                                            epoch,
                                         )
                                         .await?;
                                         continue;
@@ -9260,9 +9711,9 @@ impl KafkaConsumer {
                                         "failed to deserialize message, sending to DLQ"
                                     );
                                     discard_pre_handler(
-                                        &client,
+                                        client,
                                         topology,
-                                        &topic,
+                                        topic,
                                         group.as_deref(),
                                         metrics::FailReason::Deserialize,
                                         // sec-K-5: do NOT append the codec error message to
@@ -9273,10 +9724,10 @@ impl KafkaConsumer {
                                         payload_slice,
                                         key.as_deref(),
                                         &headers,
-                                        &completion_tx,
+                                        completion_tx,
                                         partition,
                                         offset,
-                                        assignment.epoch,
+                                        epoch,
                                     )
                                     .await?;
                                     continue;
@@ -9309,7 +9760,7 @@ impl KafkaConsumer {
                                     #[cfg(feature = "test-support")]
                                     permit_wait_probe::ENTERED.fetch_add(1, Ordering::SeqCst);
                                     match acquire_permit_while_polling(
-                                        &semaphore,
+                                        semaphore,
                                         1,
                                         consumer,
                                         Some(&shutdown),
@@ -9337,7 +9788,7 @@ impl KafkaConsumer {
                             // a restart delivers it behind the record that
                             // was waiting, and the partition's next owner is
                             // handed it from the committed offset.
-                            match after_wait(&shutdown, Some(&assignment.revoked)) {
+                            match after_wait_on(&shutdown, revoked) {
                                 AfterWait::Dispatch => {}
                                 AfterWait::Stop => {
                                     drop(permit);
@@ -9369,210 +9820,22 @@ impl KafkaConsumer {
                                 }
                             }
 
-                            let task_client = client.clone();
-                            let task_processing = processing.clone();
-                            let task_semaphore = semaphore.clone();
-                            let task_prefetch = prefetch_count;
-                            let task_tx = completion_tx.clone();
-                            let task_topic = topic.clone();
-                            let task_handler = handler.clone();
-                            let task_ctx = ctx.clone();
-                            let task_group = group.clone();
-                            let task_shutdown = task_cancel.clone();
-                            let task_waiters = in_place_waiters.clone();
-                            let task_timeout_outcome = handler_timeout_outcome_cfg.clone();
-                            let task_fault = fault_tx.clone();
-
-                            #[cfg(feature = "kafka-schema-registry")]
-                            let task_schema_registry = schema_registry.clone();
-                            #[cfg(feature = "kafka-schema-registry")]
-                            let task_schema_accepted = schema_accepted.clone();
-                            #[cfg(feature = "kafka-schema-registry")]
-                            let task_schema_message_index = schema_message_index.clone();
-                            #[cfg(feature = "kafka-schema-registry")]
-                            let task_lookup_bound = lookup_bound;
-
                             // perf-K-7: single spawn per message (was three).
                             // invoke_handler awaits the handler with catch_unwind +
                             // timeout in-place, then route_outcome runs in the same
                             // task — no inner spawn, no oneshot relay.
-                            tokio::spawn(async move {
-                                task_processing.store(true, Ordering::Release);
-
-                                let outcome = {
-                                    let handler = Arc::clone(&task_handler);
-                                    let ctx = Arc::clone(&task_ctx);
-                                    invoke_handler(
-                                        async move { handler.handle(payload, metadata, ctx.as_ref()).await },
-                                        handler_timeout,
-                                        task_timeout_outcome.clone(),
-                                        &task_topic,
-                                        task_group.as_deref(),
-                                    )
-                                    .await
-                                };
-
-                                // Under `RetryStrategy::InPlace` the Hold arms
-                                // of `route_outcome`, which republish, are not
-                                // taken: `Retry` and `Defer` are resolved here
-                                // first, in place and holding the permit, and
-                                // only a terminal outcome goes on to
-                                // `route_outcome`.
-                                let (outcome, retry_count) = if in_place {
-                                    let decode = BatchDecodeCtx {
-                                        queue: &task_topic,
-                                        #[cfg(feature = "kafka-schema-registry")]
-                                        schema_registry: task_schema_registry.as_ref(),
-                                        #[cfg(feature = "kafka-schema-registry")]
-                                        schema_enforcement,
-                                        #[cfg(feature = "kafka-schema-registry")]
-                                        schema_accepted: task_schema_accepted.as_ref(),
-                                        #[cfg(feature = "kafka-schema-registry")]
-                                        schema_message_index: task_schema_message_index.as_deref(),
-                                        #[cfg(feature = "kafka-schema-registry")]
-                                        registry_lookup_bound: task_lookup_bound,
-                                    };
-                                    match redeliver_in_place::<T, H>(
-                                        &task_handler,
-                                        &task_ctx,
-                                        &decode,
-                                        &payload_bytes,
-                                        &headers.strings,
-                                        coordinates,
-                                        outcome,
-                                        retry_count,
-                                        max_retries,
-                                        hold_queues,
-                                        handler_timeout,
-                                        task_timeout_outcome,
-                                        &task_topic,
-                                        task_group.as_deref(),
-                                        &task_shutdown,
-                                        &assignment.revoked,
-                                        &task_waiters,
-                                    )
-                                    .await
-                                    {
-                                        InPlaceEnd::Terminal { outcome, attempts } => (outcome, attempts),
-                                        InPlaceEnd::Undecodable { reason, fail, attempts } => {
-                                            tracing::error!(
-                                                queue = %task_topic,
-                                                reason,
-                                                "record no longer decodes for its in-place redelivery; dropping it as a pre-handler discard"
-                                            );
-                                            // The dead letter carries the attempts made in memory, as an
-                                            // exhausted in-place retry does, not the count the record
-                                            // arrived with.
-                                            let mut dead_headers = headers;
-                                            Arc::make_mut(&mut dead_headers.strings)
-                                                .insert(RETRY_COUNT_HEADER.to_string(), attempts.to_string());
-                                            if let Err(e) = discard_pre_handler(
-                                                &task_client,
-                                                topology,
-                                                &task_topic,
-                                                task_group.as_deref(),
-                                                fail,
-                                                reason,
-                                                &payload_bytes,
-                                                key.as_deref(),
-                                                &dead_headers,
-                                                &task_tx,
-                                                partition,
-                                                offset,
-                                                assignment.epoch,
-                                            )
-                                            .await
-                                            {
-                                                // A full channel means a sibling
-                                                // already reported a fault.
-                                                let _ = task_fault.try_send(e);
-                                            }
-                                            drop(permit);
-                                            if task_semaphore.available_permits() == task_prefetch as usize {
-                                                task_processing.store(false, Ordering::Release);
-                                            }
-                                            return;
-                                        }
-                                        InPlaceEnd::Cancelled => {
-                                            // Nothing is completed: the offset stays
-                                            // uncommitted and the loop's shutdown or
-                                            // fault arm collects this permit, then
-                                            // clears the busy flag itself once the
-                                            // drain proves every task has ended.
-                                            drop(permit);
-                                            return;
-                                        }
-                                        InPlaceEnd::Revoked => {
-                                            // Nothing is completed: the partition's
-                                            // next owner is handed the record from
-                                            // the committed offset. The loop runs on,
-                                            // so the busy flag is cleared here when no
-                                            // other task holds a permit.
-                                            drop(permit);
-                                            if task_semaphore.available_permits() == task_prefetch as usize {
-                                                task_processing.store(false, Ordering::Release);
-                                            }
-                                            return;
-                                        }
-                                        #[cfg(feature = "kafka-schema-registry")]
-                                        InPlaceEnd::Fatal(e) => {
-                                            tracing::error!(
-                                                queue = %task_topic,
-                                                error = %e,
-                                                "schema registry deployment fault during an in-place redelivery; ending the consumer"
-                                            );
-                                            // Cleanup before the report: the loop's fault
-                                            // arm drains every permit, and a permit still
-                                            // held here would hold that drain up.
-                                            drop(permit);
-                                            if task_semaphore.available_permits() == task_prefetch as usize {
-                                                task_processing.store(false, Ordering::Release);
-                                            }
-                                            // A full channel means a sibling already
-                                            // reported the same fault.
-                                            let _ = task_fault.try_send(e);
-                                            return;
-                                        }
-                                    }
-                                } else {
-                                    (outcome, retry_count)
-                                };
-
-                                // sec-K-8: the permit is held until
-                                // route_outcome returns, a republish's hold
-                                // delay included, so delayed work stays bounded
-                                // by the prefetch limit.
-                                //
-                                // Completion signaling lives inside route_outcome:
-                                // terminal outcomes signal at once; a republish
-                                // signals only once the copy landed. Without this
-                                // gating the offset would commit before the
-                                // republish landed, silently dropping the message
-                                // on republish failure.
-                                route_outcome(
-                                    &task_client,
-                                    &task_topic,
-                                    task_group.as_deref(),
-                                    &payload_bytes,
-                                    key.as_deref(),
-                                    &headers,
-                                    outcome,
-                                    topology,
-                                    retry_count,
-                                    max_retries,
-                                    hold_queues,
-                                    (task_tx, partition, offset, assignment.epoch),
-                                    &task_shutdown,
-                                    &assignment.revoked,
-                                    &task_fault,
-                                )
-                                .await;
-                                drop(permit);
-
-                                if task_semaphore.available_permits() == task_prefetch as usize {
-                                    task_processing.store(false, Ordering::Release);
-                                }
-                            });
+                            tokio::spawn(Arc::clone(&dispatch).run(Dispatched {
+                                message: payload,
+                                metadata,
+                                payload: payload_bytes,
+                                key,
+                                headers,
+                                coordinates,
+                                epoch,
+                                retry_count,
+                                in_place: in_place_token,
+                                permit,
+                            }));
                         }
                     }
                 }
@@ -9601,9 +9864,9 @@ impl KafkaConsumer {
                     Ok(stopped) => stopped,
                     Err(e) => {
                         close_without_commit(consumer, queue, SHUTDOWN_COMMIT_DEADLINE).await;
-                        tail_cancel.cancel();
-                        let _ = tail_semaphore.acquire_many(prefetch_count as u32).await;
-                        tail_processing.store(false, Ordering::Release);
+                        tail.shutdown.cancel();
+                        let _ = tail.semaphore.acquire_many(u32::from(tail.prefetch)).await;
+                        tail.processing.store(false, Ordering::Release);
                         return Err(e);
                     }
                 };
