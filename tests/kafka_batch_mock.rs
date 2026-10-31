@@ -1,8 +1,8 @@
 //! The Kafka batch consumer (`KafkaConsumer::run_batch`) against librdkafka's
 //! mock cluster (`rdkafka::mocking`), which serves the consumer group
 //! protocol, offset commits and produce requests from a localhost listener
-//! and needs no Docker. The mock lets a test refuse or delay one kind of
-//! request without touching the others.
+//! and needs no Docker. The mock lets a test refuse, delay or drop one kind
+//! of request without touching the others.
 //!
 //! The first two tests move a partition away from a member whose batch spans
 //! it, by starting a second member in the same group: the cooperative
@@ -12,16 +12,19 @@
 //! of, or beside, the records the rebalance hands back or away.
 //!
 //! The rest refuse or delay what a flush depends on. A commit refused with a
-//! rebalance in progress is re-offered, or redelivers the batch when a dead
-//! letter rode on it, and the member stays in its group. A dead letter the
-//! broker refuses redelivers the batch with nothing committed past it and no
-//! discard counted. A dead-letter topic that answers slowly keeps the member
-//! polling, so a rejected batch cannot outlast `max.poll.interval.ms`.
+//! rebalance in progress is re-offered, a dead-lettered batch's included,
+//! and the member stays in its group. A dead letter the broker refuses
+//! redelivers the batch with nothing committed past it and no discard
+//! counted. A dead-letter topic that answers slowly keeps the member
+//! polling, so a rejected batch cannot outlast `max.poll.interval.ms`. A
+//! stop's commits stay inside the shutdown deadline, a refused one ending
+//! the member with `ShoveError::Commit`.
 //!
 //! Every topic is created through the mock API, because the mock broker has
 //! no CreateTopics API, and records are produced through a raw rdkafka
-//! producer. The mock's per-request answer delay has no wrapper in
-//! `rdkafka::mocking`, so `Mock` reaches it through `rdkafka::bindings`.
+//! producer. The mock's per-request answer delay and its request log have no
+//! wrapper in `rdkafka::mocking`, so `Mock` reaches them through
+//! `rdkafka::bindings`.
 //!
 //! `test-support` gates the seams this file reads; both Kafka coverage rows
 //! enable it, so the suite runs in each.
@@ -38,6 +41,8 @@ use std::time::Duration;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use rdkafka::bindings::{
     rd_kafka_handle_mock_cluster, rd_kafka_mock_broker_push_request_error_rtts,
+    rd_kafka_mock_get_requests, rd_kafka_mock_request_api_key, rd_kafka_mock_request_destroy_array,
+    rd_kafka_mock_start_request_tracking,
 };
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::mocking::MockCluster;
@@ -47,16 +52,16 @@ use rdkafka::producer::{
 use rdkafka::types::{RDKafkaApiKey, RDKafkaMockCluster, RDKafkaRespErr};
 use rdkafka::{ClientConfig, Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
-use shove::ShoveError;
 use shove::handler::BatchMessageHandler;
 use shove::kafka::{
     BatchConsumerOptions, KafkaClient, KafkaConfig, KafkaConsumer, client_id_probe,
-    per_record_probe,
+    pending_commit_budget_for_test, per_record_probe, shutdown_commit_deadline_for_test,
 };
 use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
 use shove::topic::Topic;
 use shove::topology::TopologyBuilder;
+use shove::{CommitFailure, ShoveError};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -72,6 +77,9 @@ const SENDS_PER_PUBLISH: usize = 3;
 /// `session.timeout.ms`; a member that stops polling for longer leaves its
 /// group.
 const SHORT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// How long past the shutdown deadline a test waits for a stop before it
+/// gives up on it.
+const STOP_MARGIN: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct Order {
@@ -146,6 +154,36 @@ impl Mock {
                 "push the delayed answer onto the mock broker"
             );
         }
+    }
+
+    /// Record every request from here on; see `requests_of`.
+    fn track_requests(&self) {
+        unsafe { rd_kafka_mock_start_request_tracking(self.cluster) }
+    }
+
+    /// How many requests of `api_key` the broker has received since
+    /// `track_requests`, whichever client sent them.
+    fn requests_of(&self, api_key: RDKafkaApiKey) -> usize {
+        let mut count = 0usize;
+        let requests = unsafe { rd_kafka_mock_get_requests(self.cluster, &mut count) };
+        if requests.is_null() {
+            return 0;
+        }
+        let wanted = i16::from(api_key);
+        let matching = (0..count)
+            .filter(|&i| unsafe { rd_kafka_mock_request_api_key(*requests.add(i)) } == wanted)
+            .count();
+        unsafe { rd_kafka_mock_request_destroy_array(requests, count) };
+        matching
+    }
+
+    /// Take the broker down, as a coordinator that drops off the network
+    /// would: its connections close, a request it holds is never answered,
+    /// and it accepts no connection for the rest of the test.
+    fn broker_down(&self) {
+        self.api()
+            .broker_down(BROKER_ID)
+            .expect("take the mock broker down");
     }
 }
 
@@ -783,12 +821,14 @@ async fn batch_commit_rejected_during_rebalance_keeps_member() {
     );
 }
 
-/// A rejected batch's dead letters ride a synchronous commit, and the
-/// coordinator refuses it once with a rebalance in progress. Nothing was
-/// committed past the batch, so it is sought back and handed to the handler
-/// again, dead-lettered again, and committed; the member stays in its group.
+/// A rejected batch's dead letters land, and the synchronous commit they
+/// ride is refused once with a rebalance in progress. The batch is settled
+/// by then, so the refusal costs a re-offer: the position is offered again,
+/// as an acked batch's is, and committed once the coordinator takes it. The
+/// batch is handed to the handler once, each record is dead-lettered once,
+/// and the member stays in its group.
 #[tokio::test]
-async fn a_rejected_batch_whose_commit_is_refused_is_redelivered() {
+async fn a_dead_lettered_batch_whose_commit_is_refused_is_re_offered() {
     const TOPIC: &str = "kafka-batch-mock-reject-commit-refused";
     const DLQ: &str = "kafka-batch-mock-reject-commit-refused-dlq";
     const GROUP: &str = "kafka-batch-mock-reject-commit-refused-consumer";
@@ -818,42 +858,85 @@ async fn a_rejected_batch_whose_commit_is_refused_is_redelivered() {
             o.with_max_batch_size(2)
                 .with_max_batch_age(Duration::from_millis(500))
         });
-    wait_until(
-        || handler.flushes().len() >= 2,
-        DELIVERY_TIMEOUT,
-        "the batch handed to the handler again after its commit was refused",
-    )
-    .await;
-    let clients = client_id_probe::created().len();
     wait_for_position(
         &bootstrap,
         TOPIC,
         GROUP,
         2,
         DELIVERY_TIMEOUT,
-        "the redelivered batch committed",
+        "the refused commit re-offered until it is accepted",
     )
     .await;
     stop(run, token).await;
 
     assert_eq!(
-        clients, 1,
+        client_id_probe::created().len(),
+        1,
         "the refused commit did not reconnect the member"
     );
     assert_eq!(
-        client_id_probe::created().len(),
-        clients,
-        "nothing reconnected afterwards"
-    );
-    assert_eq!(
         handler.flushes().len(),
-        2,
-        "the batch is handed over twice, once per commit"
+        1,
+        "the dead-lettered batch is not handed to the handler again"
     );
     assert_eq!(
         high_watermark(&bootstrap, DLQ, 0).await,
-        4,
-        "both records are dead-lettered again with the redelivery"
+        2,
+        "each record is dead-lettered once"
+    );
+}
+
+/// The same refusal on a rejected batch with no DLQ to route it to. The
+/// discards ride the commit that retires the batch: the refusal hands them
+/// to the re-offer, which counts each once when it lands, and the batch is
+/// handed to the handler once.
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn a_discarded_batch_whose_commit_is_refused_counts_each_discard_once() {
+    const TOPIC: &str = "kafka-batch-mock-discard-commit-refused";
+    const GROUP: &str = "kafka-batch-mock-discard-commit-refused-consumer";
+    shove::define_topic!(DiscardTopic, Order, TopologyBuilder::new(TOPIC).build());
+
+    let snapshotter = install_recorder();
+    let mock = Mock::start();
+    mock.create_topic(TOPIC, 1);
+    let bootstrap = mock.bootstrap();
+    let producer = producer(&bootstrap);
+    for id in ["A", "B"] {
+        produce_to(&producer, TOPIC, 0, id).await;
+    }
+    mock.refuse(
+        RDKafkaApiKey::OffsetCommit,
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_REBALANCE_IN_PROGRESS,
+        1,
+    );
+
+    let handler = Recorder::new(|_| Outcome::Reject);
+    let (run, token) =
+        start_batch::<DiscardTopic>(connect(&bootstrap).await, handler.clone(), |o| {
+            o.with_max_batch_size(2)
+                .with_max_batch_age(Duration::from_millis(500))
+        });
+    wait_for_position(
+        &bootstrap,
+        TOPIC,
+        GROUP,
+        2,
+        DELIVERY_TIMEOUT,
+        "the refused commit re-offered until it is accepted",
+    )
+    .await;
+    stop(run, token).await;
+
+    assert_eq!(
+        handler.flushes().len(),
+        1,
+        "the discarded batch is not handed to the handler again"
+    );
+    assert_eq!(
+        discarded_total(&snapshotter, TOPIC),
+        2,
+        "each discarded record is counted once, by the re-offer that retired it"
     );
 }
 
@@ -1016,4 +1099,168 @@ async fn batch_reject_with_slow_dlq_stays_in_group() {
         "no rebalance: the member stayed in its group through the slow dead letters"
     );
     assert_eq!(handler.flushes().len(), 1, "the batch is handled once");
+}
+
+/// A rejected batch's dead letters land, and the commit they ride reaches
+/// the broker and has no answer: the broker goes down under it, as a
+/// coordinator that drops off the network would. A stop that lands then ends
+/// inside the shutdown deadline. The flush hands its commit to the stop as
+/// the commit in flight, which the stop waits for for its share of the
+/// deadline, and the run ends with `ShoveError::Commit` of the `Deadline`
+/// kind carrying that share and the position the commit carried.
+#[tokio::test]
+async fn a_stop_during_a_dead_letter_commit_ends_inside_the_shutdown_deadline() {
+    const TOPIC: &str = "kafka-batch-mock-stop-during-commit";
+    const DLQ: &str = "kafka-batch-mock-stop-during-commit-dlq";
+    shove::define_topic!(StopTopic, Order, TopologyBuilder::new(TOPIC).dlq().build());
+
+    let share = pending_commit_budget_for_test();
+    let deadline = shutdown_commit_deadline_for_test();
+    let mock = Mock::start();
+    mock.create_topic(TOPIC, 1);
+    mock.create_topic(DLQ, 1);
+    let bootstrap = mock.bootstrap();
+    let producer = producer(&bootstrap);
+    for id in ["A", "B"] {
+        produce_to(&producer, TOPIC, 0, id).await;
+    }
+    mock.track_requests();
+    mock.answer_late(RDKafkaApiKey::OffsetCommit, share, 1);
+
+    let handler = Recorder::new(|_| Outcome::Reject);
+    let (run, token) = start_batch::<StopTopic>(connect(&bootstrap).await, handler.clone(), |o| {
+        o.with_max_batch_size(2)
+            .with_max_batch_age(Duration::from_millis(500))
+    });
+    wait_until(
+        || mock.requests_of(RDKafkaApiKey::OffsetCommit) >= 1,
+        DELIVERY_TIMEOUT,
+        "the dead-lettered batch's commit reaching the broker",
+    )
+    .await;
+    mock.broker_down();
+    let stopped_at = Instant::now();
+    token.cancel();
+    let result = tokio::time::timeout(deadline + STOP_MARGIN, run)
+        .await
+        .expect("the stop ends inside the shutdown deadline")
+        .expect("the run task completes");
+    let took = stopped_at.elapsed();
+
+    let Err(ShoveError::Commit(failed)) = &result else {
+        panic!("the stop reports the commit it could not finish: {result:?}");
+    };
+    assert_eq!(failed.topic, TOPIC);
+    assert_eq!(
+        failed.offsets,
+        [(0, 2)],
+        "the position the dead-lettered batch's commit carried"
+    );
+    assert_eq!(
+        failed.kind,
+        CommitFailure::Deadline(share),
+        "the Deadline kind carrying the share a commit in flight is given"
+    );
+    assert!(
+        took < deadline,
+        "the stop ends inside the shutdown deadline, took {took:?}"
+    );
+    assert_eq!(handler.flushes().len(), 1, "the batch is handed over once");
+}
+
+/// Produces `ids` onto partition 0 of `topic`, then starts a batch consumer
+/// of `T` whose handler answers every flush with `outcome`, flushing two
+/// records at a time with no age deadline a test reaches, so a third record
+/// waits in the batch for the stop. Returns once the first two records'
+/// position is committed: `outcome` must commit them.
+async fn a_member_holding_a_record_for_its_stop<T>(
+    mock: &Mock,
+    topic: &'static str,
+    group: &'static str,
+    outcome: fn(usize) -> Outcome,
+) -> (Recorder, Member)
+where
+    T: Topic<Message = Order> + shove::NotSequenced + 'static,
+{
+    let bootstrap = mock.bootstrap();
+    let producer = producer(&bootstrap);
+    for id in ["A", "B", "C"] {
+        produce_to(&producer, topic, 0, id).await;
+    }
+    let handler = Recorder::new(outcome);
+    let member = start_batch::<T>(connect(&bootstrap).await, handler.clone(), |o| {
+        o.with_max_batch_size(2)
+            .with_max_batch_age(Duration::from_secs(600))
+    });
+    wait_for_position(
+        &bootstrap,
+        topic,
+        group,
+        2,
+        DELIVERY_TIMEOUT,
+        "the first batch committed",
+    )
+    .await;
+    (handler, member)
+}
+
+/// A stop flushes a batch the handler rejects, and the broker refuses every
+/// commit. The flush's commit is the stop's commit in flight, the final
+/// commit offers its position again, and the stop ends as a refused final
+/// commit ends it: with `ShoveError::Commit` naming the position the
+/// dead-lettered batch reached, its dead letters published once.
+#[tokio::test]
+async fn a_stop_whose_dead_letter_commit_is_refused_ends_with_a_commit_error() {
+    const TOPIC: &str = "kafka-batch-mock-stop-flush-refused";
+    const DLQ: &str = "kafka-batch-mock-stop-flush-refused-dlq";
+    const GROUP: &str = "kafka-batch-mock-stop-flush-refused-consumer";
+    shove::define_topic!(
+        StopFlushTopic,
+        Order,
+        TopologyBuilder::new(TOPIC).dlq().build()
+    );
+
+    let mock = Mock::start();
+    mock.create_topic(TOPIC, 1);
+    mock.create_topic(DLQ, 1);
+    let (handler, (run, token)) =
+        a_member_holding_a_record_for_its_stop::<StopFlushTopic>(&mock, TOPIC, GROUP, |flush| {
+            if flush == 0 {
+                Outcome::Ack
+            } else {
+                Outcome::Reject
+            }
+        })
+        .await;
+    mock.refuse(
+        RDKafkaApiKey::OffsetCommit,
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED,
+        8,
+    );
+    token.cancel();
+    let result = run.await.expect("the run task completes");
+
+    let Err(ShoveError::Commit(failed)) = &result else {
+        panic!("a stop whose commits are refused ends with ShoveError::Commit: {result:?}");
+    };
+    assert_eq!(
+        failed.offsets,
+        [(0, 3)],
+        "the position the dead-lettered batch reached"
+    );
+    assert!(
+        matches!(failed.kind, CommitFailure::Rejected(_)),
+        "a refused commit is reported as Rejected: {:?}",
+        failed.kind
+    );
+    assert_eq!(
+        handler.flushes().len(),
+        2,
+        "the stop flushes the record it held once"
+    );
+    assert_eq!(
+        high_watermark(&mock.bootstrap(), DLQ, 0).await,
+        1,
+        "the stop's rejected record is dead-lettered once"
+    );
 }

@@ -795,8 +795,9 @@ The record is discarded and committed, an error is logged, and `messages_discard
 A batch the handler acks is retired, and its offsets go out with the next commit: at most every 500 ms, one commit at a time on a thread of its own, while the consumer goes on.
 A commit the coordinator rejects, such as one made while the group rebalances, is re-offered.
 A consumer whose commits keep being rejected, none accepted and no rebalance resolving them, is treated as fenced and reconnects.
-A batch with dead letters or discards on it, a `Reject` or a batch with a record dropped before the handler, commits synchronously, and the flush waits for the coordinator's answer.
-A rejection of that commit does not end the consumer either: the batch is sought back and handed to the handler again, so its dead letters are published again.
+A batch with dead letters or discards on it, a `Reject` or a batch with a record dropped before the handler, commits synchronously, and the flush waits for the coordinator's answer while the consumer keeps polling.
+A rejection of that commit does not end the consumer either, and the batch is not handed to the handler again.
+Once its dead letters have landed the batch is settled, so its position is re-offered as an acked batch's is, with its discards riding on the re-offer.
 The consumer keeps polling meanwhile, so a rebalance behind the rejection can complete.
 
 A rejected batch's dead letters, and the records dropped before the handler, are published concurrently, at most 16 at a time.
@@ -814,7 +815,10 @@ The record the consumer holds when it learns of the rebalance is dropped when it
 Every record of the abandoned batch then reaches a handler once, in offset order: this consumer's for the partitions it keeps, the new owner's for the ones it lost.
 A seek that fails on a partition the consumer still holds reconnects it, and one that fails on a partition the group revoked in the same poll is left to that partition's next owner.
 
-A stop flushes the batch in hand, then commits every retired position synchronously and closes the consumer, within the 20 s shutdown deadline, as the standard consumer's stop does.
+A stop flushes the batch in hand first, and that flush is not inside the shutdown deadline: it waits for the handler and for the batch's dead letters.
+The commits that follow are bounded as the standard consumer's are.
+A commit in flight when the stop lands, the flushed batch's own included, is waited for at most 15 s, and no answer in that time ends the stop with `ShoveError::Commit` of the `Deadline` kind.
+Every retired position is then committed synchronously and the consumer closed, both on a thread of their own, within what is left of the 20 s.
 A final commit the broker does not confirm ends the run with `ShoveError::Commit`, where a batch consumer ended clean in 0.16.0.
 A rebalance in progress can refuse it, such as the one another member's stop starts.
 
