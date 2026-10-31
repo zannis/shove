@@ -2567,7 +2567,9 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 /// `socket.timeout.ms` of an assign or revoke that itself landed within
 /// `socket.timeout.ms` of an earlier assign, or of a ridden-out
 /// `__TRANSPORT` or `__RESOLVE`, because a fetch may have been pending when
-/// that change landed. The reconnect fetches the committed offsets again.
+/// that change landed. A revoke of an assignment librdkafka reports lost is
+/// never such a change, see [`AssignmentChange::LostRevoke`]. The reconnect
+/// fetches the committed offsets again.
 /// The gate is blind to a coordinator that holds a fetch unanswered for
 /// longer than `socket.timeout.ms` while the application is handed no
 /// error: an assignment change after that bound, and a connection the
@@ -2641,7 +2643,8 @@ fn log_transient_recv_error(queue: &str, error: &KafkaError) {
 /// retrying through a failing broker, arms the gate. While it is armed, a
 /// `__TRANSPORT` or `__RESOLVE` within `bound` of the change that armed it
 /// ends the loop. A revoke starts no fetch, so it opens no window for the
-/// change behind it.
+/// change behind it. A revoke of an assignment librdkafka reports lost arms
+/// nothing, see [`AssignmentChange::LostRevoke`].
 struct TransportGate {
     /// The consumer's `socket.timeout.ms`, see [`socket_timeout`].
     bound: Duration,
@@ -2659,6 +2662,23 @@ struct GateStamps {
     armed: Option<std::time::Instant>,
 }
 
+/// An assignment change the rebalance callback serves, as
+/// [`TransportGate::changed`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssignmentChange {
+    Assign,
+    Revoke,
+    /// A revoke of an assignment librdkafka reports lost: the member's
+    /// session timed out, its membership or generation was refused, it
+    /// outlasted `max.poll.interval.ms`, or its topic was deleted (bundled
+    /// librdkafka 2.12.1, `rdkafka_cgrp.c:5949-5990`, `:3459-3471`,
+    /// `:5200-5210`, `:6971-6988`). Each revokes every partition of the
+    /// topic (`rdkafka_cgrp.c:5104-5125`), and the unassign takes the ones
+    /// whose committed offsets are being fetched off that list too
+    /// (`rdkafka_assignment.c:884-887`), so no fetch is left to strand.
+    LostRevoke,
+}
+
 impl TransportGate {
     fn new(bound: Duration) -> Self {
         Self {
@@ -2669,13 +2689,17 @@ impl TransportGate {
 
     /// Stamps the assign or revoke the rebalance callback serves at `now`,
     /// arming the gate if it lands within the bound of the last assign or of
-    /// the last ridden-out `__TRANSPORT` or `__RESOLVE`.
-    fn changed(&self, event: &RebalanceEvent, now: std::time::Instant) {
+    /// the last ridden-out `__TRANSPORT` or `__RESOLVE`. A lost revoke
+    /// stamps nothing.
+    fn changed(&self, change: AssignmentChange, now: std::time::Instant) {
+        if change == AssignmentChange::LostRevoke {
+            return;
+        }
         let mut stamps = self.stamps();
         if self.within(stamps.assign, now) || self.within(stamps.ridden, now) {
             stamps.armed = Some(now);
         }
-        if matches!(event, RebalanceEvent::Assign(_)) {
+        if change == AssignmentChange::Assign {
             stamps.assign = Some(now);
         }
     }
@@ -2820,8 +2844,12 @@ impl<C: ClientContext> ConsumerContext for RebalanceContext<C> {
     /// The inner context's own `ConsumerContext` methods cannot be delegated
     /// (they take `&BaseConsumer<C>`, not `&BaseConsumer<Self>`); both
     /// wrapped contexts use the empty defaults, so nothing is lost.
-    fn pre_rebalance(&self, _base_consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
-        let event = match rebalance {
+    ///
+    /// `pre_` is also where a revoke's `assignment_lost()` still holds: the
+    /// incremental unassign rust-rdkafka makes after this callback clears
+    /// it (bundled librdkafka 2.12.1, `rdkafka_cgrp.c:4406-4407`).
+    fn pre_rebalance(&self, base_consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
+        let (event, change) = match rebalance {
             Rebalance::Assign(tpl) => {
                 let partitions = self.partitions_for_topic(tpl);
                 tracing::debug!(
@@ -2832,7 +2860,7 @@ impl<C: ClientContext> ConsumerContext for RebalanceContext<C> {
                 );
                 #[cfg(feature = "test-support")]
                 per_record_probe::ASSIGNS_QUEUED.fetch_add(1, Ordering::SeqCst);
-                RebalanceEvent::Assign(partitions)
+                (RebalanceEvent::Assign(partitions), AssignmentChange::Assign)
             }
             Rebalance::Revoke(tpl) => {
                 let partitions = self.partitions_for_topic(tpl);
@@ -2848,7 +2876,12 @@ impl<C: ClientContext> ConsumerContext for RebalanceContext<C> {
                 // which can be a housekeeping tick away. See
                 // `AssignmentTokens`.
                 cancel_assignments(&self.assignments, &partitions);
-                RebalanceEvent::Revoke(partitions)
+                let change = if base_consumer.assignment_lost() {
+                    AssignmentChange::LostRevoke
+                } else {
+                    AssignmentChange::Revoke
+                };
+                (RebalanceEvent::Revoke(partitions), change)
             }
             Rebalance::Error(e) => {
                 tracing::warn!(topic = %self.topic, error = %e, "rebalance error");
@@ -2856,7 +2889,7 @@ impl<C: ClientContext> ConsumerContext for RebalanceContext<C> {
             }
         };
         self.transport_gate
-            .changed(&event, std::time::Instant::now());
+            .changed(change, std::time::Instant::now());
         // A closed channel means the receive loop is gone (shutdown or
         // reconnect teardown, or a consumer that keeps no tracker) — nothing
         // to notify.
@@ -12560,14 +12593,6 @@ mod error_classifier_tests {
     /// librdkafka's default `socket.timeout.ms`.
     const GATE_BOUND: Duration = Duration::from_secs(60);
 
-    fn assign() -> RebalanceEvent {
-        RebalanceEvent::Assign(vec![0])
-    }
-
-    fn revoke() -> RebalanceEvent {
-        RebalanceEvent::Revoke(vec![0])
-    }
-
     fn after(origin: std::time::Instant, secs: u64) -> std::time::Instant {
         origin + Duration::from_secs(secs)
     }
@@ -12579,7 +12604,7 @@ mod error_classifier_tests {
     fn a_lone_assign_leaves_the_gate_unarmed() {
         let gate = TransportGate::new(GATE_BOUND);
         let t0 = std::time::Instant::now();
-        gate.changed(&assign(), t0);
+        gate.changed(AssignmentChange::Assign, t0);
         assert!(gate.rides_out(after(t0, 1)));
         assert!(gate.rides_out(after(t0, 2)));
     }
@@ -12591,8 +12616,8 @@ mod error_classifier_tests {
     fn a_change_within_the_bound_of_an_assign_arms_the_gate() {
         let gate = TransportGate::new(GATE_BOUND);
         let t0 = std::time::Instant::now();
-        gate.changed(&assign(), t0);
-        gate.changed(&revoke(), after(t0, 5));
+        gate.changed(AssignmentChange::Assign, t0);
+        gate.changed(AssignmentChange::Revoke, after(t0, 5));
         assert!(!gate.rides_out(after(t0, 6)));
     }
 
@@ -12603,12 +12628,12 @@ mod error_classifier_tests {
     fn a_change_within_the_bound_of_a_ridden_out_failure_arms_the_gate() {
         let gate = TransportGate::new(GATE_BOUND);
         let t0 = std::time::Instant::now();
-        gate.changed(&assign(), t0);
+        gate.changed(AssignmentChange::Assign, t0);
         assert!(
             gate.rides_out(after(t0, 100)),
             "long after the assign, nothing has armed the gate"
         );
-        gate.changed(&assign(), after(t0, 130));
+        gate.changed(AssignmentChange::Assign, after(t0, 130));
         assert!(!gate.rides_out(after(t0, 131)));
     }
 
@@ -12620,10 +12645,26 @@ mod error_classifier_tests {
     fn a_rebalance_long_after_the_last_assign_leaves_the_gate_unarmed() {
         let gate = TransportGate::new(GATE_BOUND);
         let t0 = std::time::Instant::now();
-        gate.changed(&assign(), t0);
-        gate.changed(&revoke(), after(t0, 61));
-        gate.changed(&assign(), after(t0, 62));
+        gate.changed(AssignmentChange::Assign, t0);
+        gate.changed(AssignmentChange::Revoke, after(t0, 61));
+        gate.changed(AssignmentChange::Assign, after(t0, 62));
         assert!(gate.rides_out(after(t0, 63)));
+    }
+
+    /// A revoke of an assignment librdkafka reports lost, as at a session
+    /// timeout during a broker outage, arms nothing, however soon after an
+    /// assign and a ridden-out `__TRANSPORT` it lands: it takes every
+    /// partition, the ones a fetch was querying included, so it strands
+    /// none, and the rest of the outage is ridden out.
+    #[test]
+    fn a_lost_revoke_leaves_the_gate_unarmed() {
+        let gate = TransportGate::new(GATE_BOUND);
+        let t0 = std::time::Instant::now();
+        gate.changed(AssignmentChange::Assign, t0);
+        assert!(gate.rides_out(after(t0, 1)), "the outage's first failure");
+        gate.changed(AssignmentChange::LostRevoke, after(t0, 10));
+        assert!(gate.rides_out(after(t0, 11)));
+        assert!(gate.rides_out(after(t0, 40)));
     }
 
     /// The gate stays armed for the bound after the change that armed it,
@@ -12632,8 +12673,8 @@ mod error_classifier_tests {
     fn an_armed_gate_expires_with_the_bound() {
         let gate = TransportGate::new(GATE_BOUND);
         let t0 = std::time::Instant::now();
-        gate.changed(&assign(), t0);
-        gate.changed(&revoke(), after(t0, 5));
+        gate.changed(AssignmentChange::Assign, t0);
+        gate.changed(AssignmentChange::Revoke, after(t0, 5));
         assert!(!gate.rides_out(after(t0, 65)), "at the bound");
         assert!(gate.rides_out(after(t0, 66)), "past it");
     }
@@ -12645,8 +12686,8 @@ mod error_classifier_tests {
     fn an_armed_gate_ends_the_loop_on_a_failed_connection_or_resolve() {
         let gate = TransportGate::new(GATE_BOUND);
         let now = std::time::Instant::now();
-        gate.changed(&assign(), now);
-        gate.changed(&revoke(), now);
+        gate.changed(AssignmentChange::Assign, now);
+        gate.changed(AssignmentChange::Revoke, now);
         assert!(!recv_error_is_transient(
             &gate,
             &consumption(RDKafkaErrorCode::BrokerTransportFailure)
@@ -12672,7 +12713,7 @@ mod error_classifier_tests {
             &after_resolve,
             &consumption(RDKafkaErrorCode::Resolve)
         ));
-        after_resolve.changed(&assign(), std::time::Instant::now());
+        after_resolve.changed(AssignmentChange::Assign, std::time::Instant::now());
         assert!(!recv_error_is_transient(
             &after_resolve,
             &consumption(RDKafkaErrorCode::Resolve)
@@ -12683,7 +12724,7 @@ mod error_classifier_tests {
             &after_all_down,
             &consumption(RDKafkaErrorCode::AllBrokersDown)
         ));
-        after_all_down.changed(&assign(), std::time::Instant::now());
+        after_all_down.changed(AssignmentChange::Assign, std::time::Instant::now());
         assert!(
             recv_error_is_transient(&after_all_down, &consumption(RDKafkaErrorCode::Resolve)),
             "nothing armed the gate"

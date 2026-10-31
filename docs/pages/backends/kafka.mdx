@@ -324,11 +324,12 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
 
 ### Broker outages
 
-A broker that goes away and comes back does not end a consumer, unless the bounce comes soon after an assignment change, see below.
+A broker that goes away and comes back does not end a consumer, unless the bounce comes soon after an assignment change that landed while a committed-offset fetch may have been pending, see below.
 librdkafka reports a broker connection that failed or could not be made, a broker name that did not resolve, and every broker being down at once as consumer errors, and reconnects on its own.
 The consumer logs each of them at warn level and keeps polling on the same client.
 An outage shorter than `session.timeout.ms`, 10 s, therefore costs the member nothing but the wait: it keeps its place in its group, and nothing is rebalanced.
-After a longer one the coordinator has dropped the member, and librdkafka rejoins the group on the same client once a broker answers.
+After a longer one the coordinator has dropped the member, and librdkafka revokes its assignment as lost and rejoins the group on the same client once a broker answers.
+That revoke takes every partition, so the consumer goes on riding the outage out, see below.
 librdkafka reports an identical broker failure at most once every 30 s per broker, so a bounce logs a handful of lines.
 Every other receive error ends the member's connection.
 That covers a fatal error, a missing committed offset under `KafkaAutoOffsetReset::None`, a poll interval the member outlasted, and the authorization, coordinator and fetch errors librdkafka passes on.
@@ -344,6 +345,9 @@ The fetch's partitions then stay unfetched, and so does every partition assigned
 The member keeps heartbeating meanwhile, so the group never moves them.
 The code alone cannot tell that error from a broker failure, so a failed connection or name resolution that may be one ends the member's connection instead of being ridden out.
 That is one within `socket.timeout.ms` of an assign or revoke that itself landed within `socket.timeout.ms` of an earlier assign, or of a failed connection or name resolution the consumer rode out: a fetch may have been pending when that change landed.
+A revoke of an assignment librdkafka reports lost, as when the session times out during an outage, is never such a change: it takes every partition, the ones whose committed offsets were being fetched included, so it leaves no partition unfetched.
+The assign of the rejoin that follows is such a change when it lands within `socket.timeout.ms` of a failed connection or name resolution the consumer rode out.
+Under cooperative-sticky every member is handed an assign at each round of a rebalance, an empty one included, so in a rebalance of two rounds, such as the one a joining member starts, the second round is such a change on every member of the group.
 Every broker being down at once is still ridden out, because librdkafka never fails a queued request, a committed-offset fetch among them, with that code.
 shove leaves `socket.timeout.ms` at librdkafka's default, 60 s.
 The reconnect rejoins the group and fetches the committed offsets again.
