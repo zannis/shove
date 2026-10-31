@@ -384,6 +384,13 @@ pub mod kafka {
     #[doc(hidden)]
     pub use crate::backends::kafka::fetch_queue_probe;
 
+    /// Test-only seam (see the `test-support` feature): the OAUTHBEARER
+    /// context of an MSK IAM client, for tests that call its token callback
+    /// from each kind of thread librdkafka calls it on.
+    #[cfg(all(feature = "kafka-msk-iam", feature = "test-support"))]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::msk_iam_context_for_test;
+
     /// Test-only probe (see the `test-support` feature) on the concurrent
     /// consumer's completion channel, for tests that prove a completion sat
     /// in the channel during a stall.
@@ -418,6 +425,11 @@ pub mod kafka {
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::permit_wait_probe;
+    /// Test-only seam (see the `test-support` feature): the topic a `ping`
+    /// asks the broker about, for tests that look for it in the cluster.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::ping_probe_topic_for_test;
 
     /// Test-only probe (see the `test-support` feature) on the broadcast
     /// loop's assignment refresh: counts the refreshes started and ended, and

@@ -4,13 +4,28 @@
 
 pub(super) const PAYLOAD_FIELD: &str = "payload";
 pub(super) const X_RETRY_COUNT: &str = "x-retry-count";
-/// Reserved for future distributed-tracing support; not yet written or read.
+/// Not written or read here. `x-trace-id` is a header callers set, which the
+/// audit wrapper reads, so it stays out of `INTERNAL_KEYS`.
 pub(super) const X_TRACE_ID: &str = "x-trace-id";
 pub(super) const X_MESSAGE_ID: &str = "x-message-id";
 pub(super) const X_SEQUENCE_KEY: &str = "x-sequence-key";
 pub(super) const X_DEATH_REASON: &str = "x-death-reason";
 pub(super) const X_DEATH_COUNT: &str = "x-death-count";
 pub(super) const X_ORIGINAL_QUEUE: &str = "x-original-queue";
+
+/// Stream entry fields shove writes itself or reads back as its own. They stay
+/// out of the user-visible headers, and the publisher refuses a caller header
+/// with any of these names, both in `publish_with_headers` and where it builds
+/// the XADD. A new field belongs here.
+pub(super) const INTERNAL_KEYS: &[&str] = &[
+    PAYLOAD_FIELD,
+    X_RETRY_COUNT,
+    X_SEQUENCE_KEY,
+    X_MESSAGE_ID,
+    X_DEATH_REASON,
+    X_DEATH_COUNT,
+    X_ORIGINAL_QUEUE,
+];
 
 /// Default number of FIFO routing shards when routing_shards() is not overridden.
 pub(super) const DEFAULT_ROUTING_SHARDS: u16 = 8;

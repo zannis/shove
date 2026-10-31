@@ -21,7 +21,7 @@ use crate::backends::kafka::topology::KafkaTopologyDeclarer;
 use crate::consumer::RetryStrategy;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_group::reject_fifo_concurrency;
-use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally};
+use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally, count_one};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
@@ -52,7 +52,7 @@ fn harvest_if_finished(
         && !e.is_cancelled()
     {
         tracing::error!(error = %e, group = %queue, "finished consumer task had panicked");
-        panic_count.fetch_add(1, Ordering::Relaxed);
+        count_one(panic_count);
     }
     true
 }
@@ -800,7 +800,7 @@ impl KafkaConsumerGroup {
             tokio::spawn(async move {
                 let result = consumer.run_declared::<T, H>(handler, ctx, options).await;
                 if let Err(e) = result {
-                    ec.fetch_add(1, Ordering::Relaxed);
+                    count_one(&ec);
                     tracing::error!("consumer task exited with error: {e}");
                 }
             })
@@ -830,6 +830,12 @@ impl KafkaConsumerGroup {
     ///
     /// FIFO replica count is fixed at 1 — Kafka uses partition-level ordering,
     /// so a single consumer task is sufficient.
+    ///
+    /// The group's task holds an abort guard on the shard task, so aborting
+    /// the group's task at a drain timeout aborts the shard and the handler
+    /// call it is awaiting. A handler still running when the abort reaches the
+    /// shard is dropped with it, and its record stays uncommitted and is
+    /// redelivered.
     pub fn new_fifo<T, H>(
         queue: impl Into<String>,
         client: KafkaClient,
@@ -862,21 +868,26 @@ impl KafkaConsumerGroup {
                 let handles = match consumer.spawn_fifo_shards::<T, H>(handler, ctx, options) {
                     Ok(h) => h,
                     Err(e) => {
-                        ec.fetch_add(1, Ordering::Relaxed);
+                        count_one(&ec);
                         tracing::error!("FIFO registration failed: {e}");
                         return;
                     }
                 };
+                // A dropped `JoinHandle` detaches its task; abort the shards with this wrapper.
+                let _shards: Vec<AbortOnDrop> = handles
+                    .iter()
+                    .map(|handle| AbortOnDrop(handle.abort_handle()))
+                    .collect();
                 for handle in handles {
                     match handle.await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
-                            ec.fetch_add(1, Ordering::Relaxed);
+                            count_one(&ec);
                             tracing::error!("sequenced shard exited with error: {e}");
                         }
                         Err(e) if e.is_cancelled() => {}
                         Err(e) => {
-                            pc.fetch_add(1, Ordering::Relaxed);
+                            count_one(&pc);
                             tracing::error!("sequenced shard panicked: {e}");
                         }
                     }
@@ -1081,8 +1092,7 @@ impl KafkaConsumerGroup {
         );
         self.group_token.cancel();
 
-        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
-        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+        self.take_counts_into(tally);
 
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
             let _abort_guard = AbortOnDrop(handle.abort_handle());
@@ -1091,7 +1101,7 @@ impl KafkaConsumerGroup {
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
-                    tally.panics += 1;
+                    tally.add_panics(1);
                 }
             }
         }
@@ -1103,13 +1113,19 @@ impl KafkaConsumerGroup {
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "retired consumer task panicked");
-                    tally.panics += 1;
+                    tally.add_panics(1);
                 }
             }
         }
 
-        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
-        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+        self.take_counts_into(tally);
+    }
+
+    /// Moves the counts the group's tasks recorded into `tally`, saturating
+    /// at the top.
+    fn take_counts_into(&self, tally: &mut ShutdownTally) {
+        tally.add_errors(self.error_count.swap(0, Ordering::Relaxed));
+        tally.add_panics(self.panic_count.swap(0, Ordering::Relaxed));
     }
 
     /// Abort surviving consumer handles after a drain timeout, accumulating
@@ -1132,7 +1148,7 @@ impl KafkaConsumerGroup {
                         group = %self.queue,
                         "consumer task panicked during abort escalation"
                     );
-                    tally.panics += 1;
+                    tally.add_panics(1);
                 }
             }
         }
@@ -1142,12 +1158,11 @@ impl KafkaConsumerGroup {
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "retired consumer task panicked");
-                    tally.panics += 1;
+                    tally.add_panics(1);
                 }
             }
         }
-        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
-        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+        self.take_counts_into(tally);
     }
 
     fn spawn_one(&mut self) {
@@ -1184,13 +1199,10 @@ impl KafkaConsumerGroup {
             options.schema_message_index = self.config.schema_message_index.clone();
         }
         let handle = (self.spawner)(options);
-        self.consumers.push((child_token, processing, handle));
         // Raw vec position of the new entry, not a liveness count.
-        debug!(
-            group = %self.queue,
-            consumer_index = self.consumers.len().saturating_sub(1),
-            "spawned consumer"
-        );
+        let consumer_index = self.consumers.len();
+        self.consumers.push((child_token, processing, handle));
+        debug!(group = %self.queue, consumer_index, "spawned consumer");
     }
 }
 
@@ -1333,7 +1345,8 @@ impl KafkaConsumerGroupRegistry {
         )?;
 
         let mut declarer = KafkaTopologyDeclarer::new(client.clone())
-            .with_min_partitions(config.max_consumers as i32);
+            .with_min_partitions(i32::from(config.max_consumers))
+            .with_group_offset_reset(config.auto_offset_reset());
         if let Some(rf) = self.default_replication_factor {
             declarer = declarer.with_replication_factor(rf);
         }
@@ -1839,6 +1852,93 @@ mod tests {
         assert_eq!(group.active_consumers(), 0);
         assert_eq!(tally.errors, 5);
         assert_eq!(tally.panics, 1);
+    }
+
+    // -- tally arithmetic --
+
+    /// Polls until `handle` has finished (bounded).
+    async fn wait_handle_finished(handle: &JoinHandle<()>) {
+        for _ in 0..200 {
+            if handle.is_finished() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("task did not finish within the wait budget");
+    }
+
+    /// A group whose one member and one retired member have both panicked.
+    async fn group_of_panicked_members() -> KafkaConsumerGroup {
+        let spawner: Spawner = Arc::new(|_options: ConsumerOptions| {
+            tokio::spawn(async { panic!("consumer blew up") })
+        });
+        let mut group = test_group_with_spawner(KafkaConsumerGroupConfig::new(1..=1), spawner);
+        group.start();
+        group
+            .retiring
+            .push(tokio::spawn(async { panic!("retired consumer blew up") }));
+        wait_handle_finished(&group.consumers[0].2).await;
+        wait_handle_finished(&group.retiring[0]).await;
+        group
+    }
+
+    #[tokio::test]
+    async fn a_harvested_panic_leaves_a_full_counter_full() {
+        let counter = AtomicUsize::new(usize::MAX);
+        let mut handle: JoinHandle<()> = tokio::spawn(async { panic!("consumer blew up") });
+        wait_handle_finished(&handle).await;
+
+        assert!(harvest_if_finished(&mut handle, &counter, "test-queue"));
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn a_drain_leaves_a_full_tally_full() {
+        let mut group = test_group(KafkaConsumerGroupConfig::new(0..=1));
+        group.error_count.store(usize::MAX, Ordering::Relaxed);
+        group.panic_count.store(usize::MAX, Ordering::Relaxed);
+
+        let mut tally = ShutdownTally {
+            errors: 1,
+            panics: 1,
+        };
+        group.drain_into(&mut tally).await;
+
+        assert_eq!((tally.errors, tally.panics), (usize::MAX, usize::MAX));
+    }
+
+    #[tokio::test]
+    async fn an_abort_leaves_a_full_tally_full() {
+        let mut group = test_group(KafkaConsumerGroupConfig::new(0..=1));
+        group.error_count.store(usize::MAX, Ordering::Relaxed);
+        group.panic_count.store(usize::MAX, Ordering::Relaxed);
+
+        let mut tally = ShutdownTally {
+            errors: 1,
+            panics: 1,
+        };
+        group.abort_remaining_into(&mut tally).await;
+
+        assert_eq!((tally.errors, tally.panics), (usize::MAX, usize::MAX));
+    }
+
+    #[tokio::test]
+    async fn joined_panics_leave_a_full_tally_full() {
+        let mut drained = group_of_panicked_members().await;
+        let mut tally = ShutdownTally {
+            errors: 0,
+            panics: usize::MAX,
+        };
+        drained.drain_into(&mut tally).await;
+        assert_eq!(tally.panics, usize::MAX);
+
+        let mut aborted = group_of_panicked_members().await;
+        let mut tally = ShutdownTally {
+            errors: 0,
+            panics: usize::MAX,
+        };
+        aborted.abort_remaining_into(&mut tally).await;
+        assert_eq!(tally.panics, usize::MAX);
     }
 
     // -- accessors --

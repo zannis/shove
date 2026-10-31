@@ -37,7 +37,7 @@ Done.
 
 ### Partition-key routing on Kafka
 
-`UserEventTopic` uses `.routing_shards(4)` which on Kafka means 4 Kafka partitions on the main topic. The key function `|msg: &UserEvent| msg.user_id.clone()` is hashed (consistent hashing) to select a partition; all events for the same user always land on the same partition. Within a Kafka partition messages are stored in strict append order — this is the mechanism that gives shove its per-key ordering guarantee. Changing the partition count requires deleting and recreating the topic; Kafka can only expand, not shrink.
+`UserEventTopic` uses `.routing_shards(4)` which on Kafka means 4 Kafka partitions on the main topic. The key function `|msg: &UserEvent| msg.user_id.clone()` is hashed (consistent hashing) to select a partition; all events for the same user always land on the same partition. Within a Kafka partition messages are stored in strict append order — this is the mechanism that gives shove its per-key ordering guarantee. Changing the partition count requires deleting and recreating the topic; Kafka can only expand, not shrink, and `declare` never expands a sequenced topic because a new partition remaps keys. A topic with fewer partitions than `routing_shards` makes `declare` return `ShoveError::Topology`.
 
 ### `KafkaConsumer::run_fifo` and the partition constraint
 

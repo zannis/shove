@@ -1,5 +1,6 @@
 //! Consumer supervisor harness and its outcome type.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::task::{JoinError, JoinSet};
@@ -73,6 +74,15 @@ impl ShutdownTally {
         self.add_errors(other.errors);
         self.add_panics(other.panics);
     }
+}
+
+/// Counts one more occurrence, saturating at the top.
+#[allow(dead_code)] // only the Kafka and NATS groups call it
+pub(crate) fn count_one(counter: &AtomicUsize) {
+    // The closure always answers `Some`, so the update cannot fail.
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_add(1))
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -746,6 +756,15 @@ mod tests {
         );
         assert_eq!(outcome.panics, 0);
         assert!(!outcome.timed_out);
+    }
+
+    #[test]
+    fn a_counter_stops_at_the_top_instead_of_wrapping() {
+        let counter = AtomicUsize::new(usize::MAX - 1);
+        count_one(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+        count_one(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
     }
 }
 

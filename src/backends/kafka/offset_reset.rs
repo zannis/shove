@@ -336,7 +336,7 @@ fn reset_group_offsets_blocking(
         // event queue and the initial OAUTHBEARER token would never be
         // delivered. Pump it on a scoped thread for the duration of the
         // blocking work; the thread is joined before this block returns.
-        // Same shape as `fetch_topic_partition_count_blocking`.
+        // Same shape as `MetadataConsumer::fetch`.
         let done = AtomicBool::new(false);
         return std::thread::scope(|s| {
             s.spawn(|| {

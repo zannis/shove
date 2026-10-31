@@ -8,6 +8,9 @@
 #![cfg(feature = "kafka")]
 
 use rdkafka::Message;
+use rdkafka::mocking::MockCluster;
+use rdkafka::producer::DefaultProducerContext;
+use rdkafka::types::{RDKafkaApiKey, RDKafkaRespErr};
 use serde::{Deserialize, Serialize};
 use shove::RetryStrategy;
 use shove::SequencedTopic as _;
@@ -708,7 +711,6 @@ async fn publish_raw_to(brokers: &str, topic: &str, partition: i32, payload: &[u
 
 /// The group's committed offset on one partition, or `None` when it has
 /// never committed there.
-#[cfg(feature = "test-support")]
 fn committed_offset(brokers: &str, group: &str, topic: &str, partition: i32) -> Option<i64> {
     use rdkafka::consumer::{BaseConsumer, Consumer as _};
     use rdkafka::{Offset, TopicPartitionList};
@@ -751,6 +753,38 @@ async fn wait_for_zero_lag(client: &KafkaClient, topic: &str, group: &str, timeo
             stats.messages_pending
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// How long a fresh broker may take to answer its first group-coordinator
+/// request. That request creates the offsets topic, and a leader is elected
+/// for it afterwards, which on a busy host outlasts the five attempts of the
+/// stats provider's own retry loop.
+const COORDINATOR_WARM_UP: Duration = Duration::from_secs(60);
+
+/// The lag stats of `queue`, read again while the broker's group coordinator
+/// is still coming up. Only a connection error is retried: any other error,
+/// and the last connection error once [`COORDINATOR_WARM_UP`] has passed, fails
+/// the test.
+async fn lag_stats_once_coordinator_answers(
+    client: &KafkaClient,
+    queue: &str,
+    group_id: &str,
+    reset: KafkaAutoOffsetReset,
+) -> KafkaQueueStats {
+    use shove::kafka::{KafkaLagStatsProvider, KafkaQueueStatsProvider};
+
+    let stats_provider = KafkaLagStatsProvider::new(client.clone());
+    let deadline = Instant::now() + COORDINATOR_WARM_UP;
+    loop {
+        match stats_provider.get_queue_stats(queue, group_id, reset).await {
+            Ok(stats) => return stats,
+            Err(ShoveError::Connection(e)) if Instant::now() < deadline => {
+                eprintln!("the group coordinator is not up yet, reading again: {e}");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => panic!("lag stats of {queue} failed: {e:?}"),
+        }
     }
 }
 
@@ -1999,6 +2033,303 @@ async fn publish_and_consume_batch() {
 }
 
 // ===========================================================================
+// Publish errors and batch order, against librdkafka's mock cluster
+// ===========================================================================
+
+shove::define_topic!(
+    MockPublishTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-mock-publish").build()
+);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct KeyedRecord {
+    key: String,
+    seq: u32,
+    pad: String,
+}
+
+shove::define_sequenced_topic!(
+    MockSequencedTopic,
+    KeyedRecord,
+    |record: &KeyedRecord| record.key.clone(),
+    TopologyBuilder::new("kafka-mock-sequenced")
+        .sequenced(SequenceFailure::Skip)
+        .allow_message_loss()
+        .build()
+);
+
+/// A mock cluster holding `topic` at one partition, and a broker over a
+/// client connected to it.
+async fn mock_broker_with(
+    topic: &str,
+) -> (MockCluster<'static, DefaultProducerContext>, Broker<Kafka>) {
+    let mock = MockCluster::new(1).expect("mock cluster");
+    mock.create_topic(topic, 1, 1).expect("mock topic");
+    let client = KafkaClient::connect(&KafkaConfig::new(mock.bootstrap_servers()))
+        .await
+        .expect("connect to the mock cluster");
+    (mock, Broker::<Kafka>::from_client(client))
+}
+
+/// The `seq` of every record stored on `topic`'s one partition, in offset
+/// order.
+async fn sequence_on_partition(bootstrap: &str, topic: &str) -> Vec<u32> {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _, StreamConsumer};
+    use rdkafka::{Offset, TopicPartitionList};
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .create()
+        .expect("watermark probe");
+    let (_, high) = probe
+        .fetch_watermarks(topic, 0, Duration::from_secs(10))
+        .expect("fetch the watermarks");
+    let stored = usize::try_from(high).expect("a watermark is never negative");
+    let consumer: StreamConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("group.id", format!("{topic}-read-back"))
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("read-back consumer");
+    let mut assignment = TopicPartitionList::new();
+    assignment
+        .add_partition_offset(topic, 0, Offset::Beginning)
+        .expect("name the partition");
+    consumer.assign(&assignment).expect("assign the partition");
+    let mut seqs = Vec::with_capacity(stored);
+    while seqs.len() < stored {
+        let message = tokio::time::timeout(TIMEOUT, consumer.recv())
+            .await
+            .expect("every stored record is read back")
+            .expect("read a stored record");
+        let record: KeyedRecord =
+            serde_json::from_slice(message.payload().expect("a stored record has a payload"))
+                .expect("decode a stored record");
+        seqs.push(record.seq);
+    }
+    seqs
+}
+
+/// An authorization error is final: the publish returns it at the first
+/// refusal, and the error is not retryable. The mock refuses a single
+/// produce request, so a publish that sent the record again would land it.
+#[tokio::test]
+async fn unauthorized_publish_is_not_retryable() {
+    for refusal in [
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED,
+    ] {
+        let (mock, broker) = mock_broker_with(MockPublishTopic::topology().queue()).await;
+        let publisher = broker.publisher().await.expect("publisher");
+        mock.request_errors(RDKafkaApiKey::Produce, &[refusal]);
+
+        let err = publisher
+            .publish::<MockPublishTopic>(&SimpleMessage {
+                id: "denied".into(),
+                content: "the principal may not write".into(),
+            })
+            .await
+            .expect_err("a refused publish is not sent again");
+
+        assert!(
+            !err.is_retryable(),
+            "{refusal:?} reads as retryable: {err:?}"
+        );
+        assert!(
+            matches!(err, ShoveError::Topology(_)),
+            "{refusal:?}: {err:?}"
+        );
+        broker.close().await;
+    }
+}
+
+/// A record sent again after a failure carries the headers it was first
+/// sent with: the message id, the retry count and the caller's own. The mock
+/// refuses one produce request with an error librdkafka hands back instead
+/// of retrying it, so the publish sends the record a second time itself.
+#[tokio::test]
+async fn a_retried_publish_keeps_its_headers() {
+    use rdkafka::consumer::{Consumer as _, StreamConsumer};
+    use rdkafka::message::{Headers as _, OwnedHeaders};
+    use rdkafka::{Offset, TopicPartitionList};
+
+    const REFUSAL: RDKafkaRespErr = RDKafkaRespErr::RD_KAFKA_RESP_ERR_POLICY_VIOLATION;
+    let topic = MockPublishTopic::topology().queue();
+    let mock = MockCluster::new(1).expect("mock cluster");
+    mock.create_topic(topic, 1, 1).expect("mock topic");
+    let client = KafkaClient::connect(&KafkaConfig::new(mock.bootstrap_servers()))
+        .await
+        .expect("connect to the mock cluster");
+    let broker = Broker::<Kafka>::from_client(client.clone());
+    let publisher = broker.publisher().await.expect("publisher");
+
+    mock.request_errors(RDKafkaApiKey::Produce, &[REFUSAL]);
+    client
+        .publish_with_retry(topic, None, OwnedHeaders::new(), b"{}", 1, "probe")
+        .await
+        .expect_err("a single send meets the refusal");
+
+    mock.request_errors(RDKafkaApiKey::Produce, &[REFUSAL]);
+    publisher
+        .publish_with_headers::<MockPublishTopic>(
+            &SimpleMessage {
+                id: "retried".into(),
+                content: "sent twice".into(),
+            },
+            HashMap::from([("trace-id".to_string(), "trace-7".to_string())]),
+        )
+        .await
+        .expect("the second send lands the record");
+
+    let consumer: StreamConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", mock.bootstrap_servers())
+        .set("group.id", format!("{topic}-read-back"))
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("read-back consumer");
+    let mut assignment = TopicPartitionList::new();
+    assignment
+        .add_partition_offset(topic, 0, Offset::Beginning)
+        .expect("name the partition");
+    consumer.assign(&assignment).expect("assign the partition");
+    let stored = tokio::time::timeout(TIMEOUT, consumer.recv())
+        .await
+        .expect("the record is read back")
+        .expect("read the stored record");
+    let headers: HashMap<String, String> = stored
+        .headers()
+        .map(|headers| {
+            headers
+                .iter()
+                .filter_map(|h| {
+                    h.value
+                        .map(|v| (h.key.to_string(), String::from_utf8_lossy(v).into_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        headers.get("trace-id").map(String::as_str),
+        Some("trace-7"),
+        "{headers:?}"
+    );
+    assert_eq!(
+        headers.get("Shove-Retry-Count").map(String::as_str),
+        Some("0"),
+        "{headers:?}"
+    );
+    assert!(
+        headers
+            .get("Shove-Message-Id")
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .is_some_and(|id| id.get_version_num() == 4),
+        "the message id is a version 4 UUID: {headers:?}"
+    );
+    broker.close().await;
+}
+
+/// A batch on a sequenced topic goes out in slice order and stops at the
+/// first record that fails: the records before it are stored in order,
+/// nothing after it is sent, and the report hands back the failed record
+/// with the whole tail, so republishing that set keeps the key's order. A
+/// record above librdkafka's 1 MB `message.max.bytes` fails as it is
+/// enqueued, in the middle of the batch.
+#[tokio::test]
+async fn sequenced_publish_batch_keeps_slice_order_under_partial_failure() {
+    let topic = MockSequencedTopic::topology().queue();
+    let (mock, broker) = mock_broker_with(topic).await;
+    let publisher = broker.publisher().await.expect("publisher");
+    let batch: Vec<KeyedRecord> = (0..5)
+        .map(|seq| KeyedRecord {
+            key: "account-7".into(),
+            seq,
+            pad: if seq == 2 {
+                "x".repeat(1_100_000)
+            } else {
+                String::new()
+            },
+        })
+        .collect();
+
+    let err = publisher
+        .publish_batch::<MockSequencedTopic>(&batch)
+        .await
+        .expect_err("the oversized record fails");
+
+    let ShoveError::PartialBatch(failure) = &err else {
+        panic!("expected a partial batch, got {err:?}");
+    };
+    assert_eq!(failure.failed(), &[2], "the first record that failed");
+    assert_eq!(failure.unattempted(), &[3, 4], "everything after it");
+    assert_eq!(failure.to_republish(), &[2, 3, 4]);
+    assert_eq!(failure.succeeded(), 2);
+    assert!(
+        matches!(failure.source(), ShoveError::Validation(_)),
+        "a record past the size limit is refused as invalid input: {}",
+        failure.source()
+    );
+    assert_eq!(
+        sequence_on_partition(&mock.bootstrap_servers(), topic).await,
+        vec![0, 1],
+        "only the records before the failure are stored, in slice order"
+    );
+    broker.close().await;
+}
+
+/// A record whose delivery fails is the failure of a sequenced batch, and
+/// it wins over a later record that cannot be enqueued at all. Records 0
+/// and 1 are each over half of librdkafka's 1 MB `batch.size`, so each
+/// opens its own produce request, and the mock fails the second request.
+/// Record 4 is over `message.max.bytes`, so its enqueue is refused.
+#[tokio::test]
+async fn sequenced_publish_batch_reports_a_delivery_failure_ahead_of_a_later_refusal() {
+    let topic = MockSequencedTopic::topology().queue();
+    let (mock, broker) = mock_broker_with(topic).await;
+    let publisher = broker.publisher().await.expect("publisher");
+    mock.request_errors(
+        RDKafkaApiKey::Produce,
+        &[
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR,
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_POLICY_VIOLATION,
+        ],
+    );
+    let pads = [600_000, 600_000, 0, 0, 1_100_000];
+    let batch: Vec<KeyedRecord> = (0..)
+        .zip(pads)
+        .map(|(seq, pad)| KeyedRecord {
+            key: "account-7".into(),
+            seq,
+            pad: "x".repeat(pad),
+        })
+        .collect();
+
+    let err = publisher
+        .publish_batch::<MockSequencedTopic>(&batch)
+        .await
+        .expect_err("the second record's delivery fails");
+
+    let ShoveError::PartialBatch(failure) = &err else {
+        panic!("expected a partial batch, got {err:?}");
+    };
+    assert_eq!(failure.failed(), &[1], "the failed delivery comes first");
+    assert_eq!(failure.unattempted(), &[2, 3, 4]);
+    assert_eq!(failure.succeeded(), 1);
+    assert!(
+        failure.source().to_string().contains("PolicyViolation"),
+        "the delivery's error is the one reported: {}",
+        failure.source()
+    );
+    let stored = sequence_on_partition(&mock.bootstrap_servers(), topic).await;
+    assert_eq!(stored.first(), Some(&0), "stored: {stored:?}");
+    assert!(
+        !stored.contains(&1) && !stored.contains(&4),
+        "stored: {stored:?}"
+    );
+    broker.close().await;
+}
+
+// ===========================================================================
 // Rejection & DLQ
 // ===========================================================================
 
@@ -2765,7 +3096,7 @@ async fn sequenced_skip_continues_after_rejection() {
     broker.close().await;
 }
 
-/// CAF-84: `SequenceFailure::FailAll` must halt the failing sequence key on
+/// `SequenceFailure::FailAll` must halt the failing sequence key on
 /// Kafka, not silently behave like `Skip`.
 ///
 /// Kafka carries the sequence key as the record key, so unlike NATS this
@@ -5263,8 +5594,6 @@ async fn deserialization_failure_rejects_to_dlq() {
 
 #[tokio::test]
 async fn lag_stats_provider_reports_pending_messages() {
-    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
-
     let tb = TestBroker::start().await;
     let broker = tb.broker();
     let client = tb.client();
@@ -5281,15 +5610,13 @@ async fn lag_stats_provider_reports_pending_messages() {
             .unwrap();
     }
 
-    let stats_provider = KafkaLagStatsProvider::new(client.clone());
-    let stats: KafkaQueueStats = stats_provider
-        .get_queue_stats(
-            "kafka-work",
-            "kafka-work-consumer",
-            KafkaAutoOffsetReset::Earliest,
-        )
-        .await
-        .expect("get_queue_stats should succeed");
+    let stats = lag_stats_once_coordinator_answers(
+        &client,
+        "kafka-work",
+        "kafka-work-consumer",
+        KafkaAutoOffsetReset::Earliest,
+    )
+    .await;
 
     assert!(
         stats.messages_pending >= 5,
@@ -5298,6 +5625,183 @@ async fn lag_stats_provider_reports_pending_messages() {
     );
 
     broker.close().await;
+}
+
+/// The lag read asks every partition for its start and end offset in batched
+/// requests; a six-partition topic holding keyed records must still sum to the
+/// number of records published.
+#[tokio::test]
+async fn lag_stats_provider_sums_every_partition_of_a_multi_partition_topic() {
+    shove::define_sequenced_topic!(
+        SixPartitionLagTopic,
+        OrderMessage,
+        |msg: &OrderMessage| msg.order_id.clone(),
+        TopologyBuilder::new("kafka-lag-six-partitions")
+            .sequenced(SequenceFailure::Skip)
+            .routing_shards(6)
+            .hold_queue(Duration::from_millis(200))
+            .dlq()
+            .build()
+    );
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<SixPartitionLagTopic>()
+        .await
+        .unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    for i in 0..24u64 {
+        publisher
+            .publish::<SixPartitionLagTopic>(&OrderMessage {
+                order_id: format!("order-{i}"),
+                amount: i,
+            })
+            .await
+            .unwrap();
+    }
+
+    let client = tb.client();
+    let from_start = lag_stats_once_coordinator_answers(
+        &client,
+        "kafka-lag-six-partitions",
+        "kafka-lag-six-partitions-fifo",
+        KafkaAutoOffsetReset::Earliest,
+    )
+    .await;
+    let from_tail = lag_stats_once_coordinator_answers(
+        &client,
+        "kafka-lag-six-partitions",
+        "kafka-lag-six-partitions-fifo",
+        KafkaAutoOffsetReset::Latest,
+    )
+    .await;
+
+    assert_eq!(from_start.messages_pending, 24);
+    assert_eq!(from_tail.messages_pending, 0);
+
+    broker.close().await;
+}
+
+/// On a real broker with its default topic auto-creation, a lag read of a topic
+/// the broker does not have is an error, and the second read shows that the
+/// first created nothing.
+#[tokio::test]
+async fn lag_stats_provider_refuses_an_unknown_topic() {
+    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
+
+    let tb = TestBroker::start().await;
+    let stats_provider = KafkaLagStatsProvider::new(tb.client());
+
+    for attempt in 0..2 {
+        let err = stats_provider
+            .get_queue_stats(
+                "kafka-lag-no-such-topic",
+                "kafka-lag-no-such-topic-consumer",
+                KafkaAutoOffsetReset::Earliest,
+            )
+            .await
+            .expect_err("a topic the broker does not have has no lag to report");
+        assert!(
+            matches!(err, ShoveError::Topology(_)),
+            "attempt {attempt}: got {err:?}"
+        );
+    }
+
+    tb.broker().close().await;
+}
+
+/// Deleting a prefix of a log raises its low watermark. A group that never
+/// committed starts at that watermark under `earliest`, so its lag is the
+/// records the log still holds, and the high watermark alone would count the
+/// deleted prefix too.
+#[tokio::test]
+async fn lag_stats_provider_counts_only_the_records_above_a_raised_low_watermark() {
+    use rdkafka::admin::{AdminClient, AdminOptions};
+    use rdkafka::client::DefaultClientContext;
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+    use rdkafka::{ClientConfig, Offset, TopicPartitionList};
+
+    const TOPIC: &str = "kafka-lag-raised-low-watermark";
+    let produced = [10i64, 6, 4];
+    let deleted_before = [7i64, 6, 0];
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 3).await;
+
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", tb.brokers())
+        .create()
+        .expect("failed to create raw producer");
+    for (partition, &count) in (0..).zip(&produced) {
+        for n in 0..count {
+            producer
+                .send(
+                    FutureRecord::to(TOPIC)
+                        .partition(partition)
+                        .key("k")
+                        .payload(&format!("record-{n}")),
+                    Duration::from_secs(10),
+                )
+                .await
+                .map_err(|(e, _)| e)
+                .expect("raw publish should succeed");
+        }
+    }
+    drop(producer);
+
+    let mut prefixes = TopicPartitionList::new();
+    for (partition, &before) in (0..).zip(&deleted_before) {
+        prefixes
+            .add_partition_offset(TOPIC, partition, Offset::Offset(before))
+            .expect("delete before the offset");
+    }
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", tb.brokers())
+        .create()
+        .expect("failed to create admin client");
+    let deleted = admin
+        .delete_records(&prefixes, &AdminOptions::new())
+        .await
+        .expect("delete_records failed");
+    drop(admin);
+    let mut low_watermarks: Vec<(i32, i64)> = deleted
+        .elements()
+        .iter()
+        .map(|element| {
+            element.error().expect("the prefix was deleted");
+            (
+                element.partition(),
+                element.offset().to_raw().expect("an offset"),
+            )
+        })
+        .collect();
+    low_watermarks.sort_unstable();
+    assert_eq!(
+        low_watermarks,
+        (0..).zip(deleted_before).collect::<Vec<_>>()
+    );
+
+    let stats = lag_stats_once_coordinator_answers(
+        &tb.client(),
+        TOPIC,
+        "kafka-lag-raised-low-watermark-consumer",
+        KafkaAutoOffsetReset::Earliest,
+    )
+    .await;
+
+    let retained: i64 = produced
+        .iter()
+        .zip(&deleted_before)
+        .map(|(produced, deleted)| produced - deleted)
+        .sum();
+    assert_eq!(
+        stats.messages_pending,
+        u64::try_from(retained).expect("a count of records")
+    );
+
+    tb.broker().close().await;
 }
 
 #[tokio::test]
@@ -6144,6 +6648,267 @@ async fn topology_expands_partitions_on_redeclare() {
     broker.close().await;
 }
 
+/// Declarers that start together and all find the topic short of the count
+/// they ask for race on `CreatePartitions`: the winner expands it, and the
+/// broker answers the others `INVALID_PARTITIONS` because the topic already
+/// has the count they asked for. A declarer that finds the topic at the count
+/// it wanted has nothing left to do, so every one of them succeeds.
+#[tokio::test]
+async fn concurrent_declares_that_expand_one_topic_all_succeed() {
+    const TOPIC: &str = "kafka-expand-race";
+    const DECLARERS: usize = 8;
+    shove::define_topic!(
+        ExpandRaceTopic,
+        SimpleMessage,
+        TopologyBuilder::new(TOPIC).build()
+    );
+
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(DECLARERS));
+    let mut declares = Vec::new();
+    for _ in 0..DECLARERS {
+        let client = KafkaClient::connect_with_retry(&KafkaConfig::new(tb.brokers()), 10)
+            .await
+            .expect("connect a declarer");
+        let barrier = Arc::clone(&barrier);
+        declares.push(tokio::spawn(async move {
+            barrier.wait().await;
+            KafkaTopologyDeclarer::new(client)
+                .with_min_partitions(12)
+                .declare(ExpandRaceTopic::topology())
+                .await
+        }));
+    }
+    for declare in declares {
+        declare
+            .await
+            .expect("the declare task joins")
+            .expect("a declarer that lost the expansion race still succeeds");
+    }
+
+    assert_eq!(live_partition_count(tb.brokers(), TOPIC), Some(12));
+}
+
+/// Raising a topic's partitions under a group that resets to `latest` skips
+/// the records produced to the new partitions before the group is assigned
+/// them, so the registry says so. A group that resets to `earliest` loses
+/// nothing and the registry stays quiet.
+#[tokio::test]
+async fn registry_warns_when_it_raises_partitions_under_a_latest_group() {
+    use std::fmt::Debug;
+    use std::sync::Mutex as StdMutex;
+    use tracing::field::{Field, Visit};
+    use tracing::subscriber::set_default;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct Warned(Arc<StdMutex<Vec<String>>>);
+
+    struct Fields(Vec<String>);
+
+    impl Visit for Fields {
+        fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+            self.0.push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for Warned {
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut fields = Fields(Vec::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0.join(" "));
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct Idle;
+
+    impl<T: Topic<Message = SimpleMessage>> MessageHandler<T> for Idle {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    shove::define_topic!(
+        GrowUnderLatestTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-grow-latest").build()
+    );
+    shove::define_topic!(
+        GrowUnderEarliestTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-grow-earliest").build()
+    );
+
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), "kafka-grow-latest", 1).await;
+    provision_topic(tb.brokers(), "kafka-grow-earliest", 1).await;
+    let broker = tb.broker();
+    let warned = Warned::default();
+    let _log = set_default(tracing_subscriber::registry().with(warned.clone()));
+
+    let mut group = broker.consumer_group();
+    group
+        .register::<GrowUnderLatestTopic, _>(
+            ConsumerGroupConfig::new(
+                KafkaConsumerGroupConfig::new(1..=12)
+                    .with_auto_offset_reset(KafkaAutoOffsetReset::Latest),
+            ),
+            || Idle,
+        )
+        .await
+        .expect("register the latest group");
+    group
+        .register::<GrowUnderEarliestTopic, _>(
+            ConsumerGroupConfig::new(
+                KafkaConsumerGroupConfig::new(1..=12)
+                    .with_auto_offset_reset(KafkaAutoOffsetReset::Earliest),
+            ),
+            || Idle,
+        )
+        .await
+        .expect("register the earliest group");
+
+    let events = warned.0.lock().unwrap().clone();
+    assert!(
+        events.iter().any(|event| {
+            event.contains("queue=\"kafka-grow-latest\"")
+                && event.contains("from=1")
+                && event.contains("to=12")
+        }),
+        "no warning for the latest group in {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event.contains("queue=\"kafka-grow-earliest\"") && event.contains("from=")
+        }),
+        "the earliest group warned about the raise in {events:?}"
+    );
+    assert_eq!(
+        live_partition_count(tb.brokers(), "kafka-grow-latest"),
+        Some(12)
+    );
+    broker.close().await;
+}
+
+// ===========================================================================
+// Sequenced topics keep their partition count
+// ===========================================================================
+
+/// Keys are routed over the topic's partitions, so adding one remaps part of
+/// the keys while their backlog sits in the partition they used to map to.
+/// Declaring a sequenced topology over a topic with fewer partitions than
+/// its routing shards is refused, with both counts named, and the topic is
+/// left as it was.
+#[tokio::test]
+async fn sequenced_topic_with_fewer_partitions_is_refused() {
+    const TOPIC: &str = "kafka-seq-fewer-partitions";
+    shove::define_sequenced_topic!(
+        FewerPartitionsTopic,
+        OrderMessage,
+        |msg: &OrderMessage| msg.order_id.clone(),
+        TopologyBuilder::new(TOPIC)
+            .sequenced(SequenceFailure::Skip)
+            .routing_shards(4)
+            .hold_queue(Duration::from_millis(200))
+            .dlq()
+            .build()
+    );
+
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 2).await;
+    let broker = tb.broker();
+
+    let err = broker
+        .topology()
+        .declare::<FewerPartitionsTopic>()
+        .await
+        .expect_err("a sequenced topic with fewer partitions than shards is refused");
+
+    match &err {
+        ShoveError::Topology(message) => assert!(
+            message.contains("2 partitions") && message.contains("routing_shards (4)"),
+            "the refusal must name both counts: {message}"
+        ),
+        other => panic!("expected a Topology error, got {other:?}"),
+    }
+    assert_eq!(
+        live_partition_count(tb.brokers(), TOPIC),
+        Some(2),
+        "the refused declare changed the partition count"
+    );
+    broker.close().await;
+}
+
+/// More partitions than shards remaps nothing, so the declare goes through
+/// and the topic keeps the count it has.
+#[tokio::test]
+async fn sequenced_topic_with_more_partitions_is_accepted_and_left_alone() {
+    const TOPIC: &str = "kafka-seq-more-partitions";
+    shove::define_sequenced_topic!(
+        MorePartitionsTopic,
+        OrderMessage,
+        |msg: &OrderMessage| msg.order_id.clone(),
+        TopologyBuilder::new(TOPIC)
+            .sequenced(SequenceFailure::Skip)
+            .routing_shards(2)
+            .hold_queue(Duration::from_millis(200))
+            .dlq()
+            .build()
+    );
+
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 6).await;
+    let broker = tb.broker();
+
+    broker
+        .topology()
+        .declare::<MorePartitionsTopic>()
+        .await
+        .expect("a sequenced topic with more partitions than shards is accepted");
+
+    assert_eq!(live_partition_count(tb.brokers(), TOPIC), Some(6));
+    broker.close().await;
+}
+
+/// A minimum partition count is for topics whose keys do not route over the
+/// partitions. A sequenced topic is created with exactly its routing shards,
+/// and re-declaring it with a larger minimum adds nothing.
+#[tokio::test]
+async fn sequenced_topic_ignores_a_minimum_partition_count() {
+    const TOPIC: &str = "kafka-seq-min-partitions";
+    shove::define_sequenced_topic!(
+        MinPartitionsTopic,
+        OrderMessage,
+        |msg: &OrderMessage| msg.order_id.clone(),
+        TopologyBuilder::new(TOPIC)
+            .sequenced(SequenceFailure::Skip)
+            .routing_shards(3)
+            .hold_queue(Duration::from_millis(200))
+            .dlq()
+            .build()
+    );
+
+    let tb = TestBroker::start().await;
+    let declarer = || KafkaTopologyDeclarer::new(tb.client()).with_min_partitions(12);
+
+    declarer()
+        .declare(MinPartitionsTopic::topology())
+        .await
+        .expect("the first declare creates the topic");
+    declarer()
+        .declare(MinPartitionsTopic::topology())
+        .await
+        .expect("the second declare leaves it alone");
+
+    assert_eq!(live_partition_count(tb.brokers(), TOPIC), Some(3));
+}
+
 // ===========================================================================
 // DLQ consumer edge cases
 // ===========================================================================
@@ -6602,6 +7367,113 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
     assert!(outcome.is_clean(), "outcome was {outcome:?}");
     assert_eq!(handler.counter.get(), 5);
 
+    broker.close().await;
+}
+
+shove::define_sequenced_topic!(
+    SeqAbortTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("kafka-fifo-abort")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_millis(200))
+        .dlq()
+        .build()
+);
+
+/// Starts, works for `work`, then finishes and acks.
+#[derive(Clone)]
+struct SlowFifoHandler {
+    work: Duration,
+    started: WaitableCounter,
+    finished: WaitableCounter,
+}
+
+impl MessageHandler<SeqAbortTopic> for SlowFifoHandler {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.started.increment();
+        tokio::time::sleep(self.work).await;
+        self.finished.increment();
+        Outcome::Ack
+    }
+}
+
+/// A FIFO group whose drain times out aborts its shard task with it, and the
+/// shard takes the handler call it is awaiting along. The handler never
+/// finishes, and the shard commits nothing after the timeout was reported:
+/// the group has no committed offset on the topic.
+#[tokio::test]
+async fn fifo_group_drain_timeout_stops_the_shard() {
+    const WORK: Duration = Duration::from_secs(3);
+    const TOPIC: &str = "kafka-fifo-abort";
+    const GROUP: &str = "kafka-fifo-abort-fifo";
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<SeqAbortTopic>().await.unwrap();
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<SeqAbortTopic>(&OrderMessage {
+            order_id: "A".into(),
+            amount: 0,
+        })
+        .await
+        .unwrap();
+
+    let handler = SlowFifoHandler {
+        work: WORK,
+        started: WaitableCounter::new(),
+        finished: WaitableCounter::new(),
+    };
+    let mut group = broker.consumer_group();
+    group
+        .register_fifo::<SeqAbortTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::default()),
+            {
+                let h = handler.clone();
+                move || h.clone()
+            },
+        )
+        .await
+        .unwrap();
+
+    let signal = {
+        let started = handler.started.clone();
+        async move {
+            started.wait_for(1, TIMEOUT).await;
+        }
+    };
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_millis(500))
+        .await;
+    assert!(
+        outcome.timed_out,
+        "the handler outlasts the drain (started {}): {outcome:?}",
+        handler.started.get()
+    );
+    assert_eq!(
+        (outcome.errors, outcome.panics),
+        (0, 0),
+        "an aborted shard counts as neither an error nor a panic"
+    );
+
+    // Past the point where the handler would have returned, and a shard that
+    // survived the abort would have acked and committed the record.
+    tokio::time::sleep(WORK + Duration::from_secs(1)).await;
+    assert_eq!(
+        committed_offset(tb.brokers(), GROUP, TOPIC, 0),
+        None,
+        "a shard committed after the drain timeout was reported"
+    );
+    assert_eq!(
+        handler.finished.get(),
+        0,
+        "the handler ran on after its shard was aborted"
+    );
     broker.close().await;
 }
 

@@ -53,6 +53,9 @@ cargo add shove --features kafka-msk-iam
 
 `KafkaConfig::new` takes a bootstrap server address (e.g. `localhost:9092`). TLS and SASL are configured via `KafkaTls` and `KafkaSasl` on the config — available when the `kafka-ssl` feature is enabled.
 
+librdkafka's constructors can block while they read TLS files.
+`connect` builds its metadata consumer on a blocking thread, and so do `declare` for its admin client and the autoscaler for its lag-reading consumer, so none of them holds the runtime's thread.
+
 ## Connecting to AWS MSK
 
 The `kafka-msk-iam` feature adds IAM-based authentication for Amazon MSK clusters. It pulls in `aws-config`, `aws-credential-types`, and `aws-msk-iam-sasl-signer`. Use it alongside `kafka-ssl`:
@@ -102,6 +105,41 @@ Declaration is idempotent, so it is safe to call on every startup.
 Producer topic auto-creation defaults to off (`allow.auto.create.topics=false`), so declare the topology before the first publish or provision the topic outside shove.
 A publish to a topic nobody declared fails with a `Connection` error after the produce timeout, and the topic stays absent.
 Set [`KafkaConfig::with_producer_auto_create_topics(true)`](https://docs.rs/shove/latest/shove/kafka/struct.KafkaConfig.html#method.with_producer_auto_create_topics) to allow creation on first publish when the broker enables `auto.create.topics.enable=true`.
+
+### Partitions of an existing topic
+
+`declare` creates the main topic with at least eight partitions, and more when `with_min_partitions` or the registry's `max_consumers` ask for more.
+It raises an existing topic to that count.
+A group with no committed offset on a partition starts it at its `auto.offset.reset`.
+Under `KafkaAutoOffsetReset::Latest` a record produced to a new partition before the group is assigned it is skipped, so the registry logs a warning when it raises the partitions under a group configured with `Latest`.
+
+A sequenced topic is created with exactly its `routing_shards` partitions, and `with_min_partitions` has no effect on it.
+Keys are routed over the partitions, so adding one remaps part of the keys while their backlog sits in the partition they mapped to before.
+`declare` therefore never adds partitions to a sequenced topic.
+A topic with fewer partitions than `routing_shards` is refused with a `ShoveError::Topology` that names both counts, and the topic is left as it was.
+A topic with more partitions is accepted as it is and logged with a warning.
+
+Several processes can declare the same topic at once.
+A declarer that finds the topic already at the count it asked for has nothing to do, including one that loses the race to expand it.
+The metadata of a topic that was just created can lag, so `declare` reads it again for up to a few seconds while the broker answers unknown topic or leader not available.
+A declarer whose expansion the controller refuses reads the count again, for the same few seconds, until it shows the count asked for, because the broker that answers can still report the old one.
+
+### Retry and defer without hold queues
+
+Kafka has no hold topics, so `hold_queue(Duration)` sets only how long a `Retry` or a `Defer` waits before the record comes back.
+With none declared, the consumer waits a fixed 1 s for both outcomes under both retry strategies, and the delay has no setting.
+Declare a hold queue to choose it.
+
+Under `RetryStrategy::Republish`, the default on a shove-owned topology, the consumer waits 1 s and republishes the record into the topic.
+A `Retry` carries the retry count incremented by one in its header, and a `Defer` carries it unchanged.
+Under `RetryStrategy::InPlace` the handler's task waits 1 s holding its prefetch slot and hands the same record back, with the count kept in memory.
+A sequenced consumer waits the 1 s in its receive loop under either strategy and hands the same record back, see [Retries in place](#retries-in-place).
+A `Retry` spends `max_retries` under either strategy, so the usual DLQ routing applies once the budget is spent.
+
+Kafka logs no warning for a `Retry` or a `Defer` without hold queues.
+Building a topology that declares a DLQ and no hold queues logs one warning at build time, which links to [With no hold queues](/concepts/outcomes#with-no-hold-queues).
+That page lists the fallback of every backend.
+A sequenced topology and one that calls `allow_message_loss()` get no such warning.
 
 ### Bind to an infra-owned topic
 
@@ -224,6 +262,17 @@ A record the producer refuses as larger than its `message.max.bytes`, librdkafka
 So does a record the broker refuses as too large for the topic or as invalid.
 No later send can get such a record past the limit.
 
+`publish` and `publish_with_headers` send a record again after a transient failure, three sends in all, and then return `ShoveError::Connection`.
+An authorization error is returned at the first refusal as `ShoveError::Topology`.
+A publish on a producer that librdkafka marked fatal returns `ShoveError::Unknown` whatever the cause, including a principal that may not request a producer id; `is_retryable()` is false for both.
+On a sequenced topic `publish_batch` sends the records in slice order and reports the first failure with every record after it, so a re-publish of `to_republish()` stores copies of the failed record and every record after it in slice order; see [Batch publishing](/guides/batch-publishing).
+
+A consumer's retry, defer and DLQ republishes go through the same producer and meet the same errors, and every consume path reads them the same way.
+A `ShoveError::Connection` keeps the record uncommitted, and the consume path tries it again as its section below says.
+An error no retry gets past ends the member with that error: an authorization refusal (`ShoveError::Topology`), a producer that librdkafka marked fatal or that waits to be built again (`ShoveError::Unknown`), or a producer that cannot be built (`ShoveError::Topology`).
+The next publish builds a new producer, at once or after the wait described under [Producer tuning](#producer-tuning).
+A `ShoveError::Validation` marks a record that can never be published: a `Retry` or `Defer` copy is dead-lettered instead with the death reason `republish_failed`, and a dead letter is discarded, committed past and counted in `messages_discarded_total`.
+
 ### Producer tuning
 
 shove pins the correctness-critical producer settings (`acks=all`, `enable.idempotence=true`) and keeps them non-configurable. Idempotence caps `max.in.flight.requests.per.connection` at 5, so sustained throughput is bounded by messages per request — i.e. by batching. librdkafka's defaults (`linger.ms=5`, no compression) favor low latency; high-rate pipelines can raise the throughput ceiling with three opt-in knobs on `KafkaConfig`:
@@ -246,9 +295,23 @@ Unset throughput settings keep librdkafka's defaults.
 
 The client holds a single producer, built at the first publish.
 `publisher()` and the consumer's retry, defer, and DLQ republishes share it.
-A long linger also delays those republishes.
+A producer that librdkafka marked fatal refuses every record from then on, so the publish that meets the error fails and the client builds a new producer.
+It does so at the next publish when the dead producer had delivered a record.
+A producer that died before it delivered anything usually met a fault the next one meets too, such as a principal that may not request a producer id, so the client waits before it builds again: 1 s, doubling for each such producer in a row up to 60 s, and back to 1 s once a producer delivers.
+Until the wait is over every publish fails at once with the same `ShoveError::Unknown`, and no producer is built.
+A long linger also delays the consumer's retry, defer, and DLQ republishes.
 A sequenced consumer handles nothing behind a record until that record's dead letter lands, so a long linger delays every partition the member holds while it dead-letters.
 Keep linger modest when consumers republish on the same client.
+
+### Closing the client
+
+`Broker::close` cancels the client's shutdown token, waits 500 ms for work in flight, and then flushes the producer.
+A producer build still running at that point is waited for at most 2 s, and a build that outlasts the wait is not flushed.
+The flush gives records still queued up to 5 s to be delivered, and a record that is not delivered by then is dropped with a warning in the log.
+The flush runs on a blocking thread, so a broker that never answers holds `close` for those 5 s and leaves the runtime free.
+
+`run_until_timeout` on a consumer group starts draining when its signal future resolves or when the client's shutdown token is cancelled first.
+In the second case it aborts the task that runs the signal future and waits for it to finish.
 
 ## Consume
 
@@ -604,7 +667,12 @@ shove reads nothing from the shape of an id: a record whose own id ends in `-r7`
 
 Messages for the same key stay in order. Kafka uses partition-key routing: `T::sequence_key()` becomes the Kafka message key, so messages with the same key always land on the same partition. A single consumer handles each partition at a time, guaranteeing that messages for the same key are never processed concurrently.
 
-Ordering is partition-scoped: two messages with different keys may land on different partitions and be processed concurrently. The partition count is fixed at topic creation time and caps the maximum degree of parallelism across the consumer group.
+Ordering is partition-scoped: two messages with different keys may land on different partitions and be processed concurrently. The partition count is the topology's `routing_shards`, fixed at topic creation time, and caps the maximum degree of parallelism across the consumer group. `declare` never adds partitions to a sequenced topic, see [Partitions of an existing topic](#partitions-of-an-existing-topic).
+
+A sequenced consumer group handles its records on one shard task.
+When the group's drain timeout runs out with a handler still going, the group aborts the shard task along with its own task, and the handler call the shard is awaiting goes with it.
+A handler still running when the abort reaches the shard is dropped with it: its record stays uncommitted, and the next member to take its partition receives it again.
+A handler that finishes in the moment between the report and the abort can still have its record committed.
 
 ### Retries in place
 
@@ -635,7 +703,7 @@ Between attempts the consumer waits 1 s, the wait doubling up to 30 s with ±50 
 Nothing behind the record is handled meanwhile.
 No discard is counted for a record kept that way.
 The same holds for a record dropped before the handler and for a `FailAll` cascade.
-A failure no retry gets past, such as a producer that cannot be built, ends the member with that error, and it does not reconnect.
+A failure no retry gets past, such as a refused authorization or a fatal producer (see [Publish](#publish)), ends the member with that error, and it does not reconnect.
 Before it ends, the member makes the final commit a stop makes, so the positions acked ahead of the record are committed.
 The record stays uncommitted, and no discard is counted for it.
 A dead letter that can never be published is not tried again, because trying it again would block the partition for good.
@@ -672,6 +740,16 @@ group
 
 The autoscaler measures consumer lag (the offset gap between the latest produced message and the latest committed offset) and adjusts the number of active consumers within the `min..=max` range.
 
+A lag poll asks the broker for the start offsets and then the end offsets of every partition in two batched rounds, each sending one request per partition leader, so the cost of a poll follows the number of leaders and stays flat as the partition count grows.
+The poll fails, and the group keeps its member count for that cycle, when the topic does not exist, when the broker answers the topic's metadata with an error such as `TOPIC_AUTHORIZATION_FAILED`, or when an offset request fails or comes back with an error for any partition's committed offset.
+None of those answers is read as a lag of zero.
+The autoscaler logs the failure as `failed to fetch metrics for <group>`.
+
+The autoscaler sizes each member by the messages it holds in flight at once.
+With `with_concurrent_processing` off, the default, a member handles one message at a time and counts as one permit whatever `with_prefetch_count` says.
+With `with_concurrent_processing(true)`, a member counts as `prefetch_count` permits, raised to 1 when it is 0.
+See [capacity](/guides/groups#autoscaling--the-signal) for how the permits enter the scaling thresholds.
+
 Note: consumer-group rebalances occur during scale-up and scale-down events. Rebalances cause a brief delivery pause while Kafka reassigns partitions. Plan for this when setting autoscale bounds and drain timeouts.
 
 See the [Basic example](/backends/kafka/examples/basic) for a full runnable walkthrough.
@@ -690,7 +768,7 @@ See [Retries in place](#retries-in-place).
 
 A republish that fails and may succeed later ends the member with a connection error, under either commit policy.
 Nothing is committed past the record meanwhile, and the reconnect resumes from the committed position, so the record is redelivered.
-A failure no retry gets past, such as a producer that cannot be built, ends the member with that error instead, and it does not reconnect.
+A failure no retry gets past, such as a refused authorization or a fatal producer (see [Publish](#publish)), ends the member with that error instead, and it does not reconnect.
 A copy the broker refuses as too large for the topic or as invalid can never be published, so the record is dead-lettered instead, with the death reason `republish_failed`.
 A copy past the producer's `message.max.bytes`, librdkafka's 1 MB default, can never be published either, and neither can its dead letter, which the same producer refuses.
 That record is discarded and committed, an error is logged, and `messages_discarded_total` counts it under `republish_failed`.
@@ -879,7 +957,7 @@ The same holds for a record dropped before the handler, oversize or undecodable.
 Each such failure, of a dead letter or of a republish, costs a reconnect: the member leaves its group and joins it again, which rebalances the group.
 A reconnect counts against `max_reconnect_attempts` like any connection error, and the count resets only after a connection that lasted a minute.
 With a limit set, a DLQ that stays unwritable therefore ends the consumer once the limit is spent; with the default, no limit, the consumer keeps reconnecting under its backoff.
-A failure no retry gets past, such as a producer that cannot be built, ends the member with that error at once.
+A failure no retry gets past, such as a refused authorization or a fatal producer (see [Publish](#publish)), ends the member with that error at once.
 A dead letter that can never be published is the one exception that discards: one past the producer's `message.max.bytes`, or one the broker refuses as too large or as invalid.
 The record is discarded and committed, an error is logged, and `messages_discarded_total` counts it.
 
@@ -903,7 +981,7 @@ A dead letter that fails and may land later retires nothing: nothing is committe
 The batch is handed over again from there after the delay a `Retry` waits, 1 s doubling up to 30 s, and no discard is counted for the record.
 The dead letters behind it on its partition are not tried, and the ones already published are published again with the redelivery.
 A dead letter that can never be published, one past the producer's `message.max.bytes` or one the broker refuses as too large or as invalid, is discarded and committed past, an error is logged, and `messages_discarded_total` counts it.
-A failure no retry gets past, such as a producer that cannot be built, commits nothing of the batch and ends the consumer with that error.
+A failure no retry gets past, such as a refused authorization or a fatal producer (see [Publish](#publish)), commits nothing of the batch and ends the consumer with that error.
 Dead letters are at-least-once.
 A rebalance while they run, a dead letter that fails, and a refused commit whose re-offer has not landed when the partition moves can each hand the batch over again, and its letters that had landed are then published again.
 
@@ -1150,7 +1228,7 @@ The Kafka backend emits `shove_messages_failed_total` with the following `reason
 ## Gotchas
 
 - **Replication factor defaults to `1`** — safe for single-broker dev, unsafe in production. Set `with_default_replication_factor(3)` on the registry (or `with_replication_factor` on the topology declarer) before the first declaration. The default exists so the no-config dev path works; the constant lives in `kafka::constants::DEFAULT_REPLICATION`.
-- **Partition count is set at topic creation time** and is rarely changed after the fact. Choose carefully — partition count caps the maximum degree of parallelism a consumer group can achieve (one consumer per partition maximum).
+- **Partition count is set at topic creation time** and is rarely changed after the fact. Choose carefully — partition count caps the maximum degree of parallelism a consumer group can achieve (one consumer per partition maximum). `declare` raises a non-sequenced topic to the count it is given and never adds partitions to a sequenced one, see [Partitions of an existing topic](#partitions-of-an-existing-topic).
 - **Consumer-group rebalances** during scale events cause brief delivery pauses. The larger the group and the more topics, the longer the rebalance. shove pins `session.timeout.ms` to 10 seconds and `max.poll.interval.ms` to 5 minutes (constants in `kafka::constants`); neither is settable via `KafkaConfig`. If handlers are slow, raise the handler timeout with `with_handler_timeout` (per group) or `with_default_handler_timeout` (registry-wide) instead.
 - **On Windows**, the `cmake-build` feature is required for `rdkafka` (the underlying C library). This is handled automatically via the `[target.'cfg(windows)'.dependencies]` entry in `Cargo.toml`.
 - **SASL and TLS** require the `kafka-ssl` feature.

@@ -18,7 +18,7 @@ use crate::backends::nats::consumer::{NatsConsumer, abort_on_drop, derive_ack_wa
 use crate::backends::nats::topology::NatsTopologyDeclarer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_group::reject_fifo_concurrency;
-use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally};
+use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally, count_one};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
@@ -50,14 +50,6 @@ fn harvest_if_finished(
         count_one(panic_count);
     }
     true
-}
-
-/// Counts one more occurrence, saturating at the top.
-fn count_one(counter: &AtomicUsize) {
-    // The closure always answers `Some`, so the update cannot fail.
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-        Some(n.saturating_add(1))
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,15 +1062,6 @@ mod tests {
 
     fn default_config() -> NatsConsumerGroupConfig {
         NatsConsumerGroupConfig::new(1..=4)
-    }
-
-    #[test]
-    fn a_counter_saturates_at_the_top() {
-        let counter = AtomicUsize::new(usize::MAX - 1);
-        count_one(&counter);
-        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
-        count_one(&counter);
-        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
     }
 
     #[tokio::test]
