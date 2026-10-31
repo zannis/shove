@@ -3285,6 +3285,18 @@ fn max_poll_interval_ms(options: &ConsumerOptions) -> u32 {
     MAX_POLL_INTERVAL_MS
 }
 
+/// [`max_poll_interval_ms`] for the batch consumer, whose options carry the
+/// test seam as `BatchConsumerOptionsInner::kafka_max_poll_interval`.
+fn batch_max_poll_interval_ms(options: &BatchConsumerOptionsInner) -> u32 {
+    #[cfg(feature = "test-support")]
+    if let Some(interval) = options.kafka_max_poll_interval {
+        return u32::try_from(interval.as_millis()).unwrap_or(u32::MAX);
+    }
+    #[cfg(not(feature = "test-support"))]
+    let _ = options;
+    MAX_POLL_INTERVAL_MS
+}
+
 /// The bound on one schema registry lookup made from a consume loop: a third
 /// of the member's `max.poll.interval.ms`, and at least a second.
 ///
@@ -8284,6 +8296,7 @@ impl KafkaConsumer {
             .kafka_auto_offset_reset
             .unwrap_or(KafkaAutoOffsetReset::Earliest);
         let shutdown = options.shutdown.clone();
+        let max_poll_interval_ms = batch_max_poll_interval_ms(&options);
         let max_message_size = options.max_message_size;
         let max_batch_size = options.max_batch_size;
         let max_batch_age = options.max_batch_age;
@@ -8355,7 +8368,7 @@ impl KafkaConsumer {
                     client.base_config(),
                     &group_id,
                     auto_offset_reset,
-                    MAX_POLL_INTERVAL_MS,
+                    max_poll_interval_ms,
                     queue,
                     rebalance_tx,
                     AssignmentTokens::default(),
@@ -8389,7 +8402,7 @@ impl KafkaConsumer {
                     #[cfg(feature = "kafka-schema-registry")]
                     schema_message_index: schema_message_index.as_deref(),
                     #[cfg(feature = "kafka-schema-registry")]
-                    registry_lookup_bound: registry_lookup_bound(MAX_POLL_INTERVAL_MS),
+                    registry_lookup_bound: registry_lookup_bound(max_poll_interval_ms),
                 };
 
                 // Retaining each message's wire bytes only pays for itself if
