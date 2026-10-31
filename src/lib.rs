@@ -372,7 +372,7 @@ pub mod kafka {
 
     /// Test-only counter (see the `test-support` feature) of the wakes the
     /// commit gate's deadline made, for tests that prove a gated commit wakes
-    /// its loop once rather than on every pass.
+    /// its loop once per window.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::commit_gate_probe;
