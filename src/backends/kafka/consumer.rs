@@ -1122,44 +1122,53 @@ impl CoveredDiscard {
 /// producer send any bytes there. librdkafka reports a key up to its first
 /// NUL byte. A header block librdkafka cannot parse reads as no headers, as
 /// rdkafka's own `headers()` reads it.
+///
+/// The map is sized up front for the record's header count, up to
+/// [`STRING_HEADERS_PREALLOC_CAP`].
 fn extract_string_headers(msg: &BorrowedMessage<'_>) -> Arc<HashMap<String, String>> {
-    let mut out = HashMap::new();
     let mut list = std::ptr::null_mut();
     // SAFETY: `msg.ptr()` is the live message `msg` borrows; on success
     // librdkafka points `list` at that message's own header list, which lives
     // as long as `msg` and is only read here.
     let err = unsafe { rd_kafka_message_headers(msg.ptr(), &mut list) };
-    if err == RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR && !list.is_null() {
-        // SAFETY: as above.
-        let count = unsafe { rd_kafka_header_cnt(list) };
-        for idx in 0..count {
-            let mut name = std::ptr::null();
-            let mut value = std::ptr::null();
-            let mut size = 0;
-            // SAFETY: as above, with `idx` below the list's count.
-            let err =
-                unsafe { rd_kafka_header_get_all(list, idx, &mut name, &mut value, &mut size) };
-            if err != RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR
-                || name.is_null()
-                || value.is_null()
-            {
-                continue;
-            }
-            // SAFETY: librdkafka keeps every name NUL-terminated and a value
-            // as `size` bytes, both inside the list `msg` owns.
-            let (key, value) = unsafe {
-                (
-                    CStr::from_ptr(name),
-                    std::slice::from_raw_parts(value.cast::<u8>(), size),
-                )
-            };
-            if let (Ok(key), Ok(value)) = (key.to_str(), std::str::from_utf8(value)) {
-                out.insert(key.to_owned(), value.to_owned());
-            }
+    if err != RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR || list.is_null() {
+        return Arc::new(HashMap::new());
+    }
+    // SAFETY: as above.
+    let count = unsafe { rd_kafka_header_cnt(list) };
+    let mut out = HashMap::with_capacity(count.min(STRING_HEADERS_PREALLOC_CAP));
+    for idx in 0..count {
+        let mut name = std::ptr::null();
+        let mut value = std::ptr::null();
+        let mut size = 0;
+        // SAFETY: as above, with `idx` below the list's count.
+        let err = unsafe { rd_kafka_header_get_all(list, idx, &mut name, &mut value, &mut size) };
+        if err != RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR || name.is_null() || value.is_null() {
+            continue;
+        }
+        // SAFETY: librdkafka keeps every name NUL-terminated and a value as
+        // `size` bytes, both inside the list `msg` owns.
+        let (key, value) = unsafe {
+            (
+                CStr::from_ptr(name),
+                std::slice::from_raw_parts(value.cast::<u8>(), size),
+            )
+        };
+        if let (Ok(key), Ok(value)) = (key.to_str(), std::str::from_utf8(value)) {
+            out.insert(key.to_owned(), value.to_owned());
         }
     }
     Arc::new(out)
 }
+
+/// The most entries [`extract_string_headers`] reserves before it reads a
+/// record's headers. Well above what a record carries, shove's own headers
+/// and a trace context included. The count is the producer's to choose: a
+/// header costs two bytes on the wire, so a hostile record can carry
+/// hundreds of thousands, and with repeated keys or keys that are not UTF-8
+/// they leave the map with one entry or none. A reservation sized to the
+/// count alone would allocate for every one of them.
+const STRING_HEADERS_PREALLOC_CAP: usize = 32;
 
 /// A record's headers, read once at receive.
 ///
