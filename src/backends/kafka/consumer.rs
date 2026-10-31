@@ -2038,28 +2038,20 @@ async fn dead_letter_and_complete(
     let has_dlq = topology.dlq().is_some();
     let published =
         publish_to_dlq(client, topology, payload, key, headers, reason, retry_count).await;
-    let discard = match published {
-        Ok(()) => match reject_settlement(has_dlq, true) {
-            RejectSettlement::InDlq => {
-                // Settling now keeps the ordinary dead-letter path off the
-                // synchronous commit a pending record would force.
-                pending.survived();
-                None
-            }
-            _ => Some(TerminalDiscard::Retired(pending)),
-        },
-        Err(e) if is_unpublishable(&e) => {
-            tracing::error!(
-                error = %e,
-                queue = topic,
-                reason,
-                "the dead letter can never be published; the record is discarded"
-            );
-            // A DLQ was declared, since `publish_to_dlq` is `Ok(())` without
-            // one, and nothing holds a copy.
-            Some(TerminalDiscard::Lost(pending))
+    let (_, partition, offset, _) = completion;
+    let discard = match dead_letter_answer(topic, (partition, offset), reason, published) {
+        // In the DLQ, the discard settles now, which keeps the ordinary
+        // dead-letter path off the synchronous commit a pending record would
+        // force.
+        DeadLetterAnswer::Landed => terminal_discard(has_dlq, true, pending),
+        // A DLQ was declared, since `publish_to_dlq` is `Ok(())` without one,
+        // and nothing holds a copy.
+        DeadLetterAnswer::Unpublishable => terminal_discard(true, false, pending),
+        DeadLetterAnswer::Fatal(e) => {
+            pending.survived();
+            return Err(publish_fault("DLQ publish", topic, e));
         }
-        Err(e) => {
+        DeadLetterAnswer::Retryable(e) => {
             tracing::error!(
                 error = %e,
                 queue = topic,
@@ -6393,15 +6385,37 @@ enum DeadLettered {
     Kept,
 }
 
-/// What a dead letter's publish answered, logged and read as a
-/// [`DeadLettered`].
-fn dead_lettered(
+/// What a dead letter's publish answered, read alike on every path that
+/// publishes one: the concurrent loop's, a sequenced consumer's and a batch
+/// flush's. The answers the three paths settle alike, a dead letter that can
+/// never be published and one that failed with an error no retry gets past,
+/// are logged here. What a path does with one that may land later is its
+/// own, and so is its log line.
+#[derive(Debug)]
+enum DeadLetterAnswer {
+    /// It is in the DLQ, or the topology declares none to put it in, see
+    /// [`publish_to_dlq`].
+    Landed,
+    /// It can never be published, refused as too large or as invalid, see
+    /// [`is_unpublishable`]: the record is discarded as lost.
+    Unpublishable,
+    /// It failed with an error no retry gets past; the member ends with it.
+    Fatal(ShoveError),
+    /// It failed and may land later.
+    Retryable(ShoveError),
+}
+
+/// Reads `published`, the answer of the dead letter of the record at
+/// `offset` on `partition` under the death `reason`, see
+/// [`DeadLetterAnswer`].
+fn dead_letter_answer(
     queue: &str,
     (partition, offset): (i32, i64),
+    reason: &str,
     published: Result<()>,
-) -> DeadLettered {
+) -> DeadLetterAnswer {
     let e = match published {
-        Ok(()) => return DeadLettered::Landed,
+        Ok(()) => return DeadLetterAnswer::Landed,
         Err(e) => e,
     };
     if is_unpublishable(&e) {
@@ -6410,9 +6424,10 @@ fn dead_lettered(
             queue,
             partition,
             offset,
+            reason,
             "the dead letter can never be published; the record is discarded"
         );
-        return DeadLettered::Unpublishable;
+        return DeadLetterAnswer::Unpublishable;
     }
     if !e.is_retryable() {
         tracing::error!(
@@ -6420,20 +6435,41 @@ fn dead_lettered(
             queue,
             partition,
             offset,
+            reason,
             "dead-letter publish failed with an error no retry gets past; the record stays \
              uncommitted and the consumer ends"
         );
-        return DeadLettered::Fatal(e);
+        return DeadLetterAnswer::Fatal(e);
     }
-    tracing::error!(
-        error = %e,
-        queue,
-        partition,
-        offset,
-        "dead-letter publish failed; nothing is committed past the record, and its partition \
-         is sought back to it"
-    );
-    DeadLettered::Kept
+    DeadLetterAnswer::Retryable(e)
+}
+
+/// What a batch flush's dead letter's publish answered, read as a
+/// [`DeadLettered`]: a dead letter that may land later is kept, with
+/// nothing committed past its record.
+fn dead_lettered(
+    queue: &str,
+    (partition, offset): (i32, i64),
+    reason: &str,
+    published: Result<()>,
+) -> DeadLettered {
+    match dead_letter_answer(queue, (partition, offset), reason, published) {
+        DeadLetterAnswer::Landed => DeadLettered::Landed,
+        DeadLetterAnswer::Unpublishable => DeadLettered::Unpublishable,
+        DeadLetterAnswer::Fatal(e) => DeadLettered::Fatal(e),
+        DeadLetterAnswer::Retryable(e) => {
+            tracing::error!(
+                error = %e,
+                queue,
+                partition,
+                offset,
+                reason,
+                "dead-letter publish failed; nothing is committed past the record, and its \
+                 partition is sought back to it"
+            );
+            DeadLettered::Kept
+        }
+    }
 }
 
 /// Waits for `permits` permits of a flush's dead-letter semaphore through
@@ -6534,6 +6570,9 @@ async fn dead_letter_span(
 struct DeadLetterRun {
     /// Each letter's partition and offset, index-parallel to `outcomes`.
     coordinates: Vec<(i32, i64)>,
+    /// Each letter's death reason, index-parallel to `outcomes`, which the
+    /// log line of a failed publish names.
+    reasons: Vec<Cow<'static, str>>,
     /// `Kept` until the letter's publish answers.
     outcomes: Vec<DeadLettered>,
     /// Partitions with a letter kept: nothing behind it is tried.
@@ -6550,6 +6589,7 @@ impl DeadLetterRun {
                 .iter()
                 .map(|letter| (letter.raw.headers.partition, letter.raw.headers.offset))
                 .collect(),
+            reasons: letters.iter().map(|letter| letter.reason.clone()).collect(),
             outcomes: std::iter::repeat_with(|| DeadLettered::Kept)
                 .take(letters.len())
                 .collect(),
@@ -6581,12 +6621,14 @@ impl DeadLetterRun {
                 return;
             }
         };
-        let (Some(&coordinate), Some(slot)) =
-            (self.coordinates.get(index), self.outcomes.get_mut(index))
-        else {
+        let (Some(&coordinate), Some(reason), Some(slot)) = (
+            self.coordinates.get(index),
+            self.reasons.get(index),
+            self.outcomes.get_mut(index),
+        ) else {
             return;
         };
-        let outcome = dead_lettered(queue, coordinate, published);
+        let outcome = dead_lettered(queue, coordinate, reason, published);
         match &outcome {
             DeadLettered::Kept => {
                 self.kept.insert(coordinate.0);
@@ -8640,32 +8682,21 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                     retry_count,
                 ) => published,
             };
-            let Err(e) = published else { break };
-            if is_unpublishable(&e) {
-                tracing::error!(
-                    error = %e,
-                    queue,
-                    partition = record.tracked.partition,
-                    offset = record.tracked.offset,
-                    "the dead letter can never be published; the record is discarded"
-                );
+            let coordinates = (record.tracked.partition, record.tracked.offset);
+            let e = match dead_letter_answer(queue, coordinates, reason, published) {
+                DeadLetterAnswer::Landed => break,
                 // `publish_to_dlq` is `Ok(())` when no DLQ is declared, so a
                 // DLQ was, and nothing holds a copy.
-                state.complete(&record.tracked, Some(TerminalDiscard::Lost(pending)));
-                return Ok(FifoPass::Next);
-            }
-            if !e.is_retryable() {
-                tracing::error!(
-                    error = %e,
-                    queue,
-                    partition = record.tracked.partition,
-                    offset = record.tracked.offset,
-                    "dead-letter publish failed with an error no retry gets past; the record stays \
-                     uncommitted and the consumer ends"
-                );
-                pending.survived();
-                return Ok(FifoPass::End(e));
-            }
+                DeadLetterAnswer::Unpublishable => {
+                    state.complete(&record.tracked, terminal_discard(true, false, pending));
+                    return Ok(FifoPass::Next);
+                }
+                DeadLetterAnswer::Fatal(e) => {
+                    pending.survived();
+                    return Ok(FifoPass::End(e));
+                }
+                DeadLetterAnswer::Retryable(e) => e,
+            };
             let delay = backoff.next().unwrap_or(DEAD_LETTER_RETRY_MAX);
             tracing::error!(
                 error = %e,
@@ -8696,13 +8727,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                 }
             }
         }
-        let discard = match reject_settlement(self.topology.dlq().is_some(), true) {
-            RejectSettlement::InDlq => {
-                pending.survived();
-                None
-            }
-            _ => Some(TerminalDiscard::Retired(pending)),
-        };
+        let discard = terminal_discard(self.topology.dlq().is_some(), true, pending);
         state.complete(&record.tracked, discard);
         Ok(FifoPass::Next)
     }
