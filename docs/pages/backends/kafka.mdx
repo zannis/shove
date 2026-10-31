@@ -539,6 +539,7 @@ A subscription reads the [fetch queue settings](#fetch-queue-tuning), and `subsc
   A partition the lookup cannot answer for fails the subscription rather than silently starting at the tail.
 
 A partition added while the subscription runs is picked up within a few seconds and assigned at the same start.
+The partitions the subscription already reads keep fetching where they are, so nothing on them is skipped or handed over twice, and none of them waits on the inert group's coordinator.
 A reconnect after a broker outage re-resolves the start as it stands then.
 A `Head` subscription therefore replays the retained log again, the price of having no stored position.
 

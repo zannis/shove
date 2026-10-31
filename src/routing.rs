@@ -8,15 +8,12 @@ use std::time::Duration;
 use crate::Outcome;
 use crate::topology::SequenceFailure;
 
-/// Hold-queue tier for a given retry count, clamped to the last tier.
-/// Caller guarantees `hold_queue_count > 0`.
+/// The hold-queue tier for `retry_count`, clamped to the last of
+/// `hold_queue_count` tiers, or `None` on a topology without hold queues.
 #[allow(dead_code)] // unused in an aws-sns-sqs-only build; see the note on `decide_retry`
-pub(crate) fn hold_index(retry_count: u32, hold_queue_count: usize) -> usize {
-    debug_assert!(
-        hold_queue_count > 0,
-        "hold_index called with no hold queues"
-    );
-    (retry_count as usize).min(hold_queue_count - 1)
+pub(crate) fn hold_index(retry_count: u32, hold_queue_count: usize) -> Option<usize> {
+    let last = hold_queue_count.checked_sub(1)?;
+    Some(usize::try_from(retry_count).map_or(last, |tier| tier.min(last)))
 }
 
 /// The backend-agnostic decision for what to do with a message after the
@@ -203,10 +200,28 @@ mod tests {
 
     #[test]
     fn hold_index_clamps_to_last_tier() {
-        assert_eq!(hold_index(0, 2), 0);
-        assert_eq!(hold_index(1, 2), 1);
-        assert_eq!(hold_index(5, 2), 1); // clamped
-        assert_eq!(hold_index(0, 1), 0);
+        assert_eq!(hold_index(0, 2), Some(0));
+        assert_eq!(hold_index(1, 2), Some(1));
+        assert_eq!(hold_index(5, 2), Some(1)); // clamped
+        assert_eq!(hold_index(0, 1), Some(0));
+    }
+
+    #[test]
+    fn hold_index_has_no_tier_without_hold_queues() {
+        assert_eq!(hold_index(0, 0), None);
+        assert_eq!(hold_index(u32::MAX, 0), None);
+    }
+
+    #[test]
+    fn hold_index_clamps_a_hostile_count_to_the_last_tier() {
+        assert_eq!(hold_index(u32::MAX, 1), Some(0));
+        assert_eq!(hold_index(u32::MAX, 3), Some(2));
+    }
+
+    #[test]
+    fn hold_index_keeps_a_count_below_the_tier_count() {
+        assert_eq!(hold_index(0, usize::MAX), Some(0));
+        assert_eq!(hold_index(7, usize::MAX), Some(7));
     }
 
     #[test]

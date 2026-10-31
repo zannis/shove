@@ -24,9 +24,10 @@
 //! `cargo nextest run --features kafka,test-support --test kafka_broadcast_integration`
 //! runs them too.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rdkafka::ClientConfig;
@@ -107,6 +108,16 @@ define_topic!(
         .build()
 );
 
+// Only `broadcast_partition_added_skips_and_duplicates_nothing` uses this
+// topic, on a broker of its own.
+define_topic!(
+    PartitionAddedTopic,
+    Invalidate,
+    TopologyBuilder::new("kafka-broadcast-partition-added")
+        .broadcast()
+        .build()
+);
+
 // The control for AC6: an ordinary competing-consumer topic whose group the
 // broker *does* register.
 define_topic!(
@@ -167,7 +178,8 @@ recorder_for!(
     CacheInvalidations,
     ControlTopic,
     DeferTopic,
-    HeadRefreshTopic
+    HeadRefreshTopic,
+    PartitionAddedTopic
 );
 
 /// A `tracing` writer that stamps each write with the instant it arrived, so
@@ -349,7 +361,8 @@ impl MessageHandler<StopTopic> for GatedFirst {
 // ---------------------------------------------------------------------------
 
 struct TestBroker {
-    _container: testcontainers::ContainerAsync<KafkaContainer>,
+    /// The broker's container, held for as long as the test runs.
+    _container: Box<dyn std::any::Any>,
     brokers: String,
 }
 
@@ -365,7 +378,17 @@ impl TestBroker {
             .expect("failed to get Kafka port");
         Self {
             brokers: format!("127.0.0.1:{port}"),
-            _container: container,
+            _container: Box::new(container),
+        }
+    }
+
+    /// A broker whose authorizer denies `Describe` on the consumer group
+    /// `denied_group`, see [`start_kafka_denying_group_describe`].
+    async fn denying_group_describe(denied_group: &str) -> Self {
+        let (container, brokers) = start_kafka_denying_group_describe(denied_group).await;
+        Self {
+            brokers,
+            _container: Box::new(container),
         }
     }
 
@@ -491,6 +514,41 @@ impl TestBroker {
                 .expect("partition-targeted publish failed");
         }
     }
+}
+
+/// Publishes `{prefix}-0`, `{prefix}-1`, ... onto one partition through one
+/// producer, each delivery awaited before the next send, until `stop` is set,
+/// and returns how many it published.
+async fn publish_until_stopped(
+    brokers: String,
+    topic: &'static str,
+    partition: i32,
+    prefix: &'static str,
+    stop: Arc<AtomicBool>,
+) -> usize {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create the steady producer");
+    let mut published = 0usize;
+    while !stop.load(Ordering::SeqCst) {
+        let payload = serde_json::to_string(&Invalidate {
+            key: format!("{prefix}-{published}"),
+        })
+        .expect("serialize a steady message");
+        producer
+            .send(
+                FutureRecord::<str, str>::to(topic)
+                    .partition(partition)
+                    .payload(&payload),
+                Timeout::After(Duration::from_secs(10)),
+            )
+            .await
+            .expect("steady publish failed");
+        published += 1;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    published
 }
 
 /// Milliseconds since the epoch, the unit of Kafka record timestamps and of
@@ -2006,6 +2064,173 @@ async fn broadcast_survives_a_group_describe_denial_on_the_inert_group() {
 
     sub.cancellation_token().cancel();
     let outcome = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    broker.close().await;
+}
+
+/// A partition added while a subscription runs is assigned without moving
+/// the partitions the subscription already reads: across the refresh that
+/// picks it up, each of their records is handled exactly once.
+///
+/// Two kinds of existing partition are watched. Partition 0 takes a steady
+/// stream of records through the expansion, so a refresh that put it back to
+/// an earlier position would hand some of them over twice. The others have
+/// delivered nothing when the refresh runs, so their position is unknown, and
+/// a refresh that assigned one of them again would ask the group coordinator
+/// for its committed offset. This broker refuses the coordinator lookup of
+/// the inert group, as a cluster whose ACLs grant group Describe on one
+/// prefix only does, so a partition assigned again that way never fetches
+/// again. Each of them must still deliver the record sent to it after the
+/// refresh.
+#[tokio::test]
+async fn broadcast_partition_added_skips_and_duplicates_nothing() {
+    const GROUP: &str = "acl-denied-partition-added";
+    const TOPIC: &str = "kafka-broadcast-partition-added";
+    let tb = TestBroker::denying_group_describe(GROUP).await;
+    let broker = tb.broker().await;
+    broker
+        .topology()
+        .declare::<PartitionAddedTopic>()
+        .await
+        .expect("failed to declare broadcast topic");
+    let probe_brokers = tb.brokers();
+    tokio::task::spawn_blocking(move || {
+        assert_group_describe_is_denied(&probe_brokers, GROUP, TOPIC)
+    })
+    .await
+    .expect("probe task panicked");
+
+    let recorder = Recorder::default();
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<PartitionAddedTopic, _>(
+            recorder.clone(),
+            ConsumerOptions::new().with_group_id(GROUP),
+        )
+        .expect("failed to subscribe");
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    let existing = tb.partition_count(TOPIC);
+    assert!(
+        existing >= 2,
+        "the topic needs a partition besides partition 0, it has {existing}"
+    );
+    tb.publish_to_partition(
+        TOPIC,
+        0,
+        &Invalidate {
+            key: "first".into(),
+        },
+    )
+    .await;
+    recorder.wait_for(1, Duration::from_secs(30)).await;
+    assert_eq!(recorder.keys().await, vec!["first"]);
+
+    let stop_steady = Arc::new(AtomicBool::new(false));
+    let steady = tokio::spawn(publish_until_stopped(
+        tb.brokers(),
+        TOPIC,
+        0,
+        "steady",
+        Arc::clone(&stop_steady),
+    ));
+
+    let added = i32::try_from(existing).expect("a partition count fits an i32");
+    tb.expand_topic(TOPIC, existing + 1).await;
+    // A marker that arrives from the new partition shows the refresh has run.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut markers = 0u32;
+    while !recorder
+        .keys()
+        .await
+        .iter()
+        .any(|key| key.starts_with("added-"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the subscription never assigned partition {added}"
+        );
+        tb.publish_to_partition(
+            TOPIC,
+            added,
+            &Invalidate {
+                key: format!("added-{markers}"),
+            },
+        )
+        .await;
+        markers += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    stop_steady.store(true, Ordering::SeqCst);
+    let steady_published = steady.await.expect("the steady publisher completes");
+
+    let silent: Vec<i32> = (1..added).collect();
+    for partition in &silent {
+        tb.publish_to_partition(
+            TOPIC,
+            *partition,
+            &Invalidate {
+                key: format!("silent-{partition}"),
+            },
+        )
+        .await;
+    }
+
+    let expected: Vec<String> = (0..steady_published)
+        .map(|i| format!("steady-{i}"))
+        .chain(silent.iter().map(|partition| format!("silent-{partition}")))
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let seen: HashSet<String> = recorder.keys().await.into_iter().collect();
+        if expected.iter().all(|key| seen.contains(key)) || Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // A duplicate still in flight gets the time to land before the counts are read.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let seen = recorder.keys().await;
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for key in &seen {
+        *counts.entry(key.as_str()).or_default() += 1;
+    }
+    let count = |key: &str| counts.get(key).copied().unwrap_or(0);
+    assert_eq!(count("first"), 1, "partition 0's first record: {seen:?}");
+    assert!(steady_published > 0, "the steady stream published nothing");
+    for i in 0..steady_published {
+        let key = format!("steady-{i}");
+        assert_eq!(
+            count(&key),
+            1,
+            "partition 0 handed over {key} {} times across the refresh",
+            count(&key)
+        );
+    }
+    for partition in &silent {
+        let key = format!("silent-{partition}");
+        assert_eq!(
+            count(&key),
+            1,
+            "partition {partition}, which had delivered nothing when the refresh ran, handed \
+             over the record sent to it afterwards {} times",
+            count(&key)
+        );
+    }
+    for marker in 0..markers {
+        let key = format!("added-{marker}");
+        assert!(
+            count(&key) <= 1,
+            "the new partition handed over {key} {} times",
+            count(&key)
+        );
+    }
+
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
         .run_until_timeout(std::future::pending(), Duration::from_secs(10))
         .await;
     assert!(outcome.is_clean(), "outcome: {outcome:?}");

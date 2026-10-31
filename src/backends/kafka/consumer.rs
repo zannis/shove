@@ -3547,14 +3547,6 @@ impl KafkaStreamConsumer {
         }
     }
 
-    fn position(&self) -> KafkaResult<TopicPartitionList> {
-        match self {
-            Self::Default(c) => c.position(),
-            #[cfg(feature = "kafka-msk-iam")]
-            Self::MskIam(c) => c.position(),
-        }
-    }
-
     /// Whether librdkafka has given this member's assignment up as lost,
     /// see [`FinalCommit::assignment_lost`].
     fn assignment_lost(&self) -> bool {
@@ -3726,15 +3718,19 @@ impl KafkaStreamConsumer {
         Ok(tpl)
     }
 
-    /// Extend a manual broadcast assignment with partitions added since the
-    /// previous metadata snapshot.
+    /// Extend a manual broadcast assignment with the partitions `topic` has
+    /// gained since it was assigned, and return how many were added.
     ///
-    /// Existing partitions are re-assigned at their current consumer position;
-    /// only newly discovered partitions are resolved, at the same `start` the
-    /// subscription began with, so a `Head` subscription does not skip a new
-    /// partition's first records and a `Tail` one still joins it at the tail.
-    /// This avoids both replaying already-delivered records and moving an
-    /// existing partition.
+    /// A partition the assignment does not hold yet is resolved at the same
+    /// `start` the subscription began with, so a `Head` subscription does not
+    /// skip a new partition's first records and a `Tail` one still joins it
+    /// at the tail. The new partitions are added with `incremental_assign`,
+    /// which leaves every partition already assigned fetching where it is:
+    /// nothing on one is handed over again or skipped. Assigning one of them
+    /// again would restart it from a position read before the call, and one
+    /// that has delivered nothing yet has no position: librdkafka would ask
+    /// the group coordinator for its committed offset, which a groupless
+    /// subscription has none of and may not be allowed to look up.
     ///
     /// **Blocking** for the metadata fetch; callers must use `spawn_blocking`.
     fn refresh_broadcast_partitions(
@@ -3746,9 +3742,9 @@ impl KafkaStreamConsumer {
         let metadata = self
             .fetch_metadata(Some(topic), timeout)
             .map_err(|e| map_kafka_error(&format!("failed to refresh metadata for {topic}"), e))?;
-        let mut positions = self.position().map_err(|e| {
+        let assigned = self.assignment().map_err(|e| {
             map_kafka_error(
-                &format!("failed to read broadcast positions for {topic}"),
+                &format!("failed to read the broadcast assignment of {topic}"),
                 e,
             )
         })?;
@@ -3761,7 +3757,7 @@ impl KafkaStreamConsumer {
                     .partitions()
                     .iter()
                     .map(|partition| partition.id())
-                    .filter(|partition| positions.find_partition(topic, *partition).is_none())
+                    .filter(|partition| assigned.find_partition(topic, *partition).is_none())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -3770,20 +3766,7 @@ impl KafkaStreamConsumer {
         }
 
         let additions = self.broadcast_start_positions(topic, &new_partitions, start, timeout)?;
-        for elem in additions.elements_for_topic(topic) {
-            positions
-                .add_partition_offset(topic, elem.partition(), elem.offset())
-                .map_err(|e| {
-                    map_kafka_error(
-                        &format!(
-                            "failed to extend the assignment with {topic}[{}]",
-                            elem.partition()
-                        ),
-                        e,
-                    )
-                })?;
-        }
-        self.assign(&positions).map_err(|e| {
+        self.incremental_assign(&additions).map_err(|e| {
             map_kafka_error(
                 &format!("failed to extend broadcast assignment for {topic}"),
                 e,
@@ -3830,6 +3813,14 @@ impl KafkaStreamConsumer {
             Self::Default(c) => c.assign(tpl),
             #[cfg(feature = "kafka-msk-iam")]
             Self::MskIam(c) => c.assign(tpl),
+        }
+    }
+
+    fn incremental_assign(&self, tpl: &TopicPartitionList) -> KafkaResult<()> {
+        match self {
+            Self::Default(c) => c.incremental_assign(tpl),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.incremental_assign(tpl),
         }
     }
 }
@@ -11433,19 +11424,18 @@ impl KafkaConsumer {
                             return Err(e);
                         }
 
-                        refresh = async {
-                            assignment_refresh.tick().await;
-                            let refresh_consumer = consumer.clone();
+                        _ = assignment_refresh.tick() => {
+                            let refresh_consumer = Arc::clone(&consumer);
                             let refresh_topic = queue.to_string();
-                            tokio::task::spawn_blocking(move || {
+                            // Awaited here, so no record arriving first can drop it mid-call.
+                            let refresh = tokio::task::spawn_blocking(move || {
                                 refresh_consumer.refresh_broadcast_partitions(
                                     &refresh_topic,
                                     start,
                                     BROADCAST_ASSIGN_TIMEOUT,
                                 )
                             })
-                            .await
-                        } => {
+                            .await;
                             match refresh {
                                 Ok(Ok(added)) if added > 0 => {
                                     tracing::info!(
