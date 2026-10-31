@@ -5,11 +5,12 @@
 //! A member that stops issues one synchronous commit for every partition it
 //! holds. When the coordinator rejects that commit, or gives no answer within
 //! the shutdown deadline, the member ends with `ShoveError::Commit` instead
-//! of a clean exit, and a group run counts that under `errors`. These tests
-//! inject the rejection and the delay through the mock cluster's
-//! `OffsetCommit` handling, which a real broker cannot be asked to do. The
-//! error itself is read on the direct consumer, whose `run` returns it; the
-//! group run shows the count and the exit code.
+//! of a clean exit, and a group run counts that under `errors`; a rejection
+//! while the group rebalances is tried again first. These tests inject the
+//! rejection and the delay through the mock cluster's `OffsetCommit`
+//! handling, which a real broker cannot be asked to do. The error itself is
+//! read on the direct consumer, whose `run` returns it; the group run shows
+//! the count and the exit code.
 //!
 //! The topic is bound with `external()`, because the mock broker has no
 //! CreateTopics API: each test creates the topic through the mock API, as
@@ -360,6 +361,62 @@ async fn a_rejected_commit_error_carries_no_record_payload_or_key() {
             "the error must not carry the record's {marker}: {rendered}"
         );
     }
+}
+
+/// A final commit the coordinator refuses with a rebalance in progress, as a
+/// commit made while another member's leave rebalances the group is, is
+/// tried again once the consumer has polled with its assignment paused,
+/// inside the shutdown deadline. The second try lands and the member ends
+/// clean, where it ended with `ShoveError::Commit` before.
+#[tokio::test]
+async fn a_final_commit_refused_while_the_group_rebalances_is_tried_again() {
+    let mock = mock_cluster();
+    let (result, took) = stop_a_consumer_after_one_record(&mock, |mock| {
+        mock.request_errors(
+            RDKafkaApiKey::OffsetCommit,
+            &[RDKafkaRespErr::RD_KAFKA_RESP_ERR_REBALANCE_IN_PROGRESS],
+        );
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "the second try lands and the member ends clean: {result:?}"
+    );
+    assert!(
+        took < shutdown_commit_deadline(),
+        "the retry stays inside the shutdown deadline, took {took:?}"
+    );
+    assert_eq!(
+        committed_position(&mock.bootstrap_servers()).await,
+        Some(1),
+        "the acknowledged record's position is the group's"
+    );
+}
+
+/// A final commit refused for a stale generation is tried again the same
+/// way, and the member ends clean.
+#[tokio::test]
+async fn a_final_commit_refused_for_a_stale_generation_is_tried_again() {
+    let mock = mock_cluster();
+    let (result, took) = stop_a_consumer_after_one_record(&mock, |mock| {
+        mock.request_errors(
+            RDKafkaApiKey::OffsetCommit,
+            &[RDKafkaRespErr::RD_KAFKA_RESP_ERR_ILLEGAL_GENERATION],
+        );
+    })
+    .await;
+
+    assert!(result.is_ok(), "the member ends clean: {result:?}");
+    assert!(
+        took < shutdown_commit_deadline(),
+        "the retry stays inside the shutdown deadline, took {took:?}"
+    );
+    assert_eq!(
+        committed_position(&mock.bootstrap_servers()).await,
+        Some(1),
+        "the acknowledged record's position is the group's"
+    );
 }
 
 /// An OffsetCommit held past the shutdown deadline ends the consumer within

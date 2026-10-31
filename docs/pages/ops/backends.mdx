@@ -113,6 +113,7 @@ It then commits the final position synchronously from a dedicated thread, which 
 It waits at most 20 s for both, and the thread reports the two separately.
 That 20 s bound covers the final commit of the concurrent, the sequenced and the batch consumer.
 A final commit that is rejected, has no answer within the bound, or has no thread to run on (`CommitFailure::NoThread`) ends the member with `ShoveError::Commit`.
+One refused while the group rebalances, as another member's stop makes it, is tried again inside the bound first, after the consumer has polled with its assignment paused.
 A group counts that under `errors`, so the run's exit code is 1.
 See [Offset commit semantics](/backends/kafka#offset-commit-semantics).
 A drain that times out while that commit is still waiting aborts the member instead, and the run reports `timed_out` with exit code 3.

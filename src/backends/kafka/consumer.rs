@@ -81,9 +81,10 @@ use super::constants::REGISTRY_RETRY_DELAY;
 use super::constants::{
     BASE_MESSAGE_ID_HEADER, BASE_MESSAGE_ID_KEY, DEATH_COUNT_HEADER, DEATH_COUNT_KEY,
     DEATH_REASON_HEADER, DEATH_REASON_KEY, FETCH_MIN_BYTES, FETCH_WAIT_MAX_MS,
-    MAX_POLL_INTERVAL_MS, MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER, MESSAGE_ID_KEY,
-    ORIGINAL_QUEUE_HEADER, ORIGINAL_QUEUE_KEY, PENDING_COMMIT_BUDGET, RETRY_COUNT_HEADER,
-    RETRY_COUNT_KEY, SESSION_TIMEOUT_MS, SHUTDOWN_COMMIT_DEADLINE,
+    FINAL_COMMIT_RETRY_POLL, FINAL_COMMIT_RETRY_RESERVE, MAX_POLL_INTERVAL_MS,
+    MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER, MESSAGE_ID_KEY, ORIGINAL_QUEUE_HEADER,
+    ORIGINAL_QUEUE_KEY, PENDING_COMMIT_BUDGET, RETRY_COUNT_HEADER, RETRY_COUNT_KEY,
+    SESSION_TIMEOUT_MS, SHUTDOWN_COMMIT_DEADLINE,
 };
 use super::consumer_group::{CommitPolicy, KafkaAutoOffsetReset};
 use super::offset_reset::target_from_timestamp_lookup;
@@ -482,14 +483,14 @@ impl PartitionTracker {
     /// appends the request to `__consumer_offsets`, as the rebalance
     /// re-offer in `OffsetTracker::apply_rebalance_events` relies on; and
     /// the position never lowers, see `position`.
-    fn drain_all(&mut self) -> (i64, Vec<TerminalDiscard>) {
+    fn drain_all(&mut self) -> (i64, Vec<(i64, TerminalDiscard)>) {
         let next = self.position();
         self.next_to_commit = self.next_to_commit.max(next);
         self.dirty = false;
         // `next` is exclusive, so everything strictly below it is covered.
         let remainder = self.pending_discards.split_off(&next);
         let covered = std::mem::replace(&mut self.pending_discards, remainder);
-        (next, covered.into_values().collect())
+        (next, covered.into_iter().collect())
     }
 
     /// How long this partition has been continuously dirty, or `None` if
@@ -869,18 +870,28 @@ impl OffsetTracker {
 
     /// Every partition's current position for the final commit at shutdown,
     /// see `PartitionTracker::drain_all`, with the discards those positions
-    /// retire. `None` when no partition is tracked: the member has nothing
-    /// to commit.
-    fn drain_all(&mut self) -> Option<(TopicPartitionList, Vec<TerminalDiscard>)> {
+    /// retire, each with the coordinates it rides on, so a commit refused
+    /// while the group rebalances can hand them back for its next try, see
+    /// [`re_pend`](Self::re_pend). `None` when no partition is tracked: the
+    /// member has nothing to commit.
+    fn drain_all(&mut self) -> Option<(TopicPartitionList, Vec<CoveredDiscard>)> {
         let mut tpl: Option<TopicPartitionList> = None;
         let mut discards = Vec::new();
         for (&partition, tracker) in &mut self.partitions {
             let (commit_offset, covered) = tracker.drain_all();
+            let epoch = tracker.epoch;
             match tpl
                 .get_or_insert_with(TopicPartitionList::new)
                 .add_partition_offset(&self.topic, partition, Offset::Offset(commit_offset))
             {
-                Ok(()) => discards.extend(covered),
+                Ok(()) => {
+                    discards.extend(covered.into_iter().map(|(offset, discard)| CoveredDiscard {
+                        partition,
+                        offset,
+                        epoch,
+                        discard,
+                    }))
+                }
                 Err(e) => {
                     // A partition left out here is a position the final
                     // commit never carries, which is what that commit's
@@ -898,7 +909,7 @@ impl OffsetTracker {
                         error = %e,
                         "could not add the partition to the final commit; its position is not committed"
                     );
-                    for discard in covered {
+                    for (_, discard) in covered {
                         discard.survived();
                     }
                 }
@@ -3698,15 +3709,56 @@ pub(super) fn check_per_record_prefetch(
 /// the consumer off the runtime too; see [`final_commit_on_thread`] and
 /// [`close_off_runtime_or_leak`].
 ///
-/// The `Err` is the [`CommitFailure`] the shutdown arm reports in
-/// `ShoveError::Commit`: the broker's answer, the deadline, or no thread.
+/// The `Err` the result ends with is the [`CommitFailure`] the shutdown arm
+/// reports in `ShoveError::Commit`: the broker's answer, the deadline, or no
+/// thread. With `retry`, a refusal while the group rebalances hands the
+/// consumer back unclosed instead, see [`FinalCommitted::Rebalancing`].
 async fn final_commit_off_runtime(
     consumer: LoopConsumer,
     tpl: Option<TopicPartitionList>,
     queue: &str,
     deadline: Duration,
-) -> std::result::Result<(), CommitFailure> {
-    final_commit_on_thread(consumer, tpl, queue, deadline, &mut spawn_named_thread).await
+    retry: bool,
+) -> FinalCommitted<LoopConsumer> {
+    final_commit_on_thread(
+        consumer,
+        tpl,
+        queue,
+        deadline,
+        retry,
+        &mut spawn_named_thread,
+    )
+    .await
+}
+
+/// How a final commit on its thread ended, see [`final_commit_on_thread`].
+enum FinalCommitted<C> {
+    /// The commit's result, the consumer closed after it on the thread, or
+    /// closing there once its commit returns.
+    Ended(std::result::Result<(), CommitFailure>),
+    /// The coordinator refused the commit while the group rebalances, see
+    /// [`is_rebalance_refusal`], and the thread handed the consumer back
+    /// unclosed, for the stop to poll and commit again.
+    Rebalancing { consumer: C, error: KafkaError },
+}
+
+/// What the final-commit thread reports once its commit is answered: the
+/// result, after which it closes the consumer, or the consumer itself,
+/// handed back with the refusal, see [`FinalCommitted::Rebalancing`].
+enum Committed<C> {
+    Result(KafkaResult<()>),
+    HandedBack(C, KafkaError),
+}
+
+/// Whether the coordinator refused a commit because the group is
+/// rebalancing: with a rebalance in progress, or for a generation the
+/// rebalance has made stale. A commit made while another member's leave
+/// rebalances the group meets one of the two.
+fn is_rebalance_refusal(error: &KafkaError) -> bool {
+    matches!(
+        error.rdkafka_error_code(),
+        Some(RDKafkaErrorCode::RebalanceInProgress | RDKafkaErrorCode::IllegalGeneration)
+    )
 }
 
 /// Close the consumer on a thread of its own with nothing committed, and
@@ -3723,12 +3775,17 @@ async fn final_commit_off_runtime(
 /// still in flight on another thread, that thread holds a handle too, and
 /// the close runs once that commit returns.
 async fn close_without_commit(consumer: LoopConsumer, queue: &str, deadline: Duration) {
-    if let Err(e) = final_commit_off_runtime(consumer, None, queue, deadline).await {
-        tracing::warn!(
+    match final_commit_off_runtime(consumer, None, queue, deadline, false).await {
+        FinalCommitted::Ended(Ok(())) => {}
+        FinalCommitted::Ended(Err(e)) => tracing::warn!(
             queue,
             error = %e,
             "no thread could be spawned to wait for the consumer's close; the close is not awaited"
-        );
+        ),
+        // Only a refused commit hands the consumer back, and this makes none.
+        FinalCommitted::Rebalancing { consumer, .. } => {
+            close_off_runtime_or_leak(consumer, queue, &mut spawn_named_thread);
+        }
     }
 }
 
@@ -3944,19 +4001,26 @@ impl Drop for LoopConsumer {
 /// then waited for inside what is left of `deadline`, and a close that
 /// outlives it is logged, never returned. Past the deadline the thread
 /// finishes on its own, close included.
+///
+/// With `retry`, a commit the coordinator refuses while the group
+/// rebalances closes nothing: the thread hands the consumer back over the
+/// result's channel, see [`FinalCommitted::Rebalancing`], so the stop can
+/// poll for the rebalance and commit again. A hand-back nobody waits for any
+/// more, past the deadline, closes the consumer on the thread after all.
 async fn final_commit_on_thread<C, S>(
     consumer: C,
     tpl: Option<TopicPartitionList>,
     queue: &str,
     deadline: Duration,
+    retry: bool,
     spawn: &mut S,
-) -> std::result::Result<(), CommitFailure>
+) -> FinalCommitted<C>
 where
     C: FinalCommit,
     S: FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
 {
     let started = Instant::now();
-    let (committed_tx, committed_rx) = oneshot::channel::<KafkaResult<()>>();
+    let (committed_tx, committed_rx) = oneshot::channel::<Committed<C>>();
     let (closed_tx, closed_rx) = oneshot::channel::<bool>();
     let handed = hand_to_new_thread(
         spawn,
@@ -3967,10 +4031,19 @@ where
                 Some(tpl) => consumer.commit_sync(&tpl),
                 None => Ok(()),
             };
+            let result = match result {
+                Err(error) if retry && is_rebalance_refusal(&error) => {
+                    // Unsent, the hand-back drops here, which closes the
+                    // consumer on this thread.
+                    drop(committed_tx.send(Committed::HandedBack(consumer, error)));
+                    return;
+                }
+                result => result,
+            };
             // The commit's result goes out before the close, so a slow
             // close is never read as a slow commit. Nobody may be listening
             // any more; that is the deadline case.
-            let _ = committed_tx.send(result);
+            let _ = committed_tx.send(Committed::Result(result));
             // The last `Arc`: `rd_kafka_consumer_close` runs here, off the
             // runtime, however long the broker takes to answer. With another
             // holder left, this drop closes nothing, and the signal says so.
@@ -3987,13 +4060,18 @@ where
              starts from the last position the broker accepted"
         );
         close_off_runtime_or_leak(consumer, queue, spawn);
-        return Err(CommitFailure::NoThread);
+        return FinalCommitted::Ended(Err(CommitFailure::NoThread));
     }
     let mut answered = true;
     let committed = match tokio::time::timeout(deadline, committed_rx).await {
+        Ok(Ok(Committed::HandedBack(consumer, error))) => {
+            return FinalCommitted::Rebalancing { consumer, error };
+        }
         // librdkafka's text for the broker's answer: the error code and its
         // description, and nothing of the records behind the positions.
-        Ok(Ok(result)) => result.map_err(|e| CommitFailure::Rejected(e.to_string())),
+        Ok(Ok(Committed::Result(result))) => {
+            result.map_err(|e| CommitFailure::Rejected(e.to_string()))
+        }
         // The thread died before it could answer: not the broker's verdict,
         // so not a rejection. The result is unknown, like a missed deadline.
         Ok(Err(_recv)) => {
@@ -4024,7 +4102,7 @@ where
             "the consumer's close follows the commit the thread is still waiting on; the member \
              leaves its group once that commit returns"
         );
-        return committed;
+        return FinalCommitted::Ended(committed);
     }
     // The close, inside what is left of the deadline. It is reported apart
     // from the commit: a LeaveGroup the broker is slow to answer is logged
@@ -4054,7 +4132,7 @@ where
             );
         }
     }
-    committed
+    FinalCommitted::Ended(committed)
 }
 
 /// Spawn a thread that waits for one `value`, then hand `value` to it.
@@ -4585,6 +4663,16 @@ async fn answer_while_polling(
 /// record in hand is left behind, and the batch consumer once its stop has
 /// flushed the batch in hand.
 ///
+/// A final commit the coordinator refuses while the group rebalances, see
+/// [`is_rebalance_refusal`], is tried again, for as long as
+/// `FINAL_COMMIT_RETRY_RESERVE` of the deadline is left: the consumer comes
+/// back from the thread unclosed, polls for `FINAL_COMMIT_RETRY_POLL` with
+/// its assignment paused, which serves the rebalance callbacks the
+/// rebalance waits on, and drains the rebalance events, so a partition the
+/// rebalance revoked leaves the next try. Another member's stop, or the
+/// autoscaler retiring one, starts such a rebalance, so members that stop
+/// together do not routinely end with a refused commit.
+///
 /// `Err` is `ShoveError::Commit`: a final commit the broker did not confirm,
 /// or a commit in flight that had no answer in time. `Commit` is not
 /// retryable, so `run_with_reconnect` returns it, and a group's spawner
@@ -4599,10 +4687,10 @@ async fn stop_with_final_commit(
     queue: &str,
 ) -> Result<()> {
     // One budget for everything the shutdown waits on: a commit found in
-    // flight gets at most `PENDING_COMMIT_BUDGET` of it, and the final commit
-    // with the close gets the rest, so the close is never left without a
-    // slice. With nothing in flight the final commit has the whole deadline,
-    // as in 0.15.
+    // flight gets at most `PENDING_COMMIT_BUDGET` of it, and the final commit,
+    // its tries again and the close get the rest, so the close is never left
+    // without a slice. With nothing in flight the final commit has the whole
+    // deadline, as in 0.15.
     let mut final_deadline = SHUTDOWN_COMMIT_DEADLINE;
     // The commit the stop found in flight is settled first, so the final
     // commit does not race the thread that carries it. An accepted answer
@@ -4657,62 +4745,129 @@ async fn stop_with_final_commit(
         }
         final_deadline = SHUTDOWN_COMMIT_DEADLINE.saturating_sub(started.elapsed());
     }
-    tracker.apply_rebalance_events(rebalance_rx);
-    // Every partition's current position, whether or not an earlier drain
-    // offered it: the final `Sync` commit offers every safe position,
-    // including one a rejected commit left to re-offer, for the broker to
-    // confirm. See `PartitionTracker::drain_all`.
-    let (tpl, discards) = match tracker.drain_all() {
-        Some((tpl, discards)) => (Some(tpl), discards),
-        None => (None, Vec::new()),
-    };
-    let offsets = tpl.as_ref().map(committed_offsets).unwrap_or_default();
-    // The commit and the consumer's close both block: `CommitMode::Sync`
-    // waits for the coordinator, and `Drop` runs `rd_kafka_consumer_close`.
-    // A frozen broker holds either for as long as librdkafka retries -
-    // minutes - and a blocking task cannot be aborted once started, so
-    // `spawn_blocking` would only move the wait onto a thread the runtime's
-    // shutdown then waits for. A dedicated thread that owns the last `Arc` of
-    // the consumer holds neither the runtime nor the process:
-    // `final_deadline`, `SHUTDOWN_COMMIT_DEADLINE` less the time a commit in
-    // flight took, bounds how long this loop waits for its result, and past
-    // it the thread finishes on its own.
-    match final_commit_off_runtime(consumer, tpl, queue, final_deadline).await {
-        Ok(()) => {
-            for discard in discards {
-                discard.confirm();
-            }
-            Ok(())
-        }
-        Err(kind) => {
-            for discard in discards {
-                discard.survived();
-            }
-            if offsets.is_empty() {
-                // Nothing was offered, so no commit failed: only the close
-                // could not run on the commit thread, and
-                // `close_off_runtime_or_leak` has dealt with that.
-                tracing::warn!(
-                    queue,
-                    error = %kind,
-                    "no final offset commit to make; the consumer ends clean"
-                );
+    // A try again gets what is left of `final_deadline` once the tries before
+    // it and their polls are over.
+    let tries_started = Instant::now();
+    let mut deadline = final_deadline;
+    let mut consumer = consumer;
+    let mut polled = true;
+    loop {
+        tracker.apply_rebalance_events(rebalance_rx);
+        // Every partition's current position, whether or not an earlier
+        // drain offered it: the final `Sync` commit offers every safe
+        // position, including one a rejected commit left to re-offer, for
+        // the broker to confirm. See `PartitionTracker::drain_all`.
+        let (tpl, discards) = match tracker.drain_all() {
+            Some((tpl, discards)) => (Some(tpl), discards),
+            None => (None, Vec::new()),
+        };
+        let offsets = tpl.as_ref().map(committed_offsets).unwrap_or_default();
+        let retry = polled && deadline > FINAL_COMMIT_RETRY_RESERVE;
+        // The commit and the consumer's close both block: `CommitMode::Sync`
+        // waits for the coordinator, and `Drop` runs
+        // `rd_kafka_consumer_close`. A frozen broker holds either for as long
+        // as librdkafka retries - minutes - and a blocking task cannot be
+        // aborted once started, so `spawn_blocking` would only move the wait
+        // onto a thread the runtime's shutdown then waits for. A dedicated
+        // thread that owns the last `Arc` of the consumer holds neither the
+        // runtime nor the process: `deadline`, what is left of
+        // `SHUTDOWN_COMMIT_DEADLINE` once a commit in flight and any earlier
+        // try are over, bounds how long this loop waits for its result, and
+        // past it the thread finishes on its own.
+        let error = match final_commit_off_runtime(consumer, tpl, queue, deadline, retry).await {
+            FinalCommitted::Ended(Ok(())) => {
+                for discard in discards {
+                    discard.confirm();
+                }
                 return Ok(());
             }
-            // The member ends with the failure instead of a clean exit.
+            FinalCommitted::Ended(Err(kind)) => {
+                for discard in discards {
+                    discard.survived();
+                }
+                if offsets.is_empty() {
+                    // Nothing was offered, so no commit failed: only the
+                    // close could not run on the commit thread, and
+                    // `close_off_runtime_or_leak` has dealt with that.
+                    tracing::warn!(
+                        queue,
+                        error = %kind,
+                        "no final offset commit to make; the consumer ends clean"
+                    );
+                    return Ok(());
+                }
+                // The member ends with the failure instead of a clean exit.
+                tracing::error!(
+                    queue,
+                    error = %kind,
+                    ?offsets,
+                    "final offset commit failed during shutdown; redelivery starts \
+                     from the last position the broker accepted, and the consumer \
+                     ends with ShoveError::Commit"
+                );
+                return Err(ShoveError::Commit(Box::new(FailedCommit {
+                    topic: queue.to_string(),
+                    offsets,
+                    kind,
+                })));
+            }
+            FinalCommitted::Rebalancing {
+                consumer: unclosed,
+                error,
+            } => {
+                consumer = unclosed;
+                tracker.re_pend(discards);
+                error
+            }
+        };
+        tracing::warn!(
+            queue,
+            %error,
+            ?offsets,
+            "the final offset commit was refused while the group rebalances; polling with the \
+             assignment paused, then committing again"
+        );
+        if let Err(e) = poll_paused(&consumer, queue, FINAL_COMMIT_RETRY_POLL).await {
             tracing::error!(
                 queue,
-                error = %kind,
-                ?offsets,
-                "final offset commit failed during shutdown; redelivery starts \
-                 from the last position the broker accepted, and the consumer \
-                 ends with ShoveError::Commit"
+                error = %e,
+                "polling for the rebalance at shutdown failed; the next final commit is the last"
             );
-            Err(ShoveError::Commit(Box::new(FailedCommit {
-                topic: queue.to_string(),
-                offsets,
-                kind,
-            })))
+            polled = false;
+        }
+        deadline = final_deadline.saturating_sub(tries_started.elapsed());
+    }
+}
+
+/// Polls `consumer` for `period` with its assignment paused: the wait a
+/// stop makes before it tries again a final commit refused while the group
+/// rebalances, see [`stop_with_final_commit`]. The polls serve the
+/// rebalance callbacks, and a record one hands over, from a partition
+/// assigned meanwhile, is put back with the pause widened, as in every
+/// polling wait. A stop never reconnects, so the wait reads no gate and
+/// rides out every `__TRANSPORT` and `__RESOLVE`, see
+/// [`recv_error_is_transient`].
+async fn poll_paused(consumer: &KafkaStreamConsumer, queue: &str, period: Duration) -> Result<()> {
+    apply_pause_intent(consumer, true)?;
+    let polled = tokio::time::sleep(period);
+    tokio::pin!(polled);
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut polled => return Ok(()),
+            received = consumer.recv() => match received {
+                Ok(msg) => {
+                    put_back(consumer, queue, msg.partition(), msg.offset())?;
+                    apply_pause_intent(consumer, true)?;
+                }
+                Err(e) if recv_error_is_transient(None, &e) => log_transient_recv_error(queue, &e),
+                Err(e) => {
+                    return Err(map_kafka_error(
+                        &format!("consumer recv error on {queue} while polling for a rebalance at shutdown"),
+                        e,
+                    ));
+                }
+            },
         }
     }
 }
@@ -14662,6 +14817,27 @@ mod final_commit_thread_tests {
         })
     }
 
+    /// [`final_commit_on_thread`] asked for no try again, which always ends
+    /// with the commit's result and closes on the thread.
+    async fn final_commit<C, S>(
+        consumer: C,
+        tpl: Option<TopicPartitionList>,
+        queue: &str,
+        deadline: Duration,
+        spawn: &mut S,
+    ) -> std::result::Result<(), CommitFailure>
+    where
+        C: FinalCommit,
+        S: FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    {
+        match final_commit_on_thread(consumer, tpl, queue, deadline, false, spawn).await {
+            FinalCommitted::Ended(result) => result,
+            FinalCommitted::Rebalancing { error, .. } => {
+                panic!("the consumer was handed back for {error}, with no try again asked for")
+            }
+        }
+    }
+
     fn one_offset() -> TopicPartitionList {
         let mut tpl = TopicPartitionList::new();
         tpl.add_partition_offset("orders", 0, Offset::Offset(7))
@@ -14692,7 +14868,7 @@ mod final_commit_thread_tests {
     #[tokio::test]
     async fn the_final_commit_thread_commits_and_then_owns_the_close() {
         let (probe, seen) = probe();
-        let result = final_commit_on_thread(
+        let result = final_commit(
             probe,
             Some(one_offset()),
             "orders",
@@ -14740,7 +14916,7 @@ mod final_commit_thread_tests {
     #[tokio::test]
     async fn a_failed_spawn_commits_nothing_and_closes_the_consumer_on_a_second_thread() {
         let (probe, seen) = probe();
-        let result = final_commit_on_thread(
+        let result = final_commit(
             probe,
             Some(one_offset()),
             "orders",
@@ -14768,7 +14944,7 @@ mod final_commit_thread_tests {
     #[tokio::test]
     async fn with_no_thread_at_all_the_consumer_is_leaked_and_never_closed_here() {
         let (probe, seen) = probe();
-        let result = final_commit_on_thread(
+        let result = final_commit(
             probe,
             Some(one_offset()),
             "orders",
@@ -14793,7 +14969,7 @@ mod final_commit_thread_tests {
         let (probe, seen) = probe_answering(Some(KafkaError::ConsumerCommit(
             RDKafkaErrorCode::GroupAuthorizationFailed,
         )));
-        let result = final_commit_on_thread(
+        let result = final_commit(
             probe,
             Some(one_offset()),
             "orders",
@@ -14830,7 +15006,7 @@ mod final_commit_thread_tests {
         let (release_tx, release) = std_mpsc::channel::<()>();
         let (probe, seen) = probe_with_slow_close(release);
         let started = Instant::now();
-        let result = final_commit_on_thread(
+        let result = final_commit(
             probe,
             Some(one_offset()),
             "orders",
@@ -14867,7 +15043,7 @@ mod final_commit_thread_tests {
     async fn a_drop_with_another_holder_left_reports_the_close_as_following_that_holder() {
         let warnings = Warnings::default();
         let _guard = set_default(tracing_subscriber::registry().with(warnings.clone()));
-        let result = final_commit_on_thread(
+        let result = final_commit(
             SharedProbe,
             Some(one_offset()),
             "orders",
@@ -14899,7 +15075,7 @@ mod final_commit_thread_tests {
         let warnings = Warnings::default();
         let _guard = set_default(tracing_subscriber::registry().with(warnings.clone()));
         let (release_tx, release) = std_mpsc::channel::<()>();
-        let result = final_commit_on_thread(
+        let result = final_commit(
             BlockingProbe { release },
             Some(one_offset()),
             "orders",
@@ -14933,7 +15109,7 @@ mod final_commit_thread_tests {
     /// the time waited, never as `Rejected`.
     #[tokio::test]
     async fn a_commit_thread_that_dies_without_answering_is_reported_as_unknown() {
-        let result = final_commit_on_thread(
+        let result = final_commit(
             PanickingProbe,
             Some(one_offset()),
             "orders",
@@ -14945,6 +15121,91 @@ mod final_commit_thread_tests {
             matches!(result, Err(CommitFailure::Deadline(_))),
             "a lost result is unknown, not rejected: {result:?}"
         );
+    }
+
+    /// With a try again asked for, a commit the coordinator refuses while
+    /// the group rebalances closes nothing: the thread hands the consumer
+    /// back, unclosed, with the refusal, for the stop to poll and commit
+    /// again. A rebalance in progress and a stale generation both do.
+    #[tokio::test]
+    async fn a_commit_refused_while_the_group_rebalances_hands_the_consumer_back_unclosed() {
+        for code in [
+            RDKafkaErrorCode::RebalanceInProgress,
+            RDKafkaErrorCode::IllegalGeneration,
+        ] {
+            let (probe, seen) = probe_answering(Some(KafkaError::ConsumerCommit(code)));
+            let committed = final_commit_on_thread(
+                probe,
+                Some(one_offset()),
+                "orders",
+                SHUTDOWN_COMMIT_DEADLINE,
+                true,
+                &mut real_spawner(),
+            )
+            .await;
+            let FinalCommitted::Rebalancing { consumer, error } = committed else {
+                panic!("a refusal with {code:?} hands the consumer back");
+            };
+            assert_eq!(error.rdkafka_error_code(), Some(code));
+            let events: Vec<Event> = seen.try_iter().collect();
+            assert!(
+                matches!(events.as_slice(), [Event::Commit { .. }]),
+                "the commit ran and nothing closed: {events:?}"
+            );
+            drop(consumer);
+            let events: Vec<Event> = seen.try_iter().collect();
+            assert!(
+                matches!(events.as_slice(), [Event::Drop { .. }]),
+                "the handle came back whole, and closes where it is dropped: {events:?}"
+            );
+        }
+    }
+
+    /// A refusal while the group rebalances with no try again asked for,
+    /// and a refusal of any other kind with one, close as every final
+    /// commit does: the commit and then the close, both on the thread, with
+    /// the refusal reported as `Rejected`.
+    #[tokio::test]
+    async fn a_refusal_with_no_try_again_or_of_another_kind_closes_on_the_thread() {
+        for (code, retry) in [
+            (RDKafkaErrorCode::RebalanceInProgress, false),
+            (RDKafkaErrorCode::GroupAuthorizationFailed, true),
+        ] {
+            let (probe, seen) = probe_answering(Some(KafkaError::ConsumerCommit(code)));
+            let committed = final_commit_on_thread(
+                probe,
+                Some(one_offset()),
+                "orders",
+                SHUTDOWN_COMMIT_DEADLINE,
+                retry,
+                &mut real_spawner(),
+            )
+            .await;
+            assert!(
+                matches!(
+                    committed,
+                    FinalCommitted::Ended(Err(CommitFailure::Rejected(_)))
+                ),
+                "a refusal with {code:?} and retry {retry} is reported as Rejected"
+            );
+            let events = events_until_the_drop(&seen);
+            let [
+                Event::Commit {
+                    thread: committed_on,
+                    ..
+                },
+                Event::Drop {
+                    thread: dropped_on, ..
+                },
+            ] = events.as_slice()
+            else {
+                panic!("the commit, then the close: {events:?}");
+            };
+            assert_eq!(
+                committed_on, dropped_on,
+                "the close runs on the commit's thread"
+            );
+        }
     }
 
     /// The offsets `ShoveError::Commit` carries are the commit's positions in

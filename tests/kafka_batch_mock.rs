@@ -17,8 +17,9 @@
 //! redelivers the batch with nothing committed past it and no discard
 //! counted. A dead-letter topic that answers slowly keeps the member
 //! polling, so a rejected batch cannot outlast `max.poll.interval.ms`. A
-//! stop's commits stay inside the shutdown deadline, a refused one ending
-//! the member with `ShoveError::Commit`.
+//! stop's commits stay inside the shutdown deadline, a final commit the
+//! broker refuses ends the member with `ShoveError::Commit`, and one refused
+//! while the group rebalances is tried again.
 //!
 //! Every topic is created through the mock API, because the mock broker has
 //! no CreateTopics API, and records are produced through a raw rdkafka
@@ -439,8 +440,9 @@ type Member = (
 
 /// Stops `first`, then `second` once the group has handed it what `first`
 /// held. A member's leave rebalances the group, and a final commit made
-/// while it rebalances is refused, which ends the member with
-/// `ShoveError::Commit`.
+/// while it rebalances is refused and tried again inside the shutdown
+/// deadline; stopping in turn keeps the tests that end with it from waiting
+/// on that retry.
 async fn stop_in_turn(first: Member, second: Member) {
     let assigns = per_record_probe::assigns_queued();
     stop(first.0, first.1).await;
@@ -1202,6 +1204,86 @@ where
     )
     .await;
     (handler, member)
+}
+
+/// The stop's final commit is refused once with a rebalance in progress, as
+/// a commit made while another member's leave rebalances the group is. The
+/// stop polls with its assignment paused and commits again inside the
+/// shutdown deadline, and the second try lands: the member ends clean, with
+/// the position of the record its stop flushed committed.
+#[tokio::test]
+async fn a_final_commit_refused_while_the_group_rebalances_is_tried_again() {
+    const TOPIC: &str = "kafka-batch-mock-final-commit-rebalancing";
+    const GROUP: &str = "kafka-batch-mock-final-commit-rebalancing-consumer";
+    shove::define_topic!(RetryTopic, Order, TopologyBuilder::new(TOPIC).build());
+
+    let mock = Mock::start();
+    mock.create_topic(TOPIC, 1);
+    let (handler, (run, token)) =
+        a_member_holding_a_record_for_its_stop::<RetryTopic>(&mock, TOPIC, GROUP, |_| Outcome::Ack)
+            .await;
+    mock.refuse(
+        RDKafkaApiKey::OffsetCommit,
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_REBALANCE_IN_PROGRESS,
+        1,
+    );
+    stop(run, token).await;
+
+    assert_eq!(
+        committed_position(&mock.bootstrap(), TOPIC, GROUP, 0).await,
+        Some(3),
+        "the second try carries the position of the record the stop flushed"
+    );
+    assert_eq!(
+        handler.flushes().len(),
+        2,
+        "the stop flushes the record it held"
+    );
+}
+
+/// A final commit the broker refuses outright ends the batch consumer with
+/// `ShoveError::Commit` of the `Rejected` kind, naming the position it
+/// carried, as it ends every other consumer.
+#[tokio::test]
+async fn a_refused_final_commit_ends_the_batch_consumer_with_a_commit_error() {
+    const TOPIC: &str = "kafka-batch-mock-final-commit-refused";
+    const GROUP: &str = "kafka-batch-mock-final-commit-refused-consumer";
+    shove::define_topic!(RefusedTopic, Order, TopologyBuilder::new(TOPIC).build());
+
+    let mock = Mock::start();
+    mock.create_topic(TOPIC, 1);
+    let (_handler, (run, token)) =
+        a_member_holding_a_record_for_its_stop::<RefusedTopic>(&mock, TOPIC, GROUP, |_| {
+            Outcome::Ack
+        })
+        .await;
+    mock.refuse(
+        RDKafkaApiKey::OffsetCommit,
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED,
+        8,
+    );
+    token.cancel();
+    let result = run.await.expect("the run task completes");
+
+    let Err(ShoveError::Commit(failed)) = &result else {
+        panic!("a refused final commit ends the run with ShoveError::Commit: {result:?}");
+    };
+    assert_eq!(failed.topic, TOPIC);
+    assert_eq!(
+        failed.offsets,
+        [(0, 3)],
+        "the position the final commit carried"
+    );
+    assert!(
+        matches!(failed.kind, CommitFailure::Rejected(_)),
+        "a refused commit is reported as Rejected: {:?}",
+        failed.kind
+    );
+    assert_eq!(
+        committed_position(&mock.bootstrap(), TOPIC, GROUP, 0).await,
+        Some(2),
+        "the earlier accepted commit stays the group's position"
+    );
 }
 
 /// A stop flushes a batch the handler rejects, and the broker refuses every
