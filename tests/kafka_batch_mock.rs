@@ -60,7 +60,8 @@ use serde::{Deserialize, Serialize};
 use shove::handler::BatchMessageHandler;
 use shove::kafka::{
     BatchConsumerOptions, KafkaClient, KafkaConfig, KafkaConsumer, client_id_probe,
-    pending_commit_budget_for_test, per_record_probe, shutdown_commit_deadline_for_test,
+    pending_commit_budget_for_test, per_record_probe, put_back_probe,
+    shutdown_commit_deadline_for_test,
 };
 use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
@@ -1544,5 +1545,56 @@ async fn a_stop_whose_dead_letter_commit_is_refused_ends_with_a_commit_error() {
         high_watermark(&mock.bootstrap(), DLQ, 0).await,
         1,
         "the stop's rejected record is dead-lettered once"
+    );
+}
+
+/// Rejected batches of two on a topic with eighteen more records already
+/// fetched behind them, so a `recv()` made while a batch's commit awaits its
+/// answer is handed one at once. The commit is answered in milliseconds,
+/// inside the grace the wait gives it before it polls, so no record is put
+/// back: a put-back pauses the assignment, which drops every partition's
+/// prefetched records for a refetch on resume.
+#[tokio::test]
+async fn a_dead_letter_commit_answered_at_once_puts_no_record_back() {
+    const TOPIC: &str = "kafka-batch-mock-commit-wait-grace";
+    const DLQ: &str = "kafka-batch-mock-commit-wait-grace-dlq";
+    const GROUP: &str = "kafka-batch-mock-commit-wait-grace-consumer";
+    const RECORDS: usize = 20;
+    shove::define_topic!(GraceTopic, Order, TopologyBuilder::new(TOPIC).dlq().build());
+
+    let mock = Mock::start();
+    mock.create_topic(TOPIC, 1);
+    mock.create_topic(DLQ, 1);
+    let bootstrap = mock.bootstrap();
+    let producer = producer(&bootstrap);
+    for index in 0..RECORDS {
+        produce_to(&producer, TOPIC, 0, &format!("r{index}")).await;
+    }
+
+    let handler = Recorder::new(|_| Outcome::Reject);
+    let (run, token) = start_batch::<GraceTopic>(connect(&bootstrap).await, handler.clone(), |o| {
+        o.with_max_batch_size(2)
+            .with_max_batch_age(Duration::from_secs(5))
+    });
+    wait_for_position(
+        &bootstrap,
+        TOPIC,
+        GROUP,
+        i64::try_from(RECORDS).expect("a count"),
+        DELIVERY_TIMEOUT,
+        "every rejected batch dead-lettered and committed",
+    )
+    .await;
+    stop(run, token).await;
+
+    assert_eq!(
+        put_back_probe::commit_wait(),
+        0,
+        "a commit answered inside the grace puts no record back"
+    );
+    assert_eq!(
+        high_watermark(&bootstrap, DLQ, 0).await,
+        i64::try_from(RECORDS).expect("a count"),
+        "every record is dead-lettered once"
     );
 }
