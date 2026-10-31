@@ -380,6 +380,8 @@ It reads no commit or offset-reset setting, so it refuses `with_commit_interval`
 The drain stops when the token of its options fires or when the client's token does.
 Either stop takes effect once the dead letter in hand is finished with.
 Closing the client therefore ends a drain whose own token nothing cancels.
+A stop first waits for the `handle_dead` call in hand, up to the handler timeout, or for as long as the call runs when there is none.
+It then waits up to 20 s for the final commit and the close, so with the defaults a stop takes at most 50 s.
 
 `handle_dead` runs on the drain's own task, one dead letter at a time, under panic isolation and the handler timeout.
 The timeout is `with_handler_timeout`, 30 s by default.
@@ -397,7 +399,8 @@ A dead letter handled after a quiet spell is committed at once, and a burst of d
 A commit the coordinator rejects is re-offered, and a drain whose commits keep being rejected with no rebalance resolving them is treated as fenced and reconnects.
 A stop makes one synchronous final commit of every position and closes the consumer on the same thread, waiting at most 20 s for both.
 A final commit the broker does not confirm ends the drain with `ShoveError::Commit`.
-A drain that ends on an error closes its consumer on a thread of its own, waits for the close, and reconnects.
+A drain that ends a connection on an error closes its consumer on a thread of its own and waits for the close.
+It then reconnects, unless the error is one no reconnect gets past, such as a schema registry `Topology` fault, which ends the drain with that error.
 See [Offset commit semantics](#offset-commit-semantics).
 
 ### Fan-out — a second reader on the same topic

@@ -112,6 +112,7 @@ An in-place delay on an external topic does not extend it: shutdown cuts the del
 It then commits the final position synchronously from a dedicated thread, which also closes the consumer.
 It waits at most 20 s for both, and the thread reports the two separately.
 That 20 s bound covers the final commit of the concurrent, the sequenced and the batch consumer and of the DLQ drain.
+The DLQ drain's stop first waits for the `handle_dead` call in hand, up to the handler timeout, or for as long as the call runs when the timeout is disabled, and then up to 20 s for the final commit and the close.
 A final commit that is rejected, has no answer within the bound, or has no thread to run on (`CommitFailure::NoThread`) ends the member with `ShoveError::Commit`.
 One refused while the group rebalances, as another member's stop makes it, is tried again inside the bound first, after the consumer has polled with its assignment paused.
 A stale generation reported outside a rebalance is not tried again, because librdkafka gives the assignment up as lost with it, and the member ends with `ShoveError::Commit`.
