@@ -3763,8 +3763,8 @@ fn spawn_named_thread(name: String, body: Box<dyn FnOnce() + Send>) -> std::io::
 pub mod per_record_probe {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Entries into `commit_confirmed`: every per-record commit a loop
-    /// attempted, carried or not.
+    /// Entries into `commit_confirmed`: every commit a loop attempted and
+    /// waited for, a per-record commit or a batch span's, carried or not.
     pub static COMMIT_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
     /// Assign events the rebalance callback queued for the loop, from any
     /// consumer in the process.
@@ -4208,8 +4208,9 @@ enum CommitAnswer {
 
 /// A commit on its thread whose answer the loop has not read yet: the
 /// answer, the positions the commit carries, and the discards it retires.
-/// It is the one commit a loop has in flight, see [`CommitSlot`], or the
-/// per-record commit shutdown cut short. The stop waits for it, for at most
+/// It is the one commit a loop has in flight, see [`CommitSlot`], or a
+/// commit shutdown cut short: a per-record commit, or a batch span's, see
+/// [`commit_terminal_span`]. The stop waits for it, for at most
 /// `PENDING_COMMIT_BUDGET`, before it drains the final position, so the
 /// final commit does not race the thread that carries the one in flight. An
 /// answer that does not come in time ends the stop with
@@ -4463,17 +4464,11 @@ async fn commit_answer(in_flight: Option<&mut PendingCommit>) -> Option<KafkaRes
 }
 
 /// Commit `tpl` synchronously on a thread of its own (see [`spawn_commit`])
-/// and wait for the coordinator's answer while the loop keeps polling: the
-/// commit every completion triggers under `CommitPolicy::PerRecord`.
-///
-/// The wait is a select that keeps calling `recv()`, as the permit wait
-/// does: the assignment is paused while a commit is unconfirmed (see the
-/// receive loop), so `recv()` yields nothing of it and serves the rebalance
-/// callbacks and the poll budget instead. A record it does yield belongs to
-/// a partition assigned during the pause, and is put back with the pause
-/// widened. The wait ends on the answer, on shutdown, or on a fault a
-/// handler task reports over `fault_rx`. A spawn failure is a rejection:
-/// nothing commits, and the position is re-offered.
+/// and wait for the coordinator's answer while the loop keeps polling, see
+/// [`answer_while_polling`]: the commit every completion triggers under
+/// `CommitPolicy::PerRecord`, and the commit of a batch whose span carries
+/// dead letters or discards, see [`commit_terminal_span`]. A spawn failure
+/// is a rejection: nothing commits, and the position is re-offered.
 async fn commit_confirmed(
     consumer: &Arc<KafkaStreamConsumer>,
     tpl: TopicPartitionList,
@@ -4497,23 +4492,60 @@ async fn commit_confirmed(
             )));
         }
     };
+    Ok(
+        match answer_while_polling(consumer, &mut answer, shutdown, fault_rx, queue, paused).await?
+        {
+            Answered::Came(Some(Ok(()))) => CommitAnswer::Confirmed,
+            Answered::Came(Some(Err(e))) => CommitAnswer::Rejected(e),
+            Answered::Came(None) => {
+                tracing::warn!(queue, "commit thread ended without a result");
+                CommitAnswer::Rejected(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail))
+            }
+            Answered::Stopped => CommitAnswer::Cancelled(answer),
+        },
+    )
+}
+
+/// How a wait for the answer of a commit on its thread ended, see
+/// [`answer_while_polling`].
+enum Answered {
+    /// The answer came: the commit's result, or `None` when its thread ended
+    /// without one, as [`commit_answer`] reads it.
+    Came(Option<KafkaResult<()>>),
+    /// Shutdown fired first. The commit is still in flight on its thread,
+    /// and its answer is still to come on the receiver.
+    Stopped,
+}
+
+/// Wait for `answer`, the answer of a commit on its thread (see
+/// [`spawn_commit`]), while the loop keeps polling.
+///
+/// The wait is a select that keeps calling `recv()`, as the permit wait
+/// does, so it serves the rebalance callbacks and the poll budget however
+/// long the coordinator takes. Under `CommitPolicy::PerRecord` the
+/// assignment is paused while a commit is unconfirmed (see the receive
+/// loop), so `recv()` yields nothing of it; a record it does yield, there
+/// from a partition assigned during the pause and on the batch loop from
+/// any partition, is put back with the assignment paused, and `paused`
+/// says so. The wait ends on the answer, on shutdown, or on a fault a
+/// handler task reports over `fault_rx`. Shutdown is read first, so a stop
+/// leaves the receiver unread for the stop to wait on.
+async fn answer_while_polling(
+    consumer: &Arc<KafkaStreamConsumer>,
+    answer: &mut oneshot::Receiver<KafkaResult<()>>,
+    shutdown: &CancellationToken,
+    fault_rx: Option<&mut mpsc::Receiver<ShoveError>>,
+    queue: &str,
+    paused: &mut bool,
+) -> Result<Answered> {
     let fault = handler_fault(fault_rx);
     tokio::pin!(fault);
     loop {
         tokio::select! {
             biased;
-            _ = shutdown.cancelled() => return Ok(CommitAnswer::Cancelled(answer)),
+            _ = shutdown.cancelled() => return Ok(Answered::Stopped),
             e = &mut fault => return Err(e),
-            result = &mut answer => {
-                return Ok(match result {
-                    Ok(Ok(())) => CommitAnswer::Confirmed,
-                    Ok(Err(e)) => CommitAnswer::Rejected(e),
-                    Err(_recv) => {
-                        tracing::warn!(queue, "commit thread ended without a result");
-                        CommitAnswer::Rejected(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail))
-                    }
-                });
-            }
+            result = &mut *answer => return Ok(Answered::Came(result.ok())),
             received = consumer.recv() => {
                 let msg = match received {
                     Ok(msg) => msg,
@@ -4857,7 +4889,9 @@ struct BatchFlushCtx<'a> {
 /// coordinator rejects it, and judged by the fence, which ends the member
 /// once its commits keep being rejected with no rebalance resolving them. A
 /// span with dead letters or discards on it commits synchronously instead,
-/// before the flush returns, see [`settle_terminal_span`].
+/// and the flush waits for the answer while it polls, see
+/// [`commit_terminal_span`]; a rejection of that commit leaves the position
+/// to the slot to re-offer as well.
 struct BatchState {
     tracker: OffsetTracker,
     rebalance_rx: std_mpsc::Receiver<RebalanceEvent>,
@@ -4902,37 +4936,109 @@ impl BatchState {
     }
 }
 
-/// Commits `positions` synchronously on a thread of its own, see
-/// [`spawn_commit`], and waits for the coordinator's answer: the commit of a
-/// span with dead letters or discards on it, whose flush settles them, and
-/// any seek it makes, on that answer.
+/// Commits a span with dead letters or discards on it, at the positions its
+/// flush settled it at, see [`settle_terminal_span`], and settles the
+/// discards that ride on the commit. `positions` is each partition's
+/// position under the assignment the span tracked it under, and `discards`
+/// are the discards those positions retire. `Ok(true)` says the coordinator
+/// accepted the commit.
 ///
-/// A spawn failure commits nothing and answers as a rejection, and so does a
-/// partition the list cannot carry: a partition silently missing from the
-/// commit would replay its whole span after a restart. The wait does not
-/// poll; librdkafka answers the commit within a few socket timeouts, see
-/// [`spawn_commit`], well inside `max.poll.interval.ms`.
-async fn commit_span(
-    consumer: &Arc<KafkaStreamConsumer>,
-    queue: &str,
-    positions: &HashMap<i32, i64>,
-) -> KafkaResult<()> {
-    let mut tpl = TopicPartitionList::new();
-    for (&partition, &offset) in positions {
-        tpl.add_partition_offset(queue, partition, Offset::Offset(offset))?;
-    }
-    let answer = spawn_commit(consumer, tpl, queue).map_err(|e| {
-        tracing::error!(
+/// One commit is in flight at a time, so the slot's own commit is answered
+/// first. Both waits poll, see [`answer_while_polling`], and both end on a
+/// stop, which then waits for the commit in flight for its share of the
+/// shutdown deadline before its final commit, see
+/// [`stop_with_final_commit`]: a commit the stop cut short goes to the slot
+/// as that commit, and one the stop kept from being made at all leaves its
+/// discards to the final commit, which carries its position.
+///
+/// A commit the coordinator rejects, or that no thread or partition list
+/// could carry, hands its discards back to the tracker and marks its
+/// partitions dirty, so the slot re-offers the position as it re-offers an
+/// acked span's, and the fence judges the streak, see
+/// `OffsetTracker::commit_rejected`. The span is settled by then: its dead
+/// letters have landed, so nothing of it is handed over again.
+async fn commit_terminal_span(
+    flush: &BatchFlushCtx<'_>,
+    state: &mut BatchState,
+    positions: Vec<CommitPosition>,
+    discards: Vec<CoveredDiscard>,
+) -> Result<bool> {
+    let queue = flush.queue;
+    if let Some(pending) = state.commits.in_flight.as_mut() {
+        match answer_while_polling(
+            flush.consumer,
+            &mut pending.answer,
+            flush.shutdown,
+            None,
             queue,
-            error = %e,
-            "could not spawn the commit thread; nothing commits"
-        );
-        KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail)
-    })?;
-    answer.await.unwrap_or_else(|_closed| {
-        tracing::warn!(queue, "commit thread ended without a result");
-        Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail))
-    })
+            &mut state.paused,
+        )
+        .await?
+        {
+            Answered::Came(answer) => state.commits.settle(answer, &mut state.tracker, queue),
+            Answered::Stopped => {
+                state.tracker.re_pend(discards);
+                return Ok(false);
+            }
+        }
+    }
+    let mut tpl = TopicPartitionList::new();
+    for position in &positions {
+        if let Err(e) =
+            tpl.add_partition_offset(queue, position.partition, Offset::Offset(position.offset))
+        {
+            tracing::error!(
+                queue,
+                partition = position.partition,
+                offset = position.offset,
+                error = %e,
+                "could not add the partition to the batch's commit; nothing is committed, and the \
+                 position is re-offered"
+            );
+            let now = Instant::now();
+            state.tracker.commit_rejected(&positions, discards, now);
+            state.commits.gate.mark_rejected(now);
+            return Ok(false);
+        }
+    }
+    match commit_confirmed(
+        flush.consumer,
+        tpl,
+        flush.shutdown,
+        None,
+        queue,
+        &mut state.paused,
+    )
+    .await?
+    {
+        CommitAnswer::Confirmed => {
+            state.tracker.commit_accepted(&positions);
+            discards.into_iter().for_each(CoveredDiscard::confirm);
+            state.commits.gate.mark(Instant::now());
+            Ok(true)
+        }
+        CommitAnswer::Rejected(e) => {
+            tracing::warn!(
+                queue,
+                error = %e,
+                offsets = ?position_offsets(&positions),
+                "the commit of a batch with dead letters or discards on it was rejected; the \
+                 batch is settled, and its position is re-offered"
+            );
+            let now = Instant::now();
+            state.tracker.commit_rejected(&positions, discards, now);
+            state.commits.gate.mark_rejected(now);
+            Ok(false)
+        }
+        CommitAnswer::Cancelled(answer) => {
+            state.commits.in_flight = Some(PendingCommit {
+                answer,
+                positions,
+                discards,
+            });
+            Ok(false)
+        }
+    }
 }
 
 /// The parts of a batch decode that don't change between messages.
@@ -5097,14 +5203,16 @@ struct PendingDlq {
 }
 
 /// A message dropped before the handler (oversize / undecodable), carrying
-/// its parked DLQ payload (when the topology declares one) and the discard
-/// accounting that the flush settles against the publish + commit results.
+/// its partition and offset, its parked DLQ payload (when the topology
+/// declares one) and the discard accounting that the flush settles against
+/// the publish + commit results.
 ///
 /// `dlq` is `None` exactly when the topology has no DLQ (see
 /// `BatchBuffer::retain_raw`): `publish_to_dlq` would log "no DLQ
 /// configured" and discard, so copying and holding every poison payload
 /// until the flush buys nothing.
 struct DroppedMessage {
+    coordinates: (i32, i64),
     dlq: Option<PendingDlq>,
     pending: metrics::PendingDiscard,
 }
@@ -5123,6 +5231,10 @@ struct BatchBuffer<T: Topic> {
     /// Wire bytes, index-parallel to `messages` when `retain_raw` and empty
     /// otherwise: [`push`](Self::push) writes both.
     raw: Vec<RawMessage>,
+    /// Each message's partition and offset, index-parallel to `messages`
+    /// when the topology declares no DLQ and empty otherwise, where `raw`'s
+    /// headers carry them: the record a `Reject`'s discard rides on.
+    coordinates: Vec<(i32, i64)>,
     /// Messages dropped pre-handler since the last flush, held until the
     /// batch settles.
     ///
@@ -5157,6 +5269,7 @@ impl<T: Topic> BatchBuffer<T> {
             capacity,
             retain_raw,
             raw: Vec::new(),
+            coordinates: Vec::new(),
             dropped: Vec::new(),
             start: HashMap::new(),
             end: HashMap::new(),
@@ -5209,31 +5322,41 @@ impl<T: Topic> BatchBuffer<T> {
     }
 
     /// Buffers a decoded message, and its wire bytes when the topology
-    /// declares a DLQ; `raw` builds them only then.
+    /// declares a DLQ, which `raw` builds only then, or its `coordinates`
+    /// when it declares none.
     fn push(
         &mut self,
         message: T::Message,
         metadata: MessageMetadata,
+        coordinates: (i32, i64),
         raw: impl FnOnce() -> RawMessage,
     ) {
         self.messages.push((message, metadata));
         if self.retain_raw {
             self.raw.push(raw());
+        } else {
+            self.coordinates.push(coordinates);
         }
     }
 
-    /// Records a message dropped pre-handler, parking its bytes for the DLQ
-    /// only when there is a DLQ to publish them to, and carrying the discard
-    /// accounting the flush settles against the publish + commit results.
-    /// `raw` builds the bytes only then — see [`DroppedMessage`].
+    /// Records a message dropped pre-handler at `coordinates`, parking its
+    /// bytes for the DLQ only when there is a DLQ to publish them to, and
+    /// carrying the discard accounting the flush settles against the
+    /// publish + commit results. `raw` builds the bytes only then — see
+    /// [`DroppedMessage`].
     fn drop_message(
         &mut self,
+        coordinates: (i32, i64),
         raw: impl FnOnce() -> RawMessage,
         reason: String,
         pending: metrics::PendingDiscard,
     ) {
         let dlq = self.retain_raw.then(|| PendingDlq { raw: raw(), reason });
-        self.dropped.push(DroppedMessage { dlq, pending });
+        self.dropped.push(DroppedMessage {
+            coordinates,
+            dlq,
+            pending,
+        });
     }
 
     /// The decoded messages, for the handler. `messages` starts over with
@@ -5264,6 +5387,7 @@ impl<T: Topic> BatchBuffer<T> {
     fn clear(&mut self) {
         self.messages.clear();
         self.raw.clear();
+        self.coordinates.clear();
         for dropped in self.dropped.drain(..) {
             dropped.pending.survived();
         }
@@ -5523,6 +5647,29 @@ fn terminal_discard(
     }
 }
 
+/// `discard`, riding the commit of the span whose partitions `epochs`
+/// names at `offset` on `partition`, see [`CoveredDiscard`]. A partition the
+/// span does not hold has no commit to ride: its discard settles as
+/// survived, and nothing is counted.
+fn ride(
+    epochs: &HashMap<i32, u64>,
+    (partition, offset): (i32, i64),
+    discard: TerminalDiscard,
+) -> Option<CoveredDiscard> {
+    match epochs.get(&partition) {
+        Some(&epoch) => Some(CoveredDiscard {
+            partition,
+            offset,
+            epoch,
+            discard,
+        }),
+        None => {
+            discard.survived();
+            None
+        }
+    }
+}
+
 /// Settles a span whose records leave through the DLQ or are discarded:
 /// the `rejected` messages a `Reject` dead-letters, none for a span the
 /// handler acked, and every drop parked during the batch.
@@ -5532,32 +5679,33 @@ fn terminal_discard(
 /// nothing has retired these messages until the commit below lands:
 /// recording it up front would fire a data-loss alert during the broker
 /// outage that made the commit fail, precisely when the batch is about to be
-/// redelivered. Driven off `rejected`, not `raw.len()`: with no DLQ the buffer
-/// keeps no wire bytes at all, but there are still `rejected` messages about
-/// to be dropped on the floor, which is exactly what the discard counter
-/// exists to report.
+/// redelivered. With no DLQ the buffer keeps no wire bytes at all, but there
+/// are still `rejected` messages about to be dropped on the floor, which is
+/// exactly what the discard counter exists to report: each discard rides
+/// the commit at its own record, see [`CoveredDiscard`].
 ///
 /// The dead letters run concurrently and the loop keeps polling, see
 /// [`dead_letter_span`]. A rebalance their polls served that moved a
 /// partition of the span abandons it uncommitted, as a rebalance between
-/// flushes does. Otherwise the span commits synchronously, see
-/// [`commit_span`], each partition up to its first record whose dead letter
-/// failed and may land later, or to its end; a dead letter that can never be
-/// published is discarded as lost and committed past. The discards riding
-/// the commit count once the coordinator accepts it, and a partition the
-/// commit stopped short of is then sought back to the record that failed,
-/// so the batch is handed over again from it after the escalating
+/// flushes does. Otherwise the span is settled and commits synchronously,
+/// see [`commit_terminal_span`], each partition up to its first record whose
+/// dead letter failed and may land later, or to its end; a dead letter that
+/// can never be published is discarded as lost and committed past. The
+/// discards riding the commit count once the coordinator accepts it. A
+/// partition the commit stops short of is sought back to the record that
+/// failed, so the batch is handed over again from it after the escalating
 /// redelivery delay, and its dead letter tried again; no discard is counted
 /// for a record kept so. A dead letter that failed with an error no retry
 /// gets past commits nothing and ends the member with that error.
 ///
 /// A commit the coordinator rejects, such as one made while the group
-/// rebalances, does not end the member: the whole span is sought back and
-/// handed over again, and the rejection feeds the fence, see
-/// `OffsetTracker::commit_rejected`, so a member whose commits keep being
-/// rejected with no rebalance resolving them reconnects through it. No
-/// redelivery delay follows, because the loop must poll for the rebalance
-/// to complete.
+/// rebalances, neither ends the member nor hands the span over again. The
+/// span is settled, so it is retired as an acked span is, its discards go
+/// back to the tracker, and the slot re-offers its position: a refusal
+/// costs a re-offer, with no redelivery and no second dead letter. The
+/// rejection feeds the fence, see `OffsetTracker::commit_rejected`, so a
+/// member whose commits keep being rejected with no rebalance resolving
+/// them reconnects through it.
 async fn settle_terminal_span<T: Topic>(
     flush: &BatchFlushCtx<'_>,
     buffer: &mut BatchBuffer<T>,
@@ -5569,7 +5717,7 @@ async fn settle_terminal_span<T: Topic>(
     let has_dlq = buffer.retain_raw;
     let mut letters: Vec<DeadLetter> = Vec::new();
     let mut letter_pendings: Vec<metrics::PendingDiscard> = Vec::new();
-    let mut retired: Vec<TerminalDiscard> = Vec::new();
+    let mut riding: Vec<CoveredDiscard> = Vec::new();
     if rejected > 0 {
         if has_dlq {
             for raw in buffer.raw.drain(..) {
@@ -5590,14 +5738,16 @@ async fn settle_terminal_span<T: Topic>(
                 "batch rejected, routed to the DLQ"
             );
         } else {
-            for _ in 0..rejected {
+            for &coordinates in &buffer.coordinates {
                 let pending = metrics::record_terminal(
                     flush.topic,
                     flush.group,
                     metrics::FailReason::Rejected,
                     false,
                 );
-                retired.extend(terminal_discard(false, false, pending));
+                if let Some(discard) = terminal_discard(false, false, pending) {
+                    riding.extend(ride(&buffer.epochs, coordinates, discard));
+                }
             }
             tracing::warn!(
                 queue,
@@ -5618,7 +5768,11 @@ async fn settle_terminal_span<T: Topic>(
                     reason: Cow::Owned(reason),
                 });
             }
-            None => retired.extend(terminal_discard(false, false, dropped.pending)),
+            None => {
+                if let Some(discard) = terminal_discard(false, false, dropped.pending) {
+                    riding.extend(ride(&buffer.epochs, dropped.coordinates, discard));
+                }
+            }
         }
     }
 
@@ -5635,20 +5789,19 @@ async fn settle_terminal_span<T: Topic>(
 
     // Each partition commits up to its first record kept, or to its end.
     let mut commit_to = buffer.end.clone();
-    let mut riding: Vec<(i32, i64, TerminalDiscard)> = Vec::new();
     let mut fatal: Option<ShoveError> = None;
-    for (((partition, offset), pending), outcome) in
+    for ((coordinates, pending), outcome) in
         coordinates.into_iter().zip(letter_pendings).zip(outcomes)
     {
         match outcome {
             DeadLettered::Landed => {
                 if let Some(discard) = terminal_discard(true, true, pending) {
-                    riding.push((partition, offset, discard));
+                    riding.extend(ride(&buffer.epochs, coordinates, discard));
                 }
             }
             DeadLettered::Unpublishable => {
                 if let Some(discard) = terminal_discard(true, false, pending) {
-                    riding.push((partition, offset, discard));
+                    riding.extend(ride(&buffer.epochs, coordinates, discard));
                 }
             }
             DeadLettered::Fatal(e) => {
@@ -5657,75 +5810,50 @@ async fn settle_terminal_span<T: Topic>(
             }
             DeadLettered::Kept => {
                 pending.survived();
+                let (partition, offset) = coordinates;
                 if let Some(end) = commit_to.get_mut(&partition) {
                     *end = (*end).min(offset);
                 }
             }
         }
     }
-    let settle_survived = |riding: Vec<(i32, i64, TerminalDiscard)>,
-                           retired: Vec<TerminalDiscard>| {
-        riding
-            .into_iter()
-            .for_each(|(_, _, discard)| discard.survived());
-        retired.into_iter().for_each(TerminalDiscard::survived);
-    };
     if let Some(e) = fatal {
-        settle_survived(riding, retired);
+        riding.into_iter().for_each(CoveredDiscard::survived);
         buffer.clear();
         return Err(e);
     }
     if let Some(rewound) = apply_batch_rebalance(flush.consumer, queue, buffer, state)? {
-        settle_survived(riding, retired);
+        riding.into_iter().for_each(CoveredDiscard::survived);
         return Ok(Flushed::Redelivered(rewound));
     }
 
-    // One commit in flight at a time: the slot's is answered first.
-    if state.commits.in_flight.is_some() {
-        let answer = commit_answer(state.commits.in_flight.as_mut()).await;
-        state.commits.settle(answer, &mut state.tracker, queue);
-    }
-    if let Err(e) = commit_span(flush.consumer, queue, &commit_to).await {
-        let mut offsets: Vec<(i32, i64)> = commit_to.iter().map(|(&p, &o)| (p, o)).collect();
-        offsets.sort_unstable();
-        tracing::warn!(
-            queue,
-            error = %e,
-            ?offsets,
-            "the commit of a batch with dead letters or discards on it was rejected; the batch \
-             is sought back and handed over again"
-        );
-        let positions: Vec<CommitPosition> = commit_to
-            .iter()
-            .filter_map(|(&partition, &offset)| {
-                buffer.epochs.get(&partition).map(|&epoch| CommitPosition {
-                    partition,
-                    offset,
-                    epoch,
-                })
+    // The span is settled: its commit carries each partition's position and
+    // the discards below it, and a discard at or past a kept record waits
+    // for that record's redelivery.
+    let positions: Vec<CommitPosition> = commit_to
+        .iter()
+        .filter_map(|(&partition, &offset)| {
+            buffer.epochs.get(&partition).map(|&epoch| CommitPosition {
+                partition,
+                offset,
+                epoch,
             })
-            .collect();
-        state
-            .tracker
-            .commit_rejected(&positions, Vec::new(), Instant::now());
-        settle_survived(riding, retired);
-        let rewound: BTreeSet<i32> = buffer.start.keys().copied().collect();
-        let sought = rewind_span(flush.consumer, queue, &buffer.start);
-        buffer.clear();
-        sought?;
-        return Ok(Flushed::Redelivered(rewound));
-    }
-
-    // The offsets advanced: these messages are genuinely gone.
-    buffer.retire(&mut state.tracker, &commit_to, true);
-    for (partition, offset, discard) in riding {
-        if commit_to.get(&partition).is_some_and(|&end| offset < end) {
-            discard.confirm();
+        })
+        .collect();
+    let mut covered = Vec::with_capacity(riding.len());
+    for discard in riding {
+        if commit_to
+            .get(&discard.partition)
+            .is_some_and(|&end| discard.offset < end)
+        {
+            covered.push(discard);
         } else {
             discard.survived();
         }
     }
-    retired.into_iter().for_each(TerminalDiscard::confirm);
+    let accepted = commit_terminal_span(flush, state, positions, covered).await?;
+    state.resume(flush.consumer)?;
+    buffer.retire(&mut state.tracker, &commit_to, accepted);
     let kept: HashMap<i32, i64> = commit_to
         .iter()
         .filter(|&(partition, &to)| buffer.end.get(partition).is_some_and(|&end| to < end))
@@ -5733,7 +5861,14 @@ async fn settle_terminal_span<T: Topic>(
         .collect();
     if kept.is_empty() {
         *redelivery_backoff = batch_redelivery_backoff();
-        tracing::debug!(queue, "batch settled and its offsets committed");
+        if accepted {
+            tracing::debug!(queue, "batch settled and its offsets committed");
+        } else {
+            tracing::debug!(
+                queue,
+                "batch settled; its offsets go out with the next commit"
+            );
+        }
         buffer.clear();
         return Ok(Flushed::Committed);
     }
@@ -5910,7 +6045,8 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Flushed {
     /// The span's records are retired: its offsets were committed with the
-    /// flush, or, for an acked span, go out with the loop's next commit.
+    /// flush, or go out with the loop's next commit, as an acked span's do
+    /// and as a refused commit's re-offer does.
     Committed,
     /// These partitions of the span were sought back, to the span's start or
     /// to a record whose dead letter failed, or the span was abandoned to a
@@ -5971,9 +6107,8 @@ fn rebalance_affects_batch(affected: &BTreeSet<i32>, batch_start: &HashMap<i32, 
 
 /// Seeks every partition in `targets` back to its offset there, best-effort
 /// and independently per partition: the rewind of a span abandoned to a
-/// rebalance, of a span a `Retry` or `Defer` redelivers or whose commit was
-/// rejected, and of a partition whose dead letter failed, see
-/// [`settle_terminal_span`].
+/// rebalance, of a span a `Retry` or `Defer` redelivers, and of a partition
+/// whose dead letter failed, see [`settle_terminal_span`].
 ///
 /// This consumer runs `partition.assignment.strategy=cooperative-sticky`, so a
 /// rebalance revokes only *some* partitions and leaves the rest assigned with
@@ -8690,8 +8825,8 @@ impl KafkaConsumer {
     /// - `Reject` is terminal: the batch is published to the DLQ (if the
     ///   topology declares one) and its offsets commit, matching what `Reject`
     ///   means on every other consumer path. That commit is synchronous, and
-    ///   the flush waits for its answer, because the discards and the dead
-    ///   letters' fate ride on it.
+    ///   the flush waits for its answer while the consumer keeps polling,
+    ///   because the discards ride on it.
     /// - `Retry` / `Defer` redeliver the **entire batch** after an escalating
     ///   delay. There is no per-batch retry counter, so a handler that never
     ///   acks redelivers forever — that is the intended back-pressure for a
@@ -8711,11 +8846,13 @@ impl KafkaConsumer {
     /// error.
     ///
     /// A synchronous commit the coordinator rejects does not end the
-    /// consumer: the batch is sought back and handed over again, and the
-    /// consumer keeps polling, so a rebalance behind the rejection can
-    /// complete. A consumer whose commits keep being rejected, none accepted
-    /// and no rebalance resolving them, is treated as fenced and reconnects,
-    /// as the standard consumer does.
+    /// consumer, and the batch is not handed over again: once its dead
+    /// letters have landed the batch is settled, so its position is
+    /// re-offered as an acked batch's is, with its discards riding on the
+    /// re-offer. The consumer keeps polling, so a rebalance behind the
+    /// rejection can complete. A consumer whose commits keep being rejected,
+    /// none accepted and no rebalance resolving them, is treated as fenced
+    /// and reconnects, as the standard consumer does.
     ///
     /// # Poison handling
     ///
@@ -8731,10 +8868,15 @@ impl KafkaConsumer {
     ///
     /// # Stopping
     ///
-    /// A stop flushes the batch in hand, then commits every retired position
-    /// synchronously and closes the consumer, both on a thread of their own,
-    /// within the 20 s shutdown deadline, as the standard consumer's stop
-    /// does. A final commit the broker does not confirm ends the run with
+    /// A stop flushes the batch in hand first. That flush is not inside the
+    /// shutdown deadline: it waits for the handler and for the batch's dead
+    /// letters. The commits that follow are bounded as the standard
+    /// consumer's are. A commit in flight when the stop lands, the flushed
+    /// batch's own included, is waited for at most 15 s, and every retired
+    /// position is then committed synchronously and the consumer closed,
+    /// both on a thread of their own, within what is left of the 20 s
+    /// shutdown deadline. A commit in flight with no answer in time, and a
+    /// final commit the broker does not confirm, end the run with
     /// `ShoveError::Commit`. Any other error closes the consumer on a thread
     /// of its own with nothing committed, and the error is returned once the
     /// close has run or the same deadline has passed.
@@ -9106,6 +9248,7 @@ impl KafkaConsumer {
                                         retain_raw,
                                     );
                                     buffer.drop_message(
+                                        (partition, offset),
                                         || RawMessage {
                                             payload: Bytes::copy_from_slice(payload_slice),
                                             key,
@@ -9236,6 +9379,7 @@ impl KafkaConsumer {
                                                 retain_raw,
                                             );
                                             buffer.drop_message(
+                                                (partition, offset),
                                                 || RawMessage {
                                                     payload: Bytes::copy_from_slice(payload_slice),
                                                     key,
@@ -9247,7 +9391,7 @@ impl KafkaConsumer {
                                         }
                                         BatchStaged::Decoded(decoded) => {
                                             let metadata = build_message_metadata(&headers, false, RecordCoordinates::of(&msg));
-                                            buffer.push(decoded, metadata, || RawMessage {
+                                            buffer.push(decoded, metadata, (partition, offset), || RawMessage {
                                                 payload: Bytes::copy_from_slice(payload_slice),
                                                 key,
                                                 headers: RecordHeaders::with_strings(&msg, headers),
@@ -12278,7 +12422,7 @@ mod batch_buffer_tests {
     fn dropped_messages_count_toward_the_size_trigger() {
         let mut buf = buffer();
         for _ in 0..5 {
-            buf.drop_message(raw, "deserialization_error".into(), pending());
+            buf.drop_message((0, 0), raw, "deserialization_error".into(), pending());
         }
 
         assert_eq!(
@@ -12295,9 +12439,9 @@ mod batch_buffer_tests {
     #[test]
     fn flush_len_sums_decoded_and_dropped() {
         let mut buf = buffer();
-        buf.push(BufMessage { value: 1 }, metadata(), raw);
-        buf.push(BufMessage { value: 2 }, metadata(), raw);
-        buf.drop_message(raw, "oversize".into(), pending());
+        buf.push(BufMessage { value: 1 }, metadata(), (0, 0), raw);
+        buf.push(BufMessage { value: 2 }, metadata(), (0, 0), raw);
+        buf.drop_message((0, 0), raw, "oversize".into(), pending());
 
         assert_eq!(buf.flush_len(), 3);
     }
@@ -12309,6 +12453,7 @@ mod batch_buffer_tests {
     fn a_drop_without_a_dlq_parks_no_payload_but_still_counts() {
         let mut buf = bare_buffer();
         buf.drop_message(
+            (0, 7),
             || unreachable!("no wire bytes are built without a DLQ"),
             "deserialization_error".into(),
             pending(),
@@ -12323,20 +12468,28 @@ mod batch_buffer_tests {
 
     /// The wire bytes a `Reject` dead-letters stay index-parallel to the
     /// messages handed to the handler whenever a DLQ is declared, and are
-    /// never built without one.
+    /// never built without one, where the records' coordinates are kept
+    /// instead.
     #[test]
     fn wire_bytes_are_kept_for_every_message_only_with_a_dlq() {
         let mut buf = buffer();
-        buf.push(BufMessage { value: 1 }, metadata(), || raw_at(0, 1));
-        buf.push(BufMessage { value: 2 }, metadata(), || raw_at(0, 2));
+        buf.push(BufMessage { value: 1 }, metadata(), (0, 1), || raw_at(0, 1));
+        buf.push(BufMessage { value: 2 }, metadata(), (0, 2), || raw_at(0, 2));
         assert_eq!(buf.raw.len(), buf.messages.len());
 
+        assert!(buf.coordinates.is_empty(), "the wire bytes carry them");
+
         let mut bare = bare_buffer();
-        bare.push(BufMessage { value: 1 }, metadata(), || {
+        bare.push(BufMessage { value: 1 }, metadata(), (0, 1), || {
             unreachable!("no wire bytes are built without a DLQ")
         });
         assert!(bare.raw.is_empty());
         assert_eq!(bare.messages.len(), 1);
+        assert_eq!(
+            bare.coordinates,
+            [(0, 1)],
+            "without wire bytes the record's coordinates are kept, for the discard a Reject owes"
+        );
     }
 
     /// The messages go to the handler by value, and the buffer starts the
@@ -12345,7 +12498,7 @@ mod batch_buffer_tests {
     #[test]
     fn handing_the_messages_over_keeps_the_reservation() {
         let mut buf = buffer();
-        buf.push(BufMessage { value: 1 }, metadata(), raw);
+        buf.push(BufMessage { value: 1 }, metadata(), (0, 0), raw);
         let handed = buf.take_messages();
         assert_eq!(handed.len(), 1);
         assert!(buf.messages.is_empty());
@@ -12359,7 +12512,7 @@ mod batch_buffer_tests {
     #[test]
     fn clear_resets_the_drop_count() {
         let mut buf = buffer();
-        buf.drop_message(raw, "oversize".into(), pending());
+        buf.drop_message((0, 0), raw, "oversize".into(), pending());
         buf.extend_span(0, 3, 1);
         buf.clear();
 
@@ -12375,6 +12528,7 @@ mod batch_buffer_tests {
         let mut buf = bare_buffer();
         buf.extend_span(0, 7, 1);
         buf.drop_message(
+            (0, 7),
             || unreachable!("no wire bytes are built without a DLQ"),
             "oversize".into(),
             pending(),
