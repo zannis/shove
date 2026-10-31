@@ -111,7 +111,7 @@ That wait is bounded by the handler timeout.
 An in-place delay on an external topic does not extend it: shutdown cuts the delay short, and the record stays uncommitted.
 It then commits the final position synchronously from a dedicated thread, which also closes the consumer.
 It waits at most 20 s for both, and the thread reports the two separately.
-That 20 s bound covers the final commit of the concurrent and the sequenced consumer.
+That 20 s bound covers the final commit of the concurrent, the sequenced and the batch consumer.
 A final commit that is rejected, has no answer within the bound, or has no thread to run on (`CommitFailure::NoThread`) ends the member with `ShoveError::Commit`.
 A group counts that under `errors`, so the run's exit code is 1.
 See [Offset commit semantics](/backends/kafka#offset-commit-semantics).
@@ -128,8 +128,10 @@ The source lines are as of this change.
 | `CommitPolicy::PerRecord` | Every completion is committed synchronously, and the next record waits for the coordinator's answer. | `src/backends/kafka/consumer.rs:3467`, `commit_confirmed` | `per_record_issues_one_offset_commit_per_completion` |
 | A stop with a commit in flight | The commit is waited for up to `PENDING_COMMIT_BUDGET`, and no answer ends the stop with `ShoveError::Commit` of the `Deadline` kind. | `src/backends/kafka/consumer.rs:3741-3783`, `stop_with_final_commit`, which the shutdown arm of `KafkaConsumer::run` calls, and `src/backends/kafka/constants.rs:189` | `a_per_record_stop_against_a_frozen_coordinator_reports_the_commit_it_could_not_finish`, `an_interval_stop_with_its_commit_unanswered_reports_the_pending_share`, `a_sequenced_stop_with_its_commit_unanswered_reports_the_pending_share` |
 | A final commit the broker refuses or does not answer | The member ends with `ShoveError::Commit`, counted under `errors`. | `src/backends/kafka/consumer.rs:3175`, `final_commit_on_thread` | `a_rejected_final_commit_ends_the_consumer_with_the_rejected_kind`, `a_final_commit_past_the_deadline_ends_the_consumer_with_the_deadline_kind` |
-A batch consumer commits every flush synchronously, and a commit in flight when shutdown fires blocks for as long as librdkafka retries it.
-A sequenced consumer commits as the default policy does, from a dedicated thread, and a stop waits for its commit in flight inside the 20 s bound.
+A batch consumer commits an acked batch as the default policy does, from a dedicated thread.
+A batch with dead letters or discards on it commits synchronously from one, and the flush waits for the answer.
+A sequenced consumer commits as the default policy does, from a dedicated thread.
+A stop of either waits for its commit in flight inside the 20 s bound, see [Batch consumer](/backends/kafka#batch-consumer).
 On a crash or SIGKILL, expect at-least-once redelivery from the last committed offset when the consumer restarts.
 Design handlers to be idempotent or use the dedup layer to handle this.
 
