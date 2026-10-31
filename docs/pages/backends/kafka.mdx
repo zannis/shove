@@ -360,7 +360,7 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
   A lower value refetches sooner.
   `0` removes the wait, and can raise CPU use while a queue stays full.
 
-A value outside its range is refused with `ShoveError::Topology` before any broker request.
+A value outside its range is refused with `ShoveError::Validation` before any broker request.
 A group config is checked by `register` and `register_fifo`, and options are checked where the consumer starts.
 The batch consumer takes no fetch queue setting and runs on the defaults.
 With the `env-config` feature, `KafkaFetchQueueTuning` reads the three settings from the environment, see [Environment configuration](/ops/env-config#kafka-fetch-queue).

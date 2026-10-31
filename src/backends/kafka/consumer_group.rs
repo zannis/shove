@@ -576,7 +576,7 @@ impl KafkaConsumerGroupConfig {
     /// bounds the same queue by size.
     ///
     /// The accepted range is `1..=10000000`. A value outside it is refused
-    /// with `ShoveError::Topology` by `register` and `register_fifo`, before
+    /// with `ShoveError::Validation` by `register` and `register_fifo`, before
     /// anything is declared or a member spawned. The same setting is available
     /// on `ConsumerOptions::<Kafka>` for the direct and supervisor paths.
     pub fn with_queued_min_messages(mut self, messages: u32) -> Self {
@@ -592,7 +592,7 @@ impl KafkaConsumerGroupConfig {
     /// keeps librdkafka's default, 65536, about 64 MB.
     ///
     /// The accepted range is `1..=2097151`. A value outside it is refused
-    /// with `ShoveError::Topology` by `register` and `register_fifo`, as
+    /// with `ShoveError::Validation` by `register` and `register_fifo`, as
     /// [`with_queued_min_messages`](Self::with_queued_min_messages) is. The same
     /// setting is available on `ConsumerOptions::<Kafka>` for the direct and
     /// supervisor paths.
@@ -615,7 +615,7 @@ impl KafkaConsumerGroupConfig {
     /// the wait, and can raise CPU use while a queue stays full.
     ///
     /// The accepted range is `0..=300000`. A value outside it is refused with
-    /// `ShoveError::Topology` by `register` and `register_fifo`, as
+    /// `ShoveError::Validation` by `register` and `register_fifo`, as
     /// [`with_queued_min_messages`](Self::with_queued_min_messages) is. The same
     /// setting is available on `ConsumerOptions::<Kafka>` for the direct and
     /// supervisor paths.
@@ -2683,8 +2683,8 @@ mod tests {
                 .await
                 .expect_err("an out-of-range fetch queue setting must be rejected");
 
-            let ShoveError::Topology(msg) = err else {
-                panic!("expected ShoveError::Topology, got {err:?}");
+            let ShoveError::Validation(msg) = err else {
+                panic!("expected ShoveError::Validation, got {err:?}");
             };
             assert!(
                 msg.contains("kafka-register-guard-external")
@@ -2703,8 +2703,8 @@ mod tests {
                 .await
                 .expect_err("an out-of-range fetch queue setting must be rejected");
 
-            let ShoveError::Topology(msg) = err else {
-                panic!("expected ShoveError::Topology, got {err:?}");
+            let ShoveError::Validation(msg) = err else {
+                panic!("expected ShoveError::Validation, got {err:?}");
             };
             assert!(
                 msg.contains("kafka-fifo-concurrency-guard")

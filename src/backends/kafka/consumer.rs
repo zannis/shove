@@ -11334,13 +11334,15 @@ impl KafkaConsumer {
     ///
     /// # Errors
     ///
-    /// A topology problem is returned before any dead letter is read: a DLQ
-    /// topic that does not exist on an external topology, or an option the
-    /// drain refuses. A stop whose final commit the broker does not confirm
-    /// returns `ShoveError::Commit`, as it does for every consume loop. A fault
-    /// the drain cannot ride out closes its consumer, waits for the close, and
-    /// reconnects; an error no reconnect gets past, such as a schema registry
-    /// deployment fault, ends the drain with that error.
+    /// A DLQ topic that does not exist on an external topology, or an option
+    /// the drain refuses, returns `ShoveError::Topology` before any dead letter
+    /// is read, and a fetch queue setting outside librdkafka's range returns
+    /// `ShoveError::Validation` at the same point. A stop whose final commit
+    /// the broker does not confirm returns `ShoveError::Commit`, as it does for
+    /// every consume loop. A fault the drain cannot ride out closes its
+    /// consumer, waits for the close, and reconnects; an error no reconnect
+    /// gets past, such as a schema registry deployment fault, ends the drain
+    /// with that error.
     ///
     /// [`ConsumerOptions`]: crate::ConsumerOptions
     /// [`ConsumerOptions::<Kafka>::with_group_id`]: crate::ConsumerOptions::with_group_id
@@ -16626,7 +16628,7 @@ mod consumer_config_tests {
         .expect_err("an out-of-range setting is refused");
 
         assert!(
-            matches!(&err, ShoveError::Topology(msg)
+            matches!(&err, ShoveError::Validation(msg)
                 if msg.contains("orders") && msg.contains("with_queued_min_messages")),
             "{err:?}"
         );
@@ -16717,8 +16719,8 @@ mod fetch_queue_guard_tests {
 
     fn refusal(err: ShoveError) -> String {
         match err {
-            ShoveError::Topology(msg) => msg,
-            other => panic!("expected ShoveError::Topology, got {other:?}"),
+            ShoveError::Validation(msg) => msg,
+            other => panic!("expected ShoveError::Validation, got {other:?}"),
         }
     }
 
