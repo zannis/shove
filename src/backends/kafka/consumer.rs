@@ -4679,9 +4679,13 @@ async fn answer_while_polling(
 /// flushed the batch in hand.
 ///
 /// A final commit the coordinator refuses while the group rebalances, see
-/// [`is_rebalance_refusal`], is tried again, for as long as
-/// `FINAL_COMMIT_RETRY_RESERVE` of the deadline is left: the consumer comes
-/// back from the thread unclosed, polls for `FINAL_COMMIT_RETRY_POLL` with
+/// [`is_rebalance_refusal`], is tried again while more than
+/// `FINAL_COMMIT_RETRY_RESERVE` of the deadline is left, checked when the
+/// try starts and again when its refusal comes back. The reserve is room for
+/// the poll, the last try and the close, so the tries end inside the
+/// deadline, and a refusal that comes back with less left stands. The
+/// consumer comes back from the thread unclosed, polls for
+/// `FINAL_COMMIT_RETRY_POLL` with
 /// its assignment paused, which serves the rebalance callbacks the
 /// rebalance waits on, and drains the rebalance events, so a partition the
 /// rebalance revoked leaves the next try. Another member's stop, or the
@@ -4792,7 +4796,7 @@ async fn stop_with_final_commit(
         // `SHUTDOWN_COMMIT_DEADLINE` once a commit in flight and any earlier
         // try are over, bounds how long this loop waits for its result, and
         // past it the thread finishes on its own.
-        let error = match final_commit_off_runtime(consumer, tpl, queue, deadline, retry).await {
+        let kind = match final_commit_off_runtime(consumer, tpl, queue, deadline, retry).await {
             FinalCommitted::Ended(Ok(())) => {
                 for discard in discards {
                     discard.confirm();
@@ -4814,46 +4818,65 @@ async fn stop_with_final_commit(
                     );
                     return Ok(());
                 }
-                // The member ends with the failure instead of a clean exit.
-                tracing::error!(
-                    queue,
-                    error = %kind,
-                    ?offsets,
-                    "final offset commit failed during shutdown; redelivery starts \
-                     from the last position the broker accepted, and the consumer \
-                     ends with ShoveError::Commit"
-                );
-                return Err(ShoveError::Commit(Box::new(FailedCommit {
-                    topic: queue.to_string(),
-                    offsets,
-                    kind,
-                })));
+                kind
             }
             FinalCommitted::Rebalancing {
                 consumer: unclosed,
                 error,
             } => {
-                consumer = unclosed;
-                tracker.re_pend(discards);
-                error
+                let left = final_deadline.saturating_sub(tries_started.elapsed());
+                if left <= FINAL_COMMIT_RETRY_RESERVE {
+                    tracing::warn!(
+                        queue,
+                        %error,
+                        ?offsets,
+                        ?left,
+                        "the final offset commit was refused while the group rebalances, with too \
+                         little of the shutdown deadline left to poll and commit again"
+                    );
+                    for discard in discards {
+                        discard.survived();
+                    }
+                    close_without_commit(unclosed, queue, left).await;
+                    CommitFailure::Rejected(error.to_string())
+                } else {
+                    tracing::warn!(
+                        queue,
+                        %error,
+                        ?offsets,
+                        "the final offset commit was refused while the group rebalances; polling \
+                         with the assignment paused, then committing again"
+                    );
+                    consumer = unclosed;
+                    tracker.re_pend(discards);
+                    if let Err(e) = poll_paused(&consumer, queue, FINAL_COMMIT_RETRY_POLL).await {
+                        tracing::error!(
+                            queue,
+                            error = %e,
+                            "polling for the rebalance at shutdown failed; the next final commit \
+                             is the last"
+                        );
+                        polled = false;
+                    }
+                    deadline = final_deadline.saturating_sub(tries_started.elapsed());
+                    continue;
+                }
             }
         };
-        tracing::warn!(
+        // The member ends with the failure instead of a clean exit.
+        tracing::error!(
             queue,
-            %error,
+            error = %kind,
             ?offsets,
-            "the final offset commit was refused while the group rebalances; polling with the \
-             assignment paused, then committing again"
+            "final offset commit failed during shutdown; redelivery starts \
+             from the last position the broker accepted, and the consumer \
+             ends with ShoveError::Commit"
         );
-        if let Err(e) = poll_paused(&consumer, queue, FINAL_COMMIT_RETRY_POLL).await {
-            tracing::error!(
-                queue,
-                error = %e,
-                "polling for the rebalance at shutdown failed; the next final commit is the last"
-            );
-            polled = false;
-        }
-        deadline = final_deadline.saturating_sub(tries_started.elapsed());
+        return Err(ShoveError::Commit(Box::new(FailedCommit {
+            topic: queue.to_string(),
+            offsets,
+            kind,
+        })));
     }
 }
 
