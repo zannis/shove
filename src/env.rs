@@ -838,7 +838,7 @@ mod tests {
         assert_eq!(blank.fetch_queue_backoff_ms(), None);
     }
 
-    /// A backoff of `0` is a value, not an unset: it removes the backoff.
+    /// A backoff of `0` reads as `Some(0)`, and removes the backoff.
     #[cfg(feature = "kafka")]
     #[test]
     fn kafka_fetch_queue_tuning_admits_the_edges_of_every_range() {

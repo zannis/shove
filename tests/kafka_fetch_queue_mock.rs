@@ -509,7 +509,7 @@ async fn an_out_of_range_setting_is_refused_before_a_consumer_is_created() {
         ),
     )
     .await
-    .expect("the refusal comes at startup, not after a retry loop")
+    .expect("the refusal comes at startup, before any retry loop")
     .expect_err("an out-of-range backoff is refused");
     assert!(
         matches!(&err, ShoveError::Validation(msg)

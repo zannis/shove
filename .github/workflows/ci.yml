@@ -276,7 +276,8 @@ jobs:
             # container + unsecured JWT; no AWS/LocalStack needed).
             # `metrics` asserted by `metrics_kafka_failall` and
             # `metrics_kafka_failall_no_dlq`.
-            # `env-config` runs the `KafkaTopicTuning` tests.
+            # `env-config` runs the `KafkaTopicTuning` and
+            # `KafkaFetchQueueTuning` tests.
             # `inmemory` makes tests/bench_harness_kafka.rs (gated on
             # kafka+inmemory) an executable target here, so the stress
             # harness's Kafka batch-knob wiring tests actually run in CI
