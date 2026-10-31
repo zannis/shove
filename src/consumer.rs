@@ -937,8 +937,8 @@ impl ConsumerOptions<Kafka> {
     /// [`KafkaConsumerGroupConfig::with_commit_interval`](crate::kafka::KafkaConsumerGroupConfig::with_commit_interval).
     /// A FIFO consumer, a broadcast subscription and the DLQ drain refuse it
     /// at their entry points, because none of them reads it: the FIFO
-    /// consumer commits on the fixed 500 ms default, and the other two do
-    /// not commit on an interval.
+    /// consumer and the DLQ drain commit on the fixed 500 ms default, and a
+    /// broadcast subscription commits nothing.
     ///
     /// # Panics
     ///
