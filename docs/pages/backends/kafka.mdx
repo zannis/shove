@@ -258,6 +258,8 @@ Keep linger modest when consumers republish on the same client.
 
 `consumer_group()` registers a native Kafka consumer group. `KafkaConsumerGroupConfig::new(min..=max)` sets the autoscale bounds. Kafka handles partition assignment and rebalance automatically when the group membership changes.
 
+librdkafka's constructor can block while it reads TLS files, so every consume loop builds its consumer on a blocking thread, on its first connection and on every reconnect, and none of them holds the runtime's thread.
+
 ### Group configuration
 
 ```rust,no_run
