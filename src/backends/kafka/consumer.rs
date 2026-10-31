@@ -5169,11 +5169,15 @@ impl BatchState {
 ///
 /// One commit is in flight at a time, so the slot's own commit is answered
 /// first. Both waits poll once [`PERMIT_WAIT_GRACE`] has run out, see
-/// [`answer_while_polling`], and both end on a stop, which then waits for the commit in flight for its share of the
-/// shutdown deadline before its final commit, see
-/// [`stop_with_final_commit`]: a commit the stop cut short goes to the slot
-/// as that commit, and one the stop kept from being made at all leaves its
-/// discards to the final commit, which carries its position.
+/// [`answer_while_polling`], and both end on a stop, which then waits for
+/// the commit in flight for its share of the shutdown deadline before its
+/// final commit, see [`stop_with_final_commit`]: a commit the stop cut short
+/// goes to the slot as that commit, and one the stop kept from being made at
+/// all leaves its discards to the final commit, which carries its position.
+/// A revoke the slot's wait serves comes after the drain that followed the
+/// dead letters, so it is not judged against the span, which the generation
+/// check makes safe: the span's commit lands before the partition's next
+/// owner is assigned, or is refused and re-offered without the partition.
 ///
 /// A commit the coordinator rejects, or that no thread or partition list
 /// could carry, hands its discards back to the tracker and marks its
