@@ -4,20 +4,22 @@ use std::ffi::CStr;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::StreamExt;
 use rdkafka::bindings::{
     rd_kafka_header_cnt, rd_kafka_header_get_all, rd_kafka_header_remove, rd_kafka_message_headers,
 };
 use rdkafka::client::{DefaultClientContext, OAuthToken};
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{
-    BaseConsumer, CommitMode, Consumer as RdkafkaConsumer, ConsumerContext, Rebalance,
-    StreamConsumer,
+    BaseConsumer, CommitMode, Consumer as RdkafkaConsumer, ConsumerContext, MessageStream,
+    Rebalance, StreamConsumer,
 };
 use rdkafka::error::{KafkaError, KafkaResult};
 use rdkafka::message::{BorrowedHeaders, BorrowedMessage, Header, Message, OwnedHeaders};
@@ -1901,13 +1903,16 @@ impl RegistryStall {
         tokio::pin!(retry);
         let fault = handler_fault(fault_rx);
         tokio::pin!(fault);
+        let stop = shutdown.cancelled();
+        tokio::pin!(stop);
+        let mut stream = RecvStream::new(consumer);
         loop {
             tokio::select! {
                 // Read in this order, the retry last; see the doc above.
                 biased;
-                _ = shutdown.cancelled() => return Ok(false),
+                () = &mut stop => return Ok(false),
                 e = &mut fault => return Err(e),
-                received = consumer.recv() => {
+                received = stream.recv() => {
                     let msg = match received {
                         Ok(msg) => msg,
                         Err(e) if self.groupless && is_ignorable_groupless_error(&e) => continue,
@@ -2674,6 +2679,10 @@ where
 {
     let mut outcome = first_outcome;
     let mut attempts = retry_count;
+    let stop = shutdown.cancelled();
+    tokio::pin!(stop);
+    let revoke = revoked.cancelled();
+    tokio::pin!(revoke);
     loop {
         let increment = match decide_retry(&outcome, attempts, max_retries) {
             RetryDecision::Ack | RetryDecision::Dlq { .. } => {
@@ -2694,7 +2703,7 @@ where
                 // sleep that won a tie cost one more pass before the next
                 // check read the token.
                 biased;
-                _ = shutdown.cancelled() => {
+                () = &mut stop => {
                     tracing::debug!(
                         queue = topic,
                         "shutdown fired during an in-place wait; the record stays uncommitted \
@@ -2702,7 +2711,7 @@ where
                     );
                     return InPlaceEnd::Cancelled;
                 }
-                _ = revoked.cancelled() => {
+                () = &mut revoke => {
                     tracing::debug!(
                         queue = topic,
                         partition = coordinates.partition,
@@ -2722,7 +2731,7 @@ where
             loop {
                 let decoded = tokio::select! {
                     biased;
-                    _ = revoked.cancelled() => return InPlaceEnd::Revoked,
+                    () = &mut revoke => return InPlaceEnd::Revoked,
                     decoded = decode_or_shutdown(
                         decode_batch_message::<T>(decode, payload),
                         shutdown,
@@ -2774,8 +2783,8 @@ where
                         );
                         tokio::select! {
                             biased;
-                            _ = shutdown.cancelled() => return InPlaceEnd::Cancelled,
-                            _ = revoked.cancelled() => return InPlaceEnd::Revoked,
+                            () = &mut stop => return InPlaceEnd::Cancelled,
+                            () = &mut revoke => return InPlaceEnd::Revoked,
                             _ = tokio::time::sleep(REGISTRY_RETRY_DELAY) => {}
                         }
                     }
@@ -3385,6 +3394,48 @@ pub(super) enum KafkaStreamConsumer {
     MskIam(StreamConsumer<RebalanceContext<MskIamContext>>),
 }
 
+/// A [`KafkaStreamConsumer`]'s message stream, under the context of its
+/// variant.
+enum MessageStreamOf<'c> {
+    Default(MessageStream<'c, RebalanceContext<DefaultClientContext>>),
+    #[cfg(feature = "kafka-msk-iam")]
+    MskIam(MessageStream<'c, RebalanceContext<MskIamContext>>),
+}
+
+/// The `recv()` of a loop or a wait: the consumer's message stream, made the
+/// first time it is polled and kept for the rest of the loop or the wait.
+/// Each `StreamConsumer::recv` makes a stream of its own, which registers a
+/// waker slot with the consumer and unregisters it again, and a `select!`
+/// would pay that on every pass that polls it. A record the stream hands
+/// over borrows the consumer, not the stream.
+struct RecvStream<'c> {
+    consumer: &'c KafkaStreamConsumer,
+    stream: Option<MessageStreamOf<'c>>,
+}
+
+impl<'c> RecvStream<'c> {
+    fn new(consumer: &'c KafkaStreamConsumer) -> Self {
+        Self {
+            consumer,
+            stream: None,
+        }
+    }
+
+    /// The next record, or the error, that `recv()` would answer. The
+    /// stream never ends; an end is answered as
+    /// `KafkaError::NoMessageReceived`, which ends the loop as every error
+    /// the table does not ride out does, see [`recv_error_is_transient`].
+    async fn recv(&mut self) -> KafkaResult<BorrowedMessage<'c>> {
+        let consumer = self.consumer;
+        let next = match self.stream.get_or_insert_with(|| consumer.stream()) {
+            MessageStreamOf::Default(stream) => stream.next().await,
+            #[cfg(feature = "kafka-msk-iam")]
+            MessageStreamOf::MskIam(stream) => stream.next().await,
+        };
+        next.unwrap_or(Err(KafkaError::NoMessageReceived))
+    }
+}
+
 impl KafkaStreamConsumer {
     pub(super) fn subscribe(&self, topics: &[&str]) -> KafkaResult<()> {
         match self {
@@ -3394,11 +3445,12 @@ impl KafkaStreamConsumer {
         }
     }
 
-    pub(super) async fn recv(&self) -> KafkaResult<BorrowedMessage<'_>> {
+    /// A fresh message stream, see [`RecvStream`].
+    fn stream(&self) -> MessageStreamOf<'_> {
         match self {
-            Self::Default(c) => c.recv().await,
+            Self::Default(c) => MessageStreamOf::Default(c.stream()),
             #[cfg(feature = "kafka-msk-iam")]
-            Self::MskIam(c) => c.recv().await,
+            Self::MskIam(c) => MessageStreamOf::MskIam(c.stream()),
         }
     }
 
@@ -5075,6 +5127,16 @@ async fn commit_answer(in_flight: Option<&mut PendingCommit>) -> Option<KafkaRes
     }
 }
 
+/// Moves `wake`, the `Sleep` a loop that commits through a [`CommitSlot`]
+/// keeps across its passes for the gate's deadline, to `deadline` when the
+/// deadline has moved since it was set. A commit moves it; a pass that only
+/// re-reads it resets nothing, so the timer is touched once per window.
+fn rearm(wake: Pin<&mut tokio::time::Sleep>, deadline: Instant) {
+    if wake.deadline() != deadline {
+        wake.reset(deadline);
+    }
+}
+
 /// Commit `tpl` synchronously on a thread of its own (see [`spawn_commit`])
 /// and wait for the coordinator's answer while the loop keeps polling, see
 /// [`answer_while_polling`]: the commit every completion triggers under
@@ -5170,14 +5232,17 @@ async fn answer_while_polling(
     let mut polling = grace.is_zero();
     let grace = tokio::time::sleep(grace);
     tokio::pin!(grace);
+    let stop = shutdown.cancelled();
+    tokio::pin!(stop);
+    let mut stream = RecvStream::new(consumer);
     loop {
         tokio::select! {
             biased;
-            _ = shutdown.cancelled() => return Ok(Answered::Stopped),
+            () = &mut stop => return Ok(Answered::Stopped),
             e = &mut fault => return Err(e),
             result = &mut *answer => return Ok(Answered::Came(result.ok())),
             () = &mut grace, if !polling => polling = true,
-            received = consumer.recv(), if polling => {
+            received = stream.recv(), if polling => {
                 let msg = match received {
                     Ok(msg) => msg,
                     Err(e) if recv_error_is_transient(consumer.transport_gate(), &e) => {
@@ -5442,11 +5507,12 @@ async fn poll_paused(consumer: &KafkaStreamConsumer, queue: &str, period: Durati
     apply_pause_intent(consumer, true)?;
     let polled = tokio::time::sleep(period);
     tokio::pin!(polled);
+    let mut stream = RecvStream::new(consumer);
     loop {
         tokio::select! {
             biased;
             () = &mut polled => return Ok(()),
-            received = consumer.recv() => match received {
+            received = stream.recv() => match received {
                 Ok(msg) => {
                     put_back(consumer, queue, msg.partition(), msg.offset())?;
                     apply_pause_intent(consumer, true)?;
@@ -7295,18 +7361,23 @@ async fn acquire_permit_while_polling(
     let mut polling = false;
     let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let commit_wake = tokio::time::sleep_until(Instant::now());
+    tokio::pin!(commit_wake);
+    let mut stream = RecvStream::new(consumer);
     loop {
         if let Some(commits) = commits.as_mut() {
             let assigned = commits.settle(consumer, queue)?;
             reconcile_pause_after_assign(consumer, *paused, assigned)?;
         }
         let now = Instant::now();
-        let commit_deadline = commits.as_ref().map_or(now, |c| c.slot.gate.deadline(now));
         let in_flight = commits.as_ref().is_some_and(|c| c.slot.in_flight.is_some());
         let committable = !in_flight
             && commits
                 .as_ref()
                 .is_some_and(|c| c.tracker.has_committable());
+        if let Some(c) = commits.as_ref().filter(|_| committable) {
+            rearm(commit_wake.as_mut(), c.slot.gate.deadline(now));
+        }
         tokio::select! {
             biased;
             // Shutdown and the fault are read before the permit. An in-place
@@ -7325,7 +7396,7 @@ async fn acquire_permit_while_polling(
             }
             () = &mut grace, if !polling => polling = true,
             _ = housekeeping.tick(), if commits.is_some() => {}
-            _ = tokio::time::sleep_until(commit_deadline), if committable => {
+            () = &mut commit_wake, if committable => {
                 #[cfg(feature = "test-support")]
                 commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
             }
@@ -7336,7 +7407,7 @@ async fn acquire_permit_while_polling(
                     commits.slot.settle(answer, commits.tracker, queue);
                 }
             }
-            received = consumer.recv(), if polling => {
+            received = stream.recv(), if polling => {
                 let msg = match received {
                     Ok(msg) => msg,
                     Err(e) if recv_error_is_transient(gate, &e) => {
@@ -7376,6 +7447,15 @@ async fn acquire_permit_while_polling(
             }
         }
     }
+}
+
+/// One permit of `semaphore`, its `Arc` cloned only once the arm that waits
+/// for it is polled: a `select!` builds the future of every arm on every
+/// pass, a disabled arm's included.
+async fn one_permit(
+    semaphore: &Arc<Semaphore>,
+) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+    Arc::clone(semaphore).acquire_owned().await
 }
 
 /// Resolves once `shutdown` fires, and never when there is none to read.
@@ -7650,16 +7730,26 @@ async fn fifo_wait(
     tokio::pin!(elapsed);
     let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let stop = shutdown.cancelled();
+    tokio::pin!(stop);
+    let revoke = revoked.cancelled();
+    tokio::pin!(revoke);
+    let commit_wake = tokio::time::sleep_until(Instant::now());
+    tokio::pin!(commit_wake);
+    let mut stream = RecvStream::new(consumer);
     loop {
         state.commit_due(consumer, queue)?;
         let now = Instant::now();
+        let committable = state.commits.in_flight.is_none() && state.tracker.has_committable();
+        if committable {
+            rearm(commit_wake.as_mut(), state.commits.gate.deadline(now));
+        }
         tokio::select! {
             biased;
-            _ = shutdown.cancelled() => return Ok(FifoWait::Stop),
-            _ = revoked.cancelled() => return Ok(FifoWait::Revoked),
+            () = &mut stop => return Ok(FifoWait::Stop),
+            () = &mut revoke => return Ok(FifoWait::Revoked),
             _ = housekeeping.tick() => {}
-            _ = tokio::time::sleep_until(state.commits.gate.deadline(now)),
-                if state.commits.in_flight.is_none() && state.tracker.has_committable() => {
+            () = &mut commit_wake, if committable => {
                 #[cfg(feature = "test-support")]
                 commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
             }
@@ -7667,7 +7757,7 @@ async fn fifo_wait(
                 if state.commits.in_flight.is_some() => {
                 state.commits.settle(answer, &mut state.tracker, queue);
             }
-            received = consumer.recv() => {
+            received = stream.recv() => {
                 let msg = match received {
                     Ok(msg) => msg,
                     Err(e) if recv_error_is_transient(consumer.transport_gate(), &e) => {
@@ -7983,22 +8073,30 @@ async fn receive_serially<L: SerialLoop>(
     // they re-offer are committed without a record to wait for.
     let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let stop = connection.shutdown.cancelled();
+    tokio::pin!(stop);
+    let commit_wake = tokio::time::sleep_until(Instant::now());
+    tokio::pin!(commit_wake);
+    let mut stream = RecvStream::new(consumer);
     loop {
         state.settle(consumer, queue)?;
         let now = Instant::now();
+        let committable = state.commits.in_flight.is_none() && state.tracker.has_committable();
+        if committable {
+            rearm(commit_wake.as_mut(), state.commits.gate.deadline(now));
+        }
         tokio::select! {
             // The stop first: a stop that landed during the last record's
             // wait is read before the next record is taken.
             biased;
-            _ = connection.shutdown.cancelled() => {
+            () = &mut stop => {
                 tracing::info!(queue, dlq = connection.dlq, "shutdown signal received, stopping {label}");
                 return Ok(None);
             }
             _ = housekeeping.tick() => {}
             // Wakes the loop when the commit gate's window expires with a
             // position to commit, so it lands on a topic gone idle.
-            _ = tokio::time::sleep_until(state.commits.gate.deadline(now)),
-                if state.commits.in_flight.is_none() && state.tracker.has_committable() => {
+            () = &mut commit_wake, if committable => {
                 #[cfg(feature = "test-support")]
                 commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
             }
@@ -8006,7 +8104,7 @@ async fn receive_serially<L: SerialLoop>(
                 if state.commits.in_flight.is_some() => {
                 state.commits.settle(answer, &mut state.tracker, queue);
             }
-            received = consumer.recv() => {
+            received = stream.recv() => {
                 let msg = match received {
                     Ok(msg) => msg,
                     Err(e) if recv_error_is_transient(consumer.transport_gate(), &e) => {
@@ -8328,10 +8426,12 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
     ) -> Result<FifoPass> {
         let queue = self.queue.as_str();
         let mut backoff = Backoff::new(DEAD_LETTER_RETRY_INITIAL, DEAD_LETTER_RETRY_MAX);
+        let stop = self.shutdown.cancelled();
+        tokio::pin!(stop);
         loop {
             let published = tokio::select! {
                 biased;
-                _ = self.shutdown.cancelled() => {
+                () = &mut stop => {
                     pending.survived();
                     return Ok(FifoPass::Stop);
                 }
@@ -9071,6 +9171,11 @@ impl KafkaConsumer {
                     threshold: fence_timeout,
                     group_id: &group_id,
                 };
+                let stop = shutdown.cancelled();
+                tokio::pin!(stop);
+                let commit_wake = tokio::time::sleep_until(Instant::now());
+                tokio::pin!(commit_wake);
+                let mut stream = RecvStream::new(consumer);
                 loop {
                     // Completed offsets first, then the commit step, whose
                     // rebalance events drop a revoked partition's tracker,
@@ -9249,6 +9354,10 @@ impl KafkaConsumer {
                         );
                     }
 
+                    let committable = commits.in_flight.is_none() && tracker.has_committable();
+                    if committable {
+                        rearm(commit_wake.as_mut(), commits.gate.deadline(now));
+                    }
                     // `biased`, shutdown first: a tie between ready arms is
                     // broken in the order written rather than at random.
                     // Under `PerRecord` a shutdown that cuts a confirmation
@@ -9265,7 +9374,7 @@ impl KafkaConsumer {
                         // the stop is seen. A record `recv()` has ready is
                         // read last for the same reason.
                         biased;
-                        _ = shutdown.cancelled() => {
+                        () = &mut stop => {
                             tracing::info!(queue, "shutdown signal received, draining in-flight tasks");
                             // A spare permit would otherwise deadlock the drain below.
                             drop(spare_permit.take());
@@ -9326,16 +9435,10 @@ impl KafkaConsumer {
                         // flight, whose answer arm below wakes the loop
                         // instead; no busy-spin when past due, because the
                         // top-of-loop drain then commits and `mark` pushes the
-                        // deadline forward. Cost note:
-                        // select! evaluates this expression (a `Sleep`
-                        // construct-and-drop plus the `has_committable` scan)
-                        // on every pass, even when the precondition disables
-                        // the arm; the timer only registers when the arm is
-                        // enabled, and the whole thing displaced a per-message
-                        // commit FFI call — the e2e cell's throughput went UP
-                        // ~26k -> ~30.5k msg/s with the gate in place.
-                        _ = tokio::time::sleep_until(commits.gate.deadline(now)),
-                            if commits.in_flight.is_none() && tracker.has_committable() => {
+                        // deadline forward. The `Sleep` is kept across passes
+                        // and reset only when that deadline moves, see
+                        // `rearm`.
+                        () = &mut commit_wake, if committable => {
                             #[cfg(feature = "test-support")]
                             commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
                         }
@@ -9363,7 +9466,7 @@ impl KafkaConsumer {
                         // ends it, and is kept for the next record. Not under
                         // `PerRecord`, whose pause ends only once a commit is
                         // accepted, see the resume at the top of the pass.
-                        permit = semaphore.clone().acquire_owned(), if paused && !per_record => {
+                        permit = one_permit(semaphore), if paused && !per_record => {
                             let permit = permit.map_err(|_| {
                                 ShoveError::Connection("semaphore closed".to_string())
                             })?;
@@ -9381,14 +9484,14 @@ impl KafkaConsumer {
                         // follows drains that completion and commits it; the
                         // resume at the top of a pass needs the permit in
                         // hand and nothing left to commit.
-                        permit = semaphore.clone().acquire_owned(),
+                        permit = one_permit(semaphore),
                             if per_record && spare_permit.is_none() => {
                             let permit = permit.map_err(|_| {
                                 ShoveError::Connection("semaphore closed".to_string())
                             })?;
                             spare_permit = Some(permit);
                         }
-                        msg_result = consumer.recv() => {
+                        msg_result = stream.recv() => {
                             let msg = match msg_result {
                                 Ok(msg) => msg,
                                 Err(e) if recv_error_is_transient(consumer.transport_gate(), &e) => {
@@ -10225,6 +10328,11 @@ impl KafkaConsumer {
                     // still noticed promptly.
                     let mut housekeeping = tokio::time::interval(housekeeping_interval);
                     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    let stop = shutdown.cancelled();
+                    tokio::pin!(stop);
+                    let commit_wake = tokio::time::sleep_until(Instant::now());
+                    tokio::pin!(commit_wake);
+                    let mut stream = RecvStream::new(&consumer);
 
                     loop {
                         // Catches a rebalance that lands while the topic is idle —
@@ -10246,12 +10354,14 @@ impl KafkaConsumer {
                             }
                         };
                         let now = Instant::now();
-                        let commit_deadline = state.commits.gate.deadline(now);
                         let in_flight = state.commits.in_flight.is_some();
                         let committable = !in_flight && state.tracker.has_committable();
+                        if committable {
+                            rearm(commit_wake.as_mut(), state.commits.gate.deadline(now));
+                        }
 
                         tokio::select! {
-                            _ = shutdown.cancelled() => {
+                            () = &mut stop => {
                                 if !buffer.is_empty() {
                                     flush_batch(
                                         &flush_ctx,
@@ -10273,7 +10383,7 @@ impl KafkaConsumer {
                             // Wakes the loop when the commit gate's window
                             // expires with a position to commit, so it lands on
                             // a topic gone idle.
-                            _ = tokio::time::sleep_until(commit_deadline), if committable => {
+                            () = &mut commit_wake, if committable => {
                                 #[cfg(feature = "test-support")]
                                 commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
                             }
@@ -10292,7 +10402,7 @@ impl KafkaConsumer {
                                 .await?;
                                 deadline = None;
                             }
-                            msg_result = consumer.recv() => {
+                            msg_result = stream.recv() => {
                                 let msg = match msg_result {
                                     Ok(msg) => msg,
                                     Err(e) if recv_error_is_transient(consumer.transport_gate(), &e) => {
@@ -11131,11 +11241,14 @@ impl KafkaConsumer {
                 let tail_semaphore = semaphore.clone();
                 let tail_processing = processing.clone();
                 let ended: Result<()> = async move {
+                let stop = shutdown.cancelled();
+                tokio::pin!(stop);
+                let mut stream = RecvStream::new(&consumer);
                 loop {
                     let (payload, headers, coordinates) = tokio::select! {
                         biased;
 
-                        _ = shutdown.cancelled() => {
+                        () = &mut stop => {
                             tracing::info!(queue, "shutdown signal received, draining in-flight handlers");
                             // Nothing to commit and nothing to delete: the
                             // subscription exists only in this consumer handle,
@@ -11194,7 +11307,7 @@ impl KafkaConsumer {
                             continue;
                         }
 
-                        msg_result = consumer.recv() => {
+                        msg_result = stream.recv() => {
                             let msg = match msg_result {
                                 Ok(msg) => msg,
                                 Err(e) if is_ignorable_groupless_error(&e) => {
@@ -11379,7 +11492,7 @@ impl KafkaConsumer {
                     permit_wait_probe::BROADCAST_ENTERED.fetch_add(1, Ordering::SeqCst);
                     let permit = tokio::select! {
                         biased;
-                        _ = shutdown.cancelled() => {
+                        () = &mut stop => {
                             tracing::debug!(
                                 queue,
                                 partition = coordinates.partition,
@@ -11442,6 +11555,8 @@ impl KafkaConsumer {
                     // is the order a single delivery loop promises.
                     tokio::spawn(async move {
                         task_processing.store(true, Ordering::Release);
+                        let stop = task_shutdown.cancelled();
+                        tokio::pin!(stop);
 
                         let decode = BatchDecodeCtx {
                             queue: &task_topic,
@@ -11484,7 +11599,7 @@ impl KafkaConsumer {
                                 // redeliver a message the loop is about to stop
                                 // reading. Drop it instead; broadcast is
                                 // best-effort and the process is going away.
-                                _ = task_shutdown.cancelled() => {
+                                () = &mut stop => {
                                     tracing::debug!(
                                         topic = %task_topic,
                                         "shutdown cancelled a deferred broadcast redelivery"
@@ -11523,7 +11638,7 @@ impl KafkaConsumer {
                                         metrics::record_failed(&task_topic, task_group.as_deref(), metrics::FailReason::SchemaUnavailable);
                                         tokio::select! {
                                             _ = tokio::time::sleep(REGISTRY_RETRY_DELAY) => {}
-                                            _ = task_shutdown.cancelled() => break None,
+                                            () = &mut stop => break None,
                                         }
                                     }
                                     #[cfg(feature = "kafka-schema-registry")]
