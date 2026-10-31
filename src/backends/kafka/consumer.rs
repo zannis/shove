@@ -1589,6 +1589,9 @@ pub mod put_back_probe {
     pub static PAUSED_RECEIVE: AtomicUsize = AtomicUsize::new(0);
     /// A record on another partition put back behind a rewound batch span.
     pub static BATCH_REWIND: AtomicUsize = AtomicUsize::new(0);
+    /// A record received while `answer_while_polling` waited for a commit's
+    /// answer.
+    pub static COMMIT_WAIT: AtomicUsize = AtomicUsize::new(0);
 
     pub fn registry_stall() -> usize {
         REGISTRY_STALL.load(Ordering::SeqCst)
@@ -1604,6 +1607,10 @@ pub mod put_back_probe {
 
     pub fn batch_rewind() -> usize {
         BATCH_REWIND.load(Ordering::SeqCst)
+    }
+
+    pub fn commit_wait() -> usize {
+        COMMIT_WAIT.load(Ordering::SeqCst)
     }
 }
 
@@ -4560,8 +4567,9 @@ async fn commit_answer(in_flight: Option<&mut PendingCommit>) -> Option<KafkaRes
 /// and wait for the coordinator's answer while the loop keeps polling, see
 /// [`answer_while_polling`]: the commit every completion triggers under
 /// `CommitPolicy::PerRecord`, and the commit of a batch whose span carries
-/// dead letters or discards, see [`commit_terminal_span`]. A spawn failure
-/// is a rejection: nothing commits, and the position is re-offered.
+/// dead letters or discards, see [`commit_terminal_span`]. `grace` is how
+/// long the wait goes before it polls. A spawn failure is a rejection:
+/// nothing commits, and the position is re-offered.
 async fn commit_confirmed(
     consumer: &Arc<KafkaStreamConsumer>,
     tpl: TopicPartitionList,
@@ -4569,6 +4577,7 @@ async fn commit_confirmed(
     fault_rx: Option<&mut mpsc::Receiver<ShoveError>>,
     queue: &str,
     paused: &mut bool,
+    grace: Duration,
 ) -> Result<CommitAnswer> {
     #[cfg(feature = "test-support")]
     per_record_probe::COMMIT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
@@ -4586,7 +4595,16 @@ async fn commit_confirmed(
         }
     };
     Ok(
-        match answer_while_polling(consumer, &mut answer, shutdown, fault_rx, queue, paused).await?
+        match answer_while_polling(
+            consumer,
+            &mut answer,
+            shutdown,
+            fault_rx,
+            queue,
+            paused,
+            grace,
+        )
+        .await?
         {
             Answered::Came(Some(Ok(()))) => CommitAnswer::Confirmed,
             Answered::Came(Some(Err(e))) => CommitAnswer::Rejected(e),
@@ -4613,16 +4631,19 @@ enum Answered {
 /// Wait for `answer`, the answer of a commit on its thread (see
 /// [`spawn_commit`]), while the loop keeps polling.
 ///
-/// The wait is a select that keeps calling `recv()`, as the permit wait
-/// does, so it serves the rebalance callbacks and the poll budget however
-/// long the coordinator takes. Under `CommitPolicy::PerRecord` the
-/// assignment is paused while a commit is unconfirmed (see the receive
-/// loop), so `recv()` yields nothing of it; a record it does yield, there
-/// from a partition assigned during the pause and on the batch loop from
-/// any partition, is put back with the assignment paused, and `paused`
-/// says so. The wait ends on the answer, on shutdown, or on a fault a
-/// handler task reports over `fault_rx`. Shutdown is read first, so a stop
-/// leaves the receiver unread for the stop to wait on.
+/// The wait is a select that keeps calling `recv()` once `grace` has run
+/// out, as the permit wait does, so it serves the rebalance callbacks and
+/// the poll budget however long the coordinator takes. Under
+/// `CommitPolicy::PerRecord` the assignment is paused while a commit is
+/// unconfirmed (see the receive loop), so `recv()` yields nothing of it, and
+/// the wait polls at once. On the batch loop nothing is paused, so a
+/// `recv()` would be handed a fetched record straight away, and the wait
+/// gives the commit [`PERMIT_WAIT_GRACE`] first: a commit answered inside
+/// it, the usual case, puts nothing back. A record `recv()` does yield is
+/// put back with the assignment paused, and `paused` says so. The wait ends
+/// on the answer, on shutdown, or on a fault a handler task reports over
+/// `fault_rx`. Shutdown is read first, so a stop leaves the receiver unread
+/// for the stop to wait on.
 async fn answer_while_polling(
     consumer: &Arc<KafkaStreamConsumer>,
     answer: &mut oneshot::Receiver<KafkaResult<()>>,
@@ -4630,16 +4651,21 @@ async fn answer_while_polling(
     fault_rx: Option<&mut mpsc::Receiver<ShoveError>>,
     queue: &str,
     paused: &mut bool,
+    grace: Duration,
 ) -> Result<Answered> {
     let fault = handler_fault(fault_rx);
     tokio::pin!(fault);
+    let mut polling = grace.is_zero();
+    let grace = tokio::time::sleep(grace);
+    tokio::pin!(grace);
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return Ok(Answered::Stopped),
             e = &mut fault => return Err(e),
             result = &mut *answer => return Ok(Answered::Came(result.ok())),
-            received = consumer.recv() => {
+            () = &mut grace, if !polling => polling = true,
+            received = consumer.recv(), if polling => {
                 let msg = match received {
                     Ok(msg) => msg,
                     Err(e) if recv_error_is_transient(consumer.transport_gate(), &e) => {
@@ -4654,6 +4680,8 @@ async fn answer_while_polling(
                         ));
                     }
                 };
+                #[cfg(feature = "test-support")]
+                put_back_probe::COMMIT_WAIT.fetch_add(1, Ordering::SeqCst);
                 put_back(consumer, queue, msg.partition(), msg.offset())?;
                 consumer
                     .pause_assignment()
@@ -5140,8 +5168,8 @@ impl BatchState {
 /// accepted the commit.
 ///
 /// One commit is in flight at a time, so the slot's own commit is answered
-/// first. Both waits poll, see [`answer_while_polling`], and both end on a
-/// stop, which then waits for the commit in flight for its share of the
+/// first. Both waits poll once [`PERMIT_WAIT_GRACE`] has run out, see
+/// [`answer_while_polling`], and both end on a stop, which then waits for the commit in flight for its share of the
 /// shutdown deadline before its final commit, see
 /// [`stop_with_final_commit`]: a commit the stop cut short goes to the slot
 /// as that commit, and one the stop kept from being made at all leaves its
@@ -5168,6 +5196,7 @@ async fn commit_terminal_span(
             None,
             queue,
             &mut state.paused,
+            PERMIT_WAIT_GRACE,
         )
         .await?
         {
@@ -5204,6 +5233,7 @@ async fn commit_terminal_span(
         None,
         queue,
         &mut state.paused,
+        PERMIT_WAIT_GRACE,
     )
     .await?
     {
@@ -6610,7 +6640,9 @@ impl IntervalCommits<'_> {
 }
 
 /// How long a record waits for a prefetch permit before
-/// [`acquire_permit_while_polling`] starts calling `recv()`.
+/// [`acquire_permit_while_polling`] starts calling `recv()`, and how long a
+/// batch flush waits for a commit's answer before it does, see
+/// [`answer_while_polling`].
 ///
 /// A polled `recv()` hands over the next fetched record at once, and putting
 /// that record back costs a seek, a pause and a refetch that librdkafka
@@ -8080,6 +8112,7 @@ impl KafkaConsumer {
                             Some(&mut fault_rx),
                             queue,
                             &mut paused,
+                            Duration::ZERO,
                         )
                         .await?
                         {
