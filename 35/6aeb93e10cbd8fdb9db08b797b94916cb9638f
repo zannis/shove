@@ -1,0 +1,19 @@
+tests/kafka_batch_mock.rs
+  s_1001dc3147e1e5::t_12483617ed0c4c 7,10-15,69,299,308-320,324,330-331,423-442,447,1144-1295
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "356aeb93e10cbd8fdb9db08b797b94916cb9638f",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
