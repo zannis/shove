@@ -2525,12 +2525,6 @@ enum Guarded<T> {
 /// optional timeout, and records no metric. A panic inside `fut` is caught
 /// via `AssertUnwindSafe(...).catch_unwind()`, and a call that outlasts
 /// `timeout` is dropped at its next await point.
-///
-/// perf-K-7: panic isolation previously spawned an inner `tokio::spawn` to
-/// catch panics via JoinError. The spawn allocated a task struct + scheduler
-/// enqueue per message — combined with the wrapper spawn (now removed) and
-/// outer outcome spawn, that was 3 spawns per message. catch_unwind achieves
-/// the same panic-isolation outcome without the task alloc.
 async fn guarded<F: Future>(fut: F, timeout: Option<Duration>) -> Guarded<F::Output> {
     use futures_util::FutureExt;
     use std::panic::AssertUnwindSafe;
@@ -8138,7 +8132,6 @@ impl<T: Topic, H: MessageHandler<T>> DlqDrain<T, H> {
             epoch: assignment.epoch,
             #[cfg(feature = "kafka-schema-registry")]
             revoked: assignment.revoked,
-            // perf-K-5: decoded from the message itself, with no copy.
             payload: msg.payload().unwrap_or_default(),
             headers: extract_string_headers(msg),
             coordinates: RecordCoordinates::of(msg),
@@ -8150,9 +8143,6 @@ impl<T: Topic, H: MessageHandler<T>> DlqDrain<T, H> {
         // `max_message_size` needs.
         metrics::record_message_size(&self.topic, self.group.as_deref(), record.payload.len());
 
-        // sec-K-7: honor options.max_message_size (same as the main consumer)
-        // instead of the DEFAULT_MAX_MESSAGE_SIZE constant. None means no
-        // limit.
         if let Some(max) = self.max_message_size
             && record.payload.len() > max
         {
