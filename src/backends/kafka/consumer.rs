@@ -29,7 +29,7 @@ use rdkafka::{ClientConfig, ClientContext, Offset, Statistics, TopicPartitionLis
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
+use uuid::{Builder, Uuid};
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backend::batch_consumer::settling::{
@@ -1365,8 +1365,10 @@ fn copy_message_id(base: &str, hop: Hop) -> String {
     match hop {
         Hop::Retry(attempt) => format!("{base}-r{attempt}"),
         Hop::Defer => {
+            // rand's thread RNG calls the OS only to reseed, once per 64 KiB of output.
+            let id = Builder::from_random_bytes(rand::random()).into_uuid();
             let mut buf = Uuid::encode_buffer();
-            let uuid = Uuid::new_v4().hyphenated().encode_lower(&mut buf);
+            let uuid = id.hyphenated().encode_lower(&mut buf);
             format!("{base}-d{uuid}")
         }
         Hop::DeadLetter(death_count) => format!("{base}-dlq{death_count}"),
@@ -17214,6 +17216,7 @@ mod reconnect_tests {
 #[cfg(test)]
 mod message_id_tests {
     use super::*;
+    use uuid::{Variant, Version};
 
     fn record(headers: &[(&str, &str)]) -> RecordHeaders {
         RecordHeaders {
@@ -17249,11 +17252,13 @@ mod message_id_tests {
         assert_eq!(copy_message_id("a-dlq", Hop::DeadLetter(1)), "a-dlq-dlq1");
         assert_eq!(copy_message_id("a", Hop::DeadLetter(2)), "a-dlq2");
         let deferred = copy_message_id("a", Hop::Defer);
+        let suffix = deferred
+            .strip_prefix("a-d")
+            .and_then(|suffix| Uuid::try_parse(suffix).ok());
         assert!(
-            deferred
-                .strip_prefix("a-d")
-                .is_some_and(|suffix| Uuid::try_parse(suffix).is_ok()),
-            "a Defer copy's id is the base, `-d` and a UUID"
+            suffix.is_some_and(|uuid| uuid.get_version() == Some(Version::Random)
+                && uuid.get_variant() == Variant::RFC4122),
+            "a Defer copy's id is the base, `-d` and a random UUID: {deferred}"
         );
         assert_ne!(deferred, copy_message_id("a", Hop::Defer));
     }
