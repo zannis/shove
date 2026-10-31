@@ -8989,16 +8989,22 @@ impl KafkaConsumer {
     ///
     /// A rejected batch's dead letters are published concurrently, at most 16
     /// at a time, and the consumer keeps polling while they run, so a slow
-    /// DLQ does not have it evicted at `max.poll.interval.ms`. A stop that
-    /// lands meanwhile waits for them. A dead letter that fails and may land
-    /// later retires nothing: nothing is committed past its record, the
-    /// record's partition is sought back to it, and the batch is handed over
-    /// again from there after the same escalating delay, with no discard
-    /// counted. A dead letter that can never be published, refused as too
-    /// large or as invalid, is discarded as lost, counted and logged. One that
-    /// fails with an error no retry gets past, such as a producer that cannot
-    /// be built, commits nothing of the batch and ends the consumer with that
-    /// error.
+    /// DLQ does not have it evicted at `max.poll.interval.ms`. Running
+    /// concurrently, a partition's dead letters do not reach the DLQ in
+    /// offset order. A stop that lands meanwhile waits for them. A dead
+    /// letter that fails and may land later retires nothing: nothing is
+    /// committed past its record, the record's partition is sought back to
+    /// it, and the batch is handed over again from there after the same
+    /// escalating delay, with no discard counted. A dead letter that can
+    /// never be published, refused as too large or as invalid, is discarded
+    /// as lost, counted and logged. One that fails with an error no retry
+    /// gets past, such as a producer that cannot be built, commits nothing of
+    /// the batch and ends the consumer with that error.
+    ///
+    /// Dead letters are at-least-once. A rebalance while they run, a dead
+    /// letter that fails, and a refused commit whose re-offer has not landed
+    /// when the partition moves can each hand the batch over again, and its
+    /// letters that had landed are then published again.
     ///
     /// A synchronous commit the coordinator rejects does not end the
     /// consumer, and the batch is not handed over again: once its dead
@@ -9070,7 +9076,9 @@ impl KafkaConsumer {
     ///   the whole batch uncommitted and rewinds the partitions this member
     ///   keeps, so every message in it is redelivered — to this consumer for
     ///   retained partitions, to the new owner for revoked ones — once each,
-    ///   in offset order. Every flush reads the rebalance first, the one a
+    ///   in offset order. A batch abandoned while its dead letters were
+    ///   landing was handed to the handler already, so its messages are
+    ///   handled twice. Every flush reads the rebalance first, the one a
     ///   batch's age or a stop triggers included. Expect duplicates across a
     ///   rebalance when an acked batch's commit had not landed yet, never
     ///   loss. If a partition this member still holds cannot be sought back,
