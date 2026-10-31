@@ -9196,12 +9196,13 @@ impl KafkaConsumer {
     /// [`BatchConsumerOptions::without_handler_timeout`] opts out of the
     /// deadline entirely, at the cost of making a hung flush unrecoverable.
     ///
-    /// Nothing polls while the handler runs, so a flush must finish inside
-    /// `max.poll.interval.ms`, five minutes. `handler_timeout` is the only
-    /// bound on the handler call: a timeout above that interval, or none at
-    /// all through `without_handler_timeout`, lets a slow flush outlast it,
-    /// and the member is then evicted from its group, its partitions handed
-    /// to another member, which is handed the batch again.
+    /// Nothing polls while the handler runs, so the handler call must finish
+    /// inside `max.poll.interval.ms`, five minutes; the flush's dead-letter
+    /// and commit waits poll, so they are not held to it. `handler_timeout`
+    /// is the only bound on the handler call: a timeout above that interval,
+    /// or none at all through `without_handler_timeout`, lets a slow handler
+    /// call outlast it, and the member is then evicted from its group, its
+    /// partitions handed to another member, which is handed the batch again.
     ///
     /// # Metrics
     ///
