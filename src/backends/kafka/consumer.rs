@@ -4610,8 +4610,8 @@ const SEEK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Raised by a consume loop whose own stop failed after the stop had fired:
 /// the standard consumer's wait for its handlers at a stop polls, and a
-/// receive error that ends a consumer, or a put-back or pause librdkafka
-/// refuses, ends that wait with no final commit. [`run_with_reconnect`]
+/// receive error that wait does not ride out, or a put-back or pause
+/// librdkafka refuses, ends it with no final commit. [`run_with_reconnect`]
 /// then returns the error that ended the attempt instead of reading it as
 /// the stop.
 #[derive(Default)]
@@ -4624,6 +4624,22 @@ impl StopFailed {
 
     fn raised(&self) -> bool {
         self.0.load(Ordering::Acquire)
+    }
+
+    /// Hands on the result of the stop's wait for its handlers. A wait that
+    /// failed is logged at error level and raises the flag, so the run ends
+    /// with its error.
+    fn raise_if_failed<T>(&self, waited: Result<T>, queue: &str) -> Result<T> {
+        waited.inspect_err(|e| {
+            tracing::error!(
+                queue,
+                error = %e,
+                "the stop's wait for its handlers failed; closing without the final commit, \
+                 so every record completed since the last accepted commit is redelivered, \
+                 and the run ends with this error"
+            );
+            self.raise();
+        })
     }
 }
 
@@ -7361,7 +7377,7 @@ impl KafkaConsumer {
                             // A spare permit would otherwise deadlock the drain below.
                             drop(spare_permit.take());
                             // Polls throughout, so a long handler costs no eviction.
-                            let drained = match acquire_permit_while_polling(
+                            let waited = acquire_permit_while_polling(
                                 &semaphore,
                                 u32::from(prefetch_count),
                                 consumer,
@@ -7371,23 +7387,8 @@ impl KafkaConsumer {
                                 &mut paused,
                                 None,
                             )
-                            .await
-                            {
-                                Ok(drained) => drained,
-                                Err(e) => {
-                                    tracing::error!(
-                                        queue,
-                                        error = %e,
-                                        "the stop's wait for its handlers failed; closing without \
-                                         the final commit, so every record completed since the last \
-                                         accepted commit is redelivered, and the run ends with this \
-                                         error"
-                                    );
-                                    stop_failed.raise();
-                                    return Err(e);
-                                }
-                            };
-                            drop(drained);
+                            .await;
+                            drop(stop_failed.raise_if_failed(waited, queue)?);
                             // Every task has exited. A task that ended on a
                             // cancelled wait may not have cleared the busy
                             // flag itself: a permit it releases goes to the
@@ -14478,6 +14479,27 @@ mod reconnect_tests {
         .await;
 
         assert!(result.is_ok(), "expected a clean end, got {result:?}");
+    }
+
+    /// The stop's wait for its handlers that fails raises the flag and hands
+    /// its error on, so the run ends with it; one that ends clean raises
+    /// nothing.
+    #[test]
+    fn a_failed_wait_for_the_handlers_raises_the_flag() {
+        let failed = StopFailed::default();
+        let result = failed.raise_if_failed::<()>(
+            Err(ShoveError::Connection("put-back seek failed".to_string())),
+            "test",
+        );
+        assert!(
+            matches!(&result, Err(ShoveError::Connection(msg)) if msg == "put-back seek failed"),
+            "the wait's error is handed on: {result:?}"
+        );
+        assert!(failed.raised(), "a failed wait raises the flag");
+
+        let clean = StopFailed::default();
+        assert!(clean.raise_if_failed(Ok(()), "test").is_ok());
+        assert!(!clean.raised(), "a clean wait raises nothing");
     }
 }
 
