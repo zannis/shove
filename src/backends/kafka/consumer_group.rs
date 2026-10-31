@@ -139,10 +139,9 @@ impl KafkaAutoOffsetReset {
 /// Set with `with_commit_policy` on [`KafkaConsumerGroupConfig`] or on
 /// `ConsumerOptions::<Kafka>`; `with_commit_interval(d)` on either is
 /// shorthand for `Interval(d)`. Unset keeps `Interval` at its 500 ms
-/// default. Standard consumers only: a FIFO consumer commits on the fixed
-/// 500 ms default, the DLQ drain commits each message as it settles, and a
-/// broadcast subscription commits nothing, so each refuses a policy at its
-/// entry point.
+/// default. Standard consumers only: a FIFO consumer and the DLQ drain
+/// commit on the fixed 500 ms default, and a broadcast subscription commits
+/// nothing, so each refuses a policy at its entry point.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitPolicy {

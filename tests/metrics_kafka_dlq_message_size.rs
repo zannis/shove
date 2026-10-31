@@ -8,7 +8,7 @@
 //!
 //! `record_message_size` is placed on each backend's main consume path. The
 //! dedicated DLQ-drain loops are a second delivery path that call site does
-//! not cover: `run_dlq_with_inner` in `src/backends/kafka/consumer.rs` reads
+//! not cover: `DlqDrain::record` in `src/backends/kafka/consumer.rs` reads
 //! `msg.payload()` and applies its own `options.max_message_size` gate without
 //! touching the main loop, so it applied the size limit while never sampling
 //! the size. The same held for the NATS, RabbitMQ and in-memory DLQ loops;
@@ -19,7 +19,7 @@
 //! test rather than a code comment:
 //!
 //! 1. **A sample exists at all** for a message that only ever arrived through
-//!    the DLQ drain. Deleting the call in `run_dlq_with_inner` reddens this.
+//!    the DLQ drain. Deleting the call in `DlqDrain::record` reddens this.
 //! 2. **Its value is the exact encoded payload length** — computed through the
 //!    topic's own codec rather than hard-coded, since the histogram is only
 //!    useful for sizing `max_message_size` if it reports the bytes that limit

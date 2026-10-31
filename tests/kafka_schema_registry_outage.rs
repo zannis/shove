@@ -2291,8 +2291,8 @@ async fn shutdown_during_a_dlq_registry_lookup_returns_promptly() {
         "nothing reached handle_dead"
     );
     assert_eq!(
-        committed_offset(&tb.brokers, GROUP, DLQ, 0),
-        None,
+        lag(&client, DLQ, GROUP).await,
+        1,
         "the dead message whose schema never resolved stays uncommitted"
     );
 }

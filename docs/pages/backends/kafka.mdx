@@ -305,7 +305,7 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
   A value written to the public `kafka_commit_interval` field past the setter is refused there with `ShoveError::Topology`, never with a panic.
   A longer interval sends fewer OffsetCommit requests and widens the replay window after a crash or rebalance by the same amount.
   Standard groups only: a FIFO consumer commits on the fixed 500 ms default and never reads the setting, so `register_fifo` refuses a config that sets an interval.
-  The DLQ drain commits each dead letter as it settles and refuses the setting on `ConsumerOptions::<Kafka>` for the same reason.
+  The DLQ drain commits on the same fixed 500 ms default and refuses the setting on `ConsumerOptions::<Kafka>` for the same reason, see [Draining the DLQ](#draining-the-dlq).
   See [Offset commit semantics](#offset-commit-semantics).
   The same setting is available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths.
   It is shorthand for `with_commit_policy(CommitPolicy::Interval(..))`, below.
@@ -369,6 +369,39 @@ On every assign it applies, under either commit policy and on every path that jo
 That intent is paused while the consumer holds a pause, and resumed otherwise.
 It does the same when a schema registry wait ends.
 A returned partition therefore never stays paused behind a wait that is over, and a partition handed out while the consumer holds a pause is paused with the rest.
+
+### Draining the DLQ
+
+`KafkaConsumer::run_dlq` and `run_dlq_with_options` hand every dead letter to `MessageHandler::handle_dead`.
+The drain reads `with_shutdown`, `with_handler_timeout` or `without_handler_timeout`, `with_max_message_size`, `with_group_id`, `with_consumer_group` and the schema registry settings.
+It reads no commit or offset-reset setting, so it refuses `with_commit_interval`, `with_commit_policy` and `with_auto_offset_reset` with a `ShoveError::Topology`.
+`handle_dead` returns no outcome for a timeout to resolve to, so the drain refuses `with_handler_timeout_outcome` the same way.
+
+The drain stops when the token of its options fires or when the client's token does.
+Either stop takes effect once the dead letter in hand is finished with.
+Closing the client therefore ends a drain whose own token nothing cancels.
+A stop first waits for the `handle_dead` call in hand, up to the handler timeout, or for as long as the call runs when there is none.
+It then waits up to 20 s for the final commit and the close, so with the defaults a stop takes at most 50 s.
+
+`handle_dead` runs on the drain's own task, one dead letter at a time, under panic isolation and the handler timeout.
+The timeout is `with_handler_timeout`, 30 s by default.
+`without_handler_timeout` leaves the call unbounded, so a call that never returns holds the drain for as long as it runs.
+Nothing polls while `handle_dead` runs, so the call must finish inside `max.poll.interval.ms`, five minutes.
+Keep `with_handler_timeout` below that.
+A call that panics or outlasts the timeout is logged at warn level, and the drain goes on to the next dead letter.
+The dead letter is committed whatever the call came to, as it is after a call that returns.
+A `handle_dead` call moves no consumed, in-flight, duration or failed metric under the source topic.
+The drain records `shove_message_size_bytes` for each dead letter, and each registry wait counts `shove_messages_failed_total{reason="schema_unavailable"}`.
+
+The drain commits as the FIFO consumer does.
+Completions are committed at most once per 500 ms, one commit at a time, synchronously on a thread of its own while the drain goes on.
+A dead letter handled after a quiet spell is committed at once, and a burst of dead letters costs one commit per interval.
+A commit the coordinator rejects is re-offered, and a drain whose commits keep being rejected with no rebalance resolving them is treated as fenced and reconnects.
+A stop makes one synchronous final commit of every position and closes the consumer on the same thread, waiting at most 20 s for both.
+A final commit the broker does not confirm ends the drain with `ShoveError::Commit`.
+A drain that ends a connection on an error closes its consumer on a thread of its own and waits for the close.
+It then reconnects, unless the error is one no reconnect gets past, such as a schema registry `Topology` fault, which ends the drain with that error.
+See [Offset commit semantics](#offset-commit-semantics).
 
 ### Fan-out — a second reader on the same topic
 
@@ -713,7 +746,7 @@ The deadline is chosen against the 30 s termination grace Kubernetes gives a Pod
 The thread finishes on its own and never holds the runtime or the process, so a frozen coordinator cannot turn a deploy into a `SIGKILL`.
 
 A member that ends on an error closes its consumer on a thread of its own too, with nothing committed, before it reconnects or returns the error.
-That holds for the standard, the sequenced and the batch consumer, a fenced consumer and a failed subscribe included.
+That holds for the standard, the sequenced and the batch consumer and the DLQ drain, a fenced consumer and a failed subscribe included.
 A receive error the consumer rides out ends nothing, see [Broker outages](#broker-outages).
 It waits for the close for at most the same 20 s, and returns without waiting when no thread can be spawned to run it.
 The close sends the member's LeaveGroup and waits for the coordinator's answer, so the member has left its group when the error reaches the caller.
@@ -1025,6 +1058,8 @@ The Confluent wire format (magic byte + schema id) and REST API endpoints used b
 If you enable registry decoding on the consumer that drains the DLQ (`handle_dead` path), any dead message that cannot be resolved or validated against the registry cannot be delivered to `handle_dead`. Such messages are acked-and-dropped — matching the existing behavior for undecodable dead messages. Operators concerned about this should omit the registry on the DLQ consumer, or set `SchemaEnforcement::Permissive` so subject mismatches do not block delivery.
 
 An unavailable registry stalls the drain the same way it stalls a consumer, instead of dropping the dead message.
+The dead letters ahead of the stalled one keep being committed meanwhile, and a stop ends the wait.
+See [Draining the DLQ](#draining-the-dlq).
 :::
 
 ## Metrics
