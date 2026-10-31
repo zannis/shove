@@ -79,6 +79,12 @@ there rather than restating the table in a third place.
   Two backends split the mechanics out into a helper module the routing calls
   into — `src/backends/rabbitmq/router.rs` and `src/backends/sns/router.rs` —
   so a routing change there means both files, not just `consumer.rs`.
+- **Kafka sequenced (FIFO) settling** — `src/backends/kafka/consumer.rs`:
+  `FifoLoop::handle` retries in place and `FifoLoop::dead_letter` publishes
+  the dead letter and settles its discard, with the commits in
+  `FifoState::settle` / `FifoState::commit_due`. It does **not** go through
+  `route_outcome`, so a retry/DLQ fix applied to Kafka's `route_outcome`
+  still misses the sequenced loop.
 - **Broadcast outcome settling** — `src/backend/broadcast.rs::settle_broadcast_outcome`,
   shared by the Kafka, NATS and Redis broadcast loops. It does **not** go
   through `route_outcome`, so a retry/discard fix applied to every backend's
@@ -88,11 +94,12 @@ there rather than restating the table in a third place.
 - **Batch consumption / settlement** — `src/backend/batch_consumer.rs`: the
   classifier every backend's batch flush routes an `Outcome` through, plus the
   panic/timeout invariant surface (`invoke_batch_handler`) shared by every
-  `HasBatchConsumption` backend. Kafka's *single-message* async-commit reject
-  path also imports this module's deferred-settlement machinery
-  (`TerminalDiscard`, `RejectSettlement`, `reject_settlement`) — not only its
-  batch path — so a cleanup narrowing that trio's gate must check the
-  single-message caller first, per the module's own doc comment.
+  `HasBatchConsumption` backend. Kafka's *single-message* reject path, whose
+  commit runs synchronously on its own thread, also imports this module's
+  deferred-settlement machinery (`TerminalDiscard`, `RejectSettlement`,
+  `reject_settlement`) — not only its batch path — and so does its sequenced
+  loop's `FifoLoop::dead_letter`, so a cleanup narrowing that trio's gate must
+  check both of those callers first, per the module's own doc comment.
 
 ## Build / test / lint commands
 
@@ -147,19 +154,20 @@ there rather than restating the table in a third place.
   `route_outcome`, not just one. The git history shows recurring
   "cross-backend consistency" commits because a fix landed in one backend and
   was missed in the others. When you touch retry/DLQ logic, check every backend
-  — and the two settling paths above that bypass `route_outcome`: broadcast
-  (`settle_broadcast_outcome`) and batch (`settle_batch_outcome` plus each
-  backend's own batch-flush arms).
+  — and the three settling paths above that bypass `route_outcome`: broadcast
+  (`settle_broadcast_outcome`), batch (`settle_batch_outcome` plus each
+  backend's own batch-flush arms) and Kafka FIFO (`FifoLoop::handle` /
+  `FifoLoop::dead_letter`).
 - **Pre-handler drops count toward `messages_discarded_total`**: a message
   dropped before the handler (oversize, undecodable, batch-accumulation drop)
   settles a discard under the same rules as a post-handler terminal outcome —
   via `metrics::record_terminal` / `pending_discard`, confirmed only against a
-  broker-acknowledged retirement, counted iff the message is truly gone (no
-  DLQ, or the DLQ publish failed). A batch path parks its drops and settles
-  them on the flush's commit result. New consume paths (including the batch
-  ports) wire this from day one; the per-backend completeness statement in
-  `src/metrics.rs` (`record_terminal`'s doc) is authoritative and must stay
-  accurate.
+  broker-acknowledged retirement, counted iff the message is truly gone, by
+  the per-backend rule `record_terminal`'s doc in `src/metrics.rs` states. A
+  batch path parks its drops and settles them on the flush's commit result.
+  New consume paths (including the batch ports) wire this from day one; the
+  per-backend completeness statement in `src/metrics.rs` (`record_terminal`'s
+  doc) is authoritative and must stay accurate.
 - **Conventional Commits** for commit messages. No CHANGELOG — releases are
   `release: vX.Y.Z` commits.
 - Do **not** add `Co-Authored-By` trailers to commits.

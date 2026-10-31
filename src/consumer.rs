@@ -8,7 +8,9 @@ use tokio_util::sync::CancellationToken;
 use crate::backend::capability::HasBroadcast;
 use crate::backend::{Backend, ConsumerOptionsInner};
 #[cfg(feature = "kafka")]
-use crate::backends::kafka::{CommitPolicy, KafkaAutoOffsetReset, validate_commit_policy};
+use crate::backends::kafka::{
+    CommitPolicy, FetchQueueTuning, KafkaAutoOffsetReset, validate_commit_policy,
+};
 use crate::broadcast::BroadcastStart;
 use crate::error::{Result, ShoveError};
 #[cfg(feature = "kafka")]
@@ -44,7 +46,7 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 ///
 /// | Backend | In-place primitive | This version |
 /// |---|---|---|
-/// | Apache Kafka | pauses the assignment and waits in the handler's task, the count kept in memory | both strategies, set with `ConsumerOptions::<Kafka>::with_retry_strategy` or `KafkaConsumerGroupConfig::with_retry_strategy` |
+/// | Apache Kafka | pauses the assignment and waits in the handler's task, or in the receive loop of a sequenced consumer, the count kept in memory | both strategies, set with `ConsumerOptions::<Kafka>::with_retry_strategy` or `KafkaConsumerGroupConfig::with_retry_strategy`; a sequenced consumer accepts either and always retries in place |
 /// | NATS JetStream | naks with the tier's delay, the count from JetStream's `num_delivered` | `InPlace` on an external stream, `Republish` on a shove-owned one; the setter follows |
 /// | AWS SQS | extends the visibility timeout, the path the FIFO consumer already uses | later, additive; `declare` and every consumer entry point refuse `external()` |
 /// | RabbitMQ | `basic.nack` with requeue | later, additive; `declare` and every consumer entry point refuse `external()` |
@@ -67,9 +69,11 @@ pub enum RetryStrategy {
     /// Deliver the same record again after the tier's delay, with nothing
     /// published and the record at its position. How the wait and the count
     /// are carried is the backend's own primitive, in the table above: Kafka
-    /// waits inside the handler's task, holding its prefetch slot, with the
-    /// count kept in memory; NATS naks with the delay and reads the count from
-    /// the delivery info. Implied by an external topology.
+    /// waits inside the handler's task, holding its prefetch slot, or in the
+    /// receive loop of a sequenced consumer, with the count kept in memory;
+    /// NATS naks with the delay and reads the count from the delivery info.
+    /// Implied by an external topology, and the one shape a sequenced Kafka
+    /// consumer runs.
     ///
     /// On Kafka a stop during the wait completes nothing and hands no record
     /// fetched behind the waiting one to a handler; both are redelivered on
@@ -255,6 +259,15 @@ pub struct ConsumerOptions<B: Backend> {
     /// finite value in environments where a permanently-unreachable broker
     /// should be surfaced rather than silently spinning.
     ///
+    /// On Kafka's concurrent consumer a `Retry`/`Defer` republish or a dead
+    /// letter that fails and may succeed later reconnects the member too,
+    /// which leaves the group and joins it again, and that reconnect counts
+    /// here. With a finite value a DLQ that stays unwritable therefore ends
+    /// that consumer once the value is spent; the count resets after a
+    /// connection that lasted a minute. Kafka's sequenced consumer
+    /// (`run_fifo`) tries such a dead letter again in place, without a
+    /// reconnect, so the limit never ends it on a DLQ outage.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -373,6 +386,14 @@ pub struct ConsumerOptions<B: Backend> {
     #[cfg(feature = "kafka")]
     pub(crate) kafka_commit_policy: Option<CommitPolicy>,
 
+    /// Kafka-only: the fetch queue settings of the consumer's librdkafka
+    /// client. Crate-private on purpose, like `kafka_commit_policy`: it is set
+    /// through `ConsumerOptions::<Kafka>::with_queued_min_messages`,
+    /// `with_queued_max_messages_kbytes` and `with_fetch_queue_backoff_ms`,
+    /// the setters of the one backend that reads it.
+    #[cfg(feature = "kafka")]
+    pub(crate) kafka_fetch_queue: FetchQueueTuning,
+
     /// Where a broadcast subscription starts reading. `None` (the default)
     /// and `Some(BroadcastStart::Tail)` keep deliver-new. Set via
     /// [`ConsumerOptions::with_broadcast_start`], which only a backend
@@ -437,6 +458,8 @@ impl<B: Backend> ConsumerOptions<B> {
             kafka_commit_interval: None,
             #[cfg(feature = "kafka")]
             kafka_commit_policy: None,
+            #[cfg(feature = "kafka")]
+            kafka_fetch_queue: FetchQueueTuning::default(),
             broadcast_start: None,
             retry_strategy: None,
             shutdown: None,
@@ -475,6 +498,10 @@ impl<B: Backend> ConsumerOptions<B> {
 
     /// Set the handler timeout. If a handler exceeds this duration the message
     /// is retried automatically. Panics if `timeout` is zero.
+    ///
+    /// On the Kafka DLQ drain (`KafkaConsumer::run_dlq`) the timeout bounds
+    /// each `handle_dead` call. A dead letter whose call times out is
+    /// committed and is not retried.
     ///
     /// On the Redis backend the timeout also drives crash recovery: a
     /// background sidecar reclaims entries that have been pending longer
@@ -535,6 +562,10 @@ impl<B: Backend> ConsumerOptions<B> {
     /// while the handler is still running, so it stays [`Outcome::Retry`] and
     /// lets the broker redeliver rather than retiring live work.
     ///
+    /// The Kafka DLQ drain (`KafkaConsumer::run_dlq`) refuses this setting
+    /// with `ShoveError::Topology`: `handle_dead` returns no outcome, and a
+    /// dead letter whose call times out is committed.
+    ///
     /// # Redis: this narrows a race, it does not remove one
     ///
     /// With the option unset, a timed-out Redis entry has exactly one actor —
@@ -587,6 +618,10 @@ impl<B: Backend> ConsumerOptions<B> {
     }
 
     /// Disable the handler timeout entirely (handlers may run indefinitely).
+    ///
+    /// On the Kafka DLQ drain (`KafkaConsumer::run_dlq`) each `handle_dead`
+    /// call may then run indefinitely too. The drain hands out no dead letter
+    /// behind the call, and a stop waits for it, for as long as it runs.
     ///
     /// On the Redis backend this also disables crash-recovery reclaim for
     /// the stream's maintenance sidecar: with no deadline, in-flight work is
@@ -710,6 +745,8 @@ impl<B: Backend> ConsumerOptions<B> {
             kafka_auto_offset_reset: self.kafka_auto_offset_reset,
             #[cfg(feature = "kafka")]
             kafka_commit_policy,
+            #[cfg(feature = "kafka")]
+            kafka_fetch_queue: self.kafka_fetch_queue,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: None,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
@@ -775,6 +812,8 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             kafka_commit_interval: self.kafka_commit_interval,
             #[cfg(feature = "kafka")]
             kafka_commit_policy: self.kafka_commit_policy,
+            #[cfg(feature = "kafka")]
+            kafka_fetch_queue: self.kafka_fetch_queue,
             broadcast_start: self.broadcast_start,
             retry_strategy: self.retry_strategy,
             shutdown: self.shutdown.clone(),
@@ -917,14 +956,17 @@ impl ConsumerOptions<Kafka> {
     /// [`CommitPolicy::Interval`]: both setters write the one policy slot,
     /// so the last call wins.
     ///
-    /// Completions are tracked in memory and committed asynchronously at
-    /// most once per interval, so a longer interval trades coordinator
-    /// requests for a wider replay window after a crash or a rebalance. The
-    /// final commit at shutdown is synchronous whatever the interval. For the
+    /// Completions are tracked in memory and committed at most once per
+    /// interval, one commit at a time while the consumer goes on, so a
+    /// longer interval trades coordinator requests for a wider replay window
+    /// after a crash or a rebalance. The final commit at shutdown is
+    /// synchronous whatever the interval. For the
     /// coordinated registry path the equivalent is
     /// [`KafkaConsumerGroupConfig::with_commit_interval`](crate::kafka::KafkaConsumerGroupConfig::with_commit_interval).
     /// A FIFO consumer, a broadcast subscription and the DLQ drain refuse it
-    /// at their entry points, because none of them commits on an interval.
+    /// at their entry points, because none of them reads it: the FIFO
+    /// consumer and the DLQ drain commit on the fixed 500 ms default, and a
+    /// broadcast subscription commits nothing.
     ///
     /// # Panics
     ///
@@ -976,12 +1018,73 @@ impl ConsumerOptions<Kafka> {
     /// place, a shove-owned one republishes. An external topology refuses
     /// `Republish` at the consumer's start with `ShoveError::Topology`,
     /// because the republish would write into a topic infra owns. A FIFO
-    /// consumer refuses `InPlace`, which it does not implement: it carries a
-    /// retry through the republish that keeps its per-key order. Read by the
-    /// direct and supervisor paths; for the coordinated registry path the
+    /// consumer accepts either and always retries in place, so a later
+    /// record of the key is never handled before the retried one. Read by
+    /// the direct and supervisor paths; for the coordinated registry path the
     /// equivalent is `KafkaConsumerGroupConfig::with_retry_strategy`.
     pub fn with_retry_strategy(mut self, strategy: RetryStrategy) -> Self {
         self.retry_strategy = Some(strategy);
+        self
+    }
+
+    /// librdkafka's `queued.min.messages`: how many messages per partition the
+    /// consumer tries to keep prefetched in its local queue. A partition whose
+    /// queue holds that many is not fetched again until
+    /// [`with_fetch_queue_backoff_ms`](Self::with_fetch_queue_backoff_ms) has
+    /// passed. Unset keeps librdkafka's default, 100000.
+    ///
+    /// A higher value prefetches further ahead of the handlers and holds more
+    /// messages in memory, and a lower one bounds that memory.
+    /// [`with_queued_max_messages_kbytes`](Self::with_queued_max_messages_kbytes)
+    /// bounds the same queue by size.
+    ///
+    /// The accepted range is `1..=10000000`. A value outside it is refused
+    /// with `ShoveError::Validation` where the consumer starts, before any
+    /// broker request. `KafkaConsumer::run`, `run_fifo`,
+    /// `run_dlq_with_options` and `BroadcastSubscriber::subscribe` all read the
+    /// setting. For the coordinated registry path the equivalent is
+    /// [`KafkaConsumerGroupConfig::with_queued_min_messages`](crate::kafka::KafkaConsumerGroupConfig::with_queued_min_messages).
+    pub fn with_queued_min_messages(mut self, messages: u32) -> Self {
+        self.kafka_fetch_queue.queued_min_messages = Some(messages);
+        self
+    }
+
+    /// librdkafka's `queued.max.messages.kbytes`: how many kilobytes of
+    /// prefetched messages the consumer's local queue may hold before
+    /// librdkafka stops fetching until
+    /// [`with_fetch_queue_backoff_ms`](Self::with_fetch_queue_backoff_ms) has
+    /// passed. librdkafka gives it priority over `queued.min.messages`. Unset
+    /// keeps librdkafka's default, 65536, about 64 MB.
+    ///
+    /// The accepted range is `1..=2097151`. A value outside it is refused
+    /// with `ShoveError::Validation` where the consumer starts, as
+    /// [`with_queued_min_messages`](Self::with_queued_min_messages) is. For the
+    /// coordinated registry path the equivalent is
+    /// [`KafkaConsumerGroupConfig::with_queued_max_messages_kbytes`](crate::kafka::KafkaConsumerGroupConfig::with_queued_max_messages_kbytes).
+    pub fn with_queued_max_messages_kbytes(mut self, kbytes: u32) -> Self {
+        self.kafka_fetch_queue.queued_max_messages_kbytes = Some(kbytes);
+        self
+    }
+
+    /// librdkafka's `fetch.queue.backoff.ms`: how long to wait before fetching
+    /// a partition again once its local queue reached `queued.min.messages` or
+    /// `queued.max.messages.kbytes`. Unset keeps 25 ms, which every Kafka
+    /// consumer shove builds uses, in place of librdkafka's 1000 ms.
+    ///
+    /// The wait runs its full length even when the handlers empty the queue
+    /// meanwhile. At 1000 ms a consumer that works through a backlog faster
+    /// than the queue refills idles for the rest of each second, which caps a
+    /// partition at about `queued.min.messages` messages per second. A lower
+    /// value refetches sooner and checks a full queue more often. `0` removes
+    /// the wait, and can raise CPU use while a queue stays full.
+    ///
+    /// The accepted range is `0..=300000`. A value outside it is refused with
+    /// `ShoveError::Validation` where the consumer starts, as
+    /// [`with_queued_min_messages`](Self::with_queued_min_messages) is. For the
+    /// coordinated registry path the equivalent is
+    /// [`KafkaConsumerGroupConfig::with_fetch_queue_backoff_ms`](crate::kafka::KafkaConsumerGroupConfig::with_fetch_queue_backoff_ms).
+    pub fn with_fetch_queue_backoff_ms(mut self, ms: u32) -> Self {
+        self.kafka_fetch_queue.fetch_queue_backoff_ms = Some(ms);
         self
     }
 }
@@ -1413,6 +1516,64 @@ mod tests {
         use crate::markers::Kafka;
         let inner = ConsumerOptions::<Kafka>::new().into_inner();
         assert_eq!(inner.kafka_auto_offset_reset, None);
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_fetch_queue_settings_default_to_unset() {
+        use crate::backends::kafka::FetchQueueTuning;
+        use crate::markers::Kafka;
+        let inner = ConsumerOptions::<Kafka>::new().into_inner();
+        assert_eq!(inner.kafka_fetch_queue, FetchQueueTuning::default());
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_fetch_queue_setters_propagate_through_into_inner() {
+        use crate::backends::kafka::FetchQueueTuning;
+        use crate::markers::Kafka;
+        let opts = ConsumerOptions::<Kafka>::new().with_fetch_queue_backoff_ms(250);
+        assert_eq!(
+            opts.clone().into_inner().kafka_fetch_queue,
+            FetchQueueTuning {
+                fetch_queue_backoff_ms: Some(250),
+                ..FetchQueueTuning::default()
+            },
+            "each setter writes its own setting"
+        );
+
+        let inner = opts
+            .with_queued_min_messages(5_000)
+            .with_queued_max_messages_kbytes(2_048)
+            .into_inner();
+        assert_eq!(
+            inner.kafka_fetch_queue,
+            FetchQueueTuning {
+                queued_min_messages: Some(5_000),
+                queued_max_messages_kbytes: Some(2_048),
+                fetch_queue_backoff_ms: Some(250),
+            }
+        );
+    }
+
+    /// `Clone` is written by hand, field by field.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_fetch_queue_settings_survive_a_clone() {
+        use crate::backends::kafka::FetchQueueTuning;
+        use crate::markers::Kafka;
+        let opts = ConsumerOptions::<Kafka>::new()
+            .with_queued_min_messages(5_000)
+            .with_queued_max_messages_kbytes(2_048)
+            .with_fetch_queue_backoff_ms(250);
+        assert_eq!(
+            opts.clone().into_inner().kafka_fetch_queue,
+            FetchQueueTuning {
+                queued_min_messages: Some(5_000),
+                queued_max_messages_kbytes: Some(2_048),
+                fetch_queue_backoff_ms: Some(250),
+            }
+        );
     }
 
     /// `with_commit_interval(d)` is shorthand for the `Interval(d)` policy:

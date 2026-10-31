@@ -363,6 +363,27 @@ pub mod kafka {
     #[cfg_attr(docsrs, doc(cfg(feature = "test-support")))]
     pub use crate::backends::kafka::prime_admin_oauth_token_for_test;
 
+    /// Test-only record (see the `test-support` feature) of the `client.id`
+    /// every consumer was created with, for tests that prove a member did not
+    /// reconnect.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::client_id_probe;
+
+    /// Test-only counter (see the `test-support` feature) of the wakes the
+    /// commit gate's deadline made, for tests that prove a gated commit wakes
+    /// its loop once per window.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::commit_gate_probe;
+
+    /// Test-only record (see the `test-support` feature) of the fetch queue
+    /// settings every consumer was created with, for tests that prove a
+    /// consume path hands librdkafka the settings its options carry.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::fetch_queue_probe;
+
     /// Test-only probe (see the `test-support` feature) on the concurrent
     /// consumer's completion channel, for tests that prove a completion sat
     /// in the channel during a stall.
@@ -398,6 +419,13 @@ pub mod kafka {
     #[doc(hidden)]
     pub use crate::backends::kafka::permit_wait_probe;
 
+    /// Test-only probe (see the `test-support` feature) on the broadcast
+    /// loop's assignment refresh: counts the refreshes started and ended, and
+    /// holds each one for a delay, for tests that slow a refresh down.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::broadcast_refresh_probe;
+
     /// Test-only seam (see the `test-support` feature): the receive loop's
     /// shutdown commit deadline, for tests that time a shutdown against it.
     #[cfg(feature = "test-support")]
@@ -405,7 +433,8 @@ pub mod kafka {
     pub use crate::backends::kafka::shutdown_commit_deadline_for_test;
 
     /// Test-only probe (see the `test-support` feature): the fence threshold
-    /// the last concurrent receive loop started with.
+    /// the last receive loop started with, concurrent or sequenced, and how
+    /// many times a loop has found itself fenced.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::fence_probe;
@@ -415,6 +444,13 @@ pub mod kafka {
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::final_commit_spawn_probe;
+
+    /// Test-only switch (see the `test-support` feature): refuses every dead
+    /// letter with an error no retry gets past, so a test can drive that
+    /// failure through the consume paths.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::dlq_publish_probe;
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::per_record_probe;

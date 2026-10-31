@@ -493,13 +493,10 @@ async fn route_outcome(
             }
         }
         RetryDecision::Hold { increment: true } => {
-            let new_count = retry_count + 1;
-            let delay = if hold_queues.is_empty() {
-                Duration::from_secs(1)
-            } else {
-                let idx = hold_index(retry_count, hold_queues.len());
-                hold_queues[idx].delay()
-            };
+            let new_count = retry_count.saturating_add(1);
+            let delay = hold_index(retry_count, hold_queues.len())
+                .and_then(|index| hold_queues.get(index))
+                .map_or(Duration::from_secs(1), HoldQueue::delay);
 
             if in_place {
                 // An external stream is never written by its consumer: the
@@ -520,11 +517,9 @@ async fn route_outcome(
             return;
         }
         RetryDecision::Hold { increment: false } => {
-            let delay = if hold_queues.is_empty() {
-                Duration::from_secs(1)
-            } else {
-                hold_queues[0].delay()
-            };
+            let delay = hold_queues
+                .first()
+                .map_or(Duration::from_secs(1), HoldQueue::delay);
             if let Err(e) = msg.ack_with(AckKind::Nak(Some(delay))).await {
                 tracing::error!(error = %e, "failed to nak-with-delay for defer");
             }

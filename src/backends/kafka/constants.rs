@@ -10,6 +10,7 @@
 //! `src/consumer.rs`, because the stress harness must cite them from builds
 //! that do not enable the `kafka` feature. Do not re-add them here.
 
+use std::ffi::CStr;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -21,6 +22,19 @@ pub(super) const DEATH_REASON_HEADER: &str = "Shove-Death-Reason";
 pub(super) const ORIGINAL_QUEUE_HEADER: &str = "Shove-Original-Queue";
 pub(super) const DEATH_COUNT_HEADER: &str = "Shove-Death-Count";
 pub(super) const MESSAGE_ID_HEADER: &str = "Shove-Message-Id";
+/// The id every copy of a record extends; a copy carries it beside its own
+/// `MESSAGE_ID_HEADER`.
+pub(super) const BASE_MESSAGE_ID_HEADER: &str = "Shove-Base-Message-Id";
+
+/// The keys above NUL-terminated, the form librdkafka's
+/// `rd_kafka_header_remove` takes. `c_header_keys_match_their_str_twins`
+/// keeps each spelled like its twin.
+pub(super) const RETRY_COUNT_KEY: &CStr = c"Shove-Retry-Count";
+pub(super) const DEATH_REASON_KEY: &CStr = c"Shove-Death-Reason";
+pub(super) const ORIGINAL_QUEUE_KEY: &CStr = c"Shove-Original-Queue";
+pub(super) const DEATH_COUNT_KEY: &CStr = c"Shove-Death-Count";
+pub(super) const MESSAGE_ID_KEY: &CStr = c"Shove-Message-Id";
+pub(super) const BASE_MESSAGE_ID_KEY: &CStr = c"Shove-Base-Message-Id";
 
 // ---------------------------------------------------------------------------
 // Group ID derivations
@@ -167,11 +181,11 @@ pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// finishes on its own.
 pub(super) const SHUTDOWN_COMMIT_DEADLINE: Duration = Duration::from_secs(20);
 
-/// The share of `SHUTDOWN_COMMIT_DEADLINE` the concurrent receive loop gives
-/// a `CommitPolicy::PerRecord` commit it finds in flight at shutdown: three
-/// quarters, so the final commit and the consumer's close always keep a
-/// slice of the deadline. Derived from the deadline, never written beside
-/// it.
+/// The share of `SHUTDOWN_COMMIT_DEADLINE` a receive loop gives the commit
+/// it finds in flight at shutdown, under either commit policy and on a
+/// sequenced consumer: three quarters, so the final commit and the
+/// consumer's close always keep a slice of the deadline. Derived from the
+/// deadline, never written beside it.
 pub(super) const PENDING_COMMIT_BUDGET: Duration = {
     // `Duration` has no const `Div`; `checked_div` is `None` for a divisor
     // of zero only, so the fallback arm cannot be taken.
@@ -181,6 +195,18 @@ pub(super) const PENDING_COMMIT_BUDGET: Duration = {
     };
     SHUTDOWN_COMMIT_DEADLINE.saturating_sub(quarter)
 };
+
+/// How long a stop polls, its assignment paused, before it tries again a
+/// final commit the coordinator refused while the group rebalances, so the
+/// polls can serve the rebalance callbacks the rebalance waits on.
+pub(super) const FINAL_COMMIT_RETRY_POLL: Duration = Duration::from_millis(500);
+
+/// The least of `SHUTDOWN_COMMIT_DEADLINE` that must be left, both when a
+/// final commit starts and when its refusal while the group rebalances
+/// comes back, for that refusal to be tried again: room for the poll, and
+/// for the last try and the close that follows it. A refusal that comes
+/// back with less left stands.
+pub(super) const FINAL_COMMIT_RETRY_RESERVE: Duration = Duration::from_secs(2);
 
 /// How long a consume loop waits before asking the schema registry again for
 /// a record whose schema id it could not resolve: a transport failure, or a
@@ -235,6 +261,20 @@ pub(super) const FETCH_MIN_BYTES: u32 = 1;
 /// waiting for `fetch.min.bytes` to accumulate. Set to `50` so that
 /// low-volume topics don't pay librdkafka's default 500 ms dwell.
 pub(super) const FETCH_WAIT_MAX_MS: u32 = 50;
+
+/// Consumer `fetch.queue.backoff.ms`: how long librdkafka waits before it
+/// fetches a partition again once the partition's local queue reached
+/// `queued.min.messages` or `queued.max.messages.kbytes`.
+///
+/// librdkafka's default is 1000 ms. The wait runs its full length even when
+/// the application empties the queue meanwhile, so a consumer that works
+/// through a backlog faster than the queue refills idles for the rest of each
+/// second. With the default `queued.min.messages` of 100000 that caps a
+/// consumer of one partition at about 100k messages per second. 25 ms
+/// refetches a drained queue promptly, and a queue that stays full is checked
+/// at most forty times a second per partition. Every consumer shove builds
+/// uses it, and `with_fetch_queue_backoff_ms` replaces it.
+pub(super) const FETCH_QUEUE_BACKOFF_MS: u32 = 25;
 
 #[cfg(test)]
 mod tests {
@@ -297,5 +337,19 @@ mod tests {
         // suffix so a custom group cannot re-collide on the auxiliary groups.
         assert_eq!(fifo_group_id_from_base("price-sink"), "price-sink-fifo");
         assert_eq!(dlq_group_id_from_base("price-sink"), "price-sink-dlq");
+    }
+
+    #[test]
+    fn c_header_keys_match_their_str_twins() {
+        for (c_key, key) in [
+            (RETRY_COUNT_KEY, RETRY_COUNT_HEADER),
+            (DEATH_REASON_KEY, DEATH_REASON_HEADER),
+            (ORIGINAL_QUEUE_KEY, ORIGINAL_QUEUE_HEADER),
+            (DEATH_COUNT_KEY, DEATH_COUNT_HEADER),
+            (MESSAGE_ID_KEY, MESSAGE_ID_HEADER),
+            (BASE_MESSAGE_ID_KEY, BASE_MESSAGE_ID_HEADER),
+        ] {
+            assert_eq!(c_key.to_bytes(), key.as_bytes());
+        }
     }
 }
