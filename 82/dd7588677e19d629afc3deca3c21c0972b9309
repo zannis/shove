@@ -1,0 +1,19 @@
+tests/kafka_schema_registry_outage.rs
+  s_1001dc3147e1e5::t_cdd6ffede787cf 2294-2295
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "82dd7588677e19d629afc3deca3c21c0972b9309",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
