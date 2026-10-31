@@ -104,7 +104,7 @@ use super::startup;
 /// Must be >= 2: at 1 this degenerates into "clear on the first quiet tick",
 /// which resets a genuinely wedged partition's streak on every iteration and
 /// stops it ever reaching `COMMIT_FENCE_TIMEOUT`. At 2, the tolerated window
-/// is at least `ASYNC_COMMIT_INTERVAL` while traffic flows (the re-offering
+/// is at least `DEFAULT_COMMIT_INTERVAL` while traffic flows (the re-offering
 /// drain always issues a commit and so marks the gate, holding the *first*
 /// quiet drain back a full interval; the second may follow one iteration
 /// later) and 2 × `HOUSEKEEPING_INTERVAL` on an idle topic. Both windows
@@ -114,10 +114,13 @@ use super::startup;
 /// slower than the interval cannot out-age the streak there.
 const QUIET_DRAINS_TO_RESOLVE: u32 = 2;
 
-/// Minimum spacing between offset commits issued by the concurrent receive
-/// loop.
+/// The default spacing between the offset commits a loop makes: the
+/// concurrent loop's under `CommitPolicy::Interval` unless the options set
+/// one, the fixed spacing of the sequenced consumer, the DLQ drain and the
+/// batch consumer, and under `CommitPolicy::PerRecord` the spacing of a
+/// rejected commit's re-offers, see [`commit_window`].
 ///
-/// The loop used to fire one fire-and-forget `commit(Async)` on every
+/// The concurrent loop used to fire one fire-and-forget `commit(Async)` on every
 /// iteration that advanced any offset. At high consume rates that issues
 /// commits an order of magnitude faster than the group coordinator answers
 /// them, so tens of thousands pile up in flight — and
@@ -135,21 +138,22 @@ const QUIET_DRAINS_TO_RESOLVE: u32 = 2;
 /// entries whatever the interval, and the offsets completed since the last
 /// drain are summed up by `position()` alone. A longer interval widens what a
 /// crash redelivers (about 6k offsets at 12k msg/s), nothing else.
-const ASYNC_COMMIT_INTERVAL: Duration = Duration::from_millis(500);
+const DEFAULT_COMMIT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The window a commit policy spaces commits by: the interval itself, or
 /// under `PerRecord` the default interval, which there spaces only the
-/// re-offers of a rejected commit (see `AsyncCommitGate`) and keeps the
+/// re-offers of a rejected commit (see `CommitGate`) and keeps the
 /// fence threshold at its floor.
 fn commit_window(policy: CommitPolicy) -> Duration {
     match policy {
         CommitPolicy::Interval(interval) => interval,
-        CommitPolicy::PerRecord => ASYNC_COMMIT_INTERVAL,
+        CommitPolicy::PerRecord => DEFAULT_COMMIT_INTERVAL,
     }
 }
 
-/// Rate gate for the receive loop's offset commits: `due` says whether the
-/// commit drain may run now, `mark` records that a commit was issued.
+/// Rate gate for a loop's offset commits, see [`CommitSlot`]: `due` says
+/// whether the commit drain may run now, `mark` records that a commit was
+/// issued.
 ///
 /// Only *issued* commits consume the window — a drain that found nothing to
 /// commit leaves the gate due, so the next completion is committed as soon
@@ -164,7 +168,7 @@ fn commit_window(policy: CommitPolicy) -> Duration {
 /// every re-offer would meet the same answer until the fence. Waiting out
 /// the interval lets the loop poll between re-offers, as it does under
 /// `Interval`.
-struct AsyncCommitGate {
+struct CommitGate {
     interval: Duration,
     per_record: bool,
     last: Option<Instant>,
@@ -173,7 +177,7 @@ struct AsyncCommitGate {
     rejected: bool,
 }
 
-impl AsyncCommitGate {
+impl CommitGate {
     fn new(policy: CommitPolicy) -> Self {
         Self {
             interval: commit_window(policy),
@@ -5003,14 +5007,14 @@ fn spawn_commit(
 /// so it would take raw FFI for the queue's creation, polling, wake-up and
 /// teardown order against the client; a commit on a thread takes none.
 struct CommitSlot {
-    gate: AsyncCommitGate,
+    gate: CommitGate,
     in_flight: Option<PendingCommit>,
 }
 
 impl CommitSlot {
     fn new(policy: CommitPolicy) -> Self {
         Self {
-            gate: AsyncCommitGate::new(policy),
+            gate: CommitGate::new(policy),
             in_flight: None,
         }
     }
@@ -5106,7 +5110,7 @@ impl CommitSlot {
     /// `rejected`, hands the discards back and marks the partitions to
     /// re-offer, see `OffsetTracker::commit_rejected`, and closes the gate
     /// for the window the re-offers are spaced by, see
-    /// `AsyncCommitGate::mark_rejected`. `true` says the commit was accepted.
+    /// `CommitGate::mark_rejected`. `true` says the commit was accepted.
     fn settle_commit(
         &mut self,
         positions: &[CommitPosition],
@@ -5182,7 +5186,7 @@ impl CommitSlot {
     /// [`commit_terminal_span`]. The answer is settled as the slot settles
     /// its own, see [`settle_commit`](Self::settle_commit), a rejection
     /// logged as `rejected`, and an accepted one opens the gate again, see
-    /// `AsyncCommitGate::mark`. A spawn failure is a rejection: nothing
+    /// `CommitGate::mark`. A spawn failure is a rejection: nothing
     /// commits, and the position is re-offered. A stop during the wait
     /// leaves the commit in the slot, in flight, for the stop to wait on.
     /// `grace` is how long the wait goes before it polls.
@@ -8094,7 +8098,7 @@ impl FifoState {
     /// wait runs.
     ///
     /// Commits are spaced as the standard consumer spaces them, at most once
-    /// per `ASYNC_COMMIT_INTERVAL`, and made as it makes them under
+    /// per `DEFAULT_COMMIT_INTERVAL`, and made as it makes them under
     /// `CommitPolicy::Interval`: one at a time, synchronously on a thread of
     /// its own while the loop goes on, see [`CommitSlot`]. A discard rides
     /// the commit that retires its record and counts once the broker
@@ -8271,7 +8275,7 @@ async fn run_serial_connection<L: SerialLoop>(serial: &L) -> Result<()> {
     let mut state = FifoState {
         tracker: OffsetTracker::with_assignments(queue.to_string(), assignments),
         rebalance_rx,
-        commits: CommitSlot::new(CommitPolicy::Interval(ASYNC_COMMIT_INTERVAL)),
+        commits: CommitSlot::new(CommitPolicy::Interval(DEFAULT_COMMIT_INTERVAL)),
         fence_timeout: connection.fence_timeout,
         group_id: connection.group_id.to_string(),
         paused: false,
@@ -9121,7 +9125,7 @@ impl KafkaConsumer {
         // `check_per_record_prefetch`.
         let commit_policy = options
             .kafka_commit_policy
-            .unwrap_or(CommitPolicy::Interval(ASYNC_COMMIT_INTERVAL));
+            .unwrap_or(CommitPolicy::Interval(DEFAULT_COMMIT_INTERVAL));
         check_commit_policy(commit_policy, queue)?;
         let per_record = matches!(commit_policy, CommitPolicy::PerRecord);
         if per_record {
@@ -9418,7 +9422,7 @@ impl KafkaConsumer {
                         per_record_probe::RECONCILED_AT_TOP_OF_PASS.fetch_add(1, Ordering::SeqCst);
                     }
                     reconcile_pause_after_assign(consumer, paused, assigned)?;
-                    // The gate spaces commits out (see `ASYNC_COMMIT_INTERVAL`):
+                    // The gate spaces commits out (see `DEFAULT_COMMIT_INTERVAL`):
                     // ungated, this drain committed on nearly every iteration —
                     // roughly once per message at speed — piling up in-flight
                     // commits that `rd_kafka_consumer_close` later drains one
@@ -10455,10 +10459,10 @@ impl KafkaConsumer {
                 let mut state = BatchState {
                     tracker: OffsetTracker::with_assignments(queue.to_string(), assignments),
                     rebalance_rx,
-                    commits: CommitSlot::new(CommitPolicy::Interval(ASYNC_COMMIT_INTERVAL)),
+                    commits: CommitSlot::new(CommitPolicy::Interval(DEFAULT_COMMIT_INTERVAL)),
                     fence_threshold: fence_threshold_over(
                         COMMIT_FENCE_TIMEOUT,
-                        ASYNC_COMMIT_INTERVAL,
+                        DEFAULT_COMMIT_INTERVAL,
                     ),
                     group_id: group_id.clone(),
                     paused: false,
@@ -10989,7 +10993,7 @@ impl KafkaConsumer {
             #[cfg(feature = "test-support")]
             options.kafka_max_poll_interval,
         );
-        let fence_timeout = fence_threshold_over(fence_floor(&options), ASYNC_COMMIT_INTERVAL);
+        let fence_timeout = fence_threshold_over(fence_floor(&options), DEFAULT_COMMIT_INTERVAL);
         #[cfg(feature = "test-support")]
         fence_probe::record(fence_timeout);
         #[cfg(feature = "kafka-schema-registry")]
@@ -12003,7 +12007,7 @@ impl KafkaConsumer {
             max_message_size: options.max_message_size,
             handler_timeout: options.handler_timeout,
             fetch_queue: options.kafka_fetch_queue,
-            fence_timeout: fence_threshold_over(fence_floor(&options), ASYNC_COMMIT_INTERVAL),
+            fence_timeout: fence_threshold_over(fence_floor(&options), DEFAULT_COMMIT_INTERVAL),
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: options.schema_registry.clone(),
             #[cfg(feature = "kafka-schema-registry")]
@@ -12212,7 +12216,7 @@ mod offset_tracker_tests {
     #[test]
     fn fence_threshold_grows_with_the_commit_interval() {
         assert_eq!(
-            fence_threshold_over(COMMIT_FENCE_TIMEOUT, ASYNC_COMMIT_INTERVAL),
+            fence_threshold_over(COMMIT_FENCE_TIMEOUT, DEFAULT_COMMIT_INTERVAL),
             COMMIT_FENCE_TIMEOUT
         );
         assert_eq!(
@@ -13378,14 +13382,14 @@ mod offset_tracker_tests {
 /// message at speed — and consumer close then drained tens of thousands of
 /// in-flight commits for tens of seconds (CAF: post-cancel drain timeouts).
 #[cfg(test)]
-mod async_commit_gate_tests {
+mod commit_gate_tests {
     use super::*;
 
     const INTERVAL: Duration = Duration::from_millis(500);
 
     #[test]
     fn due_immediately_when_nothing_ever_committed() {
-        let gate = AsyncCommitGate::new(CommitPolicy::Interval(INTERVAL));
+        let gate = CommitGate::new(CommitPolicy::Interval(INTERVAL));
         let now = Instant::now();
         assert!(gate.due(now), "first commit must not wait out an interval");
         assert_eq!(
@@ -13400,7 +13404,7 @@ mod async_commit_gate_tests {
 
     #[test]
     fn mark_closes_the_window_and_the_interval_reopens_it() {
-        let mut gate = AsyncCommitGate::new(CommitPolicy::Interval(INTERVAL));
+        let mut gate = CommitGate::new(CommitPolicy::Interval(INTERVAL));
         let t0 = Instant::now();
         gate.mark(t0);
         assert!(!gate.due(t0));
@@ -13413,7 +13417,7 @@ mod async_commit_gate_tests {
     /// last *issued* commit, however often the loop polls it.
     #[test]
     fn asking_does_not_advance_the_window() {
-        let mut gate = AsyncCommitGate::new(CommitPolicy::Interval(INTERVAL));
+        let mut gate = CommitGate::new(CommitPolicy::Interval(INTERVAL));
         let t0 = Instant::now();
         gate.mark(t0);
         for tenths in 1..=9u32 {
@@ -13424,7 +13428,7 @@ mod async_commit_gate_tests {
 
     #[test]
     fn deadline_is_anchored_to_the_last_commit() {
-        let mut gate = AsyncCommitGate::new(CommitPolicy::Interval(INTERVAL));
+        let mut gate = CommitGate::new(CommitPolicy::Interval(INTERVAL));
         let t0 = Instant::now();
         gate.mark(t0);
         assert_eq!(gate.deadline(t0), t0 + INTERVAL);
@@ -13440,7 +13444,7 @@ mod async_commit_gate_tests {
     /// form treats an unrepresentable deadline as already due.
     #[test]
     fn commit_gate_deadline_treats_overflow_as_due() {
-        let mut gate = AsyncCommitGate::new(CommitPolicy::Interval(Duration::MAX));
+        let mut gate = CommitGate::new(CommitPolicy::Interval(Duration::MAX));
         let now = Instant::now();
         assert_eq!(gate.deadline(now), now, "no commit yet: due now");
         gate.mark(now);
@@ -13449,15 +13453,15 @@ mod async_commit_gate_tests {
 
     /// The gate is built from the configured interval, so a consumer with
     /// `with_commit_interval(5 s)` commits at most every 5 s - not every
-    /// `ASYNC_COMMIT_INTERVAL`.
+    /// `DEFAULT_COMMIT_INTERVAL`.
     #[test]
     fn a_configured_interval_replaces_the_default_window() {
         let configured = Duration::from_secs(5);
-        let mut gate = AsyncCommitGate::new(CommitPolicy::Interval(configured));
+        let mut gate = CommitGate::new(CommitPolicy::Interval(configured));
         let t0 = Instant::now();
         gate.mark(t0);
         assert!(
-            !gate.due(t0 + ASYNC_COMMIT_INTERVAL * 4),
+            !gate.due(t0 + DEFAULT_COMMIT_INTERVAL * 4),
             "the default window has no bearing on a configured gate"
         );
         assert!(!gate.due(t0 + configured - Duration::from_millis(1)));
@@ -13470,7 +13474,7 @@ mod async_commit_gate_tests {
     /// every completion is committed as it lands.
     #[test]
     fn per_record_is_due_however_recent_the_last_confirmed_commit() {
-        let mut gate = AsyncCommitGate::new(CommitPolicy::PerRecord);
+        let mut gate = CommitGate::new(CommitPolicy::PerRecord);
         let t0 = Instant::now();
         assert!(gate.due(t0), "nothing committed yet");
         gate.mark(t0);
@@ -13485,16 +13489,16 @@ mod async_commit_gate_tests {
     /// reopens the gate.
     #[test]
     fn per_record_waits_out_the_default_interval_after_a_rejected_commit() {
-        let mut gate = AsyncCommitGate::new(CommitPolicy::PerRecord);
+        let mut gate = CommitGate::new(CommitPolicy::PerRecord);
         let t0 = Instant::now();
         gate.mark_rejected(t0);
         assert!(!gate.due(t0));
-        assert!(!gate.due(t0 + ASYNC_COMMIT_INTERVAL / 2));
-        assert_eq!(gate.deadline(t0), t0 + ASYNC_COMMIT_INTERVAL);
-        assert!(gate.due(t0 + ASYNC_COMMIT_INTERVAL));
-        gate.mark(t0 + ASYNC_COMMIT_INTERVAL);
+        assert!(!gate.due(t0 + DEFAULT_COMMIT_INTERVAL / 2));
+        assert_eq!(gate.deadline(t0), t0 + DEFAULT_COMMIT_INTERVAL);
+        assert!(gate.due(t0 + DEFAULT_COMMIT_INTERVAL));
+        gate.mark(t0 + DEFAULT_COMMIT_INTERVAL);
         assert!(
-            gate.due(t0 + ASYNC_COMMIT_INTERVAL),
+            gate.due(t0 + DEFAULT_COMMIT_INTERVAL),
             "a confirmed re-offer reopens the gate at once"
         );
     }
@@ -13503,7 +13507,7 @@ mod async_commit_gate_tests {
     /// issued one does, as in 0.15: the policy's pacing is the window.
     #[test]
     fn interval_treats_a_rejected_commit_as_an_issued_one() {
-        let mut gate = AsyncCommitGate::new(CommitPolicy::Interval(INTERVAL));
+        let mut gate = CommitGate::new(CommitPolicy::Interval(INTERVAL));
         let t0 = Instant::now();
         gate.mark_rejected(t0);
         assert!(!gate.due(t0 + INTERVAL / 2));

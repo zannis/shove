@@ -2181,7 +2181,7 @@ mod tests {
         let _ = KafkaConsumerGroupConfig::new(1..=1).with_commit_interval(Duration::ZERO);
     }
 
-    /// `AsyncCommitGate::deadline` adds the interval to an `Instant`, so an
+    /// `CommitGate::deadline` adds the interval to an `Instant`, so an
     /// interval the sum cannot represent must be refused here, at the
     /// fail-fast point, and not first met as a panic in the receive loop.
     #[test]
