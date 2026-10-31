@@ -2514,18 +2514,48 @@ async fn run_delayed_republish(
 // Handler invocation
 // ---------------------------------------------------------------------------
 
+/// How a [`guarded`] call ended.
+enum Guarded<T> {
+    Done(T),
+    Panicked,
+    /// The call outlasted this limit and was dropped.
+    TimedOut(Duration),
+}
+
+/// Awaits `fut` on the task that calls it, with panic isolation and an
+/// optional timeout, and records no metric. A panic inside `fut` is caught
+/// via `AssertUnwindSafe(...).catch_unwind()`, and a call that outlasts
+/// `timeout` is dropped at its next await point.
+///
+/// perf-K-7: panic isolation previously spawned an inner `tokio::spawn` to
+/// catch panics via JoinError. The spawn allocated a task struct + scheduler
+/// enqueue per message — combined with the wrapper spawn (now removed) and
+/// outer outcome spawn, that was 3 spawns per message. catch_unwind achieves
+/// the same panic-isolation outcome without the task alloc.
+async fn guarded<F: Future>(fut: F, timeout: Option<Duration>) -> Guarded<F::Output> {
+    use futures_util::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    let safe_fut = AssertUnwindSafe(fut).catch_unwind();
+    match timeout {
+        Some(limit) => match tokio::time::timeout(limit, safe_fut).await {
+            Ok(Ok(output)) => Guarded::Done(output),
+            Ok(Err(_panic)) => Guarded::Panicked,
+            Err(_elapsed) => Guarded::TimedOut(limit),
+        },
+        None => match safe_fut.await {
+            Ok(output) => Guarded::Done(output),
+            Err(_panic) => Guarded::Panicked,
+        },
+    }
+}
+
 /// Invoke the handler future with an optional timeout, emitting inflight /
 /// consumed / duration metrics. Returns `Outcome::Retry` on timeout or panic.
 ///
-/// Awaits the handler future with timeout + panic isolation, recording
-/// per-outcome metrics. A panic inside the user's handler is caught via
-/// `AssertUnwindSafe(...).catch_unwind()` and surfaced as `Outcome::Retry`.
-///
-/// perf-K-7: this previously spawned an inner `tokio::spawn` to catch panics
-/// via JoinError. The spawn allocated a task struct + scheduler enqueue per
-/// message — combined with the wrapper spawn (now removed) and outer outcome
-/// spawn, that was 3 spawns per message. catch_unwind achieves the same
-/// panic-isolation outcome without the task alloc.
+/// Awaits the handler future under [`guarded`], recording per-outcome
+/// metrics. A panic inside the user's handler is surfaced as
+/// `Outcome::Retry`, and a timeout as the configured timeout outcome.
 async fn invoke_handler<F>(
     fut: F,
     timeout: Option<Duration>,
@@ -2536,33 +2566,20 @@ async fn invoke_handler<F>(
 where
     F: std::future::Future<Output = Outcome> + Send,
 {
-    use futures_util::FutureExt;
-    use std::panic::AssertUnwindSafe;
-
     let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
-    let safe_fut = AssertUnwindSafe(fut).catch_unwind();
-    let outcome = match timeout {
-        Some(duration) => match tokio::time::timeout(duration, safe_fut).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(_panic)) => {
-                tracing::warn!("handler panicked, retrying message");
-                Outcome::Retry
-            }
-            Err(_) => {
-                let resolved = handler_timeout_outcome(timeout_outcome);
-                tracing::warn!(outcome = ?resolved, "handler timed out after {duration:?}");
-                metrics::record_failed(topic, group, metrics::FailReason::Timeout);
-                resolved
-            }
-        },
-        None => match safe_fut.await {
-            Ok(o) => o,
-            Err(_panic) => {
-                tracing::warn!("handler panicked, retrying message");
-                Outcome::Retry
-            }
-        },
+    let outcome = match guarded(fut, timeout).await {
+        Guarded::Done(outcome) => outcome,
+        Guarded::Panicked => {
+            tracing::warn!("handler panicked, retrying message");
+            Outcome::Retry
+        }
+        Guarded::TimedOut(duration) => {
+            let resolved = handler_timeout_outcome(timeout_outcome);
+            tracing::warn!(outcome = ?resolved, "handler timed out after {duration:?}");
+            metrics::record_failed(topic, group, metrics::FailReason::Timeout);
+            resolved
+        }
     };
     let elapsed = start.elapsed().as_secs_f64();
     metrics::record_consumed(topic, group, &outcome);
@@ -14265,6 +14282,54 @@ mod stop_drain_tests {
             "the drain rides the failure out and takes the permit: {drained:?}"
         );
         handler_ends.await.expect("the handler ends");
+    }
+}
+
+/// [`guarded`]: the call guard under every handler invocation.
+#[cfg(test)]
+mod guarded_tests {
+    use super::*;
+
+    async fn panics() -> u32 {
+        panic!("a handler that panics");
+    }
+
+    #[tokio::test]
+    async fn a_call_that_returns_is_done() {
+        assert!(matches!(guarded(async { 7 }, None).await, Guarded::Done(7)));
+        assert!(matches!(
+            guarded(async { 7 }, Some(Duration::from_secs(5))).await,
+            Guarded::Done(7)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_panic_is_caught_on_the_task_that_calls() {
+        assert!(matches!(guarded(panics(), None).await, Guarded::Panicked));
+        assert!(matches!(
+            guarded(panics(), Some(Duration::from_secs(5))).await,
+            Guarded::Panicked
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_outlasts_the_limit_is_dropped() {
+        let limit = Duration::from_secs(30);
+        let call = guarded(std::future::pending::<()>(), Some(limit)).await;
+        assert!(matches!(call, Guarded::TimedOut(reported) if reported == limit));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_limit_waits_as_long_as_the_call_runs() {
+        let call = guarded(
+            async {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                7
+            },
+            None,
+        )
+        .await;
+        assert!(matches!(call, Guarded::Done(7)));
     }
 }
 
