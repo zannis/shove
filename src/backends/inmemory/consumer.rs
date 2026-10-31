@@ -33,7 +33,7 @@ use crate::routing::{
     PoisonedKeys, RetryDecision, decide_retry, handler_timeout_outcome, hold_index,
 };
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
-use crate::topology::{QueueTopology, SequenceFailure};
+use crate::topology::{HoldQueue, QueueTopology, SequenceFailure};
 use crate::{ConsumerOptions, InMemory};
 
 /// Consumes messages from an [`InMemoryBroker`] queue.
@@ -792,7 +792,8 @@ async fn run_fifo_shard<T, H>(
             let (outcome, pre_handler_reason) = outcome;
             match outcome {
                 Outcome::Ack => {}
-                Outcome::Retry => {
+                // A `Defer` was turned into a `Retry` above.
+                Outcome::Retry | Outcome::Defer => {
                     let retry_count = get_retry_count(&env.headers);
                     if retry_count >= options.max_retries {
                         // Burning the last retry is an independent failure: this
@@ -810,14 +811,12 @@ async fn run_fifo_shard<T, H>(
                     } else {
                         // Inline sleep (blocks this shard until republish completes).
                         let hold_queues = topology.hold_queues();
-                        let delay = if hold_queues.is_empty() {
-                            Duration::ZERO
-                        } else {
-                            hold_queues[hold_index(retry_count, hold_queues.len())].delay()
-                        };
+                        let delay = hold_index(retry_count, hold_queues.len())
+                            .and_then(|index| hold_queues.get(index))
+                            .map_or(Duration::ZERO, HoldQueue::delay);
 
                         let mut new_env = env;
-                        set_retry_count(&mut new_env.headers, retry_count + 1);
+                        set_retry_count(&mut new_env.headers, retry_count.saturating_add(1));
                         new_env.reset_delivery_count();
 
                         let cancelled = tokio::select! {
@@ -931,7 +930,6 @@ async fn run_fifo_shard<T, H>(
                     )
                     .await;
                 }
-                Outcome::Defer => unreachable!("Defer normalized to Retry above"),
             }
 
             finish(&shard, &busy, &options);
@@ -1221,18 +1219,22 @@ fn schedule_redelivery(
 ) {
     let retry_count = get_retry_count(&env.headers);
     let hold_queues = topology.hold_queues();
-    let delay = if hold_queues.is_empty() {
-        if !increment {
-            tracing::warn!(
-                queue = topology.queue(),
-                "Defer with no hold queues configured — falling back to zero delay"
-            );
-        }
-        Duration::ZERO
-    } else if increment {
-        hold_queues[hold_index(retry_count, hold_queues.len())].delay()
+    let tier = if increment {
+        hold_index(retry_count, hold_queues.len()).and_then(|index| hold_queues.get(index))
     } else {
-        hold_queues[0].delay()
+        hold_queues.first()
+    };
+    let delay = match tier {
+        Some(tier) => tier.delay(),
+        None => {
+            if !increment {
+                tracing::warn!(
+                    queue = topology.queue(),
+                    "Defer with no hold queues configured — falling back to zero delay"
+                );
+            }
+            Duration::ZERO
+        }
     };
 
     let mut env = env;
@@ -1240,7 +1242,7 @@ fn schedule_redelivery(
         // `Retry` is a republish on every real backend, which resets the
         // broker's own attempt counter. Model that here so handlers written
         // against the in-process broker behave the same in production.
-        set_retry_count(&mut env.headers, retry_count + 1);
+        set_retry_count(&mut env.headers, retry_count.saturating_add(1));
         env.reset_delivery_count();
     } else {
         // `Defer` is a nak-in-place on JetStream — same message, one more

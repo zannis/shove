@@ -29,7 +29,7 @@ use rdkafka::{ClientConfig, ClientContext, Offset, Statistics, TopicPartitionLis
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
+use uuid::{Builder, Uuid};
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backend::batch_consumer::settling::{
@@ -1365,8 +1365,10 @@ fn copy_message_id(base: &str, hop: Hop) -> String {
     match hop {
         Hop::Retry(attempt) => format!("{base}-r{attempt}"),
         Hop::Defer => {
+            // rand's thread RNG calls the OS only to reseed, once per 64 KiB of output.
+            let id = Builder::from_random_bytes(rand::random()).into_uuid();
             let mut buf = Uuid::encode_buffer();
-            let uuid = Uuid::new_v4().hyphenated().encode_lower(&mut buf);
+            let uuid = id.hyphenated().encode_lower(&mut buf);
             format!("{base}-d{uuid}")
         }
         Hop::DeadLetter(death_count) => format!("{base}-dlq{death_count}"),
@@ -2551,10 +2553,117 @@ impl<T: Topic, H: MessageHandler<T>> Dispatch<T, H> {
 /// use for their own metadata round trips.
 const BROADCAST_ASSIGN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often an assign-only broadcast subscriber checks for partitions added
-/// after it connected. Manual assignments do not participate in rebalances, so
-/// metadata growth has to be reflected explicitly.
+/// How long an assign-only broadcast subscriber waits, after its initial
+/// assignment and after each check ends, before it checks for partitions
+/// added after it connected. Manual assignments do not participate in
+/// rebalances, so metadata growth has to be reflected explicitly.
 const BROADCAST_ASSIGN_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The answer of the broadcast assignment refresh in `slot`, never ready
+/// while the slot is empty.
+async fn refresh_answer<T>(
+    slot: &mut Option<tokio::task::JoinHandle<T>>,
+) -> std::result::Result<T, tokio::task::JoinError> {
+    match slot {
+        Some(refresh) => refresh.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// What one broadcast assignment refresh comes to. The partitions it added
+/// are logged. A refresh that failed leaves the existing assignment valid,
+/// so it is logged and the next one tries again, instead of a reconnect at
+/// the tail that would open a delivery gap on every partition. A refresh
+/// task that ended without an answer is the connection's error.
+fn settle_broadcast_refresh(
+    queue: &str,
+    refreshed: std::result::Result<Result<usize>, tokio::task::JoinError>,
+) -> Result<()> {
+    match refreshed {
+        Ok(Ok(0)) => Ok(()),
+        Ok(Ok(added)) => {
+            tracing::info!(
+                queue,
+                added,
+                "broadcast subscription extended its partition assignment"
+            );
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                queue,
+                "broadcast assignment refresh failed; keeping the current assignment"
+            );
+            Ok(())
+        }
+        Err(e) => Err(ShoveError::Connection(format!(
+            "broadcast assignment refresh task panicked: {e}"
+        ))),
+    }
+}
+
+/// Test-only probe (see the `test-support` feature) on the broadcast loop's
+/// assignment refresh. Two counters count the refreshes that have started
+/// and ended, and a delay a test sets holds each refresh that starts after
+/// it, on the refresh's own thread and before its metadata request, as a
+/// slow metadata answer would. The broker answers a connection's requests
+/// in order, so a metadata answer slowed at the broker would hold the
+/// fetches queued behind it as well; the delay holds the refresh alone.
+/// nextest runs each test in its own process, so the counters start at zero
+/// and the delay at none.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod broadcast_refresh_probe {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    static DELAY: Mutex<Duration> = Mutex::new(Duration::ZERO);
+    static STARTED: AtomicUsize = AtomicUsize::new(0);
+    static ENDED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Hold every refresh that starts from here on for `delay`.
+    pub fn delay_refreshes(delay: Duration) {
+        *DELAY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = delay;
+    }
+
+    /// Refreshes started so far.
+    pub fn started() -> usize {
+        STARTED.load(Ordering::SeqCst)
+    }
+
+    /// Refreshes ended so far, whatever they answered.
+    pub fn ended() -> usize {
+        ENDED.load(Ordering::SeqCst)
+    }
+
+    /// How long after a refresh ends the next one is due.
+    pub fn interval() -> Duration {
+        super::BROADCAST_ASSIGN_REFRESH_INTERVAL
+    }
+
+    /// Counts a refresh in and holds it for the delay; the guard counts it
+    /// out when it drops.
+    pub(super) fn enter() -> Refreshing {
+        STARTED.fetch_add(1, Ordering::SeqCst);
+        let delay = *DELAY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::thread::sleep(delay);
+        Refreshing
+    }
+
+    pub(super) struct Refreshing;
+
+    impl Drop for Refreshing {
+        fn drop(&mut self) {
+            ENDED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
 
 /// Whether a `recv` error on the groupless broadcast path is the one error
 /// its inert `group.id` can provoke and nothing else.
@@ -3547,14 +3656,6 @@ impl KafkaStreamConsumer {
         }
     }
 
-    fn position(&self) -> KafkaResult<TopicPartitionList> {
-        match self {
-            Self::Default(c) => c.position(),
-            #[cfg(feature = "kafka-msk-iam")]
-            Self::MskIam(c) => c.position(),
-        }
-    }
-
     /// Whether librdkafka has given this member's assignment up as lost,
     /// see [`FinalCommit::assignment_lost`].
     fn assignment_lost(&self) -> bool {
@@ -3726,15 +3827,19 @@ impl KafkaStreamConsumer {
         Ok(tpl)
     }
 
-    /// Extend a manual broadcast assignment with partitions added since the
-    /// previous metadata snapshot.
+    /// Extend a manual broadcast assignment with the partitions `topic` has
+    /// gained since it was assigned, and return how many were added.
     ///
-    /// Existing partitions are re-assigned at their current consumer position;
-    /// only newly discovered partitions are resolved, at the same `start` the
-    /// subscription began with, so a `Head` subscription does not skip a new
-    /// partition's first records and a `Tail` one still joins it at the tail.
-    /// This avoids both replaying already-delivered records and moving an
-    /// existing partition.
+    /// A partition the assignment does not hold yet is resolved at the same
+    /// `start` the subscription began with, so a `Head` subscription does not
+    /// skip a new partition's first records and a `Tail` one still joins it
+    /// at the tail. The new partitions are added with `incremental_assign`,
+    /// which leaves every partition already assigned fetching where it is:
+    /// nothing on one is handed over again or skipped. Assigning one of them
+    /// again would restart it from a position read before the call, and one
+    /// that has delivered nothing yet has no position: librdkafka would ask
+    /// the group coordinator for its committed offset, which a groupless
+    /// subscription has none of and may not be allowed to look up.
     ///
     /// **Blocking** for the metadata fetch; callers must use `spawn_blocking`.
     fn refresh_broadcast_partitions(
@@ -3743,12 +3848,14 @@ impl KafkaStreamConsumer {
         start: Option<BroadcastStart>,
         timeout: Duration,
     ) -> Result<usize> {
+        #[cfg(feature = "test-support")]
+        let _refreshing = broadcast_refresh_probe::enter();
         let metadata = self
             .fetch_metadata(Some(topic), timeout)
             .map_err(|e| map_kafka_error(&format!("failed to refresh metadata for {topic}"), e))?;
-        let mut positions = self.position().map_err(|e| {
+        let assigned = self.assignment().map_err(|e| {
             map_kafka_error(
-                &format!("failed to read broadcast positions for {topic}"),
+                &format!("failed to read the broadcast assignment of {topic}"),
                 e,
             )
         })?;
@@ -3761,7 +3868,7 @@ impl KafkaStreamConsumer {
                     .partitions()
                     .iter()
                     .map(|partition| partition.id())
-                    .filter(|partition| positions.find_partition(topic, *partition).is_none())
+                    .filter(|partition| assigned.find_partition(topic, *partition).is_none())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -3770,20 +3877,7 @@ impl KafkaStreamConsumer {
         }
 
         let additions = self.broadcast_start_positions(topic, &new_partitions, start, timeout)?;
-        for elem in additions.elements_for_topic(topic) {
-            positions
-                .add_partition_offset(topic, elem.partition(), elem.offset())
-                .map_err(|e| {
-                    map_kafka_error(
-                        &format!(
-                            "failed to extend the assignment with {topic}[{}]",
-                            elem.partition()
-                        ),
-                        e,
-                    )
-                })?;
-        }
-        self.assign(&positions).map_err(|e| {
+        self.incremental_assign(&additions).map_err(|e| {
             map_kafka_error(
                 &format!("failed to extend broadcast assignment for {topic}"),
                 e,
@@ -3830,6 +3924,14 @@ impl KafkaStreamConsumer {
             Self::Default(c) => c.assign(tpl),
             #[cfg(feature = "kafka-msk-iam")]
             Self::MskIam(c) => c.assign(tpl),
+        }
+    }
+
+    fn incremental_assign(&self, tpl: &TopicPartitionList) -> KafkaResult<()> {
+        match self {
+            Self::Default(c) => c.incremental_assign(tpl),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.incremental_assign(tpl),
         }
     }
 }
@@ -3909,8 +4011,49 @@ fn consumer_config(
     Ok(base)
 }
 
+/// The consumer a consume loop of `topic` reads with, built on a blocking
+/// thread: librdkafka's constructor is synchronous and may block on TLS
+/// material, so it never runs on a runtime thread. Every loop builds its
+/// consumer here, on every connection. It comes back as the loop's own
+/// [`LoopConsumer`], so a loop dropped while it waits for the build still
+/// closes the consumer off the runtime thread.
 #[allow(clippy::too_many_arguments)]
-fn create_stream_consumer(
+async fn create_stream_consumer(
+    base: ClientConfig,
+    group_id: &str,
+    auto_offset_reset: KafkaAutoOffsetReset,
+    max_poll_interval_ms: u32,
+    fetch_queue: &FetchQueueTuning,
+    topic: &str,
+    rebalance_tx: std_mpsc::Sender<RebalanceEvent>,
+    assignments: AssignmentTokens,
+    #[cfg(feature = "kafka-msk-iam")] msk_context: Option<MskIamContext>,
+) -> Result<LoopConsumer> {
+    let group_id = group_id.to_owned();
+    let fetch_queue = *fetch_queue;
+    let topic = topic.to_owned();
+    tokio::task::spawn_blocking(move || {
+        build_stream_consumer(
+            base,
+            &group_id,
+            auto_offset_reset,
+            max_poll_interval_ms,
+            &fetch_queue,
+            &topic,
+            rebalance_tx,
+            assignments,
+            #[cfg(feature = "kafka-msk-iam")]
+            msk_context,
+        )
+        .map(|consumer| LoopConsumer::new(consumer, &topic))
+    })
+    .await
+    .map_err(|e| ShoveError::Connection(format!("consumer build task failed: {e}")))?
+}
+
+/// [`create_stream_consumer`]'s build, on its blocking thread.
+#[allow(clippy::too_many_arguments)]
+fn build_stream_consumer(
     base: ClientConfig,
     group_id: &str,
     auto_offset_reset: KafkaAutoOffsetReset,
@@ -4555,8 +4698,8 @@ impl FinalCommit for LoopConsumer {
 }
 
 /// A consume loop's own handle on its consumer: the standard consumer's, a
-/// sequenced consumer's, the batch consumer's and the DLQ drain's, each the
-/// last holder in the ordinary case.
+/// sequenced consumer's, the batch consumer's, the DLQ drain's and the
+/// broadcast subscription's, each the last holder in the ordinary case.
 ///
 /// Dropping the last handle runs `rd_kafka_consumer_close`, which blocks
 /// until librdkafka has left the group: rust-rdkafka 0.39 polls until the
@@ -8241,21 +8384,19 @@ async fn run_serial_connection<L: SerialLoop>(serial: &L) -> Result<()> {
     // The map the rebalance callback cancels revoked partitions' tokens
     // in; the tracker below shares it. See `AssignmentTokens`.
     let assignments = AssignmentTokens::default();
-    let consumer = LoopConsumer::new(
-        create_stream_consumer(
-            connection.client.base_config(),
-            connection.group_id,
-            connection.auto_offset_reset,
-            connection.max_poll_interval_ms,
-            &connection.fetch_queue,
-            queue,
-            rebalance_tx,
-            assignments.clone(),
-            #[cfg(feature = "kafka-msk-iam")]
-            connection.client.msk_context(),
-        )?,
+    let consumer = create_stream_consumer(
+        connection.client.base_config(),
+        connection.group_id,
+        connection.auto_offset_reset,
+        connection.max_poll_interval_ms,
+        &connection.fetch_queue,
         queue,
-    );
+        rebalance_tx,
+        assignments.clone(),
+        #[cfg(feature = "kafka-msk-iam")]
+        connection.client.msk_context(),
+    )
+    .await?;
     let mut state = FifoState {
         tracker: OffsetTracker::with_assignments(queue.to_string(), assignments),
         rebalance_rx,
@@ -9248,21 +9389,19 @@ impl KafkaConsumer {
                 // for: through the final commit on a stop, through
                 // `close_without_commit` on an `Err`, a failed subscribe
                 // included. An abort leaves it to `LoopConsumer`'s drop.
-                let consumer = LoopConsumer::new(
-                    create_stream_consumer(
-                        client.base_config(),
-                        &group_id,
-                        auto_offset_reset,
-                        max_poll_interval_ms,
-                        &fetch_queue,
-                        queue,
-                        rebalance_tx,
-                        assignments.clone(),
-                        #[cfg(feature = "kafka-msk-iam")]
-                        client.msk_context(),
-                    )?,
+                let consumer = create_stream_consumer(
+                    client.base_config(),
+                    &group_id,
+                    auto_offset_reset,
+                    max_poll_interval_ms,
+                    &fetch_queue,
                     queue,
-                );
+                    rebalance_tx,
+                    assignments.clone(),
+                    #[cfg(feature = "kafka-msk-iam")]
+                    client.msk_context(),
+                )
+                .await?;
                 if let Err(e) = consumer.subscribe(&[queue]) {
                     let e = map_kafka_error("failed to subscribe", e);
                     close_without_commit(consumer, queue, SHUTDOWN_COMMIT_DEADLINE).await;
@@ -10434,21 +10573,19 @@ impl KafkaConsumer {
             async move {
                 let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
                 let assignments = AssignmentTokens::default();
-                let consumer = LoopConsumer::new(
-                    create_stream_consumer(
-                        client.base_config(),
-                        &group_id,
-                        auto_offset_reset,
-                        max_poll_interval_ms,
-                        &fetch_queue,
-                        queue,
-                        rebalance_tx,
-                        assignments.clone(),
-                        #[cfg(feature = "kafka-msk-iam")]
-                        client.msk_context(),
-                    )?,
+                let consumer = create_stream_consumer(
+                    client.base_config(),
+                    &group_id,
+                    auto_offset_reset,
+                    max_poll_interval_ms,
+                    &fetch_queue,
                     queue,
-                );
+                    rebalance_tx,
+                    assignments.clone(),
+                    #[cfg(feature = "kafka-msk-iam")]
+                    client.msk_context(),
+                )
+                .await?;
                 if let Err(e) = consumer.subscribe(&[queue]) {
                     let e = map_kafka_error("failed to subscribe", e);
                     close_without_commit(consumer, queue, SHUTDOWN_COMMIT_DEADLINE).await;
@@ -10882,6 +11019,10 @@ impl KafkaConsumer {
     /// commit the coordinator rejects is re-offered, and a member whose
     /// commits keep being rejected with no rebalance resolving them is
     /// treated as fenced and reconnects, as the standard consumer does.
+    ///
+    /// The consumer runs on a task of its own. Dropping the returned future
+    /// aborts that task: no final commit is made, and its consumer closes on
+    /// a thread of its own.
     pub async fn run_fifo<T, H>(
         &self,
         handler: H,
@@ -10909,6 +11050,11 @@ impl KafkaConsumer {
         let handles = self
             .spawn_fifo_shards_checked::<T, H>(handler, ctx, options)
             .await?;
+        // Dropping this future aborts the shards it waits for.
+        let _shards: Vec<AbortOnDrop> = handles
+            .iter()
+            .map(|handle| AbortOnDrop(handle.abort_handle()))
+            .collect();
         // Kafka has exactly one FIFO task per call (single consumer, partition ordering).
         for handle in handles {
             match handle.await {
@@ -11220,12 +11366,28 @@ impl KafkaConsumer {
     /// start - the tail unless `with_broadcast_start` says otherwise - with no
     /// `subscribe()` and no commit anywhere in the loop. Nothing is written to
     /// the broker at any point in its life, so there is nothing to tear down
-    /// when it ends and nothing to reap when the process dies without ending it
-    /// — which is why the teardown here is "drop the consumer handle" and not a
-    /// cleanup path that has to be reached. See
+    /// when it ends and nothing to reap when the process dies without ending
+    /// it. The teardown is the consumer handle's close, which every exit the
+    /// loop takes runs on a thread of its own and waits for, see
+    /// [`close_without_commit`]; an abort leaves it to [`LoopConsumer`]. See
     /// [`broadcast_group_id`](super::constants::broadcast_group_id) for why a
     /// `group.id` string is nonetheless configured, why it is a fixed one, and
     /// why `with_group_id` may replace it.
+    ///
+    /// # Partitions added later
+    ///
+    /// [`BROADCAST_ASSIGN_REFRESH_INTERVAL`] after the initial assignment, and
+    /// as long again after each check ends, the loop checks the topic for
+    /// partitions it does not hold yet and assigns them at the configured
+    /// start, see [`KafkaStreamConsumer::refresh_broadcast_partitions`]. The
+    /// check runs on a blocking thread, and records keep reaching the handler
+    /// while it runs. It holds a handle on the consumer, so a stop that lands
+    /// during a check waits for it before the close, and so does an exit on
+    /// an error. Each of its broker requests is bounded by
+    /// [`BROADCAST_ASSIGN_TIMEOUT`], 10 s. For a `Tail` or `Head` start the
+    /// check is one metadata request. Under `Timestamp`, a check that finds N
+    /// new partitions adds N watermark lookups and one `offsets_for_times`
+    /// call. An abort leaves a check in flight to finish on its thread.
     ///
     /// A reconnect re-assigns at the configured start as it stands *then*: at
     /// the then-current tail by default, so messages published while the
@@ -11334,9 +11496,12 @@ impl KafkaConsumer {
             async move {
                 // A groupless consumer never joins, so the rebalance callbacks
                 // wired into the shared context never fire; the receiver is
-                // dropped deliberately, as in the DLQ loop.
+                // dropped deliberately.
                 let (rebalance_tx, _) = std_mpsc::channel::<RebalanceEvent>();
-                let consumer = Arc::new(create_stream_consumer(
+                // Closed on a thread of its own on every exit, and waited
+                // for, see `close_without_commit`; a failed assign included.
+                // An abort leaves it to `LoopConsumer`'s drop.
+                let consumer = create_stream_consumer(
                     client.base_config(),
                     &group_id,
                     // Inert: every partition is assigned at an explicit offset
@@ -11350,7 +11515,8 @@ impl KafkaConsumer {
                     AssignmentTokens::default(),
                     #[cfg(feature = "kafka-msk-iam")]
                     client.msk_context(),
-                )?);
+                )
+                .await?;
 
                 // A schema registry deployment fault met inside a handler's
                 // task (a deferred redelivery decodes there) ends the
@@ -11377,9 +11543,9 @@ impl KafkaConsumer {
                 // never subscribes, so it has no assignor and librdkafka reports
                 // rebalance protocol NONE, under which the eager `assign()` is
                 // accepted. Pinned by `kafka_broadcast_leaves_no_consumer_group`.
-                let assign_consumer = consumer.clone();
+                let assign_consumer = Arc::clone(&consumer);
                 let assign_topic = queue.to_string();
-                let partitions = tokio::task::spawn_blocking(move || {
+                let assigned = match tokio::task::spawn_blocking(move || {
                     assign_consumer.assign_all_partitions_at(
                         &assign_topic,
                         start,
@@ -11387,9 +11553,19 @@ impl KafkaConsumer {
                     )
                 })
                 .await
-                .map_err(|e| {
-                    ShoveError::Connection(format!("broadcast assign task panicked: {e}"))
-                })??;
+                {
+                    Ok(assigned) => assigned,
+                    Err(e) => Err(ShoveError::Connection(format!(
+                        "broadcast assign task panicked: {e}"
+                    ))),
+                };
+                let partitions = match assigned {
+                    Ok(partitions) => partitions,
+                    Err(e) => {
+                        close_without_commit(consumer, queue, SHUTDOWN_COMMIT_DEADLINE).await;
+                        return Err(e);
+                    }
+                };
 
                 tracing::info!(
                     queue,
@@ -11404,14 +11580,20 @@ impl KafkaConsumer {
                 // `interval`'s first tick is immediate. The initial assignment
                 // above is already the authoritative metadata snapshot.
                 assignment_refresh.tick().await;
+                let mut refresh: Option<tokio::task::JoinHandle<Result<usize>>> = None;
 
                 let tail_cancel = task_cancel.clone();
                 let tail_semaphore = semaphore.clone();
                 let tail_processing = processing.clone();
+                // The loop borrows the consumer, which the tail below closes.
+                let loop_consumer = &consumer;
+                let loop_refresh = &mut refresh;
                 let ended: Result<()> = async move {
+                let consumer = loop_consumer;
+                let refresh = loop_refresh;
                 let stop = shutdown.cancelled();
                 tokio::pin!(stop);
-                let mut stream = RecvStream::new(&consumer);
+                let mut stream = RecvStream::new(consumer);
                 loop {
                     let (payload, headers, coordinates) = tokio::select! {
                         biased;
@@ -11420,8 +11602,8 @@ impl KafkaConsumer {
                             tracing::info!(queue, "shutdown signal received, draining in-flight handlers");
                             // Nothing to commit and nothing to delete: the
                             // subscription exists only in this consumer handle,
-                            // which is dropped when this future resolves.
-                            let _ = semaphore.acquire_many(prefetch_count as u32).await;
+                            // which the tail closes once this future resolves.
+                            let _ = semaphore.acquire_many(u32::from(prefetch_count)).await;
                             return Ok(());
                         }
 
@@ -11433,45 +11615,24 @@ impl KafkaConsumer {
                             return Err(e);
                         }
 
-                        refresh = async {
-                            assignment_refresh.tick().await;
-                            let refresh_consumer = consumer.clone();
+                        refreshed = refresh_answer(refresh), if refresh.is_some() => {
+                            *refresh = None;
+                            // Its deadline may have passed meanwhile; restarted, refreshes never run back to back.
+                            assignment_refresh.reset();
+                            settle_broadcast_refresh(queue, refreshed)?;
+                            continue;
+                        }
+
+                        _ = assignment_refresh.tick(), if refresh.is_none() => {
+                            let refresh_consumer = Arc::clone(consumer);
                             let refresh_topic = queue.to_string();
-                            tokio::task::spawn_blocking(move || {
+                            *refresh = Some(tokio::task::spawn_blocking(move || {
                                 refresh_consumer.refresh_broadcast_partitions(
                                     &refresh_topic,
                                     start,
                                     BROADCAST_ASSIGN_TIMEOUT,
                                 )
-                            })
-                            .await
-                        } => {
-                            match refresh {
-                                Ok(Ok(added)) if added > 0 => {
-                                    tracing::info!(
-                                        queue,
-                                        added,
-                                        "broadcast subscription extended its partition assignment"
-                                    );
-                                }
-                                Ok(Ok(_)) => {}
-                                Ok(Err(e)) => {
-                                    // The existing assignment remains valid.
-                                    // Retry on the next tick instead of
-                                    // reconnecting at the tail and creating an
-                                    // avoidable delivery gap on every partition.
-                                    tracing::warn!(
-                                        error = %e,
-                                        queue,
-                                        "broadcast assignment refresh failed; keeping the current assignment"
-                                    );
-                                }
-                                Err(e) => {
-                                    return Err(ShoveError::Connection(format!(
-                                        "broadcast assignment refresh task panicked: {e}"
-                                    )));
-                                }
-                            }
+                            }));
                             continue;
                         }
 
@@ -11576,7 +11737,7 @@ impl KafkaConsumer {
                                             }
                                             Ok(RegistryDecode::Unavailable { id, error }) => {
                                                 if !stall
-                                                    .wait(&consumer, &shutdown, Some(&mut fault_rx), &topic, group.as_deref(), queue, id, &error)
+                                                    .wait(consumer, &shutdown, Some(&mut fault_rx), &topic, group.as_deref(), queue, id, &error)
                                                     .await?
                                                 {
                                                     break Staged::Stop;
@@ -11592,7 +11753,7 @@ impl KafkaConsumer {
                                             }
                                         }
                                     };
-                                    stall.end(&consumer)?;
+                                    stall.end(consumer)?;
                                     staged
                                 }
                                 None => {
@@ -11837,13 +11998,27 @@ impl KafkaConsumer {
                 }
                 }
                 .await;
-                // Every fatal exit passes through here: the child token ends
-                // the handler task's redelivery wait, the permit drain proves
-                // it has released its permit, and only then is the busy flag
-                // cleared. Nothing is committed on this path at any time.
+                // Every exit passes through here. A refresh in flight holds a
+                // handle on the consumer, so it is waited for first, and the
+                // consumer is then closed on a thread of its own and waited
+                // for, see `close_without_commit`. A fatal exit then has the
+                // child token end the handler tasks' redelivery waits, the
+                // permit drain proves each has released its permit, and only
+                // then is the busy flag cleared. Nothing is committed on this
+                // path at any time.
+                if let Some(in_flight) = refresh.take()
+                    && let Err(e) = settle_broadcast_refresh(queue, in_flight.await)
+                {
+                    tracing::error!(
+                        error = %e,
+                        queue,
+                        "the assignment refresh in flight when the broadcast subscription ended failed"
+                    );
+                }
+                close_without_commit(consumer, queue, SHUTDOWN_COMMIT_DEADLINE).await;
                 let Err(e) = ended else { return Ok(()) };
                 tail_cancel.cancel();
-                let _ = tail_semaphore.acquire_many(prefetch_count as u32).await;
+                let _ = tail_semaphore.acquire_many(u32::from(prefetch_count)).await;
                 tail_processing.store(false, Ordering::Release);
                 Err(e)
             }
@@ -15103,21 +15278,20 @@ mod stop_drain_tests {
         let mut config = ClientConfig::new();
         config.set("bootstrap.servers", "127.0.0.1:1");
         let (rebalance_tx, _rebalance_rx) = std_mpsc::channel();
-        let consumer = Arc::new(
-            create_stream_consumer(
-                config,
-                "stop-drain",
-                KafkaAutoOffsetReset::Earliest,
-                MAX_POLL_INTERVAL_MS,
-                &FetchQueueTuning::default(),
-                "stop-drain",
-                rebalance_tx,
-                AssignmentTokens::default(),
-                #[cfg(feature = "kafka-msk-iam")]
-                None,
-            )
-            .expect("creating a consumer needs no broker"),
-        );
+        let consumer = create_stream_consumer(
+            config,
+            "stop-drain",
+            KafkaAutoOffsetReset::Earliest,
+            MAX_POLL_INTERVAL_MS,
+            &FetchQueueTuning::default(),
+            "stop-drain",
+            rebalance_tx,
+            AssignmentTokens::default(),
+            #[cfg(feature = "kafka-msk-iam")]
+            None,
+        )
+        .await
+        .expect("creating a consumer needs no broker");
         consumer
             .subscribe(&["stop-drain"])
             .expect("subscribing needs no broker");
@@ -17148,6 +17322,7 @@ mod reconnect_tests {
 #[cfg(test)]
 mod message_id_tests {
     use super::*;
+    use uuid::{Variant, Version};
 
     fn record(headers: &[(&str, &str)]) -> RecordHeaders {
         RecordHeaders {
@@ -17183,11 +17358,13 @@ mod message_id_tests {
         assert_eq!(copy_message_id("a-dlq", Hop::DeadLetter(1)), "a-dlq-dlq1");
         assert_eq!(copy_message_id("a", Hop::DeadLetter(2)), "a-dlq2");
         let deferred = copy_message_id("a", Hop::Defer);
+        let suffix = deferred
+            .strip_prefix("a-d")
+            .and_then(|suffix| Uuid::try_parse(suffix).ok());
         assert!(
-            deferred
-                .strip_prefix("a-d")
-                .is_some_and(|suffix| Uuid::try_parse(suffix).is_ok()),
-            "a Defer copy's id is the base, `-d` and a UUID"
+            suffix.is_some_and(|uuid| uuid.get_version() == Some(Version::Random)
+                && uuid.get_variant() == Variant::RFC4122),
+            "a Defer copy's id is the base, `-d` and a random UUID: {deferred}"
         );
         assert_ne!(deferred, copy_message_id("a", Hop::Defer));
     }
@@ -17304,6 +17481,122 @@ mod consumer_config_tests {
                 if msg.contains("with_queued_max_messages_kbytes") && msg.contains("1..=2097151")),
             "{err:?}"
         );
+    }
+}
+
+/// [`create_stream_consumer`]: every consume loop builds its consumer
+/// through it, and librdkafka's constructor runs off the runtime thread.
+#[cfg(all(test, feature = "kafka-ssl", unix))]
+mod stream_consumer_build_tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    /// How long the writer waits for the build to open the FIFO, which it
+    /// does within milliseconds.
+    const READER_BOUND: Duration = Duration::from_secs(10);
+
+    /// A client config whose CA file is a FIFO in a fresh temp dir. The
+    /// writer opens the FIFO once librdkafka's constructor has opened it for
+    /// reading, so it wakes exactly when the build is inside the native call,
+    /// holds it there for `hold`, then hands it bytes OpenSSL rejects. A
+    /// build that never opens the FIFO leaves the writer with an error after
+    /// `READER_BOUND`, so joining it never hangs. Returns the temp dir to
+    /// remove and the writer to join once the build has returned.
+    fn config_whose_ca_read_stalls(
+        hold: Duration,
+    ) -> (
+        ClientConfig,
+        std::path::PathBuf,
+        std::thread::JoinHandle<std::io::Result<()>>,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "shove-consumer-fifo-{}-{}",
+            std::process::id(),
+            hold.as_millis()
+        ));
+        std::fs::create_dir_all(&dir).expect("create the temp dir");
+        let fifo = dir.join("ca.pem");
+        let ca = fifo.to_str().expect("utf-8 path").to_string();
+        let path = std::ffi::CString::new(ca.as_str()).expect("no NUL");
+        let created = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(created, 0, "mkfifo failed");
+        let writer = std::thread::spawn(move || {
+            let mut fifo = open_once_read(&fifo, READER_BOUND)?;
+            std::thread::sleep(hold);
+            fifo.write_all(b"not a certificate\n")
+        });
+        let mut config = ClientConfig::new();
+        config
+            .set("bootstrap.servers", "127.0.0.1:1")
+            .set("security.protocol", "ssl")
+            .set("ssl.ca.location", ca.as_str());
+        (config, dir, writer)
+    }
+
+    /// Opens `fifo` for writing once a reader has it open, for at most
+    /// `bound`. A blocking open would wait for a reader with no bound, so
+    /// the open does not block and is tried again while no reader has it.
+    fn open_once_read(fifo: &std::path::Path, bound: Duration) -> std::io::Result<std::fs::File> {
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(fifo)
+            {
+                // ENXIO: no reader has the FIFO open yet.
+                Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                    if started.elapsed() >= bound {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("the build did not open its CA file within {bound:?}"),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                opened => return opened,
+            }
+        }
+    }
+
+    /// librdkafka's constructor blocks while it reads the CA file, so a
+    /// consumer is built off the runtime: a 10 ms timer on the same
+    /// current-thread runtime fires while the constructor is held on the
+    /// FIFO for 300 ms. The build's failure keeps its type.
+    #[tokio::test]
+    async fn building_a_consumer_leaves_the_runtime_free() {
+        let (config, dir, writer) = config_whose_ca_read_stalls(Duration::from_millis(300));
+        let (rebalance_tx, _rebalance_rx) = std_mpsc::channel();
+        let fetch_queue = FetchQueueTuning::default();
+        let started = tokio::time::Instant::now();
+        let tick = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            started.elapsed()
+        };
+        let build = create_stream_consumer(
+            config,
+            "build-off-runtime",
+            KafkaAutoOffsetReset::Earliest,
+            MAX_POLL_INTERVAL_MS,
+            &fetch_queue,
+            "build-off-runtime",
+            rebalance_tx,
+            AssignmentTokens::default(),
+            #[cfg(feature = "kafka-msk-iam")]
+            None,
+        );
+        let (built, ticked) = tokio::join!(build, tick);
+        let wrote = writer.join().expect("the FIFO writer thread");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        wrote.expect("the writer held the build on its CA file");
+        assert!(
+            ticked < Duration::from_millis(150),
+            "a 10 ms timer waited {ticked:?}"
+        );
+        let err = built.err().expect("the FIFO bytes are not a certificate");
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
     }
 }
 

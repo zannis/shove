@@ -419,6 +419,13 @@ pub mod kafka {
     #[doc(hidden)]
     pub use crate::backends::kafka::permit_wait_probe;
 
+    /// Test-only probe (see the `test-support` feature) on the broadcast
+    /// loop's assignment refresh: counts the refreshes started and ended, and
+    /// holds each one for a delay, for tests that slow a refresh down.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::broadcast_refresh_probe;
+
     /// Test-only seam (see the `test-support` feature): the receive loop's
     /// shutdown commit deadline, for tests that time a shutdown against it.
     #[cfg(feature = "test-support")]

@@ -258,6 +258,8 @@ Keep linger modest when consumers republish on the same client.
 
 `consumer_group()` registers a native Kafka consumer group. `KafkaConsumerGroupConfig::new(min..=max)` sets the autoscale bounds. Kafka handles partition assignment and rebalance automatically when the group membership changes.
 
+librdkafka's constructor can block while it reads TLS files, so every consume loop builds its consumer on a blocking thread, on its first connection and on every reconnect, and none of them holds the runtime's thread.
+
 ### Group configuration
 
 ```rust,no_run
@@ -539,6 +541,10 @@ A subscription reads the [fetch queue settings](#fetch-queue-tuning), and `subsc
   A partition the lookup cannot answer for fails the subscription rather than silently starting at the tail.
 
 A partition added while the subscription runs is picked up within a few seconds and assigned at the same start.
+The subscription checks the topic for new partitions 5 s after it assigns its partitions and 5 s after each check ends.
+Records keep reaching the handler while a check runs.
+The partitions the subscription already reads keep fetching where they are, so nothing on them is skipped or handed over twice, and none of them waits on the inert group's coordinator.
+A stop that lands during a check waits for the check to end, see [Offset commit semantics](#offset-commit-semantics) for how long.
 A reconnect after a broker outage re-resolves the start as it stands then.
 A `Head` subscription therefore replays the retained log again, the price of having no stored position.
 
@@ -741,19 +747,19 @@ Kafka transactions close the replay window differently: `sendOffsetsToTransactio
 An idempotent receiver removes the need for either, by making a replayed record a no-op, which is what `Interval` assumes of a handler.
 `PerRecord` trades throughput for the one-record replay bound where a handler cannot be made idempotent and produces nothing Kafka could tie to the commit.
 
-What the policy does, condition by condition, with the source line as of this change and the test that asserts it:
+What the policy does, condition by condition, with the code that does it, named by file and symbol, and the test that asserts it:
 
-| Condition | Effect | Source line | Conformance assertion |
+| Condition | Effect | Source | Conformance assertion |
 |---|---|---|---|
-| A completion under `PerRecord` | The position is committed synchronously on a thread, and the next record waits for the coordinator's answer. | `src/backends/kafka/consumer.rs:3467`, `CommitSlot::commit_confirmed` | `per_record_issues_one_offset_commit_per_completion` |
-| A record is dropped before the handler | Its position is committed like a completion, and the next record waits the same way, through a refused thread or a rejection. | `src/backends/kafka/consumer.rs:5543-5556`, the pause when a record is taken | `a_record_dropped_before_the_handler_holds_the_next_record_until_its_commit_is_accepted`, `a_record_dropped_before_the_handler_holds_the_next_record_while_its_commit_is_rejected` |
-| A schema registry stall under `PerRecord` | The stall runs inside the pause the take holds, and its end leaves the resume to the commit, so no record is fetched and put back behind it. | `src/backends/kafka/consumer.rs:5616`, `RegistryStall::inside_pause` | `a_per_record_stall_leaves_the_resume_to_the_commit` |
-| The coordinator rejects the commit | The position is re-offered every 500 ms with the assignment paused, and the fence judges the streak at the 60 s floor. | `src/backends/kafka/consumer.rs:198`, `CommitGate::mark_rejected`, and `src/backends/kafka/consumer.rs:2895`, `fence_threshold_over` | `a_rejected_commit_is_re_offered_until_the_fence_fires`, `a_rejected_commit_recovers_on_a_re_offer_before_the_next_record_is_handed_out` |
-| The answer is late | The next record waits for it, and the member keeps polling meanwhile. | `src/backends/kafka/consumer.rs:3530`, the `recv()` arm of `answer_while_polling`, which `CommitSlot::commit_confirmed` waits through | `a_late_answer_holds_the_next_record_while_the_member_keeps_polling` |
-| A `Retry` or `Defer` republish fails | The member ends with a connection error before the next record is handed out, and the reconnect redelivers the record, as under `Interval`. | `src/backends/kafka/consumer.rs:1878`, the `Republished::Failed` arm of `route_outcome` | `a_republish_that_fails_under_per_record_ends_the_member_before_the_next_record`, `failed_republish_does_not_pin_the_partition` |
-| A partition is handed back paused | Every drain that meets the assign, at the top of a pass or in the receive arm, pauses or resumes it with the rest, under either policy. | `src/backends/kafka/consumer.rs:3899`, `reconcile_pause_after_assign` | `a_partition_handed_back_paused_is_resumed_when_a_pass_drains_the_assign`, `a_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_the_assign`, `interval_partition_revoked_while_paused_resumes_on_reassign`, `interval_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_the_assign` |
-| A stop finds a commit in flight | It is waited for up to `PENDING_COMMIT_BUDGET`; an accepted answer is followed by the final commit, a rejected one is re-offered by it, and no answer ends the stop with `ShoveError::Commit` of the `Deadline` kind. | `src/backends/kafka/consumer.rs:3741-3783`, `stop_with_final_commit`, which the shutdown arm of `KafkaConsumer::run` calls | `a_stop_during_a_commit_waits_for_its_answer_and_leaves_the_group_before_returning`, `a_discard_behind_a_commit_rejected_at_the_stop_is_counted_once_by_the_final_commit`, `a_per_record_stop_against_a_frozen_coordinator_reports_the_commit_it_could_not_finish`, `an_interval_stop_with_its_commit_unanswered_reports_the_pending_share`, `a_sequenced_stop_with_its_commit_unanswered_reports_the_pending_share` |
-| A prefetch above one with concurrent processing on | Refused at `KafkaConsumer::run` and at `KafkaConsumerGroupRegistry::register`. | `src/backends/kafka/consumer.rs:2998`, `check_per_record_prefetch`, and `src/backends/kafka/consumer_group.rs:1222` | `run_rejects_per_record_commits_with_two_permits`, `register_rejects_per_record_commits_with_more_than_one_permit` |
+| A completion under `PerRecord` | The position is committed synchronously on a thread, and the next record waits for the coordinator's answer. | `src/backends/kafka/consumer.rs`, `CommitSlot::commit_confirmed` | `per_record_issues_one_offset_commit_per_completion` |
+| A record is dropped before the handler | Its position is committed like a completion, and the next record waits the same way, through a refused thread or a rejection. | `src/backends/kafka/consumer.rs`, the pause the receive arm of `KafkaConsumer::run` takes with each record | `a_record_dropped_before_the_handler_holds_the_next_record_until_its_commit_is_accepted`, `a_record_dropped_before_the_handler_holds_the_next_record_while_its_commit_is_rejected` |
+| A schema registry stall under `PerRecord` | The stall runs inside the pause the take holds, and its end leaves the resume to the commit, so no record is fetched and put back behind it. | `src/backends/kafka/consumer.rs`, `RegistryStall::inside_pause` | `a_per_record_stall_leaves_the_resume_to_the_commit` |
+| The coordinator rejects the commit | The position is re-offered every 500 ms with the assignment paused, and the fence judges the streak at the 60 s floor. | `src/backends/kafka/consumer.rs`, `CommitGate::mark_rejected` and `fence_threshold_over` | `a_rejected_commit_is_re_offered_until_the_fence_fires`, `a_rejected_commit_recovers_on_a_re_offer_before_the_next_record_is_handed_out` |
+| The answer is late | The next record waits for it, and the member keeps polling meanwhile. | `src/backends/kafka/consumer.rs`, the `recv()` arm of `answer_while_polling`, which `CommitSlot::commit_confirmed` waits through | `a_late_answer_holds_the_next_record_while_the_member_keeps_polling` |
+| A `Retry` or `Defer` republish fails | The member ends with a connection error before the next record is handed out, and the reconnect redelivers the record, as under `Interval`. | `src/backends/kafka/consumer.rs`, the `Republished::Failed` arm of `route_outcome` | `a_republish_that_fails_under_per_record_ends_the_member_before_the_next_record`, `failed_republish_does_not_pin_the_partition` |
+| A partition is handed back paused | Every drain that meets the assign, at the top of a pass or in the receive arm, pauses or resumes it with the rest, under either policy. | `src/backends/kafka/consumer.rs`, `reconcile_pause_after_assign` | `a_partition_handed_back_paused_is_resumed_when_a_pass_drains_the_assign`, `a_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_the_assign`, `interval_partition_revoked_while_paused_resumes_on_reassign`, `interval_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_the_assign` |
+| A stop finds a commit in flight | It is waited for up to `PENDING_COMMIT_BUDGET`; an accepted answer is followed by the final commit, a rejected one is re-offered by it, and no answer ends the stop with `ShoveError::Commit` of the `Deadline` kind. | `src/backends/kafka/consumer.rs`, `stop_with_final_commit`, which the shutdown arm of `KafkaConsumer::run` calls | `a_stop_during_a_commit_waits_for_its_answer_and_leaves_the_group_before_returning`, `a_discard_behind_a_commit_rejected_at_the_stop_is_counted_once_by_the_final_commit`, `a_per_record_stop_against_a_frozen_coordinator_reports_the_commit_it_could_not_finish`, `an_interval_stop_with_its_commit_unanswered_reports_the_pending_share`, `a_sequenced_stop_with_its_commit_unanswered_reports_the_pending_share` |
+| A prefetch above one with concurrent processing on | Refused at `KafkaConsumer::run` and at `KafkaConsumerGroupRegistry::register`. | `src/backends/kafka/consumer.rs`, `check_per_record_prefetch`, which `KafkaConsumerGroupRegistry::register` in `src/backends/kafka/consumer_group.rs` calls too | `run_rejects_per_record_commits_with_two_permits`, `register_rejects_per_record_commits_with_more_than_one_permit` |
 
 The commit position is derived from the offsets the broker actually delivered, never from a run of consecutive integers.
 A hole left by log compaction or by a transactional producer's control records does not hold the position back.
@@ -798,6 +804,12 @@ A process that exits on the error therefore does not cut the LeaveGroup short, a
 Against a coordinator that does not answer, the reconnect or the error comes up to 20 s later, and the close finishes on its thread.
 If a commit is still in flight on its thread, the close runs once that commit returns, and the error is returned without waiting for it.
 A member whose task is aborted closes off the runtime thread as well, but nothing waits for that close.
+Dropping the future of a direct `run_fifo` aborts its member's task the same way.
+A broadcast subscription has nothing to commit and no group to leave, and it closes its consumer on a thread of its own at every exit, a stop included, waiting for the close for at most the same 20 s.
+A stop that lands while the subscription checks the topic for new partitions waits for that check to end before the close, and so does an exit on an error.
+For a `Tail` or `Head` start the check is one metadata request of at most 10 s.
+Under `BroadcastStart::Timestamp`, a check that finds N new partitions adds N watermark lookups and one `offsets_for_times` call, each of at most 10 s.
+Delivery goes on while a check runs, see [Starting a broadcast subscription elsewhere than the tail](#starting-a-broadcast-subscription-elsewhere-than-the-tail).
 
 The wait for the handlers at a stop can fail too: on a receive error that ends a consumer, a failed connection or name resolution excepted, see [Broker outages](#broker-outages), or on a put-back or a pause librdkafka refuses.
 The stop then ends as an error exit does, with no final commit: the consumer closes with nothing committed, and every record completed since the last accepted commit is redelivered.

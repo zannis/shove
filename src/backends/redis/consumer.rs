@@ -2177,11 +2177,7 @@ fn merged_entry_fields<'a>(
 ///
 /// Returns `None` if the slice is empty (no hold queues configured).
 pub(super) fn hold_level<T>(retry_count: u32, hold_queues: &[T]) -> Option<usize> {
-    if hold_queues.is_empty() {
-        None
-    } else {
-        Some(hold_index(retry_count, hold_queues.len()))
-    }
+    hold_index(retry_count, hold_queues.len())
 }
 
 // ---------------------------------------------------------------------------
