@@ -338,6 +338,7 @@ With the default threshold that caps a consumer of one partition at about 100k m
 Every Kafka consumer shove builds runs with a backoff of 25 ms: the standard consumer, the sequenced consumer, the batch consumer, the DLQ drain and the broadcast subscription.
 A drained queue is refetched promptly, and a queue that stays full is checked at most forty times a second per partition.
 The two thresholds stay at librdkafka's defaults until a setting replaces them.
+Earlier versions left the backoff at librdkafka's 1000 ms; `with_fetch_queue_backoff_ms(1000)` restores it.
 
 Three opt-in settings replace the values.
 They are on `KafkaConsumerGroupConfig` for the registry path, and on `ConsumerOptions::<Kafka>` for the direct, sequenced, DLQ drain, broadcast and supervisor paths:
