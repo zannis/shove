@@ -1,0 +1,39 @@
+tests/kafka_commit_policy_mock.rs
+  s_1001dc3147e1e5::t_b08d579807ec82 5333-5336,5339-5340
+  s_1001dc3147e1e5::t_fa08585e48fe27 97-98
+  s_1001dc3147e1e5::t_f8562ef857e9af 5284-5287
+  s_1001dc3147e1e5::t_7011653a87ed9e 5371-5397
+  s_1001dc3147e1e5::t_9fdd186e3cc6a4 5222-5283,5288-5319,5325-5332,5337-5338,5341-5370,5398-5502
+  s_1001dc3147e1e5::t_268a5cdfd03278 70
+  s_1001dc3147e1e5::t_61187956430961 5320-5324
+  s_1001dc3147e1e5::t_665ab37a92cf85 96
+  s_1001dc3147e1e5::t_63968680d6833d 52-60
+src/lib.rs
+  s_1001dc3147e1e5::t_309cf06e5f778b 373-379
+src/backends/kafka/consumer.rs
+  s_1001dc3147e1e5::t_98ed568dd85985 7622-7625
+  s_1001dc3147e1e5::t_63f6132976a918 8906-8909
+  s_1001dc3147e1e5::t_60c2194d0f9146 3933-3951
+  s_1001dc3147e1e5::t_d64bf09be8dd40 10013-10016
+  s_1001dc3147e1e5::t_7189c9c9f92f0b 7283-7286
+  s_1001dc3147e1e5::t_4afd3d9f2c5d6e 6949-6952
+src/backends/kafka/mod.rs
+  s_1001dc3147e1e5::t_995186f4f85df6 28-29
+  s_1001dc3147e1e5::t_e08f2da1b9df70 27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "16e736a1ff5361b37a7bdb97a330dab1f80ab652",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": null
+    }
+  }
+}
