@@ -42,11 +42,12 @@
 //!
 //! A section runs the DLQ drain against the same mock: a `handle_dead` that
 //! panics or hangs costs the drain that one call and moves no handler
-//! metric, the token of its options stops it as the client's token does, and
-//! its commits are spaced by the fixed interval, re-offered when refused and
-//! carried by the final commit at its stop. A drain whose task is aborted, or
-//! that ends a connection on an error, closes its consumer off the runtime
-//! thread.
+//! metric, one under `without_handler_timeout` is waited for past the
+//! default timeout, the token of its options stops it as the client's token
+//! does, and its commits are spaced by the fixed interval, re-offered when
+//! refused and carried by the final commit at its stop. A drain whose task
+//! is aborted, or that ends a connection on an error, closes its consumer
+//! off the runtime thread.
 //!
 //! The final section takes the broker down for a few seconds, which a
 //! settled member rides out on the client it started with and a member fresh
@@ -4781,9 +4782,12 @@ async fn dlq_drain_re_offers_a_rejected_commit() {
 }
 
 /// The stop commits what the drain handled. Every commit the drain makes
-/// while it runs is refused; the coordinator accepts again just before the
-/// stop, and the stop's final commit carries the position of all three dead
-/// letters.
+/// while it runs is refused. Right after a refused re-offer, with the next
+/// one an interval away, the coordinator accepts again and the drain is
+/// stopped. The last OffsetCommit the broker receives comes after the stop,
+/// and the position it leaves is that of all three dead letters, so the
+/// stop's final commit carried it. A stop with no final commit of its own
+/// left the position to whichever re-offer landed before it.
 #[tokio::test]
 async fn dlq_drain_stop_commits_what_it_handled() {
     let (mock, bootstrap) = drain_mock(&["A", "B", "C"]).await;
@@ -4817,8 +4821,22 @@ async fn dlq_drain_stop_commits_what_it_handled() {
         "the commits made while the drain ran were refused"
     );
 
+    let refused = mock.offset_commit_requests();
+    wait_while_draining(
+        &run,
+        || mock.offset_commit_requests() > refused,
+        DELIVERY_TIMEOUT,
+        "a refused position offered again",
+    )
+    .await;
     mock.accept_commits();
+    let before_stop = mock.offset_commit_requests();
     stop_drain(run, &shutdown).await;
+    let after_stop = mock.offset_commit_requests();
+    assert!(
+        after_stop > before_stop,
+        "the last OffsetCommit followed the stop: {before_stop} before it, {after_stop} after"
+    );
     assert_eq!(
         committed_position_on(&bootstrap, DRAIN_DLQ, DRAIN_GROUP, 0).await,
         Some(3),
