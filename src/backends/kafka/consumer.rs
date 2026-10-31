@@ -2427,9 +2427,8 @@ impl<T: Topic, H: MessageHandler<T>> Dispatch<T, H> {
                             reason,
                             "record no longer decodes for its in-place redelivery; dropping it as a pre-handler discard"
                         );
-                        // The dead letter carries the attempts made in memory, as an
-                        // exhausted in-place retry does, not the count the record
-                        // arrived with.
+                        // The dead letter carries the attempts made in memory as
+                        // its retry count, as an exhausted in-place retry does.
                         let mut dead_headers = headers;
                         Arc::make_mut(&mut dead_headers.strings)
                             .insert(RETRY_COUNT_HEADER.to_string(), attempts.to_string());
@@ -3452,7 +3451,8 @@ enum MessageStreamOf<'c> {
 /// Each `StreamConsumer::recv` makes a stream of its own, which registers a
 /// waker slot with the consumer and unregisters it again, and a `select!`
 /// would pay that on every pass that polls it. A record the stream hands
-/// over borrows the consumer, not the stream.
+/// over borrows the consumer alone, so a loop holding one can poll the
+/// stream again.
 struct RecvStream<'c> {
     consumer: &'c KafkaStreamConsumer,
     stream: Option<MessageStreamOf<'c>>,
@@ -5153,10 +5153,11 @@ impl CommitSlot {
     /// it wakes then makes the commit. With neither it never resolves.
     ///
     /// The deadline wakes a loop whose topic has gone idle, so a gated
-    /// commit lands within the gate's window rather than at the next
-    /// housekeeping tick, and it waits with nothing to commit, so an idle
-    /// loop does not wake every window. Past due it wakes at once, and the
-    /// commit it leads to moves the deadline forward, so it does not spin.
+    /// commit lands when the gate's window ends; the next housekeeping tick
+    /// can be seconds later. With nothing to commit the arm never resolves,
+    /// so an idle loop sleeps through every window. Past due it wakes at
+    /// once, and the commit it leads to moves the deadline forward, so it
+    /// does not spin.
     async fn wake(
         &mut self,
         tracker: &mut OffsetTracker,
@@ -7829,8 +7830,8 @@ struct FifoLoop<T: Topic, H: MessageHandler<T>> {
     /// for the fixed default interval the loop commits on.
     fence_timeout: Duration,
     /// A child of the options' token, the loop's own: the futures its waits
-    /// arm register with it alone, not with the token every loop of a group
-    /// shares.
+    /// arm register with it alone, so they contend with no other loop of a
+    /// group on the token every member is handed.
     shutdown: CancellationToken,
     processing: Arc<AtomicBool>,
     max_retries: u32,

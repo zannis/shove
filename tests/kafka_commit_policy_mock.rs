@@ -5319,7 +5319,7 @@ async fn a_stop_under_a_backlog_hands_out_nothing_behind_the_record_in_hand() {
     );
     assert!(
         permit_wait_probe::entered() <= STOP_AT + 1,
-        "the loop took at most one record past the stop, not the backlog: {} taken",
+        "the loop took at most one record past the stop: {} taken",
         permit_wait_probe::entered()
     );
     assert_eq!(
@@ -5428,8 +5428,8 @@ fn assert_gated(mock: &Mock, window: Duration, woke_before: usize) {
 /// wake of the gate's deadline. The member commits its first record and
 /// idles. A second record then finds the gate open and is committed at
 /// once, which opens a fresh window, and a third, produced inside that
-/// window, waits for its end: not for the housekeeping tick, and not on a
-/// wake that fires on every pass.
+/// window, waits for its end on a single wake: the housekeeping tick is
+/// seconds later, and a wake that fired on every pass would count more.
 #[tokio::test]
 async fn after_an_idle_spell_a_gated_commit_lands_when_its_window_ends() {
     let mock = Mock::start();
