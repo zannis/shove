@@ -46,8 +46,9 @@
 //! holds its only permit past the poll interval, whose drain keeps polling
 //! through a rebalance.
 //!
-//! `test-support` gates the seams this file reads; both Kafka coverage rows
-//! enable it, so the suite runs in each.
+//! `test-support` gates the seams this file reads. The Kafka coverage row
+//! enables it and runs this suite; the schema-registry row compiles the
+//! binary too, but its test filter does not select it.
 
 #![cfg(all(feature = "kafka", feature = "test-support"))]
 #![allow(clippy::mutable_key_type)] // metrics-util's CompositeKey has interior mutability
