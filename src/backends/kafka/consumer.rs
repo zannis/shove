@@ -12792,6 +12792,7 @@ mod error_classifier_tests {
 mod stop_drain_tests {
     use super::*;
     use tracing::field::{Field, Visit};
+    use tracing::subscriber::set_default;
     use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
     /// The fields of one event, read for the warning a ridden-out receive
@@ -12850,9 +12851,7 @@ mod stop_drain_tests {
     #[tokio::test]
     async fn the_drain_rides_out_a_failed_connection_through_an_armed_gate() {
         let ridden_out = RiddenOut::default();
-        let _subscriber = tracing::subscriber::set_default(
-            tracing_subscriber::registry().with(ridden_out.clone()),
-        );
+        let _subscriber = set_default(tracing_subscriber::registry().with(ridden_out.clone()));
         let mut config = ClientConfig::new();
         config.set("bootstrap.servers", "127.0.0.1:1");
         let (rebalance_tx, _rebalance_rx) = std_mpsc::channel();
