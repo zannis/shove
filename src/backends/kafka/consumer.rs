@@ -3034,9 +3034,9 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 /// an error is logged, see [`log_transient_recv_error`], and the loop goes
 /// on polling on the same client. Every other error ends the loop with the
 /// error [`map_kafka_error`] makes of it. Every `recv()` arm reads this one
-/// table: each consume loop's, and each wait's that polls. `gate` is the
-/// gate of the consumer the arm polls, or `None` in the stop's drain, see
-/// below.
+/// table: each consume loop's, and each wait's that polls. `gate` is how the
+/// arm reads a `__TRANSPORT` or `__RESOLVE`: through the gate of the
+/// consumer it polls, or as the stop's drain, see [`GateMode`] and below.
 ///
 /// The codes ridden out, with the bundled librdkafka 2.12.1 source behind
 /// each:
@@ -3077,11 +3077,11 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 /// `__TRANSPORT` or `__RESOLVE`, because a fetch may have been pending when
 /// that change landed. A revoke of an assignment librdkafka reports lost is
 /// never such a change, see [`AssignmentChange::LostRevoke`]. The reconnect
-/// fetches the committed offsets again. The stop's drain passes no gate, see
-/// [`acquire_permit_while_polling`], and rides out every `__TRANSPORT` and
-/// `__RESOLVE`: the gate's one remedy is that reconnect, which a stop never
-/// makes, so ending the drain on one would only cost the stop its final
-/// commit.
+/// fetches the committed offsets again. The stop's drain reads the table as
+/// [`GateMode::Draining`], see [`acquire_permit_while_polling`], and rides
+/// out every `__TRANSPORT` and `__RESOLVE`: the gate's one remedy is that
+/// reconnect, which a stop never makes, so ending the drain on one would only
+/// cost the stop its final commit.
 /// The gate is blind to a coordinator that holds a fetch unanswered for
 /// longer than `socket.timeout.ms` while the application is handed no
 /// error: an assignment change after that bound, and a connection the
@@ -3107,15 +3107,12 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 /// reports it again. And it covers the join and fetch errors librdkafka
 /// reports on every retry of a cause that persists, a refused join among
 /// them (`rdkafka_cgrp.c:2434-2441`, `rdkafka_fetcher.c:327-338`).
-fn recv_error_is_transient<'a>(
-    gate: impl Into<Option<&'a TransportGate>>,
-    error: &KafkaError,
-) -> bool {
+fn recv_error_is_transient<'a>(gate: impl Into<GateMode<'a>>, error: &KafkaError) -> bool {
     match error {
         KafkaError::MessageConsumption(
             RDKafkaErrorCode::BrokerTransportFailure | RDKafkaErrorCode::Resolve,
         ) => {
-            let Some(gate) = gate.into() else {
+            let GateMode::Armed(gate) = gate.into() else {
                 return true;
             };
             let rides_out = gate.rides_out(std::time::Instant::now());
@@ -3133,6 +3130,26 @@ fn recv_error_is_transient<'a>(
         }
         KafkaError::MessageConsumption(RDKafkaErrorCode::AllBrokersDown) => true,
         _ => false,
+    }
+}
+
+/// How a `recv()` arm reads a `__TRANSPORT` or `__RESOLVE`, see
+/// [`recv_error_is_transient`]. A consumer's gate converts into `Armed`, and
+/// nothing converts into `Draining`, so an arm reads no gate only where it
+/// names the drain.
+#[derive(Clone, Copy)]
+enum GateMode<'a> {
+    /// Through the gate of the consumer the arm polls: every consume loop's
+    /// arm, and every wait's but the stop's.
+    Armed(&'a TransportGate),
+    /// The stop's drain: it rides out every `__TRANSPORT` and `__RESOLVE`,
+    /// since the gate's one remedy is a reconnect, which a stop never makes.
+    Draining,
+}
+
+impl<'a> From<&'a TransportGate> for GateMode<'a> {
+    fn from(gate: &'a TransportGate) -> Self {
+        Self::Armed(gate)
     }
 }
 
@@ -5548,7 +5565,9 @@ async fn poll_paused(consumer: &KafkaStreamConsumer, queue: &str, period: Durati
                     put_back(consumer, queue, msg.partition(), msg.offset())?;
                     apply_pause_intent(consumer, true)?;
                 }
-                Err(e) if recv_error_is_transient(None, &e) => log_transient_recv_error(queue, &e),
+                Err(e) if recv_error_is_transient(GateMode::Draining, &e) => {
+                    log_transient_recv_error(queue, &e);
+                }
                 Err(e) => {
                     return Err(map_kafka_error(
                         &format!("consumer recv error on {queue} while polling for a rebalance at shutdown"),
@@ -7382,7 +7401,10 @@ async fn acquire_permit_while_polling(
     mut commits: Option<IntervalCommits<'_>>,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
     // No token means the drain, whose stop has fired.
-    let gate = shutdown.map(|_| consumer.transport_gate());
+    let gate = match shutdown {
+        Some(_) => GateMode::Armed(consumer.transport_gate()),
+        None => GateMode::Draining,
+    };
     let stop = stop_requested(shutdown);
     tokio::pin!(stop);
     let fault = handler_fault(fault_rx);
@@ -14895,7 +14917,7 @@ mod error_classifier_tests {
     /// reconnects, and the rest of the table reads as it does everywhere.
     #[test]
     fn the_stops_drain_rides_out_a_failed_connection_or_resolve() {
-        let drain = None::<&TransportGate>;
+        let drain = GateMode::Draining;
         for code in [
             RDKafkaErrorCode::BrokerTransportFailure,
             RDKafkaErrorCode::Resolve,
