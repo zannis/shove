@@ -96,7 +96,7 @@ use shove::metadata::{DeadMessageMetadata, MessageMetadata};
 use shove::outcome::Outcome;
 use shove::topic::Topic;
 use shove::topology::{SequenceFailure, TopologyBuilder};
-use shove::{CommitFailure, SequencedTopic, ShoveError};
+use shove::{CommitFailure, DEFAULT_HANDLER_TIMEOUT, SequencedTopic, ShoveError};
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -4263,6 +4263,8 @@ shove::define_topic!(
 enum Fail {
     Panic,
     Hang,
+    /// Returns once the test calls [`Dead::release`].
+    Held,
 }
 
 /// Records the id of every dead letter a drain hands it, and fails each one
@@ -4271,6 +4273,7 @@ enum Fail {
 struct Dead {
     seen: Arc<Mutex<Vec<String>>>,
     fail: Vec<(&'static str, Fail)>,
+    released: Arc<Notify>,
 }
 
 impl Dead {
@@ -4278,6 +4281,11 @@ impl Dead {
     fn failing(mut self, id: &'static str, how: Fail) -> Self {
         self.fail.push((id, how));
         self
+    }
+
+    /// Lets the call on a [`Fail::Held`] dead letter return.
+    fn release(&self) {
+        self.released.notify_one();
     }
 
     fn ids(&self) -> Vec<String> {
@@ -4304,6 +4312,7 @@ impl MessageHandler<DrainOrders> for Dead {
         match self.fail.iter().find(|(id, _)| *id == msg.id) {
             Some((id, Fail::Panic)) => panic!("handle_dead fails on {id}"),
             Some((_, Fail::Hang)) => std::future::pending::<()>().await,
+            Some((_, Fail::Held)) => self.released.notified().await,
             None => {}
         }
     }
@@ -4449,6 +4458,67 @@ async fn dlq_drain_cuts_a_hung_handle_dead_at_the_handler_timeout() {
         "the timeout is logged: {:?}",
         logged.lines()
     );
+
+    stop_drain(run, &shutdown).await;
+}
+
+/// `without_handler_timeout` leaves `handle_dead` unbounded on the drain. A
+/// call that runs past the 30 s default is waited for: the dead letter behind
+/// it is not handed out, and nothing is committed, until the call returns, and
+/// both are committed then. A drain that bounded the call at the default cut
+/// it there and went on to the next dead letter.
+#[tokio::test]
+async fn dlq_drain_without_a_handler_timeout_waits_for_handle_dead() {
+    const PAST_THE_DEFAULT: Duration = Duration::from_secs(2);
+    let (_mock, bootstrap) = drain_mock(&["A", "B"]).await;
+
+    let handler = Dead::default().failing("A", Fail::Held);
+    let shutdown = CancellationToken::new();
+    let run = start_drain(
+        connect(&bootstrap).await,
+        handler.clone(),
+        ConsumerOptions::<Kafka>::new()
+            .without_handler_timeout()
+            .with_shutdown(shutdown.clone()),
+    );
+    wait_while_draining(
+        &run,
+        || handler.count() == 1,
+        DELIVERY_TIMEOUT,
+        "A reaching handle_dead",
+    )
+    .await;
+
+    tokio::time::sleep(DEFAULT_HANDLER_TIMEOUT + PAST_THE_DEFAULT).await;
+    assert!(!run.is_finished(), "the drain waits on the call");
+    assert_eq!(
+        handler.ids(),
+        ["A"],
+        "B is not handed out while the call on A runs past the default timeout"
+    );
+    assert_eq!(
+        committed_position_on(&bootstrap, DRAIN_DLQ, DRAIN_GROUP, 0).await,
+        None,
+        "nothing is committed while the call on A runs"
+    );
+
+    handler.release();
+    wait_while_draining(
+        &run,
+        || handler.count() == 2,
+        DRAIN_BOUND,
+        "B reaching handle_dead once the call on A returned",
+    )
+    .await;
+    wait_for_position(
+        &bootstrap,
+        DRAIN_DLQ,
+        DRAIN_GROUP,
+        2,
+        DRAIN_BOUND,
+        "A and B committed",
+    )
+    .await;
 
     stop_drain(run, &shutdown).await;
 }

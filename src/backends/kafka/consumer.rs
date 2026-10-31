@@ -40,7 +40,7 @@ use crate::backend::batch_consumer::{
 use crate::backend::broadcast::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_broadcast_outcome};
 use crate::batch_consumer::BatchConsumerOptions as GenericBatchConsumerOptions;
 use crate::broadcast::BroadcastStart;
-use crate::consumer::{DEFAULT_HANDLER_TIMEOUT, RetryStrategy, validate_message_size};
+use crate::consumer::{RetryStrategy, validate_message_size};
 use crate::consumer_supervisor::{AbortOnDrop, SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{CommitFailure, FailedCommit, Result};
 use crate::handler::{BatchMessageHandler, MessageHandler};
@@ -52,12 +52,15 @@ use crate::routing::{PoisonedKeys, RetryDecision, decide_retry, handler_timeout_
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{HoldQueue, Kafka, ShoveError};
-// These three, with `DEFAULT_HANDLER_TIMEOUT` above, are only read back by
-// `batch_consumer_options_tests` below, to pin that `BatchConsumerOptions` (now
-// a `pub type` alias of the generic `BatchConsumerOptions<Kafka>`) still
-// defaults to the same shared constants the type used to hardcode directly.
+// These four are only read back by `batch_consumer_options_tests` below, to
+// pin that `BatchConsumerOptions` (now a `pub type` alias of the generic
+// `BatchConsumerOptions<Kafka>`) still defaults to the same shared constants
+// the type used to hardcode directly.
 #[cfg(test)]
-use crate::{DEFAULT_KAFKA_MAX_BATCH_AGE, DEFAULT_KAFKA_MAX_BATCH_SIZE, DEFAULT_MAX_MESSAGE_SIZE};
+use crate::{
+    DEFAULT_HANDLER_TIMEOUT, DEFAULT_KAFKA_MAX_BATCH_AGE, DEFAULT_KAFKA_MAX_BATCH_SIZE,
+    DEFAULT_MAX_MESSAGE_SIZE,
+};
 
 #[cfg(feature = "kafka-msk-iam")]
 use super::msk_iam::MskIamContext;
@@ -7876,8 +7879,9 @@ struct DlqDrain<T: Topic, H: MessageHandler<T>> {
     /// [`cancelled_by_either`].
     shutdown: CancellationToken,
     max_message_size: Option<usize>,
-    /// The bound on one `handle_dead` call.
-    handler_timeout: Duration,
+    /// The bound on one `handle_dead` call, none when the options disable the
+    /// handler timeout.
+    handler_timeout: Option<Duration>,
     /// The fenced consumer detector's threshold, see [`fence_threshold_over`].
     fence_timeout: Duration,
     #[cfg(feature = "kafka-schema-registry")]
@@ -8189,7 +8193,7 @@ impl<T: Topic, H: MessageHandler<T>> DlqDrain<T, H> {
         let metadata = build_dead_metadata(&record.headers, record.coordinates);
         let called = guarded(
             self.handler.handle_dead(message, metadata, &self.ctx),
-            Some(self.handler_timeout),
+            self.handler_timeout,
         )
         .await;
         match called {
@@ -10587,19 +10591,22 @@ impl KafkaConsumer {
     }
 
     /// What the DLQ drain refuses, after the DLQ check and before it
-    /// subscribes: the two group knobs its loop never reads.
+    /// subscribes: the settings its loop never reads, two group knobs and the
+    /// outcome of a handler timeout.
     ///
     /// The drain hard-codes `earliest` for its group, and that policy applies
     /// only while the group has no usable committed offset: a fresh drain can
     /// never skip a dead letter the operator opted in to keep, and a restarted
     /// drain resumes from its commit. It commits on the fixed default
     /// interval, as the FIFO consumer does, so there is no commit policy to
-    /// set: neither an interval nor a per-record policy. Neither
-    /// `with_auto_offset_reset` nor `with_commit_policy` (or its shorthand
-    /// `with_commit_interval`) would change anything, and a setting that
-    /// changes nothing is refused rather than dropped: the FIFO consumer's
-    /// policy, applied on every path. The message names the entry point, as
-    /// `refuse_broadcast_start` does.
+    /// set: neither an interval nor a per-record policy. `handle_dead` returns
+    /// no outcome, so a call that times out has none to resolve to, and its
+    /// dead letter is committed. None of `with_auto_offset_reset`,
+    /// `with_commit_policy` (or its shorthand `with_commit_interval`) and
+    /// `with_handler_timeout_outcome` would change anything, and a setting
+    /// that changes nothing is refused rather than dropped: the FIFO
+    /// consumer's policy, applied on every path. The message names the entry
+    /// point, as `refuse_broadcast_start` does.
     fn check_dlq_options(queue: &str, dlq: &str, options: &ConsumerOptions) -> Result<()> {
         if options.kafka_commit_policy.is_some() {
             return Err(ShoveError::Topology(format!(
@@ -10614,6 +10621,14 @@ impl KafkaConsumer {
                  drain of '{dlq}', which hard-codes `earliest` for a group with no committed \
                  offset so a fresh drain never skips a dead letter; `KafkaConsumer::run_dlq` \
                  never reads it. Drop `with_auto_offset_reset(..)`."
+            )));
+        }
+        if options.handler_timeout_outcome.is_some() {
+            return Err(ShoveError::Topology(format!(
+                "topic '{queue}': `with_handler_timeout_outcome` does not apply to the \
+                 dead-letter drain of '{dlq}', where `handle_dead` returns no outcome and a \
+                 call that times out has its dead letter committed; `KafkaConsumer::run_dlq` \
+                 never reads it. Drop `with_handler_timeout_outcome(..)`."
             )));
         }
         Ok(())
@@ -11315,9 +11330,9 @@ impl KafkaConsumer {
     ///
     /// - `with_shutdown` ends the drain once the dead letter in hand has
     ///   settled, and so does closing the client, whatever the token holds.
-    /// - `with_handler_timeout` bounds each `handle_dead` call. When it is
-    ///   disabled with `without_handler_timeout`, the call is bounded by
-    ///   [`DEFAULT_HANDLER_TIMEOUT`](crate::DEFAULT_HANDLER_TIMEOUT).
+    /// - `with_handler_timeout` bounds each `handle_dead` call, 30 s by default
+    ///   ([`DEFAULT_HANDLER_TIMEOUT`](crate::DEFAULT_HANDLER_TIMEOUT)), and
+    ///   `without_handler_timeout` leaves the call unbounded.
     /// - `with_max_message_size` gates the dead letters. One over the limit is
     ///   logged and committed without reaching `handle_dead`.
     /// - `with_group_id` rebases the drain's group, `{group}-dlq`.
@@ -11331,10 +11346,13 @@ impl KafkaConsumer {
     /// under panic isolation and the handler timeout. A call that panics or
     /// outlasts the timeout is logged at warn level and does not stop the
     /// drain, and its dead letter is committed all the same, as it is after a
-    /// call that returns. Nothing polls while the call runs, so keep the
-    /// timeout below `max.poll.interval.ms`, five minutes. A `handle_dead`
-    /// call moves no consumed, in-flight, duration or failed metric under the
-    /// source topic. The series the drain does record are
+    /// call that returns. With no timeout, a call that never returns holds the
+    /// drain, its stop included, for good. Nothing polls while the call runs,
+    /// so keep the call, and the timeout, below `max.poll.interval.ms`, five
+    /// minutes. `handle_dead` returns no outcome, so
+    /// `with_handler_timeout_outcome` is refused. A `handle_dead` call moves
+    /// no consumed, in-flight, duration or failed metric under the source
+    /// topic. The series the drain does record are
     /// `shove_message_size_bytes` for each dead letter, and
     /// `shove_messages_failed_total{reason="schema_unavailable"}` for each
     /// registry wait.
@@ -11435,7 +11453,7 @@ impl KafkaConsumer {
             group: options.consumer_group.clone(),
             shutdown,
             max_message_size: options.max_message_size,
-            handler_timeout: options.handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT),
+            handler_timeout: options.handler_timeout,
             fence_timeout: fence_threshold_over(fence_floor(&options), ASYNC_COMMIT_INTERVAL),
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: options.schema_registry.clone(),
@@ -15153,6 +15171,29 @@ mod broadcast_option_guard_tests {
         let msg = topology_message(err);
         assert!(msg.contains("broadcast-option-guard-dlq"), "{msg}");
         assert!(msg.contains("with_auto_offset_reset"), "{msg}");
+        assert!(msg.contains("KafkaConsumer::run_dlq"), "{msg}");
+    }
+
+    /// `handle_dead` returns no outcome, so a call that times out has none to
+    /// resolve to and its dead letter is committed: a timeout outcome would be
+    /// read by nothing on the drain, and is refused.
+    #[tokio::test]
+    async fn run_dlq_rejects_a_handler_timeout_outcome() {
+        let consumer = consumer().await;
+        consumer.client.shutdown_token().cancel();
+        let err = consumer
+            .run_dlq_with_options::<WithDlq, _>(
+                NoopHandler,
+                (),
+                crate::ConsumerOptions::<Kafka>::new()
+                    .with_handler_timeout_outcome(Outcome::Reject)
+                    .with_shutdown(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a handler timeout outcome must be refused on the DLQ drain");
+        let msg = topology_message(err);
+        assert!(msg.contains("broadcast-option-guard-dlq"), "{msg}");
+        assert!(msg.contains("with_handler_timeout_outcome"), "{msg}");
         assert!(msg.contains("KafkaConsumer::run_dlq"), "{msg}");
     }
 
