@@ -4372,7 +4372,7 @@ fn spawn_named_thread(name: String, body: Box<dyn FnOnce() + Send>) -> std::io::
 pub mod per_record_probe {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Entries into `commit_confirmed`: every commit a loop attempted and
+    /// Entries into `CommitSlot::commit_confirmed`: every commit a loop attempted and
     /// waited for, a per-record commit or a batch span's, carried or not.
     pub static COMMIT_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
     /// Assign events the rebalance callback queued for the loop, from any
@@ -4404,7 +4404,7 @@ pub mod per_record_probe {
 
 /// Test-only counter (see the `test-support` feature) on the commit gate's
 /// wake: how many times the gate's deadline woke a loop, or a wait, that
-/// commits through a [`CommitSlot`], process-wide. A gated commit wakes its
+/// commits through a `CommitSlot`, process-wide. A gated commit wakes its
 /// loop once, when its window ends, so a test reads this to tell that wake
 /// from one that fires on every pass, which a commit's timing alone cannot
 /// show. nextest runs each test in its own process, so it starts at zero.
@@ -4904,18 +4904,24 @@ fn reconcile_pause_after_assign(
     }
 }
 
-/// What a wait for a confirmed commit ends with; see [`commit_confirmed`].
-enum CommitAnswer {
+/// How a confirmed commit ended, see [`CommitSlot::commit_confirmed`].
+#[derive(Debug, PartialEq, Eq)]
+enum Confirmed {
     /// The coordinator accepted the commit.
-    Confirmed,
+    Accepted,
     /// The coordinator refused it, librdkafka gave it up, or no thread could
-    /// be spawned for it. The position is not known to have landed.
-    Rejected(KafkaError),
+    /// be spawned for it. The position is not known to have landed, and is
+    /// re-offered.
+    Rejected,
     /// Shutdown fired during the wait. The commit is still in flight on its
-    /// thread; its answer arrives on the receiver, which the stop waits for
-    /// before the final commit, see [`PendingCommit`].
-    Cancelled(oneshot::Receiver<KafkaResult<()>>),
+    /// thread, and the slot holds it for the stop to wait on before the
+    /// final commit, see [`PendingCommit`].
+    Stopped,
 }
+
+/// The warning a commit the coordinator rejected is logged with, see
+/// [`CommitSlot::settle_commit`].
+const COMMIT_REJECTED: &str = "offset commit rejected; re-offering the position";
 
 /// A commit on its thread whose answer the loop has not read yet: the
 /// answer, the positions the commit carries, and the discards it retires.
@@ -4989,7 +4995,7 @@ fn spawn_commit(
 /// the gate.
 ///
 /// The loop reads the answer back, as it reads a completion: a select arm
-/// wakes on it, see [`commit_answer`], and the top of every pass, and of
+/// wakes on it, see [`wake`](Self::wake), and the top of every pass, and of
 /// every pass of a wait that commits, takes one that came meanwhile. An
 /// accepted commit confirms the discards it retires and ends the streak of
 /// every partition it carried. A rejected one, or one no thread could
@@ -5091,13 +5097,40 @@ impl CommitSlot {
         else {
             return;
         };
+        self.settle_commit(
+            &positions,
+            discards,
+            answer,
+            tracker,
+            queue,
+            COMMIT_REJECTED,
+        );
+    }
+
+    /// Settle `answer`, the answer of a commit of `positions` that
+    /// `discards` ride on. An accepted commit confirms the discards and ends
+    /// the streak of every partition it carried, see
+    /// `OffsetTracker::commit_accepted`. Any other answer is logged as
+    /// `rejected`, hands the discards back and marks the partitions to
+    /// re-offer, see `OffsetTracker::commit_rejected`, and closes the gate
+    /// for the window the re-offers are spaced by, see
+    /// `AsyncCommitGate::mark_rejected`. `true` says the commit was accepted.
+    fn settle_commit(
+        &mut self,
+        positions: &[CommitPosition],
+        discards: Vec<CoveredDiscard>,
+        answer: Option<KafkaResult<()>>,
+        tracker: &mut OffsetTracker,
+        queue: &str,
+        rejected: &str,
+    ) -> bool {
         let error = match answer {
             Some(Ok(())) => {
-                tracker.commit_accepted(&positions);
+                tracker.commit_accepted(positions);
                 for discard in discards {
                     discard.confirm();
                 }
-                return;
+                return true;
             }
             Some(Err(e)) => e.to_string(),
             None => "the commit thread ended without a result".to_string(),
@@ -5105,12 +5138,134 @@ impl CommitSlot {
         tracing::warn!(
             queue,
             error = %error,
-            offsets = ?position_offsets(&positions),
-            "offset commit rejected; re-offering the position"
+            offsets = ?position_offsets(positions),
+            "{rejected}"
         );
         let now = Instant::now();
-        tracker.commit_rejected(&positions, discards, now);
+        tracker.commit_rejected(positions, discards, now);
         self.gate.mark_rejected(now);
+        false
+    }
+
+    /// The `select!` arm of a loop, or of a wait, that commits through the
+    /// slot. With a commit in flight it is that commit's answer, settled as
+    /// it comes, see [`settle`](Self::settle): a oneshot receiver polled
+    /// again after it answered panics, so nothing is left for a later pass to
+    /// read. With none in flight and a position to commit it is the gate's
+    /// deadline, on `wake`, the `Sleep` the loop keeps across its passes and
+    /// moves only when the deadline has, see [`rearm`]; the top of the pass
+    /// it wakes then makes the commit. With neither it never resolves.
+    ///
+    /// The deadline wakes a loop whose topic has gone idle, so a gated
+    /// commit lands within the gate's window rather than at the next
+    /// housekeeping tick, and it waits with nothing to commit, so an idle
+    /// loop does not wake every window. Past due it wakes at once, and the
+    /// commit it leads to moves the deadline forward, so it does not spin.
+    async fn wake(
+        &mut self,
+        tracker: &mut OffsetTracker,
+        wake: Pin<&mut tokio::time::Sleep>,
+        queue: &str,
+        now: Instant,
+    ) {
+        if let Some(pending) = self.in_flight.as_mut() {
+            let answer = (&mut pending.answer).await.ok();
+            self.settle(answer, tracker, queue);
+        } else if tracker.has_committable() {
+            let mut wake = wake;
+            rearm(wake.as_mut(), self.gate.deadline(now));
+            wake.await;
+            #[cfg(feature = "test-support")]
+            commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Commit `drained` synchronously on a thread of its own (see
+    /// [`spawn_commit`]) and wait for the coordinator's answer while the loop
+    /// keeps polling, see [`answer_while_polling`]: the commit every
+    /// completion triggers under `CommitPolicy::PerRecord`, and the commit of
+    /// a batch whose span carries dead letters or discards, see
+    /// [`commit_terminal_span`]. The answer is settled as the slot settles
+    /// its own, see [`settle_commit`](Self::settle_commit), a rejection
+    /// logged as `rejected`, and an accepted one opens the gate again, see
+    /// `AsyncCommitGate::mark`. A spawn failure is a rejection: nothing
+    /// commits, and the position is re-offered. A stop during the wait
+    /// leaves the commit in the slot, in flight, for the stop to wait on.
+    /// `grace` is how long the wait goes before it polls.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_confirmed(
+        &mut self,
+        consumer: &Arc<KafkaStreamConsumer>,
+        drained: DrainedCommit,
+        tracker: &mut OffsetTracker,
+        shutdown: &CancellationToken,
+        fault_rx: Option<&mut mpsc::Receiver<ShoveError>>,
+        queue: &str,
+        paused: &mut bool,
+        grace: Duration,
+        rejected: &str,
+    ) -> Result<Confirmed> {
+        #[cfg(feature = "test-support")]
+        per_record_probe::COMMIT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        let DrainedCommit {
+            tpl,
+            positions,
+            discards,
+        } = drained;
+        let answer = match spawn_commit(consumer, tpl, queue) {
+            Ok(answer) => answer,
+            Err(e) => {
+                tracing::error!(
+                    queue,
+                    error = %e,
+                    "could not spawn the commit thread; nothing commits, the position is re-offered"
+                );
+                let refused = Some(Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail)));
+                self.settle_commit(&positions, discards, refused, tracker, queue, rejected);
+                return Ok(Confirmed::Rejected);
+            }
+        };
+        let mut pending = PendingCommit {
+            answer,
+            positions,
+            discards,
+        };
+        let answer = match answer_while_polling(
+            consumer,
+            &mut pending.answer,
+            shutdown,
+            fault_rx,
+            queue,
+            paused,
+            grace,
+        )
+        .await?
+        {
+            Answered::Came(Some(answer)) => answer,
+            Answered::Came(None) => {
+                tracing::warn!(queue, "commit thread ended without a result");
+                Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail))
+            }
+            Answered::Stopped => {
+                self.in_flight = Some(pending);
+                return Ok(Confirmed::Stopped);
+            }
+        };
+        let accepted = self.settle_commit(
+            &pending.positions,
+            pending.discards,
+            Some(answer),
+            tracker,
+            queue,
+            rejected,
+        );
+        if !accepted {
+            return Ok(Confirmed::Rejected);
+        }
+        self.gate.mark(Instant::now());
+        Ok(Confirmed::Accepted)
     }
 
     /// The commit step of a pass, the same in every loop that commits
@@ -5127,7 +5282,7 @@ impl CommitSlot {
     /// member.
     ///
     /// Under `CommitPolicy::PerRecord` the step makes no commit: that loop
-    /// commits through [`commit_confirmed`] and waits for the answer. The
+    /// commits through [`commit_confirmed`](Self::commit_confirmed) and waits for the answer. The
     /// `Ok` says whether the events held an assign, see
     /// `OffsetTracker::apply_rebalance_events`.
     fn pass(
@@ -5165,17 +5320,6 @@ struct Fence<'a> {
     group_id: &'a str,
 }
 
-/// The answer of `in_flight`, or a future that never resolves when nothing
-/// is in flight: the select arm a loop that commits through a
-/// [`CommitSlot`] wakes on. The arm's handler settles what it reads at once,
-/// since a oneshot receiver polled again after it answered panics.
-async fn commit_answer(in_flight: Option<&mut PendingCommit>) -> Option<KafkaResult<()>> {
-    match in_flight {
-        Some(pending) => (&mut pending.answer).await.ok(),
-        None => std::future::pending().await,
-    }
-}
-
 /// Moves `wake`, the `Sleep` a loop that commits through a [`CommitSlot`]
 /// keeps across its passes for the gate's deadline, to `deadline` when the
 /// deadline has moved since it was set. A commit moves it; a pass that only
@@ -5186,65 +5330,11 @@ fn rearm(wake: Pin<&mut tokio::time::Sleep>, deadline: Instant) {
     }
 }
 
-/// Commit `tpl` synchronously on a thread of its own (see [`spawn_commit`])
-/// and wait for the coordinator's answer while the loop keeps polling, see
-/// [`answer_while_polling`]: the commit every completion triggers under
-/// `CommitPolicy::PerRecord`, and the commit of a batch whose span carries
-/// dead letters or discards, see [`commit_terminal_span`]. `grace` is how
-/// long the wait goes before it polls. A spawn failure is a rejection:
-/// nothing commits, and the position is re-offered.
-async fn commit_confirmed(
-    consumer: &Arc<KafkaStreamConsumer>,
-    tpl: TopicPartitionList,
-    shutdown: &CancellationToken,
-    fault_rx: Option<&mut mpsc::Receiver<ShoveError>>,
-    queue: &str,
-    paused: &mut bool,
-    grace: Duration,
-) -> Result<CommitAnswer> {
-    #[cfg(feature = "test-support")]
-    per_record_probe::COMMIT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
-    let mut answer = match spawn_commit(consumer, tpl, queue) {
-        Ok(answer) => answer,
-        Err(e) => {
-            tracing::error!(
-                queue,
-                error = %e,
-                "could not spawn the commit thread; nothing commits, the position is re-offered"
-            );
-            return Ok(CommitAnswer::Rejected(KafkaError::ConsumerCommit(
-                RDKafkaErrorCode::Fail,
-            )));
-        }
-    };
-    Ok(
-        match answer_while_polling(
-            consumer,
-            &mut answer,
-            shutdown,
-            fault_rx,
-            queue,
-            paused,
-            grace,
-        )
-        .await?
-        {
-            Answered::Came(Some(Ok(()))) => CommitAnswer::Confirmed,
-            Answered::Came(Some(Err(e))) => CommitAnswer::Rejected(e),
-            Answered::Came(None) => {
-                tracing::warn!(queue, "commit thread ended without a result");
-                CommitAnswer::Rejected(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail))
-            }
-            Answered::Stopped => CommitAnswer::Cancelled(answer),
-        },
-    )
-}
-
 /// How a wait for the answer of a commit on its thread ended, see
 /// [`answer_while_polling`].
 enum Answered {
     /// The answer came: the commit's result, or `None` when its thread ended
-    /// without one, as [`commit_answer`] reads it.
+    /// without one, as [`CommitSlot::wake`] reads it.
     Came(Option<KafkaResult<()>>),
     /// Shutdown fired first. The commit is still in flight on its thread,
     /// and its answer is still to come on the receiver.
@@ -5891,46 +5981,33 @@ async fn commit_terminal_span(
             return Ok(false);
         }
     }
-    match commit_confirmed(
-        flush.consumer,
-        tpl,
-        flush.shutdown,
-        None,
-        queue,
-        &mut state.paused,
-        PERMIT_WAIT_GRACE,
-    )
-    .await?
-    {
-        CommitAnswer::Confirmed => {
-            state.tracker.commit_accepted(&positions);
-            discards.into_iter().for_each(CoveredDiscard::confirm);
-            state.commits.gate.mark(Instant::now());
-            Ok(true)
-        }
-        CommitAnswer::Rejected(e) => {
-            tracing::warn!(
-                queue,
-                error = %e,
-                offsets = ?position_offsets(&positions),
-                "the commit of a batch with dead letters or discards on it was rejected; the \
-                 batch is settled, and its position is re-offered"
-            );
-            let now = Instant::now();
-            state.tracker.commit_rejected(&positions, discards, now);
-            state.commits.gate.mark_rejected(now);
-            Ok(false)
-        }
-        CommitAnswer::Cancelled(answer) => {
-            state.commits.in_flight = Some(PendingCommit {
-                answer,
+    let confirmed = state
+        .commits
+        .commit_confirmed(
+            flush.consumer,
+            DrainedCommit {
+                tpl,
                 positions,
                 discards,
-            });
-            Ok(false)
-        }
-    }
+            },
+            &mut state.tracker,
+            flush.shutdown,
+            None,
+            queue,
+            &mut state.paused,
+            PERMIT_WAIT_GRACE,
+            SPAN_COMMIT_REJECTED,
+        )
+        .await?;
+    Ok(confirmed == Confirmed::Accepted)
 }
+
+/// The warning the commit of a batch span with dead letters or discards on
+/// it is logged with when the coordinator rejects it, see
+/// [`commit_terminal_span`].
+const SPAN_COMMIT_REJECTED: &str = "the commit of a batch with dead letters or discards on it \
+                                    was rejected; the batch is settled, and its position is \
+                                    re-offered";
 
 /// The parts of a batch decode that don't change between messages.
 struct BatchDecodeCtx<'a> {
@@ -7512,14 +7589,6 @@ async fn acquire_permit_while_polling(
             reconcile_pause_after_assign(consumer, *paused, assigned)?;
         }
         let now = Instant::now();
-        let in_flight = commits.as_ref().is_some_and(|c| c.slot.in_flight.is_some());
-        let committable = !in_flight
-            && commits
-                .as_ref()
-                .is_some_and(|c| c.tracker.has_committable());
-        if let Some(c) = commits.as_ref().filter(|_| committable) {
-            rearm(commit_wake.as_mut(), c.slot.gate.deadline(now));
-        }
         tokio::select! {
             biased;
             // Shutdown and the fault are read before the permit. An in-place
@@ -7538,17 +7607,7 @@ async fn acquire_permit_while_polling(
             }
             () = &mut grace, if !polling => polling = true,
             _ = housekeeping.tick(), if commits.is_some() => {}
-            () = &mut commit_wake, if committable => {
-                #[cfg(feature = "test-support")]
-                commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
-            }
-            answer = commit_answer(
-                commits.as_mut().and_then(|c| c.slot.in_flight.as_mut()),
-            ), if in_flight => {
-                if let Some(commits) = commits.as_mut() {
-                    commits.slot.settle(answer, commits.tracker, queue);
-                }
-            }
+            () = interval_wake(commits.as_mut(), commit_wake.as_mut(), queue, now) => {}
             received = poll.recv(), if polling => {
                 let Some(msg) = poll.received(received)? else {
                     continue;
@@ -7584,6 +7643,20 @@ async fn one_permit(
     semaphore: &Arc<Semaphore>,
 ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
     Arc::clone(semaphore).acquire_owned().await
+}
+
+/// [`CommitSlot::wake`] for the commits a wait makes under
+/// `CommitPolicy::Interval`, and never when it makes none.
+async fn interval_wake(
+    commits: Option<&mut IntervalCommits<'_>>,
+    wake: Pin<&mut tokio::time::Sleep>,
+    queue: &str,
+    now: Instant,
+) {
+    match commits {
+        Some(commits) => commits.slot.wake(commits.tracker, wake, queue, now).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Resolves once `shutdown` fires, and never when there is none to read.
@@ -7896,23 +7969,12 @@ async fn fifo_wait(
     loop {
         state.commit_due(consumer, queue)?;
         let now = Instant::now();
-        let committable = state.commits.in_flight.is_none() && state.tracker.has_committable();
-        if committable {
-            rearm(commit_wake.as_mut(), state.commits.gate.deadline(now));
-        }
         tokio::select! {
             biased;
             () = &mut stop => return Ok(FifoWait::Stop),
             () = &mut revoke => return Ok(FifoWait::Revoked),
             _ = housekeeping.tick() => {}
-            () = &mut commit_wake, if committable => {
-                #[cfg(feature = "test-support")]
-                commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
-            }
-            answer = commit_answer(state.commits.in_flight.as_mut()),
-                if state.commits.in_flight.is_some() => {
-                state.commits.settle(answer, &mut state.tracker, queue);
-            }
+            () = state.commits.wake(&mut state.tracker, commit_wake.as_mut(), queue, now) => {}
             received = poll.recv() => {
                 let Some(msg) = poll.received(received)? else {
                     continue;
@@ -8223,10 +8285,6 @@ async fn receive_serially<L: SerialLoop>(
     loop {
         state.settle(consumer, queue)?;
         let now = Instant::now();
-        let committable = state.commits.in_flight.is_none() && state.tracker.has_committable();
-        if committable {
-            rearm(commit_wake.as_mut(), state.commits.gate.deadline(now));
-        }
         tokio::select! {
             // The stop first: a stop that landed during the last record's
             // wait is read before the next record is taken.
@@ -8236,16 +8294,9 @@ async fn receive_serially<L: SerialLoop>(
                 return Ok(None);
             }
             _ = housekeeping.tick() => {}
-            // Wakes the loop when the commit gate's window expires with a
-            // position to commit, so it lands on a topic gone idle.
-            () = &mut commit_wake, if committable => {
-                #[cfg(feature = "test-support")]
-                commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
-            }
-            answer = commit_answer(state.commits.in_flight.as_mut()),
-                if state.commits.in_flight.is_some() => {
-                state.commits.settle(answer, &mut state.tracker, queue);
-            }
+            // The gate's deadline, so a position lands on a topic gone idle,
+            // or the answer of the commit in flight, see `CommitSlot::wake`.
+            () = state.commits.wake(&mut state.tracker, commit_wake.as_mut(), queue, now) => {}
             received = stream.recv() => {
                 let msg = match received {
                     Ok(msg) => msg,
@@ -9355,19 +9406,15 @@ impl KafkaConsumer {
                     if per_record
                         && commits.in_flight.is_none()
                         && commits.gate.due(now)
-                        && let Some(DrainedCommit {
-                            tpl,
-                            positions,
-                            discards,
-                        }) = tracker.drain_committable()
+                        && let Some(drained) = tracker.drain_committable()
                     {
                         // Every completion is committed before the next
                         // record is handed out, and only a confirmed
                         // commit counts: the position is committed
                         // synchronously on a thread of its own and the
                         // loop waits for the coordinator's answer while
-                        // it keeps polling, see `commit_confirmed`. The
-                        // assignment has been paused since the record
+                        // it keeps polling, see `CommitSlot::commit_confirmed`.
+                        // The assignment has been paused since the record
                         // was handed out, so nothing is taken meanwhile.
                         // A rejected commit is re-offered as under
                         // `Interval`, through the dirty flag, with its
@@ -9375,67 +9422,39 @@ impl KafkaConsumer {
                         // retires them; the fence judges the streak, and
                         // the gate spaces the re-offers so the loop polls
                         // between them. The assignment stays paused until
-                        // a commit is accepted, see the resume below.
-                        match commit_confirmed(
-                            consumer,
-                            tpl,
-                            &shutdown,
-                            Some(&mut fault_rx),
-                            queue,
-                            &mut paused,
-                            Duration::ZERO,
-                        )
-                        .await?
-                        {
-                            CommitAnswer::Confirmed => {
-                                tracker.commit_accepted(&positions);
-                                for discard in discards {
-                                    discard.confirm();
-                                }
-                                commits.gate.mark(Instant::now());
-                            }
-                            CommitAnswer::Rejected(e) => {
-                                tracing::warn!(
-                                    queue,
-                                    error = %e,
-                                    offsets = ?position_offsets(&positions),
-                                    "offset commit rejected; re-offering the position"
-                                );
-                                let now = Instant::now();
-                                tracker.commit_rejected(&positions, discards, now);
-                                commits.gate.mark_rejected(now);
-                                // A rejected position holds the next
-                                // record back whatever brought the loop
-                                // here. A record taken paused the
-                                // assignment already; a position
-                                // re-offered after a rebalance was
-                                // committed with nothing paused, and its
-                                // rejection pauses the same way, until a
-                                // re-offer is accepted.
-                                if !paused {
-                                    consumer
-                                        .pause_assignment()
-                                        .map_err(|e| map_kafka_error("pause failed", e))?;
-                                    paused = true;
-                                    tracing::info!(
-                                        queue,
-                                        "offset commit rejected; assignment paused until a re-offer is accepted"
-                                    );
-                                }
-                            }
-                            CommitAnswer::Cancelled(answer) => {
-                                // Shutdown fired during the wait. The
-                                // commit is still in flight on its
-                                // thread; the shutdown arm, which this
-                                // pass reaches next, waits for its answer
-                                // and settles what rides on it before
-                                // the final commit.
-                                commits.in_flight = Some(PendingCommit {
-                                    answer,
-                                    positions,
-                                    discards,
-                                });
-                            }
+                        // a commit is accepted, see the resume below. A
+                        // stop during the wait leaves the commit in flight,
+                        // and the shutdown arm, which this pass reaches
+                        // next, waits for its answer and settles what rides
+                        // on it before the final commit.
+                        let confirmed = commits
+                            .commit_confirmed(
+                                consumer,
+                                drained,
+                                &mut tracker,
+                                &shutdown,
+                                Some(&mut fault_rx),
+                                queue,
+                                &mut paused,
+                                Duration::ZERO,
+                                COMMIT_REJECTED,
+                            )
+                            .await?;
+                        // A rejected position holds the next record back
+                        // whatever brought the loop here. A record taken
+                        // paused the assignment already; a position
+                        // re-offered after a rebalance was committed with
+                        // nothing paused, and its rejection pauses the same
+                        // way, until a re-offer is accepted.
+                        if confirmed == Confirmed::Rejected && !paused {
+                            consumer
+                                .pause_assignment()
+                                .map_err(|e| map_kafka_error("pause failed", e))?;
+                            paused = true;
+                            tracing::info!(
+                                queue,
+                                "offset commit rejected; assignment paused until a re-offer is accepted"
+                            );
                         }
                     }
 
@@ -9503,10 +9522,6 @@ impl KafkaConsumer {
                         );
                     }
 
-                    let committable = commits.in_flight.is_none() && tracker.has_committable();
-                    if committable {
-                        rearm(commit_wake.as_mut(), commits.gate.deadline(now));
-                    }
                     // `biased`, shutdown first: a tie between ready arms is
                     // broken in the order written rather than at random.
                     // Under `PerRecord` a shutdown that cuts a confirmation
@@ -9572,32 +9587,14 @@ impl KafkaConsumer {
                         // Falls through to the top-of-loop drain — see the
                         // comment on `housekeeping` above.
                         _ = housekeeping.tick() => {}
-                        // Wakes the loop when the commit gate's window expires
-                        // with commit work pending, so a gated commit lands
-                        // within ~ASYNC_COMMIT_INTERVAL even on a topic gone
-                        // idle — without this arm it would wait for the next
-                        // housekeeping tick, regressing the idle-topic
-                        // redelivery bound (see the completion arm below) from
-                        // the gate interval to HOUSEKEEPING_INTERVAL. Disabled
-                        // when nothing is committable, so an idle consumer does
-                        // not wake every interval, and while a commit is in
-                        // flight, whose answer arm below wakes the loop
-                        // instead; no busy-spin when past due, because the
-                        // top-of-loop drain then commits and `mark` pushes the
-                        // deadline forward. The `Sleep` is kept across passes
-                        // and reset only when that deadline moves, see
-                        // `rearm`.
-                        () = &mut commit_wake, if committable => {
-                            #[cfg(feature = "test-support")]
-                            commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
-                        }
-                        // The answer of the commit in flight, settled at once:
-                        // a rejection marks its partitions to re-offer, so the
-                        // wake above is due once the gate allows it.
-                        answer = commit_answer(commits.in_flight.as_mut()),
-                            if commits.in_flight.is_some() => {
-                            commits.settle(answer, &mut tracker, queue);
-                        }
+                        // The gate's deadline, or the answer of the commit in
+                        // flight, see `CommitSlot::wake`. The deadline lands
+                        // a gated commit within the gate's window on a topic
+                        // gone idle too; the next housekeeping tick would
+                        // stretch the idle-topic redelivery bound (see the
+                        // completion arm below) from the window to
+                        // HOUSEKEEPING_INTERVAL.
+                        () = commits.wake(&mut tracker, commit_wake.as_mut(), queue, now) => {}
                         // Handler completions must wake the loop even when no new
                         // message arrives: with only the recv() arm, the offsets of
                         // the last in-flight batch sat uncommitted until the *next*
@@ -10508,11 +10505,6 @@ impl KafkaConsumer {
                             }
                         };
                         let now = Instant::now();
-                        let in_flight = state.commits.in_flight.is_some();
-                        let committable = !in_flight && state.tracker.has_committable();
-                        if committable {
-                            rearm(commit_wake.as_mut(), state.commits.gate.deadline(now));
-                        }
 
                         tokio::select! {
                             () = &mut stop => {
@@ -10534,16 +10526,10 @@ impl KafkaConsumer {
                                 // Nothing to do — the drain at the top of the next
                                 // iteration is the point of the wake-up.
                             }
-                            // Wakes the loop when the commit gate's window
-                            // expires with a position to commit, so it lands on
-                            // a topic gone idle.
-                            () = &mut commit_wake, if committable => {
-                                #[cfg(feature = "test-support")]
-                                commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
-                            }
-                            answer = commit_answer(state.commits.in_flight.as_mut()), if in_flight => {
-                                state.commits.settle(answer, &mut state.tracker, queue);
-                            }
+                            // The gate's deadline, so a position lands on a
+                            // topic gone idle, or the answer of the commit in
+                            // flight, see `CommitSlot::wake`.
+                            () = state.commits.wake(&mut state.tracker, commit_wake.as_mut(), queue, now) => {}
                             () = sleep_until_deadline => {
                                 flush_batch(
                                     &flush_ctx,
