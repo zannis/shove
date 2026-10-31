@@ -3297,6 +3297,19 @@ fn batch_max_poll_interval_ms(options: &BatchConsumerOptionsInner) -> u32 {
     MAX_POLL_INTERVAL_MS
 }
 
+/// How often the batch loop wakes with nothing else to wake it: the pinned
+/// `HOUSEKEEPING_INTERVAL`, or under `test-support` the value a test
+/// injected through `BatchConsumerOptionsInner::kafka_housekeeping_interval`.
+fn batch_housekeeping_interval(options: &BatchConsumerOptionsInner) -> Duration {
+    #[cfg(feature = "test-support")]
+    if let Some(interval) = options.kafka_housekeeping_interval {
+        return interval;
+    }
+    #[cfg(not(feature = "test-support"))]
+    let _ = options;
+    HOUSEKEEPING_INTERVAL
+}
+
 /// The bound on one schema registry lookup made from a consume loop: a third
 /// of the member's `max.poll.interval.ms`, and at least a second.
 ///
@@ -8297,6 +8310,7 @@ impl KafkaConsumer {
             .unwrap_or(KafkaAutoOffsetReset::Earliest);
         let shutdown = options.shutdown.clone();
         let max_poll_interval_ms = batch_max_poll_interval_ms(&options);
+        let housekeeping_interval = batch_housekeeping_interval(&options);
         let max_message_size = options.max_message_size;
         let max_batch_size = options.max_batch_size;
         let max_batch_age = options.max_batch_age;
@@ -8415,7 +8429,7 @@ impl KafkaConsumer {
                 // Wakes the loop when neither a message nor the batch deadline
                 // will, so a rebalance that arrives while the topic is idle is
                 // still noticed promptly.
-                let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
+                let mut housekeeping = tokio::time::interval(housekeeping_interval);
                 housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
                 loop {

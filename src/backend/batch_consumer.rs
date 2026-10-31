@@ -123,6 +123,13 @@ pub(crate) struct BatchConsumerOptionsInner {
     /// `BatchConsumerOptions::<Kafka>::with_max_poll_interval_for_test`.
     #[cfg(all(feature = "kafka", feature = "test-support"))]
     pub kafka_max_poll_interval: Option<Duration>,
+    /// Kafka-only, `test-support` builds: how often the batch loop wakes to
+    /// drain rebalance events when nothing else wakes it, in place of the
+    /// pinned `HOUSEKEEPING_INTERVAL`, so a test can leave a drain to the arm
+    /// it is about. Propagated from
+    /// `BatchConsumerOptions::<Kafka>::with_housekeeping_interval_for_test`.
+    #[cfg(all(feature = "kafka", feature = "test-support"))]
+    pub kafka_housekeeping_interval: Option<Duration>,
 
     /// Kafka-only: Schema Registry client for decoding Confluent wire-framed
     /// batch messages. `None` disables registry-based decoding.

@@ -77,6 +77,8 @@ pub struct BatchConsumerOptions<B: Backend> {
     pub(crate) kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
     #[cfg(all(feature = "kafka", feature = "test-support"))]
     pub(crate) kafka_max_poll_interval: Option<Duration>,
+    #[cfg(all(feature = "kafka", feature = "test-support"))]
+    pub(crate) kafka_housekeeping_interval: Option<Duration>,
 
     #[cfg(feature = "kafka-schema-registry")]
     pub(crate) schema_registry: Option<Arc<SchemaRegistry>>,
@@ -114,6 +116,8 @@ impl<B: Backend> BatchConsumerOptions<B> {
             kafka_auto_offset_reset: None,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: None,
+            #[cfg(all(feature = "kafka", feature = "test-support"))]
+            kafka_housekeeping_interval: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: None,
             // Matches `ConsumerOptions`: enforcement is opt-out, not opt-in.
@@ -243,6 +247,8 @@ impl<B: Backend> BatchConsumerOptions<B> {
             kafka_auto_offset_reset: self.kafka_auto_offset_reset,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: self.kafka_max_poll_interval,
+            #[cfg(all(feature = "kafka", feature = "test-support"))]
+            kafka_housekeeping_interval: self.kafka_housekeeping_interval,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: self.schema_registry,
             #[cfg(feature = "kafka-schema-registry")]
@@ -289,6 +295,17 @@ impl BatchConsumerOptions<Kafka> {
     #[doc(hidden)]
     pub fn with_max_poll_interval_for_test(mut self, interval: Duration) -> Self {
         self.kafka_max_poll_interval = Some(interval);
+        self
+    }
+
+    /// Test-only seam (see the `test-support` feature): wake the batch loop
+    /// to drain rebalance events every `interval` instead of every five
+    /// seconds, so a test can leave a rebalance undrained until the arm it is
+    /// about runs.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_housekeeping_interval_for_test(mut self, interval: Duration) -> Self {
+        self.kafka_housekeeping_interval = Some(interval);
         self
     }
 }
