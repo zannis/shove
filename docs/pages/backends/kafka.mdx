@@ -373,16 +373,17 @@ A returned partition therefore never stays paused behind a wait that is over, an
 ### Draining the DLQ
 
 `KafkaConsumer::run_dlq` and `run_dlq_with_options` hand every dead letter to `MessageHandler::handle_dead`.
-The drain reads `with_shutdown`, `with_handler_timeout`, `with_max_message_size`, `with_group_id`, `with_consumer_group` and the schema registry settings.
+The drain reads `with_shutdown`, `with_handler_timeout` or `without_handler_timeout`, `with_max_message_size`, `with_group_id`, `with_consumer_group` and the schema registry settings.
 It reads no commit or offset-reset setting, so it refuses `with_commit_interval`, `with_commit_policy` and `with_auto_offset_reset` with a `ShoveError::Topology`.
+`handle_dead` returns no outcome for a timeout to resolve to, so the drain refuses `with_handler_timeout_outcome` the same way.
 
 The drain stops when the token of its options fires or when the client's token does.
 Either stop takes effect once the dead letter in hand is finished with.
 Closing the client therefore ends a drain whose own token nothing cancels.
 
-`handle_dead` runs on the drain's own task, one dead letter at a time, under panic isolation and a timeout.
+`handle_dead` runs on the drain's own task, one dead letter at a time, under panic isolation and the handler timeout.
 The timeout is `with_handler_timeout`, 30 s by default.
-A drain whose options call `without_handler_timeout` is bounded by the same 30 s, so a call that never returns cannot hold the partition for good.
+`without_handler_timeout` leaves the call unbounded, so a call that never returns holds the drain and its partition for as long as it runs.
 Nothing polls while `handle_dead` runs, so the call must finish inside `max.poll.interval.ms`, five minutes.
 Keep `with_handler_timeout` below that.
 A call that panics or outlasts the timeout is logged at warn level, and the drain goes on to the next dead letter.
