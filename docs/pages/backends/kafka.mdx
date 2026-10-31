@@ -801,6 +801,7 @@ A process that exits on the error therefore does not cut the LeaveGroup short, a
 Against a coordinator that does not answer, the reconnect or the error comes up to 20 s later, and the close finishes on its thread.
 If a commit is still in flight on its thread, the close runs once that commit returns, and the error is returned without waiting for it.
 A member whose task is aborted closes off the runtime thread as well, but nothing waits for that close.
+Dropping the future of a direct `run_fifo` aborts its member's task the same way.
 A broadcast subscription has nothing to commit and no group to leave, and it closes its consumer on a thread of its own at every exit, a stop included, waiting for the close for at most the same 20 s.
 
 The wait for the handlers at a stop can fail too: on a receive error that ends a consumer, a failed connection or name resolution excepted, see [Broker outages](#broker-outages), or on a put-back or a pause librdkafka refuses.
