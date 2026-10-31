@@ -510,7 +510,7 @@ async fn an_out_of_range_setting_is_refused_before_a_consumer_is_created() {
     .expect("the refusal comes at startup, not after a retry loop")
     .expect_err("an out-of-range backoff is refused");
     assert!(
-        matches!(&err, ShoveError::Topology(msg)
+        matches!(&err, ShoveError::Validation(msg)
             if msg.contains("with_fetch_queue_backoff_ms") && msg.contains("0..=300000")),
         "{err:?}"
     );
@@ -526,7 +526,7 @@ async fn an_out_of_range_setting_is_refused_before_a_consumer_is_created() {
         .await
         .expect_err("an out-of-range threshold is refused at registration");
     assert!(
-        matches!(&err, ShoveError::Topology(msg)
+        matches!(&err, ShoveError::Validation(msg)
             if msg.contains("with_queued_min_messages") && msg.contains("1..=10000000")),
         "{err:?}"
     );

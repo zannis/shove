@@ -35,9 +35,8 @@ pub(crate) struct FetchQueueTuning {
 
 impl FetchQueueTuning {
     /// Refuses a setting outside librdkafka's range with
-    /// `ShoveError::Topology`, the variant every refusal of a consumer's
-    /// options uses, naming `queue`, the setter and the range. Unset settings
-    /// pass.
+    /// `ShoveError::Validation`, naming `queue`, the setter and the range.
+    /// Unset settings pass.
     pub(crate) fn validate(&self, queue: &str) -> Result<()> {
         within(
             queue,
@@ -95,7 +94,7 @@ fn within(
     unset: &str,
 ) -> Result<()> {
     match value {
-        Some(value) if !range.contains(&value) => Err(ShoveError::Topology(format!(
+        Some(value) if !range.contains(&value) => Err(ShoveError::Validation(format!(
             "topic '{queue}': `{setter}` takes a value in {}..={}, the range librdkafka admits \
              for `{property}`, and this consumer has {value}. Set a value in that range, or \
              leave the setting unset for {unset}.",
@@ -226,8 +225,8 @@ mod tests {
                 tuning.validate("orders"),
                 tuning.apply(&mut config, "orders"),
             ] {
-                let Err(ShoveError::Topology(msg)) = refused else {
-                    panic!("{tuning:?} must be refused with ShoveError::Topology: {refused:?}");
+                let Err(ShoveError::Validation(msg)) = refused else {
+                    panic!("{tuning:?} must be refused with ShoveError::Validation: {refused:?}");
                 };
                 assert!(
                     msg.contains("orders")

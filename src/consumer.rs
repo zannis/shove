@@ -1039,10 +1039,10 @@ impl ConsumerOptions<Kafka> {
     /// bounds the same queue by size.
     ///
     /// The accepted range is `1..=10000000`. A value outside it is refused
-    /// with `ShoveError::Topology` where the consumer starts, before any broker
-    /// request. `KafkaConsumer::run`, `run_fifo`, `run_dlq_with_options` and
-    /// `BroadcastSubscriber::subscribe` all read the setting. For the
-    /// coordinated registry path the equivalent is
+    /// with `ShoveError::Validation` where the consumer starts, before any
+    /// broker request. `KafkaConsumer::run`, `run_fifo`,
+    /// `run_dlq_with_options` and `BroadcastSubscriber::subscribe` all read the
+    /// setting. For the coordinated registry path the equivalent is
     /// [`KafkaConsumerGroupConfig::with_queued_min_messages`](crate::kafka::KafkaConsumerGroupConfig::with_queued_min_messages).
     pub fn with_queued_min_messages(mut self, messages: u32) -> Self {
         self.kafka_fetch_queue.queued_min_messages = Some(messages);
@@ -1057,7 +1057,7 @@ impl ConsumerOptions<Kafka> {
     /// keeps librdkafka's default, 65536, about 64 MB.
     ///
     /// The accepted range is `1..=2097151`. A value outside it is refused
-    /// with `ShoveError::Topology` where the consumer starts, as
+    /// with `ShoveError::Validation` where the consumer starts, as
     /// [`with_queued_min_messages`](Self::with_queued_min_messages) is. For the
     /// coordinated registry path the equivalent is
     /// [`KafkaConsumerGroupConfig::with_queued_max_messages_kbytes`](crate::kafka::KafkaConsumerGroupConfig::with_queued_max_messages_kbytes).
@@ -1079,7 +1079,7 @@ impl ConsumerOptions<Kafka> {
     /// the wait, and can raise CPU use while a queue stays full.
     ///
     /// The accepted range is `0..=300000`. A value outside it is refused with
-    /// `ShoveError::Topology` where the consumer starts, as
+    /// `ShoveError::Validation` where the consumer starts, as
     /// [`with_queued_min_messages`](Self::with_queued_min_messages) is. For the
     /// coordinated registry path the equivalent is
     /// [`KafkaConsumerGroupConfig::with_fetch_queue_backoff_ms`](crate::kafka::KafkaConsumerGroupConfig::with_fetch_queue_backoff_ms).
