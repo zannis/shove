@@ -9027,11 +9027,14 @@ impl KafkaConsumer {
     /// batch's own included, is waited for at most 15 s, and every retired
     /// position is then committed synchronously and the consumer closed,
     /// both on a thread of their own, within what is left of the 20 s
-    /// shutdown deadline. A commit in flight with no answer in time, and a
-    /// final commit the broker does not confirm, end the run with
-    /// `ShoveError::Commit`. Any other error closes the consumer on a thread
-    /// of its own with nothing committed, and the error is returned once the
-    /// close has run or the same deadline has passed.
+    /// shutdown deadline. A final commit refused while the group
+    /// rebalances, as one made during another member's stop can be, is
+    /// tried again inside that deadline once the consumer has polled. A
+    /// commit in flight with no answer in time, and a final commit the broker
+    /// does not confirm, end the run with `ShoveError::Commit`. Any other
+    /// error closes the consumer on a thread of its own with nothing
+    /// committed, and the error is returned once the close has run or the
+    /// same deadline has passed.
     ///
     /// # Handler failures
     ///
