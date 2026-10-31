@@ -302,9 +302,17 @@ impl BatchConsumerOptions<Kafka> {
     /// to drain rebalance events every `interval` instead of every five
     /// seconds, so a test can leave a rebalance undrained until the arm it is
     /// about runs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `interval` is zero: the loop's tick has no zero period.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn with_housekeeping_interval_for_test(mut self, interval: Duration) -> Self {
+        assert!(
+            !interval.is_zero(),
+            "housekeeping interval must be positive"
+        );
         self.kafka_housekeeping_interval = Some(interval);
         self
     }
