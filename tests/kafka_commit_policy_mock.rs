@@ -49,11 +49,15 @@
 //! is aborted, or that ends a connection on an error, closes its consumer
 //! off the runtime thread.
 //!
-//! The final section takes the broker down for a few seconds, which a
-//! settled member rides out on the client it started with and a member fresh
-//! from a rebalance reconnects through, and stops a member whose handler
-//! holds its only permit past the poll interval, whose drain keeps polling
-//! through a rebalance.
+//! A section takes the broker down for a few seconds, which a settled member
+//! rides out on the client it started with and a member fresh from a
+//! rebalance reconnects through, and stops a member whose handler holds its
+//! only permit past the poll interval, whose drain keeps polling through a
+//! rebalance.
+//!
+//! The final section stops a standard and a sequenced member while a backlog
+//! is queued behind the record in hand, and times the commit the gate holds
+//! back once a member has sat idle, on both.
 //!
 //! `test-support` gates the seams this file reads. The Kafka coverage row
 //! enables it and runs this suite; the schema-registry row compiles the
@@ -63,6 +67,7 @@
 #![allow(clippy::mutable_key_type)] // metrics-util's CompositeKey has interior mutability
 
 use std::os::raw::c_int;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -88,9 +93,9 @@ use shove::consumer_group::ConsumerGroupConfig;
 use shove::handler::MessageHandler;
 use shove::kafka::{
     CommitPolicy, KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroup,
-    KafkaConsumerGroupConfig, client_id_probe, fence_probe, final_commit_spawn_probe,
-    housekeeping_interval_for_test, pending_commit_budget_for_test, per_record_probe,
-    put_back_probe, shutdown_commit_deadline_for_test,
+    KafkaConsumerGroupConfig, client_id_probe, commit_gate_probe, fence_probe,
+    final_commit_spawn_probe, housekeeping_interval_for_test, pending_commit_budget_for_test,
+    per_record_probe, permit_wait_probe, put_back_probe, shutdown_commit_deadline_for_test,
 };
 use shove::markers::Kafka;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -5213,4 +5218,288 @@ async fn shutdown_drain_keeps_polling() {
     group_a.shutdown().await;
     token_b.cancel();
     let _ = run_b.await.expect("B's task completes");
+}
+
+// ---------------------------------------------------------------------------
+// A stop under a backlog, and the commit gate's wake after an idle spell
+// ---------------------------------------------------------------------------
+
+/// Records queued for the member, enough that one is always ready to receive
+/// when the stop lands.
+const BACKLOG: usize = 50;
+/// The delivery whose handler stops the member.
+const STOP_AT: usize = 10;
+/// The commit gate's window in the gate test of the standard consumer: short
+/// against the 5 s housekeeping tick, so a commit the gate's deadline woke is
+/// told apart from one that waited for the tick.
+const GATE_WINDOW: Duration = Duration::from_millis(1500);
+/// The window a sequenced consumer commits on, its fixed default interval.
+const SEQUENCED_WINDOW: Duration = Duration::from_millis(500);
+/// How far a gated commit may land from the end of its window: the commit
+/// thread's spawn and the request's way to the broker on one side, a busy
+/// runner on the other.
+const GATE_SLACK: Duration = Duration::from_millis(1000);
+
+/// `BACKLOG` order ids, `o0` onwards.
+fn backlog() -> Vec<String> {
+    (0..BACKLOG).map(|i| format!("o{i}")).collect()
+}
+
+/// Acknowledges every record and counts it, and cancels `shutdown` from
+/// inside the handler of delivery `STOP_AT`, so the stop lands while the
+/// member holds that record with the backlog queued behind it.
+#[derive(Clone)]
+struct StopsAt {
+    seen: Arc<AtomicUsize>,
+    shutdown: CancellationToken,
+}
+
+impl StopsAt {
+    fn new(shutdown: CancellationToken) -> Self {
+        Self {
+            seen: Arc::default(),
+            shutdown,
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.seen.load(Ordering::SeqCst)
+    }
+}
+
+impl<T: Topic<Message = Order>> MessageHandler<T> for StopsAt {
+    type Context = ();
+    async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+        if self.seen.fetch_add(1, Ordering::SeqCst) + 1 == STOP_AT {
+            self.shutdown.cancel();
+        }
+        Outcome::Ack
+    }
+}
+
+/// A stop that lands while a backlog is queued ends the receive loop within
+/// one pass: the record the member holds completes, nothing behind it
+/// reaches the handler, and the final commit carries the position past the
+/// last record handled. On one permit the next record waits for the one the
+/// stopping handler holds, and the stop is read before that permit. The
+/// handler acks at once, so no wait runs long enough to pause the assignment
+/// and leave a spare permit, which would let a record skip the wait. The
+/// records that entered the wait then count what the loop took: at most one
+/// past the stop, where a loop that read the stop late would take the
+/// backlog.
+#[tokio::test]
+async fn a_stop_under_a_backlog_hands_out_nothing_behind_the_record_in_hand() {
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    let ids = backlog();
+    produce(
+        &bootstrap,
+        &ids.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await;
+
+    let shutdown = CancellationToken::new();
+    let handler = StopsAt::new(shutdown.clone());
+    let client = connect(&bootstrap).await;
+    let h = handler.clone();
+    let opts = one_permit(shutdown);
+    let run = tokio::spawn(async move {
+        KafkaConsumer::new(client)
+            .run::<OrdersTopic, _>(h, (), opts)
+            .await
+    });
+    tokio::time::timeout(DELIVERY_TIMEOUT, run)
+        .await
+        .expect("the stop ends the run")
+        .expect("the run task completes")
+        .expect("a clean stop");
+
+    assert_eq!(
+        handler.count(),
+        STOP_AT,
+        "nothing behind the record in hand reached the handler"
+    );
+    assert!(
+        permit_wait_probe::entered() <= STOP_AT + 1,
+        "the loop took at most one record past the stop: {} taken",
+        permit_wait_probe::entered()
+    );
+    assert_eq!(
+        committed_position(&bootstrap).await,
+        Some(i64::try_from(STOP_AT).expect("a small count")),
+        "the final commit carries every record handled"
+    );
+}
+
+/// The same stop on a sequenced consumer: the record in hand is acked, and
+/// the loop reads the stop before it takes the next one. The loop samples
+/// the size of every record it takes, so with `metrics` on the samples
+/// count what it took: none past the stop. A decode reads the stop too, so
+/// the handler count alone would not tell a loop that took one record more.
+#[tokio::test]
+async fn a_sequenced_stop_under_a_backlog_hands_out_nothing_behind_the_record_in_hand() {
+    #[cfg(feature = "metrics")]
+    let snapshotter = install_recorder();
+    let ids = backlog();
+    let (_mock, bootstrap) =
+        sequenced_mock(&ids.iter().map(String::as_str).collect::<Vec<_>>()).await;
+
+    let shutdown = CancellationToken::new();
+    let handler = StopsAt::new(shutdown.clone());
+    let client = connect(&bootstrap).await;
+    let h = handler.clone();
+    let opts = ConsumerOptions::<Kafka>::new().with_shutdown(shutdown);
+    let run = tokio::spawn(async move {
+        KafkaConsumer::new(client)
+            .run_fifo::<SequencedOrders, _>(h, (), opts)
+            .await
+    });
+    tokio::time::timeout(DELIVERY_TIMEOUT, run)
+        .await
+        .expect("the stop ends the run")
+        .expect("the run task completes")
+        .expect("a clean stop");
+
+    assert_eq!(
+        handler.count(),
+        STOP_AT,
+        "nothing behind the record in hand reached the handler"
+    );
+    assert_eq!(
+        committed_position_on(&bootstrap, SEQUENCED_TOPIC, SEQUENCED_GROUP, 0).await,
+        Some(i64::try_from(STOP_AT).expect("a small count")),
+        "the final commit carries every record handled"
+    );
+    #[cfg(feature = "metrics")]
+    assert_eq!(
+        size_samples(&snapshotter, SEQUENCED_TOPIC),
+        STOP_AT,
+        "the loop took no record past the stop"
+    );
+}
+
+/// How many `shove_message_size_bytes` samples `topic` has, from one
+/// draining snapshot of the debugging recorder: one per record a loop took.
+#[cfg(feature = "metrics")]
+fn size_samples(snapshotter: &Snapshotter, topic: &str) -> usize {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(key, ..)| key.key().name() == "shove_message_size_bytes")
+        .filter(|(key, ..)| {
+            key.key()
+                .labels()
+                .any(|label| label.key() == "topic" && label.value() == topic)
+        })
+        .map(|(.., value)| match value {
+            DebugValue::Histogram(samples) => samples.len(),
+            other => panic!("shove_message_size_bytes is not a histogram: {other:?}"),
+        })
+        .sum()
+}
+
+/// The gap between the last two OffsetCommit requests the broker received.
+fn last_commit_gap(mock: &Mock) -> Duration {
+    let stamps = mock.request_timestamps(RDKafkaApiKey::OffsetCommit);
+    let [.., opened, gated] = stamps[..] else {
+        panic!("two commits reached the broker: {stamps:?}");
+    };
+    Duration::from_micros(u64::try_from(gated - opened).expect("arrival order"))
+}
+
+/// Asserts the last commit was gated: made `window` after the one before
+/// it, give or take `GATE_SLACK`, on a single wake of the gate's deadline
+/// since `woke_before` was read.
+fn assert_gated(mock: &Mock, window: Duration, woke_before: usize) {
+    let gap = last_commit_gap(mock);
+    assert!(
+        gap + GATE_SLACK >= window && gap <= window + GATE_SLACK,
+        "the gated commit lands when its window ends, {window:?} after the one before it: \
+         gap {gap:?}"
+    );
+    assert_eq!(
+        commit_gate_probe::woke() - woke_before,
+        1,
+        "the gate's deadline woke the member once for the gated commit"
+    );
+}
+
+/// A completion inside the commit gate's window, once the member has sat
+/// idle past an earlier window, is committed when its window ends, on one
+/// wake of the gate's deadline. The member commits its first record and
+/// idles. A second record then finds the gate open and is committed at
+/// once, which opens a fresh window, and a third, produced inside that
+/// window, waits for its end on a single wake: the housekeeping tick is
+/// seconds later, and a wake that fired on every pass would count more.
+#[tokio::test]
+async fn after_an_idle_spell_a_gated_commit_lands_when_its_window_ends() {
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    produce(&bootstrap, &["o1"]).await;
+    mock.track_requests();
+
+    let handler = Acking::default();
+    let h = handler.clone();
+    let (run, shutdown) = start(connect(&bootstrap).await, h, |token| {
+        options(CommitPolicy::Interval(GATE_WINDOW), token)
+    });
+    wait_for_committed_position(&bootstrap, 1, DELIVERY_TIMEOUT).await;
+    tokio::time::sleep(GATE_WINDOW * 2).await;
+
+    produce(&bootstrap, &["o2"]).await;
+    wait_for_committed_position(&bootstrap, 2, DELIVERY_TIMEOUT).await;
+    let woke = commit_gate_probe::woke();
+    produce(&bootstrap, &["o3"]).await;
+    wait_for_committed_position(&bootstrap, 3, DELIVERY_TIMEOUT).await;
+    assert_gated(&mock, GATE_WINDOW, woke);
+
+    shutdown.cancel();
+    run.await
+        .expect("the run task completes")
+        .expect("a clean stop");
+}
+
+/// The same on a sequenced consumer, which commits on its fixed default
+/// interval. That window is shorter than `GATE_SLACK`, so the gap's lower
+/// bound can never fail here, and the wake count is what pins the behaviour.
+#[tokio::test]
+async fn after_an_idle_spell_a_sequenced_gated_commit_lands_when_its_window_ends() {
+    let (mock, bootstrap) = sequenced_mock(&["o1"]).await;
+    mock.track_requests();
+
+    let shutdown = CancellationToken::new();
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let client = connect(&bootstrap).await;
+    let h = handler.clone();
+    let opts = ConsumerOptions::<Kafka>::new().with_shutdown(shutdown.clone());
+    let run = tokio::spawn(async move {
+        KafkaConsumer::new(client)
+            .run_fifo::<SequencedOrders, _>(h, (), opts)
+            .await
+    });
+    let committed = |position| {
+        wait_for_position(
+            &bootstrap,
+            SEQUENCED_TOPIC,
+            SEQUENCED_GROUP,
+            position,
+            DELIVERY_TIMEOUT,
+            "the sequenced consumer's commit",
+        )
+    };
+    committed(1).await;
+    tokio::time::sleep(SEQUENCED_WINDOW * 4).await;
+
+    produce_on(&bootstrap, SEQUENCED_TOPIC, &["o2"]).await;
+    committed(2).await;
+    let woke = commit_gate_probe::woke();
+    produce_on(&bootstrap, SEQUENCED_TOPIC, &["o3"]).await;
+    committed(3).await;
+    assert_gated(&mock, SEQUENCED_WINDOW, woke);
+
+    shutdown.cancel();
+    run.await
+        .expect("the run task completes")
+        .expect("a clean stop");
 }

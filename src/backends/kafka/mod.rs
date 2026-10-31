@@ -25,6 +25,9 @@ pub use client::{KafkaSasl, KafkaTls};
 pub use consumer::client_id_probe;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
+pub use consumer::commit_gate_probe;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
 pub use consumer::completion_probe;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
