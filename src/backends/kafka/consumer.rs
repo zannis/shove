@@ -10914,6 +10914,10 @@ impl KafkaConsumer {
     /// commit the coordinator rejects is re-offered, and a member whose
     /// commits keep being rejected with no rebalance resolving them is
     /// treated as fenced and reconnects, as the standard consumer does.
+    ///
+    /// The consumer runs on a task of its own. Dropping the returned future
+    /// aborts that task: no final commit is made, and its consumer closes on
+    /// a thread of its own.
     pub async fn run_fifo<T, H>(
         &self,
         handler: H,
@@ -10941,6 +10945,11 @@ impl KafkaConsumer {
         let handles = self
             .spawn_fifo_shards_checked::<T, H>(handler, ctx, options)
             .await?;
+        // Dropping this future aborts the shards it waits for.
+        let _shards: Vec<AbortOnDrop> = handles
+            .iter()
+            .map(|handle| AbortOnDrop(handle.abort_handle()))
+            .collect();
         // Kafka has exactly one FIFO task per call (single consumer, partition ordering).
         for handle in handles {
             match handle.await {

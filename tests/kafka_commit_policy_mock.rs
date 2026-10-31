@@ -36,9 +36,11 @@
 //!
 //! A section runs a sequenced consumer against the same mock: a streak of
 //! rejected commits fences it, and it reconnects once the close that error
-//! exit makes has had its LeaveGroup answered; and a stop that finds its
-//! commit in flight unanswered reports the share of the shutdown deadline it
-//! waited, as the standard consumer's does under `Interval`.
+//! exit makes has had its LeaveGroup answered; a stop that finds its commit
+//! in flight unanswered reports the share of the shutdown deadline it
+//! waited, as the standard consumer's does under `Interval`; and a direct
+//! `run_fifo` whose future is dropped stops its shard, which leaves its
+//! group.
 //!
 //! A section runs the DLQ drain against the same mock: a `handle_dead` that
 //! panics or hangs costs the drain that one call and moves no handler
@@ -4157,6 +4159,49 @@ async fn a_sequenced_error_exit_closes_before_it_reconnects() {
 
     token.cancel();
     group.shutdown().await;
+}
+
+/// Dropping the future of a direct `run_fifo` stops its shard. The run's
+/// task is aborted while its member holds the topic's partition, which
+/// drops the future that waits for the shard; the shard task is aborted
+/// with it, and the consumer it leaves behind closes off the runtime thread
+/// and leaves its group. A record produced afterwards reaches no handler.
+#[tokio::test]
+async fn dropping_a_direct_run_fifo_stops_its_shard() {
+    const LEAVE_TIMEOUT: Duration = Duration::from_secs(10);
+    let (mock, bootstrap) = sequenced_mock(&["o1"]).await;
+    mock.track_requests();
+
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let client = connect(&bootstrap).await;
+    let h = handler.clone();
+    let run = tokio::spawn(async move {
+        KafkaConsumer::new(client)
+            .run_fifo::<SequencedOrders, _>(h, (), ConsumerOptions::<Kafka>::new())
+            .await
+    });
+    wait_until(
+        || handler.count() >= 1,
+        DELIVERY_TIMEOUT,
+        "o1 reaching the handler",
+    )
+    .await;
+
+    run.abort();
+    let _ = run.await;
+    wait_until(
+        || mock.requests_of(RDKafkaApiKey::LeaveGroup) >= 1,
+        LEAVE_TIMEOUT,
+        "the dropped run's shard leaving its group",
+    )
+    .await;
+    produce_on(&bootstrap, SEQUENCED_TOPIC, &["o2"]).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        handler.ids(),
+        ["o1"],
+        "a stopped shard hands no later record to the handler"
+    );
 }
 
 /// The text of every event logged in this process, as `field=value` pairs,
