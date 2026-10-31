@@ -11374,6 +11374,21 @@ impl KafkaConsumer {
     /// `group.id` string is nonetheless configured, why it is a fixed one, and
     /// why `with_group_id` may replace it.
     ///
+    /// # Partitions added later
+    ///
+    /// [`BROADCAST_ASSIGN_REFRESH_INTERVAL`] after the initial assignment, and
+    /// as long again after each check ends, the loop checks the topic for
+    /// partitions it does not hold yet and assigns them at the configured
+    /// start, see [`KafkaStreamConsumer::refresh_broadcast_partitions`]. The
+    /// check runs on a blocking thread, and records keep reaching the handler
+    /// while it runs. It holds a handle on the consumer, so a stop that lands
+    /// during a check waits for it before the close, and so does an exit on
+    /// an error. Each of its broker requests is bounded by
+    /// [`BROADCAST_ASSIGN_TIMEOUT`], 10 s. For a `Tail` or `Head` start the
+    /// check is one metadata request. Under `Timestamp`, a check that finds N
+    /// new partitions adds N watermark lookups and one `offsets_for_times`
+    /// call. An abort leaves a check in flight to finish on its thread.
+    ///
     /// A reconnect re-assigns at the configured start as it stands *then*: at
     /// the then-current tail by default, so messages published while the
     /// connection was down are not replayed - deliver-new applied to the

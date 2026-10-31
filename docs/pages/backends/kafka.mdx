@@ -541,7 +541,10 @@ A subscription reads the [fetch queue settings](#fetch-queue-tuning), and `subsc
   A partition the lookup cannot answer for fails the subscription rather than silently starting at the tail.
 
 A partition added while the subscription runs is picked up within a few seconds and assigned at the same start.
+The subscription checks the topic for new partitions 5 s after it assigns its partitions and 5 s after each check ends.
+Records keep reaching the handler while a check runs.
 The partitions the subscription already reads keep fetching where they are, so nothing on them is skipped or handed over twice, and none of them waits on the inert group's coordinator.
+A stop that lands during a check waits for the check to end, see [Offset commit semantics](#offset-commit-semantics) for how long.
 A reconnect after a broker outage re-resolves the start as it stands then.
 A `Head` subscription therefore replays the retained log again, the price of having no stored position.
 
@@ -803,6 +806,10 @@ If a commit is still in flight on its thread, the close runs once that commit re
 A member whose task is aborted closes off the runtime thread as well, but nothing waits for that close.
 Dropping the future of a direct `run_fifo` aborts its member's task the same way.
 A broadcast subscription has nothing to commit and no group to leave, and it closes its consumer on a thread of its own at every exit, a stop included, waiting for the close for at most the same 20 s.
+A stop that lands while the subscription checks the topic for new partitions waits for that check to end before the close, and so does an exit on an error.
+For a `Tail` or `Head` start the check is one metadata request of at most 10 s.
+Under `BroadcastStart::Timestamp`, a check that finds N new partitions adds N watermark lookups and one `offsets_for_times` call, each of at most 10 s.
+Delivery goes on while a check runs, see [Starting a broadcast subscription elsewhere than the tail](#starting-a-broadcast-subscription-elsewhere-than-the-tail).
 
 The wait for the handlers at a stop can fail too: on a receive error that ends a consumer, a failed connection or name resolution excepted, see [Broker outages](#broker-outages), or on a put-back or a pause librdkafka refuses.
 The stop then ends as an error exit does, with no final commit: the consumer closes with nothing committed, and every record completed since the last accepted commit is redelivered.
