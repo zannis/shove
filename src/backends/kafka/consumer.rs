@@ -3930,6 +3930,25 @@ pub mod per_record_probe {
     }
 }
 
+/// Test-only counter (see the `test-support` feature) on the commit gate's
+/// wake: how many times the gate's deadline woke a loop, or a wait, that
+/// commits through a [`CommitSlot`], process-wide. A gated commit wakes its
+/// loop once, when its window ends, so a test reads this to tell that wake
+/// from one that fires on every pass, which a commit's timing alone cannot
+/// show. nextest runs each test in its own process, so it starts at zero.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod commit_gate_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub static WOKE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Wakes the gate's deadline has made so far.
+    pub fn woke() -> usize {
+        WOKE.load(Ordering::SeqCst)
+    }
+}
+
 /// Test-only record (see the `test-support` feature) of the `client.id`
 /// every consumer this process created was given, in creation order. A
 /// reconnect creates a consumer, and with it a fresh id, so a test that must
@@ -6927,7 +6946,10 @@ async fn acquire_permit_while_polling(
             }
             () = &mut grace, if !polling => polling = true,
             _ = housekeeping.tick(), if commits.is_some() => {}
-            _ = tokio::time::sleep_until(commit_deadline), if committable => {}
+            _ = tokio::time::sleep_until(commit_deadline), if committable => {
+                #[cfg(feature = "test-support")]
+                commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
+            }
             answer = commit_answer(
                 commits.as_mut().and_then(|c| c.slot.in_flight.as_mut()),
             ), if in_flight => {
@@ -7258,7 +7280,10 @@ async fn fifo_wait(
             _ = revoked.cancelled() => return Ok(FifoWait::Revoked),
             _ = housekeeping.tick() => {}
             _ = tokio::time::sleep_until(state.commits.gate.deadline(now)),
-                if state.commits.in_flight.is_none() && state.tracker.has_committable() => {}
+                if state.commits.in_flight.is_none() && state.tracker.has_committable() => {
+                #[cfg(feature = "test-support")]
+                commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
+            }
             answer = commit_answer(state.commits.in_flight.as_mut()),
                 if state.commits.in_flight.is_some() => {
                 state.commits.settle(answer, &mut state.tracker, queue);
@@ -7594,7 +7619,10 @@ async fn receive_serially<L: SerialLoop>(
             // Wakes the loop when the commit gate's window expires with a
             // position to commit, so it lands on a topic gone idle.
             _ = tokio::time::sleep_until(state.commits.gate.deadline(now)),
-                if state.commits.in_flight.is_none() && state.tracker.has_committable() => {}
+                if state.commits.in_flight.is_none() && state.tracker.has_committable() => {
+                #[cfg(feature = "test-support")]
+                commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
+            }
             answer = commit_answer(state.commits.in_flight.as_mut()),
                 if state.commits.in_flight.is_some() => {
                 state.commits.settle(answer, &mut state.tracker, queue);
@@ -8875,7 +8903,10 @@ impl KafkaConsumer {
                         // commit FFI call — the e2e cell's throughput went UP
                         // ~26k -> ~30.5k msg/s with the gate in place.
                         _ = tokio::time::sleep_until(commits.gate.deadline(now)),
-                            if commits.in_flight.is_none() && tracker.has_committable() => {}
+                            if commits.in_flight.is_none() && tracker.has_committable() => {
+                            #[cfg(feature = "test-support")]
+                            commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
+                        }
                         // The answer of the commit in flight, settled at once:
                         // a rejection marks its partitions to re-offer, so the
                         // wake above is due once the gate allows it.
@@ -9979,7 +10010,10 @@ impl KafkaConsumer {
                             // Wakes the loop when the commit gate's window
                             // expires with a position to commit, so it lands on
                             // a topic gone idle.
-                            _ = tokio::time::sleep_until(commit_deadline), if committable => {}
+                            _ = tokio::time::sleep_until(commit_deadline), if committable => {
+                                #[cfg(feature = "test-support")]
+                                commit_gate_probe::WOKE.fetch_add(1, Ordering::SeqCst);
+                            }
                             answer = commit_answer(state.commits.in_flight.as_mut()), if in_flight => {
                                 state.commits.settle(answer, &mut state.tracker, queue);
                             }
