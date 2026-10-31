@@ -1,0 +1,25 @@
+tests/kafka_fetch_queue_mock.rs
+  s_1001dc3147e1e5::t_50b8b6ab8536b7 495-497,500
+src/backends/kafka/consumer.rs
+  s_1001dc3147e1e5::t_d0d94f4d94bdac 16640-16641
+  s_1001dc3147e1e5::t_e564a94a8ba77b 16662-16664
+  s_1001dc3147e1e5::t_dfe372b8313033 16676-16681
+  s_1001dc3147e1e5::t_727999d4bc3bad 16661
+  s_1001dc3147e1e5::t_1167702506dfce 16665
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1b94958ef693c1aaa849afb74a2f69357f88bfb0",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
