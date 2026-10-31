@@ -22,10 +22,10 @@ pub(crate) const FETCH_QUEUE_BACKOFF_MS_RANGE: RangeInclusive<u32> = 0..=300_000
 ///
 /// `None` leaves a setting to its default: librdkafka's for the two
 /// thresholds, `FETCH_QUEUE_BACKOFF_MS` for the backoff. Set on
-/// `ConsumerOptions::<Kafka>` and `KafkaConsumerGroupConfig`, and checked
-/// against librdkafka's ranges where a consumer starts or a group registers,
-/// by [`validate`](Self::validate), and again where the config is built, by
-/// [`apply`](Self::apply).
+/// `ConsumerOptions::<Kafka>`, `BatchConsumerOptions::<Kafka>` and
+/// `KafkaConsumerGroupConfig`, and checked against librdkafka's ranges where a
+/// consumer starts or a group registers, by [`validate`](Self::validate), and
+/// again where the config is built, by [`apply`](Self::apply).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FetchQueueTuning {
     pub(crate) queued_min_messages: Option<u32>,
