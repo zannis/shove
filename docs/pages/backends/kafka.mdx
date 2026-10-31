@@ -995,6 +995,8 @@ The batch consumer flushes the records ahead of the stalled one first.
 Its committed span therefore ends before that record until it decodes.
 If that flush seeks part of the span back, for a `Retry` or `Defer`, a rejected commit, a dead letter that failed or a rebalance, the stalled record is handed back to the broker as well.
 It arrives again behind the rewound records, so every batch stays in offset order.
+The batch consumer commits through the wait as it does outside it, at most every 500 ms, so the offsets it flushed, and the ones a rebalance or a rejected commit re-offers, are committed however long the wait runs.
+A revoke of the stalled record's partition ends the batch consumer's wait, and the partition's next owner is handed the record again from the committed offset.
 The loop keeps polling while it waits, so the member stays in its group for the whole outage, however long.
 A partition the group assigns to the member during the wait is paused too.
 A record it delivers first is handed back to the broker and arrives again, in order, once the wait ends.
