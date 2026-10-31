@@ -173,8 +173,9 @@ if let Some(ms) = tuning.fetch_queue_backoff_ms() {
 }
 ```
 
-`ConsumerOptions::<Kafka>` has setters of the same names, so the same getters
-feed the direct, sequenced, DLQ drain, broadcast and supervisor paths.
+`ConsumerOptions::<Kafka>` and `BatchConsumerOptions::<Kafka>` have setters of
+the same names, so the same getters feed the direct, sequenced, DLQ drain,
+broadcast, supervisor and batch paths.
 
 ## Knobs shove doesn't model
 

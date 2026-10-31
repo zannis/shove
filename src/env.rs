@@ -565,19 +565,22 @@ impl KafkaFetchQueueTuning {
         })
     }
 
-    /// Feeds [`ConsumerOptions::<Kafka>::with_queued_min_messages`](crate::ConsumerOptions::with_queued_min_messages)
+    /// Feeds [`ConsumerOptions::<Kafka>::with_queued_min_messages`](crate::ConsumerOptions::with_queued_min_messages),
+    /// [`BatchConsumerOptions::<Kafka>::with_queued_min_messages`](crate::BatchConsumerOptions::with_queued_min_messages)
     /// and [`KafkaConsumerGroupConfig::with_queued_min_messages`](crate::kafka::KafkaConsumerGroupConfig::with_queued_min_messages).
     pub fn queued_min_messages(&self) -> Option<u32> {
         self.queued_min_messages
     }
 
-    /// Feeds [`ConsumerOptions::<Kafka>::with_queued_max_messages_kbytes`](crate::ConsumerOptions::with_queued_max_messages_kbytes)
+    /// Feeds [`ConsumerOptions::<Kafka>::with_queued_max_messages_kbytes`](crate::ConsumerOptions::with_queued_max_messages_kbytes),
+    /// [`BatchConsumerOptions::<Kafka>::with_queued_max_messages_kbytes`](crate::BatchConsumerOptions::with_queued_max_messages_kbytes)
     /// and [`KafkaConsumerGroupConfig::with_queued_max_messages_kbytes`](crate::kafka::KafkaConsumerGroupConfig::with_queued_max_messages_kbytes).
     pub fn queued_max_messages_kbytes(&self) -> Option<u32> {
         self.queued_max_messages_kbytes
     }
 
-    /// Feeds [`ConsumerOptions::<Kafka>::with_fetch_queue_backoff_ms`](crate::ConsumerOptions::with_fetch_queue_backoff_ms)
+    /// Feeds [`ConsumerOptions::<Kafka>::with_fetch_queue_backoff_ms`](crate::ConsumerOptions::with_fetch_queue_backoff_ms),
+    /// [`BatchConsumerOptions::<Kafka>::with_fetch_queue_backoff_ms`](crate::BatchConsumerOptions::with_fetch_queue_backoff_ms)
     /// and [`KafkaConsumerGroupConfig::with_fetch_queue_backoff_ms`](crate::kafka::KafkaConsumerGroupConfig::with_fetch_queue_backoff_ms).
     pub fn fetch_queue_backoff_ms(&self) -> Option<u32> {
         self.fetch_queue_backoff_ms
@@ -882,14 +885,15 @@ mod tests {
         }
     }
 
-    /// The values read from the environment reach both builders, and what
+    /// The values read from the environment reach every builder, and what
     /// each builder carries is what a consumer applies to librdkafka.
     #[cfg(feature = "kafka")]
     #[test]
-    fn kafka_fetch_queue_tuning_round_trips_through_both_builders() {
+    fn kafka_fetch_queue_tuning_round_trips_through_every_builder() {
         use rdkafka::ClientConfig;
 
         use crate::backends::kafka::{FetchQueueTuning, KafkaConsumerGroupConfig};
+        use crate::batch_consumer::BatchConsumerOptions;
         use crate::consumer::ConsumerOptions;
         use crate::markers::Kafka;
 
@@ -904,17 +908,21 @@ mod tests {
         .unwrap();
 
         let mut options = ConsumerOptions::<Kafka>::new();
+        let mut batch = BatchConsumerOptions::<Kafka>::new();
         let mut group = KafkaConsumerGroupConfig::new(1..=1);
         if let Some(n) = tuning.queued_min_messages() {
             options = options.with_queued_min_messages(n);
+            batch = batch.with_queued_min_messages(n);
             group = group.with_queued_min_messages(n);
         }
         if let Some(kb) = tuning.queued_max_messages_kbytes() {
             options = options.with_queued_max_messages_kbytes(kb);
+            batch = batch.with_queued_max_messages_kbytes(kb);
             group = group.with_queued_max_messages_kbytes(kb);
         }
         if let Some(ms) = tuning.fetch_queue_backoff_ms() {
             options = options.with_fetch_queue_backoff_ms(ms);
+            batch = batch.with_fetch_queue_backoff_ms(ms);
             group = group.with_fetch_queue_backoff_ms(ms);
         }
 
@@ -924,6 +932,7 @@ mod tests {
             fetch_queue_backoff_ms: Some(250),
         };
         assert_eq!(options.into_inner().kafka_fetch_queue, expected);
+        assert_eq!(batch.into_inner().kafka_fetch_queue, expected);
         assert_eq!(group.fetch_queue, expected);
 
         let mut config = ClientConfig::new();

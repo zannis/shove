@@ -341,7 +341,7 @@ The two thresholds stay at librdkafka's defaults until a setting replaces them.
 Earlier versions left the backoff at librdkafka's 1000 ms; `with_fetch_queue_backoff_ms(1000)` restores it.
 
 Three opt-in settings replace the values.
-They are on `KafkaConsumerGroupConfig` for the registry path, and on `ConsumerOptions::<Kafka>` for the direct, sequenced, DLQ drain, broadcast and supervisor paths:
+They are on `KafkaConsumerGroupConfig` for the registry path, on `ConsumerOptions::<Kafka>` for the direct, sequenced, DLQ drain, broadcast and supervisor paths, and on `BatchConsumerOptions::<Kafka>` for the batch consumer:
 
 ```rust
 use shove::kafka::KafkaConsumerGroupConfig;
@@ -363,7 +363,6 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
 
 A value outside its range is refused with `ShoveError::Validation` before any broker request.
 A group config is checked by `register` and `register_fifo`, and options are checked where the consumer starts.
-The batch consumer takes no fetch queue setting and runs on the defaults.
 With the `env-config` feature, `KafkaFetchQueueTuning` reads the three settings from the environment, see [Environment configuration](/ops/env-config#kafka-fetch-queue).
 
 ### Broker outages
@@ -874,7 +873,7 @@ The record is discarded and committed, an error is logged, and `messages_discard
 
 ### Batch consumer
 
-`run_batch` and `Broker::<Kafka>::batch_consumer()` take no [fetch queue setting](#fetch-queue-tuning) and run on the default backoff of 25 ms.
+`run_batch` and `Broker::<Kafka>::batch_consumer()` take the [fetch queue settings](#fetch-queue-tuning) on `BatchConsumerOptions::<Kafka>`, and run on the default backoff of 25 ms until a setting replaces it.
 They commit as the standard consumer commits under the default `CommitPolicy::Interval`.
 A batch the handler acks is retired, and its offsets go out with the next commit: at most every 500 ms, one commit at a time on a thread of its own, while the consumer goes on.
 A commit the coordinator rejects, such as one made while the group rebalances, is re-offered.

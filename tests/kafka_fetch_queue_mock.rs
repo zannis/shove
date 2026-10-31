@@ -11,8 +11,8 @@
 //! backoff is the default of 25 ms and the two thresholds are left to
 //! librdkafka. The standard consumer takes overrides through the options and
 //! through the group config. The sequenced consumer, the DLQ drain and the
-//! broadcast subscription take them through the options. The batch consumer
-//! has no setting and runs on the default.
+//! broadcast subscription take them through the options, and the batch
+//! consumer through its own options.
 //!
 //! The topics are created through the mock API, because the mock broker has
 //! no CreateTopics API, and the ones a registry declares are bound with
@@ -265,6 +265,13 @@ fn tuned_options() -> ConsumerOptions<Kafka> {
         .with_fetch_queue_backoff_ms(250)
 }
 
+fn tuned_batch_options() -> BatchConsumerOptions {
+    BatchConsumerOptions::new()
+        .with_queued_min_messages(5_000)
+        .with_queued_max_messages_kbytes(2_048)
+        .with_fetch_queue_backoff_ms(250)
+}
+
 fn tuned_group_config() -> KafkaConsumerGroupConfig {
     KafkaConsumerGroupConfig::new(1..=1)
         .with_queued_min_messages(5_000)
@@ -459,13 +466,14 @@ async fn a_broadcast_subscription_consumes_on_the_options_fetch_queue_settings()
     assert_every_consumer_created_with_the_overrides();
 }
 
-#[tokio::test]
-async fn a_batch_consumer_consumes_on_the_default_backoff() {
+/// Starts a batch consumer of the batch topic on `options`, produces a record,
+/// waits for the batch handler to see it and stops the consumer.
+async fn consume_one_in_a_batch(options: BatchConsumerOptions) {
     let mock = Mock::start().with_topics(&[BATCH_TOPIC]);
     let bootstrap = mock.bootstrap();
     let handler = Acking::default();
     let shutdown = CancellationToken::new();
-    let options = BatchConsumerOptions::new()
+    let options = options
         .with_max_batch_age(Duration::from_millis(200))
         .with_shutdown(shutdown.clone());
     let client = connect(&bootstrap).await;
@@ -487,14 +495,27 @@ async fn a_batch_consumer_consumes_on_the_default_backoff() {
     .await;
 
     stop(run, &shutdown).await;
+}
+
+#[tokio::test]
+async fn a_batch_consumer_consumes_on_the_default_backoff() {
+    consume_one_in_a_batch(BatchConsumerOptions::new()).await;
+
     assert_every_consumer_created_with("25", None, None);
 }
 
+#[tokio::test]
+async fn a_batch_consumer_consumes_on_the_options_fetch_queue_settings() {
+    consume_one_in_a_batch(tuned_batch_options()).await;
+
+    assert_every_consumer_created_with_the_overrides();
+}
+
 /// A setting outside librdkafka's range is refused with a typed error before
-/// the consumer is created, and a group config with one is refused at
-/// registration, before the registry declares or spawns anything. The topic
-/// does not exist on the mock cluster, so a refusal that came after the broker
-/// was asked for the topic would read as a missing topic.
+/// the consumer is created, by `run` and by `run_batch`, and a group config
+/// with one is refused at registration, before the registry declares or spawns
+/// anything. The topic does not exist on the mock cluster, so a refusal that
+/// came after the broker was asked for the topic would read as a missing topic.
 #[tokio::test]
 async fn an_out_of_range_setting_is_refused_before_a_consumer_is_created() {
     let mock = Mock::start();
@@ -514,6 +535,23 @@ async fn an_out_of_range_setting_is_refused_before_a_consumer_is_created() {
     assert!(
         matches!(&err, ShoveError::Validation(msg)
             if msg.contains("with_fetch_queue_backoff_ms") && msg.contains("0..=300000")),
+        "{err:?}"
+    );
+
+    let err = tokio::time::timeout(
+        DELIVERY_TIMEOUT,
+        KafkaConsumer::new(connect(&bootstrap).await).run_batch::<DirectOrders, _>(
+            Acking::default(),
+            (),
+            BatchConsumerOptions::new().with_queued_max_messages_kbytes(2_097_152),
+        ),
+    )
+    .await
+    .expect("the refusal comes at startup, before any retry loop")
+    .expect_err("an out-of-range threshold is refused by the batch consumer");
+    assert!(
+        matches!(&err, ShoveError::Validation(msg)
+            if msg.contains("with_queued_max_messages_kbytes") && msg.contains("1..=2097151")),
         "{err:?}"
     );
 
