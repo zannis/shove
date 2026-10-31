@@ -4847,7 +4847,7 @@ fn offsets_topic_records(brokers: &str) -> u64 {
 /// commits *issued*, counted as records appended to `__consumer_offsets`:
 /// the ungated loop writes on the order of one record per message, the
 /// interval-gated loop one commit round (≤ one record per partition) per
-/// `ASYNC_COMMIT_INTERVAL`. The wall-clock bound stays as the symptom-level
+/// `DEFAULT_COMMIT_INTERVAL`. The wall-clock bound stays as the symptom-level
 /// backstop — on any broker slow enough to pile commits, the broken loop
 /// blows it.
 ///
@@ -4962,7 +4962,7 @@ async fn post_cancel_drain_is_bounded_after_a_large_fast_corpus() {
     );
     let commit_records = commit_records_after - commit_records_before;
     // The gated loop issues at most one commit round (<= 8 partition records)
-    // per ASYNC_COMMIT_INTERVAL (500ms), so the fixed path's record count
+    // per DEFAULT_COMMIT_INTERVAL (500ms), so the fixed path's record count
     // scales with consume duration: bound it that way rather than with a
     // constant a slow run could legitimately cross. Measured here: gated 32-35
     // records over ~13s (budget ~1400); ungated 79,818 and 117,106 — two
@@ -4982,7 +4982,7 @@ async fn post_cancel_drain_is_bounded_after_a_large_fast_corpus() {
         commit_records < commit_record_bound,
         "consumer wrote {commit_records} offset-commit records for a {CORPUS}-message corpus \
          (bound {commit_record_bound}); the receive loop is committing per iteration instead \
-         of on the ASYNC_COMMIT_INTERVAL gate, which piles up in-flight commits that consumer \
+         of on the DEFAULT_COMMIT_INTERVAL gate, which piles up in-flight commits that consumer \
          close then waits out (measured ungated: 79,818 and 117,106 records; gated: 32-35)"
     );
     assert!(outcome.is_clean(), "outcome: {outcome:?}");
