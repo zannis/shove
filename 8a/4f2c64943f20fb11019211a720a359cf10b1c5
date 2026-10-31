@@ -1,0 +1,23 @@
+src/env.rs
+  s_1001dc3147e1e5::t_8e2cfb8cf81e60 841
+.github/workflows/ci.yml
+  s_1001dc3147e1e5::t_0baf6e1958526a 279-280
+tests/kafka_fetch_queue_mock.rs
+  s_1001dc3147e1e5::t_d2418b270f45dd 512
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8a4f2c64943f20fb11019211a720a359cf10b1c5",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
