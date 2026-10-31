@@ -30,8 +30,9 @@
 //! wrapper in `rdkafka::mocking`, so `Mock` reaches them through
 //! `rdkafka::bindings`.
 //!
-//! `test-support` gates the seams this file reads; both Kafka coverage rows
-//! enable it, so the suite runs in each.
+//! `test-support` gates the seams this file reads. The Kafka coverage row
+//! enables it and runs this suite; the schema-registry row compiles the
+//! binary too, but its test filter does not select it.
 
 #![cfg(all(feature = "kafka", feature = "test-support"))]
 #![allow(clippy::mutable_key_type)] // metrics-util's CompositeKey has interior mutability
@@ -1064,7 +1065,10 @@ async fn batch_dlq_publish_failure_redelivers() {
 /// 10 s floor. The dead letters run concurrently, a bounded number at a
 /// time, and the member keeps polling while they run, so a flush that takes
 /// longer than the poll interval does not evict it: the batch is
-/// dead-lettered once and committed with no rebalance and no reconnect.
+/// dead-lettered once and committed with no rebalance and no reconnect. The
+/// test checks its own premise, that the flush did outlast the poll
+/// interval, so a change in the concurrency or in the mock's delay cannot
+/// leave it passing without the polling it is about.
 #[tokio::test]
 async fn batch_reject_with_slow_dlq_stays_in_group() {
     const TOPIC: &str = "kafka-batch-mock-slow-dlq";
@@ -1110,6 +1114,7 @@ async fn batch_reject_with_slow_dlq_stays_in_group() {
         "the batch reaching the handler",
     )
     .await;
+    let flushed_at = Instant::now();
     let clients = client_id_probe::created().len();
     let assigns = per_record_probe::assigns_queued();
     wait_for_position(
@@ -1121,8 +1126,13 @@ async fn batch_reject_with_slow_dlq_stays_in_group() {
         "the rejected batch dead-lettered and committed",
     )
     .await;
+    let flush_took = flushed_at.elapsed();
     stop(run, token).await;
 
+    assert!(
+        flush_took > SHORT_POLL_INTERVAL,
+        "the flush outlasts the poll interval, the premise of the test: it took {flush_took:?}"
+    );
     assert_eq!(
         high_watermark(&bootstrap, DLQ, 0).await,
         i64::try_from(RECORDS).expect("a count"),
