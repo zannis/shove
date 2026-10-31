@@ -1936,34 +1936,35 @@ impl RegistryStall {
         tokio::pin!(fault);
         let stop = shutdown.cancelled();
         tokio::pin!(stop);
-        let mut stream = RecvStream::new(consumer);
+        let mut poll = PollingWait::new(
+            consumer,
+            queue,
+            consumer.transport_gate().into(),
+            WaitName {
+                of: "consumer",
+                during: "during a schema registry wait",
+                logged: false,
+            },
+        );
         loop {
             tokio::select! {
                 // Read in this order, the retry last; see the doc above.
                 biased;
                 () = &mut stop => return Ok(false),
                 e = &mut fault => return Err(e),
-                received = stream.recv() => {
-                    let msg = match received {
-                        Ok(msg) => msg,
-                        Err(e) if self.groupless && is_ignorable_groupless_error(&e) => continue,
-                        Err(e) if recv_error_is_transient(consumer.transport_gate(), &e) => {
-                            log_transient_recv_error(queue, &e);
-                            continue;
-                        }
-                        Err(e) => {
-                            return Err(map_kafka_error(
-                                &format!("consumer recv error on {queue} during a schema registry wait"),
-                                e,
-                            ));
-                        }
+                received = poll.recv() => {
+                    if let Err(e) = &received
+                        && self.groupless
+                        && is_ignorable_groupless_error(e)
+                    {
+                        continue;
+                    }
+                    let Some(msg) = poll.received(received)? else {
+                        continue;
                     };
                     #[cfg(feature = "test-support")]
                     put_back_probe::REGISTRY_STALL.fetch_add(1, Ordering::SeqCst);
-                    put_back(consumer, queue, msg.partition(), msg.offset())?;
-                    consumer
-                        .pause_assignment()
-                        .map_err(|e| map_kafka_error("pause failed", e))?;
+                    poll.put_back(&msg)?;
                     tracing::debug!(
                         queue,
                         partition = msg.partition(),
@@ -5282,7 +5283,16 @@ async fn answer_while_polling(
     tokio::pin!(grace);
     let stop = shutdown.cancelled();
     tokio::pin!(stop);
-    let mut stream = RecvStream::new(consumer);
+    let mut poll = PollingWait::new(
+        consumer,
+        queue,
+        consumer.transport_gate().into(),
+        WaitName {
+            of: "consumer",
+            during: "while waiting for a commit",
+            logged: true,
+        },
+    );
     loop {
         tokio::select! {
             biased;
@@ -5290,27 +5300,13 @@ async fn answer_while_polling(
             e = &mut fault => return Err(e),
             result = &mut *answer => return Ok(Answered::Came(result.ok())),
             () = &mut grace, if !polling => polling = true,
-            received = stream.recv(), if polling => {
-                let msg = match received {
-                    Ok(msg) => msg,
-                    Err(e) if recv_error_is_transient(consumer.transport_gate(), &e) => {
-                        log_transient_recv_error(queue, &e);
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, queue, "consumer recv error");
-                        return Err(map_kafka_error(
-                            &format!("consumer recv error on {queue} while waiting for a commit"),
-                            e,
-                        ));
-                    }
+            received = poll.recv(), if polling => {
+                let Some(msg) = poll.received(received)? else {
+                    continue;
                 };
                 #[cfg(feature = "test-support")]
                 put_back_probe::COMMIT_WAIT.fetch_add(1, Ordering::SeqCst);
-                put_back(consumer, queue, msg.partition(), msg.offset())?;
-                consumer
-                    .pause_assignment()
-                    .map_err(|e| map_kafka_error("pause failed", e))?;
+                poll.put_back(&msg)?;
                 *paused = true;
                 tracing::debug!(
                     queue,
@@ -5555,26 +5551,25 @@ async fn poll_paused(consumer: &KafkaStreamConsumer, queue: &str, period: Durati
     apply_pause_intent(consumer, true)?;
     let polled = tokio::time::sleep(period);
     tokio::pin!(polled);
-    let mut stream = RecvStream::new(consumer);
+    let mut poll = PollingWait::new(
+        consumer,
+        queue,
+        GateMode::Draining,
+        WaitName {
+            of: "consumer",
+            during: "while polling for a rebalance at shutdown",
+            logged: false,
+        },
+    );
     loop {
         tokio::select! {
             biased;
             () = &mut polled => return Ok(()),
-            received = stream.recv() => match received {
-                Ok(msg) => {
-                    put_back(consumer, queue, msg.partition(), msg.offset())?;
-                    apply_pause_intent(consumer, true)?;
+            received = poll.recv() => {
+                if let Some(msg) = poll.received(received)? {
+                    poll.put_back(&msg)?;
                 }
-                Err(e) if recv_error_is_transient(GateMode::Draining, &e) => {
-                    log_transient_recv_error(queue, &e);
-                }
-                Err(e) => {
-                    return Err(map_kafka_error(
-                        &format!("consumer recv error on {queue} while polling for a rebalance at shutdown"),
-                        e,
-                    ));
-                }
-            },
+            }
         }
     }
 }
@@ -7199,6 +7194,91 @@ fn put_back(
     settle_put_back_seek(queue, partition, offset, errors, still_assigned.as_ref())
 }
 
+/// The `recv()` half of a wait that keeps the member polling: the permit
+/// wait, the wait for a commit's answer, a sequenced consumer's hold and
+/// dead-letter backoff, a schema registry stall, and the poll a stop makes
+/// before it tries a refused final commit again. A record the wait's
+/// `recv()` hands over is put back with the pause widened over the
+/// assignment, see [`put_back`], so it arrives again, in order, once the
+/// wait is over. An error [`recv_error_is_transient`] rides out is logged,
+/// and any other ends the wait. When a wait starts polling, what it counts,
+/// and what it makes of the pause it leaves are the wait's own.
+struct PollingWait<'c> {
+    consumer: &'c KafkaStreamConsumer,
+    stream: RecvStream<'c>,
+    queue: &'c str,
+    gate: GateMode<'c>,
+    name: WaitName,
+}
+
+/// How a [`PollingWait`] names itself in the error a failed `recv()` ends it
+/// with: `{of} recv error on {queue} {during}`.
+#[derive(Clone, Copy)]
+struct WaitName {
+    /// The loop the wait belongs to, `consumer` or `FIFO consumer`.
+    of: &'static str,
+    /// The wait, as in `while waiting for a permit`.
+    during: &'static str,
+    /// Whether that failure is logged at error before the wait ends with it.
+    logged: bool,
+}
+
+impl<'c> PollingWait<'c> {
+    fn new(
+        consumer: &'c KafkaStreamConsumer,
+        queue: &'c str,
+        gate: GateMode<'c>,
+        name: WaitName,
+    ) -> Self {
+        Self {
+            consumer,
+            stream: RecvStream::new(consumer),
+            queue,
+            gate,
+            name,
+        }
+    }
+
+    /// The next answer of the wait's `recv()`, see [`RecvStream`].
+    async fn recv(&mut self) -> KafkaResult<BorrowedMessage<'c>> {
+        self.stream.recv().await
+    }
+
+    /// Reads one `recv()` answer: `Ok(Some(..))` is the record it handed
+    /// over, for the wait to [`put_back`](Self::put_back); `Ok(None)` an
+    /// error the table rides out, logged; `Err` the error that ends the
+    /// wait.
+    fn received(
+        &self,
+        received: KafkaResult<BorrowedMessage<'c>>,
+    ) -> Result<Option<BorrowedMessage<'c>>> {
+        match received {
+            Ok(msg) => Ok(Some(msg)),
+            Err(e) if recv_error_is_transient(self.gate, &e) => {
+                log_transient_recv_error(self.queue, &e);
+                Ok(None)
+            }
+            Err(e) => {
+                let WaitName { of, during, logged } = self.name;
+                if logged {
+                    tracing::error!(error = %e, queue = self.queue, "{of} recv error");
+                }
+                Err(map_kafka_error(
+                    &format!("{of} recv error on {} {during}", self.queue),
+                    e,
+                ))
+            }
+        }
+    }
+
+    /// Puts `msg` back, see [`put_back`], and pauses the whole assignment,
+    /// which widens the pause to a partition assigned since it took effect.
+    fn put_back(&self, msg: &BorrowedMessage<'_>) -> Result<()> {
+        put_back(self.consumer, self.queue, msg.partition(), msg.offset())?;
+        apply_pause_intent(self.consumer, true)
+    }
+}
+
 /// What the receive loop does with a record it holds once a wait it polled
 /// `recv()` through has ended: the wait for a prefetch permit, or a schema
 /// registry stall. The stop and the record's assignment are read again then,
@@ -7416,7 +7496,16 @@ async fn acquire_permit_while_polling(
     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let commit_wake = tokio::time::sleep_until(Instant::now());
     tokio::pin!(commit_wake);
-    let mut stream = RecvStream::new(consumer);
+    let mut poll = PollingWait::new(
+        consumer,
+        queue,
+        gate,
+        WaitName {
+            of: "consumer",
+            during: "while waiting for a permit",
+            logged: true,
+        },
+    );
     loop {
         if let Some(commits) = commits.as_mut() {
             let assigned = commits.settle(consumer, queue)?;
@@ -7460,27 +7549,13 @@ async fn acquire_permit_while_polling(
                     commits.slot.settle(answer, commits.tracker, queue);
                 }
             }
-            received = stream.recv(), if polling => {
-                let msg = match received {
-                    Ok(msg) => msg,
-                    Err(e) if recv_error_is_transient(gate, &e) => {
-                        log_transient_recv_error(queue, &e);
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, queue, "consumer recv error");
-                        return Err(map_kafka_error(
-                            &format!("consumer recv error on {queue} while waiting for a permit"),
-                            e,
-                        ));
-                    }
+            received = poll.recv(), if polling => {
+                let Some(msg) = poll.received(received)? else {
+                    continue;
                 };
                 #[cfg(feature = "test-support")]
                 put_back_probe::PERMIT_WAIT.fetch_add(1, Ordering::SeqCst);
-                put_back(consumer, queue, msg.partition(), msg.offset())?;
-                consumer
-                    .pause_assignment()
-                    .map_err(|e| map_kafka_error("pause failed", e))?;
+                poll.put_back(&msg)?;
                 if !*paused {
                     *paused = true;
                     // A transition, at info: a member can sit paused for
@@ -7808,7 +7883,16 @@ async fn fifo_wait(
     tokio::pin!(revoke);
     let commit_wake = tokio::time::sleep_until(Instant::now());
     tokio::pin!(commit_wake);
-    let mut stream = RecvStream::new(consumer);
+    let mut poll = PollingWait::new(
+        consumer,
+        queue,
+        consumer.transport_gate().into(),
+        WaitName {
+            of: "FIFO consumer",
+            during: "during a wait",
+            logged: true,
+        },
+    );
     loop {
         state.commit_due(consumer, queue)?;
         let now = Instant::now();
@@ -7829,25 +7913,11 @@ async fn fifo_wait(
                 if state.commits.in_flight.is_some() => {
                 state.commits.settle(answer, &mut state.tracker, queue);
             }
-            received = stream.recv() => {
-                let msg = match received {
-                    Ok(msg) => msg,
-                    Err(e) if recv_error_is_transient(consumer.transport_gate(), &e) => {
-                        log_transient_recv_error(queue, &e);
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, queue, "FIFO consumer recv error");
-                        return Err(map_kafka_error(
-                            &format!("FIFO consumer recv error on {queue} during a wait"),
-                            e,
-                        ));
-                    }
+            received = poll.recv() => {
+                let Some(msg) = poll.received(received)? else {
+                    continue;
                 };
-                put_back(consumer, queue, msg.partition(), msg.offset())?;
-                consumer
-                    .pause_assignment()
-                    .map_err(|e| map_kafka_error("pause failed", e))?;
+                poll.put_back(&msg)?;
                 tracing::debug!(
                     queue,
                     partition = msg.partition(),
