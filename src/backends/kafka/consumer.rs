@@ -9773,6 +9773,8 @@ impl KafkaConsumer {
         // already performed. One definition (`validate_batch_topic`), two
         // call sites; see the trait doc for why both are load-bearing.
         validate_batch_topic::<T>()?;
+        let fetch_queue = options.kafka_fetch_queue;
+        fetch_queue.validate(queue)?;
         // Same precedence as `run_with_inner`: explicit override, then the
         // topology's fan-out group, then the topic default.
         let group_id = options
@@ -9863,7 +9865,7 @@ impl KafkaConsumer {
                         &group_id,
                         auto_offset_reset,
                         max_poll_interval_ms,
-                        &FetchQueueTuning::default(),
+                        &fetch_queue,
                         queue,
                         rebalance_tx,
                         assignments.clone(),
@@ -16401,6 +16403,61 @@ mod batch_consumer_options_tests {
         token.cancel();
         assert!(opts.shutdown.is_cancelled());
     }
+
+    #[test]
+    fn fetch_queue_settings_default_to_unset() {
+        assert_eq!(
+            BatchConsumerOptions::default().kafka_fetch_queue,
+            FetchQueueTuning::default()
+        );
+    }
+
+    #[test]
+    fn the_fetch_queue_setters_store_their_values_independently() {
+        let opts = BatchConsumerOptions::new().with_queued_min_messages(5_000);
+        assert_eq!(
+            opts.kafka_fetch_queue,
+            FetchQueueTuning {
+                queued_min_messages: Some(5_000),
+                ..FetchQueueTuning::default()
+            }
+        );
+
+        let opts = opts
+            .with_queued_max_messages_kbytes(2_048)
+            .with_fetch_queue_backoff_ms(250);
+        assert_eq!(
+            opts.kafka_fetch_queue,
+            FetchQueueTuning {
+                queued_min_messages: Some(5_000),
+                queued_max_messages_kbytes: Some(2_048),
+                fetch_queue_backoff_ms: Some(250),
+            }
+        );
+    }
+
+    /// The batch loop reads the lowered options, so the lowering must carry
+    /// the settings.
+    #[test]
+    fn the_fetch_queue_settings_survive_the_lowering() {
+        let inner = BatchConsumerOptions::new()
+            .with_queued_min_messages(5_000)
+            .with_queued_max_messages_kbytes(2_048)
+            .with_fetch_queue_backoff_ms(250)
+            .into_inner();
+        assert_eq!(
+            inner.kafka_fetch_queue,
+            FetchQueueTuning {
+                queued_min_messages: Some(5_000),
+                queued_max_messages_kbytes: Some(2_048),
+                fetch_queue_backoff_ms: Some(250),
+            }
+        );
+        assert_eq!(
+            BatchConsumerOptions::new().into_inner().kafka_fetch_queue,
+            FetchQueueTuning::default()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -16633,6 +16690,41 @@ mod consumer_config_tests {
             "{err:?}"
         );
     }
+
+    /// The batch consumer builds its config from the lowered batch options.
+    #[test]
+    fn the_batch_options_reach_the_config_with_the_default_and_with_the_overrides() {
+        let default = config_of(&BatchConsumerOptions::new().into_inner().kafka_fetch_queue)
+            .expect("the default tuning is valid");
+        assert_eq!(default.get("fetch.queue.backoff.ms"), Some("25"));
+        assert_eq!(default.get("queued.min.messages"), None);
+        assert_eq!(default.get("queued.max.messages.kbytes"), None);
+
+        let tuned = BatchConsumerOptions::new()
+            .with_queued_min_messages(5_000)
+            .with_queued_max_messages_kbytes(2_048)
+            .with_fetch_queue_backoff_ms(250)
+            .into_inner();
+        let tuned = config_of(&tuned.kafka_fetch_queue).expect("an in-range tuning is valid");
+        assert_eq!(tuned.get("queued.min.messages"), Some("5000"));
+        assert_eq!(tuned.get("queued.max.messages.kbytes"), Some("2048"));
+        assert_eq!(tuned.get("fetch.queue.backoff.ms"), Some("250"));
+    }
+
+    #[test]
+    fn an_out_of_range_batch_setting_builds_no_config() {
+        let inner = BatchConsumerOptions::new()
+            .with_queued_max_messages_kbytes(2_097_152)
+            .into_inner();
+        let err = config_of(&inner.kafka_fetch_queue)
+            .expect_err("an out-of-range batch setting is refused");
+
+        assert!(
+            matches!(&err, ShoveError::Validation(msg)
+                if msg.contains("with_queued_max_messages_kbytes") && msg.contains("1..=2097151")),
+            "{err:?}"
+        );
+    }
 }
 
 /// A fetch queue setting outside librdkafka's range is refused where each
@@ -16707,6 +16799,12 @@ mod fetch_queue_guard_tests {
     impl<T: Topic<Message = Entry>> MessageHandler<T> for NoopHandler {
         type Context = ();
         async fn handle(&self, _: Entry, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+    impl<T: Topic<Message = Entry>> BatchMessageHandler<T> for NoopHandler {
+        type Context = ();
+        async fn handle_batch(&self, _: Vec<(Entry, MessageMetadata)>, _: &()) -> Outcome {
             Outcome::Ack
         }
     }
@@ -16785,6 +16883,26 @@ mod fetch_queue_guard_tests {
         .expect_err("an out-of-range setting must be refused");
 
         assert_names(&refusal(err), "fetch-queue-guard-dlq");
+    }
+
+    #[tokio::test]
+    async fn run_batch_refuses_an_out_of_range_setting_before_any_broker_request() {
+        let options = BatchConsumerOptions::new()
+            .with_queued_min_messages(0)
+            .with_max_reconnect_attempts(1)
+            .with_shutdown(CancellationToken::new());
+
+        let err = tokio::time::timeout(
+            REFUSAL_BOUND,
+            consumer()
+                .await
+                .run_batch::<Plain, _>(NoopHandler, (), options),
+        )
+        .await
+        .expect("the refusal makes no broker request")
+        .expect_err("an out-of-range setting must be refused");
+
+        assert_names(&refusal(err), "fetch-queue-guard-plain");
     }
 
     /// A broadcast subscription takes the same settings, and `subscribe()`
