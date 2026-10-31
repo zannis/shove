@@ -6588,8 +6588,9 @@ const PERMIT_WAIT_GRACE: Duration = Duration::from_secs(1);
 /// their hold. Its shutdown arm waits here for every permit, the proof that
 /// every handler task has ended, see the drain there. A batch flush waits
 /// here for the permits its dead letters hold, see [`dead_letter_span`],
-/// with no commits to make. librdkafka counts the
-/// member as polling only when a `recv()` actually polls its queue
+/// and makes no commit while it waits: a position acked before the flush,
+/// and a re-offer of a rejected one, wait for the flush to end. librdkafka
+/// counts the member as polling only when a `recv()` actually polls its queue
 /// (`rd_kafka_app_polled`, bundled librdkafka 2.12.1, `rdkafka_int.h:1219`;
 /// rust-rdkafka 0.39 polls it with a zero timeout,
 /// `stream_consumer.rs:125-131`). A bare `acquire_owned().await` here would
@@ -9061,6 +9062,13 @@ impl KafkaConsumer {
     /// in particular is indistinguishable from `Retry` here.
     /// [`BatchConsumerOptions::without_handler_timeout`] opts out of the
     /// deadline entirely, at the cost of making a hung flush unrecoverable.
+    ///
+    /// Nothing polls while the handler runs, so a flush must finish inside
+    /// `max.poll.interval.ms`, five minutes. `handler_timeout` is the only
+    /// bound on the handler call: a timeout above that interval, or none at
+    /// all through `without_handler_timeout`, lets a slow flush outlast it,
+    /// and the member is then evicted from its group, its partitions handed
+    /// to another member, which is handed the batch again.
     ///
     /// # Metrics
     ///

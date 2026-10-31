@@ -815,6 +815,10 @@ A failure no retry gets past, such as a producer that cannot be built, commits n
 Dead letters are at-least-once.
 A rebalance while they run, a dead letter that fails, and a refused commit whose re-offer has not landed when the partition moves can each hand the batch over again, and its letters that had landed are then published again.
 
+Nothing polls while the handler runs, so a flush must finish inside `max.poll.interval.ms`, five minutes.
+The handler timeout is the only bound on the handler call: a timeout above that interval, or none at all through `without_handler_timeout`, lets a slow flush outlast it.
+The member is then evicted from its group, and its partitions go to another member, which is handed the batch again.
+
 Every flush reads the group's rebalance events first, the one the batch's age or a stop triggers included.
 A rebalance that moves a partition the batch spans abandons the batch uncommitted, and the partitions the consumer keeps are sought back to the batch's start.
 The record the consumer holds when it learns of the rebalance is dropped when its partition was sought back, because the broker delivers it again behind the rewound records.
