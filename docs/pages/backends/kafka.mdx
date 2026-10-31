@@ -194,6 +194,7 @@ The second spares a member draining a backlog the refetch that handing the next 
 A further record that arrives once the wait polls is handed back to the broker, and the assignment is paused until a slot frees.
 A partition the group assigns to the member during a pause is paused too.
 A record it delivers first is handed back to the broker and arrives again, in order, once a slot frees.
+A partition revoked during a pause and handed back after it is resumed with the rest, see [Pauses and rebalances](#pauses-and-rebalances).
 The pause lasts until a slot frees: the slot that ends the wait serves the record already in hand, so with one slot the assignment stays paused through that record's handler as well.
 A shutdown during a wait completes nothing: the record stays uncommitted and is redelivered on restart.
 A record the consumer had fetched but not yet handed to a handler when shutdown fired is dropped unhandled too.
@@ -320,6 +321,54 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
   The same setting is available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths.
   A FIFO consumer, the DLQ drain and a broadcast subscription refuse a policy as they refuse an interval.
   See [Offset commit semantics](#offset-commit-semantics).
+
+### Broker outages
+
+A broker that goes away and comes back does not end a consumer, unless the bounce comes soon after an assignment change that landed while a committed-offset fetch may have been pending, see below.
+librdkafka reports a broker connection that failed or could not be made, a broker name that did not resolve, and every broker being down at once as consumer errors, and reconnects on its own.
+The consumer logs each of them at warn level and keeps polling on the same client.
+An outage shorter than `session.timeout.ms`, 10 s, therefore costs the member nothing but the wait: it keeps its place in its group, and nothing is rebalanced.
+After a longer one the coordinator has dropped the member, and librdkafka revokes its assignment as lost and rejoins the group on the same client once a broker answers.
+That revoke takes every partition, so the consumer goes on riding the outage out, see below.
+librdkafka reports an identical broker failure at most once every 30 s per broker, so a bounce logs a handful of lines.
+Every other receive error ends the member's connection.
+That covers a fatal error, a missing committed offset under `KafkaAutoOffsetReset::None`, a poll interval the member outlasted, and the authorization, coordinator and fetch errors librdkafka passes on.
+A committed-offset fetch the coordinator refused leaves its partitions unfetched until the assignment changes, and librdkafka does not fetch them again on its own.
+An authorization a coordinator lookup or a fetch was refused, and a subscribed topic the cluster does not know, are reported once, and librdkafka goes on retrying them in silence.
+Only an operator clears either, with an ACL grant or the topic created, so the consumer ends its connection where the error shows, and every reconnect reports the error again.
+A retryable error reconnects, which rejoins the group and fetches the committed offsets again, and a permanent one ends the member.
+That holds for a group member, `KafkaConsumer::run`, `run_batch`, `run_fifo`, a broadcast subscription and `run_dlq`, and for every wait in them that polls.
+
+A committed-offset fetch can fail with the code a failed broker connection or a broker name that did not resolve reports, because librdkafka fails the requests it holds for a broker with that code.
+librdkafka retries the fetch through those failures for as long as the assignment it was sent for stands, so the error reaches the consumer only once an assign or revoke has changed the assignment under the fetch.
+The fetch's partitions then stay unfetched, and so does every partition assigned to the member after them, until they are revoked.
+The member keeps heartbeating meanwhile, so the group never moves them.
+The code alone cannot tell that error from a broker failure, so a failed connection or name resolution that may be one ends the member's connection instead of being ridden out.
+That is one within `socket.timeout.ms` of an assign or revoke that itself landed within `socket.timeout.ms` of an earlier assign, or of a failed connection or name resolution the consumer rode out: a fetch may have been pending when that change landed.
+A revoke of an assignment librdkafka reports lost, as when the session times out during an outage, is never such a change: it takes every partition, the ones whose committed offsets were being fetched included, so it leaves no partition unfetched.
+The assign of the rejoin that follows is such a change when it lands within `socket.timeout.ms` of a failed connection or name resolution the consumer rode out.
+Under cooperative-sticky every member is handed an assign at each round of a rebalance, an empty one included, so in a rebalance of two rounds, such as the one a joining member starts, the second round is such a change on every member of the group.
+Every broker being down at once is still ridden out, because librdkafka never fails a queued request, a committed-offset fetch among them, with that code.
+shove leaves `socket.timeout.ms` at librdkafka's default, 60 s.
+The reconnect rejoins the group and fetches the committed offsets again.
+The drain at a stop rides out a failed connection or name resolution whatever change came before it, because a stop never reconnects: ending the drain on one would only cost the stop its final commit.
+A bounce that lands on a member with no such change behind it is ridden out as above.
+One case stays out of sight: a coordinator that holds a fetch unanswered for longer than `socket.timeout.ms` while the consumer is handed no error.
+An assignment change after that bound, and a connection the coordinator drops after it, leave the fetch's partitions unfetched with the error ridden out.
+They stay so until those partitions are revoked or the member restarts.
+
+### Pauses and rebalances
+
+A consumer keeps polling while it waits: for a prefetch slot, for a commit under `CommitPolicy::PerRecord`, through a hold or a dead-letter retry on a sequenced consumer, through a schema registry wait, and through the drain at a stop.
+The wait for a prefetch slot and the drain at a stop leave the assignment as it is for their first second, and pause all of it once they put a record back after that.
+While every slot is held and a holder is a handler waiting in place, the consumer pauses it at once instead, see [Bind to an infra-owned topic](#bind-to-an-infra-owned-topic).
+The other waits run with the whole assignment paused.
+librdkafka keeps a pause flag per partition and keeps it across a revoke.
+A partition revoked while the consumer was paused and handed back later therefore arrives paused, and one assigned fresh arrives unpaused.
+On every assign it applies, under either commit policy and on every path that joins a group, the consumer re-applies its intent over the whole assignment.
+That intent is paused while the consumer holds a pause, and resumed otherwise.
+It does the same when a schema registry wait ends.
+A returned partition therefore never stays paused behind a wait that is over, and a partition handed out while the consumer holds a pause is paused with the rest.
 
 ### Fan-out — a second reader on the same topic
 
@@ -485,7 +534,8 @@ Either `RetryStrategy` is accepted, and both retry in place.
 A member handles one record at a time across every partition it holds, so a hold delays the member's whole assignment, other keys included.
 
 During the wait the consumer pauses its assignment and keeps polling, so a hold longer than `max.poll.interval.ms` does not evict the member from its group.
-A record of a partition assigned during the wait is handed back to the broker and arrives again, in order, once the wait ends.
+A partition assigned during the wait is paused with the rest, and a record it delivered first is handed back to the broker and arrives again, in order, once the wait ends.
+A partition revoked during the wait and handed back after it is resumed with the rest, see [Pauses and rebalances](#pauses-and-rebalances).
 A revoke of the held record's partition ends the wait with nothing committed for the record, and the partition's next owner is handed the record from the committed offset.
 A stop during the wait returns at once: the record stays uncommitted, nothing behind it is handled, and the next consumer of the group is handed the record first.
 
@@ -594,10 +644,8 @@ A rejected commit is re-offered as under `Interval`, spaced by the default 500 m
 The loop therefore polls between re-offers, and a rebalance behind a `REBALANCE_IN_PROGRESS` can complete.
 The assignment stays paused until a re-offer is accepted, so no record is handed out behind a rejected position.
 A partition revoked while paused and handed back later arrives paused, because librdkafka keeps a partition's pause flag across a revoke.
-The consumer re-applies its intent over the whole assignment on every assign event a pass drains.
-A record that comes through `recv()` needs no such step.
-The pause when it is taken and the resume when its commit lands cover the whole assignment.
-A returned partition is therefore paused or resumed with the rest, either way.
+The consumer re-applies its intent over the whole assignment on every assign event it drains, as it does under `Interval`.
+A returned partition is therefore paused or resumed with the rest, see [Pauses and rebalances](#pauses-and-rebalances).
 Two commits on one connection cannot overtake each other.
 librdkafka sends a member's OffsetCommit requests to its coordinator over one connection and in order (bundled librdkafka 2.12.1, `rdkafka_cgrp.c:4209`, `rdkafka_broker.c:2763-2771`).
 The [Kafka protocol](https://kafka.apache.org/protocol#protocol_network) processes one connection's requests in the order they were sent.
@@ -626,7 +674,7 @@ What the policy does, condition by condition, with the source line as of this ch
 | The coordinator rejects the commit | The position is re-offered every 500 ms with the assignment paused, and the fence judges the streak at the 60 s floor. | `src/backends/kafka/consumer.rs:198`, `AsyncCommitGate::mark_rejected`, and `src/backends/kafka/consumer.rs:2895`, `fence_threshold_over` | `a_rejected_commit_is_re_offered_until_the_fence_fires`, `a_rejected_commit_recovers_on_a_re_offer_before_the_next_record_is_handed_out` |
 | The answer is late | The next record waits for it, and the member keeps polling meanwhile. | `src/backends/kafka/consumer.rs:3530`, the `recv()` arm of `commit_confirmed` | `a_late_answer_holds_the_next_record_while_the_member_keeps_polling` |
 | A `Retry` or `Defer` republish fails | The member ends with a connection error before the next record is handed out, and the reconnect redelivers the record, as under `Interval`. | `src/backends/kafka/consumer.rs:1878`, the `Republished::Failed` arm of `route_outcome` | `a_republish_that_fails_under_per_record_ends_the_member_before_the_next_record`, `failed_republish_does_not_pin_the_partition` |
-| A partition is handed back paused | A pass that drains the assign pauses or resumes it with the rest, and a record the receive arm takes covers it with its own pause and resume cycle. | `src/backends/kafka/consumer.rs:3387`, `reconcile_pause_after_assign`, and `src/backends/kafka/consumer.rs:5543-5556` | `a_partition_handed_back_paused_is_resumed_when_a_pass_drains_the_assign`, `a_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_the_assign` |
+| A partition is handed back paused | Every drain that meets the assign, at the top of a pass or in the receive arm, pauses or resumes it with the rest, under either policy. | `src/backends/kafka/consumer.rs:3899`, `reconcile_pause_after_assign` | `a_partition_handed_back_paused_is_resumed_when_a_pass_drains_the_assign`, `a_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_the_assign`, `interval_partition_revoked_while_paused_resumes_on_reassign`, `interval_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_the_assign` |
 | A stop finds a commit in flight | It is waited for up to `PENDING_COMMIT_BUDGET`; an accepted answer is followed by the final commit, a rejected one is re-offered by it, and no answer ends the stop with `ShoveError::Commit` of the `Deadline` kind. | `src/backends/kafka/consumer.rs:3741-3783`, `stop_with_final_commit`, which the shutdown arm of `KafkaConsumer::run` calls | `a_stop_during_a_commit_waits_for_its_answer_and_leaves_the_group_before_returning`, `a_discard_behind_a_commit_rejected_at_the_stop_is_counted_once_by_the_final_commit`, `a_per_record_stop_against_a_frozen_coordinator_reports_the_commit_it_could_not_finish`, `an_interval_stop_with_its_commit_unanswered_reports_the_pending_share`, `a_sequenced_stop_with_its_commit_unanswered_reports_the_pending_share` |
 | A prefetch above one with concurrent processing on | Refused at `KafkaConsumer::run` and at `KafkaConsumerGroupRegistry::register`. | `src/backends/kafka/consumer.rs:2998`, `check_per_record_prefetch`, and `src/backends/kafka/consumer_group.rs:1222` | `run_rejects_per_record_commits_with_two_permits`, `register_rejects_per_record_commits_with_more_than_one_permit` |
 
@@ -637,9 +685,12 @@ That holds for a hole between delivered records.
 A trailing control record is different: with nothing delivered after it, the committed position stays one below the high watermark.
 An idle transactional topic therefore reads a lag of 1 until the next record arrives, and nothing is redelivered.
 
-On shutdown the consumer first waits for its in-flight handlers to finish.
+On shutdown the consumer first waits for its in-flight handlers to finish, unless that wait fails, as described below.
 That wait is bounded by the handler timeout.
 An in-place delay does not extend it: shutdown cuts the delay short, and the record stays uncommitted.
+The consumer keeps polling while it waits, and a record it is handed meanwhile goes back to the broker with the assignment paused.
+A handler that holds its slot past `max.poll.interval.ms` therefore does not evict the member, and a rebalance that needs this member's revoke completes during the wait.
+A partition that rebalance revokes is left out of the final commit, so its next owner is handed again every record its handlers completed since the last accepted commit.
 It then drains the republish queue and commits its final position **synchronously**.
 That commit carries every partition's current position, whether or not an earlier commit already offered it.
 It therefore offers every safe position, including one a rejected commit left to re-offer.
@@ -663,12 +714,19 @@ The thread finishes on its own and never holds the runtime or the process, so a 
 
 A member that ends on an error closes its consumer on a thread of its own too, with nothing committed, before it reconnects or returns the error.
 That holds for the standard and the sequenced consumer, a fenced consumer and a failed subscribe included.
+A receive error the consumer rides out ends nothing, see [Broker outages](#broker-outages).
 It waits for the close for at most the same 20 s, and returns without waiting when no thread can be spawned to run it.
 The close sends the member's LeaveGroup and waits for the coordinator's answer, so the member has left its group when the error reaches the caller.
 A process that exits on the error therefore does not cut the LeaveGroup short, and its group does not wait out `session.timeout.ms` for the member.
 Against a coordinator that does not answer, the reconnect or the error comes up to 20 s later, and the close finishes on its thread.
 If a commit is still in flight on its thread, the close runs once that commit returns, and the error is returned without waiting for it.
 A member whose task is aborted closes off the runtime thread as well, but nothing waits for that close.
+
+The wait for the handlers at a stop can fail too: on a receive error that ends a consumer, a failed connection or name resolution excepted, see [Broker outages](#broker-outages), or on a put-back or a pause librdkafka refuses.
+The stop then ends as an error exit does, with no final commit: the consumer closes with nothing committed, and every record completed since the last accepted commit is redelivered.
+The close comes before the handlers finish, so the member leaves its group while they may still run, and the stop returns once every one of them has finished.
+The consumer logs the failure at error level and ends with it: `run` returns that error, a `ShoveError::Connection` for a refused put-back or pause, and a group run counts the member under `errors`.
+Nothing reconnects, because the stop has already fired.
 
 A final commit the broker does not confirm ends the member with `ShoveError::Commit` instead of a clean exit.
 The error reads `offset commit at shutdown`, because the commit it names can be the one in flight when the stop landed.
@@ -714,9 +772,11 @@ What that means for replay:
 - After a clean shutdown, a record whose handler returned a terminal outcome and whose offset reached the final commit is not redelivered.
   A record whose handler had not settled when shutdown fired stays uncommitted and is redelivered.
   A record the consumer had fetched but not yet handed to a handler is not handled during the drain, and is redelivered too.
+  A partition a rebalance revokes during the drain is left out of the final commit, so it replays from its last accepted commit.
   When the final commit is rejected or hits its deadline, redelivery starts from the last position the broker accepted, and the member reports that with `ShoveError::Commit`.
   A commit request librdkafka abandoned on a coordinator reconnect can also be applied after the final one, as the commit section above describes.
   A coordinator hiccup overlapping the shutdown can therefore replay a few records.
+- After a stop whose wait for the handlers failed, no final commit is made, so every record completed since the last accepted commit is redelivered, and the member ends with the error that failed the wait.
 
 `Outcome::Reject` routes to the DLQ (if configured) and commits the offset; the original is not redelivered. Messages that exhaust `max_retries` follow the same DLQ-then-commit path.
 A dead letter that fails and may land later commits nothing.
@@ -892,6 +952,8 @@ It arrives again behind the rewound records, so every batch stays in offset orde
 The loop keeps polling while it waits, so the member stays in its group for the whole outage, however long.
 A partition the group assigns to the member during the wait is paused too.
 A record it delivers first is handed back to the broker and arrives again, in order, once the wait ends.
+When the wait ends the consumer re-applies its pause intent over the whole assignment, a partition handed back during the wait included, see [Pauses and rebalances](#pauses-and-rebalances).
+The batch consumer and the DLQ drain resume it then, and do the same on every later assign, so a partition revoked during the wait and handed back after it does not stay paused.
 
 A registry that does answer, but wrongly for the deployment, is not an outage and is not waited on.
 A 401 or 403, a redirect the client cannot follow, another unexpected status, or an undecodable response ends the consumer.

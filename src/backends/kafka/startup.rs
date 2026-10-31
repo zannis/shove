@@ -191,7 +191,7 @@ pub(super) async fn verify(
     // A probe blocks for up to the metadata timeout and `run_with_reconnect`
     // looks at `shutdown` only between attempts, so a stop races the probe.
     tokio::select! {
-        ended = run_with_reconnect(shutdown, queue, max_reconnect_attempts, || async move {
+        ended = run_with_reconnect(shutdown, queue, max_reconnect_attempts, None, || async move {
             check(client, required, queue).await
         }) => ended,
         _ = shutdown.cancelled() => Ok(()),
