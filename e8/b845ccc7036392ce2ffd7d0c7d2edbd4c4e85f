@@ -1,0 +1,52 @@
+src/batch_consumer.rs
+  s_1001dc3147e1e5::t_da0bbd69a57d64 119-120
+  s_1001dc3147e1e5::t_265847774499d3 34
+  s_1001dc3147e1e5::t_c40807f956977c 252-253
+  s_1001dc3147e1e5::t_4a7b94b0734746 78-79
+  s_1001dc3147e1e5::t_c2db4d4b9558e4 295-356
+src/backends/kafka/consumer.rs
+  s_1001dc3147e1e5::t_d32a2712d52c25 16888-16907
+  s_1001dc3147e1e5::t_22ac9e0c4bc81c 16805-16810
+  s_1001dc3147e1e5::t_00a003b8ca594a 9776-9777
+  s_1001dc3147e1e5::t_aa77ca46c8c8ab 9868
+  s_1001dc3147e1e5::t_453a31b1ddda22 16406-16460
+  s_1001dc3147e1e5::t_f0d15e0f19ddc9 16693-16727
+src/backend/batch_consumer.rs
+  s_1001dc3147e1e5::t_c352adb3e657be 80
+  s_1001dc3147e1e5::t_dfe48983566d32 119-124
+src/env.rs
+  s_1001dc3147e1e5::t_923670f6720764 582-583
+  s_1001dc3147e1e5::t_e9c760e2b320b5 575-576
+  s_1001dc3147e1e5::t_ad4a4b01d85d68 911,915,920,925,935
+  s_1001dc3147e1e5::t_e0f93f40efc1f2 568-569
+  s_1001dc3147e1e5::t_9b0668b3eb26b2 888,892,896
+docs/pages/ops/env-config.mdx
+  s_1001dc3147e1e5::t_760f120d6990f3 176-178
+docs/pages/backends/kafka.mdx
+  s_1001dc3147e1e5::t_1cab92986e69ec 876
+  s_1001dc3147e1e5::t_6ed5f6bac1ec09 344
+tests/kafka_fetch_queue_mock.rs
+  s_1001dc3147e1e5::t_93c7bf9798d4a6 14-15
+  s_1001dc3147e1e5::t_adb92ffd7d06a6 469-471,476,498-500,502-503,507-512
+  s_1001dc3147e1e5::t_df916465e02bab 501
+  s_1001dc3147e1e5::t_8961f30ddf233f 515-518
+  s_1001dc3147e1e5::t_0384fc583f7d65 541-557
+  s_1001dc3147e1e5::t_b1c915cf25491c 268-274
+  s_1001dc3147e1e5::t_3d0787462bd0c7 513
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e8b845ccc7036392ce2ffd7d0c7d2edbd4c4e85f",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
