@@ -1,0 +1,182 @@
+src/metrics.rs
+  s_1001dc3147e1e5::t_000c4893270acf 476-480
+  s_1001dc3147e1e5::t_c5f6b53a8f81ac 474-475
+README.md
+  s_1001dc3147e1e5::t_08f49f5f82359b 108
+docs/design/sequence-failure-parity.md
+  s_1001dc3147e1e5::t_9231d9a0cb08d1 132-133
+docs/pages/backends/kafka/examples/audited.mdx
+  s_1001dc3147e1e5::t_01590b49c5e2e8 3,32,40,58,60,62,64,68
+docs/pages/backends/kafka/examples/msk_iam.mdx
+  s_1001dc3147e1e5::t_f895cc645b6ab5 89
+docs/pages/backends/kafka/examples/sequenced.mdx
+  s_1001dc3147e1e5::t_ac96d3af4aed54 40
+docs/pages/backends/nats/examples/audited.mdx
+  s_1001dc3147e1e5::t_a25adee97907fe 3,32,40,58,60,68
+docs/pages/backends/rabbitmq/examples/consumer-groups.mdx
+  s_1001dc3147e1e5::t_5b3c3f6e64d8ab 44
+docs/pages/backends/sqs/examples/audited.mdx
+  s_1001dc3147e1e5::t_5c2b20aa96ab78 3,33,41,57
+docs/pages/backends/sqs/examples/autoscaler.mdx
+  s_1001dc3147e1e5::t_a548591de351d7 49,55
+docs/pages/concepts/broadcast.mdx
+  s_1001dc3147e1e5::t_816a6448b3df67 51,55
+docs/pages/concepts/handlers.mdx
+  s_1001dc3147e1e5::t_06b31981adb3b7 134,140,146,148
+docs/pages/guides/batch-publishing.mdx
+  s_1001dc3147e1e5::t_1a7ba83798e6b2 56,71-72
+docs/pages/guides/groups.mdx
+  s_1001dc3147e1e5::t_6dc1ca2037f184 49,69-77
+docs/pages/guides/liveness.mdx
+  s_1001dc3147e1e5::t_4973c35b299741 30,39-40
+docs/pages/guides/retries.mdx
+  s_1001dc3147e1e5::t_5b67033f8a2e7f 32-33,59,61,93,110-111,120,122,137-138,141,230
+src/autoscaler.rs
+  s_1001dc3147e1e5::t_3be78c65230a7b 148-151,172-211,745-805
+src/backend/broadcast.rs
+  s_1001dc3147e1e5::t_44327e7131319c 213-217
+src/backend/capability.rs
+  s_1001dc3147e1e5::t_60a1aa83d4b8cc 48-53
+src/backends/inmemory/autoscaler.rs
+  s_1001dc3147e1e5::t_d57a23ced9ecc5 138-139,142-143
+src/backends/inmemory/constants.rs
+  s_1001dc3147e1e5::t_88dffecb2aa6ee 9-31
+src/backends/inmemory/publisher.rs
+  s_1001dc3147e1e5::t_0a5c5037843238 86
+src/backends/kafka/autoscaler.rs
+  s_1001dc3147e1e5::t_037d818c97101e 2-4,7-8,13,45,53-58,67-73,119-272,286-305,326-329,331,333,335,337,358,364-366,387,391-393,398-410,412-414,416,422,424,461-467,474-475,488-495,508,515-516,519,524-529,531-533,539-540,545-549,620,632,655,658-659,713,717-718,876-1182,1217-1218,1229-1240,1252-1257,1279-1317,1530,1566,1612
+src/backends/kafka/backend.rs
+  s_1001dc3147e1e5::t_d9ededcd2dd2e8 360,362-366
+src/backends/kafka/msk_iam.rs
+  s_1001dc3147e1e5::t_abe2a63ef0ce5b 1-2,9,14-26,28,30-41,43,57-81,83-147,150-153,174,182-252
+src/backends/kafka/offset_reset.rs
+  s_1001dc3147e1e5::t_44de22b7f3ca97 339
+src/backends/kafka/topology.rs
+  s_1001dc3147e1e5::t_dee104448197e0 6,8,69-89,95,97-99,120,128-139,145-151,177,245-247,249-251,266-272,293-294,298-304,309-315,354-355,439-505
+src/backends/nats/autoscaler.rs
+  s_1001dc3147e1e5::t_2b7b3c606d8023 138,149,166,169-170,280-281,292-303,315-320
+src/backends/nats/publisher.rs
+  s_1001dc3147e1e5::t_5d516bd840858f 317,354
+src/backends/rabbitmq/autoscaler.rs
+  s_1001dc3147e1e5::t_4e6ae5752d7248 84,92,109,112-113
+src/backends/rabbitmq/consumer_group.rs
+  s_1001dc3147e1e5::t_3ec6e76af71947 18,175-193,276-277,280-283,294-297,359-360,366-368,630,633,642-674
+src/backends/rabbitmq/headers.rs
+  s_1001dc3147e1e5::t_aa98554d0f5257 21-29,99,159-165
+src/backends/rabbitmq/publisher.rs
+  s_1001dc3147e1e5::t_2017e0e0fa22fe 357
+src/backends/redis/autoscaler.rs
+  s_1001dc3147e1e5::t_1c614416fd78b0 216,224,241,244-245,444-448,454-460,485-490
+src/backends/redis/constants.rs
+  s_1001dc3147e1e5::t_cc8f1219311c26 7-8,16-29
+src/backends/redis/consumer.rs
+  s_1001dc3147e1e5::t_4dd13b948687d8 33-34
+src/backends/redis/publisher.rs
+  s_1001dc3147e1e5::t_cc94dd4f704ea2 16,42,44-45,75-79,139,153-156,159,180-183,189,264-267,274-282,292-295,400-404,410-411,414,421,426,455-535
+src/backends/sns/autoscaler.rs
+  s_1001dc3147e1e5::t_8ac530146af6a1 76,84,101,104-105,156,191-201,236,261-267
+src/backends/sns/consumer_group.rs
+  s_1001dc3147e1e5::t_ca68491af3d261 198-201,331,334
+src/backends/sns/publisher.rs
+  s_1001dc3147e1e5::t_c3f38a7d5c2746 19-26,150-210,253-257,350,414-418,473,482-483,524,743-840
+src/backends/sns/router.rs
+  s_1001dc3147e1e5::t_6fc3c839e13072 8-9,18-22,602,605-609
+src/backends/sns/topology.rs
+  s_1001dc3147e1e5::t_e0c3e8bb126483 8-9,18-24,402,490-495
+src/batch.rs
+  s_1001dc3147e1e5::t_f9938fdd9f691b 55-57,67-70,89-92
+src/consumer.rs
+  s_1001dc3147e1e5::t_dbb8af2db7e4ee 554-557
+src/consumer_group.rs
+  s_1001dc3147e1e5::t_acdbd0283e64b0 80-86,283-286,295-296,299,301-302,313-324,326,352,356,358,393-406
+src/metadata.rs
+  s_1001dc3147e1e5::t_4440a95c06ff57 86-90
+src/outcome.rs
+  s_1001dc3147e1e5::t_83b03192db9773 4-45,61-64,74-76,79-86,109-112,114-117
+src/publisher.rs
+  s_1001dc3147e1e5::t_161f586a5e537f 32-40,77
+src/publisher_internal.rs
+  s_1001dc3147e1e5::t_16afa3100d57c4 5,7-28,31-33,35-38,41-51,53,56,63-78,112,119,126,133-231,236
+src/routing.rs
+  s_1001dc3147e1e5::t_f284e6d4723f7d 46-48
+src/topology.rs
+  s_1001dc3147e1e5::t_e8f844d4efd497 951,958-960,1131
+src/topology_declarer.rs
+  s_1001dc3147e1e5::t_981d87529cc118 52-55
+tests/inmemory_integration.rs
+  s_1001dc3147e1e5::t_0757c5a6bffa1a 13,1116-1118,1363-1468,2252-2302
+tests/kafka_msk_iam_integration.rs
+  s_1001dc3147e1e5::t_bc9060839b4f99 8-12,14-19,21,23-28,47,305-478
+tests/kafka_ping.rs
+  s_1001dc3147e1e5::t_61912e7f2d8947 7-16,47-155
+tests/kafka_schema_registry.rs
+  s_1001dc3147e1e5::t_d4a55ef8dc186b 11,13,1006-1143
+tests/kafka_startup_topic_checks_mock.rs
+  s_1001dc3147e1e5::t_4b7cff093e472d 13-16,21-22,672-768
+tests/nats_integration.rs
+  s_1001dc3147e1e5::t_63ea52de85eee2 2152,3554-3593
+tests/publisher_reserved_headers.rs
+  s_1001dc3147e1e5::t_efe8ce9278e2a0 1-661
+tests/rabbitmq_integration.rs
+  s_1001dc3147e1e5::t_354c47a7ef9874 2003-2103
+tests/redis_integration.rs
+  s_1001dc3147e1e5::t_9f37500b84b38d 26-27,321,899,3407-3512
+tests/sns_sqs_integration.rs
+  s_1001dc3147e1e5::t_54e7155b43c9c1 2321-2410
+docs/pages/backends/kafka.mdx
+  s_76243ae17724b6::t_005c2cdbd496b1 56-58,109-143,265-275,298-302,306-315,670-675,706,743-752,771,960,984,1231
+docs/pages/backends/nats.mdx
+  s_76243ae17724b6::t_0865b12afc9986 96-112
+docs/pages/concepts/outcomes.mdx
+  s_76243ae17724b6::t_85c7c133e69203 15,40-72,90-93,95,97
+docs/pages/guides/observability.mdx
+  s_76243ae17724b6::t_be5755562f0fc9 262,278-293
+docs/pages/guides/sequenced.mdx
+  s_76243ae17724b6::t_6266d10bb3b47d 141,168-169
+docs/pages/ops/env-config.mdx
+  s_76243ae17724b6::t_407ccaeb580efe 143-146
+src/backends/kafka/client.rs
+  s_76243ae17724b6::t_ce0eb6260fd60a 3-4,8-9,24-32,47,457-459,467,473-735,747,752,899-912,918,929-935,940-944,957,959-977,985,992,996,1006-1022,1032-1062,1064,1114-1118,1123-1126,1135,1147-1163,1210-1211,1213-1217,1225-1232,1243-1244,1246,1253-1254,1259-1266,1270-1278,1288-1289,1306,1313-1323,1338,1342,1348,1354,1362,1366-1371,1381-1387,1398-1412,1487-1492,1498-1512,1514-1523,1562-1563,1565-1577,1579-1670,1769-1770,1774,1779,1795,1819,1835-1836,1843,1845-1853,1867,1931-1938,2281-2284,2296,2313,2318-2360,2382,2388-2611,2647-2652,2654-2717,2720,2723-2753,2763,2770,2786,2797,2804,2808-3248
+src/backends/kafka/constants.rs
+  s_76243ae17724b6::t_fb7639b68a1c57 39-50,173-185,196-224,336-341
+src/backends/kafka/consumer_group.rs
+  s_76243ae17724b6::t_7e16e886357a50 24,55,803,833-838,871,876-880,885,890,1095,1104,1116,1121-1128,1151,1161,1165,1203-1205,1348-1349,1857-1943
+src/backends/kafka/mod.rs
+  s_76243ae17724b6::t_2d5913a71828bc 51-53,101-109
+src/backends/kafka/publisher.rs
+  s_76243ae17724b6::t_e06b7c964d0fd9 2,5,10,12-13,25,32-92,94-99,106,113-116,120,122-180,182,185,187-249,309-325,359-361,363-365,367-368,382-407,422-423,426,455-457,476,481-483,497-508,522-525,527-528,530,532-534,536-563,573-588
+src/backends/nats/constants.rs
+  s_76243ae17724b6::t_3998bc300fa7f3 24-36,52-62
+src/backends/nats/consumer_group.rs
+  s_76243ae17724b6::t_4e84efec663e1b 21
+src/consumer_supervisor.rs
+  s_76243ae17724b6::t_175123447f9474 3,79-87,760-768
+src/lib.rs
+  s_76243ae17724b6::t_0803b2a4bfbc7b 387-393,428-432
+tests/kafka_integration.rs
+  s_76243ae17724b6::t_3dafcca47643c6 11-13,759-790,2035-2331,3099,5613-5619,5630-5806,6651-6911,7373-7479
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "74f897f164c2e5b16a625988380a13dcaaf53356",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": null
+    },
+    "s_76243ae17724b6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a777384995ad55842",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
