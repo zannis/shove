@@ -140,6 +140,42 @@ if let Some(n) = tuning.min_partitions() {
 declarer.declare::<IngestionTopic>().await?;
 ```
 
+## Kafka fetch queue
+
+| Variable | Type | Default |
+|---|---|---|
+| `{PREFIX}_QUEUED_MIN_MESSAGES` | `u32`, `1..=10000000` | unset |
+| `{PREFIX}_QUEUED_MAX_MESSAGES_KBYTES` | `u32`, `1..=2097151` | unset |
+| `{PREFIX}_FETCH_QUEUE_BACKOFF_MS` | `u32`, `0..=300000` | unset |
+
+The ranges are librdkafka's own. All three stay `Option` because "unset" has to
+remain distinguishable from every value. An unset threshold keeps librdkafka's
+default, and an unset backoff keeps the 25 ms that every `shove` Kafka consumer
+runs with. A backoff of `0` is a value, and removes the wait. See
+[Fetch queue tuning](/backends/kafka#fetch-queue-tuning) for what the three
+settings do.
+
+```rust
+use shove::env::KafkaFetchQueueTuning;
+use shove::kafka::KafkaConsumerGroupConfig;
+
+let tuning = KafkaFetchQueueTuning::from_env("INGEST")?;
+
+let mut config = KafkaConsumerGroupConfig::new(1..=4);
+if let Some(n) = tuning.queued_min_messages() {
+    config = config.with_queued_min_messages(n);
+}
+if let Some(kb) = tuning.queued_max_messages_kbytes() {
+    config = config.with_queued_max_messages_kbytes(kb);
+}
+if let Some(ms) = tuning.fetch_queue_backoff_ms() {
+    config = config.with_fetch_queue_backoff_ms(ms);
+}
+```
+
+`ConsumerOptions::<Kafka>` has setters of the same names, so the same getters
+feed the direct, sequenced, DLQ drain, broadcast and supervisor paths.
+
 ## Knobs shove doesn't model
 
 `EnvVars` is the primitive the constructors above are built on, and it is
@@ -176,6 +212,7 @@ let tuning = ConsumerTuning::from_pairs(
 assert_eq!(tuning.range(), 2..=16);
 ```
 
-`AutoscalerConfig::from_vars`, `NatsStreamConfig::from_vars`, and
-`KafkaTopicTuning::from_vars` all take an `EnvVars`, so one reader can populate
-several config structs from the same source.
+`AutoscalerConfig::from_vars`, `NatsStreamConfig::from_vars`,
+`KafkaTopicTuning::from_vars`, and `KafkaFetchQueueTuning::from_vars` all take an
+`EnvVars`, so one reader can populate several config structs from the same
+source.

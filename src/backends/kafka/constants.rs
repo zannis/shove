@@ -262,6 +262,20 @@ pub(super) const FETCH_MIN_BYTES: u32 = 1;
 /// low-volume topics don't pay librdkafka's default 500 ms dwell.
 pub(super) const FETCH_WAIT_MAX_MS: u32 = 50;
 
+/// Consumer `fetch.queue.backoff.ms`: how long librdkafka waits before it
+/// fetches a partition again once the partition's local queue reached
+/// `queued.min.messages` or `queued.max.messages.kbytes`.
+///
+/// librdkafka's default is 1000 ms. The wait runs its full length even when
+/// the application empties the queue meanwhile, so a consumer that works
+/// through a backlog faster than the queue refills idles for the rest of each
+/// second. With the default `queued.min.messages` of 100000 that caps a
+/// consumer of one partition at about 100k messages per second. 25 ms
+/// refetches a drained queue promptly, and a queue that stays full is checked
+/// at most forty times a second per partition. Every consumer shove builds
+/// uses it, and `with_fetch_queue_backoff_ms` replaces it.
+pub(super) const FETCH_QUEUE_BACKOFF_MS: u32 = 25;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -86,6 +86,7 @@ use super::constants::{
     SESSION_TIMEOUT_MS, SHUTDOWN_COMMIT_DEADLINE,
 };
 use super::consumer_group::{CommitPolicy, KafkaAutoOffsetReset};
+use super::fetch_queue::FetchQueueTuning;
 use super::offset_reset::target_from_timestamp_lookup;
 use super::startup;
 
@@ -3404,26 +3405,20 @@ fn registry_lookup_bound(max_poll_interval_ms: u32) -> Duration {
     Duration::from_millis(u64::from(max_poll_interval_ms) / 3).max(Duration::from_secs(1))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn create_stream_consumer(
+/// The client config every shove consumer is created with: the connection
+/// settings of `base`, the group and client identity, the pinned protocol and
+/// fetch settings, and the fetch queue settings of `fetch_queue`.
+fn consumer_config(
     mut base: ClientConfig,
     group_id: &str,
+    client_id: &str,
     auto_offset_reset: KafkaAutoOffsetReset,
     max_poll_interval_ms: u32,
+    fetch_queue: &FetchQueueTuning,
     topic: &str,
-    rebalance_tx: std_mpsc::Sender<RebalanceEvent>,
-    assignments: AssignmentTokens,
-    #[cfg(feature = "kafka-msk-iam")] msk_context: Option<MskIamContext>,
-) -> Result<KafkaStreamConsumer> {
-    // Each consumer task within a group gets a distinct `client.id` so
-    // librdkafka treats them as separate members. Without this, group
-    // rebalances across repeated join attempts can produce stale
-    // "group generation id is not valid" commit errors.
-    let client_id = format!("shove-{}", uuid::Uuid::new_v4().simple());
-    #[cfg(feature = "test-support")]
-    client_id_probe::record(&client_id);
+) -> Result<ClientConfig> {
     base.set("group.id", group_id)
-        .set("client.id", &client_id)
+        .set("client.id", client_id)
         // Cooperative-sticky assignment performs incremental rebalance so that
         // adding/removing a consumer only reassigns the delta — without this,
         // every join triggers an eager (stop-the-world) rebalance that
@@ -3439,6 +3434,40 @@ fn create_stream_consumer(
         // blocking dwell so the broker doesn't hold the connection open.
         .set("fetch.min.bytes", FETCH_MIN_BYTES.to_string())
         .set("fetch.wait.max.ms", FETCH_WAIT_MAX_MS.to_string());
+    fetch_queue.apply(&mut base, topic)?;
+    Ok(base)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_stream_consumer(
+    base: ClientConfig,
+    group_id: &str,
+    auto_offset_reset: KafkaAutoOffsetReset,
+    max_poll_interval_ms: u32,
+    fetch_queue: &FetchQueueTuning,
+    topic: &str,
+    rebalance_tx: std_mpsc::Sender<RebalanceEvent>,
+    assignments: AssignmentTokens,
+    #[cfg(feature = "kafka-msk-iam")] msk_context: Option<MskIamContext>,
+) -> Result<KafkaStreamConsumer> {
+    // Each consumer task within a group gets a distinct `client.id` so
+    // librdkafka treats them as separate members. Without this, group
+    // rebalances across repeated join attempts can produce stale
+    // "group generation id is not valid" commit errors.
+    let client_id = format!("shove-{}", uuid::Uuid::new_v4().simple());
+    #[cfg(feature = "test-support")]
+    client_id_probe::record(&client_id);
+    let base = consumer_config(
+        base,
+        group_id,
+        &client_id,
+        auto_offset_reset,
+        max_poll_interval_ms,
+        fetch_queue,
+        topic,
+    )?;
+    #[cfg(feature = "test-support")]
+    fetch_queue_probe::record(&base);
     let transport_gate = TransportGate::new(socket_timeout(&base)?);
     #[cfg(feature = "kafka-msk-iam")]
     if let Some(ctx) = msk_context {
@@ -3614,13 +3643,14 @@ fn lazy_positions(topic: &str, partitions: &[i32], offset: Offset) -> Result<Top
 /// The FIFO entry points reach the spawn without the registry's own check,
 /// so the refusals live here: every FIFO entry point then fails the same way
 /// on a setting the FIFO loop would never read. A retry strategy is not
-/// refused: the FIFO loop retries in place whichever one is set.
+/// refused: the FIFO loop retries in place whichever one is set. A fetch queue
+/// setting outside librdkafka's range is refused here too.
 fn check_fifo_options(queue: &str, options: &ConsumerOptions) -> Result<()> {
     options.refuse_broadcast_start(queue, "KafkaConsumer::run_fifo")?;
     if options.kafka_commit_policy.is_some() {
         return Err(reject_fifo_commit_policy(queue));
     }
-    Ok(())
+    options.kafka_fetch_queue.validate(queue)
 }
 
 /// The error every FIFO entry point returns for options that set a commit
@@ -3926,6 +3956,49 @@ pub mod client_id_probe {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(client_id.to_owned());
+    }
+}
+
+/// Test-only record (see the `test-support` feature) of the fetch queue
+/// settings every consumer this process created was handed, in creation
+/// order, as the strings librdkafka was given. A setting nobody set reads
+/// `None`. nextest runs each test in its own process, so the record belongs to
+/// that test's consumers alone.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod fetch_queue_probe {
+    use std::sync::Mutex;
+
+    use rdkafka::ClientConfig;
+
+    /// The fetch queue settings of one consumer.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Created {
+        pub fetch_queue_backoff_ms: Option<String>,
+        pub queued_min_messages: Option<String>,
+        pub queued_max_messages_kbytes: Option<String>,
+    }
+
+    static CREATED: Mutex<Vec<Created>> = Mutex::new(Vec::new());
+
+    /// The settings of each consumer, in creation order.
+    pub fn created() -> Vec<Created> {
+        CREATED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(super) fn record(config: &ClientConfig) {
+        let read = |key: &str| config.get(key).map(str::to_owned);
+        CREATED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Created {
+                fetch_queue_backoff_ms: read("fetch.queue.backoff.ms"),
+                queued_min_messages: read("queued.min.messages"),
+                queued_max_messages_kbytes: read("queued.max.messages.kbytes"),
+            });
     }
 }
 
@@ -7023,6 +7096,7 @@ struct FifoLoop<T: Topic, H: MessageHandler<T>> {
     group_id: String,
     auto_offset_reset: KafkaAutoOffsetReset,
     max_poll_interval_ms: u32,
+    fetch_queue: FetchQueueTuning,
     /// The fenced consumer detector's threshold, see [`fence_threshold_over`],
     /// for the fixed default interval the loop commits on.
     fence_timeout: Duration,
@@ -7410,6 +7484,7 @@ struct SerialConnection<'a> {
     group_id: &'a str,
     auto_offset_reset: KafkaAutoOffsetReset,
     max_poll_interval_ms: u32,
+    fetch_queue: FetchQueueTuning,
     /// The fenced consumer detector's threshold, see [`fence_threshold_over`].
     fence_timeout: Duration,
     shutdown: &'a CancellationToken,
@@ -7444,6 +7519,7 @@ async fn run_serial_connection<L: SerialLoop>(serial: &L) -> Result<()> {
             connection.group_id,
             connection.auto_offset_reset,
             connection.max_poll_interval_ms,
+            &connection.fetch_queue,
             queue,
             rebalance_tx,
             assignments.clone(),
@@ -7556,6 +7632,7 @@ impl<T: Topic, H: MessageHandler<T>> SerialLoop for FifoLoop<T, H> {
             group_id: &self.group_id,
             auto_offset_reset: self.auto_offset_reset,
             max_poll_interval_ms: self.max_poll_interval_ms,
+            fetch_queue: self.fetch_queue,
             fence_timeout: self.fence_timeout,
             shutdown: &self.shutdown,
             label: "FIFO consumer",
@@ -7977,6 +8054,7 @@ struct DlqDrain<T: Topic, H: MessageHandler<T>> {
     /// The bound on one `handle_dead` call, none when the options disable the
     /// handler timeout.
     handler_timeout: Option<Duration>,
+    fetch_queue: FetchQueueTuning,
     /// The fenced consumer detector's threshold, see [`fence_threshold_over`].
     fence_timeout: Duration,
     #[cfg(feature = "kafka-schema-registry")]
@@ -8016,6 +8094,7 @@ impl<T: Topic, H: MessageHandler<T>> SerialLoop for DlqDrain<T, H> {
             // `check_dlq_options` refuses it for the drain.
             auto_offset_reset: KafkaAutoOffsetReset::Earliest,
             max_poll_interval_ms: MAX_POLL_INTERVAL_MS,
+            fetch_queue: self.fetch_queue,
             fence_timeout: self.fence_timeout,
             shutdown: &self.shutdown,
             label: "DLQ consumer",
@@ -8321,6 +8400,8 @@ impl KafkaConsumer {
         if per_record {
             check_per_record_prefetch(options.prefetch_count, queue, "KafkaConsumer::run")?;
         }
+        let fetch_queue = options.kafka_fetch_queue;
+        fetch_queue.validate(queue)?;
         let fence_timeout =
             fence_threshold_over(fence_floor(&options), commit_window(commit_policy));
         #[cfg(feature = "test-support")]
@@ -8439,6 +8520,7 @@ impl KafkaConsumer {
                         &group_id,
                         auto_offset_reset,
                         max_poll_interval_ms,
+                        &fetch_queue,
                         queue,
                         rebalance_tx,
                         assignments.clone(),
@@ -9781,6 +9863,7 @@ impl KafkaConsumer {
                         &group_id,
                         auto_offset_reset,
                         max_poll_interval_ms,
+                        &FetchQueueTuning::default(),
                         queue,
                         rebalance_tx,
                         assignments.clone(),
@@ -10353,6 +10436,7 @@ impl KafkaConsumer {
                 .kafka_auto_offset_reset
                 .unwrap_or(KafkaAutoOffsetReset::Earliest),
             max_poll_interval_ms,
+            fetch_queue: options.kafka_fetch_queue,
             fence_timeout,
             shutdown: options.shutdown.clone(),
             processing: options.processing.clone(),
@@ -10520,7 +10604,8 @@ impl KafkaConsumer {
     /// policy on the same ground, and a setting that changes nothing is
     /// refused rather than dropped. A retry strategy is refused on that
     /// ground too: the loop settles every outcome without one, so
-    /// `with_retry_strategy` would be read by nothing.
+    /// `with_retry_strategy` would be read by nothing. The loop does read the
+    /// fetch queue settings, and one outside librdkafka's range is refused.
     pub(crate) fn check_broadcast_options(queue: &str, options: &ConsumerOptions) -> Result<()> {
         if options.kafka_commit_policy.is_some() {
             return Err(ShoveError::Topology(format!(
@@ -10543,7 +10628,7 @@ impl KafkaConsumer {
                 "BroadcastSubscriber::subscribe",
             ));
         }
-        Ok(())
+        options.kafka_fetch_queue.validate(queue)
     }
 
     /// Run this process's own groupless subscription to `T` until shutdown.
@@ -10599,6 +10684,7 @@ impl KafkaConsumer {
             .map(str::to_string)
             .unwrap_or_else(|| super::constants::broadcast_group_id(queue));
         let start = options.broadcast_start;
+        let fetch_queue = options.kafka_fetch_queue;
         // One warning per subscription, not per poll: the error repeats on
         // every coordinator lookup for the life of the handle.
         let warned_group_acl = Arc::new(AtomicBool::new(false));
@@ -10681,6 +10767,7 @@ impl KafkaConsumer {
                     // `Latest` states the intent anyway.
                     KafkaAutoOffsetReset::Latest,
                     MAX_POLL_INTERVAL_MS,
+                    &fetch_queue,
                     queue,
                     rebalance_tx,
                     AssignmentTokens::default(),
@@ -11212,6 +11299,9 @@ impl KafkaConsumer {
     ///   logged and committed without reaching `handle_dead`.
     /// - `with_group_id` rebases the drain's group, `{group}-dlq`.
     /// - `with_consumer_group` labels the size sample of the drain.
+    /// - `with_queued_min_messages`, `with_queued_max_messages_kbytes` and
+    ///   `with_fetch_queue_backoff_ms` set the fetch queue of the drain's
+    ///   consumer. One outside librdkafka's range is refused.
     /// - The schema registry options decode the dead letters through the
     ///   registry.
     ///
@@ -11290,6 +11380,7 @@ impl KafkaConsumer {
                 "KafkaConsumer::run_dlq",
             ));
         }
+        options.kafka_fetch_queue.validate(topology.queue())?;
 
         // Honor the `group.id` override (set via
         // `ConsumerOptions::<Kafka>::with_group_id`) by rebasing the DLQ group
@@ -11329,6 +11420,7 @@ impl KafkaConsumer {
             shutdown,
             max_message_size: options.max_message_size,
             handler_timeout: options.handler_timeout,
+            fetch_queue: options.kafka_fetch_queue,
             fence_timeout: fence_threshold_over(fence_floor(&options), ASYNC_COMMIT_INTERVAL),
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: options.schema_registry.clone(),
@@ -14433,6 +14525,7 @@ mod stop_drain_tests {
                 "stop-drain",
                 KafkaAutoOffsetReset::Earliest,
                 MAX_POLL_INTERVAL_MS,
+                &FetchQueueTuning::default(),
                 "stop-drain",
                 rebalance_tx,
                 AssignmentTokens::default(),
@@ -16458,5 +16551,254 @@ mod message_id_tests {
             "a Defer copy's id is the base, `-d` and a UUID"
         );
         assert_ne!(deferred, copy_message_id("a", Hop::Defer));
+    }
+}
+
+/// [`consumer_config`]: the librdkafka settings every shove consumer is
+/// created with, the fetch queue's among them.
+#[cfg(test)]
+mod consumer_config_tests {
+    use super::*;
+
+    fn config_of(fetch_queue: &FetchQueueTuning) -> Result<ClientConfig> {
+        consumer_config(
+            ClientConfig::new(),
+            "orders-consumer",
+            "shove-test",
+            KafkaAutoOffsetReset::Earliest,
+            MAX_POLL_INTERVAL_MS,
+            fetch_queue,
+            "orders",
+        )
+    }
+
+    #[test]
+    fn every_consumer_is_created_with_the_default_fetch_queue_backoff() {
+        let config = config_of(&FetchQueueTuning::default()).expect("the default tuning is valid");
+
+        assert_eq!(config.get("fetch.queue.backoff.ms"), Some("25"));
+        assert_eq!(config.get("queued.min.messages"), None);
+        assert_eq!(config.get("queued.max.messages.kbytes"), None);
+    }
+
+    #[test]
+    fn the_overrides_reach_the_config_and_the_pinned_settings_stay() {
+        let config = config_of(&FetchQueueTuning {
+            queued_min_messages: Some(5_000),
+            queued_max_messages_kbytes: Some(2_048),
+            fetch_queue_backoff_ms: Some(250),
+        })
+        .expect("an in-range tuning is valid");
+
+        assert_eq!(config.get("queued.min.messages"), Some("5000"));
+        assert_eq!(config.get("queued.max.messages.kbytes"), Some("2048"));
+        assert_eq!(config.get("fetch.queue.backoff.ms"), Some("250"));
+        assert_eq!(config.get("group.id"), Some("orders-consumer"));
+        assert_eq!(config.get("client.id"), Some("shove-test"));
+        assert_eq!(config.get("enable.auto.commit"), Some("false"));
+        assert_eq!(config.get("fetch.min.bytes"), Some("1"));
+        assert_eq!(config.get("fetch.wait.max.ms"), Some("50"));
+    }
+
+    /// What librdkafka itself reads back: the default backoff, and its own
+    /// defaults for the two thresholds nobody set.
+    #[test]
+    fn librdkafka_reads_back_the_default_backoff_and_keeps_its_threshold_defaults() {
+        let native = config_of(&FetchQueueTuning::default())
+            .expect("the default tuning is valid")
+            .create_native_config()
+            .expect("librdkafka takes the consumer config");
+
+        assert_eq!(native.get("fetch.queue.backoff.ms").as_deref(), Ok("25"));
+        assert_eq!(native.get("queued.min.messages").as_deref(), Ok("100000"));
+        assert_eq!(
+            native.get("queued.max.messages.kbytes").as_deref(),
+            Ok("65536")
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_setting_builds_no_config() {
+        let err = config_of(&FetchQueueTuning {
+            queued_min_messages: Some(0),
+            ..FetchQueueTuning::default()
+        })
+        .expect_err("an out-of-range setting is refused");
+
+        assert!(
+            matches!(&err, ShoveError::Topology(msg)
+                if msg.contains("orders") && msg.contains("with_queued_min_messages")),
+            "{err:?}"
+        );
+    }
+}
+
+/// A fetch queue setting outside librdkafka's range is refused where each
+/// consume path starts, before any broker request: the broker the client
+/// points at is never listening.
+#[cfg(test)]
+mod fetch_queue_guard_tests {
+    use super::*;
+    use crate::topology::{SequenceFailure, TopologyBuilder};
+
+    /// Far above a refusal that makes no request, far below a hang.
+    const REFUSAL_BOUND: Duration = Duration::from_secs(10);
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct Entry {
+        account: String,
+    }
+
+    struct Plain;
+    impl Topic for Plain {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("fetch-queue-guard-plain").build())
+        }
+    }
+    impl NotSequenced for Plain {}
+
+    struct WithDlq;
+    impl Topic for WithDlq {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("fetch-queue-guard-dlq").dlq().build())
+        }
+    }
+
+    struct Ledger;
+    impl Topic for Ledger {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| {
+                TopologyBuilder::new("fetch-queue-guard-ledger")
+                    .sequenced(SequenceFailure::FailAll)
+                    .hold_queue(Duration::from_secs(5))
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+    impl SequencedTopic for Ledger {
+        fn sequence_key(msg: &Entry) -> String {
+            msg.account.clone()
+        }
+    }
+
+    struct NoopHandler;
+    impl<T: Topic<Message = Entry>> MessageHandler<T> for NoopHandler {
+        type Context = ();
+        async fn handle(&self, _: Entry, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    async fn consumer() -> KafkaConsumer {
+        let client = KafkaClient::connect(&super::super::client::KafkaConfig::new("127.0.0.1:1"))
+            .await
+            .expect("client construction is lazy");
+        KafkaConsumer::new(client)
+    }
+
+    /// The reconnect budget of one bounds a path that does not refuse to one
+    /// refused connection.
+    fn out_of_range() -> crate::ConsumerOptions<Kafka> {
+        crate::ConsumerOptions::<Kafka>::new()
+            .with_queued_min_messages(0)
+            .with_max_reconnect_attempts(1)
+            .with_shutdown(CancellationToken::new())
+    }
+
+    fn refusal(err: ShoveError) -> String {
+        match err {
+            ShoveError::Topology(msg) => msg,
+            other => panic!("expected ShoveError::Topology, got {other:?}"),
+        }
+    }
+
+    fn assert_names(msg: &str, queue: &str) {
+        assert!(msg.contains(queue), "the message names the topic: {msg}");
+        assert!(
+            msg.contains("with_queued_min_messages") && msg.contains("1..=10000000"),
+            "the message names the setter and the range: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_refuses_an_out_of_range_setting_before_any_broker_request() {
+        let err = tokio::time::timeout(
+            REFUSAL_BOUND,
+            consumer()
+                .await
+                .run::<Plain, _>(NoopHandler, (), out_of_range()),
+        )
+        .await
+        .expect("the refusal makes no broker request")
+        .expect_err("an out-of-range setting must be refused");
+
+        assert_names(&refusal(err), "fetch-queue-guard-plain");
+    }
+
+    #[tokio::test]
+    async fn run_fifo_refuses_an_out_of_range_setting_before_any_broker_request() {
+        let err = tokio::time::timeout(
+            REFUSAL_BOUND,
+            consumer()
+                .await
+                .run_fifo::<Ledger, _>(NoopHandler, (), out_of_range()),
+        )
+        .await
+        .expect("the refusal makes no broker request")
+        .expect_err("an out-of-range setting must be refused");
+
+        assert_names(&refusal(err), "fetch-queue-guard-ledger");
+    }
+
+    #[tokio::test]
+    async fn run_dlq_refuses_an_out_of_range_setting_before_any_broker_request() {
+        let err = tokio::time::timeout(
+            REFUSAL_BOUND,
+            consumer()
+                .await
+                .run_dlq_with_options::<WithDlq, _>(NoopHandler, (), out_of_range()),
+        )
+        .await
+        .expect("the refusal makes no broker request")
+        .expect_err("an out-of-range setting must be refused");
+
+        assert_names(&refusal(err), "fetch-queue-guard-dlq");
+    }
+
+    /// A broadcast subscription takes the same settings, and `subscribe()`
+    /// refuses a bad one synchronously, before it spawns the loop.
+    #[test]
+    fn a_broadcast_subscription_refuses_an_out_of_range_setting() {
+        let err = KafkaConsumer::check_broadcast_options(
+            "fetch-queue-guard-plain",
+            &out_of_range().into_inner(),
+        )
+        .expect_err("an out-of-range setting must be refused");
+
+        assert_names(&refusal(err), "fetch-queue-guard-plain");
+    }
+
+    /// Negative control: the same options with the setting inside its range
+    /// pass the broadcast check.
+    #[test]
+    fn a_broadcast_subscription_admits_a_setting_inside_its_range() {
+        let options = crate::ConsumerOptions::<Kafka>::new()
+            .with_queued_min_messages(1)
+            .with_queued_max_messages_kbytes(2_097_151)
+            .with_fetch_queue_backoff_ms(0)
+            .into_inner();
+
+        KafkaConsumer::check_broadcast_options("fetch-queue-guard-plain", &options)
+            .expect("settings inside the ranges are admitted");
     }
 }

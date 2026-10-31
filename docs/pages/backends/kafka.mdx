@@ -321,6 +321,49 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
   The same setting is available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths.
   A FIFO consumer, the DLQ drain and a broadcast subscription refuse a policy as they refuse an interval.
   See [Offset commit semantics](#offset-commit-semantics).
+- **`with_queued_min_messages(u32)`**, **`with_queued_max_messages_kbytes(u32)`** and **`with_fetch_queue_backoff_ms(u32)`** - the fetch queue settings of each member's librdkafka client.
+  Unset, the backoff is 25 ms and the two thresholds are librdkafka's.
+  See [Fetch queue tuning](#fetch-queue-tuning).
+  The same settings are available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths.
+
+### Fetch queue tuning
+
+librdkafka prefetches records into a local queue for each partition and hands them to the consumer from there.
+Two thresholds bound that queue: `queued.min.messages`, 100000 messages by default, and `queued.max.messages.kbytes`, 65536 by default, about 64 MB.
+A partition whose queue reaches either one is not fetched again until `fetch.queue.backoff.ms` has passed.
+The wait runs its full length even when the handlers empty the queue meanwhile.
+librdkafka's default backoff is 1000 ms, so a consumer that works through a backlog faster than the queue refills idles for the rest of each second.
+With the default threshold that caps a consumer of one partition at about 100k messages per second.
+
+Every Kafka consumer shove builds runs with a backoff of 25 ms: the standard consumer, the sequenced consumer, the batch consumer, the DLQ drain and the broadcast subscription.
+A drained queue is refetched promptly, and a queue that stays full is checked at most forty times a second per partition.
+The two thresholds stay at librdkafka's defaults until a setting replaces them.
+
+Three opt-in settings replace the values.
+They are on `KafkaConsumerGroupConfig` for the registry path, and on `ConsumerOptions::<Kafka>` for the direct, sequenced, DLQ drain, broadcast and supervisor paths:
+
+```rust
+use shove::kafka::KafkaConsumerGroupConfig;
+
+let cfg = KafkaConsumerGroupConfig::new(1..=8)
+    .with_queued_min_messages(500_000)
+    .with_queued_max_messages_kbytes(262_144)
+    .with_fetch_queue_backoff_ms(10);
+```
+
+- **`with_queued_min_messages(u32)`** - `queued.min.messages`, accepted in `1..=10000000`.
+  A higher value prefetches further ahead of the handlers and holds more messages in memory, and a lower one bounds that memory.
+- **`with_queued_max_messages_kbytes(u32)`** - `queued.max.messages.kbytes`, accepted in `1..=2097151`.
+  librdkafka gives it priority over `queued.min.messages`.
+- **`with_fetch_queue_backoff_ms(u32)`** - `fetch.queue.backoff.ms`, accepted in `0..=300000`.
+  The default is `25`.
+  A lower value refetches sooner.
+  `0` removes the wait, and can raise CPU use while a queue stays full.
+
+A value outside its range is refused with `ShoveError::Topology` before any broker request.
+A group config is checked by `register` and `register_fifo`, and options are checked where the consumer starts.
+The batch consumer takes no fetch queue setting and runs on the defaults.
+With the `env-config` feature, `KafkaFetchQueueTuning` reads the three settings from the environment, see [Environment configuration](/ops/env-config#kafka-fetch-queue).
 
 ### Broker outages
 
@@ -373,7 +416,7 @@ A returned partition therefore never stays paused behind a wait that is over, an
 ### Draining the DLQ
 
 `KafkaConsumer::run_dlq` and `run_dlq_with_options` hand every dead letter to `MessageHandler::handle_dead`.
-The drain reads `with_shutdown`, `with_handler_timeout` or `without_handler_timeout`, `with_max_message_size`, `with_group_id`, `with_consumer_group` and the schema registry settings.
+The drain reads `with_shutdown`, `with_handler_timeout` or `without_handler_timeout`, `with_max_message_size`, `with_group_id`, `with_consumer_group`, the [fetch queue settings](#fetch-queue-tuning) and the schema registry settings.
 It reads no commit or offset-reset setting, so it refuses `with_commit_interval`, `with_commit_policy` and `with_auto_offset_reset` with a `ShoveError::Topology`.
 `handle_dead` returns no outcome for a timeout to resolve to, so the drain refuses `with_handler_timeout_outcome` the same way.
 
@@ -485,6 +528,7 @@ A broadcast subscription refuses `with_commit_policy`, its shorthand `with_commi
 It commits nothing and assigns every partition at an explicit offset, so none of those settings would change anything.
 A setting that changes nothing is refused rather than dropped.
 The competing-consumer entry points refuse `with_broadcast_start` for the same reason.
+A subscription reads the [fetch queue settings](#fetch-queue-tuning), and `subscribe()` refuses one outside librdkafka's range.
 
 - **`BroadcastStart::Tail`**, and no call at all - every partition at its end offset: deliver-new, the broadcast contract.
 - **`BroadcastStart::Head`** - every partition at its beginning, so a fresh instance replays the retained log before it tails.
@@ -829,7 +873,8 @@ The record is discarded and committed, an error is logged, and `messages_discard
 
 ### Batch consumer
 
-`run_batch` and `Broker::<Kafka>::batch_consumer()` commit as the standard consumer commits under the default `CommitPolicy::Interval`.
+`run_batch` and `Broker::<Kafka>::batch_consumer()` take no [fetch queue setting](#fetch-queue-tuning) and run on the default backoff of 25 ms.
+They commit as the standard consumer commits under the default `CommitPolicy::Interval`.
 A batch the handler acks is retired, and its offsets go out with the next commit: at most every 500 ms, one commit at a time on a thread of its own, while the consumer goes on.
 A commit the coordinator rejects, such as one made while the group rebalances, is re-offered.
 A consumer whose commits keep being rejected, none accepted and no rebalance resolving them, is treated as fenced and reconnects.
