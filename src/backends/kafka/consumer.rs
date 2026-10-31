@@ -3342,27 +3342,14 @@ impl KafkaStreamConsumer {
 // ---------------------------------------------------------------------------
 
 /// The `max.poll.interval.ms` a group member is created with: the pinned
-/// `MAX_POLL_INTERVAL_MS`, or under `test-support` the value a test injected
-/// through `ConsumerOptionsInner::kafka_max_poll_interval`.
-fn max_poll_interval_ms(options: &ConsumerOptions) -> u32 {
+/// `MAX_POLL_INTERVAL_MS`, or under `test-support` the value a test injected,
+/// `kafka_max_poll_interval` on `ConsumerOptionsInner` or on
+/// `BatchConsumerOptionsInner`.
+fn max_poll_interval_ms(#[cfg(feature = "test-support")] injected: Option<Duration>) -> u32 {
     #[cfg(feature = "test-support")]
-    if let Some(interval) = options.kafka_max_poll_interval {
+    if let Some(interval) = injected {
         return u32::try_from(interval.as_millis()).unwrap_or(u32::MAX);
     }
-    #[cfg(not(feature = "test-support"))]
-    let _ = options;
-    MAX_POLL_INTERVAL_MS
-}
-
-/// [`max_poll_interval_ms`] for the batch consumer, whose options carry the
-/// test seam as `BatchConsumerOptionsInner::kafka_max_poll_interval`.
-fn batch_max_poll_interval_ms(options: &BatchConsumerOptionsInner) -> u32 {
-    #[cfg(feature = "test-support")]
-    if let Some(interval) = options.kafka_max_poll_interval {
-        return u32::try_from(interval.as_millis()).unwrap_or(u32::MAX);
-    }
-    #[cfg(not(feature = "test-support"))]
-    let _ = options;
     MAX_POLL_INTERVAL_MS
 }
 
@@ -7777,7 +7764,10 @@ impl KafkaConsumer {
             fence_threshold_over(fence_floor(&options), commit_window(commit_policy));
         #[cfg(feature = "test-support")]
         fence_probe::record(fence_timeout);
-        let max_poll_interval_ms = max_poll_interval_ms(&options);
+        let max_poll_interval_ms = max_poll_interval_ms(
+            #[cfg(feature = "test-support")]
+            options.kafka_max_poll_interval,
+        );
         #[cfg(feature = "kafka-schema-registry")]
         let lookup_bound = registry_lookup_bound(max_poll_interval_ms);
 
@@ -9148,7 +9138,10 @@ impl KafkaConsumer {
             .kafka_auto_offset_reset
             .unwrap_or(KafkaAutoOffsetReset::Earliest);
         let shutdown = options.shutdown.clone();
-        let max_poll_interval_ms = batch_max_poll_interval_ms(&options);
+        let max_poll_interval_ms = max_poll_interval_ms(
+            #[cfg(feature = "test-support")]
+            options.kafka_max_poll_interval,
+        );
         let housekeeping_interval = batch_housekeeping_interval(&options);
         let max_message_size = options.max_message_size;
         let max_batch_size = options.max_batch_size;
@@ -9747,7 +9740,10 @@ impl KafkaConsumer {
                 super::constants::consumer_group_id_fifo_scoped(&queue, topology.consumer_group())
             }
         };
-        let max_poll_interval_ms = max_poll_interval_ms(&options);
+        let max_poll_interval_ms = max_poll_interval_ms(
+            #[cfg(feature = "test-support")]
+            options.kafka_max_poll_interval,
+        );
         let fence_timeout = fence_threshold_over(fence_floor(&options), ASYNC_COMMIT_INTERVAL);
         #[cfg(feature = "test-support")]
         fence_probe::record(fence_timeout);
@@ -15569,6 +15565,13 @@ mod batch_consumer_options_tests {
     fn with_max_batch_age_sets_value() {
         let opts = BatchConsumerOptions::new().with_max_batch_age(Duration::from_secs(2));
         assert_eq!(opts.max_batch_age, Duration::from_secs(2));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    #[should_panic(expected = "housekeeping interval must be positive")]
+    fn with_housekeeping_interval_for_test_zero_panics() {
+        let _ = BatchConsumerOptions::new().with_housekeeping_interval_for_test(Duration::ZERO);
     }
 
     #[test]
