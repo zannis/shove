@@ -370,6 +370,13 @@ pub mod kafka {
     #[doc(hidden)]
     pub use crate::backends::kafka::client_id_probe;
 
+    /// Test-only counter (see the `test-support` feature) of the wakes the
+    /// commit gate's deadline made, for tests that prove a gated commit wakes
+    /// its loop once rather than on every pass.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::commit_gate_probe;
+
     /// Test-only record (see the `test-support` feature) of the fetch queue
     /// settings every consumer was created with, for tests that prove a
     /// consume path hands librdkafka the settings its options carry.
