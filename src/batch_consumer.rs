@@ -31,7 +31,7 @@ use crate::outcome::Outcome;
 use crate::topic::NotSequenced;
 
 #[cfg(feature = "kafka")]
-use crate::backends::kafka::KafkaAutoOffsetReset;
+use crate::backends::kafka::{FetchQueueTuning, KafkaAutoOffsetReset};
 #[cfg(feature = "kafka")]
 use crate::markers::Kafka;
 #[cfg(feature = "kafka-schema-registry")]
@@ -75,6 +75,8 @@ pub struct BatchConsumerOptions<B: Backend> {
     pub(crate) kafka_group_id: Option<Arc<str>>,
     #[cfg(feature = "kafka")]
     pub(crate) kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
+    #[cfg(feature = "kafka")]
+    pub(crate) kafka_fetch_queue: FetchQueueTuning,
     #[cfg(all(feature = "kafka", feature = "test-support"))]
     pub(crate) kafka_max_poll_interval: Option<Duration>,
     #[cfg(all(feature = "kafka", feature = "test-support"))]
@@ -114,6 +116,8 @@ impl<B: Backend> BatchConsumerOptions<B> {
             kafka_group_id: None,
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: None,
+            #[cfg(feature = "kafka")]
+            kafka_fetch_queue: FetchQueueTuning::default(),
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: None,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
@@ -245,6 +249,8 @@ impl<B: Backend> BatchConsumerOptions<B> {
             kafka_group_id: self.kafka_group_id,
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: self.kafka_auto_offset_reset,
+            #[cfg(feature = "kafka")]
+            kafka_fetch_queue: self.kafka_fetch_queue,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: self.kafka_max_poll_interval,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
@@ -283,6 +289,68 @@ impl BatchConsumerOptions<Kafka> {
     /// Kafka-only: `auto.offset.reset` override.
     pub fn with_auto_offset_reset(mut self, reset: KafkaAutoOffsetReset) -> Self {
         self.kafka_auto_offset_reset = Some(reset);
+        self
+    }
+
+    /// librdkafka's `queued.min.messages`: how many messages per partition the
+    /// consumer tries to keep prefetched in its local queue. A partition whose
+    /// queue holds that many is not fetched again until
+    /// [`with_fetch_queue_backoff_ms`](Self::with_fetch_queue_backoff_ms) has
+    /// passed. Unset keeps librdkafka's default, 100000.
+    ///
+    /// A higher value prefetches further ahead of the handler and holds more
+    /// messages in memory, and a lower one bounds that memory.
+    /// [`with_queued_max_messages_kbytes`](Self::with_queued_max_messages_kbytes)
+    /// bounds the same queue by size.
+    ///
+    /// The accepted range is `1..=10000000`. A value outside it is refused
+    /// with `ShoveError::Validation` where the consumer starts, before any
+    /// broker request. The same setting is available on
+    /// [`ConsumerOptions::<Kafka>`](crate::ConsumerOptions::with_queued_min_messages)
+    /// for the other consume paths.
+    pub fn with_queued_min_messages(mut self, messages: u32) -> Self {
+        self.kafka_fetch_queue.queued_min_messages = Some(messages);
+        self
+    }
+
+    /// librdkafka's `queued.max.messages.kbytes`: how many kilobytes of
+    /// prefetched messages the consumer's local queue may hold before
+    /// librdkafka stops fetching until
+    /// [`with_fetch_queue_backoff_ms`](Self::with_fetch_queue_backoff_ms) has
+    /// passed. librdkafka gives it priority over `queued.min.messages`. Unset
+    /// keeps librdkafka's default, 65536, about 64 MB.
+    ///
+    /// The accepted range is `1..=2097151`. A value outside it is refused
+    /// with `ShoveError::Validation` where the consumer starts, as
+    /// [`with_queued_min_messages`](Self::with_queued_min_messages) is. The
+    /// same setting is available on
+    /// [`ConsumerOptions::<Kafka>`](crate::ConsumerOptions::with_queued_max_messages_kbytes)
+    /// for the other consume paths.
+    pub fn with_queued_max_messages_kbytes(mut self, kbytes: u32) -> Self {
+        self.kafka_fetch_queue.queued_max_messages_kbytes = Some(kbytes);
+        self
+    }
+
+    /// librdkafka's `fetch.queue.backoff.ms`: how long to wait before fetching
+    /// a partition again once its local queue reached `queued.min.messages` or
+    /// `queued.max.messages.kbytes`. Unset keeps 25 ms, which every Kafka
+    /// consumer shove builds uses, in place of librdkafka's 1000 ms.
+    ///
+    /// The wait runs its full length even when the handler empties the queue
+    /// meanwhile. At 1000 ms a consumer that works through a backlog faster
+    /// than the queue refills idles for the rest of each second, which caps a
+    /// partition at about `queued.min.messages` messages per second. A lower
+    /// value refetches sooner and checks a full queue more often. `0` removes
+    /// the wait, and can raise CPU use while a queue stays full.
+    ///
+    /// The accepted range is `0..=300000`. A value outside it is refused with
+    /// `ShoveError::Validation` where the consumer starts, as
+    /// [`with_queued_min_messages`](Self::with_queued_min_messages) is. The
+    /// same setting is available on
+    /// [`ConsumerOptions::<Kafka>`](crate::ConsumerOptions::with_fetch_queue_backoff_ms)
+    /// for the other consume paths.
+    pub fn with_fetch_queue_backoff_ms(mut self, ms: u32) -> Self {
+        self.kafka_fetch_queue.fetch_queue_backoff_ms = Some(ms);
         self
     }
 

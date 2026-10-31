@@ -77,7 +77,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "kafka")]
-use crate::backends::kafka::KafkaAutoOffsetReset;
+use crate::backends::kafka::{FetchQueueTuning, KafkaAutoOffsetReset};
 use crate::error::{Result, ShoveError};
 use crate::handler::BatchMessageHandler;
 use crate::outcome::Outcome;
@@ -116,6 +116,12 @@ pub(crate) struct BatchConsumerOptionsInner {
     /// the library default of `earliest`.
     #[cfg(feature = "kafka")]
     pub kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
+    /// Kafka-only: the fetch queue settings the batch consumer's librdkafka
+    /// client is created with. Unset settings keep the backoff default and
+    /// librdkafka's thresholds. See `ConsumerOptionsInner::kafka_fetch_queue`
+    /// for the single-message counterpart this mirrors.
+    #[cfg(feature = "kafka")]
+    pub kafka_fetch_queue: FetchQueueTuning,
     /// Kafka-only, `test-support` builds: the `max.poll.interval.ms` the
     /// batch consumer is created with, in place of the pinned
     /// `MAX_POLL_INTERVAL_MS`, so an integration test can observe a member

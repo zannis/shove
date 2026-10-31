@@ -370,6 +370,13 @@ pub mod kafka {
     #[doc(hidden)]
     pub use crate::backends::kafka::client_id_probe;
 
+    /// Test-only record (see the `test-support` feature) of the fetch queue
+    /// settings every consumer was created with, for tests that prove a
+    /// consume path hands librdkafka the settings its options carry.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::fetch_queue_probe;
+
     /// Test-only probe (see the `test-support` feature) on the concurrent
     /// consumer's completion channel, for tests that prove a completion sat
     /// in the channel during a stall.
