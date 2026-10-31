@@ -1,0 +1,20 @@
+tests/kafka_commit_policy_mock.rs
+  s_1001dc3147e1e5::t_668240abacbed7 1284-1285,1288
+  s_1001dc3147e1e5::t_e383b9af3d657c 1329-1385
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "08071a8509074a30d5ac35ebafb2d16eac911f08",
+  "prompts": {},
+  "sessions": {
+    "s_1001dc3147e1e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc9b68e2-bf14-46f0-b5ec-7ecdbe6bce07",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
