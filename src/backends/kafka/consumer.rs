@@ -1177,8 +1177,10 @@ const STRING_HEADERS_PREALLOC_CAP: usize = 32;
 /// byte: a republished or dead-lettered copy is built from it, so the copy
 /// keeps every header the record carried, in order, binary and null values,
 /// repeated keys and keys that are not UTF-8 included. `None` when the record
-/// carries no headers. `partition` and `offset` name a record that carries
-/// no id, see [`base_message_id`](Self::base_message_id).
+/// carries no headers, or when the loop that read it publishes no copy of
+/// it, see [`strings_only`](Self::strings_only). `partition` and `offset`
+/// name a record that carries no id, see
+/// [`base_message_id`](Self::base_message_id).
 struct RecordHeaders {
     strings: Arc<HashMap<String, String>>,
     wire: Option<OwnedHeaders>,
@@ -1196,6 +1198,21 @@ impl RecordHeaders {
         Self {
             strings,
             wire: msg.headers().map(BorrowedHeaders::detach),
+            partition: msg.partition(),
+            offset: msg.offset(),
+        }
+    }
+
+    /// [`read`](Self::read) without the wire copy, for a loop that never
+    /// builds a copy of the record from it: one that retries in place, so it
+    /// republishes nothing, and whose topology declares no DLQ, so
+    /// `publish_to_dlq` returns before it reads the headers. librdkafka's
+    /// copy of the header list is the one cost of `read` that grows with
+    /// every header.
+    fn strings_only(msg: &BorrowedMessage<'_>) -> Self {
+        Self {
+            strings: extract_string_headers(msg),
+            wire: None,
             partition: msg.partition(),
             offset: msg.offset(),
         }
@@ -7655,12 +7672,28 @@ struct Tracked {
 }
 
 /// The record a sequenced consumer has in hand, read once off its message.
+///
+/// The message itself is kept, live for as long as the record is in hand,
+/// so the wire copy of its headers a dead letter is built from is made only
+/// when the record is dead-lettered, see [`dead_letter_headers`]; every
+/// other read takes `strings`.
+///
+/// [`dead_letter_headers`]: Self::dead_letter_headers
 struct FifoRecord<'m> {
     tracked: Tracked,
     payload: &'m [u8],
     key: Option<&'m [u8]>,
-    headers: RecordHeaders,
+    strings: Arc<HashMap<String, String>>,
     coordinates: RecordCoordinates,
+    message: &'m BorrowedMessage<'m>,
+}
+
+impl FifoRecord<'_> {
+    /// The headers a dead letter of the record is built from, the wire copy
+    /// included, see [`RecordHeaders`].
+    fn dead_letter_headers(&self) -> RecordHeaders {
+        RecordHeaders::with_strings(self.message, Arc::clone(&self.strings))
+    }
 }
 
 /// Whether a [`SerialLoop`] goes on to the next record or stops.
@@ -8177,8 +8210,9 @@ impl<T: Topic, H: MessageHandler<T>> SerialLoop for FifoLoop<T, H> {
             tracked: state.take(consumer, msg)?,
             payload: msg.payload().unwrap_or_default(),
             key: msg.key(),
-            headers: RecordHeaders::read(msg),
+            strings: extract_string_headers(msg),
             coordinates: RecordCoordinates::of(msg),
+            message: msg,
         };
         // The Kafka message key *is* the sequence key — the publisher sets it
         // from `SEQUENCE_KEY_FN`.
@@ -8208,7 +8242,7 @@ impl<T: Topic, H: MessageHandler<T>> SerialLoop for FifoLoop<T, H> {
                 metrics::FailReason::Rejected,
                 has_dlq,
             );
-            let retry_count = get_retry_count(&record.headers.strings);
+            let retry_count = get_retry_count(&record.strings);
             return self
                 .dead_letter(consumer, state, &record, "rejected", retry_count, pending)
                 .await;
@@ -8223,7 +8257,7 @@ impl<T: Topic, H: MessageHandler<T>> SerialLoop for FifoLoop<T, H> {
                 metrics::FailReason::Oversize,
                 has_dlq,
             );
-            let retry_count = get_retry_count(&record.headers.strings);
+            let retry_count = get_retry_count(&record.strings);
             return self
                 .dead_letter(
                     consumer,
@@ -8241,7 +8275,7 @@ impl<T: Topic, H: MessageHandler<T>> SerialLoop for FifoLoop<T, H> {
             Staged::Drop(fail, reason) => {
                 poison_key(&self.poisoned, &seq_key, queue);
                 let pending = metrics::record_terminal(&self.topic, group, fail, has_dlq);
-                let retry_count = get_retry_count(&record.headers.strings);
+                let retry_count = get_retry_count(&record.strings);
                 return self
                     .dead_letter(consumer, state, &record, reason, retry_count, pending)
                     .await;
@@ -8320,7 +8354,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
         let group = self.group.as_deref();
         let _busy = Busy::begin(&self.processing);
         let mut message = Some(first);
-        let mut attempts = get_retry_count(&record.headers.strings);
+        let mut attempts = get_retry_count(&record.strings);
         let mut redelivered = false;
         loop {
             let payload = match message.take() {
@@ -8349,7 +8383,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                 },
             };
             let mut metadata =
-                build_message_metadata(&record.headers.strings, redelivered, record.coordinates);
+                build_message_metadata(&record.strings, redelivered, record.coordinates);
             metadata.retry_count = attempts;
             let outcome = adjust_outcome_for_fifo(
                 invoke_handler(
@@ -8443,6 +8477,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
     ) -> Result<FifoPass> {
         let queue = self.queue.as_str();
         let mut backoff = Backoff::new(DEAD_LETTER_RETRY_INITIAL, DEAD_LETTER_RETRY_MAX);
+        let headers = record.dead_letter_headers();
         let stop = self.shutdown.cancelled();
         tokio::pin!(stop);
         loop {
@@ -8457,7 +8492,7 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
                     self.topology,
                     record.payload,
                     record.key,
-                    &record.headers,
+                    &headers,
                     reason,
                     retry_count,
                 ) => published,
@@ -8958,6 +8993,10 @@ impl KafkaConsumer {
             "KafkaConsumer::run",
         )?;
         let in_place = retry_strategy == RetryStrategy::InPlace;
+        // Whether a copy of a record is ever published: a republish, or a
+        // dead letter. A loop that publishes neither reads no wire headers,
+        // see `RecordHeaders::strings_only`.
+        let publishes_copies = !in_place || topology.dlq().is_some();
 
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
@@ -9531,7 +9570,11 @@ impl KafkaConsumer {
                             // only because the handler runs in a spawned task that outlives
                             // this loop iteration.
                             let payload_slice = msg.payload().unwrap_or_default();
-                            let headers = RecordHeaders::read(&msg);
+                            let headers = if publishes_copies {
+                                RecordHeaders::read(&msg)
+                            } else {
+                                RecordHeaders::strings_only(&msg)
+                            };
                             let partition = msg.partition();
                             let offset = msg.offset();
                             let key = msg.key().map(Bytes::copy_from_slice);
