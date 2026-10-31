@@ -351,6 +351,7 @@ Under cooperative-sticky every member is handed an assign at each round of a reb
 Every broker being down at once is still ridden out, because librdkafka never fails a queued request, a committed-offset fetch among them, with that code.
 shove leaves `socket.timeout.ms` at librdkafka's default, 60 s.
 The reconnect rejoins the group and fetches the committed offsets again.
+The drain at a stop rides out a failed connection or name resolution whatever change came before it, because a stop never reconnects: ending the drain on one would only cost the stop its final commit.
 A bounce that lands on a member with no such change behind it is ridden out as above.
 One case stays out of sight: a coordinator that holds a fetch unanswered for longer than `socket.timeout.ms` while the consumer is handed no error.
 An assignment change after that bound, and a connection the coordinator drops after it, leave the fetch's partitions unfetched with the error ridden out.
@@ -721,7 +722,7 @@ Against a coordinator that does not answer, the reconnect or the error comes up 
 If a commit is still in flight on its thread, the close runs once that commit returns, and the error is returned without waiting for it.
 A member whose task is aborted closes off the runtime thread as well, but nothing waits for that close.
 
-The wait for the handlers at a stop can fail too: on a receive error that ends a consumer, see [Broker outages](#broker-outages), or on a put-back or a pause librdkafka refuses.
+The wait for the handlers at a stop can fail too: on a receive error that ends a consumer, a failed connection or name resolution excepted, see [Broker outages](#broker-outages), or on a put-back or a pause librdkafka refuses.
 The stop then ends as an error exit does, with no final commit: the consumer closes with nothing committed, and every record completed since the last accepted commit is redelivered.
 The close comes before the handlers finish, so the member leaves its group while they may still run, and the stop returns once every one of them has finished.
 The consumer logs the failure at error level and ends with it: `run` returns that error, a `ShoveError::Connection` for a refused put-back or pause, and a group run counts the member under `errors`.
