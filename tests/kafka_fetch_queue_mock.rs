@@ -492,10 +492,12 @@ async fn a_batch_consumer_consumes_on_the_default_backoff() {
 
 /// A setting outside librdkafka's range is refused with a typed error before
 /// the consumer is created, and a group config with one is refused at
-/// registration, before the registry declares or spawns anything.
+/// registration, before the registry declares or spawns anything. The topic
+/// does not exist on the mock cluster, so a refusal that came after the broker
+/// was asked for the topic would read as a missing topic.
 #[tokio::test]
 async fn an_out_of_range_setting_is_refused_before_a_consumer_is_created() {
-    let mock = Mock::start().with_topics(&[DIRECT_TOPIC]);
+    let mock = Mock::start();
     let bootstrap = mock.bootstrap();
 
     let err = tokio::time::timeout(

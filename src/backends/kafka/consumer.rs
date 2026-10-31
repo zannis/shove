@@ -16637,7 +16637,8 @@ mod consumer_config_tests {
 
 /// A fetch queue setting outside librdkafka's range is refused where each
 /// consume path starts, before any broker request: the broker the client
-/// points at is never listening.
+/// points at is never listening. The topologies are external, because an owned
+/// one makes no startup request and a refusal after startup would pass too.
 #[cfg(test)]
 mod fetch_queue_guard_tests {
     use super::*;
@@ -16657,7 +16658,11 @@ mod fetch_queue_guard_tests {
         type Codec = crate::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
-            TOPOLOGY.get_or_init(|| TopologyBuilder::new("fetch-queue-guard-plain").build())
+            TOPOLOGY.get_or_init(|| {
+                TopologyBuilder::new("fetch-queue-guard-plain")
+                    .external()
+                    .build()
+            })
         }
     }
     impl NotSequenced for Plain {}
@@ -16668,7 +16673,12 @@ mod fetch_queue_guard_tests {
         type Codec = crate::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
-            TOPOLOGY.get_or_init(|| TopologyBuilder::new("fetch-queue-guard-dlq").dlq().build())
+            TOPOLOGY.get_or_init(|| {
+                TopologyBuilder::new("fetch-queue-guard-dlq")
+                    .external()
+                    .dlq()
+                    .build()
+            })
         }
     }
 
