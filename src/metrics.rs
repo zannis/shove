@@ -464,19 +464,20 @@ pub(crate) fn record_discarded(_: &str, _: Option<&str>, _: FailReason) {}
 /// - **Not every terminal outcome is a discard.** SNS/SQS deliberately never
 ///   calls this: its reject path deletes nothing, it makes the message visible
 ///   again for AWS-side redrive. See `backends::sns::router::route_reject`.
-/// - **Not every failed dead letter is a discard.** On Kafka's concurrent and
-///   sequenced consumers a dead letter that fails and may land later retires
-///   nothing. No commit passes the record: the concurrent consumer reconnects
-///   and is handed it again, the sequenced one keeps it and tries the publish
-///   again, and the pending discard settles as survived. One that fails with
-///   an error no retry gets past, such as a producer that cannot be built,
-///   retires nothing either: the member ends with that error, and no discard
-///   is counted for the record. The one dead letter there whose failure is a
+/// - **Not every failed dead letter is a discard.** On Kafka's concurrent,
+///   sequenced and batch consumers a dead letter that fails and may land
+///   later retires nothing. No commit passes the record: the concurrent
+///   consumer reconnects and is handed it again, the sequenced one keeps it
+///   and tries the publish again, the batch consumer seeks the record's
+///   partition back to it and is handed the batch again from there, and the
+///   pending discard settles as survived. One that fails with an error no
+///   retry gets past, such as a producer that cannot be built, retires
+///   nothing either: the member ends with that error, and no discard is
+///   counted for the record. The one dead letter there whose failure is a
 ///   discard is one that can never be published, refused by the producer or
 ///   the broker as too large or as invalid: the record is retired as lost and
 ///   counted, under `FailReason::RepublishFailed` when its `Retry` or `Defer`
-///   copy could not be published before it. Kafka's batch consumer still
-///   retires a record whose dead letter failed, and counts it as lost.
+///   copy could not be published before it.
 /// - **Not every failure is terminal.** Two reasons `record_failed` counts
 ///   never reach this function on their own. `FailReason::SchemaUnavailable`:
 ///   the consumer keeps the record and retries the lookup, so there is
