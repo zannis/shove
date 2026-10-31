@@ -804,6 +804,7 @@ Once its dead letters have landed the batch is settled, so its position is re-of
 The consumer keeps polling meanwhile, so a rebalance behind the rejection can complete.
 
 A rejected batch's dead letters, and the records dropped before the handler, are published concurrently, at most 16 at a time.
+Running concurrently, a partition's dead letters do not reach the DLQ in offset order.
 The consumer keeps polling while they run, so a DLQ that answers slowly does not have it evicted at `max.poll.interval.ms`.
 A stop that lands meanwhile waits for them.
 A dead letter that fails and may land later retires nothing: nothing is committed past its record, and the record's partition is sought back to it.
@@ -811,11 +812,14 @@ The batch is handed over again from there after the delay a `Retry` waits, 1 s d
 The dead letters behind it on its partition are not tried, and the ones already published are published again with the redelivery.
 A dead letter that can never be published, one past the producer's `message.max.bytes` or one the broker refuses as too large or as invalid, is discarded and committed past, an error is logged, and `messages_discarded_total` counts it.
 A failure no retry gets past, such as a producer that cannot be built, commits nothing of the batch and ends the consumer with that error.
+Dead letters are at-least-once.
+A rebalance while they run, a dead letter that fails, and a refused commit whose re-offer has not landed when the partition moves can each hand the batch over again, and its letters that had landed are then published again.
 
 Every flush reads the group's rebalance events first, the one the batch's age or a stop triggers included.
 A rebalance that moves a partition the batch spans abandons the batch uncommitted, and the partitions the consumer keeps are sought back to the batch's start.
 The record the consumer holds when it learns of the rebalance is dropped when its partition was sought back, because the broker delivers it again behind the rewound records.
-Every record of the abandoned batch then reaches a handler once, in offset order: this consumer's for the partitions it keeps, the new owner's for the ones it lost.
+Every record of the abandoned batch is then handed over again, in offset order and none skipped: to this consumer for the partitions it keeps, to the new owner for the ones it lost.
+A batch abandoned while its dead letters were landing was handed to the handler already, so its records reach a handler twice.
 A seek that fails on a partition the consumer still holds reconnects it, and one that fails on a partition the group revoked in the same poll is left to that partition's next owner.
 
 A stop flushes the batch in hand first, and that flush is not inside the shutdown deadline: it waits for the handler and for the batch's dead letters.
