@@ -11378,7 +11378,7 @@ impl KafkaConsumer {
             async move {
                 // A groupless consumer never joins, so the rebalance callbacks
                 // wired into the shared context never fire; the receiver is
-                // dropped deliberately, as in the DLQ loop.
+                // dropped deliberately.
                 let (rebalance_tx, _) = std_mpsc::channel::<RebalanceEvent>();
                 // Closed on a thread of its own on every exit, and waited
                 // for, see `close_without_commit`; a failed assign included.
