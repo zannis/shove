@@ -4,6 +4,7 @@ mod client;
 mod constants;
 mod consumer;
 mod consumer_group;
+mod fetch_queue;
 #[cfg(feature = "kafka-msk-iam")]
 mod msk_iam;
 mod offset_reset;
@@ -27,12 +28,20 @@ pub use consumer::client_id_probe;
 pub use consumer::completion_probe;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
+pub use consumer::fetch_queue_probe;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
 pub use consumer::permit_wait_probe;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use consumer::put_back_probe;
 pub use consumer::{BatchConsumerOptions, KafkaConsumer};
 pub(crate) use consumer_group::validate_commit_policy;
+pub(crate) use fetch_queue::FetchQueueTuning;
+#[cfg(feature = "env-config")]
+pub(crate) use fetch_queue::{
+    FETCH_QUEUE_BACKOFF_MS_RANGE, QUEUED_MAX_MESSAGES_KBYTES_RANGE, QUEUED_MIN_MESSAGES_RANGE,
+};
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use startup::startup_probe;
