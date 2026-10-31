@@ -385,7 +385,7 @@ It then waits up to 20 s for the final commit and the close, so with the default
 
 `handle_dead` runs on the drain's own task, one dead letter at a time, under panic isolation and the handler timeout.
 The timeout is `with_handler_timeout`, 30 s by default.
-`without_handler_timeout` leaves the call unbounded, so a call that never returns holds the drain and its partition for as long as it runs.
+`without_handler_timeout` leaves the call unbounded, so a call that never returns holds the drain for as long as it runs.
 Nothing polls while `handle_dead` runs, so the call must finish inside `max.poll.interval.ms`, five minutes.
 Keep `with_handler_timeout` below that.
 A call that panics or outlasts the timeout is logged at warn level, and the drain goes on to the next dead letter.

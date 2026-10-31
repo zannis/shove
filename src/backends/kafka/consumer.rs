@@ -7417,6 +7417,9 @@ struct SerialConnection<'a> {
     label: &'static str,
     /// The context of the error a refused subscribe ends on.
     subscribe_failed: &'static str,
+    /// The dead-letter topic a drain reads, logged under `dlq`; `None` for a
+    /// sequenced consumer.
+    dlq: Option<&'a str>,
 }
 
 /// One connection of a [`SerialLoop`]: subscribe and consume until a stop
@@ -7508,7 +7511,7 @@ async fn receive_serially<L: SerialLoop>(
             // wait is read before the next record is taken.
             biased;
             _ = connection.shutdown.cancelled() => {
-                tracing::info!(queue, "shutdown signal received, stopping {label}");
+                tracing::info!(queue, dlq = connection.dlq, "shutdown signal received, stopping {label}");
                 return Ok(None);
             }
             _ = housekeeping.tick() => {}
@@ -7528,7 +7531,7 @@ async fn receive_serially<L: SerialLoop>(
                         continue;
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, queue, "{label} recv error");
+                        tracing::error!(error = %e, queue, dlq = connection.dlq, "{label} recv error");
                         return Err(map_kafka_error(
                             &format!("{label} recv error on {queue}"),
                             e,
@@ -7557,6 +7560,7 @@ impl<T: Topic, H: MessageHandler<T>> SerialLoop for FifoLoop<T, H> {
             shutdown: &self.shutdown,
             label: "FIFO consumer",
             subscribe_failed: "failed to subscribe",
+            dlq: None,
         }
     }
 
@@ -8016,6 +8020,7 @@ impl<T: Topic, H: MessageHandler<T>> SerialLoop for DlqDrain<T, H> {
             shutdown: &self.shutdown,
             label: "DLQ consumer",
             subscribe_failed: "failed to subscribe to DLQ",
+            dlq: Some(self.dlq),
         }
     }
 
@@ -9603,7 +9608,7 @@ impl KafkaConsumer {
     /// kill offset commits, rebalance handling and shutdown along with it.
     ///
     /// A flush that outruns `options.handler_timeout` (default
-    /// [`DEFAULT_HANDLER_TIMEOUT`], 30 s) resolves to `Retry` too, but that is
+    /// [`DEFAULT_HANDLER_TIMEOUT`](crate::DEFAULT_HANDLER_TIMEOUT), 30 s) resolves to `Retry` too, but that is
     /// a *default*, not a rule:
     /// [`BatchConsumerOptions::with_handler_timeout_outcome`] can make it any
     /// `Outcome`, and `Ack`/`Reject` commit or dead-letter the entire batch
