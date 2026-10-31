@@ -5281,10 +5281,12 @@ impl<T: Topic<Message = Order>> MessageHandler<T> for StopsAt {
 /// one pass: the record the member holds completes, nothing behind it
 /// reaches the handler, and the final commit carries the position past the
 /// last record handled. On one permit the next record waits for the one the
-/// stopping handler holds, and the stop is read before that permit. Every
-/// record the loop takes waits for its permit, so the records that entered
-/// that wait count what the loop took: at most one past the stop, where a
-/// loop that read the stop late would take the backlog.
+/// stopping handler holds, and the stop is read before that permit. The
+/// handler acks at once, so no wait runs long enough to pause the assignment
+/// and leave a spare permit, which would let a record skip the wait. The
+/// records that entered the wait then count what the loop took: at most one
+/// past the stop, where a loop that read the stop late would take the
+/// backlog.
 #[tokio::test]
 async fn a_stop_under_a_backlog_hands_out_nothing_behind_the_record_in_hand() {
     let mock = Mock::start();
@@ -5459,7 +5461,8 @@ async fn after_an_idle_spell_a_gated_commit_lands_when_its_window_ends() {
 }
 
 /// The same on a sequenced consumer, which commits on its fixed default
-/// interval.
+/// interval. That window is shorter than `GATE_SLACK`, so the gap's lower
+/// bound can never fail here, and the wake count is what pins the behaviour.
 #[tokio::test]
 async fn after_an_idle_spell_a_sequenced_gated_commit_lands_when_its_window_ends() {
     let (mock, bootstrap) = sequenced_mock(&["o1"]).await;
