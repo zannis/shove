@@ -55,9 +55,14 @@
 //! only permit past the poll interval, whose drain keeps polling through a
 //! rebalance.
 //!
-//! The final section stops a standard and a sequenced member while a backlog
-//! is queued behind the record in hand, and times the commit the gate holds
+//! A section stops a standard and a sequenced member while a backlog is
+//! queued behind the record in hand, and times the commit the gate holds
 //! back once a member has sat idle, on both.
+//!
+//! The final section runs a broadcast subscription against the same mock:
+//! whether it stops or ends on an error, it closes its consumer on a thread
+//! of its own, and with no thread to be had the handle is leaked rather than
+//! closed on the runtime thread.
 //!
 //! `test-support` gates the seams this file reads. The Kafka coverage row
 //! enables it and runs this suite; the schema-registry row compiles the
@@ -87,6 +92,7 @@ use rdkafka::producer::{
 use rdkafka::types::{RDKafkaApiKey, RDKafkaMockCluster, RDKafkaRespErr};
 use rdkafka::{ClientConfig, Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
+use shove::broadcast::BroadcastSubscriber;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
 use shove::consumer_group::ConsumerGroupConfig;
@@ -5502,4 +5508,134 @@ async fn after_an_idle_spell_a_sequenced_gated_commit_lands_when_its_window_ends
     run.await
         .expect("the run task completes")
         .expect("a clean stop");
+}
+
+// ---------------------------------------------------------------------------
+// A broadcast subscription's consumer, closed off the runtime thread
+// ---------------------------------------------------------------------------
+
+const BROADCAST_TOPIC: &str = "kafka-commit-policy-mock-broadcast";
+/// How long a broadcast subscription's teardown may take before the test
+/// gives up on it.
+const BROADCAST_DRAIN: Duration = Duration::from_secs(30);
+
+shove::define_topic!(
+    BroadcastOrders,
+    Order,
+    TopologyBuilder::new(BROADCAST_TOPIC).broadcast().build()
+);
+
+/// One mock broker with the broadcast topic created, and a subscriber on a
+/// client of its own, subscribed with `options` and `handler`, which has
+/// handled a record: the subscription starts at the tail, so records are
+/// produced until one arrives. Requests are tracked from before the
+/// subscription starts.
+async fn live_broadcast_subscription(
+    handler: &Recorder,
+    options: ConsumerOptions<Kafka>,
+) -> (Mock, BroadcastSubscriber<Kafka>) {
+    let mock = Mock::start();
+    mock.api()
+        .create_topic(BROADCAST_TOPIC, 1, 1)
+        .expect("create the topic through the mock API");
+    mock.track_requests();
+    let bootstrap = mock.bootstrap();
+    let broker = Broker::<Kafka>::from_client(connect(&bootstrap).await);
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<BroadcastOrders, _>(handler.clone(), options)
+        .expect("subscribe on the mock cluster");
+    let deadline = Instant::now() + DELIVERY_TIMEOUT;
+    while handler.count() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no record reached the subscription within {DELIVERY_TIMEOUT:?}"
+        );
+        produce_on(&bootstrap, BROADCAST_TOPIC, &["b"]).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    (mock, subscriber)
+}
+
+/// The consumer of a subscription that has ended goes on fetching: it was
+/// neither closed nor dropped, so its handle was leaked. A consumer closed
+/// when its loop ended sends no request once the loop is gone.
+async fn assert_the_consumer_was_leaked(mock: &Mock) {
+    let fetches = mock.requests_of(RDKafkaApiKey::Fetch);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let later = mock.requests_of(RDKafkaApiKey::Fetch);
+    assert!(
+        later > fetches,
+        "the consumer stopped fetching when its loop ended, so it was closed there, on the \
+         runtime thread: {fetches} fetches then, {later} two seconds later"
+    );
+}
+
+/// A broadcast subscription that stops closes its consumer on a thread of
+/// its own, as every other consume loop does, and never on the runtime
+/// thread. With no thread to be had for the close, the handle is leaked
+/// rather than closed where the loop ran, so the consumer goes on fetching
+/// after the subscription has ended cleanly.
+#[tokio::test]
+async fn a_stopped_broadcast_subscription_never_closes_its_consumer_on_the_runtime_thread() {
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let (mock, subscriber) =
+        live_broadcast_subscription(&handler, ConsumerOptions::<Kafka>::new()).await;
+
+    final_commit_spawn_probe::refuse_threads(true);
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending(), BROADCAST_DRAIN)
+        .await;
+    assert_eq!(
+        (outcome.errors, outcome.panics, outcome.timed_out),
+        (0, 0, false),
+        "the stop ends the subscription cleanly: {outcome:?}"
+    );
+    assert_the_consumer_was_leaked(&mock).await;
+}
+
+/// The same on an error exit. The next fetch is answered with an unknown
+/// broker error, which ends the subscription's connection, and its one
+/// reconnect attempt is spent at once, so the subscription ends with the
+/// error. With no thread to be had for the close, the handle is leaked
+/// rather than closed where the loop ran. librdkafka backs the partition off
+/// for `fetch.error.backoff.ms`, 500 ms, after that error, well inside the
+/// window the leak is read in; a refused authorization would back it off for
+/// 5 s.
+#[tokio::test]
+async fn a_broadcast_subscription_ending_on_an_error_never_closes_its_consumer_on_the_runtime_thread()
+ {
+    let handler = Recorder::new(|_, _| Outcome::Ack);
+    let (mock, subscriber) = live_broadcast_subscription(
+        &handler,
+        ConsumerOptions::<Kafka>::new().with_max_reconnect_attempts(1),
+    )
+    .await;
+
+    final_commit_spawn_probe::refuse_threads(true);
+    let fetches = mock.requests_of(RDKafkaApiKey::Fetch);
+    mock.api().request_errors(
+        RDKafkaApiKey::Fetch,
+        &[RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN],
+    );
+    wait_until(
+        || mock.requests_of(RDKafkaApiKey::Fetch) > fetches,
+        DELIVERY_TIMEOUT,
+        "the failed fetch reaching the broker",
+    )
+    .await;
+    // The error reaches the loop with the fetch's answer; the exit follows.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending(), BROADCAST_DRAIN)
+        .await;
+    assert_eq!(
+        (outcome.errors, outcome.panics, outcome.timed_out),
+        (1, 0, false),
+        "the failed fetch ended the subscription with its error: {outcome:?}"
+    );
+    assert_the_consumer_was_leaked(&mock).await;
 }
