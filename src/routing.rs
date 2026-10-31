@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::Outcome;
-use crate::topology::SequenceFailure;
+use crate::topology::{HoldQueue, SequenceFailure};
 
 /// The hold-queue tier for `retry_count`, clamped to the last of
 /// `hold_queue_count` tiers, or `None` on a topology without hold queues.
@@ -14,6 +14,21 @@ use crate::topology::SequenceFailure;
 pub(crate) fn hold_index(retry_count: u32, hold_queue_count: usize) -> Option<usize> {
     let last = hold_queue_count.checked_sub(1)?;
     Some(usize::try_from(retry_count).map_or(last, |tier| tier.min(last)))
+}
+
+/// The hold a backend waits out before it hands a message back on a topology
+/// without hold queues.
+#[allow(dead_code)] // only NATS calls `hold_delay` so far
+const NO_HOLD_QUEUE_DELAY: Duration = Duration::from_secs(1);
+
+/// The delay of the hold tier for `retry_count`: the tier [`hold_index`]
+/// picks, or [`NO_HOLD_QUEUE_DELAY`] on a topology without hold queues. A
+/// `Defer` holds for tier 0's delay, so it passes 0.
+#[allow(dead_code)] // only NATS calls it so far
+pub(crate) fn hold_delay(hold_queues: &[HoldQueue], retry_count: u32) -> Duration {
+    hold_index(retry_count, hold_queues.len())
+        .and_then(|tier| hold_queues.get(tier))
+        .map_or(NO_HOLD_QUEUE_DELAY, HoldQueue::delay)
 }
 
 /// The backend-agnostic decision for what to do with a message after the
@@ -222,6 +237,56 @@ mod tests {
     fn hold_index_keeps_a_count_below_the_tier_count() {
         assert_eq!(hold_index(0, usize::MAX), Some(0));
         assert_eq!(hold_index(7, usize::MAX), Some(7));
+    }
+
+    fn ladder(delays_ms: &[u64]) -> Vec<HoldQueue> {
+        delays_ms
+            .iter()
+            .map(|&ms| HoldQueue {
+                name: format!("hold-{ms}ms"),
+                delay: Duration::from_millis(ms),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_retry_holds_for_its_tier_and_the_last_tier_repeats() {
+        let hold_queues = ladder(&[100, 200, 400]);
+        let delays: Vec<Duration> = [0, 1, 2, 3, 50]
+            .into_iter()
+            .map(|count| hold_delay(&hold_queues, count))
+            .collect();
+        assert_eq!(delays, [100, 200, 400, 400, 400].map(Duration::from_millis));
+    }
+
+    #[test]
+    fn hold_delay_holds_for_the_tier_hold_index_picks() {
+        for tiers in 1..=3usize {
+            let hold_queues = ladder(&[100, 200, 400][..tiers]);
+            for count in 0..6u32 {
+                let tier = hold_index(count, tiers).expect("a ladder with tiers has a tier");
+                assert_eq!(
+                    hold_delay(&hold_queues, count),
+                    hold_queues[tier].delay(),
+                    "{tiers} tiers, count {count}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_count_from_a_hostile_header_holds_for_the_last_tier() {
+        let hold_queues = ladder(&[100, 200]);
+        assert_eq!(
+            hold_delay(&hold_queues, u32::MAX),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn no_hold_queues_hold_for_a_second() {
+        assert_eq!(hold_delay(&[], 0), Duration::from_secs(1));
+        assert_eq!(hold_delay(&[], u32::MAX), Duration::from_secs(1));
     }
 
     #[test]

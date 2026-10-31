@@ -13,7 +13,8 @@ use tracing::{debug, info, warn};
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::nats::client::NatsClient;
-use crate::backends::nats::consumer::{NatsConsumer, derive_ack_wait};
+use crate::backends::nats::constants::UNBOUNDED_ACK_PENDING;
+use crate::backends::nats::consumer::{NatsConsumer, abort_on_drop, derive_ack_wait};
 use crate::backends::nats::topology::NatsTopologyDeclarer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_group::reject_fifo_concurrency;
@@ -46,9 +47,17 @@ fn harvest_if_finished(
         && !e.is_cancelled()
     {
         tracing::error!(error = %e, group = %queue, "finished consumer task had panicked");
-        panic_count.fetch_add(1, Ordering::Relaxed);
+        count_one(panic_count);
     }
     true
+}
+
+/// Counts one more occurrence, saturating at the top.
+fn count_one(counter: &AtomicUsize) {
+    // The closure always answers `Some`, so the update cannot fail.
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_add(1))
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +115,14 @@ impl NatsConsumerGroupConfig {
         }
     }
 
+    /// Set how many messages each member handles at once with
+    /// `concurrent_processing(true)`; a sequential member handles one. A
+    /// member pulls no more messages than it can start, so this is also the
+    /// most it has delivered and un-acked, apart from retries held for their
+    /// delay, which are bounded at the same count on their own. Zero is
+    /// accepted for configuration compatibility and lowered to `1`, as
+    /// [`ConsumerOptions::with_prefetch_count`](crate::ConsumerOptions::with_prefetch_count)
+    /// does.
     pub fn with_prefetch_count(mut self, prefetch_count: u16) -> Self {
         self.prefetch_count = prefetch_count;
         self
@@ -126,12 +143,14 @@ impl NatsConsumerGroupConfig {
         self
     }
 
-    /// Override the aggregate JetStream `max_ack_pending` budget for the
-    /// group's durable consumer, instead of deriving it from
-    /// `prefetch_count × max_consumers` (or `max_consumers` in sequential
-    /// mode). Set this consistently with any external tuning of prefetch —
-    /// a value smaller than the group's live concurrency starves consumers
-    /// of ack slots.
+    /// Cap the JetStream `max_ack_pending` of the group's durable consumer.
+    ///
+    /// Unset, the durable is created unbounded (`-1`): each member already
+    /// bounds its own in-flight messages at its prefetch, so the group can
+    /// hold `prefetch_count × consumers` with concurrent processing on and
+    /// one per member without. A cap is shared by every member attached to
+    /// the durable, in every process, and a value below their combined
+    /// concurrency leaves members waiting for ack slots.
     ///
     /// Pass `-1` for an unbounded budget.
     ///
@@ -250,7 +269,7 @@ impl NatsConsumerGroup {
         H: MessageHandler<T> + 'static,
     {
         let concurrent = config.concurrent_processing;
-        let max_ack_pending = aggregate_max_ack_pending(&config);
+        let max_ack_pending = durable_max_ack_pending(&config);
         let error_count = Arc::new(AtomicUsize::new(0));
         let ec_for_spawner = error_count.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
@@ -271,7 +290,7 @@ impl NatsConsumerGroup {
             tokio::spawn(async move {
                 let result = consumer.run_with_inner::<T, H>(handler, ctx, options).await;
                 if let Err(e) = result {
-                    ec.fetch_add(1, Ordering::Relaxed);
+                    count_one(&ec);
                     tracing::error!("consumer task exited with error: {e}");
                 }
             })
@@ -279,7 +298,7 @@ impl NatsConsumerGroup {
 
         Self {
             queue: queue.into(),
-            consumers: Vec::with_capacity(config.max_consumers as usize),
+            consumers: Vec::with_capacity(usize::from(config.max_consumers)),
             config,
             spawner,
             group_token,
@@ -329,21 +348,22 @@ impl NatsConsumerGroup {
                 {
                     Ok(h) => h,
                     Err(e) => {
-                        ec.fetch_add(1, Ordering::Relaxed);
+                        count_one(&ec);
                         tracing::error!("FIFO registration failed: {e}");
                         return;
                     }
                 };
+                let _shards = abort_on_drop(&handles);
                 for handle in handles {
                     match handle.await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
-                            ec.fetch_add(1, Ordering::Relaxed);
+                            count_one(&ec);
                             tracing::error!("sequenced shard exited with error: {e}");
                         }
                         Err(e) if e.is_cancelled() => {}
                         Err(e) => {
-                            pc.fetch_add(1, Ordering::Relaxed);
+                            count_one(&pc);
                             tracing::error!("sequenced shard panicked: {e}");
                         }
                     }
@@ -533,8 +553,8 @@ impl NatsConsumerGroup {
         );
         self.group_token.cancel();
 
-        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
-        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+        tally.add_errors(self.error_count.swap(0, Ordering::Relaxed));
+        tally.add_panics(self.panic_count.swap(0, Ordering::Relaxed));
 
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
             let _abort_guard = AbortOnDrop(handle.abort_handle());
@@ -543,7 +563,7 @@ impl NatsConsumerGroup {
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
-                    tally.panics += 1;
+                    tally.add_panics(1);
                 }
             }
         }
@@ -555,13 +575,13 @@ impl NatsConsumerGroup {
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "retired consumer task panicked");
-                    tally.panics += 1;
+                    tally.add_panics(1);
                 }
             }
         }
 
-        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
-        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+        tally.add_errors(self.error_count.swap(0, Ordering::Relaxed));
+        tally.add_panics(self.panic_count.swap(0, Ordering::Relaxed));
     }
 
     /// Abort every surviving consumer handle and tally the result.
@@ -588,7 +608,7 @@ impl NatsConsumerGroup {
                         group = %self.queue,
                         "consumer task panicked during abort escalation"
                     );
-                    tally.panics += 1;
+                    tally.add_panics(1);
                 }
             }
         }
@@ -598,12 +618,12 @@ impl NatsConsumerGroup {
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "retired consumer task panicked");
-                    tally.panics += 1;
+                    tally.add_panics(1);
                 }
             }
         }
-        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
-        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+        tally.add_errors(self.error_count.swap(0, Ordering::Relaxed));
+        tally.add_panics(self.panic_count.swap(0, Ordering::Relaxed));
     }
 
     fn spawn_one(&mut self) {
@@ -611,7 +631,7 @@ impl NatsConsumerGroup {
         let processing = Arc::new(AtomicBool::new(false));
         let mut options = ConsumerOptions::defaults_with_shutdown(child_token.clone());
         options.max_retries = self.config.max_retries;
-        options.prefetch_count = self.config.prefetch_count;
+        options.prefetch_count = self.config.prefetch_count.max(1);
         options.processing = processing.clone();
         options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
         options.handler_timeout_outcome = self.config.handler_timeout_outcome.clone();
@@ -622,7 +642,11 @@ impl NatsConsumerGroup {
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         // Raw vec position of the new entry, not a liveness count.
-        debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");
+        debug!(
+            group = %self.queue,
+            consumer_index = self.consumers.len().saturating_sub(1),
+            "spawned consumer"
+        );
     }
 }
 
@@ -715,15 +739,14 @@ impl NatsConsumerGroupRegistry {
         let declarer = NatsTopologyDeclarer::new(client.clone());
         declarer.declare(topology).await?;
 
-        // Pre-establish the durable pull consumer with the aggregate
-        // ack budget — eliminates N-way `CONSUMER.CREATE` storms on
-        // reconnect (one per consumer task). Per-consumer code now
-        // uses `get_consumer` (read-only) to attach.
+        // Pre-establish the durable pull consumer once — eliminates N-way
+        // `CONSUMER.CREATE` storms on reconnect (one per consumer task).
+        // Per-consumer code uses `get_consumer` (read-only) to attach.
         //
         // `config.handler_timeout` was folded to `Set(resolved)` above, so
         // this resolves to exactly the effective timeout the group's
         // consumers will enforce.
-        let max_ack_pending = aggregate_max_ack_pending(&config);
+        let max_ack_pending = durable_max_ack_pending(&config);
         let ack_wait = derive_ack_wait(resolve_handler_timeout(config.handler_timeout, None));
         let consumer_name = super::constants::consumer_name(topology.queue());
         let filter_subjects = topology.nats_stream_subjects().unwrap_or(&[]);
@@ -876,24 +899,18 @@ impl NatsConsumerGroupRegistry {
     }
 }
 
-/// Aggregate `max_ack_pending` budget for a consumer-group config.
+/// The `max_ack_pending` of a group's durable consumer: the budget
+/// [`with_max_ack_pending`](NatsConsumerGroupConfig::with_max_ack_pending)
+/// set, or unbounded (`-1`).
 ///
-/// In concurrent mode every consumer holds up to `prefetch_count` messages
-/// in flight, so the group as a whole can have `prefetch_count × max_consumers`
-/// pending acks. In sequential mode each consumer holds at most 1, so the
-/// budget is `max_consumers`. Used both by the topology declarer (to size
-/// the durable JetStream consumer once) and by `NatsConsumerGroup::new` (to
-/// communicate the same value to spawned consumer tasks, even though they
-/// only `get_consumer` now and don't re-write the config).
-pub(crate) fn aggregate_max_ack_pending(config: &NatsConsumerGroupConfig) -> i64 {
-    if let Some(n) = config.max_ack_pending {
-        return n;
-    }
-    if config.concurrent_processing {
-        config.prefetch_count as i64 * config.max_consumers as i64
-    } else {
-        config.max_consumers as i64
-    }
+/// Every member bounds its own in-flight messages at its prefetch, so the
+/// durable needs no budget of its own, and a finite one would be shared by
+/// every member of every process attached to it. Used both by the topology
+/// declarer (to create the durable once) and by `NatsConsumerGroup::new` (to
+/// hand the same value to spawned consumer tasks, which only `get_consumer`
+/// and create the durable themselves only when it has gone missing).
+pub(crate) fn durable_max_ack_pending(config: &NatsConsumerGroupConfig) -> i64 {
+    config.max_ack_pending.unwrap_or(UNBOUNDED_ACK_PENDING)
 }
 
 // ---------------------------------------------------------------------------
@@ -903,6 +920,7 @@ pub(crate) fn aggregate_max_ack_pending(config: &NatsConsumerGroupConfig) -> i64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::RegistryImpl;
     use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
     use crate::supervision::{
         RESPAWN_BACKOFF_MAX, RESPAWN_CIRCUIT_COOLDOWN, RESPAWN_CIRCUIT_LIMIT,
@@ -1052,6 +1070,32 @@ mod tests {
 
     fn default_config() -> NatsConsumerGroupConfig {
         NatsConsumerGroupConfig::new(1..=4)
+    }
+
+    #[test]
+    fn a_counter_saturates_at_the_top() {
+        let counter = AtomicUsize::new(usize::MAX - 1);
+        count_one(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+        count_one(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn a_harvested_panic_saturates_the_panic_count() {
+        let mut handle: JoinHandle<()> =
+            tokio::spawn(async { panic!("the consumer task panics on purpose") });
+        for _ in 0..200 {
+            if handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let panics = AtomicUsize::new(usize::MAX);
+
+        assert!(harvest_if_finished(&mut handle, &panics, "test-queue"));
+
+        assert_eq!(panics.load(Ordering::Relaxed), usize::MAX);
     }
 
     // -- start --
@@ -1386,6 +1430,113 @@ mod tests {
         assert_eq!(tally.panics, 1);
     }
 
+    // -- saturation --
+
+    fn saturated_tally() -> ShutdownTally {
+        ShutdownTally {
+            errors: usize::MAX,
+            panics: usize::MAX,
+        }
+    }
+
+    /// Waits until every retiring consumer task has finished.
+    async fn wait_retiring_finished(group: &NatsConsumerGroup) {
+        for _ in 0..200 {
+            if group.retiring.iter().all(JoinHandle::is_finished) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("a retiring consumer task did not finish within the wait budget");
+    }
+
+    #[tokio::test]
+    async fn a_drain_leaves_a_saturated_tally_saturated() {
+        // Every addition the drain makes has a positive amount to add.
+        let errors = Arc::new(AtomicUsize::new(0));
+        let panics = Arc::new(AtomicUsize::new(0));
+        let (ec, pc) = (errors.clone(), panics.clone());
+        let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+            let (ec, pc) = (ec.clone(), pc.clone());
+            tokio::spawn(async move {
+                options.shutdown.cancelled().await;
+                ec.fetch_add(1, Ordering::Relaxed);
+                pc.fetch_add(1, Ordering::Relaxed);
+                panic!("the consumer task panics on purpose");
+            })
+        });
+        let mut group = test_group_with_spawner(NatsConsumerGroupConfig::new(1..=1), spawner);
+        group.error_count = errors;
+        group.panic_count = panics;
+        group.start();
+        group.retiring.push(tokio::spawn(async {
+            panic!("the retiring task panics on purpose")
+        }));
+        wait_retiring_finished(&group).await;
+        group.error_count.store(1, Ordering::Relaxed);
+        group.panic_count.store(1, Ordering::Relaxed);
+        let mut tally = saturated_tally();
+
+        group.drain_into(&mut tally).await;
+
+        assert_eq!(tally.errors, usize::MAX);
+        assert_eq!(tally.panics, usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn an_abort_leaves_a_saturated_tally_saturated() {
+        let spawner: Spawner = Arc::new(|_options: ConsumerOptions| {
+            tokio::spawn(async { panic!("the consumer task panics on purpose") })
+        });
+        let mut group = test_group_with_spawner(NatsConsumerGroupConfig::new(1..=1), spawner);
+        group.start();
+        group.retiring.push(tokio::spawn(async {
+            panic!("the retiring task panics on purpose")
+        }));
+        wait_finished(&group, 0).await;
+        wait_retiring_finished(&group).await;
+        group.error_count.store(1, Ordering::Relaxed);
+        group.panic_count.store(1, Ordering::Relaxed);
+        let mut tally = saturated_tally();
+
+        group.abort_remaining_into(&mut tally).await;
+
+        assert_eq!(tally.errors, usize::MAX);
+        assert_eq!(tally.panics, usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn a_saturated_panic_count_still_reads_as_a_dirty_shutdown() {
+        // Both groups are saturated, and one harvests one more panic on top.
+        let panicking: Spawner = Arc::new(|_options: ConsumerOptions| {
+            tokio::spawn(async { panic!("the consumer task panics on purpose") })
+        });
+        let mut harvesting =
+            test_group_with_spawner(NatsConsumerGroupConfig::new(0..=2), panicking);
+        harvesting.panic_count.store(usize::MAX, Ordering::Relaxed);
+        harvesting.error_count.store(usize::MAX, Ordering::Relaxed);
+        assert!(harvesting.scale_up());
+        wait_finished(&harvesting, 0).await;
+        assert!(harvesting.scale_up());
+        let other = test_group(default_config());
+        other.panic_count.store(usize::MAX, Ordering::Relaxed);
+        other.error_count.store(usize::MAX, Ordering::Relaxed);
+        let registry = NatsConsumerGroupRegistry::from_groups(HashMap::from([
+            ("harvesting".to_string(), harvesting),
+            ("other".to_string(), other),
+        ]));
+
+        let outcome = registry.drain_until_timeout(Duration::from_secs(5)).await;
+
+        assert_eq!(outcome.panics, usize::MAX);
+        assert_eq!(outcome.errors, usize::MAX);
+        assert!(
+            !outcome.is_clean(),
+            "a saturated count never wraps to clean"
+        );
+        assert_eq!(outcome.exit_code(), 2);
+    }
+
     // -- accessors --
 
     #[test]
@@ -1423,24 +1574,31 @@ mod tests {
     }
 
     #[test]
-    fn with_max_ack_pending_overrides_aggregate() {
+    fn with_max_ack_pending_caps_the_durable() {
         let config = NatsConsumerGroupConfig::new(1..=4)
             .with_concurrent_processing(true)
             .with_prefetch_count(10)
             .with_max_ack_pending(999);
         assert_eq!(config.max_ack_pending(), Some(999));
-        assert_eq!(aggregate_max_ack_pending(&config), 999);
+        assert_eq!(durable_max_ack_pending(&config), 999);
     }
 
+    /// Each member bounds its own in-flight messages, so a durable the group
+    /// creates has no budget of its own whatever the prefetch and mode.
     #[test]
-    fn aggregate_max_ack_pending_derives_when_unset() {
+    fn durable_max_ack_pending_is_unbounded_when_unset() {
         let sequential = NatsConsumerGroupConfig::new(1..=4);
-        assert_eq!(aggregate_max_ack_pending(&sequential), 4);
+        assert_eq!(durable_max_ack_pending(&sequential), -1);
 
         let concurrent = NatsConsumerGroupConfig::new(1..=4)
             .with_concurrent_processing(true)
             .with_prefetch_count(10);
-        assert_eq!(aggregate_max_ack_pending(&concurrent), 40);
+        assert_eq!(durable_max_ack_pending(&concurrent), -1);
+
+        let zero_prefetch = NatsConsumerGroupConfig::new(1..=4)
+            .with_concurrent_processing(true)
+            .with_prefetch_count(0);
+        assert_eq!(durable_max_ack_pending(&zero_prefetch), -1);
     }
 
     /// The config getter alone does not pin the fix: `spawn_one` has to copy
@@ -1459,6 +1617,26 @@ mod tests {
         let mut group = test_group_with_spawner(config, spawner);
         group.start();
         assert_eq!(*captured.lock().unwrap(), Some(Some(3)));
+        group.shutdown().await;
+    }
+
+    /// A zero prefetch reaches a member as one, the lowering
+    /// `ConsumerOptions::with_prefetch_count` documents.
+    #[tokio::test]
+    async fn spawn_one_lowers_a_zero_prefetch_to_one() {
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+            *cap.lock().unwrap() = Some(options.prefetch_count);
+            tokio::spawn(async move { options.shutdown.cancelled().await })
+        });
+        let config = NatsConsumerGroupConfig::new(1..=1)
+            .with_concurrent_processing(true)
+            .with_prefetch_count(0);
+        let mut group = test_group_with_spawner(config, spawner);
+        group.start();
+        assert_eq!(*captured.lock().unwrap(), Some(1));
         group.shutdown().await;
     }
 
@@ -1501,7 +1679,7 @@ mod tests {
     #[test]
     fn with_max_ack_pending_allows_unbounded_sentinel() {
         let config = NatsConsumerGroupConfig::new(1..=4).with_max_ack_pending(-1);
-        assert_eq!(aggregate_max_ack_pending(&config), -1);
+        assert_eq!(durable_max_ack_pending(&config), -1);
     }
 
     // -- handler timeout tri-state --

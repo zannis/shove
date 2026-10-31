@@ -222,8 +222,9 @@ pub struct ConsumerOptions<B: Backend> {
     ///
     /// [`ConsumerSupervisor`]: crate::consumer_supervisor::ConsumerSupervisor
     pub concurrent_processing: bool,
-    /// Maximum time a handler may spend processing a single message.
-    /// If the handler exceeds this duration the message is retried.
+    /// Maximum time a handler that yields may spend processing a single
+    /// message. See [`with_handler_timeout`](Self::with_handler_timeout) for
+    /// what happens to a handler that runs past it.
     ///
     /// Default: [`DEFAULT_HANDLER_TIMEOUT`] (30 s). Set to `None` to disable.
     pub handler_timeout: Option<Duration>,
@@ -311,9 +312,14 @@ pub struct ConsumerOptions<B: Backend> {
     #[cfg(feature = "aws-sns-sqs")]
     #[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
     pub receive_batch_size: u16,
-    /// Override for JetStream `max_ack_pending` on the durable consumer.
+    /// Cap for JetStream `max_ack_pending` on a durable consumer this consumer
+    /// creates.
     ///
-    /// `None` means use `prefetch_count` (the default for standalone consumers).
+    /// `None` (the default) creates the durable unbounded (`-1`). The cap is
+    /// not what bounds this consumer: it pulls no more messages than
+    /// `prefetch_count` lets it start. A durable is shared by every consumer
+    /// of the topic, in every process, so a cap set here bounds them all
+    /// together.
     #[cfg(feature = "nats")]
     #[cfg_attr(docsrs, doc(cfg(feature = "nats")))]
     pub max_ack_pending: Option<i64>,
@@ -496,8 +502,23 @@ impl<B: Backend> ConsumerOptions<B> {
         self
     }
 
-    /// Set the handler timeout. If a handler exceeds this duration the message
-    /// is retried automatically. Panics if `timeout` is zero.
+    /// Set the handler timeout. Panics if `timeout` is zero.
+    ///
+    /// The timeout bounds a handler that yields. Once it passes, the handler
+    /// is dropped at its next `.await` that yields, and the message is retried
+    /// automatically, or settled as
+    /// [`with_handler_timeout_outcome`](Self::with_handler_timeout_outcome)
+    /// chooses. A handler that holds its thread, with blocking work that never
+    /// yields, is not stopped by the timeout on any backend.
+    ///
+    /// Kafka, Redis Streams, the in-memory backend and NATS, apart from the
+    /// NATS and Redis broadcast subscribers, run the timer on the task that
+    /// polls the handler. A handler there that runs past the timeout and then
+    /// returns without yielding keeps the outcome it returned. RabbitMQ,
+    /// SNS/SQS and those two broadcast subscribers poll the handler in a task
+    /// of its own and run the timer beside it: on a multi-threaded runtime the
+    /// message settles as timed out once the timeout passes, and the handler
+    /// runs on until it yields or returns.
     ///
     /// On the Kafka DLQ drain (`KafkaConsumer::run_dlq`) the timeout bounds
     /// each `handle_dead` call. A dead letter whose call times out is
@@ -841,7 +862,11 @@ impl ConsumerOptions<Sqs> {
 #[cfg(feature = "nats")]
 #[cfg_attr(docsrs, doc(cfg(feature = "nats")))]
 impl ConsumerOptions<Nats> {
-    /// Override the durable consumer's `max_ack_pending`.
+    /// Cap the `max_ack_pending` of a durable consumer this consumer creates,
+    /// which is otherwise unbounded. See
+    /// [`max_ack_pending`](Self::max_ack_pending): the cap is shared by every
+    /// consumer attached to the durable, and applies only when this consumer
+    /// is the one that creates it.
     ///
     /// Pass `-1` for an unbounded budget.
     ///

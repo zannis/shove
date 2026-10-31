@@ -9,13 +9,13 @@
 //! `record_message_size` is placed on each backend's main consume path. The
 //! dedicated DLQ-drain loops are a second delivery path that call site does
 //! not cover: `NatsConsumer::run_dlq` in `src/backends/nats/consumer.rs` pulls
-//! from the DLQ stream and applies its own `DEFAULT_MAX_MESSAGE_SIZE` gate
-//! without touching the main loop, so it applied a size limit while never
-//! sampling the size. The same held for the Kafka, RabbitMQ and in-memory DLQ
-//! loops; each has its own `metrics_*_dlq_message_size` binary asserting the
-//! same rule.
+//! from the DLQ stream and applies its own `max_message_size` gate without
+//! touching the main loop, so it applied a size limit while never sampling
+//! the size. The same held for the Kafka, RabbitMQ and in-memory DLQ loops;
+//! each has its own `metrics_*_dlq_message_size` binary asserting the same
+//! rule.
 //!
-//! Three things are pinned here, and the third is the reason this is worth a
+//! Four things are pinned here, and the third is the reason this is worth a
 //! test rather than a code comment:
 //!
 //! 1. **A sample exists at all** for a message that only ever arrived through
@@ -32,6 +32,11 @@
 //!    summing across the main and DLQ paths. The main consumer here runs under
 //!    an explicit `consumer_group`, so its own sample lands on a separate
 //!    series and cannot be mistaken for the DLQ one.
+//! 4. **The drain records no handler-call series** under that topic and group:
+//!    no consumed, in-flight, duration or failed series. A dead letter was
+//!    already counted when the main path retired it, and Kafka, RabbitMQ,
+//!    in-memory and SNS drains call `handle_dead` without recording any of
+//!    them, so counting it again would inflate the topic's success ratio.
 //!
 //! Uses `metrics-util::debugging::DebuggingRecorder`, which takes the *global*
 //! recorder slot and whose `snapshot()` drains what it reads. Hence its own
@@ -278,6 +283,36 @@ fn size_series(snapshot: &Snapshot) -> Vec<String> {
     series
 }
 
+/// The families a handler call records, which a dead-letter drain must leave
+/// alone.
+const HANDLER_METRICS: [&str; 4] = [
+    "shove_messages_consumed_total",
+    "shove_messages_inflight",
+    "shove_message_processing_duration_seconds",
+    "shove_messages_failed_total",
+];
+
+/// Every [`HANDLER_METRICS`] series recorded for `topic` under `group`.
+fn handler_series(snapshot: &Snapshot, topic: &str, group: &str) -> Vec<String> {
+    let mut series: Vec<String> = snapshot
+        .iter()
+        .filter(|(k, _)| HANDLER_METRICS.contains(&k.key().name()))
+        .filter(|(k, _)| {
+            k.key()
+                .labels()
+                .any(|l| l.key() == "topic" && l.value() == topic)
+        })
+        .filter(|(k, _)| {
+            k.key()
+                .labels()
+                .any(|l| l.key() == "consumer_group" && l.value() == group)
+        })
+        .map(|(k, (_, _, value))| format!("{} => {value:?}", k.key().name()))
+        .collect();
+    series.sort();
+    series
+}
+
 /// The byte length the consumer should report for `msg` — the topic's own
 /// encoding, so the assertion survives a codec change.
 fn encoded_len<T: Topic>(msg: &T::Message) -> f64 {
@@ -389,5 +424,11 @@ async fn dlq_drain_records_message_size_under_the_source_topic() {
          name {DLQ}: the drain reports the source topic, so main-path and \
          DLQ-path sizes stay summable under one label; observed series: \
          {observed:?}"
+    );
+    assert_eq!(
+        handler_series(&snapshot, QUEUE, DLQ_GROUP),
+        Vec::<String>::new(),
+        "the drain must record no handler-call series under the source topic: \
+         the dead letter was counted when the main path retired it"
     );
 }

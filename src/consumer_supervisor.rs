@@ -57,11 +57,21 @@ pub(crate) struct ShutdownTally {
     pub panics: usize,
 }
 
+/// Every addition saturates, so a count at the top stays at the top and a dirty
+/// shutdown cannot wrap around to a clean one.
 #[allow(dead_code)]
 impl ShutdownTally {
+    pub(crate) fn add_errors(&mut self, n: usize) {
+        self.errors = self.errors.saturating_add(n);
+    }
+
+    pub(crate) fn add_panics(&mut self, n: usize) {
+        self.panics = self.panics.saturating_add(n);
+    }
+
     pub(crate) fn add(&mut self, other: ShutdownTally) {
-        self.errors += other.errors;
-        self.panics += other.panics;
+        self.add_errors(other.errors);
+        self.add_panics(other.panics);
     }
 }
 
@@ -79,6 +89,29 @@ impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// A token that fires when `first` or `second` does. It is a child of `first`,
+/// so a stop through `first` reaches it in the same step, and a task forwards
+/// `second` to it, at once when `second` has fired already. The guard ends that
+/// task, so hold it as long as the token is in use.
+#[allow(dead_code)] // only the Kafka and NATS DLQ drains call it
+pub(crate) fn cancelled_by_either(
+    first: &CancellationToken,
+    second: &CancellationToken,
+) -> (CancellationToken, AbortOnDrop) {
+    let merged = first.child_token();
+    if second.is_cancelled() {
+        merged.cancel();
+    }
+    let forward = tokio::spawn({
+        let (second, merged) = (second.clone(), merged.clone());
+        async move {
+            second.cancelled().await;
+            merged.cancel();
+        }
+    });
+    (merged, AbortOnDrop(forward.abort_handle()))
 }
 
 /// Map a `JoinSet::join_next` result onto running `errors` / `panics`
@@ -424,6 +457,58 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
     }
 }
 
+/// [`cancelled_by_either`]: the token the DLQ drains stop on.
+#[cfg(test)]
+mod either_token_tests {
+    use super::*;
+
+    async fn fires(token: &CancellationToken) -> bool {
+        tokio::time::timeout(Duration::from_secs(1), token.cancelled())
+            .await
+            .is_ok()
+    }
+
+    /// The first token reaches the merged one in the same step, so a stop
+    /// requested through it takes effect before anything else runs.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_token_fires_it_at_once() {
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        let (merged, _guard) = cancelled_by_either(&first, &second);
+        assert!(!fires(&merged).await, "nothing has fired yet");
+        first.cancel();
+        assert!(merged.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_second_token_fires_it_through_the_forwarder() {
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        let (merged, _guard) = cancelled_by_either(&first, &second);
+        second.cancel();
+        assert!(fires(&merged).await);
+        assert!(!first.is_cancelled(), "the first token is left alone");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_token_that_has_fired_already_fires_it_at_once() {
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        second.cancel();
+        let (merged, _guard) = cancelled_by_either(&first, &second);
+        assert!(merged.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_guard_ends_only_the_forwarding() {
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        let (merged, guard) = cancelled_by_either(&first, &second);
+        drop(guard);
+        tokio::task::yield_now().await;
+        second.cancel();
+        assert!(!fires(&merged).await, "no task is left to forward it");
+        first.cancel();
+        assert!(merged.is_cancelled(), "the first token needs no task");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +547,22 @@ mod tests {
             timed_out: true,
         };
         assert_eq!(o.exit_code(), 3);
+    }
+
+    #[test]
+    fn adding_to_a_tally_at_the_top_stays_at_the_top() {
+        let mut tally = ShutdownTally {
+            errors: usize::MAX,
+            panics: usize::MAX,
+        };
+
+        tally.add(ShutdownTally {
+            errors: 1,
+            panics: 1,
+        });
+
+        assert_eq!(tally.errors, usize::MAX);
+        assert_eq!(tally.panics, usize::MAX);
     }
 
     use crate::error::ShoveError;

@@ -43,7 +43,7 @@ Done.
 
 ### Consumer group via `Broker<Nats>`
 
-`broker.consumer_group()` returns a `ConsumerGroup\<Nats\>`. `group.register::<OrderTopic, _>(ConsumerGroupConfig::new(NatsConsumerGroupConfig::new(1..=1)), || OrderHandler)` wires the handler factory to the topic with a fixed pool of one worker. The `NatsConsumerGroupConfig` maps to a JetStream durable consumer with `max_ack_pending` set from the computed prefetch count. The factory closure `|| OrderHandler` is called once per spawned worker.
+`broker.consumer_group()` returns a `ConsumerGroup\<Nats\>`. `group.register::<OrderTopic, _>(ConsumerGroupConfig::new(NatsConsumerGroupConfig::new(1..=1)), || OrderHandler)` wires the handler factory to the topic with a fixed pool of one worker. The `NatsConsumerGroupConfig` maps to a JetStream durable consumer, and each worker pulls only as many messages as its prefetch count lets it start, so the durable keeps `max_ack_pending` unbounded. The factory closure `|| OrderHandler` is called once per spawned worker.
 
 ### Run until timeout
 

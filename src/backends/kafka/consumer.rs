@@ -43,7 +43,9 @@ use crate::backend::broadcast::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_b
 use crate::batch_consumer::BatchConsumerOptions as GenericBatchConsumerOptions;
 use crate::broadcast::BroadcastStart;
 use crate::consumer::{RetryStrategy, validate_message_size};
-use crate::consumer_supervisor::{AbortOnDrop, SupervisorOutcome, drive_fifo_until_timeout};
+use crate::consumer_supervisor::{
+    AbortOnDrop, SupervisorOutcome, cancelled_by_either, drive_fifo_until_timeout,
+};
 use crate::error::{CommitFailure, FailedCommit, Result};
 use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -8880,28 +8882,6 @@ impl<T: Topic, H: MessageHandler<T>> FifoLoop<T, H> {
 // DLQ drain
 // ---------------------------------------------------------------------------
 
-/// A token that fires when `first` or `second` does. It is a child of `first`,
-/// so a stop through `first` reaches it in the same step, and a task forwards
-/// `second` to it, at once when `second` has fired already. The guard ends that
-/// task, so hold it as long as the token is in use.
-fn cancelled_by_either(
-    first: &CancellationToken,
-    second: &CancellationToken,
-) -> (CancellationToken, AbortOnDrop) {
-    let merged = first.child_token();
-    if second.is_cancelled() {
-        merged.cancel();
-    }
-    let forward = tokio::spawn({
-        let (second, merged) = (second.clone(), merged.clone());
-        async move {
-            second.cancelled().await;
-            merged.cancel();
-        }
-    });
-    (merged, AbortOnDrop(forward.abort_handle()))
-}
-
 /// What every connection of one DLQ drain reads: the handler, the client and
 /// the settings `KafkaConsumer::run_dlq_with_inner` resolved once.
 struct DlqDrain<T: Topic, H: MessageHandler<T>> {
@@ -15389,58 +15369,6 @@ mod guarded_tests {
         )
         .await;
         assert!(matches!(call, Guarded::Done(7)));
-    }
-}
-
-/// [`cancelled_by_either`]: the token the DLQ drain stops on.
-#[cfg(test)]
-mod either_token_tests {
-    use super::*;
-
-    async fn fires(token: &CancellationToken) -> bool {
-        tokio::time::timeout(Duration::from_secs(1), token.cancelled())
-            .await
-            .is_ok()
-    }
-
-    /// The first token reaches the merged one in the same step, so a stop
-    /// requested through it takes effect before anything else runs.
-    #[tokio::test(start_paused = true)]
-    async fn the_first_token_fires_it_at_once() {
-        let (first, second) = (CancellationToken::new(), CancellationToken::new());
-        let (merged, _guard) = cancelled_by_either(&first, &second);
-        assert!(!fires(&merged).await, "nothing has fired yet");
-        first.cancel();
-        assert!(merged.is_cancelled());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn the_second_token_fires_it_through_the_forwarder() {
-        let (first, second) = (CancellationToken::new(), CancellationToken::new());
-        let (merged, _guard) = cancelled_by_either(&first, &second);
-        second.cancel();
-        assert!(fires(&merged).await);
-        assert!(!first.is_cancelled(), "the first token is left alone");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_second_token_that_has_fired_already_fires_it_at_once() {
-        let (first, second) = (CancellationToken::new(), CancellationToken::new());
-        second.cancel();
-        let (merged, _guard) = cancelled_by_either(&first, &second);
-        assert!(merged.is_cancelled());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_dropped_guard_ends_only_the_forwarding() {
-        let (first, second) = (CancellationToken::new(), CancellationToken::new());
-        let (merged, guard) = cancelled_by_either(&first, &second);
-        drop(guard);
-        tokio::task::yield_now().await;
-        second.cancel();
-        assert!(!fires(&merged).await, "no task is left to forward it");
-        first.cancel();
-        assert!(merged.is_cancelled(), "the first token needs no task");
     }
 }
 

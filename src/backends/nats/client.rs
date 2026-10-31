@@ -6,7 +6,10 @@ use std::fmt;
 use std::path::PathBuf;
 use std::process;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::ShoveError;
@@ -101,6 +104,8 @@ pub struct NatsClient {
     client: async_nats::Client,
     jetstream: jetstream::Context,
     shutdown_token: CancellationToken,
+    /// Changes each time the client connects, its first connection included.
+    connected: watch::Receiver<()>,
 }
 
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
@@ -392,7 +397,18 @@ impl NatsClient {
         validate_transport_security(config)?;
 
         let client_name = format!("shove-rs-{}", process::id());
-        let mut opts = async_nats::ConnectOptions::new().name(client_name);
+        let (connected_tx, connected) = watch::channel(());
+        let connected_tx = Arc::new(connected_tx);
+        let mut opts = async_nats::ConnectOptions::new()
+            .name(client_name)
+            .event_callback(move |event| {
+                let connected_tx = Arc::clone(&connected_tx);
+                async move {
+                    if matches!(event, async_nats::Event::Connected) {
+                        connected_tx.send_replace(());
+                    }
+                }
+            });
 
         if let Some(ca) = &config.tls_ca_cert {
             opts = opts.add_root_certificates(ca.clone());
@@ -423,6 +439,7 @@ impl NatsClient {
             client,
             jetstream,
             shutdown_token: CancellationToken::new(),
+            connected,
         })
     }
 
@@ -431,20 +448,18 @@ impl NatsClient {
         let mut attempts = 0u32;
 
         loop {
-            attempts += 1;
+            attempts = attempts.saturating_add(1);
             match Self::connect(config).await {
                 Ok(client) => return Ok(client),
                 Err(e) => {
                     if attempts >= max_attempts {
                         return Err(e);
                     }
-                    let delay = backoff
-                        .next()
-                        .expect("backoff iterator is infinite; this is a bug");
+                    let delay = backoff.next_delay();
                     tracing::warn!(
                         attempt = attempts,
                         max_attempts,
-                        delay_ms = delay.as_millis() as u64,
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                         error = %e,
                         "NATS connection failed, retrying"
                     );
@@ -464,6 +479,19 @@ impl NatsClient {
 
     pub fn is_connected(&self) -> bool {
         matches!(self.client.connection_state(), State::Connected)
+    }
+
+    /// How many times the client has connected, its first connection
+    /// included. It grows by one on every reconnect, before
+    /// [`connection_changes`](Self::connection_changes) fires.
+    pub(super) fn connections(&self) -> u64 {
+        self.client.statistics().connects.load(Ordering::Relaxed)
+    }
+
+    /// A receiver that changes each time the client connects, its first
+    /// connection included, so a reconnect wakes whoever waits on it.
+    pub(super) fn connection_changes(&self) -> watch::Receiver<()> {
+        self.connected.clone()
     }
 
     /// Liveness check. Subscribes to a unique inbox subject, publishes to it,
@@ -523,6 +551,8 @@ impl NatsClient {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU32;
+
     use super::*;
 
     #[test]
@@ -583,17 +613,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn connect_with_retry_backoff_is_infinite() {
-        // connect_with_retry calls backoff.next().expect("backoff iterator is infinite; this is a bug").
-        // Verify that the Backoff used there (100ms initial, 5s max) never yields None.
-        let delays: Vec<_> = Backoff::new(
-            std::time::Duration::from_millis(100),
-            std::time::Duration::from_secs(5),
-        )
-        .take(200)
-        .collect();
-        assert_eq!(delays.len(), 200, "Backoff must never return None");
+    /// A loopback server that takes each connection and drops it, so every
+    /// attempt to connect fails once its TCP handshake is done. Returns the
+    /// URL to connect to and the number of connections taken so far.
+    async fn connection_dropping_server() -> (String, Arc<AtomicU32>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port is free");
+        let url = format!("nats://{}", listener.local_addr().expect("a bound address"));
+        let taken = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&taken);
+        tokio::spawn(async move {
+            while let Ok((connection, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(connection);
+            }
+        });
+        (url, taken)
+    }
+
+    /// The wait before the second attempt is 100 ms and before the third 200 ms,
+    /// each jittered by up to half either way.
+    #[tokio::test]
+    async fn connect_with_retry_waits_between_attempts_and_stops_at_the_last() {
+        let (url, taken) = connection_dropping_server().await;
+        let started = std::time::Instant::now();
+
+        let outcome = NatsClient::connect_with_retry(&NatsConfig::new(url), 3).await;
+
+        assert!(
+            matches!(outcome, Err(ShoveError::Connection(_))),
+            "the last refusal is the error"
+        );
+        assert_eq!(
+            taken.load(Ordering::SeqCst),
+            3,
+            "one connection per attempt"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "two backoff waits separate three attempts: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_with_retry_makes_one_attempt_without_a_budget_to_retry() {
+        for max_attempts in [0, 1] {
+            let (url, taken) = connection_dropping_server().await;
+
+            let outcome = NatsClient::connect_with_retry(&NatsConfig::new(url), max_attempts).await;
+
+            assert!(matches!(outcome, Err(ShoveError::Connection(_))));
+            assert_eq!(
+                taken.load(Ordering::SeqCst),
+                1,
+                "{max_attempts} attempts allowed: the one attempt is not retried"
+            );
+        }
     }
 
     // --- sec-2: username must be redacted in Debug output ---

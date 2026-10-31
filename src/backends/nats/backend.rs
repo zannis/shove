@@ -204,15 +204,13 @@ impl ConsumerImpl for NatsConsumer {
         &self,
         handler: H,
         ctx: H::Context,
-        _options: ConsumerOptionsInner,
+        options: ConsumerOptionsInner,
     ) -> Result<()>
     where
         T: Topic,
         H: MessageHandler<T>,
     {
-        // NATS JetStream DLQ consumer does not consult max_message_size —
-        // message size is enforced stream-side at declaration time.
-        NatsConsumer::run_dlq::<T, H>(self, handler, ctx).await
+        NatsConsumer::run_dlq_with_inner::<T, H>(self, handler, ctx, options).await
     }
 
     async fn spawn_fifo_shards<T, H>(
@@ -317,7 +315,7 @@ impl RegistryImpl for NatsConsumerGroupRegistry {
             },
             Err(_) => {
                 tracing::warn!(
-                    timeout_ms = drain_timeout.as_millis() as u64,
+                    timeout_ms = u64::try_from(drain_timeout.as_millis()).unwrap_or(u64::MAX),
                     "drain timeout elapsed; aborting surviving consumer tasks"
                 );
                 self.abort_all_remaining_into(&mut tally).await;
