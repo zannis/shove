@@ -3141,8 +3141,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Maps a rdkafka `KafkaError` to the appropriate `ShoveError` variant.
-/// Permanent errors (bad config, fatal consumption, cancelled) become
-/// `Topology`; transient errors (broker down, network) become `Connection`.
+/// Permanent errors end the consumer; transient errors become `Connection`.
 /// A receive loop never ends on a `recv()` error it rides out, so it maps
 /// none of those, see [`recv_error_is_transient`].
 ///
@@ -3158,12 +3157,19 @@ where
 /// replaces the member, which meets the same answer again (see the `None`
 /// variant's doc for the schedule).
 fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
+    if matches!(
+        e,
+        KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset)
+    ) {
+        return ShoveError::KafkaOffsetReset {
+            context: context.to_owned(),
+        };
+    }
     let is_permanent = matches!(
         &e,
         KafkaError::ClientConfig(..)
             | KafkaError::ClientCreation(_)
             | KafkaError::MessageConsumptionFatal(_)
-            | KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset)
             | KafkaError::Canceled
             | KafkaError::Nul(_)
     );
@@ -11699,11 +11705,6 @@ impl KafkaConsumer {
                                     }
                                     continue;
                                 }
-                                Err(KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset)) => {
-                                    return Err(ShoveError::BroadcastOffsetOutOfRange {
-                                        topic: queue.to_string(),
-                                    });
-                                }
                                 Err(e) if recv_error_is_transient(consumer.transport_gate(), &e) => {
                                     log_transient_recv_error(queue, &e);
                                     continue;
@@ -14867,16 +14868,16 @@ mod after_wait_tests {
 mod error_classifier_tests {
     use super::*;
 
-    /// librdkafka raises `AutoOffsetReset` when a partition has no committed
-    /// offset and the policy is `error`. A reconnect rejoins the same group
-    /// under the same policy and meets the same answer, so the classifier
-    /// must end the consumer (`Topology`) rather than loop on `Connection`.
+    /// A missing or expired position under the error policy is typed and
+    /// permanent across every Kafka receive path.
     #[test]
     fn a_missing_offset_under_the_error_policy_is_permanent() {
         let e = KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset);
+        let error = map_kafka_error("consumer recv error on test-topic", e);
+        assert!(!error.is_retryable());
         assert!(matches!(
-            map_kafka_error("recv", e),
-            ShoveError::Topology(msg) if msg.starts_with("recv: ")
+            error,
+            ShoveError::KafkaOffsetReset { context } if context == "consumer recv error on test-topic"
         ));
     }
 

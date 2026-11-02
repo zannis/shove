@@ -18,11 +18,6 @@ pub enum ShoveError {
     #[error("topology error: {0}")]
     Topology(String),
 
-    /// A Kafka broadcast subscription configured to fail on an invalid
-    /// position could not fetch its assigned replay offset.
-    #[error("broadcast offset out of range on {topic:?}")]
-    BroadcastOffsetOutOfRange { topic: String },
-
     /// Input validation failed (e.g. message too large, reserved header).
     #[error("validation error: {0}")]
     Validation(String),
@@ -100,6 +95,15 @@ pub enum ShoveError {
     /// Boxed to keep `ShoveError` small, like [`PartialBatch`](Self::PartialBatch).
     #[error(transparent)]
     Commit(Box<FailedCommit>),
+
+    /// Kafka reported that a fetch position is missing or out of range while
+    /// `auto.offset.reset` is set to `error`. `context` identifies the receive
+    /// operation; it is not necessarily a topic name.
+    ///
+    /// The consumer ends without retrying. Its supervisor counts the error in
+    /// [`SupervisorOutcome::errors`](crate::SupervisorOutcome::errors).
+    #[error("Kafka AutoOffsetReset: {context}")]
+    KafkaOffsetReset { context: String },
 }
 
 /// An offset commit at shutdown that was not confirmed, the final commit

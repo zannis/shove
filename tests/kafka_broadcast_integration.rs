@@ -666,7 +666,7 @@ async fn broadcast_expired_resolved_offset_fails_closed() {
         .await;
     assert_eq!(outcome.errors, 1, "{outcome:?}");
     assert!(
-        matches!(errors.as_slice(), [ShoveError::BroadcastOffsetOutOfRange { topic }] if topic == TOPIC)
+        matches!(errors.as_slice(), [ShoveError::KafkaOffsetReset { context }] if context.contains(TOPIC))
     );
     assert!(recorder.keys().await.is_empty());
     broker.close().await;
