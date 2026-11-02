@@ -18,6 +18,11 @@ pub enum ShoveError {
     #[error("topology error: {0}")]
     Topology(String),
 
+    /// A Kafka broadcast subscription configured to fail on an invalid
+    /// position could not fetch its assigned replay offset.
+    #[error("broadcast offset out of range on {topic:?}")]
+    BroadcastOffsetOutOfRange { topic: String },
+
     /// Input validation failed (e.g. message too large, reserved header).
     #[error("validation error: {0}")]
     Validation(String),
