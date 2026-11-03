@@ -2,6 +2,11 @@ pub(super) const RETRY_COUNT_HEADER: &str = "Shove-Retry-Count";
 pub(super) const DEATH_REASON_HEADER: &str = "Shove-Death-Reason";
 pub(super) const ORIGINAL_QUEUE_HEADER: &str = "Shove-Original-Queue";
 pub(super) const DEATH_COUNT_HEADER: &str = "Shove-Death-Count";
+/// The delivery a retry copy or dead letter was made from, as
+/// `{stream}.{consumer}.{stream_sequence}`. A duplicate PubAck for a copy is
+/// trusted only when the message stored under the copy's id carries the same
+/// value and payload.
+pub(super) const COPY_OF_HEADER: &str = "Shove-Copy-Of";
 /// Sequence key of a message on a sequenced topic.
 ///
 /// The shard is already encoded in the subject (`{queue}.shard.{n}`), but a

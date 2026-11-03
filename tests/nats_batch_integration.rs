@@ -152,6 +152,20 @@ shove::define_topic!(
     TopologyBuilder::new("nats-batch-supply").build()
 );
 
+/// A message that is only an enum. A payload naming a variant it does not have
+/// fails to decode, and serde quotes that variant in its error verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+enum Shape {
+    Circle,
+    Square,
+}
+
+shove::define_topic!(
+    ShapeTopic,
+    Shape,
+    TopologyBuilder::new("nats-batch-shape").dlq().build()
+);
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -1462,9 +1476,7 @@ async fn undeserializable_message_is_dropped_to_the_dlq_and_the_rest_flush() {
 
     // Straight through JetStream, bypassing shove's codec — the only way to
     // land a body `T::Codec` cannot decode. Carries a unique message id the
-    // way any real publisher does: `publish_to_dlq` derives the DLQ copy's id
-    // from the original's, and an id-less original yields the constant id
-    // `-dlq`, which JetStream's dedup window collapses across runs.
+    // way any real publisher does.
     let mut poison_headers = async_nats::HeaderMap::new();
     poison_headers.insert(
         NATS_MESSAGE_ID,
@@ -1600,6 +1612,110 @@ async fn oversized_message_is_dropped_to_the_dlq_and_the_rest_flush() {
         "the two in-size messages should reach the handler, got {:?}",
         handler.batches()
     );
+    broker.close().await;
+}
+
+/// Keeps every `Shape` a flush is handed.
+#[derive(Clone)]
+struct ShapeBatchRecorder(Arc<Mutex<Vec<Shape>>>);
+
+impl BatchMessageHandler<ShapeTopic> for ShapeBatchRecorder {
+    type Context = ();
+    async fn handle_batch(&self, messages: Vec<(Shape, MessageMetadata)>, _: &()) -> Outcome {
+        self.0
+            .lock()
+            .unwrap()
+            .extend(messages.into_iter().map(|(shape, _)| shape));
+        Outcome::Ack
+    }
+}
+
+/// serde quotes an unknown variant verbatim, so `"a\nb"` fails to decode with
+/// a raw newline in the error text. The batch intake dead-letters it under the
+/// fixed reason instead of that text, and the consumer flushes what follows.
+#[tokio::test]
+async fn decode_error_with_newline_dead_letters_without_panic() {
+    use futures_util::StreamExt;
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<ShapeTopic>().await.unwrap();
+    client
+        .jetstream()
+        .publish("nats-batch-shape", br#""a\nb""#.as_slice().into())
+        .await
+        .expect("raw publish should succeed")
+        .await
+        .expect("raw publish should be acked");
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = ShapeBatchRecorder(seen.clone());
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<ShapeTopic, _>(
+                recorder,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(3)
+                    .with_max_batch_age(Duration::from_millis(300))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    let reader = client
+        .jetstream()
+        .get_stream("nats-batch-shape-dlq")
+        .await
+        .expect("the DLQ stream exists")
+        .get_or_create_consumer(
+            "test-dead-letter-reader",
+            PullConsumerConfig {
+                durable_name: Some("test-dead-letter-reader".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the DLQ reader is created");
+    let mut dead_letters = reader.messages().await.expect("the DLQ reader pulls");
+    let dead = tokio::time::timeout(TIMEOUT, dead_letters.next())
+        .await
+        .expect("the poison payload reaches the DLQ")
+        .expect("the DLQ reader stream stays open")
+        .expect("the dead letter is readable");
+    let reason = dead
+        .headers
+        .as_ref()
+        .and_then(|headers| headers.get("Shove-Death-Reason"))
+        .map(|value| value.as_str().to_string());
+    assert_eq!(reason.as_deref(), Some("deserialization_error"));
+
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<ShapeTopic>(&Shape::Circle)
+        .await
+        .expect("publish should succeed");
+    let deadline = Instant::now() + TIMEOUT;
+    while seen.lock().unwrap().is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![Shape::Circle],
+        "the consumer outlives the poison message and flushes the next one"
+    );
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("the batch consumer task does not panic")
+        .expect("the batch consumer stops cleanly");
     broker.close().await;
 }
 
