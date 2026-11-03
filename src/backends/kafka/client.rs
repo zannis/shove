@@ -1330,9 +1330,8 @@ fn fetch_topic_metadata_blocking(
 ///
 /// rdkafka services the OAUTHBEARER refresh event by polling the client's main
 /// queue; the admin client never polls it, so we generate and set the token
-/// ourselves. `generate_oauth_token` drives an async signer via
-/// `Handle::block_on`, which panics on a Tokio worker thread, so it runs on a
-/// blocking thread (the same contract librdkafka's own C callback thread has).
+/// ourselves. `generate_oauth_token` blocks its thread until the token is
+/// signed, so it runs on a blocking thread rather than a Tokio worker.
 #[cfg(feature = "kafka-msk-iam")]
 async fn prime_admin_oauth_token<C>(admin: &AdminClient<C>, ctx: C) -> Result<()>
 where
