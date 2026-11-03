@@ -487,6 +487,10 @@ impl<B: Backend> ConsumerOptions<B> {
     /// Set the handler timeout. If a handler exceeds this duration the message
     /// is retried automatically. Panics if `timeout` is zero.
     ///
+    /// On the Kafka DLQ drain (`KafkaConsumer::run_dlq`) the timeout bounds
+    /// each `handle_dead` call. A dead letter whose call times out is
+    /// committed and is not retried.
+    ///
     /// On the Redis backend the timeout also drives crash recovery: a
     /// background sidecar reclaims entries that have been pending longer
     /// than the timeout. Reclaim applies to the whole consumer group, so
@@ -546,6 +550,10 @@ impl<B: Backend> ConsumerOptions<B> {
     /// while the handler is still running, so it stays [`Outcome::Retry`] and
     /// lets the broker redeliver rather than retiring live work.
     ///
+    /// The Kafka DLQ drain (`KafkaConsumer::run_dlq`) refuses this setting
+    /// with `ShoveError::Topology`: `handle_dead` returns no outcome, and a
+    /// dead letter whose call times out is committed.
+    ///
     /// # Redis: this narrows a race, it does not remove one
     ///
     /// With the option unset, a timed-out Redis entry has exactly one actor —
@@ -598,6 +606,10 @@ impl<B: Backend> ConsumerOptions<B> {
     }
 
     /// Disable the handler timeout entirely (handlers may run indefinitely).
+    ///
+    /// On the Kafka DLQ drain (`KafkaConsumer::run_dlq`) each `handle_dead`
+    /// call may then run indefinitely too. The drain hands out no dead letter
+    /// behind the call, and a stop waits for it, for as long as it runs.
     ///
     /// On the Redis backend this also disables crash-recovery reclaim for
     /// the stream's maintenance sidecar: with no deadline, in-flight work is
@@ -937,8 +949,8 @@ impl ConsumerOptions<Kafka> {
     /// [`KafkaConsumerGroupConfig::with_commit_interval`](crate::kafka::KafkaConsumerGroupConfig::with_commit_interval).
     /// A FIFO consumer, a broadcast subscription and the DLQ drain refuse it
     /// at their entry points, because none of them reads it: the FIFO
-    /// consumer commits on the fixed 500 ms default, and the other two do
-    /// not commit on an interval.
+    /// consumer and the DLQ drain commit on the fixed 500 ms default, and a
+    /// broadcast subscription commits nothing.
     ///
     /// # Panics
     ///

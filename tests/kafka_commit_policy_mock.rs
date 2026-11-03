@@ -40,6 +40,15 @@
 //! commit in flight unanswered reports the share of the shutdown deadline it
 //! waited, as the standard consumer's does under `Interval`.
 //!
+//! A section runs the DLQ drain against the same mock: a `handle_dead` that
+//! panics or hangs costs the drain that one call and moves no handler
+//! metric, one under `without_handler_timeout` is waited for past the
+//! default timeout, the token of its options stops it as the client's token
+//! does, and its commits are spaced by the fixed interval, re-offered when
+//! refused and carried by the final commit at its stop. A drain whose task
+//! is aborted, or that ends a connection on an error, closes its consumer
+//! off the runtime thread.
+//!
 //! The final section takes the broker down for a few seconds, which a
 //! settled member rides out on the client it started with and a member fresh
 //! from a rebalance reconnects through, and stops a member whose handler
@@ -84,11 +93,11 @@ use shove::kafka::{
     put_back_probe, shutdown_commit_deadline_for_test,
 };
 use shove::markers::Kafka;
-use shove::metadata::MessageMetadata;
+use shove::metadata::{DeadMessageMetadata, MessageMetadata};
 use shove::outcome::Outcome;
 use shove::topic::Topic;
 use shove::topology::{SequenceFailure, TopologyBuilder};
-use shove::{CommitFailure, SequencedTopic, ShoveError};
+use shove::{CommitFailure, DEFAULT_HANDLER_TIMEOUT, SequencedTopic, ShoveError};
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -4230,6 +4239,729 @@ async fn a_sequenced_stop_with_its_commit_unanswered_reports_the_pending_share()
         "no second commit races the one in flight"
     );
     assert_eq!(handler.ids(), ["o1"]);
+}
+
+// ---------------------------------------------------------------------------
+// The DLQ drain: its stop tokens, its handler call and its commits
+// ---------------------------------------------------------------------------
+
+const DRAIN_TOPIC: &str = "kafka-commit-policy-mock-drain";
+const DRAIN_DLQ: &str = "kafka-commit-policy-mock-drain-dlq";
+/// The group a drain of the topic's DLQ joins: `{dlq}-consumer`.
+const DRAIN_GROUP: &str = "kafka-commit-policy-mock-drain-dlq-consumer";
+/// How long a test waits for a drain that has to stop, or to get past a
+/// handler call that hangs.
+const DRAIN_BOUND: Duration = Duration::from_secs(15);
+
+shove::define_topic!(
+    DrainOrders,
+    Order,
+    TopologyBuilder::new(DRAIN_TOPIC).dlq().build()
+);
+
+/// What a [`Dead`] handler does with the dead letter it is told to fail.
+#[derive(Clone, Copy)]
+enum Fail {
+    Panic,
+    Hang,
+    /// Returns once the test calls [`Dead::release`].
+    Held,
+}
+
+/// Records the id of every dead letter a drain hands it, and fails each one
+/// `fail` names.
+#[derive(Clone, Default)]
+struct Dead {
+    seen: Arc<Mutex<Vec<String>>>,
+    fail: Vec<(&'static str, Fail)>,
+    released: Arc<Notify>,
+}
+
+impl Dead {
+    /// This handler, failing the dead letter `id` as `how` says.
+    fn failing(mut self, id: &'static str, how: Fail) -> Self {
+        self.fail.push((id, how));
+        self
+    }
+
+    /// Lets the call on a [`Fail::Held`] dead letter return.
+    fn release(&self) {
+        self.released.notify_one();
+    }
+
+    fn ids(&self) -> Vec<String> {
+        self.seen.lock().expect("handler mutex poisoned").clone()
+    }
+
+    fn count(&self) -> usize {
+        self.seen.lock().expect("handler mutex poisoned").len()
+    }
+}
+
+impl MessageHandler<DrainOrders> for Dead {
+    type Context = ();
+
+    async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+
+    async fn handle_dead(&self, msg: Order, _: DeadMessageMetadata, _: &()) {
+        self.seen
+            .lock()
+            .expect("handler mutex poisoned")
+            .push(msg.id.clone());
+        match self.fail.iter().find(|(id, _)| *id == msg.id) {
+            Some((id, Fail::Panic)) => panic!("handle_dead fails on {id}"),
+            Some((_, Fail::Hang)) => std::future::pending::<()>().await,
+            Some((_, Fail::Held)) => self.released.notified().await,
+            None => {}
+        }
+    }
+}
+
+/// One mock broker with the drain's DLQ created, and a dead letter produced
+/// onto it for each of `ids`.
+async fn drain_mock(ids: &[&str]) -> (Mock, String) {
+    let mock = Mock::start();
+    mock.api()
+        .create_topic(DRAIN_DLQ, 1, 1)
+        .expect("create the topic through the mock API");
+    let bootstrap = mock.bootstrap();
+    produce_on(&bootstrap, DRAIN_DLQ, ids).await;
+    (mock, bootstrap)
+}
+
+type Drain = tokio::task::JoinHandle<Result<(), ShoveError>>;
+
+/// Runs a drain of the topic's DLQ on its own task.
+fn start_drain(client: KafkaClient, handler: Dead, options: ConsumerOptions<Kafka>) -> Drain {
+    tokio::spawn(async move {
+        KafkaConsumer::new(client)
+            .run_dlq_with_options::<DrainOrders, _>(handler, (), options)
+            .await
+    })
+}
+
+/// [`wait_until`] that fails at once if the drain ends before `done` holds.
+async fn wait_while_draining(run: &Drain, done: impl Fn() -> bool, timeout: Duration, what: &str) {
+    wait_until(
+        || {
+            assert!(!run.is_finished(), "the drain ended before {what}");
+            done()
+        },
+        timeout,
+        what,
+    )
+    .await;
+}
+
+/// Stops a drain through `shutdown` and requires it to end clean, inside
+/// [`DRAIN_BOUND`].
+async fn stop_drain(run: Drain, shutdown: &CancellationToken) {
+    shutdown.cancel();
+    tokio::time::timeout(DRAIN_BOUND, run)
+        .await
+        .expect("the drain stops on the token of its options")
+        .expect("the drain task completes")
+        .expect("a clean stop");
+}
+
+/// A `handle_dead` that panics costs the drain that one call. The panic is
+/// caught where the call is made and logged, the dead letter behind the
+/// panicking one is handled, both are committed, and the drain goes on
+/// running. A panic that unwound the drain's task ended the drain with the
+/// dead letter behind it unread.
+#[tokio::test]
+async fn dlq_drain_survives_a_panicking_handle_dead() {
+    let logged = Logged::install();
+    let (_mock, bootstrap) = drain_mock(&["A", "B"]).await;
+
+    let handler = Dead::default().failing("A", Fail::Panic);
+    let shutdown = CancellationToken::new();
+    let run = start_drain(
+        connect(&bootstrap).await,
+        handler.clone(),
+        ConsumerOptions::<Kafka>::new().with_shutdown(shutdown.clone()),
+    );
+    wait_while_draining(
+        &run,
+        || handler.count() == 2,
+        DELIVERY_TIMEOUT,
+        "B reaching handle_dead behind the panicking A",
+    )
+    .await;
+    wait_for_position(
+        &bootstrap,
+        DRAIN_DLQ,
+        DRAIN_GROUP,
+        2,
+        DELIVERY_TIMEOUT,
+        "A, which panicked, committed with B",
+    )
+    .await;
+    assert!(!run.is_finished(), "the panic did not end the drain");
+    assert_eq!(
+        handler.ids(),
+        ["A", "B"],
+        "each dead letter is handled once"
+    );
+    assert!(
+        logged
+            .lines()
+            .iter()
+            .any(|line| line.contains("handle_dead panicked")),
+        "the panic is logged: {:?}",
+        logged.lines()
+    );
+
+    stop_drain(run, &shutdown).await;
+}
+
+/// A `handle_dead` that outlasts the handler timeout is cut there, logged,
+/// and its dead letter committed: the drain does not wait for a call that
+/// never returns. The timeout is the options' own.
+#[tokio::test]
+async fn dlq_drain_cuts_a_hung_handle_dead_at_the_handler_timeout() {
+    const CALL_LIMIT: Duration = Duration::from_millis(500);
+    let logged = Logged::install();
+    let (_mock, bootstrap) = drain_mock(&["A", "B"]).await;
+
+    let handler = Dead::default().failing("A", Fail::Hang);
+    let shutdown = CancellationToken::new();
+    let run = start_drain(
+        connect(&bootstrap).await,
+        handler.clone(),
+        ConsumerOptions::<Kafka>::new()
+            .with_handler_timeout(CALL_LIMIT)
+            .with_shutdown(shutdown.clone()),
+    );
+    wait_while_draining(
+        &run,
+        || handler.count() == 2,
+        DRAIN_BOUND,
+        "B reaching handle_dead behind the hung A",
+    )
+    .await;
+    wait_for_position(
+        &bootstrap,
+        DRAIN_DLQ,
+        DRAIN_GROUP,
+        2,
+        DRAIN_BOUND,
+        "A, which timed out, committed with B",
+    )
+    .await;
+    assert!(
+        logged
+            .lines()
+            .iter()
+            .any(|line| line.contains("handle_dead timed out")),
+        "the timeout is logged: {:?}",
+        logged.lines()
+    );
+
+    stop_drain(run, &shutdown).await;
+}
+
+/// `without_handler_timeout` leaves `handle_dead` unbounded on the drain. A
+/// call that runs past the 30 s default is waited for: the dead letter behind
+/// it is not handed out, and nothing is committed, until the call returns, and
+/// both are committed then. A drain that bounded the call at the default cut
+/// it there and went on to the next dead letter.
+#[tokio::test]
+async fn dlq_drain_without_a_handler_timeout_waits_for_handle_dead() {
+    const PAST_THE_DEFAULT: Duration = Duration::from_secs(2);
+    let (_mock, bootstrap) = drain_mock(&["A", "B"]).await;
+
+    let handler = Dead::default().failing("A", Fail::Held);
+    let shutdown = CancellationToken::new();
+    let run = start_drain(
+        connect(&bootstrap).await,
+        handler.clone(),
+        ConsumerOptions::<Kafka>::new()
+            .without_handler_timeout()
+            .with_shutdown(shutdown.clone()),
+    );
+    wait_while_draining(
+        &run,
+        || handler.count() == 1,
+        DELIVERY_TIMEOUT,
+        "A reaching handle_dead",
+    )
+    .await;
+
+    tokio::time::sleep(DEFAULT_HANDLER_TIMEOUT + PAST_THE_DEFAULT).await;
+    assert!(!run.is_finished(), "the drain waits on the call");
+    assert_eq!(
+        handler.ids(),
+        ["A"],
+        "B is not handed out while the call on A runs past the default timeout"
+    );
+    assert_eq!(
+        committed_position_on(&bootstrap, DRAIN_DLQ, DRAIN_GROUP, 0).await,
+        None,
+        "nothing is committed while the call on A runs"
+    );
+
+    handler.release();
+    wait_while_draining(
+        &run,
+        || handler.count() == 2,
+        DRAIN_BOUND,
+        "B reaching handle_dead once the call on A returned",
+    )
+    .await;
+    wait_for_position(
+        &bootstrap,
+        DRAIN_DLQ,
+        DRAIN_GROUP,
+        2,
+        DRAIN_BOUND,
+        "A and B committed",
+    )
+    .await;
+
+    stop_drain(run, &shutdown).await;
+}
+
+/// The names of `topic`'s series in one draining snapshot of the debugging
+/// recorder, sorted and without repeats.
+#[cfg(feature = "metrics")]
+fn series_of(snapshotter: &Snapshotter, topic: &str) -> Vec<String> {
+    let mut names: Vec<String> = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(key, ..)| {
+            key.key()
+                .labels()
+                .any(|label| label.key() == "topic" && label.value() == topic)
+        })
+        .map(|(key, ..)| key.key().name().to_owned())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// A `handle_dead` call moves no handler metric under the source topic,
+/// whether it returns, panics or outlasts the handler timeout: no consumed,
+/// in-flight, duration or failed series. The size sample of each dead letter
+/// is the one series the drain records there.
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn dlq_drain_handler_calls_move_no_handler_metric() {
+    let snapshotter = install_recorder();
+    let (_mock, bootstrap) = drain_mock(&["A", "B", "C"]).await;
+
+    let handler = Dead::default()
+        .failing("A", Fail::Panic)
+        .failing("B", Fail::Hang);
+    let shutdown = CancellationToken::new();
+    let run = start_drain(
+        connect(&bootstrap).await,
+        handler.clone(),
+        ConsumerOptions::<Kafka>::new()
+            .with_handler_timeout(Duration::from_millis(500))
+            .with_shutdown(shutdown.clone()),
+    );
+    wait_while_draining(
+        &run,
+        || handler.count() == 3,
+        DRAIN_BOUND,
+        "C reaching handle_dead behind the panicking A and the hung B",
+    )
+    .await;
+    wait_for_position(
+        &bootstrap,
+        DRAIN_DLQ,
+        DRAIN_GROUP,
+        3,
+        DRAIN_BOUND,
+        "all three dead letters committed",
+    )
+    .await;
+    stop_drain(run, &shutdown).await;
+
+    assert_eq!(
+        series_of(&snapshotter, DRAIN_TOPIC),
+        ["shove_message_size_bytes"],
+        "the drain records the size of each dead letter and nothing about the calls"
+    );
+}
+
+/// The token of the options stops the drain, with the client's token never
+/// fired. The stop commits the dead letter in hand.
+#[tokio::test]
+async fn dlq_drain_stops_on_options_shutdown() {
+    let (_mock, bootstrap) = drain_mock(&["A"]).await;
+
+    let client = connect(&bootstrap).await;
+    let client_token = client.shutdown_token();
+    let handler = Dead::default();
+    let shutdown = CancellationToken::new();
+    let run = start_drain(
+        client,
+        handler.clone(),
+        ConsumerOptions::<Kafka>::new().with_shutdown(shutdown.clone()),
+    );
+    wait_while_draining(
+        &run,
+        || handler.count() == 1,
+        DELIVERY_TIMEOUT,
+        "A reaching handle_dead",
+    )
+    .await;
+
+    shutdown.cancel();
+    tokio::time::timeout(DRAIN_BOUND, run)
+        .await
+        .expect("the drain stops on the token of its options")
+        .expect("the drain task completes")
+        .expect("a clean stop");
+    assert!(
+        !client_token.is_cancelled(),
+        "the stop did not go through the client's token"
+    );
+    assert_eq!(
+        committed_position_on(&bootstrap, DRAIN_DLQ, DRAIN_GROUP, 0).await,
+        Some(1),
+        "the stop committed A"
+    );
+}
+
+/// The client's token stops a drain whose options carry a token of their own
+/// that nothing fires, as it stops one that carries none.
+#[tokio::test]
+async fn dlq_drain_stops_on_the_clients_token() {
+    let (_mock, bootstrap) = drain_mock(&["A"]).await;
+
+    let client = connect(&bootstrap).await;
+    let client_token = client.shutdown_token();
+    let handler = Dead::default();
+    let options_token = CancellationToken::new();
+    let run = start_drain(
+        client,
+        handler.clone(),
+        ConsumerOptions::<Kafka>::new().with_shutdown(options_token.clone()),
+    );
+    wait_while_draining(
+        &run,
+        || handler.count() == 1,
+        DELIVERY_TIMEOUT,
+        "A reaching handle_dead",
+    )
+    .await;
+
+    client_token.cancel();
+    tokio::time::timeout(DRAIN_BOUND, run)
+        .await
+        .expect("the drain stops on the client's token")
+        .expect("the drain task completes")
+        .expect("a clean stop");
+    assert!(
+        !options_token.is_cancelled(),
+        "the stop left the options' token alone"
+    );
+}
+
+/// The drain does not commit once per dead letter. Forty dead letters are
+/// handled and committed, and the broker receives far fewer OffsetCommit
+/// requests than that: the drain commits at most once per interval, one
+/// commit at a time. An asynchronous commit per record, whose answer nothing
+/// read, sent forty.
+#[tokio::test]
+async fn dlq_drain_commits_are_gated() {
+    const LETTERS: usize = 40;
+    let ids: Vec<String> = (0..LETTERS).map(|n| format!("d{n}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let (mock, bootstrap) = drain_mock(&refs).await;
+    mock.track_requests();
+
+    let handler = Dead::default();
+    let shutdown = CancellationToken::new();
+    let run = start_drain(
+        connect(&bootstrap).await,
+        handler.clone(),
+        ConsumerOptions::<Kafka>::new().with_shutdown(shutdown.clone()),
+    );
+    wait_while_draining(
+        &run,
+        || handler.count() == LETTERS,
+        DELIVERY_TIMEOUT,
+        "every dead letter reaching handle_dead",
+    )
+    .await;
+    wait_for_position(
+        &bootstrap,
+        DRAIN_DLQ,
+        DRAIN_GROUP,
+        i64::try_from(LETTERS).expect("a small count"),
+        DELIVERY_TIMEOUT,
+        "every dead letter committed",
+    )
+    .await;
+
+    let commits = mock.offset_commit_requests();
+    assert!(
+        commits < LETTERS / 2,
+        "{commits} OffsetCommit requests for {LETTERS} dead letters"
+    );
+    assert_eq!(
+        handler.ids(),
+        ids,
+        "each dead letter is handled once, in order"
+    );
+
+    stop_drain(run, &shutdown).await;
+}
+
+/// A commit the coordinator refuses is offered again. Every OffsetCommit is
+/// refused for two seconds, which the three dead letters are handled inside
+/// of, and then accepted. The position still reaches the end of what was
+/// handled, on the same connection and with no dead letter handled twice. A
+/// refusal that nothing read left the position where it was.
+#[tokio::test]
+async fn dlq_drain_re_offers_a_rejected_commit() {
+    const REFUSING: Duration = Duration::from_secs(2);
+    let (mock, bootstrap) = drain_mock(&["A", "B", "C"]).await;
+    mock.track_requests();
+    mock.reject_commits(512);
+
+    let handler = Dead::default();
+    let shutdown = CancellationToken::new();
+    let run = start_drain(
+        connect(&bootstrap).await,
+        handler.clone(),
+        ConsumerOptions::<Kafka>::new().with_shutdown(shutdown.clone()),
+    );
+    wait_while_draining(
+        &run,
+        || handler.count() == 3,
+        DELIVERY_TIMEOUT,
+        "three dead letters reaching handle_dead",
+    )
+    .await;
+    wait_while_draining(
+        &run,
+        || mock.offset_commit_requests() >= 1,
+        DELIVERY_TIMEOUT,
+        "a commit reaching the broker",
+    )
+    .await;
+    let assigns = per_record_probe::assigns_queued();
+    tokio::time::sleep(REFUSING).await;
+    assert_eq!(
+        committed_position_on(&bootstrap, DRAIN_DLQ, DRAIN_GROUP, 0).await,
+        None,
+        "every commit inside the window was refused"
+    );
+
+    mock.accept_commits();
+    wait_for_position(
+        &bootstrap,
+        DRAIN_DLQ,
+        DRAIN_GROUP,
+        3,
+        DRAIN_BOUND,
+        "the refused position offered again",
+    )
+    .await;
+    assert_eq!(
+        handler.ids(),
+        ["A", "B", "C"],
+        "the position was offered again, and no dead letter was handled again"
+    );
+    assert_eq!(
+        per_record_probe::assigns_queued(),
+        assigns,
+        "the re-offer landed on the same connection"
+    );
+
+    stop_drain(run, &shutdown).await;
+}
+
+/// The stop commits what the drain handled. Every commit the drain makes
+/// while it runs is refused. Right after a refused re-offer, with the next
+/// one an interval away, the coordinator accepts again and the drain is
+/// stopped. The last OffsetCommit the broker receives comes after the stop,
+/// and the position it leaves is that of all three dead letters, so the
+/// stop's final commit carried it. A stop with no final commit of its own
+/// left the position to whichever re-offer landed before it.
+#[tokio::test]
+async fn dlq_drain_stop_commits_what_it_handled() {
+    let (mock, bootstrap) = drain_mock(&["A", "B", "C"]).await;
+    mock.track_requests();
+    mock.reject_commits(512);
+
+    let handler = Dead::default();
+    let shutdown = CancellationToken::new();
+    let run = start_drain(
+        connect(&bootstrap).await,
+        handler.clone(),
+        ConsumerOptions::<Kafka>::new().with_shutdown(shutdown.clone()),
+    );
+    wait_while_draining(
+        &run,
+        || handler.count() == 3,
+        DELIVERY_TIMEOUT,
+        "three dead letters reaching handle_dead",
+    )
+    .await;
+    wait_while_draining(
+        &run,
+        || mock.offset_commit_requests() >= 1,
+        DELIVERY_TIMEOUT,
+        "a commit reaching the broker",
+    )
+    .await;
+    assert_eq!(
+        committed_position_on(&bootstrap, DRAIN_DLQ, DRAIN_GROUP, 0).await,
+        None,
+        "the commits made while the drain ran were refused"
+    );
+
+    let refused = mock.offset_commit_requests();
+    wait_while_draining(
+        &run,
+        || mock.offset_commit_requests() > refused,
+        DELIVERY_TIMEOUT,
+        "a refused position offered again",
+    )
+    .await;
+    mock.accept_commits();
+    let before_stop = mock.offset_commit_requests();
+    stop_drain(run, &shutdown).await;
+    let after_stop = mock.offset_commit_requests();
+    assert!(
+        after_stop > before_stop,
+        "the last OffsetCommit followed the stop: {before_stop} before it, {after_stop} after"
+    );
+    assert_eq!(
+        committed_position_on(&bootstrap, DRAIN_DLQ, DRAIN_GROUP, 0).await,
+        Some(3),
+        "the final commit carried the position of the three dead letters"
+    );
+}
+
+/// A drain whose task is aborted closes its consumer off the runtime thread.
+/// The dead letter's commit has landed, so nothing is in flight when the
+/// abort drops the drain where it waits; the close it leaves behind waits for
+/// the held LeaveGroup answer while a ticker on the same current-thread
+/// runtime keeps ticking.
+#[tokio::test(flavor = "current_thread")]
+async fn an_aborted_dlq_drain_closes_off_runtime() {
+    let (mock, bootstrap) = drain_mock(&["A"]).await;
+    mock.track_requests();
+    mock.answer_next_late(
+        RDKafkaApiKey::LeaveGroup,
+        CLOSE_HOLD,
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR,
+    );
+
+    let handler = Dead::default();
+    let ticker = Ticker::start();
+    let run = start_drain(
+        connect(&bootstrap).await,
+        handler.clone(),
+        ConsumerOptions::<Kafka>::new().with_shutdown(CancellationToken::new()),
+    );
+    wait_for_position(
+        &bootstrap,
+        DRAIN_DLQ,
+        DRAIN_GROUP,
+        1,
+        DELIVERY_TIMEOUT,
+        "A committed",
+    )
+    .await;
+
+    let aborted_at = Instant::now();
+    run.abort();
+    let _ = run.await;
+    tokio::time::sleep(CLOSE_HOLD + TICK_STALL).await;
+    assert!(
+        mock.requests_of(RDKafkaApiKey::LeaveGroup) >= 1,
+        "the aborted drain's close reached the coordinator"
+    );
+    let stall = ticker.longest_gap_since(aborted_at);
+    assert!(
+        stall < TICK_STALL,
+        "the close waited for the held LeaveGroup off the runtime thread, the ticker stopped for {stall:?}"
+    );
+    assert_eq!(handler.ids(), ["A"]);
+}
+
+/// A drain that ends a connection on an error waits for its consumer's close,
+/// off the runtime thread, before it reconnects. The broker refuses one fetch
+/// for authorization, which librdkafka reports to the consumer once and
+/// leaves to the reconnect, and the mock holds the answer to the LeaveGroup
+/// the close sends: the reconnect's JoinGroup reaches the broker only once
+/// that answer is in. A ticker on the same current-thread runtime keeps
+/// ticking through the close.
+#[tokio::test(flavor = "current_thread")]
+async fn a_dlq_drain_error_exit_closes_before_it_reconnects() {
+    let (mock, bootstrap) = drain_mock(&["A"]).await;
+    mock.track_requests();
+    mock.answer_next_late(
+        RDKafkaApiKey::LeaveGroup,
+        CLOSE_HOLD,
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR,
+    );
+
+    let handler = Dead::default();
+    let ticker = Ticker::start();
+    let shutdown = CancellationToken::new();
+    let run = start_drain(
+        connect(&bootstrap).await,
+        handler.clone(),
+        ConsumerOptions::<Kafka>::new().with_shutdown(shutdown.clone()),
+    );
+    wait_for_position(
+        &bootstrap,
+        DRAIN_DLQ,
+        DRAIN_GROUP,
+        1,
+        DELIVERY_TIMEOUT,
+        "A committed",
+    )
+    .await;
+
+    let failing_at = Instant::now();
+    mock.api().request_errors(
+        RDKafkaApiKey::Fetch,
+        &[RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED],
+    );
+    let joins_before = mock.requests_of(RDKafkaApiKey::JoinGroup);
+    wait_while_draining(
+        &run,
+        || mock.requests_of(RDKafkaApiKey::JoinGroup) > joins_before,
+        CLOSE_HOLD + DELIVERY_TIMEOUT,
+        "the reconnected drain joining the group again",
+    )
+    .await;
+
+    let left = *mock
+        .request_timestamps(RDKafkaApiKey::LeaveGroup)
+        .first()
+        .expect("the close sent a LeaveGroup");
+    let rejoined = mock
+        .request_timestamps(RDKafkaApiKey::JoinGroup)
+        .into_iter()
+        .find(|&joined| joined > left)
+        .expect("the reconnect sent a JoinGroup after the LeaveGroup");
+    let gap = Duration::from_micros(u64::try_from(rejoined - left).expect("arrival order"));
+    assert!(
+        gap >= CLOSE_HOLD,
+        "the reconnect waits for the close, which waits for the held LeaveGroup answer: gap {gap:?}"
+    );
+    let stall = ticker.longest_gap_since(failing_at);
+    assert!(
+        stall < TICK_STALL,
+        "the close waited for the held LeaveGroup off the runtime thread, the ticker stopped for {stall:?}"
+    );
+
+    stop_drain(run, &shutdown).await;
 }
 
 // ---------------------------------------------------------------------------
