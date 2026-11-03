@@ -1,0 +1,14 @@
+src/backends/kafka/mod.rs
+  h_f81d3033687456 51-53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1a38df2d57e4a0eabb8ed02d3fbe426792a405dc",
+  "prompts": {},
+  "humans": {
+    "h_f81d3033687456": {
+      "author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
