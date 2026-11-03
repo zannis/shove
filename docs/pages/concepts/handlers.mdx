@@ -193,6 +193,7 @@ Under `RetryStrategy::Republish`, `shove` increments the count itself and carrie
 Under `RetryStrategy::InPlace` no copy is published.
 Kafka then keeps the count in memory for the redelivery.
 An external NATS stream reads it from the JetStream delivery information, which counts every redelivery.
+A sequenced Kafka consumer publishes no copy under either strategy and keeps the count in memory too, seeded from the record's `Shove-Retry-Count` header on every delivery, so a restart, a rebalance or a crash starts it again.
 
 ### `retry_count` vs `delivery_count`
 
@@ -208,6 +209,8 @@ It holds the original un-acked for the delay, with progress acknowledgements, th
 In every case the count survives the hop because `shove` carries it in a header.
 Under `RetryStrategy::InPlace` on Kafka, implied by an external topology, no copy is published.
 The count advances on each `Retry` the handler's task waits out, and is kept in memory for the redelivery.
+A sequenced Kafka consumer publishes no copy under either strategy.
+Its count advances on each `Retry` its receive loop waits out, and is seeded from the record's `Shove-Retry-Count` header on every delivery, so a restart, a rebalance or a crash starts it again.
 Under `RetryStrategy::InPlace` on an external NATS stream, the count is the number of redeliveries JetStream reports.
 A `Defer` nak and an `ack_wait` expiry are redeliveries there, so they advance it too.
 
@@ -224,13 +227,14 @@ A `Defer` nak and an `ack_wait` expiry are redeliveries there, so they advance i
 
 Treat `None` as "unknown", never as zero. Where it is reported, a first delivery is `Some(1)`.
 
-Because the count belongs to a *broker-level* message, anything that creates a new one restarts it at 1. Under `RetryStrategy::Republish`, the default on a shove-owned topology, `Retry` publishes an incremented copy and so resets `delivery_count`; `retry_count` is the field that survives a retry. Under `RetryStrategy::InPlace`, Kafka on an external or opted-in topology and NATS on an external stream, no copy is published and the same record comes back: Kafka keeps `retry_count` in memory, and NATS reads it from this very count, which climbs with every redelivery there. `Defer` resets `delivery_count` where deferring re-sends the message (SQS) and preserves it where deferring naks in place (NATS, and the in-process broker, which models NATS here).
+Because the count belongs to a *broker-level* message, anything that creates a new one restarts it at 1. Under `RetryStrategy::Republish`, the default on a shove-owned topology, `Retry` publishes an incremented copy and so resets `delivery_count`; `retry_count` is the field that survives a retry. Under `RetryStrategy::InPlace`, Kafka on an external or opted-in topology and NATS on an external stream, no copy is published and the same record comes back: Kafka keeps `retry_count` in memory, and NATS reads it from this very count, which climbs with every redelivery there. On a sequenced Kafka topic a `Retry` under `RetryStrategy::Republish` waits in place too and publishes no copy, and Kafka keeps `retry_count` in memory. `Defer` resets `delivery_count` where deferring re-sends the message (SQS) and preserves it where deferring naks in place (NATS, and the in-process broker, which models NATS here).
 
 That last case is what `delivery_count` is for; see [Bounding a `Defer` loop](/guides/retries#defer-vs-retry).
 
 A consumer running with `RetryStrategy::InPlace` publishes no copy on `Retry` or `Defer`: on Kafka, where an external topology implies it and a shove-owned one may opt into it, the handler's task waits and hands the record back; on an external NATS stream the broker redelivers after a delayed `Nak`.
 The same record comes back in place.
 On Kafka its `retry_count` is kept in memory for the redelivery.
+A sequenced Kafka consumer waits the same way under either strategy, in its receive loop rather than a handler's task, and every new consumer incarnation starts its count again from the record's header.
 On an external NATS stream it is read from the JetStream delivery information, which counts every redelivery.
 
 ## Dead-letter handling
