@@ -1,6 +1,6 @@
 # Kafka — Audited Consumer
 
-Use this when you need to confirm that audit trace IDs survive Kafka hold-queue retries. The handler returns `Outcome::Retry` on first delivery; both delivery attempts emit a JSON audit record with the same UUID, demonstrating that the `trace_id` propagates correctly through Kafka record headers across the hold-queue topic round-trip.
+Use this to see the `Audited` wrapper on Kafka. The handler returns `Outcome::Retry` on first delivery, so the message is delivered twice and each delivery emits a JSON audit record. The example publishes with `publish`, which sets no `x-trace-id` header, so the two records carry different `trace_id` values. To keep one `trace_id` across the attempts, publish with `publish_with_headers` and an `x-trace-id` header, as [Trace ID propagation](#trace-id-propagation) describes.
 
 ## Prerequisites
 
@@ -29,7 +29,7 @@ published payment
 }
 [handler] payment=PAY-001 amount=$49.99 attempt=2
 [audit] {
-  "trace_id": "550e8400-e29b-41d4-a716-446655440000",
+  "trace_id": "9b2f6c1e-3d7a-4c58-8e1f-a47d02c5b6d3",
   "outcome": "Ack",
   "duration_ms": 0,
   ...
@@ -37,7 +37,7 @@ published payment
 done
 ```
 
-The same UUID appears on both delivery attempts. The 10-second run window allows the 5-second hold queue topic to deliver the retried message before shutdown.
+Each delivery attempt has its own UUID, because the example sets no `x-trace-id`. The 10-second run window leaves room for the 5-second retry delay and the redelivery before shutdown.
 
 ## Source
 
@@ -55,17 +55,17 @@ Unlike the Kafka sequenced example (which drops to `KafkaConsumer::run_fifo`), t
 
 `StdoutAuditHandler` derives `Clone` and `Default` because the factory closure `|| PaymentHandler.audited(StdoutAuditHandler)` is called once per spawned consumer, and each call produces a fresh `Audited\<PaymentHandler, StdoutAuditHandler\>` value. In this example `StdoutAuditHandler` holds no state, so `Clone` is trivially cheap. A real audit handler that batches records to Kafka would clone an `Arc<Producer>` instead.
 
-### Trace ID propagation via Kafka headers
+### Trace ID propagation
 
-On Kafka, shove embeds the `trace_id` in a record header (`shove-trace-id`). When `Outcome::Retry` causes the message to be published to the hold-queue topic, the `shove-trace-id` header is copied to the hold-queue record. When the hold-queue consumer redelivers the message back to the main topic, the header is again copied. This chain of header propagation is what allows the same UUID to appear on both the retry and the final ack delivery without any changes to the handler code.
+`Audited` takes the `trace_id` from the `x-trace-id` header of the delivery, and generates a new UUID for a delivery that has none. A retry copy carries the headers of the original, so a publisher that sets `x-trace-id` with `publish_with_headers` keeps one `trace_id` across every attempt. See [Trace ID propagation](/guides/audit#trace-id-propagation) for the call.
 
-### Hold queue as a separate Kafka topic
+### The retry delay
 
-On Kafka, `Outcome::Retry` publishes the message to `kafka-audited-payments-hold-5s` (a separate Kafka topic) and commits the offset on the main topic. After 5 seconds a framework-internal consumer reads from the hold-queue topic and republishes to the main topic. This is why the 10-second run window is needed — the 5-second TTL plus consume-and-republish latency must both fit within the window.
+On Kafka, `Outcome::Retry` creates no hold-queue topic. The consumer waits the tier's delay, 5 seconds here from `.hold_queue(Duration::from_secs(5))`, then republishes the message into `kafka-audited-payments` with the retry count incremented in its `Shove-Retry-Count` header. This is why the example needs a 10-second run window: the 5-second delay and the republish round trip must both fit within it.
 
 ## What to try next
 
-- Inspect the Kafka topic list after the example exits — you should see `kafka-audited-payments`, `kafka-audited-payments-hold-5s`, and `kafka-audited-payments-dlq` all present.
+- Inspect the Kafka topic list after the example exits — you should see `kafka-audited-payments` and `kafka-audited-payments-dlq`, and no hold-queue topic.
 - Add `.with_max_retries(1)` and make `PaymentHandler` always retry — verify the audit record shows `outcome: "Reject"` on the final delivery after the retry limit.
 - Replace `StdoutAuditHandler` with one that publishes to a separate Kafka topic using the same `broker.publisher()`.
 - See [Guides: Audit](/guides/audit) for the complete `AuditRecord` schema.

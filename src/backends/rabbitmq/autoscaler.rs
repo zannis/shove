@@ -81,7 +81,7 @@ impl<S: QueueStatsProvider> AutoscalerBackend for RabbitMqAutoscalerBackend<S> {
     }
 
     async fn fetch_metrics(&self, group: &Self::GroupId) -> Result<ScalingMetrics> {
-        let (queue, prefetch, active) = {
+        let (queue, concurrent, prefetch, active) = {
             let reg = self.registry.lock().await;
             let g = reg
                 .groups()
@@ -89,6 +89,7 @@ impl<S: QueueStatsProvider> AutoscalerBackend for RabbitMqAutoscalerBackend<S> {
                 .ok_or_else(|| ShoveError::Topology(format!("group not found: {group}")))?;
             (
                 g.queue().to_owned(),
+                g.config().concurrent_processing(),
                 g.config().prefetch_count(),
                 g.active_consumers(),
             )
@@ -105,10 +106,11 @@ impl<S: QueueStatsProvider> AutoscalerBackend for RabbitMqAutoscalerBackend<S> {
             "fetched metrics"
         );
 
-        Ok(ScalingMetrics::new(
+        Ok(ScalingMetrics::for_group(
             stats.messages_ready,
             stats.messages_unacknowledged,
-            active as u16,
+            active,
+            concurrent,
             prefetch,
         ))
     }
