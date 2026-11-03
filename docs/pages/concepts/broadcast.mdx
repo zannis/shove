@@ -128,7 +128,7 @@ The tail is the default start, not the only one.
 `ConsumerOptions::with_broadcast_start` takes a `BroadcastStart`, and Kafka honours all three variants.
 `Tail` is the default, and `Head` replays every retained record before tailing.
 `Timestamp(ms)` starts at the first record at or after that instant, resolved with the same lookup `reset_consumer_group_offsets` uses.
-A partition added while the subscription runs is assigned at the same start.
+A partition added while the subscription runs is assigned at the same start, and the partitions already assigned keep fetching where they are.
 See [Starting a broadcast subscription elsewhere than the tail](/backends/kafka#starting-a-broadcast-subscription-elsewhere-than-the-tail).
 
 One wrinkle worth knowing about if you go looking at client config: librdkafka refuses `assign()` on a consumer handle with no `group.id` at all, so `shove` configures the fixed string `{queue}-broadcast`. It is inert — nothing joins under it and nothing commits to it — and it is deliberately *not* a per-process value, because a per-restart identifier showing up in client tooling is the same accumulating residue this feature exists to avoid.

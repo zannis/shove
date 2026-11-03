@@ -1608,10 +1608,10 @@ async fn route_shard_retry(
     queue: &str,
 ) {
     let delivery = &received.delivery;
-    if !shard_hold_queues.is_empty() {
-        let new_retry_count = retry_count + 1;
-        let index = hold_index(retry_count, shard_hold_queues.len());
-        let hold_queue = &shard_hold_queues[index];
+    if let Some(hold_queue) = hold_index(retry_count, shard_hold_queues.len())
+        .and_then(|index| shard_hold_queues.get(index))
+    {
+        let new_retry_count = retry_count.saturating_add(1);
         let headers = router::clone_headers_with_retry(delivery, new_retry_count);
 
         match publisher
