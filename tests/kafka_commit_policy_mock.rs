@@ -34,11 +34,17 @@
 //! are shove-owned, because a republish writes into its topic, and are
 //! created through the mock API as well.
 //!
-//! The final section runs a sequenced consumer against the same mock: a
-//! streak of rejected commits fences it, and it reconnects once the close
-//! that error exit makes has had its LeaveGroup answered; and a stop that
-//! finds its commit in flight unanswered reports the share of the shutdown
-//! deadline it waited, as the standard consumer's does under `Interval`.
+//! A section runs a sequenced consumer against the same mock: a streak of
+//! rejected commits fences it, and it reconnects once the close that error
+//! exit makes has had its LeaveGroup answered; and a stop that finds its
+//! commit in flight unanswered reports the share of the shutdown deadline it
+//! waited, as the standard consumer's does under `Interval`.
+//!
+//! The final section takes the broker down for a few seconds, which a
+//! settled member rides out on the client it started with and a member fresh
+//! from a rebalance reconnects through, and stops a member whose handler
+//! holds its only permit past the poll interval, whose drain keeps polling
+//! through a rebalance.
 //!
 //! `test-support` gates the seams this file reads; both Kafka coverage rows
 //! enable it, so the suite runs in each.
@@ -72,9 +78,9 @@ use shove::consumer_group::ConsumerGroupConfig;
 use shove::handler::MessageHandler;
 use shove::kafka::{
     CommitPolicy, KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroup,
-    KafkaConsumerGroupConfig, fence_probe, final_commit_spawn_probe,
+    KafkaConsumerGroupConfig, client_id_probe, fence_probe, final_commit_spawn_probe,
     housekeeping_interval_for_test, pending_commit_budget_for_test, per_record_probe,
-    shutdown_commit_deadline_for_test,
+    put_back_probe, shutdown_commit_deadline_for_test,
 };
 use shove::markers::Kafka;
 use shove::metadata::MessageMetadata;
@@ -1424,18 +1430,21 @@ async fn wait_for_return_position(bootstrap: &str, partition: i32, expected: i64
     }
 }
 
-/// The two-partition return topic with a per-record member A on it, and the
+/// The two-partition return topic with a one-permit member A on it, and the
 /// cycle that hands A a partition back paused: A holds `hold-{round}` on
 /// partition 0 and is paused over both partitions, B joins and the
 /// cooperative rebalance moves one partition to it, A's hold ends and A
 /// works through what it kept, B leaves, and the moved partition returns to
-/// an idle, unpaused A with the pause flag it left with. `produced` counts
-/// the records on each partition, so a committed position can be waited
-/// for whoever consumed the records.
+/// an idle, unpaused A with the pause flag it left with. Under `PerRecord`
+/// taking the held record pauses A; under `Interval` the record behind it
+/// waits for the permit, and the one after that is put back, which pauses
+/// A. `produced` counts the records on each partition, so a committed
+/// position can be waited for whoever consumed the records.
 struct ReturnCycle {
     /// Lives for the cluster; the broker is reached through `bootstrap`.
     _mock: Mock,
     bootstrap: String,
+    policy: CommitPolicy,
     a: Holding,
     run_a: tokio::task::JoinHandle<Result<(), ShoveError>>,
     token_a: CancellationToken,
@@ -1444,7 +1453,7 @@ struct ReturnCycle {
 }
 
 impl ReturnCycle {
-    async fn start() -> Self {
+    async fn start(policy: CommitPolicy) -> Self {
         let mock = Mock::start();
         let bootstrap = mock.bootstrap();
         mock.api()
@@ -1452,16 +1461,16 @@ impl ReturnCycle {
             .expect("create the return topic through the mock API");
         mock.track_requests();
         let (release, released) = watch::channel(0);
-        // Member A: a commit per record, one permit, and a payload limit a
-        // padded record exceeds.
+        // Member A: one permit, and a payload limit a padded record exceeds.
         let a = Holding::new(released);
         let (run_a, token_a) =
             start_on_return_topic(connect(&bootstrap).await, a.clone(), |token| {
-                options(CommitPolicy::PerRecord, token).with_max_message_size(SIZE_LIMIT)
+                options(policy, token).with_max_message_size(SIZE_LIMIT)
             });
         Self {
             _mock: mock,
             bootstrap,
+            policy,
             a,
             run_a,
             token_a,
@@ -1493,9 +1502,20 @@ impl ReturnCycle {
         .await;
         // One probe per partition, unconsumed while A is paused: whichever
         // partition moves to B, B's first record comes from it.
+        let put_back = put_back_probe::permit_wait();
         for partition in RETURN_PARTITIONS {
             self.produce(&format!("probe-{round}-{partition}"), partition)
                 .await;
+        }
+        // Under `Interval` the pause is the permit wait's: the first probe
+        // waits for the permit the hold keeps, and the second is put back.
+        if matches!(self.policy, CommitPolicy::Interval(_)) {
+            wait_until(
+                || put_back_probe::permit_wait() > put_back,
+                DELIVERY_TIMEOUT,
+                "A pausing while a probe waits for the permit",
+            )
+            .await;
         }
 
         // Member B joins, and the cooperative rebalance moves one partition
@@ -1607,7 +1627,7 @@ impl ReturnCycle {
 /// cycle runs again; the top-of-pass path has its own test below.
 #[tokio::test]
 async fn a_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_the_assign() {
-    let mut cycle = ReturnCycle::start().await;
+    let mut cycle = ReturnCycle::start(CommitPolicy::PerRecord).await;
     let mut met_in_the_receive_arm = false;
     for round in 1..=RECEIVE_ARM_ATTEMPTS {
         let (moved, kept) = cycle.hand_a_partition_back_paused(round).await;
@@ -1650,7 +1670,7 @@ async fn a_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_t
 /// and discarded there, and the record never arrives.
 #[tokio::test]
 async fn a_partition_handed_back_paused_is_resumed_when_a_pass_drains_the_assign() {
-    let mut cycle = ReturnCycle::start().await;
+    let mut cycle = ReturnCycle::start(CommitPolicy::PerRecord).await;
     let (moved, _kept) = cycle.hand_a_partition_back_paused(1).await;
     let at_top_of_pass = per_record_probe::reconciled_at_top_of_pass();
     let at_receive_arm = per_record_probe::assigns_drained_at_receive_arm();
@@ -1668,6 +1688,73 @@ async fn a_partition_handed_back_paused_is_resumed_when_a_pass_drains_the_assign
     );
 
     cycle.prove_resumed(moved, "after-return").await;
+    cycle.stop().await;
+}
+
+/// The same return under `Interval`, where the pause is the permit wait's:
+/// the probe behind the held record waits for the permit, and the probe
+/// after it is put back with the assignment paused. The moved partition
+/// keeps that pause flag across the revoke and comes back paused once B
+/// leaves, and nothing in the member's own cycle resumes it, because a
+/// record taken under `Interval` pauses nothing. The housekeeping pass
+/// drains the assign and re-applies the member's intent, unpaused, over the
+/// whole assignment, so the record produced onto the returned partition
+/// afterwards arrives. Red while only `PerRecord` re-applied the intent.
+#[tokio::test]
+async fn interval_partition_revoked_while_paused_resumes_on_reassign() {
+    let mut cycle = ReturnCycle::start(CommitPolicy::Interval(Duration::from_millis(500))).await;
+    let (moved, _kept) = cycle.hand_a_partition_back_paused(1).await;
+    let at_top_of_pass = per_record_probe::reconciled_at_top_of_pass();
+    let at_receive_arm = per_record_probe::assigns_drained_at_receive_arm();
+
+    // Nothing is produced, so the next pass is the housekeeping tick's.
+    tokio::time::sleep(housekeeping_interval_for_test() + Duration::from_secs(1)).await;
+    cycle.prove_resumed(moved, "after-return").await;
+    assert!(
+        per_record_probe::reconciled_at_top_of_pass() > at_top_of_pass,
+        "the housekeeping pass drained the assign and reconciled it"
+    );
+    assert_eq!(
+        per_record_probe::assigns_drained_at_receive_arm(),
+        at_receive_arm,
+        "nothing came through recv before that pass"
+    );
+    cycle.stop().await;
+}
+
+/// The receive-arm return under `Interval`: the assign is drained by the
+/// receive arm, ahead of the record over the size limit on the kept
+/// partition that brought it, and that drain re-applies the member's intent
+/// itself. Under `Interval` nothing else would, because the dropped record
+/// pauses and resumes nothing. The record produced onto the returned
+/// partition afterwards is the proof. The housekeeping tick can take the
+/// assign first, in which case the cycle runs again, as in the `PerRecord`
+/// test above.
+#[tokio::test]
+async fn interval_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_the_assign() {
+    let mut cycle = ReturnCycle::start(CommitPolicy::Interval(Duration::from_millis(500))).await;
+    let mut met_in_the_receive_arm = false;
+    for round in 1..=RECEIVE_ARM_ATTEMPTS {
+        let (moved, kept) = cycle.hand_a_partition_back_paused(round).await;
+        let at_top_of_pass = per_record_probe::reconciled_at_top_of_pass();
+        let at_receive_arm = per_record_probe::assigns_drained_at_receive_arm();
+        cycle.drop_an_oversize_record_on(kept).await;
+        cycle
+            .prove_resumed(moved, &format!("after-return-{round}"))
+            .await;
+        if per_record_probe::assigns_drained_at_receive_arm() > at_receive_arm {
+            met_in_the_receive_arm = true;
+            break;
+        }
+        assert!(
+            per_record_probe::reconciled_at_top_of_pass() > at_top_of_pass,
+            "the assign was reconciled by one drain or the other"
+        );
+    }
+    assert!(
+        met_in_the_receive_arm,
+        "the receive arm drained no assign in {RECEIVE_ARM_ATTEMPTS} cycles"
+    );
     cycle.stop().await;
 }
 
@@ -2833,7 +2920,7 @@ async fn an_unpublishable_record_whose_dead_letter_also_fails_is_discarded_as_lo
 /// to the broker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_waiting_briefly_for_a_permit_is_not_put_back() {
-    use shove::kafka::{permit_wait_probe, put_back_probe};
+    use shove::kafka::permit_wait_probe;
 
     const DRAIN_TOPIC: &str = "kafka-permit-wait-drain";
     const RECORDS: usize = 200;
@@ -4142,4 +4229,255 @@ async fn a_sequenced_stop_with_its_commit_unanswered_reports_the_pending_share()
         "no second commit races the one in flight"
     );
     assert_eq!(handler.ids(), ["o1"]);
+}
+
+// ---------------------------------------------------------------------------
+// A broker bounce ridden out on the client the member started with, one soon
+// after a rebalance that reconnects, and a stop that keeps polling while a
+// handler holds the permit
+// ---------------------------------------------------------------------------
+
+/// A broker that goes away for a few seconds and comes back costs the member
+/// nothing but the outage. librdkafka reports the refused reconnects, and
+/// every broker being down, as consumer errors and reconnects on its own, so
+/// the loop logs them and goes on polling on the same client: the
+/// `client.id` the member started with is the only one it ever has, and the
+/// record produced after the bounce reaches the handler. Red while every
+/// receive error ended the loop and reconnected it on a fresh client.
+#[tokio::test]
+async fn broker_bounce_does_not_rejoin() {
+    const BOUNCE: Duration = Duration::from_secs(3);
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    produce(&bootstrap, &["o1"]).await;
+
+    let handler = Acking::default();
+    let h = handler.clone();
+    let (run, shutdown) = start(connect(&bootstrap).await, h, |token| {
+        options(CommitPolicy::Interval(Duration::from_millis(500)), token)
+    });
+    wait_for_committed_position(&bootstrap, 1, DELIVERY_TIMEOUT).await;
+    let clients = client_id_probe::created();
+    assert_eq!(
+        clients.len(),
+        1,
+        "one consumer before the bounce: {clients:?}"
+    );
+
+    mock.api()
+        .broker_down(BROKER_ID)
+        .expect("take the mock broker down");
+    tokio::time::sleep(BOUNCE).await;
+    mock.api()
+        .broker_up(BROKER_ID)
+        .expect("bring the mock broker back");
+
+    produce(&bootstrap, &["o2"]).await;
+    wait_until(
+        || handler.count() == 2,
+        DELIVERY_TIMEOUT,
+        "the record produced after the bounce reaching the handler",
+    )
+    .await;
+    wait_for_committed_position(&bootstrap, 2, DELIVERY_TIMEOUT).await;
+    assert_eq!(
+        client_id_probe::created(),
+        clients,
+        "the member rode out the bounce on the client it started with"
+    );
+    assert_eq!(handler.ids(), ["o1", "o2"]);
+
+    shutdown.cancel();
+    run.await
+        .expect("the run task completes")
+        .expect("a clean stop");
+}
+
+/// A broker bounce soon after a rebalance ends a member's loop, and the
+/// member reconnects on a fresh client. The rebalance may have changed the
+/// assignment while a committed-offset fetch was pending, and librdkafka's
+/// only trace of a fetch that change stranded is a `__TRANSPORT`, the code a
+/// failed reconnect reports too (bundled librdkafka 2.12.1,
+/// `rdkafka_assignment.c:283-298`). Member A takes both partitions of the
+/// return topic, and B joins straight after, so the cooperative rebalance
+/// revokes one of A's partitions within seconds of A's assign.
+///
+/// The broker then stays down until a member has reconnected. A member's
+/// first reconnect to it fails at once where the host refuses the
+/// connection, and once the connect times out where the host lets it hang,
+/// after about 8 s on macOS; either way inside the default
+/// `socket.timeout.ms`, 60 s, of the rebalance. A 3 s bounce on macOS
+/// surfaces no `__TRANSPORT` at all, only every broker being down. The
+/// close that ends the member's loop waits out the shutdown deadline against
+/// the down broker, and the member reconnects after it. Red while every
+/// `__TRANSPORT` was ridden out, whatever the rebalance callback had served.
+#[tokio::test]
+async fn broker_bounce_soon_after_a_rebalance_reconnects() {
+    /// The bound for a wait that spans a rebalance: the mock coordinator
+    /// waits up to `session.timeout.ms` for its members to rejoin.
+    const REBALANCE_TIMEOUT: Duration = Duration::from_secs(60);
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    mock.api()
+        .create_topic(RETURN_TOPIC, 2, 1)
+        .expect("create the return topic through the mock API");
+    let (_release, released) = watch::channel(0);
+    let a = Holding::new(released.clone());
+    let (run_a, token_a) = start_on_return_topic(connect(&bootstrap).await, a.clone(), |token| {
+        ConsumerOptions::<Kafka>::new().with_shutdown(token)
+    });
+    for partition in RETURN_PARTITIONS {
+        produce_pinned(&bootstrap, &format!("a-{partition}"), partition).await;
+    }
+    wait_until(
+        || a.seen().len() == RETURN_PARTITIONS.len(),
+        DELIVERY_TIMEOUT,
+        "A handling a record of each partition",
+    )
+    .await;
+
+    let b = Holding::new(released);
+    let (run_b, token_b) = start_on_return_topic(connect(&bootstrap).await, b.clone(), |token| {
+        ConsumerOptions::<Kafka>::new().with_shutdown(token)
+    });
+    // Whichever partition moves to B, B has a record of it.
+    for partition in RETURN_PARTITIONS {
+        produce_pinned(&bootstrap, &format!("b-{partition}"), partition).await;
+    }
+    wait_until(
+        || !b.seen().is_empty(),
+        REBALANCE_TIMEOUT,
+        "B handling a record of the partition it took",
+    )
+    .await;
+    let before = client_id_probe::created();
+    assert_eq!(
+        before.len(),
+        2,
+        "one consumer per member before the bounce: {before:?}"
+    );
+
+    mock.api()
+        .broker_down(BROKER_ID)
+        .expect("take the mock broker down");
+    wait_until(
+        || client_id_probe::created().len() > before.len(),
+        DELIVERY_TIMEOUT,
+        "a member reconnecting on a fresh client while the broker is down",
+    )
+    .await;
+    mock.api()
+        .broker_up(BROKER_ID)
+        .expect("bring the mock broker back");
+
+    // The reconnect rebalances the group, so a final commit may be refused.
+    token_a.cancel();
+    token_b.cancel();
+    let _ = run_a.await.expect("A's task completes");
+    let _ = run_b.await.expect("B's task completes");
+}
+
+/// A stop that finds a handler holding the only permit keeps the member
+/// polling while it waits for that permit: the drain polls with the
+/// assignment paused and puts back what it is handed. Member A, a group
+/// member with the poll interval at its 10 s floor, holds the head of
+/// partition 0. A stops, and member B joins while A drains. The cooperative
+/// rebalance cannot finish until A serves its revoke, which only a drain
+/// that polls does. A's hold then runs past that interval and the session
+/// timeout both. B handling a record of the partition it took, and no
+/// LeaveGroup reaching the coordinator inside the hold, show the drain
+/// served the rebalance and A stayed in its group: librdkafka leaves the
+/// group for a member that outlasts its poll interval (bundled librdkafka
+/// 2.12.1, `rdkafka_cgrp.c:5200-5201`). Its warning says so too, but it is
+/// delivered through the consumer's own queue (rust-rdkafka 0.39,
+/// `client.rs:257-276`), so a member that has stopped polling never logs
+/// it; the LeaveGroup is the trace that does not depend on the member. Red
+/// while the drain parked on the semaphore: A left its group at the poll
+/// interval, and only then did B take its partitions.
+#[tokio::test]
+async fn shutdown_drain_keeps_polling() {
+    /// How long past A's poll interval the coordinator's requests are read:
+    /// librdkafka checks the interval on a timer of its own.
+    const PAST_THE_INTERVAL: Duration = Duration::from_secs(3);
+    /// The bound for a wait that spans a rebalance: the mock coordinator
+    /// waits up to `session.timeout.ms` for its members to rejoin.
+    const REBALANCE_TIMEOUT: Duration = Duration::from_secs(60);
+    let logged = Logged::install();
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    mock.api()
+        .create_topic(RETURN_TOPIC, 2, 1)
+        .expect("create the return topic through the mock API");
+    produce_pinned(&bootstrap, "hold-1", 0).await;
+    mock.track_requests();
+
+    let (release, released) = watch::channel(0);
+    let a = Holding::new(released.clone());
+    let token_a = CancellationToken::new();
+    let h = a.clone();
+    let mut group_a = KafkaConsumerGroup::new::<ReturnTopic, _>(
+        RETURN_TOPIC,
+        KafkaConsumerGroupConfig::new(1..=1)
+            .with_prefetch_count(1)
+            .with_max_poll_interval_for_test(SHORT_POLL_INTERVAL),
+        connect(&bootstrap).await,
+        token_a.clone(),
+        move || h.clone(),
+        (),
+    );
+    group_a.start();
+    wait_until(
+        || a.has("hold-1"),
+        DELIVERY_TIMEOUT,
+        "A holding the head of partition 0",
+    )
+    .await;
+
+    token_a.cancel();
+    let stopped_at = Instant::now();
+    let b = Holding::new(released);
+    let (run_b, token_b) = start_on_return_topic(connect(&bootstrap).await, b.clone(), |token| {
+        ConsumerOptions::<Kafka>::new().with_shutdown(token)
+    });
+    // One record per partition behind the hold: whichever partition moves
+    // to B, B has a record of it to handle.
+    for partition in RETURN_PARTITIONS {
+        produce_pinned(&bootstrap, &format!("behind-{partition}"), partition).await;
+    }
+    wait_until(
+        || !b.seen().is_empty(),
+        REBALANCE_TIMEOUT,
+        "B handling a record of the partition it took",
+    )
+    .await;
+    tokio::time::sleep_until(stopped_at + SHORT_POLL_INTERVAL + PAST_THE_INTERVAL).await;
+    assert_eq!(
+        mock.requests_of(RDKafkaApiKey::LeaveGroup),
+        0,
+        "no member left the group while A's drain waited out the hold"
+    );
+    let evicted: Vec<String> = logged
+        .lines()
+        .into_iter()
+        .filter(|line| line.contains("maximum poll interval"))
+        .collect();
+    assert!(
+        evicted.is_empty(),
+        "A, polling through its drain, logged no eviction: {evicted:?}"
+    );
+    assert_eq!(
+        a.seen()
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["hold-1"],
+        "the drain handed A's handler nothing behind the held record"
+    );
+
+    // B stops inside the rebalance A's departure starts, so its final commit
+    // may be refused; only the rebalance inside the hold matters here.
+    release.send(1).expect("the handlers hold the receiver");
+    group_a.shutdown().await;
+    token_b.cancel();
+    let _ = run_b.await.expect("B's task completes");
 }
