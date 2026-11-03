@@ -133,6 +133,7 @@ Declare a hold queue to choose it.
 Under `RetryStrategy::Republish`, the default on a shove-owned topology, the consumer waits 1 s and republishes the record into the topic.
 A `Retry` carries the retry count incremented by one in its header, and a `Defer` carries it unchanged.
 Under `RetryStrategy::InPlace` the handler's task waits 1 s holding its prefetch slot and hands the same record back, with the count kept in memory.
+A sequenced consumer waits the 1 s in its receive loop under either strategy and hands the same record back, see [Retries in place](#retries-in-place).
 A `Retry` spends `max_retries` under either strategy, so the usual DLQ routing applies once the budget is spent.
 
 Kafka logs no warning for a `Retry` or a `Defer` without hold queues.
@@ -261,6 +262,17 @@ A record the producer refuses as larger than its `message.max.bytes`, librdkafka
 So does a record the broker refuses as too large for the topic or as invalid.
 No later send can get such a record past the limit.
 
+`publish` and `publish_with_headers` send a record again after a transient failure, three sends in all, and then return `ShoveError::Connection`.
+An authorization error is returned at the first refusal as `ShoveError::Topology`.
+A publish on a producer that librdkafka marked fatal returns `ShoveError::Unknown` whatever the cause, including a principal that may not request a producer id; `is_retryable()` is false for both.
+On a sequenced topic `publish_batch` sends the records in slice order and reports the first failure with every record after it, so a re-publish of `to_republish()` stores copies of the failed record and every record after it in slice order; see [Batch publishing](/guides/batch-publishing).
+
+A consumer's retry, defer and DLQ republishes go through the same producer and meet the same errors, and every consume path reads them the same way.
+A `ShoveError::Connection` keeps the record uncommitted, and the consume path tries it again as its section below says.
+An error no retry gets past ends the member with that error: an authorization refusal (`ShoveError::Topology`), a producer that librdkafka marked fatal or that waits to be built again (`ShoveError::Unknown`), or a producer that cannot be built (`ShoveError::Topology`).
+The next publish builds a new producer, at once or after the wait described under [Producer tuning](#producer-tuning).
+A `ShoveError::Validation` marks a record that can never be published: a `Retry` or `Defer` copy is dead-lettered instead with the death reason `republish_failed`, and a dead letter is discarded, committed past and counted in `messages_discarded_total`.
+
 ### Producer tuning
 
 shove pins the correctness-critical producer settings (`acks=all`, `enable.idempotence=true`) and keeps them non-configurable. Idempotence caps `max.in.flight.requests.per.connection` at 5, so sustained throughput is bounded by messages per request — i.e. by batching. librdkafka's defaults (`linger.ms=5`, no compression) favor low latency; high-rate pipelines can raise the throughput ceiling with three opt-in knobs on `KafkaConfig`:
@@ -283,7 +295,11 @@ Unset throughput settings keep librdkafka's defaults.
 
 The client holds a single producer, built at the first publish.
 `publisher()` and the consumer's retry, defer, and DLQ republishes share it.
-A long linger also delays those republishes.
+A producer that librdkafka marked fatal refuses every record from then on, so the publish that meets the error fails and the client builds a new producer.
+It does so at the next publish when the dead producer had delivered a record.
+A producer that died before it delivered anything usually met a fault the next one meets too, such as a principal that may not request a producer id, so the client waits before it builds again: 1 s, doubling for each such producer in a row up to 60 s, and back to 1 s once a producer delivers.
+Until the wait is over every publish fails at once with the same `ShoveError::Unknown`, and no producer is built.
+A long linger also delays the consumer's retry, defer, and DLQ republishes.
 A sequenced consumer handles nothing behind a record until that record's dead letter lands, so a long linger delays every partition the member holds while it dead-letters.
 Keep linger modest when consumers republish on the same client.
 
@@ -682,7 +698,7 @@ Between attempts the consumer waits 1 s, the wait doubling up to 30 s with ±50 
 Nothing behind the record is handled meanwhile.
 No discard is counted for a record kept that way.
 The same holds for a record dropped before the handler and for a `FailAll` cascade.
-A failure no retry gets past, such as a producer that cannot be built, ends the member with that error, and it does not reconnect.
+A failure no retry gets past, such as a refused authorization or a fatal producer (see [Publish](#publish)), ends the member with that error, and it does not reconnect.
 Before it ends, the member makes the final commit a stop makes, so the positions acked ahead of the record are committed.
 The record stays uncommitted, and no discard is counted for it.
 A dead letter that can never be published is not tried again, because trying it again would block the partition for good.
@@ -737,7 +753,7 @@ See [Retries in place](#retries-in-place).
 
 A republish that fails and may succeed later ends the member with a connection error, under either commit policy.
 Nothing is committed past the record meanwhile, and the reconnect resumes from the committed position, so the record is redelivered.
-A failure no retry gets past, such as a producer that cannot be built, ends the member with that error instead, and it does not reconnect.
+A failure no retry gets past, such as a refused authorization or a fatal producer (see [Publish](#publish)), ends the member with that error instead, and it does not reconnect.
 A copy the broker refuses as too large for the topic or as invalid can never be published, so the record is dead-lettered instead, with the death reason `republish_failed`.
 A copy past the producer's `message.max.bytes`, librdkafka's 1 MB default, can never be published either, and neither can its dead letter, which the same producer refuses.
 That record is discarded and committed, an error is logged, and `messages_discarded_total` counts it under `republish_failed`.
@@ -926,7 +942,7 @@ The same holds for a record dropped before the handler, oversize or undecodable.
 Each such failure, of a dead letter or of a republish, costs a reconnect: the member leaves its group and joins it again, which rebalances the group.
 A reconnect counts against `max_reconnect_attempts` like any connection error, and the count resets only after a connection that lasted a minute.
 With a limit set, a DLQ that stays unwritable therefore ends the consumer once the limit is spent; with the default, no limit, the consumer keeps reconnecting under its backoff.
-A failure no retry gets past, such as a producer that cannot be built, ends the member with that error at once.
+A failure no retry gets past, such as a refused authorization or a fatal producer (see [Publish](#publish)), ends the member with that error at once.
 A dead letter that can never be published is the one exception that discards: one past the producer's `message.max.bytes`, or one the broker refuses as too large or as invalid.
 The record is discarded and committed, an error is logged, and `messages_discarded_total` counts it.
 
@@ -950,7 +966,7 @@ A dead letter that fails and may land later retires nothing: nothing is committe
 The batch is handed over again from there after the delay a `Retry` waits, 1 s doubling up to 30 s, and no discard is counted for the record.
 The dead letters behind it on its partition are not tried, and the ones already published are published again with the redelivery.
 A dead letter that can never be published, one past the producer's `message.max.bytes` or one the broker refuses as too large or as invalid, is discarded and committed past, an error is logged, and `messages_discarded_total` counts it.
-A failure no retry gets past, such as a producer that cannot be built, commits nothing of the batch and ends the consumer with that error.
+A failure no retry gets past, such as a refused authorization or a fatal producer (see [Publish](#publish)), commits nothing of the batch and ends the consumer with that error.
 Dead letters are at-least-once.
 A rebalance while they run, a dead letter that fails, and a refused commit whose re-offer has not landed when the partition moves can each hand the batch over again, and its letters that had landed are then published again.
 

@@ -8,6 +8,9 @@
 #![cfg(feature = "kafka")]
 
 use rdkafka::Message;
+use rdkafka::mocking::MockCluster;
+use rdkafka::producer::DefaultProducerContext;
+use rdkafka::types::{RDKafkaApiKey, RDKafkaRespErr};
 use serde::{Deserialize, Serialize};
 use shove::RetryStrategy;
 use shove::SequencedTopic as _;
@@ -1995,6 +1998,298 @@ async fn publish_and_consume_batch() {
     shutdown.cancel();
     handle.await.unwrap().ok();
     assert_eq!(handler.counter.get(), 5);
+    broker.close().await;
+}
+
+// ===========================================================================
+// Publish errors and batch order, against librdkafka's mock cluster
+// ===========================================================================
+
+shove::define_topic!(
+    MockPublishTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-mock-publish").build()
+);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct KeyedRecord {
+    key: String,
+    seq: u32,
+    pad: String,
+}
+
+shove::define_sequenced_topic!(
+    MockSequencedTopic,
+    KeyedRecord,
+    |record: &KeyedRecord| record.key.clone(),
+    TopologyBuilder::new("kafka-mock-sequenced")
+        .sequenced(SequenceFailure::Skip)
+        .allow_message_loss()
+        .build()
+);
+
+/// A mock cluster holding `topic` at one partition, and a broker over a
+/// client connected to it.
+async fn mock_broker_with(
+    topic: &str,
+) -> (MockCluster<'static, DefaultProducerContext>, Broker<Kafka>) {
+    let mock = MockCluster::new(1).expect("mock cluster");
+    mock.create_topic(topic, 1, 1).expect("mock topic");
+    let client = KafkaClient::connect(&KafkaConfig::new(mock.bootstrap_servers()))
+        .await
+        .expect("connect to the mock cluster");
+    (mock, Broker::<Kafka>::from_client(client))
+}
+
+/// The `seq` of every record stored on `topic`'s one partition, in offset
+/// order.
+async fn sequence_on_partition(bootstrap: &str, topic: &str) -> Vec<u32> {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _, StreamConsumer};
+    use rdkafka::{Offset, TopicPartitionList};
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .create()
+        .expect("watermark probe");
+    let (_, high) = probe
+        .fetch_watermarks(topic, 0, Duration::from_secs(10))
+        .expect("fetch the watermarks");
+    let stored = usize::try_from(high).expect("a watermark is never negative");
+    let consumer: StreamConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("group.id", format!("{topic}-read-back"))
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("read-back consumer");
+    let mut assignment = TopicPartitionList::new();
+    assignment
+        .add_partition_offset(topic, 0, Offset::Beginning)
+        .expect("name the partition");
+    consumer.assign(&assignment).expect("assign the partition");
+    let mut seqs = Vec::with_capacity(stored);
+    while seqs.len() < stored {
+        let message = tokio::time::timeout(TIMEOUT, consumer.recv())
+            .await
+            .expect("every stored record is read back")
+            .expect("read a stored record");
+        let record: KeyedRecord =
+            serde_json::from_slice(message.payload().expect("a stored record has a payload"))
+                .expect("decode a stored record");
+        seqs.push(record.seq);
+    }
+    seqs
+}
+
+/// An authorization error is final: the publish returns it at the first
+/// refusal, and the error is not retryable. The mock refuses a single
+/// produce request, so a publish that sent the record again would land it.
+#[tokio::test]
+async fn unauthorized_publish_is_not_retryable() {
+    for refusal in [
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED,
+    ] {
+        let (mock, broker) = mock_broker_with(MockPublishTopic::topology().queue()).await;
+        let publisher = broker.publisher().await.expect("publisher");
+        mock.request_errors(RDKafkaApiKey::Produce, &[refusal]);
+
+        let err = publisher
+            .publish::<MockPublishTopic>(&SimpleMessage {
+                id: "denied".into(),
+                content: "the principal may not write".into(),
+            })
+            .await
+            .expect_err("a refused publish is not sent again");
+
+        assert!(
+            !err.is_retryable(),
+            "{refusal:?} reads as retryable: {err:?}"
+        );
+        assert!(
+            matches!(err, ShoveError::Topology(_)),
+            "{refusal:?}: {err:?}"
+        );
+        broker.close().await;
+    }
+}
+
+/// A record sent again after a failure carries the headers it was first
+/// sent with: the message id, the retry count and the caller's own. The mock
+/// refuses one produce request with an error librdkafka hands back instead
+/// of retrying it, so the publish sends the record a second time itself.
+#[tokio::test]
+async fn a_retried_publish_keeps_its_headers() {
+    use rdkafka::consumer::{Consumer as _, StreamConsumer};
+    use rdkafka::message::{Headers as _, OwnedHeaders};
+    use rdkafka::{Offset, TopicPartitionList};
+
+    const REFUSAL: RDKafkaRespErr = RDKafkaRespErr::RD_KAFKA_RESP_ERR_POLICY_VIOLATION;
+    let topic = MockPublishTopic::topology().queue();
+    let mock = MockCluster::new(1).expect("mock cluster");
+    mock.create_topic(topic, 1, 1).expect("mock topic");
+    let client = KafkaClient::connect(&KafkaConfig::new(mock.bootstrap_servers()))
+        .await
+        .expect("connect to the mock cluster");
+    let broker = Broker::<Kafka>::from_client(client.clone());
+    let publisher = broker.publisher().await.expect("publisher");
+
+    mock.request_errors(RDKafkaApiKey::Produce, &[REFUSAL]);
+    client
+        .publish_with_retry(topic, None, OwnedHeaders::new(), b"{}", 1, "probe")
+        .await
+        .expect_err("a single send meets the refusal");
+
+    mock.request_errors(RDKafkaApiKey::Produce, &[REFUSAL]);
+    publisher
+        .publish_with_headers::<MockPublishTopic>(
+            &SimpleMessage {
+                id: "retried".into(),
+                content: "sent twice".into(),
+            },
+            HashMap::from([("trace-id".to_string(), "trace-7".to_string())]),
+        )
+        .await
+        .expect("the second send lands the record");
+
+    let consumer: StreamConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", mock.bootstrap_servers())
+        .set("group.id", format!("{topic}-read-back"))
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("read-back consumer");
+    let mut assignment = TopicPartitionList::new();
+    assignment
+        .add_partition_offset(topic, 0, Offset::Beginning)
+        .expect("name the partition");
+    consumer.assign(&assignment).expect("assign the partition");
+    let stored = tokio::time::timeout(TIMEOUT, consumer.recv())
+        .await
+        .expect("the record is read back")
+        .expect("read the stored record");
+    let headers: HashMap<String, String> = stored
+        .headers()
+        .map(|headers| {
+            headers
+                .iter()
+                .filter_map(|h| {
+                    h.value
+                        .map(|v| (h.key.to_string(), String::from_utf8_lossy(v).into_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        headers.get("trace-id").map(String::as_str),
+        Some("trace-7"),
+        "{headers:?}"
+    );
+    assert_eq!(
+        headers.get("Shove-Retry-Count").map(String::as_str),
+        Some("0"),
+        "{headers:?}"
+    );
+    assert!(
+        headers
+            .get("Shove-Message-Id")
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .is_some_and(|id| id.get_version_num() == 4),
+        "the message id is a version 4 UUID: {headers:?}"
+    );
+    broker.close().await;
+}
+
+/// A batch on a sequenced topic goes out in slice order and stops at the
+/// first record that fails: the records before it are stored in order,
+/// nothing after it is sent, and the report hands back the failed record
+/// with the whole tail, so republishing that set keeps the key's order. A
+/// record above librdkafka's 1 MB `message.max.bytes` fails as it is
+/// enqueued, in the middle of the batch.
+#[tokio::test]
+async fn sequenced_publish_batch_keeps_slice_order_under_partial_failure() {
+    let topic = MockSequencedTopic::topology().queue();
+    let (mock, broker) = mock_broker_with(topic).await;
+    let publisher = broker.publisher().await.expect("publisher");
+    let batch: Vec<KeyedRecord> = (0..5)
+        .map(|seq| KeyedRecord {
+            key: "account-7".into(),
+            seq,
+            pad: if seq == 2 {
+                "x".repeat(1_100_000)
+            } else {
+                String::new()
+            },
+        })
+        .collect();
+
+    let err = publisher
+        .publish_batch::<MockSequencedTopic>(&batch)
+        .await
+        .expect_err("the oversized record fails");
+
+    let ShoveError::PartialBatch(failure) = &err else {
+        panic!("expected a partial batch, got {err:?}");
+    };
+    assert_eq!(failure.failed(), &[2], "the first record that failed");
+    assert_eq!(failure.unattempted(), &[3, 4], "everything after it");
+    assert_eq!(failure.to_republish(), &[2, 3, 4]);
+    assert_eq!(failure.succeeded(), 2);
+    assert_eq!(
+        sequence_on_partition(&mock.bootstrap_servers(), topic).await,
+        vec![0, 1],
+        "only the records before the failure are stored, in slice order"
+    );
+    broker.close().await;
+}
+
+/// A record whose delivery fails is the failure of a sequenced batch, and
+/// it wins over a later record that cannot be enqueued at all. Records 0
+/// and 1 are each over half of librdkafka's 1 MB `batch.size`, so each
+/// opens its own produce request, and the mock fails the second request.
+/// Record 4 is over `message.max.bytes`, so its enqueue is refused.
+#[tokio::test]
+async fn sequenced_publish_batch_reports_a_delivery_failure_ahead_of_a_later_refusal() {
+    let topic = MockSequencedTopic::topology().queue();
+    let (mock, broker) = mock_broker_with(topic).await;
+    let publisher = broker.publisher().await.expect("publisher");
+    mock.request_errors(
+        RDKafkaApiKey::Produce,
+        &[
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR,
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_POLICY_VIOLATION,
+        ],
+    );
+    let pads = [600_000, 600_000, 0, 0, 1_100_000];
+    let batch: Vec<KeyedRecord> = (0..)
+        .zip(pads)
+        .map(|(seq, pad)| KeyedRecord {
+            key: "account-7".into(),
+            seq,
+            pad: "x".repeat(pad),
+        })
+        .collect();
+
+    let err = publisher
+        .publish_batch::<MockSequencedTopic>(&batch)
+        .await
+        .expect_err("the second record's delivery fails");
+
+    let ShoveError::PartialBatch(failure) = &err else {
+        panic!("expected a partial batch, got {err:?}");
+    };
+    assert_eq!(failure.failed(), &[1], "the failed delivery comes first");
+    assert_eq!(failure.unattempted(), &[2, 3, 4]);
+    assert_eq!(failure.succeeded(), 1);
+    assert!(
+        failure.source().to_string().contains("PolicyViolation"),
+        "the delivery's error is the one reported: {}",
+        failure.source()
+    );
+    let stored = sequence_on_partition(&mock.bootstrap_servers(), topic).await;
+    assert_eq!(stored.first(), Some(&0), "stored: {stored:?}");
+    assert!(
+        !stored.contains(&1) && !stored.contains(&4),
+        "stored: {stored:?}"
+    );
     broker.close().await;
 }
 
