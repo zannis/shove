@@ -31,6 +31,8 @@ use crate::topic::Topic;
 /// [`Timestamp`](Self::Timestamp) at `subscribe()` with a
 /// [`ShoveError::Topology`], rather than silently subscribing at the tail:
 /// a start that changes nothing must not be accepted.
+/// A Kafka subscription may opt into failing on expired positions with
+/// `with_auto_offset_reset(KafkaAutoOffsetReset::None)`.
 ///
 /// `#[non_exhaustive]`: a later position, such as an absolute sequence or
 /// offset, is a new variant and not a breaking change, so match with a
@@ -306,11 +308,22 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
     /// timeout the surviving tasks are aborted and
     /// [`SupervisorOutcome::timed_out`] is set — backends release their
     /// subscription from a drop guard, so the abort path reaps too.
-    pub async fn run_until_timeout<S>(
+    pub async fn run_until_timeout<S>(self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
+    where
+        S: Future<Output = ()> + Send + 'static,
+    {
+        self.run_until_timeout_with_errors(signal, drain_timeout)
+            .await
+            .0
+    }
+
+    /// Like `run_until_timeout`, but also returns each subscription's error.
+    /// Panics and timeouts remain represented by the outcome.
+    pub async fn run_until_timeout_with_errors<S>(
         mut self,
         signal: S,
         drain_timeout: Duration,
-    ) -> SupervisorOutcome
+    ) -> (SupervisorOutcome, Vec<ShoveError>)
     where
         S: Future<Output = ()> + Send + 'static,
     {
@@ -321,19 +334,21 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
 
         let mut errors = 0usize;
         let mut panics = 0usize;
+        let mut causes = Vec::new();
 
         let drain = {
             let tasks = &mut self.tasks;
             let errors = &mut errors;
             let panics = &mut panics;
+            let causes = &mut causes;
             async move {
                 while let Some(res) = tasks.join_next().await {
-                    tally_join_result(res, errors, panics);
+                    tally_broadcast_result(res, errors, panics, causes);
                 }
             }
         };
 
-        match tokio::time::timeout(drain_timeout, drain).await {
+        let outcome = match tokio::time::timeout(drain_timeout, drain).await {
             Ok(()) => SupervisorOutcome {
                 errors,
                 panics,
@@ -346,7 +361,7 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
                 );
                 self.tasks.abort_all();
                 while let Some(res) = self.tasks.join_next().await {
-                    tally_join_result(res, &mut errors, &mut panics);
+                    tally_broadcast_result(res, &mut errors, &mut panics, &mut causes);
                 }
                 SupervisorOutcome {
                     errors,
@@ -354,7 +369,24 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
                     timed_out: true,
                 }
             }
+        };
+        (outcome, causes)
+    }
+}
+
+fn tally_broadcast_result(
+    res: std::result::Result<Result<()>, tokio::task::JoinError>,
+    errors: &mut usize,
+    panics: &mut usize,
+    causes: &mut Vec<ShoveError>,
+) {
+    match res {
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "consumer task failed");
+            *errors += 1;
+            causes.push(e);
         }
+        other => tally_join_result(other, errors, panics),
     }
 }
 

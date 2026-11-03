@@ -1799,6 +1799,42 @@ pub mod permit_wait_probe {
     }
 }
 
+/// Synchronizes a test with the interval between resolving and assigning a
+/// broadcast start, when retention can invalidate a resolved offset.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod broadcast_assign_probe {
+    use std::sync::Mutex;
+
+    type Hook = (&'static str, Box<dyn FnOnce() + Send>);
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    pub fn before_assign(topic: &'static str, hook: impl FnOnce() + Send + 'static) {
+        *HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((topic, Box::new(hook)));
+    }
+
+    pub(super) fn resolved(topic: &str) {
+        let hook = {
+            let mut slot = HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot
+                .as_ref()
+                .is_some_and(|(expected, _)| *expected == topic)
+            {
+                slot.take().map(|(_, hook)| hook)
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 /// Runs a decode until it answers or `shutdown` fires, whichever comes
 /// first. `None` means shutdown fired.
 ///
@@ -3105,8 +3141,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Maps a rdkafka `KafkaError` to the appropriate `ShoveError` variant.
-/// Permanent errors (bad config, fatal consumption, cancelled) become
-/// `Topology`; transient errors (broker down, network) become `Connection`.
+/// Permanent errors end the consumer; transient errors become `Connection`.
 /// A receive loop never ends on a `recv()` error it rides out, so it maps
 /// none of those, see [`recv_error_is_transient`].
 ///
@@ -3122,12 +3157,19 @@ where
 /// replaces the member, which meets the same answer again (see the `None`
 /// variant's doc for the schedule).
 fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
+    if matches!(
+        e,
+        KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset)
+    ) {
+        return ShoveError::KafkaOffsetReset {
+            context: context.to_owned(),
+        };
+    }
     let is_permanent = matches!(
         &e,
         KafkaError::ClientConfig(..)
             | KafkaError::ClientCreation(_)
             | KafkaError::MessageConsumptionFatal(_)
-            | KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset)
             | KafkaError::Canceled
             | KafkaError::Nul(_)
     );
@@ -3744,6 +3786,8 @@ impl KafkaStreamConsumer {
         }
 
         let tpl = self.broadcast_start_positions(topic, &partitions, start, timeout)?;
+        #[cfg(feature = "test-support")]
+        broadcast_assign_probe::resolved(topic);
         self.assign(&tpl)
             .map_err(|e| map_kafka_error(&format!("failed to assign partitions of {topic}"), e))?;
         Ok(partitions.len())
@@ -11319,15 +11363,16 @@ impl KafkaConsumer {
     /// subscription refuses at `subscribe()`, before its loop is spawned.
     ///
     /// Every [`BroadcastStart`] is honoured here, so none is refused. The
-    /// two group knobs are: the loop commits nothing, so a commit policy,
-    /// interval or per-record, would be read by nothing, and it assigns
-    /// every partition at an explicit offset, so librdkafka never consults
-    /// `auto.offset.reset`. The FIFO consumer already refuses a commit
+    /// loop commits nothing, so a commit policy, interval or per-record,
+    /// would be read by nothing. The FIFO consumer already refuses a commit
     /// policy on the same ground, and a setting that changes nothing is
-    /// refused rather than dropped. A retry strategy is refused on that
-    /// ground too: the loop settles every outcome without one, so
-    /// `with_retry_strategy` would be read by nothing. The loop does read the
-    /// fetch queue settings, and one outside librdkafka's range is refused.
+    /// refused rather than dropped. The loop assigns every partition at an
+    /// explicit offset, so of the offset reset policies only `None` changes
+    /// anything: it fails the loop on an expired position, and every other
+    /// policy is refused. A retry strategy is refused because the loop
+    /// settles every outcome without one, so `with_retry_strategy` would be
+    /// read by nothing. The loop does read the fetch queue settings, and one
+    /// outside librdkafka's range is refused.
     pub(crate) fn check_broadcast_options(queue: &str, options: &ConsumerOptions) -> Result<()> {
         if options.kafka_commit_policy.is_some() {
             return Err(ShoveError::Topology(format!(
@@ -11336,12 +11381,13 @@ impl KafkaConsumer {
                  commits nothing. Drop the call."
             )));
         }
-        if options.kafka_auto_offset_reset.is_some() {
+        if options
+            .kafka_auto_offset_reset
+            .is_some_and(|policy| policy != KafkaAutoOffsetReset::None)
+        {
             return Err(ShoveError::Topology(format!(
-                "topic '{queue}' is a broadcast topology; `with_auto_offset_reset` does not \
-                 apply to a broadcast subscription, which assigns every partition at an \
-                 explicit offset and never consults `auto.offset.reset`. Drop \
-                 `with_auto_offset_reset(..)` and set the start with `with_broadcast_start`."
+                "topic '{queue}' is a broadcast topology; `with_auto_offset_reset` only accepts \
+                 `None` to fail on expired offsets. Set the start with `with_broadcast_start`."
             )));
         }
         if options.retry_strategy.is_some() {
@@ -11423,6 +11469,9 @@ impl KafkaConsumer {
             .unwrap_or_else(|| super::constants::broadcast_group_id(queue));
         let start = options.broadcast_start;
         let fetch_queue = options.kafka_fetch_queue;
+        let auto_offset_reset = options
+            .kafka_auto_offset_reset
+            .unwrap_or(KafkaAutoOffsetReset::Latest);
         // One warning per subscription, not per poll: the error repeats on
         // every coordinator lookup for the life of the handle.
         let warned_group_acl = Arc::new(AtomicBool::new(false));
@@ -11504,10 +11553,7 @@ impl KafkaConsumer {
                 let consumer = create_stream_consumer(
                     client.base_config(),
                     &group_id,
-                    // Inert: every partition is assigned at an explicit offset
-                    // below, so librdkafka never consults the reset policy.
-                    // `Latest` states the intent anyway.
-                    KafkaAutoOffsetReset::Latest,
+                    auto_offset_reset,
                     MAX_POLL_INTERVAL_MS,
                     &fetch_queue,
                     queue,
@@ -14822,16 +14868,16 @@ mod after_wait_tests {
 mod error_classifier_tests {
     use super::*;
 
-    /// librdkafka raises `AutoOffsetReset` when a partition has no committed
-    /// offset and the policy is `error`. A reconnect rejoins the same group
-    /// under the same policy and meets the same answer, so the classifier
-    /// must end the consumer (`Topology`) rather than loop on `Connection`.
+    /// A missing or expired position under the error policy is typed and
+    /// permanent across every Kafka receive path.
     #[test]
     fn a_missing_offset_under_the_error_policy_is_permanent() {
         let e = KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset);
+        let error = map_kafka_error("consumer recv error on test-topic", e);
+        assert!(!error.is_retryable());
         assert!(matches!(
-            map_kafka_error("recv", e),
-            ShoveError::Topology(msg) if msg.starts_with("recv: ")
+            error,
+            ShoveError::KafkaOffsetReset { context } if context == "consumer recv error on test-topic"
         ));
     }
 
@@ -16006,9 +16052,7 @@ mod broadcast_option_guard_tests {
         assert!(msg.contains("broadcast"), "{msg}");
     }
 
-    /// Every partition is assigned at an explicit offset, so librdkafka never
-    /// consults `auto.offset.reset`: the setting is refused, and the error
-    /// points at the knob that does decide where the subscription starts.
+    /// Only `None` is accepted for broadcast offset resets.
     #[test]
     fn broadcast_subscribe_rejects_auto_offset_reset() {
         let inner = crate::ConsumerOptions::<Kafka>::new()
@@ -16021,6 +16065,14 @@ mod broadcast_option_guard_tests {
         assert!(msg.contains("cache-invalidations"), "{msg}");
         assert!(msg.contains("with_auto_offset_reset"), "{msg}");
         assert!(msg.contains("with_broadcast_start"), "{msg}");
+    }
+
+    #[test]
+    fn broadcast_subscribe_accepts_fail_closed_reset() {
+        let inner = crate::ConsumerOptions::<Kafka>::new()
+            .with_auto_offset_reset(KafkaAutoOffsetReset::None)
+            .into_inner();
+        KafkaConsumer::check_broadcast_options("cache-invalidations", &inner).unwrap();
     }
 
     /// The broadcast loop settles every outcome without a retry strategy, so

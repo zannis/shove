@@ -3,7 +3,7 @@
 //!
 //! `None` is librdkafka's `auto.offset.reset=error`. A group member with no
 //! usable committed offset receives `AutoOffsetReset` instead of a first
-//! record and ends with a `ShoveError::Topology` that names it. That ends the
+//! record and ends with `ShoveError::KafkaOffsetReset`. That ends the
 //! **member**, not the group: the group's spawner logs the error, adds one to
 //! the group's error count and returns, and the group run keeps waiting for
 //! its shutdown signal. Without autoscaling nothing respawns the member, so
@@ -196,7 +196,7 @@ fn group_config(group_id: &str, policy: KafkaAutoOffsetReset) -> ConsumerGroupCo
     )
 }
 
-/// Under `None`, a fresh group's member ends with `ShoveError::Topology`
+/// Under `None`, a fresh group's member ends with `ShoveError::KafkaOffsetReset`
 /// naming librdkafka's `AutoOffsetReset` answer. The group run does not end,
 /// nothing respawns the member without autoscaling, and the one error comes
 /// back in the `SupervisorOutcome` at shutdown. An `Earliest` group on the same
@@ -290,8 +290,8 @@ async fn reset_policy_none_on_a_fresh_group_ends_the_member_and_not_the_group() 
         "exactly one member ended, so nothing respawned it: {exits:#?}"
     );
     assert!(
-        exits[0].contains("topology error") && exits[0].contains("AutoOffsetReset"),
-        "the member ends with ShoveError::Topology naming AutoOffsetReset: {}",
+        exits[0].contains("Kafka AutoOffsetReset"),
+        "the member ends with ShoveError::KafkaOffsetReset: {}",
         exits[0]
     );
     let starts = logs.lines_with(&["Kafka consumer started", NONE_GROUP]);

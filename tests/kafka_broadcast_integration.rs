@@ -107,6 +107,14 @@ define_topic!(
         .broadcast()
         .build()
 );
+#[cfg(feature = "test-support")]
+define_topic!(
+    ExpiredFloorTopic,
+    Invalidate,
+    TopologyBuilder::new("kafka-broadcast-expired-floor")
+        .broadcast()
+        .build()
+);
 
 // Only `broadcast_partition_added_skips_and_duplicates_nothing` uses this
 // topic, on a broker of its own.
@@ -181,6 +189,8 @@ recorder_for!(
     HeadRefreshTopic,
     PartitionAddedTopic
 );
+#[cfg(feature = "test-support")]
+recorder_for!(ExpiredFloorTopic);
 
 /// A `tracing` writer that stamps each write with the instant it arrived, so
 /// a test can order a subscriber's own log lines against its own actions.
@@ -577,6 +587,90 @@ fn now_ms() -> i64 {
 /// before the assignment lands would test deliver-new's failure mode instead of
 /// the fan-out.
 const ASSIGN_SETTLE: Duration = Duration::from_secs(5);
+/// An assigned timestamp offset can expire before the fetch starts. The
+/// subscriber must fail rather than silently resetting to the new end.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn broadcast_expired_resolved_offset_fails_closed() {
+    use rdkafka::{Offset, TopicPartitionList};
+    use shove::kafka::{KafkaAutoOffsetReset, broadcast_assign_probe};
+
+    const TOPIC: &str = "kafka-broadcast-expired-floor";
+    let tb = TestBroker::start().await;
+    let broker = tb.broker().await;
+    broker
+        .topology()
+        .declare::<ExpiredFloorTopic>()
+        .await
+        .unwrap();
+    tb.publish_to_partition(
+        TOPIC,
+        0,
+        &Invalidate {
+            key: "expired".into(),
+        },
+    )
+    .await;
+
+    let (resolved_tx, resolved_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    broadcast_assign_probe::before_assign(TOPIC, move || {
+        resolved_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    });
+    let recorder = Recorder::default();
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<ExpiredFloorTopic, _>(
+            recorder.clone(),
+            ConsumerOptions::new()
+                .with_broadcast_start(BroadcastStart::Timestamp(0))
+                .with_auto_offset_reset(KafkaAutoOffsetReset::None),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), resolved_rx)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", tb.brokers())
+        .create()
+        .unwrap();
+    let mut offsets = TopicPartitionList::new();
+    offsets
+        .add_partition_offset(TOPIC, 0, Offset::Offset(1))
+        .unwrap();
+    let deleted = admin
+        .delete_records(&offsets, &AdminOptions::new())
+        .await
+        .unwrap();
+    let partition = deleted.find_partition(TOPIC, 0).unwrap();
+    partition.error().unwrap();
+    assert_eq!(partition.offset(), Offset::Offset(1));
+    tb.publish_to_partition(
+        TOPIC,
+        0,
+        &Invalidate {
+            key: "after-expiry".into(),
+        },
+    )
+    .await;
+    resume_tx.send(()).unwrap();
+
+    let (outcome, errors) = subscriber
+        .run_until_timeout_with_errors(
+            tokio::time::sleep(Duration::from_secs(10)),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert_eq!(outcome.errors, 1, "{outcome:?}");
+    assert!(
+        matches!(errors.as_slice(), [ShoveError::KafkaOffsetReset { context }] if context.contains(TOPIC))
+    );
+    assert!(recorder.keys().await.is_empty());
+    broker.close().await;
+}
 
 /// A caller-provided zero prefetch must still allow one handler to run.
 ///

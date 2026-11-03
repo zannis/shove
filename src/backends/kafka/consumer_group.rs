@@ -84,8 +84,8 @@ pub enum KafkaAutoOffsetReset {
     ///
     /// The error ends the **member**, not the group. A member with no usable
     /// committed offset receives librdkafka's `AutoOffsetReset` answer instead
-    /// of a first record and exits with a [`ShoveError::Topology`] that names
-    /// it. A reconnect would rejoin the same group under the same policy and
+    /// of a first record and exits with [`ShoveError::KafkaOffsetReset`]. A
+    /// reconnect would rejoin the same group under the same policy and
     /// meet the same answer, so the member does not retry. The group's spawner
     /// logs that error, adds one to the group's error count and returns, and
     /// the group run keeps waiting for its shutdown signal. The count reaches

@@ -95,6 +95,15 @@ pub enum ShoveError {
     /// Boxed to keep `ShoveError` small, like [`PartialBatch`](Self::PartialBatch).
     #[error(transparent)]
     Commit(Box<FailedCommit>),
+
+    /// Kafka reported that a fetch position is missing or out of range while
+    /// `auto.offset.reset` is set to `error`. `context` identifies the receive
+    /// operation; it is not necessarily a topic name.
+    ///
+    /// The consumer ends without retrying. Its supervisor counts the error in
+    /// [`SupervisorOutcome::errors`](crate::SupervisorOutcome::errors).
+    #[error("Kafka AutoOffsetReset: {context}")]
+    KafkaOffsetReset { context: String },
 }
 
 /// An offset commit at shutdown that was not confirmed, the final commit

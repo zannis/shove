@@ -282,7 +282,7 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
 - **`with_group_id(impl Into<String>)`** — override the broker-side consumer group ID. Defaults to `"{queue}-consumer"`. Set this when two independent services consume the same topic and must each receive every message (fan-out) — otherwise they share a group and compete for partitions. Prefer `.for_consumer_group(...)` on the topology (below), which sets the group *and* the DLQ/hold-queue names together.
 - **`with_auto_offset_reset(KafkaAutoOffsetReset)`** — `Earliest` (default, replay history), `Latest` (tail-only), or `None` (refuse silent replay/skip on a fresh group).
   The same setting is available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths, which have no group config to carry it.
-  Under `None`, a group member with no usable committed offset ends with a `ShoveError::Topology` naming librdkafka's `AutoOffsetReset` answer.
+  Under `None`, a group member with no usable committed offset ends with `ShoveError::KafkaOffsetReset`.
   A reconnect would only meet the same answer, so the member does not retry.
   The error ends that member, not the group: the group run keeps waiting for its shutdown signal.
   The error count the run reports in `SupervisorOutcome` at shutdown grows by one per member.

@@ -642,7 +642,7 @@ async fn reset_is_refused_while_the_group_has_members() {
 /// `KafkaAutoOffsetReset::None` on a group with no committed offset is a
 /// configuration fault, not an outage: librdkafka answers every fetch with
 /// `AutoOffsetReset`, and reconnecting rejoins the same group under the same
-/// policy. The consumer ends with a `Topology` error that names the fault
+/// policy. The consumer ends with a `KafkaOffsetReset` error that names the fault
 /// instead of cycling through its reconnect budget.
 #[tokio::test]
 async fn reset_policy_none_on_a_fresh_group_ends_the_consumer() {
@@ -667,7 +667,7 @@ async fn reset_policy_none_on_a_fresh_group_ends_the_consumer() {
 
     let err = result.expect_err("a fresh group under `None` has nowhere to start from");
     assert!(
-        matches!(err, ShoveError::Topology(_)),
+        matches!(err, ShoveError::KafkaOffsetReset { .. }),
         "the fault is permanent, not a connection error: {err}"
     );
     assert!(

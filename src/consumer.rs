@@ -938,10 +938,11 @@ impl ConsumerOptions<Kafka> {
     /// path the equivalent is
     /// [`KafkaConsumerGroupConfig::with_auto_offset_reset`](crate::kafka::KafkaConsumerGroupConfig::with_auto_offset_reset),
     /// which wins there exactly as `with_group_id` does. A broadcast
-    /// subscription refuses it at `subscribe()`: it assigns every partition
-    /// at an explicit offset and never consults the policy, and its start is
+    /// subscription accepts only `None`, to fail if an assigned position
+    /// expires rather than silently resetting to the tail; without it the
+    /// existing tail-reset behavior remains. Its initial start is
     /// [`with_broadcast_start`](Self::with_broadcast_start). The DLQ drain
-    /// (`run_dlq_with_options`) refuses it too: the drain hard-codes
+    /// (`run_dlq_with_options`) refuses this option: the drain hard-codes
     /// `earliest`, which applies only while its group has no usable committed
     /// offset, so a fresh drain never skips a dead letter and a restarted one
     /// resumes from its commit.
