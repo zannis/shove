@@ -29,6 +29,15 @@ impl<B: Backend> Publisher<B> {
         res
     }
 
+    /// Publish `msg` with caller-supplied `headers`.
+    ///
+    /// A reserved header name returns [`ShoveError::Validation`] naming the
+    /// header, and nothing is published. The names are the ones a backend
+    /// stamps itself or reads back as its own, and some belong to one backend
+    /// only. The [reserved header names] guide lists them.
+    ///
+    /// [`ShoveError::Validation`]: crate::error::ShoveError::Validation
+    /// [reserved header names]: https://shove.rs/guides/observability#reserved-header-names
     pub async fn publish_with_headers<T: Topic>(
         &self,
         msg: &T::Message,

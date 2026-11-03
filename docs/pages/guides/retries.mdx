@@ -90,7 +90,7 @@ Use this when a permanently-unreachable broker should fail fast and visibly rath
 
 ## The retry counter is best-effort
 
-The retry counter is stored in a broker-level header (`x-shove-retry-count` or the backend equivalent). The publish-to-hold-queue and ack-of-original-delivery are two separate broker operations. There is a small window between them where a crash can produce a duplicate:
+Where a backend republishes a copy, the retry counter is stored in a broker-level header: `x-retry-count` on RabbitMQ, Redis, SNS/SQS and the in-process broker, `Shove-Retry-Count` on Kafka and NATS. The publish-to-hold-queue and ack-of-original-delivery are two separate broker operations. There is a small window between them where a crash can produce a duplicate:
 
 1. Handler returns `Outcome::Retry`.
 2. Consumer publishes the message to the hold queue (counter incremented in the header).
