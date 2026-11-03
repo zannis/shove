@@ -9,11 +9,13 @@
 //! ([`BatchFailure`](crate::batch::BatchFailure)) — this module is the
 //! consume side.
 //!
-//! This module also houses the terminal-settlement machinery Kafka's
-//! *single-message* async-commit path depends on — `TerminalDiscard`,
-//! `RejectSettlement` and `reject_settlement` — not only its batch path. A
-//! later cleanup must not narrow the gate on those three below `kafka`
-//! without checking that single-message caller first.
+//! This module also houses terminal-settlement machinery that Kafka's batch
+//! path and two of its non-batch paths depend on: `TerminalDiscard`,
+//! `RejectSettlement` and `reject_settlement`. The non-batch callers are the
+//! *single-message* reject path, whose commit runs synchronously on its own
+//! thread, and the sequenced consumer's dead letter (`FifoLoop::dead_letter`).
+//! A later cleanup must not narrow the gate on those three below `kafka`
+//! without checking both of those callers first.
 //!
 //! # Gating
 //!
@@ -75,7 +77,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "kafka")]
-use crate::backends::kafka::KafkaAutoOffsetReset;
+use crate::backends::kafka::{FetchQueueTuning, KafkaAutoOffsetReset};
 use crate::error::{Result, ShoveError};
 use crate::handler::BatchMessageHandler;
 use crate::outcome::Outcome;
@@ -114,6 +116,26 @@ pub(crate) struct BatchConsumerOptionsInner {
     /// the library default of `earliest`.
     #[cfg(feature = "kafka")]
     pub kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
+    /// Kafka-only: the fetch queue settings the batch consumer's librdkafka
+    /// client is created with. Unset settings keep the backoff default and
+    /// librdkafka's thresholds. See `ConsumerOptionsInner::kafka_fetch_queue`
+    /// for the single-message counterpart this mirrors.
+    #[cfg(feature = "kafka")]
+    pub kafka_fetch_queue: FetchQueueTuning,
+    /// Kafka-only, `test-support` builds: the `max.poll.interval.ms` the
+    /// batch consumer is created with, in place of the pinned
+    /// `MAX_POLL_INTERVAL_MS`, so an integration test can observe a member
+    /// eviction in seconds. Propagated from
+    /// `BatchConsumerOptions::<Kafka>::with_max_poll_interval_for_test`.
+    #[cfg(all(feature = "kafka", feature = "test-support"))]
+    pub kafka_max_poll_interval: Option<Duration>,
+    /// Kafka-only, `test-support` builds: how often the batch loop wakes to
+    /// drain rebalance events when nothing else wakes it, in place of the
+    /// pinned `HOUSEKEEPING_INTERVAL`, so a test can leave a drain to the arm
+    /// it is about. Propagated from
+    /// `BatchConsumerOptions::<Kafka>::with_housekeeping_interval_for_test`.
+    #[cfg(all(feature = "kafka", feature = "test-support"))]
+    pub kafka_housekeeping_interval: Option<Duration>,
 
     /// Kafka-only: Schema Registry client for decoding Confluent wire-framed
     /// batch messages. `None` disables registry-based decoding.

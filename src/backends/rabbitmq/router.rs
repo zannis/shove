@@ -33,12 +33,12 @@ pub(crate) async fn route_retry(
     publisher: &ChannelPublisher,
     retry_count: u32,
 ) -> Result<()> {
-    let new_retry_count = retry_count + 1;
+    let new_retry_count = retry_count.saturating_add(1);
     let hold_queues = topology.hold_queues();
 
-    if !hold_queues.is_empty() {
-        let index = hold_index(retry_count, hold_queues.len());
-        let hold_queue = &hold_queues[index];
+    if let Some(hold_queue) =
+        hold_index(retry_count, hold_queues.len()).and_then(|index| hold_queues.get(index))
+    {
         let headers = clone_headers_with_retry(delivery, new_retry_count);
 
         match publisher

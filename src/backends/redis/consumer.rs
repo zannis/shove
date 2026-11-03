@@ -30,8 +30,8 @@ use crate::topology::{HoldQueue, QueueTopology};
 
 use super::client::{RedisClient, RedisConnection};
 use super::constants::{
-    BLOCK_MS, PAYLOAD_FIELD, X_DEATH_COUNT, X_DEATH_REASON, X_MESSAGE_ID, X_ORIGINAL_QUEUE,
-    X_RETRY_COUNT, X_SEQUENCE_KEY,
+    BLOCK_MS, INTERNAL_KEYS, PAYLOAD_FIELD, X_DEATH_COUNT, X_DEATH_REASON, X_MESSAGE_ID,
+    X_ORIGINAL_QUEUE, X_RETRY_COUNT, X_SEQUENCE_KEY,
 };
 use super::lease;
 use super::requeue::{HoldEntry, enqueue_hold, spawn_requeuer};
@@ -2113,18 +2113,6 @@ pub(super) fn parse_xreadgroup_reply(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Shove-internal field names that are exposed via dedicated `MessageMetadata`
-/// fields and must be excluded from the user-visible `headers` map.
-const INTERNAL_KEYS: &[&str] = &[
-    PAYLOAD_FIELD,
-    X_RETRY_COUNT,
-    X_SEQUENCE_KEY,
-    X_MESSAGE_ID,
-    X_DEATH_REASON,
-    X_DEATH_COUNT,
-    X_ORIGINAL_QUEUE,
-];
-
 /// Partition raw XREADGROUP entry fields into `(internal_fields, user_headers)`
 /// in a single pass, consuming `fields_vec` without cloning any values.
 ///
@@ -2177,11 +2165,7 @@ fn merged_entry_fields<'a>(
 ///
 /// Returns `None` if the slice is empty (no hold queues configured).
 pub(super) fn hold_level<T>(retry_count: u32, hold_queues: &[T]) -> Option<usize> {
-    if hold_queues.is_empty() {
-        None
-    } else {
-        Some(hold_index(retry_count, hold_queues.len()))
-    }
+    hold_index(retry_count, hold_queues.len())
 }
 
 // ---------------------------------------------------------------------------
