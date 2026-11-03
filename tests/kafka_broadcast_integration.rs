@@ -449,6 +449,16 @@ impl TestBroker {
             matches!(results.as_slice(), [Ok(name)] if name == topic),
             "partition expansion failed: {results:?}"
         );
+        // The broker acks the expansion before its metadata reports the new
+        // partitions; a producer built in that window rejects them locally.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.partition_count(topic) < partitions {
+            assert!(
+                Instant::now() < deadline,
+                "metadata never reported {partitions} partitions for {topic}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     fn partition_count(&self, topic: &str) -> usize {
