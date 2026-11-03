@@ -17,6 +17,10 @@ pub(super) const COPY_OF_HEADER: &str = "Shove-Copy-Of";
 /// mis-poisoning.
 pub(super) const SEQUENCE_KEY_HEADER: &str = "Shove-Sequence-Key";
 
+/// The `max_ack_pending` of a durable shove creates when no budget was set:
+/// unbounded, because every worker bounds its own in-flight messages.
+pub(super) const UNBOUNDED_ACK_PENDING: i64 = -1;
+
 /// Header names this backend writes itself. A new one belongs here: a test
 /// checks that `validate_headers` reserves every name in this list.
 /// `Nats-Msg-Id` is left out on purpose: callers set it for deduplication.
@@ -34,9 +38,8 @@ const INTERNAL_HEADERS: &[&str] = &[
 /// JetStream WorkQueue retention permits only one non-filtered consumer per
 /// stream, so every task in a consumer group binds to the *same* durable
 /// consumer and the server load-balances messages across them. The group
-/// registry is responsible for configuring the consumer once (with a
-/// sufficient `max_ack_pending`) so all tasks inherit the right in-flight
-/// budget.
+/// registry creates that durable once, and each task bounds its own
+/// in-flight messages, so the durable needs no budget of its own.
 pub(super) fn consumer_name(queue: &str) -> String {
     format!("{queue}-consumer")
 }

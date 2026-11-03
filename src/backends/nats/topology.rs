@@ -192,8 +192,10 @@ impl NatsTopologyDeclarer {
     /// upserts of the same durable object on every reconnect storm. The
     /// per-consumer path now uses `get_consumer` instead (read-only).
     ///
-    /// `max_ack_pending` must reflect the **aggregate** in-flight budget
-    /// for the whole group (typically `prefetch_count × max_consumers`).
+    /// `max_ack_pending` is `-1`, unbounded, unless the group set a cap
+    /// ([`durable_max_ack_pending`](super::consumer_group::durable_max_ack_pending)):
+    /// each member bounds its own in-flight messages, and a cap here is
+    /// shared by every member attached to the durable, in every process.
     ///
     /// `ack_wait` must leave headroom above the group's handler timeout so a
     /// handler running to its limit never has its message redelivered

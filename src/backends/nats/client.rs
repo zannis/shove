@@ -6,7 +6,10 @@ use std::fmt;
 use std::path::PathBuf;
 use std::process;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::ShoveError;
@@ -101,6 +104,8 @@ pub struct NatsClient {
     client: async_nats::Client,
     jetstream: jetstream::Context,
     shutdown_token: CancellationToken,
+    /// Changes each time the client connects, its first connection included.
+    connected: watch::Receiver<()>,
 }
 
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
@@ -392,7 +397,18 @@ impl NatsClient {
         validate_transport_security(config)?;
 
         let client_name = format!("shove-rs-{}", process::id());
-        let mut opts = async_nats::ConnectOptions::new().name(client_name);
+        let (connected_tx, connected) = watch::channel(());
+        let connected_tx = Arc::new(connected_tx);
+        let mut opts = async_nats::ConnectOptions::new()
+            .name(client_name)
+            .event_callback(move |event| {
+                let connected_tx = Arc::clone(&connected_tx);
+                async move {
+                    if matches!(event, async_nats::Event::Connected) {
+                        connected_tx.send_replace(());
+                    }
+                }
+            });
 
         if let Some(ca) = &config.tls_ca_cert {
             opts = opts.add_root_certificates(ca.clone());
@@ -423,6 +439,7 @@ impl NatsClient {
             client,
             jetstream,
             shutdown_token: CancellationToken::new(),
+            connected,
         })
     }
 
@@ -464,6 +481,19 @@ impl NatsClient {
 
     pub fn is_connected(&self) -> bool {
         matches!(self.client.connection_state(), State::Connected)
+    }
+
+    /// How many times the client has connected, its first connection
+    /// included. It grows by one on every reconnect, before
+    /// [`connection_changes`](Self::connection_changes) fires.
+    pub(super) fn connections(&self) -> u64 {
+        self.client.statistics().connects.load(Ordering::Relaxed)
+    }
+
+    /// A receiver that changes each time the client connects, its first
+    /// connection included, so a reconnect wakes whoever waits on it.
+    pub(super) fn connection_changes(&self) -> watch::Receiver<()> {
+        self.connected.clone()
     }
 
     /// Liveness check. Subscribes to a unique inbox subject, publishes to it,

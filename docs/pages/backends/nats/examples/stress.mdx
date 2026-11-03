@@ -68,7 +68,7 @@ NatsConsumerGroupConfig::new(consumers..=consumers)
     .with_concurrent_processing(concurrent)
 ```
 
-The `prefetch_count` maps to JetStream's `max_ack_pending` — how many messages the JetStream server will push to the consumer before requiring acknowledgements. When `--concurrent` is passed, `with_concurrent_processing(true)` enables parallel handler invocations within a single consumer, which is especially effective for `slow` and `heavy` profiles.
+The `prefetch_count` bounds each consumer's in-flight messages on the client: a consumer pulls only as many messages from JetStream as it has free slots, so the durable keeps `max_ack_pending` unbounded. When `--concurrent` is passed, `with_concurrent_processing(true)` enables parallel handler invocations within a single consumer, which is especially effective for `slow` and `heavy` profiles.
 
 ### Interpreting the results
 
