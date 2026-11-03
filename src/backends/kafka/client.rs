@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 #[cfg(feature = "kafka-ssl")]
 use std::path::PathBuf;
 use std::process;
@@ -18,7 +19,11 @@ use rdkafka::message::OwnedHeaders;
 use rdkafka::metadata::Metadata;
 use rdkafka::producer::{FutureProducer, Producer};
 
-use super::constants::{MESSAGE_TIMEOUT_MS, SHUTDOWN_GRACE};
+use super::constants::{
+    MESSAGE_TIMEOUT_MS, PARTITION_METADATA_ATTEMPTS, PARTITION_METADATA_RETRY_INITIAL,
+    PARTITION_METADATA_RETRY_MAX, PING_PROBE_TOPIC, PRODUCER_BUILD_SHUTDOWN_WAIT,
+    PRODUCER_FLUSH_TIMEOUT, SHUTDOWN_GRACE,
+};
 use super::publisher::publish_with_retry as publisher_publish_with_retry;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
@@ -459,6 +464,18 @@ enum KafkaProducerInner {
     MskIam(FutureProducer<MskIamContext>),
 }
 
+impl KafkaProducerInner {
+    /// Blocks until the queue is empty or `timeout` passes; the caller runs
+    /// this on a blocking thread.
+    fn flush(&self, timeout: Duration) -> KafkaResult<()> {
+        match self {
+            Self::Default(p) => p.flush(timeout),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(p) => p.flush(timeout),
+        }
+    }
+}
+
 /// librdkafka's constructor is synchronous and may block on TLS material, so
 /// the caller runs this on a blocking thread.
 fn build_producer(
@@ -622,11 +639,20 @@ impl KafkaClient {
         // `ping` probes with. The producer itself is built at the first
         // publish, see `Self::producer`.
         let producer_config = producer_config(&base_config, &client_name, config)?;
-        let metadata = MetadataConsumer::create(
-            base_config.clone(),
-            #[cfg(feature = "kafka-msk-iam")]
-            msk_context.clone(),
-        )?;
+        let mut metadata_config = base_config.clone();
+        // `ping` asks about a topic that does not exist; the broker must not create it.
+        metadata_config.set("allow.auto.create.topics", "false");
+        #[cfg(feature = "kafka-msk-iam")]
+        let metadata_context = msk_context.clone();
+        let metadata = tokio::task::spawn_blocking(move || {
+            MetadataConsumer::create(
+                metadata_config,
+                #[cfg(feature = "kafka-msk-iam")]
+                metadata_context,
+            )
+        })
+        .await
+        .map_err(|e| ShoveError::Topology(format!("metadata consumer task failed: {e}")))??;
 
         Ok(Self {
             brokers: config.brokers.clone(),
@@ -762,13 +788,19 @@ impl KafkaClient {
         self.shutdown_token.clone()
     }
 
-    /// Liveness check. Issues a single `fetch_metadata(None, timeout)` on the
-    /// metadata consumer `connect` built. No new socket, no consumer-group
-    /// churn, no side effects, and no producer.
+    /// Liveness check. Issues a single metadata request that names one probe
+    /// topic, on the metadata consumer `connect` built. Any answer from a
+    /// broker shows the cluster is reachable, so the probe topic's own error
+    /// is not looked at. No new socket, no consumer-group churn, no producer,
+    /// and no topic created.
     ///
     /// Returns `Err(ShoveError::Connection)` if the client is shut down, the
     /// metadata fetch fails, or `spawn_blocking` itself fails.
     pub(super) async fn ping(&self, timeout: Duration) -> Result<()> {
+        self.ping_metadata(timeout).await.map(|_| ())
+    }
+
+    async fn ping_metadata(&self, timeout: Duration) -> Result<Metadata> {
         if self.shutdown_token.is_cancelled() {
             return Err(ShoveError::Connection("client is shut down".into()));
         }
@@ -777,7 +809,7 @@ impl KafkaClient {
         let shutdown = self.shutdown_token();
         let join = tokio::task::spawn_blocking(move || {
             consumer.fetch(
-                None,
+                PING_PROBE_TOPIC,
                 timeout,
                 #[cfg(feature = "kafka-msk-iam")]
                 &shutdown,
@@ -789,9 +821,23 @@ impl KafkaClient {
             .map_err(|_| ShoveError::Connection(format!("kafka ping timed out after {timeout:?}")))?
             .map_err(|e| ShoveError::Connection(format!("kafka ping task failed: {e}")))?;
 
-        metadata_result
-            .map(|_| ())
-            .map_err(|e| ShoveError::Connection(format!("kafka ping failed: {e}")))
+        metadata_result.map_err(|e| ShoveError::Connection(format!("kafka ping failed: {e}")))
+    }
+
+    /// Test-only seam (see the `test-support` feature): each topic the
+    /// metadata answer to a `ping` lists, with the error the broker gave it.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn ping_topics_for_test(
+        &self,
+        timeout: Duration,
+    ) -> Result<Vec<(String, Option<RDKafkaRespErr>)>> {
+        let metadata = self.ping_metadata(timeout).await?;
+        Ok(metadata
+            .topics()
+            .iter()
+            .map(|topic| (topic.name().to_string(), topic.error()))
+            .collect())
     }
 
     /// What the broker says of one topic, creating nothing; see
@@ -838,13 +884,14 @@ impl KafkaClient {
         }
     }
 
+    /// librdkafka's constructor may block on TLS material, so the admin client
+    /// is built on a blocking thread.
     pub(super) async fn create_admin_default(&self) -> Result<AdminClient<DefaultClientContext>> {
-        let admin: AdminClient<DefaultClientContext> = self
-            .base_config
-            .clone()
-            .create()
-            .map_err(|e| ShoveError::Topology(format!("failed to create admin client: {e}")))?;
-        Ok(admin)
+        let config = self.base_config();
+        tokio::task::spawn_blocking(move || config.create::<AdminClient<DefaultClientContext>>())
+            .await
+            .map_err(|e| ShoveError::Topology(format!("admin client task failed: {e}")))?
+            .map_err(|e| ShoveError::Topology(format!("failed to create admin client: {e}")))
     }
 
     #[cfg(feature = "kafka-msk-iam")]
@@ -852,11 +899,14 @@ impl KafkaClient {
         &self,
         ctx: MskIamContext,
     ) -> Result<AdminClient<MskIamContext>> {
-        let admin: AdminClient<MskIamContext> = self
-            .base_config
-            .clone()
-            .create_with_context(ctx.clone())
-            .map_err(|e| ShoveError::Topology(format!("failed to create MSK admin client: {e}")))?;
+        let config = self.base_config();
+        let admin_ctx = ctx.clone();
+        let admin = tokio::task::spawn_blocking(move || {
+            config.create_with_context::<_, AdminClient<MskIamContext>>(admin_ctx)
+        })
+        .await
+        .map_err(|e| ShoveError::Topology(format!("MSK admin client task failed: {e}")))?
+        .map_err(|e| ShoveError::Topology(format!("failed to create MSK admin client: {e}")))?;
         // Unlike the producer and stream/base consumers, rdkafka's admin client
         // never polls its main queue, so it never services the OAUTHBEARER
         // token-refresh event and would fail authentication under MSK IAM. Admin
@@ -867,26 +917,42 @@ impl KafkaClient {
         Ok(admin)
     }
 
-    /// Create a topic, or bring an existing one up to spec: expand its
-    /// partition count if lower than requested, and reconcile the given
+    /// Create a topic, or bring an existing one up to spec: treat its
+    /// partition count as `existing` says, and reconcile the given
     /// topic-level config entries if they drift from the live values.
+    /// Returns the growth when partitions were added to an existing topic.
     pub(super) async fn create_topic(
         &self,
         name: &str,
         num_partitions: i32,
         replication_factor: i32,
         config: &[(String, String)],
-    ) -> Result<()> {
+        existing: ExistingTopic,
+    ) -> Result<Option<PartitionGrowth>> {
         #[cfg(feature = "kafka-msk-iam")]
         if let Some(ctx) = self.msk_context() {
             let admin = self.create_admin_msk(ctx).await?;
             return self
-                .create_topic_with_admin(&admin, name, num_partitions, replication_factor, config)
+                .create_topic_with_admin(
+                    &admin,
+                    name,
+                    num_partitions,
+                    replication_factor,
+                    config,
+                    existing,
+                )
                 .await;
         }
         let admin = self.create_admin_default().await?;
-        self.create_topic_with_admin(&admin, name, num_partitions, replication_factor, config)
-            .await
+        self.create_topic_with_admin(
+            &admin,
+            name,
+            num_partitions,
+            replication_factor,
+            config,
+            existing,
+        )
+        .await
     }
 
     async fn create_topic_with_admin<C>(
@@ -896,7 +962,8 @@ impl KafkaClient {
         num_partitions: i32,
         replication_factor: i32,
         config: &[(String, String)],
-    ) -> Result<()>
+        existing: ExistingTopic,
+    ) -> Result<Option<PartitionGrowth>>
     where
         C: ClientContext + 'static,
     {
@@ -913,13 +980,24 @@ impl KafkaClient {
             .await
             .map_err(|e| ShoveError::Topology(format!("failed to create topic {name}: {e}")))?;
 
+        let mut growth = None;
         for result in results {
             match result {
                 Ok(_) => {}
                 Err((topic, code)) => {
                     if code == RDKafkaErrorCode::TopicAlreadyExists {
                         tracing::debug!(topic, "topic already exists, checking partition count");
-                        self.ensure_partitions(admin, name, num_partitions).await?;
+                        // Settle the count before the configs, so a refused topic stays untouched.
+                        growth = match existing {
+                            ExistingTopic::Grow => {
+                                self.ensure_partitions(admin, name, num_partitions).await?
+                            }
+                            ExistingTopic::Keep => {
+                                let live = self.live_partition_count(name).await?;
+                                check_kept_partitions(name, live, num_partitions)?;
+                                None
+                            }
+                        };
                         self.ensure_topic_configs(admin, name, config).await?;
                     } else {
                         metrics::record_backend_error(
@@ -934,43 +1012,23 @@ impl KafkaClient {
             }
         }
 
-        Ok(())
+        Ok(growth)
     }
 
     /// If the existing topic has fewer partitions than `desired`, expand it.
+    /// `Some` when partitions were added.
     async fn ensure_partitions<C>(
         &self,
         admin: &AdminClient<C>,
         name: &str,
         desired: i32,
-    ) -> Result<()>
+    ) -> Result<Option<PartitionGrowth>>
     where
         C: ClientContext + 'static,
     {
         use rdkafka::admin::NewPartitions;
 
-        // Fetch current partition count from metadata. The blocking work is
-        // pushed onto a dedicated thread because librdkafka's metadata fetch
-        // is synchronous; the helper owns all the cfg-gated context selection.
-        let base = (*self.base_config).clone();
-        let topic_name = name.to_string();
-        #[cfg(feature = "kafka-msk-iam")]
-        let msk_ctx = self.msk_context();
-        #[cfg(feature = "kafka-msk-iam")]
-        let shutdown = self.shutdown_token();
-        let current = tokio::task::spawn_blocking(move || {
-            fetch_topic_partition_count_blocking(
-                base,
-                &topic_name,
-                #[cfg(feature = "kafka-msk-iam")]
-                msk_ctx,
-                #[cfg(feature = "kafka-msk-iam")]
-                shutdown,
-            )
-        })
-        .await
-        .map_err(|e| ShoveError::Topology(format!("metadata task failed: {e}")))??;
-
+        let current = self.live_partition_count(name).await?;
         if current >= desired {
             tracing::debug!(
                 topic = name,
@@ -978,11 +1036,16 @@ impl KafkaClient {
                 desired,
                 "partition count already sufficient"
             );
-            return Ok(());
+            return Ok(None);
         }
 
         tracing::info!(topic = name, current, desired, "expanding partition count");
-        let new_parts = NewPartitions::new(name, desired as usize);
+        let target = usize::try_from(desired).map_err(|_| {
+            ShoveError::Topology(format!(
+                "cannot expand {name} to {desired} partitions: not a partition count"
+            ))
+        })?;
+        let new_parts = NewPartitions::new(name, target);
         let results = admin
             .create_partitions(&[new_parts], &AdminOptions::new())
             .await
@@ -992,6 +1055,13 @@ impl KafkaClient {
 
         for result in results {
             if let Err((topic, code)) = result {
+                // Lost the expansion race: the broker refuses a count the topic already has.
+                if code == RDKafkaErrorCode::InvalidPartitions
+                    && self.partition_count_reaching(name, desired).await? >= desired
+                {
+                    tracing::debug!(topic, desired, "another declarer expanded the topic first");
+                    return Ok(None);
+                }
                 metrics::record_backend_error(
                     metrics::BackendLabel::Kafka,
                     metrics::BackendErrorKind::Topology,
@@ -1002,7 +1072,21 @@ impl KafkaClient {
             }
         }
 
-        Ok(())
+        Ok(Some(PartitionGrowth {
+            from: current,
+            to: desired,
+        }))
+    }
+
+    /// The partition count the broker reports for a topic that `CreateTopics`
+    /// said exists, read as `read_partition_count` reads it.
+    async fn live_partition_count(&self, name: &str) -> Result<i32> {
+        self.partition_count_reaching(name, 0).await
+    }
+
+    /// The partition count of a topic, read until it is at least `at_least`.
+    async fn partition_count_reaching(&self, name: &str, at_least: i32) -> Result<i32> {
+        read_partition_count(name, at_least, || self.probe_topic(name)).await
     }
 
     /// If any declared config entry differs from the topic's live value,
@@ -1077,25 +1161,41 @@ impl KafkaClient {
         Ok(())
     }
 
+    /// Cancels the client's shutdown token, gives in-flight work a moment,
+    /// and flushes the producer if one was built.
+    ///
+    /// A producer build still in flight is waited for a bounded time, and the
+    /// flush, which blocks until the queue is empty or its timeout passes,
+    /// runs on a blocking thread, so neither holds the runtime.
     pub async fn shutdown(&self) {
         self.shutdown_token.cancel();
         tokio::time::sleep(SHUTDOWN_GRACE).await;
         // A failing initializer waits for a build in flight and starts none,
         // and the cancelled token refuses every build from here on.
-        let built = self
-            .producer
-            .get_or_try_init(|| async { Err::<KafkaProducerInner, ()>(()) })
-            .await
-            .ok();
-        match built {
-            Some(KafkaProducerInner::Default(p)) => {
-                p.flush(Duration::from_secs(5)).ok();
+        let producer = match tokio::time::timeout(
+            PRODUCER_BUILD_SHUTDOWN_WAIT,
+            self.producer
+                .get_or_try_init(|| async { Err::<KafkaProducerInner, ()>(()) }),
+        )
+        .await
+        {
+            Ok(Ok(producer)) => producer.clone(),
+            Ok(Err(())) => return,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    wait = ?PRODUCER_BUILD_SHUTDOWN_WAIT,
+                    "a Kafka producer build was still running at shutdown; its records are not flushed"
+                );
+                return;
             }
-            #[cfg(feature = "kafka-msk-iam")]
-            Some(KafkaProducerInner::MskIam(p)) => {
-                p.flush(Duration::from_secs(5)).ok();
-            }
-            None => {}
+        };
+        match tokio::task::spawn_blocking(move || producer.flush(PRODUCER_FLUSH_TIMEOUT)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(
+                error = %e,
+                "the Kafka producer flush at shutdown did not finish; unsent records are dropped"
+            ),
+            Err(e) => tracing::warn!(error = %e, "the Kafka producer flush task failed"),
         }
     }
 
@@ -1134,39 +1234,115 @@ fn overlay_dynamic_entries<'a>(
     merged
 }
 
-/// Build a metadata `BaseConsumer` against `base`, fetch the topic's metadata
-/// synchronously, and return its partition count. Runs inside `spawn_blocking`
-/// because librdkafka's `fetch_metadata` is blocking.
+/// Reads a topic's partition count through `probe` until it is at least
+/// `at_least`, and returns the last count read.
 ///
-/// The cfg branching lives in [`fetch_topic_metadata_blocking`] so
-/// `ensure_partitions` stays readable.
-fn fetch_topic_partition_count_blocking(
-    base: ClientConfig,
-    topic_name: &str,
-    #[cfg(feature = "kafka-msk-iam")] msk_ctx: Option<MskIamContext>,
-    #[cfg(feature = "kafka-msk-iam")] shutdown: CancellationToken,
-) -> Result<i32> {
-    let mut cfg = base;
-    // arch-K-10: per-process suffix on the group id so multiple shove
-    // processes don't collide in kafka-consumer-groups.sh / Kafka UI /
-    // MSK console under a single shared "shove-partition-check" name.
-    cfg.set(
-        "group.id",
-        format!("shove-partition-check-{}", process::id()),
+/// A topic whose metadata is `UNKNOWN_TOPIC_OR_PART` (the broker metadata comes
+/// from is behind the one that created it) or `LEADER_NOT_AVAILABLE` (its
+/// leaders are still being elected) is read again, a bounded number of times.
+/// So is a count below `at_least`; the last such count is returned once the
+/// reads run out, for the caller to judge. Any other topic-level error is final.
+async fn read_partition_count<F, Fut>(name: &str, at_least: i32, mut probe: F) -> Result<i32>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<TopicProbe>>,
+{
+    let mut waits = Backoff::new(
+        PARTITION_METADATA_RETRY_INITIAL,
+        PARTITION_METADATA_RETRY_MAX,
     );
-    let md = fetch_topic_metadata_blocking(
-        cfg,
-        topic_name,
-        #[cfg(feature = "kafka-msk-iam")]
-        msk_ctx,
-        #[cfg(feature = "kafka-msk-iam")]
-        shutdown,
-    )?;
-    let topic = md
-        .topics()
-        .first()
-        .ok_or_else(|| ShoveError::Topology(format!("no metadata for topic {topic_name}")))?;
-    Ok(topic.partitions().len() as i32)
+    let mut last = "no metadata";
+    let mut behind = None;
+    for attempt in 1..=PARTITION_METADATA_ATTEMPTS {
+        match probe().await? {
+            TopicProbe::Present(partitions) if partitions >= at_least => return Ok(partitions),
+            TopicProbe::Present(partitions) => behind = Some(partitions),
+            TopicProbe::Missing => {
+                behind = None;
+                last = "no such topic";
+            }
+            TopicProbe::Failed(RDKafkaRespErr::RD_KAFKA_RESP_ERR_LEADER_NOT_AVAILABLE) => {
+                behind = None;
+                last = "no leaders";
+            }
+            TopicProbe::Failed(code) => {
+                metrics::record_backend_error(
+                    metrics::BackendLabel::Kafka,
+                    metrics::BackendErrorKind::Topology,
+                );
+                return Err(ShoveError::Topology(format!(
+                    "metadata for topic {name} returned {code:?}"
+                )));
+            }
+        }
+        if attempt < PARTITION_METADATA_ATTEMPTS
+            && let Some(wait) = waits.next()
+        {
+            tokio::time::sleep(wait).await;
+        }
+    }
+    if let Some(partitions) = behind {
+        return Ok(partitions);
+    }
+    metrics::record_backend_error(
+        metrics::BackendLabel::Kafka,
+        metrics::BackendErrorKind::Topology,
+    );
+    Err(ShoveError::Topology(format!(
+        "topic {name} exists, but its metadata still shows {last} after \
+         {PARTITION_METADATA_ATTEMPTS} reads"
+    )))
+}
+
+/// What `create_topic` does when the topic it is asked to create exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExistingTopic {
+    /// Raise the partition count to the requested one when it is lower.
+    Grow,
+    /// Leave the partition count alone. A topic whose keys are routed over
+    /// its partitions remaps them when one is added, so a count below the
+    /// requested one is refused and a count above it is kept, with a warning.
+    Keep,
+}
+
+/// A partition count `create_topic` raised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PartitionGrowth {
+    pub(super) from: i32,
+    pub(super) to: i32,
+}
+
+/// The `ExistingTopic::Keep` verdict on a topic with `live` partitions, for a
+/// topology whose keys are routed over `required` of them.
+fn check_kept_partitions(name: &str, live: i32, required: i32) -> Result<()> {
+    use std::cmp::Ordering;
+
+    match live.cmp(&required) {
+        Ordering::Less => {
+            metrics::record_backend_error(
+                metrics::BackendLabel::Kafka,
+                metrics::BackendErrorKind::Topology,
+            );
+            Err(ShoveError::Topology(format!(
+                "sequenced topic `{name}` has {live} partitions, fewer than its routing_shards \
+                 ({required}). Keys are routed over the partitions, so adding one would remap \
+                 keys whose backlog sits in the partition they used to map to, and shove never \
+                 adds partitions to a sequenced topic. Provision the topic with {required} \
+                 partitions, or lower routing_shards to {live}"
+            )))
+        }
+        Ordering::Equal => Ok(()),
+        Ordering::Greater => {
+            tracing::warn!(
+                topic = name,
+                partitions = live,
+                routing_shards = required,
+                "sequenced topic has more partitions than its routing_shards; shove leaves the \
+                 count alone, since adding or removing partitions remaps keys"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// What the broker's metadata says of one topic.
@@ -1265,16 +1441,17 @@ impl MetadataConsumer {
         Ok(Self::Default(consumer))
     }
 
-    /// Fetch the metadata of one topic, or of the whole cluster for `None`.
+    /// Fetch the metadata of one topic. There is no way to ask for the whole
+    /// cluster: that answer lists every topic and grows with the cluster.
     /// Blocking: the caller runs this inside `spawn_blocking`.
     fn fetch(
         &self,
-        topic_name: Option<&str>,
+        topic_name: &str,
         timeout: Duration,
         #[cfg(feature = "kafka-msk-iam")] shutdown: &CancellationToken,
     ) -> KafkaResult<Metadata> {
         match self {
-            Self::Default(consumer) => consumer.fetch_metadata(topic_name, timeout),
+            Self::Default(consumer) => consumer.fetch_metadata(Some(topic_name), timeout),
             #[cfg(feature = "kafka-msk-iam")]
             Self::MskIam(consumer) => {
                 // A metadata consumer never polls, so nothing would deliver
@@ -1290,7 +1467,7 @@ impl MetadataConsumer {
                             let _ = consumer.poll(Duration::from_millis(100));
                         }
                     });
-                    let md = consumer.fetch_metadata(topic_name, timeout);
+                    let md = consumer.fetch_metadata(Some(topic_name), timeout);
                     done.store(true, Ordering::Relaxed);
                     md
                 })
@@ -1314,7 +1491,7 @@ fn fetch_topic_metadata_blocking(
         msk_ctx,
     )?;
     let metadata = consumer.fetch(
-        Some(topic_name),
+        topic_name,
         Duration::from_secs(10),
         #[cfg(feature = "kafka-msk-iam")]
         &shutdown,
@@ -1338,9 +1515,17 @@ where
     C: ClientContext + Send + 'static,
 {
     let token = tokio::task::spawn_blocking(move || {
-        // The `Box<dyn Error>` from generate_oauth_token is not `Send`; stringify
+        // The `Box<dyn Error>` from generate_oauth_token is not `Send`; reduce
         // it inside the blocking thread so only a `String` crosses the boundary.
-        ctx.generate_oauth_token(None).map_err(|e| e.to_string())
+        // A typed `Connection` error gives up its prefix; the wrapper below adds it.
+        ctx.generate_oauth_token(None)
+            .map_err(|e| match e.downcast::<ShoveError>() {
+                Ok(typed) => match *typed {
+                    ShoveError::Connection(message) => message,
+                    other => other.to_string(),
+                },
+                Err(other) => other.to_string(),
+            })
     })
     .await
     .map_err(|e| ShoveError::Topology(format!("oauth token task join failed: {e}")))?
@@ -1354,7 +1539,7 @@ where
 }
 
 /// Test-only seam: run the exact admin OAUTHBEARER priming path
-/// ([`prime_admin_oauth_token`]) against a caller-supplied admin client and
+/// (`prime_admin_oauth_token`) against a caller-supplied admin client and
 /// context. Exists because MSK IAM's presigned-URL tokens cannot be validated
 /// without real AWS, so the integration test substitutes an unsecured-JWT
 /// context to exercise this code path against a local OAUTHBEARER broker.
@@ -1418,6 +1603,12 @@ fn set_admin_oauth_token(rk: *mut rd_kafka_t, token: &OAuthToken) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rdkafka::mocking::MockCluster;
+    use rdkafka::producer::DefaultProducerContext;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::future::{Ready, ready};
+    use std::rc::Rc;
 
     #[test]
     fn default_config_is_localhost() {
@@ -1857,44 +2048,113 @@ mod tests {
         assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
     }
 
-    /// A client whose producer reads its CA file from a FIFO in a fresh temp
-    /// dir. Opening the FIFO for writing blocks until librdkafka's
-    /// constructor opens it for reading, so the writer wakes exactly when
-    /// the build is inside the native call, holds it there for `hold`, then
-    /// hands it bytes OpenSSL rejects. Returns the temp dir to remove and the
-    /// writer to join once the build has returned.
+    /// A CA file that is a FIFO in a fresh temp dir. Opening the FIFO for
+    /// writing blocks until librdkafka's constructor opens it for reading,
+    /// so the writer wakes exactly when a native constructor is inside the
+    /// read, holds it there for `hold` or until `release`, then hands it
+    /// bytes OpenSSL rejects. One constructor reads it: a second one would
+    /// wait for a writer that never comes.
     #[cfg(all(feature = "kafka-ssl", unix))]
-    async fn client_whose_producer_build_stalls(
-        hold: Duration,
-    ) -> (KafkaClient, std::path::PathBuf, std::thread::JoinHandle<()>) {
-        use std::io::Write as _;
+    struct StalledCa {
+        path: String,
+        dir: std::path::PathBuf,
+        writer: std::thread::JoinHandle<()>,
+        release: std::sync::mpsc::Sender<()>,
+    }
 
-        let dir = std::env::temp_dir().join(format!(
-            "shove-client-fifo-{}-{}",
-            process::id(),
-            hold.as_millis()
-        ));
-        std::fs::create_dir_all(&dir).expect("create the temp dir");
-        let fifo = dir.join("ca.pem");
-        let ca = fifo.to_str().expect("utf-8 path").to_string();
-        let path = std::ffi::CString::new(ca.as_str()).expect("no NUL");
-        let created = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
-        assert_eq!(created, 0, "mkfifo failed");
-        let writer = std::thread::spawn(move || {
-            let mut fifo = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&fifo)
-                .expect("open the FIFO for writing");
-            std::thread::sleep(hold);
-            fifo.write_all(b"not a certificate\n")
-                .expect("write the FIFO");
-        });
+    #[cfg(all(feature = "kafka-ssl", unix))]
+    impl StalledCa {
+        fn new(tag: &str, hold: Duration) -> Self {
+            use std::io::Write as _;
+
+            let dir =
+                std::env::temp_dir().join(format!("shove-client-fifo-{}-{tag}", process::id()));
+            std::fs::create_dir_all(&dir).expect("create the temp dir");
+            let fifo = dir.join("ca.pem");
+            let path = fifo.to_str().expect("utf-8 path").to_string();
+            let c_path = std::ffi::CString::new(path.as_str()).expect("no NUL");
+            let created = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+            assert_eq!(created, 0, "mkfifo failed");
+            let (release, released) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                let mut fifo = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)
+                    .expect("open the FIFO for writing");
+                let _ = released.recv_timeout(hold);
+                fifo.write_all(b"not a certificate\n")
+                    .expect("write the FIFO");
+            });
+            Self {
+                path,
+                dir,
+                writer,
+                release,
+            }
+        }
+
+        /// End the hold now: the constructor fails as soon as it is released.
+        fn release(&self) {
+            let _ = self.release.send(());
+        }
+
+        /// Join the writer, which returns once the constructor has read the
+        /// FIFO, and remove the temp dir.
+        fn finish(self) {
+            self.writer.join().expect("the FIFO writer thread");
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+
+        /// `base` with TLS on and its CA read from this FIFO.
+        fn applied_to(&self, base: &ClientConfig) -> Arc<ClientConfig> {
+            let mut config = base.clone();
+            config
+                .set("security.protocol", "ssl")
+                .set("ssl.ca.location", self.path.as_str());
+            Arc::new(config)
+        }
+    }
+
+    /// A client whose producer reads its CA from a stalled FIFO.
+    #[cfg(all(feature = "kafka-ssl", unix))]
+    async fn client_whose_producer_build_stalls(hold: Duration) -> (KafkaClient, StalledCa) {
+        let ca = StalledCa::new(&format!("producer-{}", hold.as_millis()), hold);
         let client = client_whose_producer_config_sets(&[
             ("security.protocol", "ssl"),
-            ("ssl.ca.location", ca.as_str()),
+            ("ssl.ca.location", ca.path.as_str()),
         ])
         .await;
-        (client, dir, writer)
+        (client, ca)
+    }
+
+    /// Drives `work` beside a 10 ms ticker on this runtime and returns its
+    /// output with the longest gap between two ticks. On a current-thread
+    /// runtime the ticker only runs while `work` is suspended, so the gap is
+    /// how long `work` held the thread.
+    #[cfg(all(feature = "kafka-ssl", unix))]
+    async fn longest_stall<T>(work: impl std::future::Future<Output = T>) -> (T, Duration) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker = tokio::spawn({
+            let stop = Arc::clone(&stop);
+            async move {
+                let mut longest = Duration::ZERO;
+                let mut last = tokio::time::Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let now = tokio::time::Instant::now();
+                    longest = longest.max(now.saturating_duration_since(last));
+                    last = now;
+                }
+                longest
+            }
+        });
+        // The ticker takes its first reading before `work` starts.
+        tokio::task::yield_now().await;
+        let output = work.await;
+        stop.store(true, Ordering::Relaxed);
+        (output, ticker.await.expect("the ticker joins"))
     }
 
     /// librdkafka's constructor blocks while it reads the CA file, so the
@@ -1904,16 +2164,14 @@ mod tests {
     #[cfg(all(feature = "kafka-ssl", unix))]
     #[tokio::test]
     async fn a_producer_build_blocked_in_librdkafka_leaves_the_runtime_free() {
-        let (client, dir, writer) =
-            client_whose_producer_build_stalls(Duration::from_millis(300)).await;
+        let (client, ca) = client_whose_producer_build_stalls(Duration::from_millis(300)).await;
         let started = tokio::time::Instant::now();
         let tick = async {
             tokio::time::sleep(Duration::from_millis(10)).await;
             started.elapsed()
         };
         let (built, ticked) = tokio::join!(client.producer(), tick);
-        writer.join().expect("the FIFO writer thread");
-        let _ = std::fs::remove_dir_all(&dir);
+        ca.finish();
 
         let free = ticked < Duration::from_millis(150);
         assert!(free, "a 10 ms timer waited {ticked:?}");
@@ -1929,8 +2187,7 @@ mod tests {
     #[cfg(all(feature = "kafka-ssl", unix))]
     #[tokio::test]
     async fn shutdown_waits_for_a_producer_build_in_flight() {
-        let (client, dir, writer) =
-            client_whose_producer_build_stalls(Duration::from_secs(1)).await;
+        let (client, ca) = client_whose_producer_build_stalls(Duration::from_secs(1)).await;
         let started = tokio::time::Instant::now();
         let build = async { client.producer().await.err() };
         let close = async {
@@ -1941,8 +2198,7 @@ mod tests {
             started.elapsed()
         };
         let (build_err, closed_after) = tokio::join!(build, close);
-        writer.join().expect("the FIFO writer thread");
-        let _ = std::fs::remove_dir_all(&dir);
+        ca.finish();
 
         let waited = closed_after >= Duration::from_millis(900);
         assert!(waited, "shutdown returned at {closed_after:?}");
@@ -1951,6 +2207,447 @@ mod tests {
         assert!(
             client.producer.get().is_none(),
             "a failed build left a producer behind"
+        );
+    }
+
+    /// A build that never returns cannot hold a shutdown: with the build held
+    /// on the FIFO for 8 s, `shutdown` stops waiting for it after its own
+    /// bound and returns long before the build does. The writer is released
+    /// afterwards so the test ends.
+    #[cfg(all(feature = "kafka-ssl", unix))]
+    #[tokio::test]
+    async fn shutdown_does_not_wait_forever_for_a_stuck_producer_build() {
+        let (client, ca) = client_whose_producer_build_stalls(Duration::from_secs(8)).await;
+        let started = tokio::time::Instant::now();
+        let build = async { client.producer().await.err() };
+        let close = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client.shutdown().await;
+            let closed_after = started.elapsed();
+            ca.release();
+            closed_after
+        };
+        let (build_err, closed_after) = tokio::join!(build, close);
+        ca.finish();
+
+        let bounded = closed_after < Duration::from_secs(5);
+        assert!(
+            bounded,
+            "shutdown returned at {closed_after:?}, with the build still held"
+        );
+        assert!(
+            matches!(build_err, Some(ShoveError::Topology(_))),
+            "got {build_err:?}"
+        );
+    }
+
+    /// Creating an admin client runs librdkafka's constructor, which blocks
+    /// while it reads the CA file, so it must not run on the runtime thread:
+    /// the ticker keeps ticking while the constructor is held for 400 ms.
+    #[cfg(all(feature = "kafka-ssl", unix))]
+    #[tokio::test]
+    async fn creating_an_admin_client_leaves_the_runtime_free() {
+        let ca = StalledCa::new("admin", Duration::from_millis(400));
+        let mut client = client().await;
+        client.base_config = ca.applied_to(&client.base_config);
+
+        let (created, longest) = longest_stall(client.create_admin_default()).await;
+        ca.finish();
+
+        let err = created.expect_err("the FIFO bytes are not a certificate");
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+        assert!(
+            longest < Duration::from_millis(200),
+            "the runtime stalled for {longest:?} while the admin client was created"
+        );
+    }
+
+    /// `connect` builds the metadata consumer, so it must not hold the
+    /// runtime thread while librdkafka reads the CA file.
+    #[cfg(all(feature = "kafka-ssl", unix))]
+    #[tokio::test]
+    async fn connect_builds_the_metadata_consumer_off_the_runtime() {
+        let ca = StalledCa::new("connect", Duration::from_millis(400));
+        let config = KafkaConfig::new("127.0.0.1:1").with_tls(KafkaTls {
+            ca_location: Some(ca.path.clone().into()),
+            ..KafkaTls::default()
+        });
+
+        let (connected, longest) = longest_stall(KafkaClient::connect(&config)).await;
+        ca.finish();
+
+        let err = connected
+            .err()
+            .expect("the FIFO bytes are not a certificate");
+        assert!(
+            err.to_string()
+                .contains("failed to create metadata consumer"),
+            "{err}"
+        );
+        assert!(
+            longest < Duration::from_millis(200),
+            "the runtime stalled for {longest:?} while connect built the metadata consumer"
+        );
+    }
+
+    /// The autoscaler's stats consumer is created on the first poll of a
+    /// group, inside an async fn, so its constructor must run off the
+    /// runtime thread as well.
+    #[cfg(all(feature = "kafka-ssl", unix))]
+    #[tokio::test]
+    async fn creating_the_stats_consumer_leaves_the_runtime_free() {
+        use super::super::autoscaler::{KafkaLagStatsProvider, KafkaQueueStatsProvider};
+        use super::super::consumer_group::KafkaAutoOffsetReset;
+
+        let ca = StalledCa::new("stats", Duration::from_millis(400));
+        let mut client = client().await;
+        client.base_config = ca.applied_to(&client.base_config);
+        let provider = KafkaLagStatsProvider::new(client);
+
+        let (stats, longest) = longest_stall(provider.get_queue_stats(
+            "orders",
+            "orders-consumer",
+            KafkaAutoOffsetReset::Earliest,
+        ))
+        .await;
+        ca.finish();
+
+        let err = stats.expect_err("the FIFO bytes are not a certificate");
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+        assert!(
+            longest < Duration::from_millis(200),
+            "the runtime stalled for {longest:?} while the stats consumer was created"
+        );
+    }
+
+    // -- a sequenced topic keeps the partition count it has --
+
+    /// The fields of every WARN event `f` emits, one `name=value` list per
+    /// event.
+    fn warnings(f: impl FnOnce()) -> Vec<String> {
+        use std::fmt::Debug;
+        use std::sync::Mutex;
+        use tracing::field::{Field, Visit};
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Clone, Default)]
+        struct Warned(Arc<Mutex<Vec<String>>>);
+
+        struct Fields(Vec<String>);
+
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+                self.0.push(format!("{}={value:?}", field.name()));
+            }
+        }
+
+        impl<S: tracing::Subscriber> Layer<S> for Warned {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    let mut fields = Fields(Vec::new());
+                    event.record(&mut fields);
+                    self.0.lock().unwrap().push(fields.0.join(" "));
+                }
+            }
+        }
+
+        let warned = Warned::default();
+        with_default(tracing_subscriber::registry().with(warned.clone()), f);
+        warned.0.lock().unwrap().clone()
+    }
+
+    /// Fewer partitions than routing shards is refused, and the message
+    /// carries both counts.
+    #[test]
+    fn a_kept_topic_with_fewer_partitions_than_required_is_refused() {
+        let err =
+            check_kept_partitions("orders", 2, 4).expect_err("two partitions for four shards");
+
+        let ShoveError::Topology(message) = &err else {
+            panic!("expected Topology, got {err:?}");
+        };
+        assert!(message.contains("2 partitions"), "{message}");
+        assert!(message.contains("routing_shards (4)"), "{message}");
+    }
+
+    #[test]
+    fn a_kept_topic_with_exactly_the_required_partitions_passes_silently() {
+        let warned = warnings(|| {
+            check_kept_partitions("orders", 4, 4).expect("the counts agree");
+        });
+
+        assert!(warned.is_empty(), "{warned:?}");
+    }
+
+    /// More partitions than shards is accepted and left alone, with a
+    /// warning that names the topic and both counts.
+    #[test]
+    fn a_kept_topic_with_more_partitions_than_required_passes_with_a_warning() {
+        let warned = warnings(|| {
+            check_kept_partitions("orders", 6, 4).expect("more partitions remap nothing");
+        });
+
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        for field in ["topic=\"orders\"", "partitions=6", "routing_shards=4"] {
+            assert!(warned[0].contains(field), "{field} missing from {warned:?}");
+        }
+    }
+
+    // -- ensure_partitions answers from the topic's own metadata --
+
+    /// A mock cluster with `topic` at four partitions and a client over it.
+    async fn client_on_a_mock_with(
+        topic: Option<&str>,
+    ) -> (MockCluster<'static, DefaultProducerContext>, KafkaClient) {
+        let mock = MockCluster::new(1).expect("mock cluster");
+        if let Some(topic) = topic {
+            mock.create_topic(topic, 4, 1).expect("mock topic");
+        }
+        let client = KafkaClient::connect(&KafkaConfig::new(mock.bootstrap_servers()))
+            .await
+            .expect("connect to the mock cluster");
+        (mock, client)
+    }
+
+    /// A topic-level metadata error is not an answer about partitions: the
+    /// mock still lists the four partitions beside it, and trusting them
+    /// would report a topic the principal may not even describe as ready.
+    #[tokio::test]
+    async fn ensure_partitions_reports_a_topic_metadata_error() {
+        let (mock, client) = client_on_a_mock_with(Some("orders")).await;
+        mock.topic_error(
+            "orders",
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+        )
+        .expect("inject the topic error");
+        let admin = client.create_admin_default().await.expect("admin client");
+
+        let err = client
+            .ensure_partitions(&admin, "orders", 4)
+            .await
+            .expect_err("an errored topic answers nothing");
+
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("TOPIC_AUTHORIZATION_FAILED"),
+            "{err}"
+        );
+    }
+
+    /// Leader election trails a topic's creation, and a declarer that lost
+    /// the creation race reads the topic in that window: LEADER_NOT_AVAILABLE
+    /// is read again until it clears, so the answer comes after the error does.
+    #[tokio::test]
+    async fn ensure_partitions_waits_out_a_leader_not_available_answer() {
+        const CLEARS_AFTER: Duration = Duration::from_millis(1500);
+        let (mock, client) = client_on_a_mock_with(Some("orders")).await;
+        mock.topic_error(
+            "orders",
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_LEADER_NOT_AVAILABLE,
+        )
+        .expect("inject the topic error");
+        let admin = client.create_admin_default().await.expect("admin client");
+
+        let started = tokio::time::Instant::now();
+        let ensure = async {
+            let settled = client.ensure_partitions(&admin, "orders", 4).await;
+            (settled, started.elapsed())
+        };
+        let ((settled, waited), ()) = tokio::join!(ensure, async {
+            tokio::time::sleep(CLEARS_AFTER).await;
+            mock.topic_error("orders", RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR)
+                .expect("clear the topic error");
+        });
+
+        settled.expect("a topic whose leaders are elected has its partitions");
+        assert!(
+            waited >= CLEARS_AFTER,
+            "answered at {waited:?}, before the error cleared"
+        );
+    }
+
+    /// `CreateTopics` said the topic exists, yet the broker's metadata does
+    /// not list it for a while: UNKNOWN_TOPIC_OR_PART is retried.
+    #[tokio::test]
+    async fn ensure_partitions_waits_for_a_topic_that_metadata_does_not_list_yet() {
+        const LISTED_AFTER: Duration = Duration::from_millis(1200);
+        let (mock, client) = client_on_a_mock_with(None).await;
+        let admin = client.create_admin_default().await.expect("admin client");
+
+        let (settled, ()) = tokio::join!(client.ensure_partitions(&admin, "orders", 4), async {
+            tokio::time::sleep(LISTED_AFTER).await;
+            mock.create_topic("orders", 4, 1).expect("create the topic");
+        });
+
+        settled.expect("a topic that shows up is ready");
+    }
+
+    // -- the bounded read of a topic's partition count --
+
+    /// A probe that answers from `script`, one answer per read, and the count
+    /// of reads it has been asked for. A read past the end of the script
+    /// panics, which fails a test whose reads are not bounded.
+    fn scripted(
+        script: Vec<TopicProbe>,
+    ) -> (impl FnMut() -> Ready<Result<TopicProbe>>, Rc<Cell<u32>>) {
+        let reads = Rc::new(Cell::new(0));
+        let counted = Rc::clone(&reads);
+        let mut script: VecDeque<TopicProbe> = script.into();
+        let probe = move || {
+            counted.set(counted.get() + 1);
+            ready(Ok(script.pop_front().expect("a read past the script")))
+        };
+        (probe, reads)
+    }
+
+    /// The broker that answers a metadata read can still report the count from
+    /// before an expansion the controller has accepted: reads continue until
+    /// the target count shows.
+    #[tokio::test(start_paused = true)]
+    async fn partition_count_behind_the_target_is_read_again_until_it_catches_up() {
+        let (probe, reads) = scripted(vec![
+            TopicProbe::Present(2),
+            TopicProbe::Present(2),
+            TopicProbe::Present(4),
+        ]);
+
+        let count = read_partition_count("orders", 4, probe)
+            .await
+            .expect("the third read shows the new count");
+
+        assert_eq!((count, reads.get()), (4, 3));
+    }
+
+    /// A count that never catches up ends the reads at their bound and is
+    /// returned for the caller to judge.
+    #[tokio::test(start_paused = true)]
+    async fn partition_count_that_stays_behind_the_target_is_returned_after_the_bounded_reads() {
+        let (probe, reads) = scripted(
+            (0..PARTITION_METADATA_ATTEMPTS)
+                .map(|_| TopicProbe::Present(2))
+                .collect(),
+        );
+
+        let count = read_partition_count("orders", 4, probe)
+            .await
+            .expect("a count that stays behind is still an answer");
+
+        assert_eq!((count, reads.get()), (2, PARTITION_METADATA_ATTEMPTS));
+    }
+
+    /// A missing topic, an election in progress and a stale count are all
+    /// transient, and one run of reads waits out the three of them.
+    #[tokio::test(start_paused = true)]
+    async fn partition_count_reads_wait_out_stale_and_transient_answers_together() {
+        let (probe, reads) = scripted(vec![
+            TopicProbe::Missing,
+            TopicProbe::Failed(RDKafkaRespErr::RD_KAFKA_RESP_ERR_LEADER_NOT_AVAILABLE),
+            TopicProbe::Present(2),
+            TopicProbe::Present(4),
+        ]);
+
+        let count = read_partition_count("orders", 4, probe)
+            .await
+            .expect("the fourth read shows the new count");
+
+        assert_eq!((count, reads.get()), (4, 4));
+    }
+
+    /// Any other topic-level error is final: one read, then the error.
+    #[tokio::test(start_paused = true)]
+    async fn partition_count_with_a_final_topic_error_ends_the_reads_at_once() {
+        let (probe, reads) = scripted(vec![TopicProbe::Failed(
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+        )]);
+
+        let err = read_partition_count("orders", 4, probe)
+            .await
+            .expect_err("an authorization error is final");
+
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("TOPIC_AUTHORIZATION_FAILED"),
+            "{err}"
+        );
+        assert_eq!(reads.get(), 1);
+    }
+
+    /// With no target the first count is the answer, as for a caller that
+    /// only wants to know how many partitions the topic has.
+    #[tokio::test(start_paused = true)]
+    async fn partition_count_with_no_target_answers_on_the_first_read() {
+        let (probe, reads) = scripted(vec![TopicProbe::Present(2)]);
+
+        let count = read_partition_count("orders", 0, probe)
+            .await
+            .expect("the first read answers");
+
+        assert_eq!((count, reads.get()), (2, 1));
+    }
+
+    /// A topic that never shows up fails after the bounded reads, naming what
+    /// the last read showed.
+    #[tokio::test(start_paused = true)]
+    async fn partition_count_of_a_topic_that_never_shows_up_fails_after_the_bounded_reads() {
+        let (probe, reads) = scripted(
+            (0..PARTITION_METADATA_ATTEMPTS)
+                .map(|_| TopicProbe::Missing)
+                .collect(),
+        );
+
+        let err = read_partition_count("orders", 4, probe)
+            .await
+            .expect_err("a missing topic is not a count");
+
+        assert!(matches!(err, ShoveError::Topology(_)), "got {err:?}");
+        assert!(err.to_string().contains("no such topic"), "{err}");
+        assert_eq!(reads.get(), PARTITION_METADATA_ATTEMPTS);
+    }
+
+    // -- the admin OAUTHBEARER token error carries one prefix --
+
+    /// A context whose token callback fails with the typed error the MSK IAM
+    /// signer returns.
+    #[cfg(feature = "kafka-msk-iam")]
+    struct SigningFails;
+
+    #[cfg(feature = "kafka-msk-iam")]
+    impl ClientContext for SigningFails {
+        fn generate_oauth_token(
+            &self,
+            _principal_name: Option<&str>,
+        ) -> std::result::Result<OAuthToken, Box<dyn std::error::Error>> {
+            Err(Box::new(ShoveError::Connection(
+                "failed to sign an MSK IAM token: no credentials".into(),
+            )))
+        }
+    }
+
+    /// The signer's `Connection` error is unwrapped before the admin path
+    /// wraps it, so the message reads "connection error: ..." once.
+    #[cfg(feature = "kafka-msk-iam")]
+    #[tokio::test]
+    async fn a_failed_admin_token_error_carries_one_connection_prefix() {
+        let admin: AdminClient<SigningFails> = ClientConfig::new()
+            .set("bootstrap.servers", "127.0.0.1:1")
+            .create_with_context(SigningFails)
+            .expect("an admin client over a context");
+
+        let err = prime_admin_oauth_token(&admin, SigningFails)
+            .await
+            .expect_err("the signer fails");
+
+        let shown = err.to_string();
+        assert!(matches!(err, ShoveError::Connection(_)), "got {err:?}");
+        assert_eq!(shown.matches("connection error").count(), 1, "{shown}");
+        assert!(
+            shown.contains("failed to generate OAUTHBEARER token for admin client"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("failed to sign an MSK IAM token: no credentials"),
+            "{shown}"
         );
     }
 }
