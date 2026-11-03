@@ -48,11 +48,11 @@ So `.broadcast()` implies `allow_message_loss`, and the retry budget is pinned t
 | `Ack` | Message retired. |
 | `Retry` | Discarded with a `WARN`, and `shove_messages_discarded_total{reason="max_retries_exceeded"}` increments. |
 | `Reject` | Discarded with a `WARN`, same counters. |
-| `Defer` | Redelivered **within this subscription only** — never to the other subscribers. |
+| `Defer` | Redelivered **within this subscription only**, after a fixed 1 s wait that is the same on every backend. The other subscribers never see it. |
 
 That is the same terminal path a topology with no DLQ already takes, so an existing data-loss alert on `shove_messages_discarded_total` covers broadcast without changes. If losing a message on handler failure is unacceptable for your use case, broadcast is the wrong primitive — use a consumer group per reader with `for_consumer_group`.
 
-`Defer` deserves one warning. A broadcast subscription is a single delivery loop, so a deferred message is retried **in place**, holding up the messages behind it — and because `Defer` never spends the retry budget, a handler that always defers stalls the subscription indefinitely. There is nowhere else to put the message: no second consumer to hand the backlog to, and no DLQ or hold queue to park it in. Use `Defer` on a broadcast topic only for a condition you expect to clear on its own.
+`Defer` deserves one warning. A broadcast subscription is a single delivery loop, so a deferred message is retried **in place** after the fixed 1 s wait, holding up the messages behind it — and because `Defer` never spends the retry budget, a handler that always defers stalls the subscription indefinitely. There is nowhere else to put the message: no second consumer to hand the backlog to, and no DLQ or hold queue to park it in. Use `Defer` on a broadcast topic only for a condition you expect to clear on its own.
 
 **One consumer per instance.** There is no autoscaling knob on `BroadcastSubscriber`, because a second consumer inside the same process would *split* the fan-out rather than duplicate it — competing consumption sneaking back in through the wrong door. Registering a `.broadcast()` topology on `consumer_group()` or `consumer_supervisor()` returns a `ShoveError::Topology` for the same reason.
 
@@ -128,7 +128,7 @@ The tail is the default start, not the only one.
 `ConsumerOptions::with_broadcast_start` takes a `BroadcastStart`, and Kafka honours all three variants.
 `Tail` is the default, and `Head` replays every retained record before tailing.
 `Timestamp(ms)` starts at the first record at or after that instant, resolved with the same lookup `reset_consumer_group_offsets` uses.
-A partition added while the subscription runs is assigned at the same start.
+A partition added while the subscription runs is assigned at the same start, and the partitions already assigned keep fetching where they are.
 See [Starting a broadcast subscription elsewhere than the tail](/backends/kafka#starting-a-broadcast-subscription-elsewhere-than-the-tail).
 
 One wrinkle worth knowing about if you go looking at client config: librdkafka refuses `assign()` on a consumer handle with no `group.id` at all, so `shove` configures the fixed string `{queue}-broadcast`. It is inert — nothing joins under it and nothing commits to it — and it is deliberately *not* a per-process value, because a per-restart identifier showing up in client tooling is the same accumulating residue this feature exists to avoid.

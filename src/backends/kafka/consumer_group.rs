@@ -14,9 +14,9 @@ use tracing::{debug, info, warn};
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::kafka::client::KafkaClient;
 use crate::backends::kafka::consumer::{
-    KafkaConsumer, check_per_record_prefetch, reject_fifo_commit_policy, reject_fifo_in_place,
-    resolve_retry_strategy,
+    KafkaConsumer, check_per_record_prefetch, reject_fifo_commit_policy, resolve_retry_strategy,
 };
+use crate::backends::kafka::fetch_queue::FetchQueueTuning;
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
 use crate::consumer::RetryStrategy;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
@@ -52,9 +52,17 @@ fn harvest_if_finished(
         && !e.is_cancelled()
     {
         tracing::error!(error = %e, group = %queue, "finished consumer task had panicked");
-        panic_count.fetch_add(1, Ordering::Relaxed);
+        count_one(panic_count);
     }
     true
+}
+
+/// Counts one more occurrence, saturating at the top.
+fn count_one(counter: &AtomicUsize) {
+    // The closure always answers `Some`, so the update cannot fail.
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_add(1))
+    });
 }
 
 /// `auto.offset.reset` policy applied when a consumer group joins a topic
@@ -141,16 +149,28 @@ impl KafkaAutoOffsetReset {
 /// `ConsumerOptions::<Kafka>`; `with_commit_interval(d)` on either is
 /// shorthand for `Interval(d)`. Unset keeps `Interval` at its 500 ms
 /// default. Standard consumers only: a FIFO consumer and the DLQ drain
-/// commit each message as it settles, and a broadcast subscription commits
+/// commit on the fixed 500 ms default, and a broadcast subscription commits
 /// nothing, so each refuses a policy at its entry point.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitPolicy {
-    /// Asynchronously, at most once per interval: completions are tracked
-    /// in memory and the position is committed when the window reopens, so
-    /// a crash replays about one interval of completed records. The
-    /// default, with a 500 ms interval. The interval must be positive and
-    /// at most one hour.
+    /// At most once per interval, while the consumer goes on: completions
+    /// are tracked in memory and the position is committed when the window
+    /// reopens, so a crash replays about one interval of completed records.
+    /// The default, with a 500 ms interval. The interval must be positive
+    /// and at most one hour.
+    ///
+    /// One commit is in flight at a time, made synchronously on a thread of
+    /// its own, and the consumer reads its answer back without waiting for
+    /// it. A commit the coordinator rejects is re-offered, and a member
+    /// whose commits keep being rejected with no rebalance resolving them
+    /// is treated as fenced and reconnects.
+    ///
+    /// A `Retry` or `Defer` whose republish fails, or a dead letter that
+    /// fails, and may succeed later ends the member with a connection error,
+    /// as under `PerRecord`. Nothing is committed past the record, and the
+    /// reconnect redelivers it with every record behind it that was not
+    /// committed yet.
     Interval(Duration),
     /// On every completion, accepted by the coordinator before the next
     /// record is handed out. The position is committed synchronously on a
@@ -173,9 +193,10 @@ pub enum CommitPolicy {
     /// was in flight across a coordinator reconnect. librdkafka retries an
     /// abandoned commit on the next connection, and the broker may apply
     /// the abandoned copy after later commits. The Kafka page cites those
-    /// lines too. A `Retry` or `Defer` whose republish fails ends the member
-    /// with a connection error. The reconnect redelivers that record, and
-    /// nothing behind it was handed out meanwhile.
+    /// lines too. A `Retry` or `Defer` whose republish fails, or a dead
+    /// letter that fails, and may succeed later ends the member with a
+    /// connection error. The reconnect redelivers that record, and nothing
+    /// behind it was handed out meanwhile.
     ///
     /// Every record costs a commit round trip and a fetch round trip,
     /// because the resume refetches from the position: an opt-in for a
@@ -242,6 +263,11 @@ pub struct KafkaConsumerGroupConfig {
     /// [`with_retry_strategy`](Self::with_retry_strategy). `None` lets the
     /// topology's ownership decide.
     retry_strategy: Option<RetryStrategy>,
+    /// The fetch queue settings of the members' librdkafka clients, see
+    /// [`with_queued_min_messages`](Self::with_queued_min_messages) and its
+    /// two siblings. Unset settings keep the backoff default and librdkafka's
+    /// thresholds.
+    pub(crate) fetch_queue: FetchQueueTuning,
     /// `test-support` builds only: the members' `max.poll.interval.ms`, see
     /// [`with_max_poll_interval_for_test`](Self::with_max_poll_interval_for_test).
     #[cfg(feature = "test-support")]
@@ -303,6 +329,7 @@ impl KafkaConsumerGroupConfig {
             auto_offset_reset: None,
             commit_policy: None,
             retry_strategy: None,
+            fetch_queue: FetchQueueTuning::default(),
             #[cfg(feature = "test-support")]
             max_poll_interval: None,
             #[cfg(feature = "test-support")]
@@ -436,16 +463,17 @@ impl KafkaConsumerGroupConfig {
     /// [`CommitPolicy::Interval`]: both setters write the one policy slot,
     /// so the last call wins.
     ///
-    /// Completions are tracked in memory and committed asynchronously at most
-    /// once per interval, so a longer interval trades coordinator requests
-    /// for a wider replay window after a crash or a rebalance. The final
-    /// commit at shutdown is synchronous whatever the interval. The fenced
-    /// consumer detector's threshold grows with the interval, because the
-    /// streak it watches can only clear on a commit drain.
+    /// Completions are tracked in memory and committed at most once per
+    /// interval, one commit at a time while the consumer goes on, so a
+    /// longer interval trades coordinator requests for a wider replay window
+    /// after a crash or a rebalance. The final commit at shutdown is
+    /// synchronous whatever the interval. The fenced consumer detector's
+    /// threshold grows with the interval, because a rejected position is
+    /// re-offered only once per interval.
     ///
-    /// Standard groups only. A FIFO group commits each message as it
-    /// settles, so it has no interval to set; `register_fifo` refuses a
-    /// config that sets one rather than ignore it.
+    /// Standard groups only. A FIFO group commits on the fixed 500 ms
+    /// default and never reads the setting; `register_fifo` refuses a config
+    /// that sets one rather than ignore it.
     ///
     /// # Panics
     ///
@@ -495,11 +523,11 @@ impl KafkaConsumerGroupConfig {
         self
     }
 
-    /// Test-only seam (see the `test-support` feature): judge the group's
-    /// concurrent members' rejected commits by this floor instead of the
-    /// pinned sixty seconds, so a test can watch the fenced consumer
-    /// detector fire in seconds. The threshold still grows with the commit
-    /// interval above the floor.
+    /// Test-only seam (see the `test-support` feature): judge the rejected
+    /// commits of the group's members, concurrent and sequenced, by this
+    /// floor instead of the pinned sixty seconds, so a test can watch the
+    /// fenced consumer detector fire in seconds. The threshold still grows
+    /// with the commit interval above the floor.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn with_commit_fence_floor_for_test(mut self, floor: Duration) -> Self {
@@ -528,9 +556,10 @@ impl KafkaConsumerGroupConfig {
     /// Unset, the topology's ownership decides: an external topology runs in
     /// place, a shove-owned one republishes into the topic. An external
     /// topology refuses `Republish` when a member starts, because the
-    /// republish would write into a topic infra owns. `register_fifo` refuses
-    /// `InPlace`, which the FIFO consumer does not implement. For the direct
-    /// and supervisor paths the equivalent is
+    /// republish would write into a topic infra owns. `register_fifo`
+    /// accepts either: a sequenced consumer always retries in place, so a
+    /// later record of the key is never handled before the retried one. For
+    /// the direct and supervisor paths the equivalent is
     /// `ConsumerOptions::<Kafka>::with_retry_strategy`.
     pub fn with_retry_strategy(mut self, strategy: RetryStrategy) -> Self {
         self.retry_strategy = Some(strategy);
@@ -541,6 +570,66 @@ impl KafkaConsumerGroupConfig {
     /// topology's ownership decides.
     pub fn retry_strategy(&self) -> Option<RetryStrategy> {
         self.retry_strategy
+    }
+
+    /// librdkafka's `queued.min.messages` for every member: how many messages
+    /// per partition a member tries to keep prefetched in its local queue. A
+    /// partition whose queue holds that many is not fetched again until
+    /// [`with_fetch_queue_backoff_ms`](Self::with_fetch_queue_backoff_ms) has
+    /// passed. Unset keeps librdkafka's default, 100000.
+    ///
+    /// A higher value prefetches further ahead of the handlers and holds more
+    /// messages in memory, and a lower one bounds that memory.
+    /// [`with_queued_max_messages_kbytes`](Self::with_queued_max_messages_kbytes)
+    /// bounds the same queue by size.
+    ///
+    /// The accepted range is `1..=10000000`. A value outside it is refused
+    /// with `ShoveError::Validation` by `register` and `register_fifo`, before
+    /// anything is declared or a member spawned. The same setting is available
+    /// on `ConsumerOptions::<Kafka>` for the direct and supervisor paths.
+    pub fn with_queued_min_messages(mut self, messages: u32) -> Self {
+        self.fetch_queue.queued_min_messages = Some(messages);
+        self
+    }
+
+    /// librdkafka's `queued.max.messages.kbytes` for every member: how many
+    /// kilobytes of prefetched messages a member's local queue may hold before
+    /// librdkafka stops fetching until
+    /// [`with_fetch_queue_backoff_ms`](Self::with_fetch_queue_backoff_ms) has
+    /// passed. librdkafka gives it priority over `queued.min.messages`. Unset
+    /// keeps librdkafka's default, 65536, about 64 MB.
+    ///
+    /// The accepted range is `1..=2097151`. A value outside it is refused
+    /// with `ShoveError::Validation` by `register` and `register_fifo`, as
+    /// [`with_queued_min_messages`](Self::with_queued_min_messages) is. The same
+    /// setting is available on `ConsumerOptions::<Kafka>` for the direct and
+    /// supervisor paths.
+    pub fn with_queued_max_messages_kbytes(mut self, kbytes: u32) -> Self {
+        self.fetch_queue.queued_max_messages_kbytes = Some(kbytes);
+        self
+    }
+
+    /// librdkafka's `fetch.queue.backoff.ms` for every member: how long to
+    /// wait before fetching a partition again once its local queue reached
+    /// `queued.min.messages` or `queued.max.messages.kbytes`. Unset keeps
+    /// 25 ms, which every Kafka consumer shove builds uses, in place of
+    /// librdkafka's 1000 ms.
+    ///
+    /// The wait runs its full length even when the handlers empty the queue
+    /// meanwhile. At 1000 ms a consumer that works through a backlog faster
+    /// than the queue refills idles for the rest of each second, which caps a
+    /// partition at about `queued.min.messages` messages per second. A lower
+    /// value refetches sooner and checks a full queue more often. `0` removes
+    /// the wait, and can raise CPU use while a queue stays full.
+    ///
+    /// The accepted range is `0..=300000`. A value outside it is refused with
+    /// `ShoveError::Validation` by `register` and `register_fifo`, as
+    /// [`with_queued_min_messages`](Self::with_queued_min_messages) is. The same
+    /// setting is available on `ConsumerOptions::<Kafka>` for the direct and
+    /// supervisor paths.
+    pub fn with_fetch_queue_backoff_ms(mut self, ms: u32) -> Self {
+        self.fetch_queue.fetch_queue_backoff_ms = Some(ms);
+        self
     }
 
     /// Set the Schema Registry client for this consumer group.
@@ -719,7 +808,7 @@ impl KafkaConsumerGroup {
             tokio::spawn(async move {
                 let result = consumer.run_declared::<T, H>(handler, ctx, options).await;
                 if let Err(e) = result {
-                    ec.fetch_add(1, Ordering::Relaxed);
+                    count_one(&ec);
                     tracing::error!("consumer task exited with error: {e}");
                 }
             })
@@ -749,6 +838,12 @@ impl KafkaConsumerGroup {
     ///
     /// FIFO replica count is fixed at 1 — Kafka uses partition-level ordering,
     /// so a single consumer task is sufficient.
+    ///
+    /// The group's task holds an abort guard on the shard task, so aborting
+    /// the group's task at a drain timeout aborts the shard and the handler
+    /// call it is awaiting. A handler still running when the abort reaches the
+    /// shard is dropped with it, and its record stays uncommitted and is
+    /// redelivered.
     pub fn new_fifo<T, H>(
         queue: impl Into<String>,
         client: KafkaClient,
@@ -781,21 +876,26 @@ impl KafkaConsumerGroup {
                 let handles = match consumer.spawn_fifo_shards::<T, H>(handler, ctx, options) {
                     Ok(h) => h,
                     Err(e) => {
-                        ec.fetch_add(1, Ordering::Relaxed);
+                        count_one(&ec);
                         tracing::error!("FIFO registration failed: {e}");
                         return;
                     }
                 };
+                // A dropped `JoinHandle` detaches its task; abort the shards with this wrapper.
+                let _shards: Vec<AbortOnDrop> = handles
+                    .iter()
+                    .map(|handle| AbortOnDrop(handle.abort_handle()))
+                    .collect();
                 for handle in handles {
                     match handle.await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
-                            ec.fetch_add(1, Ordering::Relaxed);
+                            count_one(&ec);
                             tracing::error!("sequenced shard exited with error: {e}");
                         }
                         Err(e) if e.is_cancelled() => {}
                         Err(e) => {
-                            pc.fetch_add(1, Ordering::Relaxed);
+                            count_one(&pc);
                             tracing::error!("sequenced shard panicked: {e}");
                         }
                     }
@@ -1000,8 +1100,7 @@ impl KafkaConsumerGroup {
         );
         self.group_token.cancel();
 
-        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
-        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+        self.take_counts_into(tally);
 
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
             let _abort_guard = AbortOnDrop(handle.abort_handle());
@@ -1010,7 +1109,7 @@ impl KafkaConsumerGroup {
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
-                    tally.panics += 1;
+                    tally.panics = tally.panics.saturating_add(1);
                 }
             }
         }
@@ -1022,13 +1121,23 @@ impl KafkaConsumerGroup {
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "retired consumer task panicked");
-                    tally.panics += 1;
+                    tally.panics = tally.panics.saturating_add(1);
                 }
             }
         }
 
-        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
-        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+        self.take_counts_into(tally);
+    }
+
+    /// Moves the counts the group's tasks recorded into `tally`, saturating
+    /// at the top.
+    fn take_counts_into(&self, tally: &mut ShutdownTally) {
+        tally.errors = tally
+            .errors
+            .saturating_add(self.error_count.swap(0, Ordering::Relaxed));
+        tally.panics = tally
+            .panics
+            .saturating_add(self.panic_count.swap(0, Ordering::Relaxed));
     }
 
     /// Abort surviving consumer handles after a drain timeout, accumulating
@@ -1051,7 +1160,7 @@ impl KafkaConsumerGroup {
                         group = %self.queue,
                         "consumer task panicked during abort escalation"
                     );
-                    tally.panics += 1;
+                    tally.panics = tally.panics.saturating_add(1);
                 }
             }
         }
@@ -1061,12 +1170,11 @@ impl KafkaConsumerGroup {
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "retired consumer task panicked");
-                    tally.panics += 1;
+                    tally.panics = tally.panics.saturating_add(1);
                 }
             }
         }
-        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
-        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+        self.take_counts_into(tally);
     }
 
     fn spawn_one(&mut self) {
@@ -1088,6 +1196,7 @@ impl KafkaConsumerGroup {
         }
         options.kafka_auto_offset_reset = self.config.auto_offset_reset;
         options.kafka_commit_policy = self.config.commit_policy;
+        options.kafka_fetch_queue = self.config.fetch_queue;
         options.retry_strategy = self.config.retry_strategy;
         #[cfg(feature = "test-support")]
         {
@@ -1102,9 +1211,10 @@ impl KafkaConsumerGroup {
             options.schema_message_index = self.config.schema_message_index.clone();
         }
         let handle = (self.spawner)(options);
-        self.consumers.push((child_token, processing, handle));
         // Raw vec position of the new entry, not a liveness count.
-        debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");
+        let consumer_index = self.consumers.len();
+        self.consumers.push((child_token, processing, handle));
+        debug!(group = %self.queue, consumer_index, "spawned consumer");
     }
 }
 
@@ -1225,6 +1335,7 @@ impl KafkaConsumerGroupRegistry {
                 "KafkaConsumerGroupRegistry::register",
             )?;
         }
+        config.fetch_queue.validate(&name)?;
 
         if self.groups.contains_key(&name) {
             metrics::record_backend_error(
@@ -1246,7 +1357,8 @@ impl KafkaConsumerGroupRegistry {
         )?;
 
         let mut declarer = KafkaTopologyDeclarer::new(client.clone())
-            .with_min_partitions(config.max_consumers as i32);
+            .with_min_partitions(i32::from(config.max_consumers))
+            .with_group_offset_reset(config.auto_offset_reset());
         if let Some(rf) = self.default_replication_factor {
             declarer = declarer.with_replication_factor(rf);
         }
@@ -1295,9 +1407,6 @@ impl KafkaConsumerGroupRegistry {
         if config.commit_policy().is_some() {
             return Err(reject_fifo_commit_policy(T::topology().queue()));
         }
-        if config.retry_strategy() == Some(RetryStrategy::InPlace) {
-            return Err(reject_fifo_in_place(T::topology().queue()));
-        }
 
         let mut config = config;
         config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
@@ -1307,6 +1416,7 @@ impl KafkaConsumerGroupRegistry {
 
         let topology = T::topology();
         let name = topology.queue().to_string();
+        config.fetch_queue.validate(&name)?;
 
         if self.groups.contains_key(&name) {
             return Err(ShoveError::Topology(format!(
@@ -1756,6 +1866,93 @@ mod tests {
         assert_eq!(tally.panics, 1);
     }
 
+    // -- tally arithmetic --
+
+    /// Polls until `handle` has finished (bounded).
+    async fn wait_handle_finished(handle: &JoinHandle<()>) {
+        for _ in 0..200 {
+            if handle.is_finished() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("task did not finish within the wait budget");
+    }
+
+    /// A group whose one member and one retired member have both panicked.
+    async fn group_of_panicked_members() -> KafkaConsumerGroup {
+        let spawner: Spawner = Arc::new(|_options: ConsumerOptions| {
+            tokio::spawn(async { panic!("consumer blew up") })
+        });
+        let mut group = test_group_with_spawner(KafkaConsumerGroupConfig::new(1..=1), spawner);
+        group.start();
+        group
+            .retiring
+            .push(tokio::spawn(async { panic!("retired consumer blew up") }));
+        wait_handle_finished(&group.consumers[0].2).await;
+        wait_handle_finished(&group.retiring[0]).await;
+        group
+    }
+
+    #[tokio::test]
+    async fn a_harvested_panic_leaves_a_full_counter_full() {
+        let counter = AtomicUsize::new(usize::MAX);
+        let mut handle: JoinHandle<()> = tokio::spawn(async { panic!("consumer blew up") });
+        wait_handle_finished(&handle).await;
+
+        assert!(harvest_if_finished(&mut handle, &counter, "test-queue"));
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn a_drain_leaves_a_full_tally_full() {
+        let mut group = test_group(KafkaConsumerGroupConfig::new(0..=1));
+        group.error_count.store(usize::MAX, Ordering::Relaxed);
+        group.panic_count.store(usize::MAX, Ordering::Relaxed);
+
+        let mut tally = ShutdownTally {
+            errors: 1,
+            panics: 1,
+        };
+        group.drain_into(&mut tally).await;
+
+        assert_eq!((tally.errors, tally.panics), (usize::MAX, usize::MAX));
+    }
+
+    #[tokio::test]
+    async fn an_abort_leaves_a_full_tally_full() {
+        let mut group = test_group(KafkaConsumerGroupConfig::new(0..=1));
+        group.error_count.store(usize::MAX, Ordering::Relaxed);
+        group.panic_count.store(usize::MAX, Ordering::Relaxed);
+
+        let mut tally = ShutdownTally {
+            errors: 1,
+            panics: 1,
+        };
+        group.abort_remaining_into(&mut tally).await;
+
+        assert_eq!((tally.errors, tally.panics), (usize::MAX, usize::MAX));
+    }
+
+    #[tokio::test]
+    async fn joined_panics_leave_a_full_tally_full() {
+        let mut drained = group_of_panicked_members().await;
+        let mut tally = ShutdownTally {
+            errors: 0,
+            panics: usize::MAX,
+        };
+        drained.drain_into(&mut tally).await;
+        assert_eq!(tally.panics, usize::MAX);
+
+        let mut aborted = group_of_panicked_members().await;
+        let mut tally = ShutdownTally {
+            errors: 0,
+            panics: usize::MAX,
+        };
+        aborted.abort_remaining_into(&mut tally).await;
+        assert_eq!(tally.panics, usize::MAX);
+    }
+
     // -- accessors --
 
     #[test]
@@ -2019,13 +2216,84 @@ mod tests {
         );
     }
 
+    // -- fetch queue --
+
+    #[test]
+    fn fetch_queue_settings_default_to_unset() {
+        assert_eq!(
+            KafkaConsumerGroupConfig::new(1..=1).fetch_queue,
+            FetchQueueTuning::default()
+        );
+    }
+
+    #[test]
+    fn the_fetch_queue_setters_store_their_values_independently() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1).with_queued_min_messages(5_000);
+        assert_eq!(
+            cfg.fetch_queue,
+            FetchQueueTuning {
+                queued_min_messages: Some(5_000),
+                ..FetchQueueTuning::default()
+            }
+        );
+
+        let cfg = cfg
+            .with_queued_max_messages_kbytes(2_048)
+            .with_fetch_queue_backoff_ms(250);
+        assert_eq!(
+            cfg.fetch_queue,
+            FetchQueueTuning {
+                queued_min_messages: Some(5_000),
+                queued_max_messages_kbytes: Some(2_048),
+                fetch_queue_backoff_ms: Some(250),
+            }
+        );
+    }
+
+    /// Every member the group spawns, the first ones and the ones the
+    /// autoscaler adds, is created from the group config's settings.
+    #[tokio::test]
+    async fn spawn_one_hands_every_member_the_fetch_queue_settings() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spawner: Spawner = {
+            let seen = seen.clone();
+            Arc::new(move |options: ConsumerOptions| {
+                seen.lock()
+                    .expect("capture mutex poisoned")
+                    .push(options.kafka_fetch_queue);
+                tokio::spawn(async move {
+                    options.shutdown.cancelled().await;
+                })
+            })
+        };
+        let config = KafkaConsumerGroupConfig::new(2..=3)
+            .with_queued_min_messages(5_000)
+            .with_queued_max_messages_kbytes(2_048)
+            .with_fetch_queue_backoff_ms(250);
+        let mut group = test_group_with_spawner(config, spawner);
+
+        group.start();
+        assert!(group.scale_up());
+
+        let expected = FetchQueueTuning {
+            queued_min_messages: Some(5_000),
+            queued_max_messages_kbytes: Some(2_048),
+            fetch_queue_backoff_ms: Some(250),
+        };
+        assert_eq!(
+            *seen.lock().expect("capture mutex poisoned"),
+            vec![expected; 3]
+        );
+        group.shutdown().await;
+    }
+
     #[test]
     #[should_panic(expected = "commit_interval must be positive")]
     fn with_commit_interval_rejects_zero() {
         let _ = KafkaConsumerGroupConfig::new(1..=1).with_commit_interval(Duration::ZERO);
     }
 
-    /// `AsyncCommitGate::deadline` adds the interval to an `Instant`, so an
+    /// `CommitGate::deadline` adds the interval to an `Instant`, so an
     /// interval the sum cannot represent must be refused here, at the
     /// fail-fast point, and not first met as a panic in the receive loop.
     #[test]
@@ -2378,33 +2646,32 @@ mod tests {
             );
         }
 
-        /// The in-place retry strategy is refused the same way: the FIFO
-        /// consumer carries a retry through the republish that keeps its
-        /// per-key order and has no in-place shape.
+        /// Either retry strategy passes `register_fifo`'s checks, because a
+        /// FIFO consumer always retries in place. The test registry has no
+        /// client, so a config the checks admit fails at the client lookup.
         #[tokio::test]
-        async fn register_fifo_rejects_in_place_retries() {
-            let config =
-                KafkaConsumerGroupConfig::new(1..=4).with_retry_strategy(RetryStrategy::InPlace);
+        async fn register_fifo_accepts_either_retry_strategy() {
+            for strategy in [RetryStrategy::InPlace, RetryStrategy::Republish] {
+                let config = KafkaConsumerGroupConfig::new(1..=4).with_retry_strategy(strategy);
 
-            let err = registry()
-                .register_fifo::<GuardLedger, _>(config, || NoopHandler, ())
-                .await
-                .expect_err("RetryStrategy::InPlace must be rejected on a FIFO consumer");
+                let err = registry()
+                    .register_fifo::<GuardLedger, _>(config, || NoopHandler, ())
+                    .await
+                    .expect_err("the test registry has no client");
 
-            let ShoveError::Topology(msg) = err else {
-                panic!("expected ShoveError::Topology, got {err:?}");
-            };
-            assert!(
-                msg.contains("kafka-fifo-concurrency-guard")
-                    && msg.contains("is sequenced")
-                    && msg.contains("RetryStrategy::InPlace"),
-                "message must name the topic and the refused setting: {msg}"
-            );
+                let ShoveError::Topology(msg) = err else {
+                    panic!("expected ShoveError::Topology, got {err:?}");
+                };
+                assert!(
+                    msg.contains("registry has no client"),
+                    "{strategy:?} must pass the checks and reach the client lookup: {msg}"
+                );
+            }
         }
 
-        /// A commit interval is refused the same way: a FIFO consumer commits
-        /// each message as it settles, so the setting would change nothing,
-        /// and a setting that changes nothing must not be accepted silently.
+        /// A commit interval is refused: a FIFO consumer commits on the fixed
+        /// default interval and never reads the setting, and a setting that
+        /// changes nothing must not be accepted silently.
         #[tokio::test]
         async fn register_fifo_rejects_commit_interval() {
             let config =
@@ -2422,12 +2689,12 @@ mod tests {
                 msg.contains("kafka-fifo-concurrency-guard")
                     && msg.contains("is sequenced")
                     && msg.contains("with_commit_interval")
-                    && msg.contains("commits each message as it settles"),
+                    && msg.contains("commits on the fixed default interval"),
                 "message must name the topic and the refused setting: {msg}"
             );
         }
 
-        /// A FIFO consumer commits each message as it settles, so a
+        /// A FIFO consumer commits on the fixed default interval, so a
         /// per-record policy would change nothing there and is refused like
         /// the interval is.
         #[tokio::test]
@@ -2447,7 +2714,7 @@ mod tests {
                 msg.contains("kafka-fifo-concurrency-guard")
                     && msg.contains("is sequenced")
                     && msg.contains("with_commit_policy")
-                    && msg.contains("commits each message as it settles"),
+                    && msg.contains("commits on the fixed default interval"),
                 "message must name the topic and the refused setting: {msg}"
             );
         }
@@ -2502,6 +2769,84 @@ mod tests {
                     .await
                     .expect_err("a client-less registry cannot finish registering");
 
+                let ShoveError::Topology(msg) = err else {
+                    panic!("expected ShoveError::Topology, got {err:?}");
+                };
+                assert!(
+                    msg.contains("registry has no client"),
+                    "expected to reach the client lookup past the guard, got: {msg}"
+                );
+            }
+        }
+
+        /// A fetch queue setting outside librdkafka's range is refused at
+        /// registration, before anything is declared or a member spawned:
+        /// each member would otherwise refuse it where its consumer is
+        /// created, and the group would count an error per member and stay
+        /// empty after `register` reported success. The test registry has no
+        /// client, so a check that ran after the client lookup would surface
+        /// as the client error instead.
+        #[tokio::test]
+        async fn register_rejects_an_out_of_range_fetch_queue_setting() {
+            let config = KafkaConsumerGroupConfig::new(1..=4).with_queued_max_messages_kbytes(0);
+
+            let err = registry()
+                .register::<GuardExternal, _>(config, || NoopHandler, ())
+                .await
+                .expect_err("an out-of-range fetch queue setting must be rejected");
+
+            let ShoveError::Validation(msg) = err else {
+                panic!("expected ShoveError::Validation, got {err:?}");
+            };
+            assert!(
+                msg.contains("kafka-register-guard-external")
+                    && msg.contains("with_queued_max_messages_kbytes")
+                    && msg.contains("1..=2097151"),
+                "message must name the topic, the setter and the range: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn register_fifo_rejects_an_out_of_range_fetch_queue_setting() {
+            let config = KafkaConsumerGroupConfig::new(1..=4).with_fetch_queue_backoff_ms(300_001);
+
+            let err = registry()
+                .register_fifo::<GuardLedger, _>(config, || NoopHandler, ())
+                .await
+                .expect_err("an out-of-range fetch queue setting must be rejected");
+
+            let ShoveError::Validation(msg) = err else {
+                panic!("expected ShoveError::Validation, got {err:?}");
+            };
+            assert!(
+                msg.contains("kafka-fifo-concurrency-guard")
+                    && msg.contains("with_fetch_queue_backoff_ms")
+                    && msg.contains("0..=300000"),
+                "message must name the topic, the setter and the range: {msg}"
+            );
+        }
+
+        /// Negative control: settings inside the ranges, edges included, run
+        /// past the guard and only then fail on the absent client.
+        #[tokio::test]
+        async fn register_admits_fetch_queue_settings_inside_the_ranges() {
+            let config = || {
+                KafkaConsumerGroupConfig::new(1..=4)
+                    .with_queued_min_messages(1)
+                    .with_queued_max_messages_kbytes(2_097_151)
+                    .with_fetch_queue_backoff_ms(0)
+            };
+
+            let plain = registry()
+                .register::<GuardExternal, _>(config(), || NoopHandler, ())
+                .await
+                .expect_err("a client-less registry cannot finish registering");
+            let fifo = registry()
+                .register_fifo::<GuardLedger, _>(config(), || NoopHandler, ())
+                .await
+                .expect_err("a client-less registry cannot finish registering");
+
+            for err in [plain, fifo] {
                 let ShoveError::Topology(msg) = err else {
                     panic!("expected ShoveError::Topology, got {err:?}");
                 };

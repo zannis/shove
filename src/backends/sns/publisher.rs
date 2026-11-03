@@ -16,6 +16,14 @@ use crate::publisher_internal::{fnv1a_64, shard_for_key, validate_headers};
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
+/// Message attribute a sequenced topic's subscription filter policy routes a
+/// message to its shard queue by.
+pub(crate) const SHARD_ATTR: &str = "shard";
+
+/// Attribute names only this backend writes itself, which a caller may not set.
+/// The names every backend reserves are in `validate_headers`.
+pub(crate) const RESERVED_ATTRS: &[&str] = &[SHARD_ATTR];
+
 /// Maximum number of messages in a single SNS PublishBatch call.
 const SNS_BATCH_LIMIT: usize = 10;
 
@@ -139,6 +147,67 @@ fn hashmap_to_message_attributes(
         .collect()
 }
 
+/// The `shard` attribute of a sequenced message.
+fn shard_attribute(shard: u16) -> Result<MessageAttributeValue> {
+    MessageAttributeValue::builder()
+        .data_type("String")
+        .string_value(shard.to_string())
+        .build()
+        .map_err(|e| ShoveError::Validation(format!("invalid shard attribute: {e}")))
+}
+
+/// The attributes of a published message: the caller's, then the shard
+/// attribute of a sequenced message. The shard attribute goes last so a caller
+/// attribute of the same name cannot replace it and misroute the message.
+fn message_attributes(
+    caller: Option<HashMap<String, MessageAttributeValue>>,
+    shard: Option<u16>,
+) -> Result<HashMap<String, MessageAttributeValue>> {
+    let mut attributes = caller.unwrap_or_default();
+    if let Some(shard) = shard {
+        attributes.insert(SHARD_ATTR.to_string(), shard_attribute(shard)?);
+    }
+    Ok(attributes)
+}
+
+/// One `PublishBatch` entry per payload. An entry's id is its index, so a
+/// rejected entry maps back to its record. On a sequenced topic `routing_keys`
+/// holds one key per payload: the key is the entry's message group, and with
+/// `routing_shards` it picks the entry's shard attribute.
+fn batch_entries(
+    payloads: &[String],
+    routing_keys: Option<&[String]>,
+    routing_shards: Option<u16>,
+) -> Result<Vec<PublishBatchRequestEntry>> {
+    payloads
+        .iter()
+        .enumerate()
+        .map(|(i, payload)| {
+            let mut entry = PublishBatchRequestEntry::builder()
+                .id(i.to_string())
+                .message(payload);
+
+            if let Some(keys) = routing_keys {
+                let key = keys.get(i).ok_or_else(|| {
+                    ShoveError::Validation(format!("batch entry {i} has no routing key"))
+                })?;
+                entry = entry
+                    .message_group_id(key)
+                    .message_deduplication_id(content_dedup_id(payload));
+
+                if let Some(shards) = routing_shards {
+                    let shard = shard_attribute(shard_for_key(key, shards))?;
+                    entry = entry.message_attributes(SHARD_ATTR, shard);
+                }
+            }
+
+            entry
+                .build()
+                .map_err(|e| ShoveError::Validation(format!("invalid batch entry {i}: {e}")))
+        })
+        .collect()
+}
+
 /// SNS publisher that implements the `Publisher` trait.
 #[derive(Clone)]
 pub struct SnsPublisher {
@@ -179,22 +248,13 @@ impl SnsPublisher {
             req = req
                 .message_group_id(gid)
                 .message_deduplication_id(content_dedup_id(payload));
-
-            if let Some(shards) = routing_shards {
-                let shard = shard_for_key(gid, shards);
-                let shard_attr = MessageAttributeValue::builder()
-                    .data_type("String")
-                    .string_value(shard.to_string())
-                    .build()
-                    .map_err(|e| ShoveError::Validation(format!("invalid shard attribute: {e}")))?;
-                req = req.message_attributes("shard", shard_attr);
-            }
         }
 
-        if let Some(attrs) = attributes {
-            for (k, v) in attrs {
-                req = req.message_attributes(k, v);
-            }
+        let shard = group_id
+            .zip(routing_shards)
+            .map(|(gid, shards)| shard_for_key(gid, shards));
+        for (name, value) in message_attributes(attributes, shard)? {
+            req = req.message_attributes(name, value);
         }
 
         req.send().await.map_err(|e| {
@@ -287,7 +347,7 @@ impl SnsPublisher {
         message: &T::Message,
         headers: HashMap<String, String>,
     ) -> Result<()> {
-        validate_headers(&headers)?;
+        validate_headers(&headers, RESERVED_ATTRS)?;
         self.do_publish::<T>(message, Some(headers)).await
     }
 
@@ -351,37 +411,11 @@ impl SnsPublisher {
         );
 
         // Build batch entries
-        let entries = payloads
-            .iter()
-            .enumerate()
-            .map(|(i, payload)| {
-                let mut entry = PublishBatchRequestEntry::builder()
-                    .id(i.to_string())
-                    .message(payload);
-
-                if let Some(ref keys) = routing_keys {
-                    entry = entry
-                        .message_group_id(&keys[i])
-                        .message_deduplication_id(content_dedup_id(payload));
-
-                    if let Some(seq) = topology.sequencing() {
-                        let shard = shard_for_key(&keys[i], seq.routing_shards());
-                        let shard_attr = MessageAttributeValue::builder()
-                            .data_type("String")
-                            .string_value(shard.to_string())
-                            .build()
-                            .map_err(|e| {
-                                ShoveError::Validation(format!("invalid shard attribute: {e}"))
-                            })?;
-                        entry = entry.message_attributes("shard", shard_attr);
-                    }
-                }
-
-                entry
-                    .build()
-                    .map_err(|e| ShoveError::Validation(format!("invalid batch entry {i}: {e}")))
-            })
-            .collect::<Result<Vec<_>>>();
+        let entries = batch_entries(
+            &payloads,
+            routing_keys.as_deref(),
+            topology.sequencing().map(|seq| seq.routing_shards()),
+        );
         let entries = match entries {
             Ok(v) => v,
             Err(e) => return BatchReport::wholly_unattempted(total, e),
@@ -436,7 +470,7 @@ impl SnsPublisher {
                 {
                     Ok(result) => {
                         let failed = result.failed();
-                        if !failed.is_empty() {
+                        if let Some(first) = failed.first() {
                             metrics::record_backend_error(
                                 metrics::BackendLabel::SnsSqs,
                                 metrics::BackendErrorKind::Publish,
@@ -445,8 +479,8 @@ impl SnsPublisher {
                                 "SNS batch publish: {} of {} messages failed. First error: {} (code: {})",
                                 failed.len(),
                                 chunk.len(),
-                                failed[0].message().unwrap_or("unknown"),
-                                failed[0].code(),
+                                first.message().unwrap_or("unknown"),
+                                first.code(),
                             )));
                             match parse_failed_indices(failed.iter().map(|f| f.id()), &chunk_range)
                             {
@@ -487,8 +521,7 @@ impl SnsPublisher {
                         warn!(queue_name, attempt, error = %err, "SNS batch chunk failed, retrying");
                         chunk_err = Some(err);
                         if attempt < 2 {
-                            let delay = backoff.next().expect("backoff is infinite");
-                            tokio::time::sleep(delay).await;
+                            tokio::time::sleep(backoff.next_delay()).await;
                         }
                     }
                 }
@@ -705,6 +738,104 @@ mod tests {
         let id = content_dedup_id(r#"{"foo":"bar"}"#);
         assert_eq!(id.len(), 16);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    fn payloads(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!(r#"{{"n":{i}}}"#)).collect()
+    }
+
+    fn keys(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("acct-{i}")).collect()
+    }
+
+    #[test]
+    fn a_sequenced_batch_entry_carries_its_index_group_and_shard() {
+        let payloads = payloads(3);
+        let keys = keys(3);
+        let entries = batch_entries(&payloads, Some(&keys), Some(4)).expect("the entries build");
+        assert_eq!(entries.len(), 3);
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.id(), i.to_string());
+            assert_eq!(entry.message(), payloads[i]);
+            assert_eq!(entry.message_group_id(), Some(keys[i].as_str()));
+            assert_eq!(
+                entry.message_deduplication_id(),
+                Some(content_dedup_id(&payloads[i]).as_str())
+            );
+            let shard = entry
+                .message_attributes()
+                .and_then(|attributes| attributes.get(SHARD_ATTR))
+                .and_then(|attribute| attribute.string_value());
+            assert_eq!(shard, Some(shard_for_key(&keys[i], 4).to_string().as_str()));
+        }
+    }
+
+    #[test]
+    fn an_unsequenced_batch_entry_has_no_group_or_shard() {
+        let payloads = payloads(2);
+        let entries = batch_entries(&payloads, None, None).expect("the entries build");
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            assert_eq!(entry.message_group_id(), None);
+            assert_eq!(entry.message_deduplication_id(), None);
+            assert!(
+                entry
+                    .message_attributes()
+                    .is_none_or(|attributes| attributes.is_empty())
+            );
+        }
+    }
+
+    fn caller_attributes(pairs: &[(&str, &str)]) -> HashMap<String, MessageAttributeValue> {
+        hashmap_to_message_attributes(
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+        )
+        .expect("the caller attributes build")
+    }
+
+    fn value<'a>(
+        attributes: &'a HashMap<String, MessageAttributeValue>,
+        name: &str,
+    ) -> Option<&'a str> {
+        attributes
+            .get(name)
+            .and_then(|attribute| attribute.string_value())
+    }
+
+    #[test]
+    fn the_shard_attribute_cannot_be_replaced_by_a_caller_attribute() {
+        let caller = caller_attributes(&[(SHARD_ATTR, "99"), ("x-trace-id", "trace-1")]);
+        let attributes = message_attributes(Some(caller), Some(1)).expect("the attributes compose");
+        assert_eq!(value(&attributes, SHARD_ATTR), Some("1"));
+        assert_eq!(value(&attributes, "x-trace-id"), Some("trace-1"));
+        assert_eq!(attributes.len(), 2);
+    }
+
+    #[test]
+    fn a_message_carries_the_attributes_it_was_given() {
+        let none = message_attributes(None, None).expect("the attributes compose");
+        assert!(none.is_empty());
+
+        let caller = caller_attributes(&[("x-trace-id", "trace-1")]);
+        let unsequenced = message_attributes(Some(caller), None).expect("the attributes compose");
+        assert_eq!(value(&unsequenced, "x-trace-id"), Some("trace-1"));
+        assert_eq!(unsequenced.len(), 1);
+
+        let sequenced = message_attributes(None, Some(3)).expect("the attributes compose");
+        assert_eq!(value(&sequenced, SHARD_ATTR), Some("3"));
+        assert_eq!(sequenced.len(), 1);
+    }
+
+    #[test]
+    fn a_batch_entry_without_a_routing_key_is_a_typed_error() {
+        let payloads = payloads(3);
+        let keys = keys(2);
+        let err = batch_entries(&payloads, Some(&keys), Some(4))
+            .expect_err("a payload with no routing key is refused");
+        assert!(matches!(err, ShoveError::Validation(_)), "{err:?}");
     }
 
     // SNS PublishBatch caps a call at 10 entries *and* 256 KiB of total

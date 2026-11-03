@@ -131,21 +131,21 @@ group
 | Outcome | What a timeout then does |
 |---|---|
 | `Retry` | **Default.** Redelivers and consumes retry budget, so a persistently slow handler eventually dead-letters — or, with no DLQ declared, is discarded once `max_retries` is exhausted. |
-| `Defer` | Redelivers via `hold_queues[0]` **without** consuming retry budget, so a slow handler never dead-letters a valid message. |
+| `Defer` | Redelivers via `hold_queues[0]` **without** consuming retry budget, so a slow handler never dead-letters a valid message. On an [external NATS stream](/backends/nats#bind-to-an-externally-provisioned-stream) every redelivery counts toward `max_retries`, so a `Defer` does consume budget there. |
 | `Reject` | Treats the timeout as terminal: dead-letters on the first occurrence, consuming no retry budget. |
 | `Ack` | Drops the message. The handler is cancelled mid-flight, so any work it had not yet committed is lost. |
 
 Leaving it unset preserves the existing behaviour on every backend.
 
-**Pick `Defer` when a timeout means "too slow right now", not "poisoned".** That is the case a service hits when its handler stalls on a downstream dependency: under `Retry` the stall burns the whole retry budget and the message is dead-lettered — or discarded, if the topology declares no DLQ — even though nothing was ever wrong with it. `Defer` is the outcome that survives a slow dependency without losing valid data.
+**Pick `Defer` when a timeout means "too slow right now", not "poisoned".** That is the case a service hits when its handler stalls on a downstream dependency: under `Retry` the stall burns the whole retry budget and the message is dead-lettered — or discarded, if the topology declares no DLQ — even though nothing was ever wrong with it. `Defer` is the outcome that survives a slow dependency without losing valid data. An [external NATS stream](/backends/nats#bind-to-an-externally-provisioned-stream) is the exception: its retry count is JetStream's redelivery count, so a `Defer` there raises the count that a later `Retry` is measured against.
 
 That discard is no longer silent: it increments `shove_messages_discarded_total`, which is worth alerting on whichever outcome you pick here. See [Alerting on silent discards](/guides/observability#alerting-on-silent-discards).
 
 Three caveats before you reach for it, all inherited from [`Outcome::Defer`](/concepts/outcomes) itself:
 
-- **Nothing bounds the redeliveries.** `Defer` has no circuit breaker, so a handler that times out forever is redelivered forever. Pair it with your own attempt ceiling — or with monitoring on `FailReason::Timeout` — if the work can genuinely never succeed.
+- **Nothing bounds the redeliveries.** `Defer` has no circuit breaker, so a handler that times out forever is redelivered forever. An [external NATS stream](/backends/nats#bind-to-an-externally-provisioned-stream) raises the retry count with each deferral, but a `Defer` is never dead-lettered, so the redeliveries stay unbounded there too. Pair it with your own attempt ceiling — or with monitoring on `FailReason::Timeout` — if the work can genuinely never succeed.
 - **On sequenced consumers, `Defer` is not uniform across backends.** Kafka, NATS, SNS/SQS and the in-memory backend refuse it — deferral would violate the ordering guarantee, so it is downgraded to `Retry` with a warning and the override does not spare the retry budget. RabbitMQ's sharded consumer and Redis Streams instead route it to a hold queue without incrementing the retry count, so it can defer indefinitely. Check which half your backend falls in before choosing `Defer` for an ordered topic.
-- **With no hold queues configured**, `Defer` falls back to requeue-without-delay, which turns a slow handler into a hot redelivery loop. Declare at least one hold queue on the topic before choosing `Defer`.
+- **With no hold queues configured**, `Defer` redelivers after a fixed 1 s on Kafka and NATS and with no delay on the other backends. A slow handler then sees the same message again every second on those two, and in a hot redelivery loop on the rest. Declare at least one hold queue on the topic before choosing `Defer`. [With no hold queues](/concepts/outcomes#with-no-hold-queues) lists the fallback per backend.
 
 **Redis Streams starts from a different default.** With no override, a timed-out entry is not mapped to an outcome at all: it is left in the PEL and reclaimed by `XAUTOCLAIM` after the idle deadline, which already redelivers without consuming retry budget. Setting this option makes Redis route the given outcome instead — so `Defer` there means the configured hold-queue delay rather than the idle deadline.
 
@@ -193,6 +193,7 @@ Under `RetryStrategy::Republish`, `shove` increments the count itself and carrie
 Under `RetryStrategy::InPlace` no copy is published.
 Kafka then keeps the count in memory for the redelivery.
 An external NATS stream reads it from the JetStream delivery information, which counts every redelivery.
+A sequenced Kafka consumer publishes no copy under either strategy and keeps the count in memory too, seeded from the record's `Shove-Retry-Count` header on every delivery, so a restart, a rebalance or a crash starts it again.
 
 ### `retry_count` vs `delivery_count`
 
@@ -208,6 +209,8 @@ It holds the original un-acked for the delay, with progress acknowledgements, th
 In every case the count survives the hop because `shove` carries it in a header.
 Under `RetryStrategy::InPlace` on Kafka, implied by an external topology, no copy is published.
 The count advances on each `Retry` the handler's task waits out, and is kept in memory for the redelivery.
+A sequenced Kafka consumer publishes no copy under either strategy.
+Its count advances on each `Retry` its receive loop waits out, and is seeded from the record's `Shove-Retry-Count` header on every delivery, so a restart, a rebalance or a crash starts it again.
 Under `RetryStrategy::InPlace` on an external NATS stream, the count is the number of redeliveries JetStream reports.
 A `Defer` nak and an `ack_wait` expiry are redeliveries there, so they advance it too.
 A sequenced NATS consumer publishes no copy either: it holds the record through each `Retry` and hands it back, with the count kept in memory and seeded from the record's `Shove-Retry-Count` header plus one for every earlier JetStream delivery, so a stop, a crash or an `ack_wait` expiry spends a retry too.
@@ -225,13 +228,14 @@ A sequenced NATS consumer publishes no copy either: it holds the record through 
 
 Treat `None` as "unknown", never as zero. Where it is reported, a first delivery is `Some(1)`.
 
-Because the count belongs to a *broker-level* message, anything that creates a new one restarts it at 1. Under `RetryStrategy::Republish`, the default on a shove-owned topology, `Retry` publishes an incremented copy and so resets `delivery_count`; `retry_count` is the field that survives a retry. Under `RetryStrategy::InPlace`, Kafka on an external or opted-in topology and NATS on an external stream, no copy is published and the same record comes back: Kafka keeps `retry_count` in memory, and NATS reads it from this very count, which climbs with every redelivery there. `Defer` resets `delivery_count` where deferring re-sends the message (SQS) and preserves it where deferring naks in place (NATS, and the in-process broker, which models NATS here).
+Because the count belongs to a *broker-level* message, anything that creates a new one restarts it at 1. Under `RetryStrategy::Republish`, the default on a shove-owned topology, `Retry` publishes an incremented copy and so resets `delivery_count`; `retry_count` is the field that survives a retry. Under `RetryStrategy::InPlace`, Kafka on an external or opted-in topology and NATS on an external stream, no copy is published and the same record comes back: Kafka keeps `retry_count` in memory, and NATS reads it from this very count, which climbs with every redelivery there. On a sequenced Kafka topic a `Retry` under `RetryStrategy::Republish` waits in place too and publishes no copy, and Kafka keeps `retry_count` in memory. `Defer` resets `delivery_count` where deferring re-sends the message (SQS) and preserves it where deferring naks in place (NATS, and the in-process broker, which models NATS here).
 
 That last case is what `delivery_count` is for; see [Bounding a `Defer` loop](/guides/retries#defer-vs-retry).
 
 A consumer running with `RetryStrategy::InPlace` publishes no copy on `Retry` or `Defer`: on Kafka, where an external topology implies it and a shove-owned one may opt into it, the handler's task waits and hands the record back; on an external NATS stream the broker redelivers after a delayed `Nak`.
 The same record comes back in place.
 On Kafka its `retry_count` is kept in memory for the redelivery.
+A sequenced Kafka consumer waits the same way under either strategy, in its receive loop rather than a handler's task, and every new consumer incarnation starts its count again from the record's header.
 On an external NATS stream it is read from the JetStream delivery information, which counts every redelivery.
 
 ## Dead-letter handling
