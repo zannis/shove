@@ -151,6 +151,12 @@ pub enum CommitPolicy {
     /// a crash replays about one interval of completed records. The
     /// default, with a 500 ms interval. The interval must be positive and
     /// at most one hour.
+    ///
+    /// A `Retry` or `Defer` whose republish fails, or a dead letter that
+    /// fails, and may succeed later ends the member with a connection error,
+    /// as under `PerRecord`. Nothing is committed past the record, and the
+    /// reconnect redelivers it with every record behind it that was not
+    /// committed yet.
     Interval(Duration),
     /// On every completion, accepted by the coordinator before the next
     /// record is handed out. The position is committed synchronously on a
@@ -173,9 +179,10 @@ pub enum CommitPolicy {
     /// was in flight across a coordinator reconnect. librdkafka retries an
     /// abandoned commit on the next connection, and the broker may apply
     /// the abandoned copy after later commits. The Kafka page cites those
-    /// lines too. A `Retry` or `Defer` whose republish fails ends the member
-    /// with a connection error. The reconnect redelivers that record, and
-    /// nothing behind it was handed out meanwhile.
+    /// lines too. A `Retry` or `Defer` whose republish fails, or a dead
+    /// letter that fails, and may succeed later ends the member with a
+    /// connection error. The reconnect redelivers that record, and nothing
+    /// behind it was handed out meanwhile.
     ///
     /// Every record costs a commit round trip and a fetch round trip,
     /// because the resume refetches from the position: an opt-in for a
