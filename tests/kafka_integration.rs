@@ -757,6 +757,38 @@ async fn wait_for_zero_lag(client: &KafkaClient, topic: &str, group: &str, timeo
     }
 }
 
+/// How long a fresh broker may take to answer its first group-coordinator
+/// request. That request creates the offsets topic, and a leader is elected
+/// for it afterwards, which on a busy host outlasts the five attempts of the
+/// stats provider's own retry loop.
+const COORDINATOR_WARM_UP: Duration = Duration::from_secs(60);
+
+/// The lag stats of `queue`, read again while the broker's group coordinator
+/// is still coming up. Only a connection error is retried: any other error,
+/// and the last connection error once [`COORDINATOR_WARM_UP`] has passed, fails
+/// the test.
+async fn lag_stats_once_coordinator_answers(
+    client: &KafkaClient,
+    queue: &str,
+    group_id: &str,
+    reset: KafkaAutoOffsetReset,
+) -> KafkaQueueStats {
+    use shove::kafka::{KafkaLagStatsProvider, KafkaQueueStatsProvider};
+
+    let stats_provider = KafkaLagStatsProvider::new(client.clone());
+    let deadline = Instant::now() + COORDINATOR_WARM_UP;
+    loop {
+        match stats_provider.get_queue_stats(queue, group_id, reset).await {
+            Ok(stats) => return stats,
+            Err(ShoveError::Connection(e)) if Instant::now() < deadline => {
+                eprintln!("the group coordinator is not up yet, reading again: {e}");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => panic!("lag stats of {queue} failed: {e:?}"),
+        }
+    }
+}
+
 /// The broker's view of `group` right now: its state and its member count.
 #[cfg(feature = "test-support")]
 fn group_state(brokers: &str, group: &str) -> (String, usize) {
@@ -3060,7 +3092,7 @@ async fn sequenced_skip_continues_after_rejection() {
     broker.close().await;
 }
 
-/// CAF-84: `SequenceFailure::FailAll` must halt the failing sequence key on
+/// `SequenceFailure::FailAll` must halt the failing sequence key on
 /// Kafka, not silently behave like `Skip`.
 ///
 /// Kafka carries the sequence key as the record key, so unlike NATS this
@@ -5558,8 +5590,6 @@ async fn deserialization_failure_rejects_to_dlq() {
 
 #[tokio::test]
 async fn lag_stats_provider_reports_pending_messages() {
-    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
-
     let tb = TestBroker::start().await;
     let broker = tb.broker();
     let client = tb.client();
@@ -5576,15 +5606,13 @@ async fn lag_stats_provider_reports_pending_messages() {
             .unwrap();
     }
 
-    let stats_provider = KafkaLagStatsProvider::new(client.clone());
-    let stats: KafkaQueueStats = stats_provider
-        .get_queue_stats(
-            "kafka-work",
-            "kafka-work-consumer",
-            KafkaAutoOffsetReset::Earliest,
-        )
-        .await
-        .expect("get_queue_stats should succeed");
+    let stats = lag_stats_once_coordinator_answers(
+        &client,
+        "kafka-work",
+        "kafka-work-consumer",
+        KafkaAutoOffsetReset::Earliest,
+    )
+    .await;
 
     assert!(
         stats.messages_pending >= 5,
@@ -5593,6 +5621,183 @@ async fn lag_stats_provider_reports_pending_messages() {
     );
 
     broker.close().await;
+}
+
+/// The lag read asks every partition for its start and end offset in batched
+/// requests; a six-partition topic holding keyed records must still sum to the
+/// number of records published.
+#[tokio::test]
+async fn lag_stats_provider_sums_every_partition_of_a_multi_partition_topic() {
+    shove::define_sequenced_topic!(
+        SixPartitionLagTopic,
+        OrderMessage,
+        |msg: &OrderMessage| msg.order_id.clone(),
+        TopologyBuilder::new("kafka-lag-six-partitions")
+            .sequenced(SequenceFailure::Skip)
+            .routing_shards(6)
+            .hold_queue(Duration::from_millis(200))
+            .dlq()
+            .build()
+    );
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<SixPartitionLagTopic>()
+        .await
+        .unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    for i in 0..24u64 {
+        publisher
+            .publish::<SixPartitionLagTopic>(&OrderMessage {
+                order_id: format!("order-{i}"),
+                amount: i,
+            })
+            .await
+            .unwrap();
+    }
+
+    let client = tb.client();
+    let from_start = lag_stats_once_coordinator_answers(
+        &client,
+        "kafka-lag-six-partitions",
+        "kafka-lag-six-partitions-fifo",
+        KafkaAutoOffsetReset::Earliest,
+    )
+    .await;
+    let from_tail = lag_stats_once_coordinator_answers(
+        &client,
+        "kafka-lag-six-partitions",
+        "kafka-lag-six-partitions-fifo",
+        KafkaAutoOffsetReset::Latest,
+    )
+    .await;
+
+    assert_eq!(from_start.messages_pending, 24);
+    assert_eq!(from_tail.messages_pending, 0);
+
+    broker.close().await;
+}
+
+/// On a real broker with its default topic auto-creation, a lag read of a topic
+/// the broker does not have is an error, and the second read shows that the
+/// first created nothing.
+#[tokio::test]
+async fn lag_stats_provider_refuses_an_unknown_topic() {
+    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
+
+    let tb = TestBroker::start().await;
+    let stats_provider = KafkaLagStatsProvider::new(tb.client());
+
+    for attempt in 0..2 {
+        let err = stats_provider
+            .get_queue_stats(
+                "kafka-lag-no-such-topic",
+                "kafka-lag-no-such-topic-consumer",
+                KafkaAutoOffsetReset::Earliest,
+            )
+            .await
+            .expect_err("a topic the broker does not have has no lag to report");
+        assert!(
+            matches!(err, ShoveError::Topology(_)),
+            "attempt {attempt}: got {err:?}"
+        );
+    }
+
+    tb.broker().close().await;
+}
+
+/// Deleting a prefix of a log raises its low watermark. A group that never
+/// committed starts at that watermark under `earliest`, so its lag is the
+/// records the log still holds, and the high watermark alone would count the
+/// deleted prefix too.
+#[tokio::test]
+async fn lag_stats_provider_counts_only_the_records_above_a_raised_low_watermark() {
+    use rdkafka::admin::{AdminClient, AdminOptions};
+    use rdkafka::client::DefaultClientContext;
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+    use rdkafka::{ClientConfig, Offset, TopicPartitionList};
+
+    const TOPIC: &str = "kafka-lag-raised-low-watermark";
+    let produced = [10i64, 6, 4];
+    let deleted_before = [7i64, 6, 0];
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 3).await;
+
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", tb.brokers())
+        .create()
+        .expect("failed to create raw producer");
+    for (partition, &count) in (0..).zip(&produced) {
+        for n in 0..count {
+            producer
+                .send(
+                    FutureRecord::to(TOPIC)
+                        .partition(partition)
+                        .key("k")
+                        .payload(&format!("record-{n}")),
+                    Duration::from_secs(10),
+                )
+                .await
+                .map_err(|(e, _)| e)
+                .expect("raw publish should succeed");
+        }
+    }
+    drop(producer);
+
+    let mut prefixes = TopicPartitionList::new();
+    for (partition, &before) in (0..).zip(&deleted_before) {
+        prefixes
+            .add_partition_offset(TOPIC, partition, Offset::Offset(before))
+            .expect("delete before the offset");
+    }
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", tb.brokers())
+        .create()
+        .expect("failed to create admin client");
+    let deleted = admin
+        .delete_records(&prefixes, &AdminOptions::new())
+        .await
+        .expect("delete_records failed");
+    drop(admin);
+    let mut low_watermarks: Vec<(i32, i64)> = deleted
+        .elements()
+        .iter()
+        .map(|element| {
+            element.error().expect("the prefix was deleted");
+            (
+                element.partition(),
+                element.offset().to_raw().expect("an offset"),
+            )
+        })
+        .collect();
+    low_watermarks.sort_unstable();
+    assert_eq!(
+        low_watermarks,
+        (0..).zip(deleted_before).collect::<Vec<_>>()
+    );
+
+    let stats = lag_stats_once_coordinator_answers(
+        &tb.client(),
+        TOPIC,
+        "kafka-lag-raised-low-watermark-consumer",
+        KafkaAutoOffsetReset::Earliest,
+    )
+    .await;
+
+    let retained: i64 = produced
+        .iter()
+        .zip(&deleted_before)
+        .map(|(produced, deleted)| produced - deleted)
+        .sum();
+    assert_eq!(
+        stats.messages_pending,
+        u64::try_from(retained).expect("a count of records")
+    );
+
+    tb.broker().close().await;
 }
 
 #[tokio::test]
