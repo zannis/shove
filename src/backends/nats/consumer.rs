@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 
-use async_nats::HeaderMap;
 use async_nats::header::{HeaderName, HeaderValue, NATS_MESSAGE_ID};
 use async_nats::jetstream::Message;
 use async_nats::jetstream::consumer::pull::{Batch, Config as PullConsumerConfig};
@@ -18,6 +17,8 @@ use async_nats::jetstream::context::{
     ConsumerInfoError, ConsumerInfoErrorKind, GetStreamError, GetStreamErrorKind,
 };
 use async_nats::jetstream::message::AckKind;
+use async_nats::{HeaderMap, Request};
+use bytes::Bytes;
 use futures_util::FutureExt;
 use futures_util::stream::{self, StreamExt};
 use tokio::sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore, SemaphorePermit, watch};
@@ -128,6 +129,50 @@ fn resolve_retry_strategy(topology: &QueueTopology) -> RetryStrategy {
 /// `MessageMetadata::delivery_count` doc states the same.
 fn in_place_retry_count(metadata: &MessageMetadata) -> u32 {
     metadata.delivery_count.map_or(0, |n| n.saturating_sub(1))
+}
+
+/// Judges the `max_deliver` of the durable a consumer has attached to.
+///
+/// JetStream stops redelivering a message after `max_deliver` deliveries and
+/// tells nobody, so a message redelivered that often waits on the stream for
+/// good, never delivered again and never dead-lettered. JetStream reports a
+/// durable with no cap as `-1`, and every other value warns.
+///
+/// On an external stream a retry is a redelivery and the retry count is the
+/// delivery count, so a message runs out of retries, and is dead-lettered, on
+/// delivery `max_retries + 1`. A cap at or below `max_retries` keeps that
+/// delivery from ever happening, so the consumer refuses to attach.
+fn check_max_deliver(
+    queue: &str,
+    consumer: &str,
+    max_deliver: i64,
+    strategy: RetryStrategy,
+    max_retries: u32,
+) -> Result<()> {
+    if max_deliver <= 0 {
+        return Ok(());
+    }
+    if strategy == RetryStrategy::InPlace && max_deliver <= i64::from(max_retries) {
+        return Err(ShoveError::Topology(format!(
+            "the durable `{consumer}` on external stream `{queue}` stops redelivering a message \
+             after max_deliver = {max_deliver} deliveries, but a retry there is a redelivery, \
+             and max_retries = {max_retries} takes {} deliveries to run out. The message would \
+             wait on the stream for good and never be dead-lettered. Lift the cap in place with \
+             `nats consumer edit {queue} {consumer} --max-deliver=-1`, raise it above \
+             max_retries, or lower max_retries.",
+            i64::from(max_retries).saturating_add(1)
+        )));
+    }
+    tracing::warn!(
+        queue,
+        consumer,
+        max_deliver,
+        "the durable stops redelivering a message after max_deliver deliveries and tells no \
+         consumer, so a message redelivered that often waits on the stream for good, never \
+         dead-lettered; lift the cap in place with `nats consumer edit {queue} {consumer} \
+         --max-deliver=-1`"
+    );
+    Ok(())
 }
 
 /// Reads `Shove-Sequence-Key` from headers.
@@ -556,6 +601,39 @@ async fn ack_dead_letter(msg: &Message, dlq: &str) {
     }
 }
 
+/// How long [`confirmed_ack`] waits for the server to answer an ack.
+const ACK_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Acks `msg` and waits for the server to say it applied the ack.
+///
+/// The consumer that takes an ack carrying a reply subject answers with an
+/// empty message. When no consumer takes it, because its stream or durable is
+/// gone, the server answers in its place with a status, a `503` for no
+/// responders. async-nats's `double_ack` takes any reply for the confirmation,
+/// so an ack that reached nothing would pass for a retirement. This one
+/// confirms only a reply without a status, which is the only reply that lets a
+/// discard count.
+async fn confirmed_ack(msg: &Message) -> Result<()> {
+    let reply = msg.reply.clone().ok_or_else(|| {
+        ShoveError::Connection("a message with no reply subject cannot be acked".to_string())
+    })?;
+    let ack = Request::new()
+        .payload(Bytes::from(AckKind::Ack))
+        .timeout(Some(ACK_CONFIRMATION_TIMEOUT));
+    let answer = msg
+        .context
+        .client()
+        .send_request(reply, ack)
+        .await
+        .map_err(|e| ShoveError::Connection(format!("the server did not answer the ack: {e}")))?;
+    match answer.status {
+        None => Ok(()),
+        Some(status) => Err(ShoveError::Connection(format!(
+            "the server answered the ack with status {status}, so no consumer took it"
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sequenced settlement
 // ---------------------------------------------------------------------------
@@ -713,7 +791,7 @@ async fn dead_letter_unhandled<H, C>(
 /// Dead-letters a record whose outcome is terminal, a `Reject` or an exhausted
 /// `Retry`, stamped with the count it was settled at, and with the accounting
 /// of `route_outcome`'s DLQ arm: the failure counts at once, the discard only
-/// once `double_ack` confirms the record is retired.
+/// once [`confirmed_ack`] confirms the record is retired.
 async fn dead_letter_terminal<H, C>(
     shard: &FifoShard<'_, H, C>,
     msg: &Message,
@@ -729,7 +807,7 @@ async fn dead_letter_terminal<H, C>(
     match dead_letter_in_place(shard, msg, reason, Some(retry_count)).await {
         DeadLetter::Landed => {
             // Only a server-confirmed ack proves the record is retired.
-            match msg.double_ack().await {
+            match confirmed_ack(msg).await {
                 Ok(()) => pending.confirm(),
                 Err(e) => {
                     tracing::error!(error = %e, "failed to ack after DLQ publish");
@@ -795,7 +873,7 @@ where
         if has_dlq {
             // The message is in the DLQ, so it exists whatever the ack does
             // and `confirm` could never count it. Settling now keeps the
-            // dead-lettered cascade off the `double_ack` round trip the live
+            // dead-lettered cascade off the `confirmed_ack` round trip the live
             // pending record below needs — and a poisoned key drains its whole
             // backlog through this branch, so that tax is per message.
             pending.survived();
@@ -805,11 +883,11 @@ where
             return ShardStep::Settled;
         }
         // No DLQ, so this ack is what drops the message and it decides the
-        // discard accounting. `double_ack` rather than `ack`: `ack` returns as
+        // discard accounting. `confirmed_ack` rather than `ack`: `ack` returns as
         // soon as `+ACK` is written to the connection, so a connection lost
         // before JetStream applies it would redeliver a message already
         // counted gone. Same reasoning as `route_outcome`'s Dlq arm.
-        match msg.double_ack().await {
+        match confirmed_ack(msg).await {
             Ok(()) => pending.confirm(),
             Err(e) => {
                 tracing::error!(
@@ -1282,11 +1360,6 @@ fn ended_pull_backoff() -> Backoff {
     Backoff::new(ENDED_PULL_PAUSE, ENDED_PULL_PAUSE_MAX)
 }
 
-/// The next pause from `backoff`, whose iterator never ends.
-fn next_pause(backoff: &mut Backoff) -> Duration {
-    backoff.next().unwrap_or(ENDED_PULL_PAUSE_MAX)
-}
-
 /// `None` when `shutdown` fires before `work` finishes.
 async fn unless_stopped<F: Future>(shutdown: &CancellationToken, work: F) -> Option<F::Output> {
     tokio::select! {
@@ -1333,7 +1406,7 @@ async fn ended_pull(
     tracing::warn!(error = %status, queue, "the server ended a pull, probing the connection");
     match unless_stopped(shutdown, consumer.get_info()).await {
         None => EndedPull::Stopped,
-        Some(Ok(_)) => EndedPull::Pause(next_pause(backoff)),
+        Some(Ok(_)) => EndedPull::Pause(backoff.next_delay()),
         Some(Err(probe_err)) => {
             metrics::record_backend_error(
                 metrics::BackendLabel::Nats,
@@ -1893,18 +1966,20 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                         // JetStream still owns the delivery and will redeliver
                         // on ack-wait expiry, so a failed ack is not a discard.
                         //
-                        // `double_ack` rather than `ack` because this is the
+                        // `confirmed_ack` rather than `ack` because this is the
                         // arm that decides whether a discard actually
                         // happened. `ack` only publishes `+ACK` to the client
                         // connection and returns as soon as it is written; a
                         // connection lost before JetStream applies it
                         // redelivers the message while `confirm` has already
-                        // counted it gone. `double_ack` waits for the server's
-                        // reply, so `Ok` means the stream really did retire
-                        // the delivery. The extra round trip is paid only on
-                        // terminal outcomes (rejected or retries exhausted),
-                        // not on the happy path above.
-                        match msg.double_ack().await {
+                        // counted it gone. `confirmed_ack` waits for the
+                        // consumer's reply, so `Ok` means the stream really did
+                        // retire the delivery, and a status from the server in
+                        // its place is an ack that reached no consumer. The
+                        // extra round trip is paid only on terminal outcomes
+                        // (rejected or retries exhausted), not on the happy
+                        // path above.
+                        match confirmed_ack(msg).await {
                             Ok(()) => pending.confirm(),
                             Err(e) => {
                                 tracing::error!(error = %e, "failed to ack after DLQ publish");
@@ -2148,6 +2223,13 @@ impl NatsConsumer {
                     };
 
                     let config = &pull_consumer.cached_info().config;
+                    check_max_deliver(
+                        queue,
+                        &consumer_name,
+                        config.max_deliver,
+                        worker.retry_strategy,
+                        worker.max_retries,
+                    )?;
                     // The server's effective ack_wait, which paces the progress acks.
                     let ack_wait = config.ack_wait;
                     // The fallback never updates an existing durable's budget.
@@ -2264,14 +2346,14 @@ impl NatsConsumer {
         Ok(())
     }
 
-    /// Spawn one task per routing shard and return the join handles.
+    /// Spawn one task per routing shard and return the join handles. Each
+    /// handle resolves to its shard's `Result<()>`, an error once the shard has
+    /// spent its reconnect attempts or met an error a reconnect cannot clear.
     ///
-    /// Each shard task internally returns `()` (errors are logged within the
-    /// task), so each handle is wrapped to produce `Result<()>` for a uniform
-    /// handle type across backends.
+    /// A topic whose topology carries no sequencing config has no shards to
+    /// attach to, and returns a `Topology` error.
     ///
-    /// The `pub(crate)` visibility is required for Phase 2 (Task 16), which
-    /// calls this from the consumer-group module.
+    /// The `pub(crate)` visibility lets the consumer-group module call this.
     pub(crate) async fn spawn_fifo_shards<T, H>(
         &self,
         handler: H,
@@ -2285,9 +2367,14 @@ impl NatsConsumer {
         let topology = T::topology();
         let queue = topology.queue();
         options.refuse_broadcast_start(queue, "NatsConsumer::run_fifo")?;
-        let seq_config = topology
-            .sequencing()
-            .expect("run_fifo requires a sequenced topology");
+        let seq_config = topology.sequencing().ok_or_else(|| {
+            ShoveError::Topology(format!(
+                "topic '{queue}' implements `SequencedTopic` but its topology has no \
+                 sequencing config; `NatsConsumer::run_fifo` would attach to shard subjects \
+                 that were never declared. Add `.sequenced(...)` to the topology, or consume \
+                 the topic with `run`."
+            ))
+        })?;
         let routing_shards = seq_config.routing_shards();
         let on_failure = seq_config.on_failure();
 
@@ -2314,7 +2401,7 @@ impl NatsConsumer {
         );
 
         let mut shard_tasks: Vec<tokio::task::JoinHandle<Result<()>>> =
-            Vec::with_capacity(routing_shards as usize);
+            Vec::with_capacity(usize::from(routing_shards));
 
         for shard in 0..routing_shards {
             let consumer_name = format!("{queue}-shard-{shard}");
@@ -2884,7 +2971,7 @@ async fn ack_batch(acks: &[Message]) {
 }
 
 /// `Reject`: per message, the exact terminal contract of the single-message
-/// path's DLQ arm — `record_terminal`, publish to the DLQ, then `double_ack`
+/// path's DLQ arm — `record_terminal`, publish to the DLQ, then `confirmed_ack`
 /// (the server-confirmed ack is what decides whether a discard really
 /// happened, so `confirm` waits for it and a failed ack `survived`s instead).
 /// A failed DLQ publish leaves the message un-acked and Naks it for
@@ -2907,7 +2994,7 @@ async fn settle_reject_batch(ctx: &NatsBatchCtx, acks: &[Message]) {
                 metrics::record_terminal(&ctx.topic, group, metrics::FailReason::Rejected, has_dlq);
             let dead_letter = publish_to_dlq(&ctx.client, ctx.topology, msg, "rejected");
             match renewing(msg, ctx.ack_wait, dead_letter).await {
-                Ok(()) => match msg.double_ack().await {
+                Ok(()) => match confirmed_ack(msg).await {
                     Ok(()) => pending.confirm(),
                     Err(e) => {
                         tracing::error!(
@@ -3893,6 +3980,58 @@ mod retry_strategy_tests {
         let external = TopologyBuilder::new("nats-external").external().build();
         assert_eq!(resolve_retry_strategy(&owned), RetryStrategy::Republish);
         assert_eq!(resolve_retry_strategy(&external), RetryStrategy::InPlace);
+    }
+
+    fn attach(max_deliver: i64, strategy: RetryStrategy, max_retries: u32) -> Result<()> {
+        check_max_deliver(
+            "orders",
+            "orders-consumer",
+            max_deliver,
+            strategy,
+            max_retries,
+        )
+    }
+
+    #[test]
+    fn a_durable_with_no_cap_attaches_under_any_budget() {
+        for max_deliver in [-1, 0] {
+            for strategy in [RetryStrategy::InPlace, RetryStrategy::Republish] {
+                for max_retries in [0, 10, u32::MAX] {
+                    assert!(attach(max_deliver, strategy, max_retries).is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_in_place_budget_needs_one_delivery_more_than_its_retries() {
+        assert!(matches!(
+            attach(3, RetryStrategy::InPlace, 3),
+            Err(ShoveError::Topology(_))
+        ));
+        assert!(matches!(
+            attach(3, RetryStrategy::InPlace, 10),
+            Err(ShoveError::Topology(_))
+        ));
+        assert!(attach(3, RetryStrategy::InPlace, 2).is_ok());
+        assert!(attach(1, RetryStrategy::InPlace, 0).is_ok());
+        assert!(attach(i64::MAX, RetryStrategy::InPlace, u32::MAX).is_ok());
+    }
+
+    #[test]
+    fn a_republish_budget_does_not_depend_on_the_cap() {
+        assert!(attach(3, RetryStrategy::Republish, 10).is_ok());
+        assert!(attach(1, RetryStrategy::Republish, u32::MAX).is_ok());
+    }
+
+    #[test]
+    fn the_refusal_names_the_durable_the_cap_and_the_deliveries_the_budget_needs() {
+        let Err(ShoveError::Topology(message)) = attach(3, RetryStrategy::InPlace, u32::MAX) else {
+            panic!("a cap of 3 cannot serve u32::MAX retries");
+        };
+        assert!(message.contains("orders-consumer"), "{message}");
+        assert!(message.contains("max_deliver = 3"), "{message}");
+        assert!(message.contains("4294967296"), "{message}");
     }
 
     #[test]

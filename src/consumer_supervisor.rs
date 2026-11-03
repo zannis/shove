@@ -57,11 +57,21 @@ pub(crate) struct ShutdownTally {
     pub panics: usize,
 }
 
+/// Every addition saturates, so a count at the top stays at the top and a dirty
+/// shutdown cannot wrap around to a clean one.
 #[allow(dead_code)]
 impl ShutdownTally {
+    pub(crate) fn add_errors(&mut self, n: usize) {
+        self.errors = self.errors.saturating_add(n);
+    }
+
+    pub(crate) fn add_panics(&mut self, n: usize) {
+        self.panics = self.panics.saturating_add(n);
+    }
+
     pub(crate) fn add(&mut self, other: ShutdownTally) {
-        self.errors += other.errors;
-        self.panics += other.panics;
+        self.add_errors(other.errors);
+        self.add_panics(other.panics);
     }
 }
 
@@ -462,6 +472,22 @@ mod tests {
             timed_out: true,
         };
         assert_eq!(o.exit_code(), 3);
+    }
+
+    #[test]
+    fn adding_to_a_tally_at_the_top_stays_at_the_top() {
+        let mut tally = ShutdownTally {
+            errors: usize::MAX,
+            panics: usize::MAX,
+        };
+
+        tally.add(ShutdownTally {
+            errors: 1,
+            panics: 1,
+        });
+
+        assert_eq!(tally.errors, usize::MAX);
+        assert_eq!(tally.panics, usize::MAX);
     }
 
     use crate::error::ShoveError;
