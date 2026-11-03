@@ -40,6 +40,9 @@ enum SendFailure {
     Fatal(RDKafkaErrorCode, String),
     /// The broker refused the principal, and refuses it again.
     Unauthorized,
+    /// The producer or the broker refused the record as too large or as
+    /// invalid, and refuses it again.
+    Unpublishable,
     /// Another send may get past it.
     Transient,
 }
@@ -57,6 +60,9 @@ impl SendFailure {
                 RDKafkaErrorCode::TopicAuthorizationFailed
                 | RDKafkaErrorCode::ClusterAuthorizationFailed,
             ) => Self::Unauthorized,
+            Some(RDKafkaErrorCode::MessageSizeTooLarge | RDKafkaErrorCode::InvalidRecord) => {
+                Self::Unpublishable
+            }
             _ => Self::Transient,
         }
     }
@@ -71,6 +77,9 @@ impl SendFailure {
                  every publish fails for a wait that grows with each such producer"
             )),
             Self::Unauthorized => ShoveError::Topology(format!("{label} was refused: {error}")),
+            Self::Unpublishable => ShoveError::Validation(format!(
+                "{label} refused, and no later send can get past it: {error}"
+            )),
             Self::Transient => {
                 ShoveError::Connection(format!("{label} failed after {attempts} attempts: {error}"))
             }
@@ -83,8 +92,11 @@ impl SendFailure {
 /// consumer (for DLQ and retry publishes).
 ///
 /// `headers` move into the first send and come back only with a failed
-/// one. An authorization error or a fatal producer error is not sent
+/// one. An authorization error, a fatal producer error and a record the
+/// producer or the broker refuses as too large or as invalid are not sent
 /// again; see [`KafkaClient::publish_with_retry`] for the errors returned.
+/// The consumer reads the `ShoveError::Validation` of that last refusal as
+/// a publish that can never succeed.
 pub(super) async fn publish_with_retry<C>(
     producer: &FutureProducer<C>,
     topic: &str,
