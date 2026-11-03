@@ -359,8 +359,8 @@ They stay so until those partitions are revoked or the member restarts.
 
 ### Pauses and rebalances
 
-A consumer keeps polling while it waits: for a prefetch slot, for a commit under `CommitPolicy::PerRecord`, through a hold or a dead-letter retry on a sequenced consumer, through a schema registry wait, and through the drain at a stop.
-The wait for a prefetch slot and the drain at a stop leave the assignment as it is for their first second, and pause all of it once they put a record back after that.
+A consumer keeps polling while it waits: for a prefetch slot, for a commit under `CommitPolicy::PerRecord`, through a hold or a dead-letter retry on a sequenced consumer, for a batch's dead letters, through a schema registry wait, and through the drain at a stop.
+The wait for a prefetch slot, the wait for a batch's dead letters and the drain at a stop leave the assignment as it is for their first second, and pause all of it once they put a record back after that.
 While every slot is held and a holder is a handler waiting in place, the consumer pauses it at once instead, see [Bind to an infra-owned topic](#bind-to-an-infra-owned-topic).
 The other waits run with the whole assignment paused.
 librdkafka keeps a pause flag per partition and keeps it across a revoke.
@@ -713,7 +713,7 @@ The deadline is chosen against the 30 s termination grace Kubernetes gives a Pod
 The thread finishes on its own and never holds the runtime or the process, so a frozen coordinator cannot turn a deploy into a `SIGKILL`.
 
 A member that ends on an error closes its consumer on a thread of its own too, with nothing committed, before it reconnects or returns the error.
-That holds for the standard and the sequenced consumer, a fenced consumer and a failed subscribe included.
+That holds for the standard, the sequenced and the batch consumer, a fenced consumer and a failed subscribe included.
 A receive error the consumer rides out ends nothing, see [Broker outages](#broker-outages).
 It waits for the close for at most the same 20 s, and returns without waiting when no thread can be spawned to run it.
 The close sends the member's LeaveGroup and waits for the coordinator's answer, so the member has left its group when the error reaches the caller.
@@ -748,8 +748,13 @@ Nothing else about the run changes: it still ends on its stop signal.
 A drain that times out while the commit is still waiting aborts the member instead.
 The run then reports `timed_out`, so `exit_code()` is 3 and no error is counted.
 A member the autoscaler retires on scale-down makes the same final commit.
-The rebalance that retirement starts can make the coordinator reject it with a rebalance in progress or a stale generation.
-For now that rejection counts under `errors` like any other.
+The rebalance that retirement starts, or another member's stop, can make the coordinator refuse it with a rebalance in progress or a stale generation.
+A refusal with a rebalance in progress is tried again inside the same 20 s, under either commit policy and on the sequenced and the batch consumer, and so is a stale generation librdkafka meets while it rejoins the group.
+The consumer polls for 500 ms with its assignment paused, so the rebalance can complete, and commits every position it still holds again; a partition the rebalance revoked meanwhile is left out.
+It tries again for as long as more than 2 s of the deadline are left, so members that stop together do not routinely end with a refused commit.
+A stale generation reported outside a rebalance is not tried again: with that refusal librdkafka gives the member's assignment up as lost, so nothing is left to commit under it.
+The member then ends with `ShoveError::Commit` of the `Rejected` kind, carrying the positions the refused commit held.
+A refusal still standing counts under `errors` like any other, and each partition's next owner replays from the last position the broker accepted.
 A member with nothing to commit has no commit to fail and still ends clean.
 An acknowledged offset on a partition a rebalance revoked before the stop is not part of the final commit and raises no error.
 Its tracker went with the partition, and the new owner picks the record up.
@@ -788,6 +793,48 @@ With a limit set, a DLQ that stays unwritable therefore ends the consumer once t
 A failure no retry gets past, such as a producer that cannot be built, ends the member with that error at once.
 A dead letter that can never be published is the one exception that discards: one past the producer's `message.max.bytes`, or one the broker refuses as too large or as invalid.
 The record is discarded and committed, an error is logged, and `messages_discarded_total` counts it.
+
+### Batch consumer
+
+`run_batch` and `Broker::<Kafka>::batch_consumer()` commit as the standard consumer commits under the default `CommitPolicy::Interval`.
+A batch the handler acks is retired, and its offsets go out with the next commit: at most every 500 ms, one commit at a time on a thread of its own, while the consumer goes on.
+A commit the coordinator rejects, such as one made while the group rebalances, is re-offered.
+A consumer whose commits keep being rejected, none accepted and no rebalance resolving them, is treated as fenced and reconnects.
+A batch with dead letters or discards on it, a `Reject` or a batch with a record dropped before the handler, commits synchronously, and the flush waits for the coordinator's answer while the consumer keeps polling.
+A rejection of that commit does not end the consumer either, and the batch is not handed to the handler again.
+Once its dead letters have landed the batch is settled, so its position is re-offered as an acked batch's is, with its discards riding on the re-offer.
+The consumer keeps polling meanwhile, so a rebalance behind the rejection can complete.
+
+A rejected batch's dead letters, and the records dropped before the handler, are published concurrently, at most 16 at a time.
+Running concurrently, a partition's dead letters do not reach the DLQ in offset order.
+The consumer keeps polling while they run, so a DLQ that answers slowly does not have it evicted at `max.poll.interval.ms`.
+A stop that lands meanwhile waits for them.
+A dead letter that fails and may land later retires nothing: nothing is committed past its record, and the record's partition is sought back to it.
+The batch is handed over again from there after the delay a `Retry` waits, 1 s doubling up to 30 s, and no discard is counted for the record.
+The dead letters behind it on its partition are not tried, and the ones already published are published again with the redelivery.
+A dead letter that can never be published, one past the producer's `message.max.bytes` or one the broker refuses as too large or as invalid, is discarded and committed past, an error is logged, and `messages_discarded_total` counts it.
+A failure no retry gets past, such as a producer that cannot be built, commits nothing of the batch and ends the consumer with that error.
+Dead letters are at-least-once.
+A rebalance while they run, a dead letter that fails, and a refused commit whose re-offer has not landed when the partition moves can each hand the batch over again, and its letters that had landed are then published again.
+
+Nothing polls while the handler runs, so the handler call must finish inside `max.poll.interval.ms`, five minutes.
+The flush's dead-letter and commit waits poll, so they are not held to it.
+The handler timeout is the only bound on the handler call: a timeout above that interval, or none at all through `without_handler_timeout`, lets a slow handler call outlast it.
+The member is then evicted from its group, and its partitions go to another member, which is handed the batch again.
+
+Every flush reads the group's rebalance events first, the one the batch's age or a stop triggers included.
+A rebalance that moves a partition the batch spans abandons the batch uncommitted, and the partitions the consumer keeps are sought back to the batch's start.
+The record the consumer holds when it learns of the rebalance is dropped when its partition was sought back, because the broker delivers it again behind the rewound records.
+Every record of the abandoned batch is then handed over again, in offset order and none skipped: to this consumer for the partitions it keeps, to the new owner for the ones it lost.
+A batch abandoned while its dead letters were landing was handed to the handler already, so its records reach a handler twice.
+A seek that fails on a partition the consumer still holds reconnects it, and one that fails on a partition the group revoked in the same poll is left to that partition's next owner.
+
+A stop flushes the batch in hand first, and that flush is not inside the shutdown deadline: it waits for the handler and for the batch's dead letters.
+The commits that follow are bounded as the standard consumer's are.
+A commit in flight when the stop lands, the flushed batch's own included, is waited for at most 15 s, and no answer in that time ends the stop with `ShoveError::Commit` of the `Deadline` kind.
+Every retired position is then committed synchronously and the consumer closed, both on a thread of their own, within what is left of the 20 s.
+A final commit the broker does not confirm ends the run with `ShoveError::Commit`, where a batch consumer ended clean in 0.16.0.
+One refused while the group rebalances, such as the rebalance another member's stop starts, is tried again first, as on the standard consumer.
 
 ## Schema Registry
 
@@ -946,9 +993,10 @@ Nothing is dead-lettered or discarded, so `shove_messages_discarded_total` does 
 "Cannot answer" means a transport failure, or a 5xx, a 408 or a 429 that outlasts the client's own retries.
 The batch consumer flushes the records ahead of the stalled one first.
 Its committed span therefore ends before that record until it decodes.
-If that flush comes back `Retry` or `Defer`, the span is sought back to its start.
-The stalled record is then handed back to the broker as well.
+If that flush seeks part of the span back, for a `Retry` or `Defer`, a rejected commit, a dead letter that failed or a rebalance, the stalled record is handed back to the broker as well.
 It arrives again behind the rewound records, so every batch stays in offset order.
+The batch consumer commits through the wait as it does outside it, at most every 500 ms, so the offsets it flushed, and the ones a rebalance or a rejected commit re-offers, are committed however long the wait runs.
+A revoke of the stalled record's partition ends the batch consumer's wait, and the partition's next owner is handed the record again from the committed offset.
 The loop keeps polling while it waits, so the member stays in its group for the whole outage, however long.
 A partition the group assigns to the member during the wait is paused too.
 A record it delivers first is handed back to the broker and arrives again, in order, once the wait ends.

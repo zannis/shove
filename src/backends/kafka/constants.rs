@@ -196,6 +196,18 @@ pub(super) const PENDING_COMMIT_BUDGET: Duration = {
     SHUTDOWN_COMMIT_DEADLINE.saturating_sub(quarter)
 };
 
+/// How long a stop polls, its assignment paused, before it tries again a
+/// final commit the coordinator refused while the group rebalances, so the
+/// polls can serve the rebalance callbacks the rebalance waits on.
+pub(super) const FINAL_COMMIT_RETRY_POLL: Duration = Duration::from_millis(500);
+
+/// The least of `SHUTDOWN_COMMIT_DEADLINE` that must be left, both when a
+/// final commit starts and when its refusal while the group rebalances
+/// comes back, for that refusal to be tried again: room for the poll, and
+/// for the last try and the close that follows it. A refusal that comes
+/// back with less left stands.
+pub(super) const FINAL_COMMIT_RETRY_RESERVE: Duration = Duration::from_secs(2);
+
 /// How long a consume loop waits before asking the schema registry again for
 /// a record whose schema id it could not resolve: a transport failure, or a
 /// 5xx after the client's own retries. The record is kept, not discarded, so

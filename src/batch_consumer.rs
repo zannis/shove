@@ -75,6 +75,10 @@ pub struct BatchConsumerOptions<B: Backend> {
     pub(crate) kafka_group_id: Option<Arc<str>>,
     #[cfg(feature = "kafka")]
     pub(crate) kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
+    #[cfg(all(feature = "kafka", feature = "test-support"))]
+    pub(crate) kafka_max_poll_interval: Option<Duration>,
+    #[cfg(all(feature = "kafka", feature = "test-support"))]
+    pub(crate) kafka_housekeeping_interval: Option<Duration>,
 
     #[cfg(feature = "kafka-schema-registry")]
     pub(crate) schema_registry: Option<Arc<SchemaRegistry>>,
@@ -110,6 +114,10 @@ impl<B: Backend> BatchConsumerOptions<B> {
             kafka_group_id: None,
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: None,
+            #[cfg(all(feature = "kafka", feature = "test-support"))]
+            kafka_max_poll_interval: None,
+            #[cfg(all(feature = "kafka", feature = "test-support"))]
+            kafka_housekeeping_interval: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: None,
             // Matches `ConsumerOptions`: enforcement is opt-out, not opt-in.
@@ -237,6 +245,10 @@ impl<B: Backend> BatchConsumerOptions<B> {
             kafka_group_id: self.kafka_group_id,
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: self.kafka_auto_offset_reset,
+            #[cfg(all(feature = "kafka", feature = "test-support"))]
+            kafka_max_poll_interval: self.kafka_max_poll_interval,
+            #[cfg(all(feature = "kafka", feature = "test-support"))]
+            kafka_housekeeping_interval: self.kafka_housekeeping_interval,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: self.schema_registry,
             #[cfg(feature = "kafka-schema-registry")]
@@ -271,6 +283,37 @@ impl BatchConsumerOptions<Kafka> {
     /// Kafka-only: `auto.offset.reset` override.
     pub fn with_auto_offset_reset(mut self, reset: KafkaAutoOffsetReset) -> Self {
         self.kafka_auto_offset_reset = Some(reset);
+        self
+    }
+
+    /// Test-only seam (see the `test-support` feature): create the batch
+    /// consumer with this `max.poll.interval.ms` instead of the pinned five
+    /// minutes, so a test can observe an eviction in seconds. librdkafka
+    /// refuses a value below `session.timeout.ms`, which is pinned at 10 s,
+    /// so 10 s is the floor.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_max_poll_interval_for_test(mut self, interval: Duration) -> Self {
+        self.kafka_max_poll_interval = Some(interval);
+        self
+    }
+
+    /// Test-only seam (see the `test-support` feature): wake the batch loop
+    /// to drain rebalance events every `interval` instead of every five
+    /// seconds, so a test can leave a rebalance undrained until the arm it is
+    /// about runs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `interval` is zero: the loop's tick has no zero period.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_housekeeping_interval_for_test(mut self, interval: Duration) -> Self {
+        assert!(
+            !interval.is_zero(),
+            "housekeeping interval must be positive"
+        );
+        self.kafka_housekeeping_interval = Some(interval);
         self
     }
 }
