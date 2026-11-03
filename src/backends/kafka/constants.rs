@@ -181,11 +181,11 @@ pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// finishes on its own.
 pub(super) const SHUTDOWN_COMMIT_DEADLINE: Duration = Duration::from_secs(20);
 
-/// The share of `SHUTDOWN_COMMIT_DEADLINE` the concurrent receive loop gives
-/// a `CommitPolicy::PerRecord` commit it finds in flight at shutdown: three
-/// quarters, so the final commit and the consumer's close always keep a
-/// slice of the deadline. Derived from the deadline, never written beside
-/// it.
+/// The share of `SHUTDOWN_COMMIT_DEADLINE` a receive loop gives the commit
+/// it finds in flight at shutdown, under either commit policy and on a
+/// sequenced consumer: three quarters, so the final commit and the
+/// consumer's close always keep a slice of the deadline. Derived from the
+/// deadline, never written beside it.
 pub(super) const PENDING_COMMIT_BUDGET: Duration = {
     // `Duration` has no const `Div`; `checked_div` is `None` for a divisor
     // of zero only, so the fallback arm cannot be taken.

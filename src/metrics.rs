@@ -570,9 +570,9 @@ impl PendingDiscard {
     /// `Ok`. Handing a message off to something that will retire it later does
     /// not qualify: Kafka's concurrent consumer therefore carries the pending
     /// record into its offset tracker rather than settling at hand-off, and
-    /// the tracker commits a batch containing a terminal offset with
-    /// `CommitMode::Sync` so there is a real acknowledgement to settle
-    /// against. See `backends::kafka::consumer::signal_completion`.
+    /// the tracker's commits are made with `CommitMode::Sync`, on a thread of
+    /// their own, so there is a real acknowledgement to settle against. See
+    /// `backends::kafka::consumer::signal_completion`.
     ///
     /// Where a retirement is genuinely ambiguous — a commit that failed, a
     /// partition revoked before its commit landed — settle with [`survived`]

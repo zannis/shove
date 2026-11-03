@@ -928,10 +928,11 @@ impl ConsumerOptions<Kafka> {
     /// [`CommitPolicy::Interval`]: both setters write the one policy slot,
     /// so the last call wins.
     ///
-    /// Completions are tracked in memory and committed asynchronously at
-    /// most once per interval, so a longer interval trades coordinator
-    /// requests for a wider replay window after a crash or a rebalance. The
-    /// final commit at shutdown is synchronous whatever the interval. For the
+    /// Completions are tracked in memory and committed at most once per
+    /// interval, one commit at a time while the consumer goes on, so a
+    /// longer interval trades coordinator requests for a wider replay window
+    /// after a crash or a rebalance. The final commit at shutdown is
+    /// synchronous whatever the interval. For the
     /// coordinated registry path the equivalent is
     /// [`KafkaConsumerGroupConfig::with_commit_interval`](crate::kafka::KafkaConsumerGroupConfig::with_commit_interval).
     /// A FIFO consumer, a broadcast subscription and the DLQ drain refuse it

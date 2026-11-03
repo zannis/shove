@@ -12,10 +12,10 @@
 //! This module also houses terminal-settlement machinery that Kafka's batch
 //! path and two of its non-batch paths depend on: `TerminalDiscard`,
 //! `RejectSettlement` and `reject_settlement`. The non-batch callers are the
-//! *single-message* async-commit reject path and the sequenced consumer's
-//! dead letter (`FifoLoop::dead_letter`). A later cleanup must not narrow
-//! the gate on those three below `kafka` without checking both of those
-//! callers first.
+//! *single-message* reject path, whose commit runs synchronously on its own
+//! thread, and the sequenced consumer's dead letter (`FifoLoop::dead_letter`).
+//! A later cleanup must not narrow the gate on those three below `kafka`
+//! without checking both of those callers first.
 //!
 //! # Gating
 //!
