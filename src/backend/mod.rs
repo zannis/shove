@@ -89,6 +89,9 @@ mod bounds_smoke {
     // Imports below feed the per-backend `_anchor_*` functions, which are
     // each gated behind their backend's feature flag — so without any
     // backend feature enabled these imports go unused.
+    #[cfg(feature = "kafka")]
+    #[allow(unused_imports)]
+    use crate::backends::kafka::FetchQueueTuning;
     #[allow(unused_imports)]
     use crate::markers::*;
     #[cfg(feature = "kafka-schema-registry")]
@@ -221,6 +224,8 @@ mod bounds_smoke {
             kafka_auto_offset_reset: None,
             #[cfg(feature = "kafka")]
             kafka_commit_policy: None,
+            #[cfg(feature = "kafka")]
+            kafka_fetch_queue: FetchQueueTuning::default(),
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: None,
             #[cfg(all(feature = "kafka", feature = "test-support"))]

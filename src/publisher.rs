@@ -29,6 +29,15 @@ impl<B: Backend> Publisher<B> {
         res
     }
 
+    /// Publish `msg` with caller-supplied `headers`.
+    ///
+    /// A reserved header name returns [`ShoveError::Validation`] naming the
+    /// header, and nothing is published. The names are the ones a backend
+    /// stamps itself or reads back as its own, and some belong to one backend
+    /// only. The [reserved header names] guide lists them.
+    ///
+    /// [`ShoveError::Validation`]: crate::error::ShoveError::Validation
+    /// [reserved header names]: https://shove.rs/guides/observability#reserved-header-names
     pub async fn publish_with_headers<T: Topic>(
         &self,
         msg: &T::Message,
@@ -65,7 +74,7 @@ impl<B: Backend> Publisher<B> {
     ///
     /// | Backend | Shape | What that means |
     /// |---|---|---|
-    /// | Kafka | **sparse** | every record is attempted independently, so `failed()` names exactly the rejected ones and `unattempted()` is empty |
+    /// | Kafka | **sparse**, or **prefix** on a sequenced topic | without a sequence key every record is attempted independently, so `failed()` names exactly the rejected ones and `unattempted()` is empty; a sequenced topic sends in slice order, `failed()` is the first failure and `unattempted()` everything after it |
     /// | SNS | **sparse** | rejected entries are named per 10-entry chunk; a chunk that errors as a whole, and every later chunk, becomes `unattempted()` |
     /// | NATS | **sparse + tail** | ack failures are exact over the submitted prefix; if submission breaks partway, the rest of the batch is `unattempted()` |
     /// | RabbitMQ | **prefix** | confirms are awaited in order and the call stops at the first nack: `failed()` is that one index, `unattempted()` is everything after it |

@@ -35,12 +35,15 @@
 //! where the cascade is the very thing under test.
 //!
 //! Kafka runs a single FIFO task over its whole partition assignment and
-//! processes one message fully (including its synchronous commit) before
-//! `recv()`-ing the next, so with `routing_shards(1)` pinning the topic to one
-//! partition, publish order is consume order. The trailing valid message
-//! reaching the handler therefore proves the two poison messages ahead of it
-//! were already decoded, dropped, and — because each FIFO commit is
-//! synchronous — fully settled, not merely dispatched.
+//! finishes with one message before it `recv()`s the next, so with
+//! `routing_shards(1)` pinning the topic to one partition, publish order is
+//! consume order. The trailing valid message reaching the handler therefore
+//! proves the two poison messages ahead of it were already decoded and
+//! dropped. Their discards ride the commit that retires them: a gated
+//! commit, synchronous because a discard rides it, or the final commit at
+//! the stop, which is synchronous too. Either is waited for before the
+//! consumer's run returns, so both discards are settled before the snapshot
+//! is taken.
 //!
 //! `.allow_message_loss()` is required on the no-DLQ topology: sequenced
 //! topics otherwise refuse to `build()` without a DLQ or a hold queue.

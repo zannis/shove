@@ -354,7 +354,7 @@ impl RabbitMqPublisher {
         message: &T::Message,
         headers: HashMap<String, String>,
     ) -> Result<()> {
-        validate_headers(&headers)?;
+        validate_headers(&headers, &[])?;
         let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let field_table = hashmap_to_field_table(headers);
         let topology = T::topology();
