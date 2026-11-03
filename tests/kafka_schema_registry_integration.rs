@@ -830,7 +830,9 @@ async fn cp_real_schema_registry_e2e() {
         shutdown.cancel();
         handle.await.unwrap().ok();
 
-        let received = handler.messages().await;
+        // Unkeyed records land on any of the topic's partitions: arrival order is undefined.
+        let mut received = handler.messages().await;
+        received.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(received.len(), 2, "protobuf: exactly two messages decoded");
         assert_eq!(received[0].id, "proto-1", "protobuf: first id must match");
         assert_eq!(received[0].qty, 10, "protobuf: first qty must match");
