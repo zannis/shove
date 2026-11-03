@@ -26,10 +26,8 @@ const NO_HOLD_QUEUE_DELAY: Duration = Duration::from_secs(1);
 /// `Defer` holds for tier 0's delay, so it passes 0.
 #[allow(dead_code)] // only NATS calls it so far
 pub(crate) fn hold_delay(hold_queues: &[HoldQueue], retry_count: u32) -> Duration {
-    usize::try_from(retry_count)
-        .ok()
+    hold_index(retry_count, hold_queues.len())
         .and_then(|tier| hold_queues.get(tier))
-        .or_else(|| hold_queues.last())
         .map_or(NO_HOLD_QUEUE_DELAY, HoldQueue::delay)
 }
 
@@ -268,9 +266,10 @@ mod tests {
         for tiers in 1..=3usize {
             let hold_queues = ladder(&[100, 200, 400][..tiers]);
             for count in 0..6u32 {
+                let tier = hold_index(count, tiers).expect("a ladder with tiers has a tier");
                 assert_eq!(
                     hold_delay(&hold_queues, count),
-                    hold_queues[hold_index(count, tiers)].delay(),
+                    hold_queues[tier].delay(),
                     "{tiers} tiers, count {count}"
                 );
             }
