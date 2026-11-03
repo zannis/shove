@@ -1281,10 +1281,11 @@ async fn a_republish_that_fails_under_per_record_ends_the_member_before_the_next
     produce_on(&bootstrap, RETRY_TOPIC, &["o1", "o2"]).await;
     mock.track_requests();
     // Every Produce from here on is refused with an error the producer does
-    // not retry, so the republish fails on each of its attempts.
+    // not retry and shove reads as transient, so the republish fails on each
+    // of its attempts.
     mock.api().request_errors(
         RDKafkaApiKey::Produce,
-        &[RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED; 32],
+        &[RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN; 32],
     );
 
     let handler = Retrying::default();
@@ -1316,6 +1317,63 @@ async fn a_republish_that_fails_under_per_record_ends_the_member_before_the_next
         *handler.seen.lock().expect("handler mutex poisoned"),
         vec!["o1".to_string()],
         "the second record was never handed out"
+    );
+    assert_eq!(
+        mock.offset_commit_requests(),
+        0,
+        "nothing was committed behind the record"
+    );
+    drop(shutdown);
+}
+
+/// A `Retry` whose republish the broker refuses for authorization ends the
+/// member at once with that refusal as `ShoveError::Topology`. No later send
+/// gets past it, so the member does not reconnect to be handed the record
+/// again, even with no limit on its reconnects: the handler sees the first
+/// record once, the second is never handed out, and no commit reaches the
+/// broker.
+#[tokio::test]
+async fn a_republish_refused_for_authorization_ends_the_member_without_a_reconnect() {
+    const RETRY_TOPIC: &str = "kafka-commit-policy-retry-unauthorized";
+    shove::define_topic!(
+        RetryTopic,
+        Order,
+        TopologyBuilder::new(RETRY_TOPIC)
+            .hold_queue(Duration::from_millis(200))
+            .build()
+    );
+
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    mock.api()
+        .create_topic(RETRY_TOPIC, 1, 1)
+        .expect("create the retry topic through the mock API");
+    produce_on(&bootstrap, RETRY_TOPIC, &["o1", "o2"]).await;
+    mock.track_requests();
+    mock.refuse_produce(
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+        32,
+    );
+
+    let handler = Recorder::new(|_, _| Outcome::Retry);
+    let (run, shutdown) =
+        start_on::<RetryTopic, _>(connect(&bootstrap).await, handler.clone(), |token| {
+            options(CommitPolicy::PerRecord, token)
+        });
+    let result = tokio::time::timeout(DELIVERY_TIMEOUT, run)
+        .await
+        .expect("the member ends within the bound")
+        .expect("the run task completes");
+    let err = result.expect_err("a refused republish ends the member");
+    assert!(
+        matches!(&err, ShoveError::Topology(msg)
+            if msg.contains("retry republish") && msg.contains("TopicAuthorizationFailed")),
+        "the member ends with the authorization refusal, as it came: {err}"
+    );
+    assert_eq!(
+        handler.ids(),
+        ["o1"],
+        "o1 is handled once: no reconnect handed it over again, and o2 waited behind it"
     );
     assert_eq!(
         mock.offset_commit_requests(),
