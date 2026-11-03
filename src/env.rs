@@ -18,6 +18,8 @@
 //! - [`ConsumerTuning`] — consumer range + prefetch, the knobs every
 //!   coordinated-group backend's consumer-group config takes.
 //! - [`KafkaTopicTuning`] — replication factor and partition floor.
+//! - [`KafkaFetchQueueTuning`] — a Kafka consumer's prefetch thresholds and
+//!   fetch queue backoff.
 //! - [`AutoscalerConfig::from_env`](crate::autoscaler::AutoscalerConfig::from_env)
 //!   and [`NatsStreamConfig::from_env`](crate::topology::NatsStreamConfig::from_env)
 //!   live next to their own types.
@@ -48,6 +50,10 @@ use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::time::Duration;
 
+#[cfg(feature = "kafka")]
+use crate::backends::kafka::{
+    FETCH_QUEUE_BACKOFF_MS_RANGE, QUEUED_MAX_MESSAGES_KBYTES_RANGE, QUEUED_MIN_MESSAGES_RANGE,
+};
 use crate::error::{Result, ShoveError};
 
 /// A prefix-scoped, typed reader over environment variables.
@@ -484,6 +490,103 @@ impl KafkaTopicTuning {
     }
 }
 
+// ---------------------------------------------------------------------------
+// KafkaFetchQueueTuning
+// ---------------------------------------------------------------------------
+
+/// Kafka consumer fetch queue knobs read from the environment: the two
+/// prefetch thresholds of librdkafka's local queue and the backoff it waits
+/// out before it fetches a partition that reached one.
+///
+/// | Variable | Type | Default |
+/// |---|---|---|
+/// | `{PREFIX}_QUEUED_MIN_MESSAGES` | `u32`, `1..=10000000` | unset |
+/// | `{PREFIX}_QUEUED_MAX_MESSAGES_KBYTES` | `u32`, `1..=2097151` | unset |
+/// | `{PREFIX}_FETCH_QUEUE_BACKOFF_MS` | `u32`, `0..=300000` | unset |
+///
+/// The ranges are librdkafka's own. All three are `Option` because "unset"
+/// has to stay distinguishable from every value: an unset threshold keeps
+/// librdkafka's default, and an unset backoff keeps the 25 ms every shove
+/// consumer runs with. A `0` backoff is a value, and removes the wait.
+///
+/// ```ignore
+/// let tuning = KafkaFetchQueueTuning::from_env("INGEST")?;
+/// let mut options = ConsumerOptions::<Kafka>::new();
+/// if let Some(n) = tuning.queued_min_messages() {
+///     options = options.with_queued_min_messages(n);
+/// }
+/// if let Some(kb) = tuning.queued_max_messages_kbytes() {
+///     options = options.with_queued_max_messages_kbytes(kb);
+/// }
+/// if let Some(ms) = tuning.fetch_queue_backoff_ms() {
+///     options = options.with_fetch_queue_backoff_ms(ms);
+/// }
+/// ```
+#[cfg(feature = "kafka")]
+#[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KafkaFetchQueueTuning {
+    queued_min_messages: Option<u32>,
+    queued_max_messages_kbytes: Option<u32>,
+    fetch_queue_backoff_ms: Option<u32>,
+}
+
+#[cfg(feature = "kafka")]
+impl KafkaFetchQueueTuning {
+    /// Read from the process environment under `prefix`.
+    pub fn from_env(prefix: impl Into<String>) -> Result<Self> {
+        Self::from_vars(&EnvVars::with_prefix(prefix))
+    }
+
+    /// Read from an explicit set of `(name, value)` pairs. See
+    /// [`EnvVars::from_pairs`].
+    pub fn from_pairs<K, V>(
+        prefix: impl Into<String>,
+        pairs: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<Self>
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        Self::from_vars(&EnvVars::from_pairs(prefix, pairs))
+    }
+
+    /// Read from an existing [`EnvVars`].
+    pub fn from_vars(vars: &EnvVars) -> Result<Self> {
+        Ok(Self {
+            queued_min_messages: vars
+                .opt_parse_in("QUEUED_MIN_MESSAGES", QUEUED_MIN_MESSAGES_RANGE)?,
+            queued_max_messages_kbytes: vars.opt_parse_in(
+                "QUEUED_MAX_MESSAGES_KBYTES",
+                QUEUED_MAX_MESSAGES_KBYTES_RANGE,
+            )?,
+            fetch_queue_backoff_ms: vars
+                .opt_parse_in("FETCH_QUEUE_BACKOFF_MS", FETCH_QUEUE_BACKOFF_MS_RANGE)?,
+        })
+    }
+
+    /// Feeds [`ConsumerOptions::<Kafka>::with_queued_min_messages`](crate::ConsumerOptions::with_queued_min_messages),
+    /// [`BatchConsumerOptions::<Kafka>::with_queued_min_messages`](crate::BatchConsumerOptions::with_queued_min_messages)
+    /// and [`KafkaConsumerGroupConfig::with_queued_min_messages`](crate::kafka::KafkaConsumerGroupConfig::with_queued_min_messages).
+    pub fn queued_min_messages(&self) -> Option<u32> {
+        self.queued_min_messages
+    }
+
+    /// Feeds [`ConsumerOptions::<Kafka>::with_queued_max_messages_kbytes`](crate::ConsumerOptions::with_queued_max_messages_kbytes),
+    /// [`BatchConsumerOptions::<Kafka>::with_queued_max_messages_kbytes`](crate::BatchConsumerOptions::with_queued_max_messages_kbytes)
+    /// and [`KafkaConsumerGroupConfig::with_queued_max_messages_kbytes`](crate::kafka::KafkaConsumerGroupConfig::with_queued_max_messages_kbytes).
+    pub fn queued_max_messages_kbytes(&self) -> Option<u32> {
+        self.queued_max_messages_kbytes
+    }
+
+    /// Feeds [`ConsumerOptions::<Kafka>::with_fetch_queue_backoff_ms`](crate::ConsumerOptions::with_fetch_queue_backoff_ms),
+    /// [`BatchConsumerOptions::<Kafka>::with_fetch_queue_backoff_ms`](crate::BatchConsumerOptions::with_fetch_queue_backoff_ms)
+    /// and [`KafkaConsumerGroupConfig::with_fetch_queue_backoff_ms`](crate::kafka::KafkaConsumerGroupConfig::with_fetch_queue_backoff_ms).
+    pub fn fetch_queue_backoff_ms(&self) -> Option<u32> {
+        self.fetch_queue_backoff_ms
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,5 +808,137 @@ mod tests {
     #[test]
     fn kafka_topic_tuning_rejects_zero_replication() {
         assert!(KafkaTopicTuning::from_vars(&vars(&[("SVC_REPLICATION_FACTOR", "0")])).is_err());
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_fetch_queue_tuning_reads_the_three_knobs() {
+        let tuning = KafkaFetchQueueTuning::from_vars(&vars(&[
+            ("SVC_QUEUED_MIN_MESSAGES", "5000"),
+            ("SVC_QUEUED_MAX_MESSAGES_KBYTES", "2048"),
+            ("SVC_FETCH_QUEUE_BACKOFF_MS", "250"),
+        ]))
+        .unwrap();
+        assert_eq!(tuning.queued_min_messages(), Some(5000));
+        assert_eq!(tuning.queued_max_messages_kbytes(), Some(2048));
+        assert_eq!(tuning.fetch_queue_backoff_ms(), Some(250));
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_fetch_queue_tuning_keeps_an_unset_knob_unset() {
+        let unset = KafkaFetchQueueTuning::from_vars(&vars(&[])).unwrap();
+        assert_eq!(unset.queued_min_messages(), None);
+        assert_eq!(unset.queued_max_messages_kbytes(), None);
+        assert_eq!(unset.fetch_queue_backoff_ms(), None);
+
+        let blank = KafkaFetchQueueTuning::from_vars(&vars(&[
+            ("SVC_QUEUED_MIN_MESSAGES", "  "),
+            ("SVC_FETCH_QUEUE_BACKOFF_MS", ""),
+        ]))
+        .unwrap();
+        assert_eq!(blank.queued_min_messages(), None);
+        assert_eq!(blank.fetch_queue_backoff_ms(), None);
+    }
+
+    /// A backoff of `0` reads as `Some(0)`, and removes the backoff.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_fetch_queue_tuning_admits_the_edges_of_every_range() {
+        let low = KafkaFetchQueueTuning::from_vars(&vars(&[
+            ("SVC_QUEUED_MIN_MESSAGES", "1"),
+            ("SVC_QUEUED_MAX_MESSAGES_KBYTES", "1"),
+            ("SVC_FETCH_QUEUE_BACKOFF_MS", "0"),
+        ]))
+        .unwrap();
+        assert_eq!(low.fetch_queue_backoff_ms(), Some(0));
+
+        let high = KafkaFetchQueueTuning::from_vars(&vars(&[
+            ("SVC_QUEUED_MIN_MESSAGES", "10000000"),
+            ("SVC_QUEUED_MAX_MESSAGES_KBYTES", "2097151"),
+            ("SVC_FETCH_QUEUE_BACKOFF_MS", "300000"),
+        ]))
+        .unwrap();
+        assert_eq!(high.queued_min_messages(), Some(10_000_000));
+        assert_eq!(high.queued_max_messages_kbytes(), Some(2_097_151));
+        assert_eq!(high.fetch_queue_backoff_ms(), Some(300_000));
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_fetch_queue_tuning_refuses_a_value_outside_a_range_naming_the_variable() {
+        for (name, value, range) in [
+            ("SVC_QUEUED_MIN_MESSAGES", "0", "1..=10000000"),
+            ("SVC_QUEUED_MIN_MESSAGES", "10000001", "1..=10000000"),
+            ("SVC_QUEUED_MAX_MESSAGES_KBYTES", "0", "1..=2097151"),
+            ("SVC_QUEUED_MAX_MESSAGES_KBYTES", "2097152", "1..=2097151"),
+            ("SVC_FETCH_QUEUE_BACKOFF_MS", "300001", "0..=300000"),
+            ("SVC_FETCH_QUEUE_BACKOFF_MS", "-1", "u32"),
+            ("SVC_FETCH_QUEUE_BACKOFF_MS", "soon", "u32"),
+        ] {
+            let err = KafkaFetchQueueTuning::from_vars(&vars(&[(name, value)])).unwrap_err();
+            assert!(
+                matches!(&err, ShoveError::Validation(msg)
+                    if msg.contains(name) && msg.contains(range)),
+                "{name}={value} must name the variable and say {range}: {err}"
+            );
+        }
+    }
+
+    /// The values read from the environment reach every builder, and what
+    /// each builder carries is what a consumer applies to librdkafka.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_fetch_queue_tuning_round_trips_through_every_builder() {
+        use rdkafka::ClientConfig;
+
+        use crate::backends::kafka::{FetchQueueTuning, KafkaConsumerGroupConfig};
+        use crate::batch_consumer::BatchConsumerOptions;
+        use crate::consumer::ConsumerOptions;
+        use crate::markers::Kafka;
+
+        let tuning = KafkaFetchQueueTuning::from_pairs(
+            "INGEST",
+            [
+                ("INGEST_QUEUED_MIN_MESSAGES", "5000"),
+                ("INGEST_QUEUED_MAX_MESSAGES_KBYTES", "2048"),
+                ("INGEST_FETCH_QUEUE_BACKOFF_MS", "250"),
+            ],
+        )
+        .unwrap();
+
+        let mut options = ConsumerOptions::<Kafka>::new();
+        let mut batch = BatchConsumerOptions::<Kafka>::new();
+        let mut group = KafkaConsumerGroupConfig::new(1..=1);
+        if let Some(n) = tuning.queued_min_messages() {
+            options = options.with_queued_min_messages(n);
+            batch = batch.with_queued_min_messages(n);
+            group = group.with_queued_min_messages(n);
+        }
+        if let Some(kb) = tuning.queued_max_messages_kbytes() {
+            options = options.with_queued_max_messages_kbytes(kb);
+            batch = batch.with_queued_max_messages_kbytes(kb);
+            group = group.with_queued_max_messages_kbytes(kb);
+        }
+        if let Some(ms) = tuning.fetch_queue_backoff_ms() {
+            options = options.with_fetch_queue_backoff_ms(ms);
+            batch = batch.with_fetch_queue_backoff_ms(ms);
+            group = group.with_fetch_queue_backoff_ms(ms);
+        }
+
+        let expected = FetchQueueTuning {
+            queued_min_messages: Some(5000),
+            queued_max_messages_kbytes: Some(2048),
+            fetch_queue_backoff_ms: Some(250),
+        };
+        assert_eq!(options.into_inner().kafka_fetch_queue, expected);
+        assert_eq!(batch.into_inner().kafka_fetch_queue, expected);
+        assert_eq!(group.fetch_queue, expected);
+
+        let mut config = ClientConfig::new();
+        expected.apply(&mut config, "ingest").unwrap();
+        assert_eq!(config.get("queued.min.messages"), Some("5000"));
+        assert_eq!(config.get("queued.max.messages.kbytes"), Some("2048"));
+        assert_eq!(config.get("fetch.queue.backoff.ms"), Some("250"));
     }
 }

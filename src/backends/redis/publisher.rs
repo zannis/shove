@@ -13,7 +13,7 @@ use crate::publisher_internal::{shard_for_key as shared_shard_for_key, validate_
 use crate::topic::Topic;
 
 use super::client::{RedisClient, RedisConnection};
-use super::constants::{DEFAULT_ROUTING_SHARDS, PAYLOAD_FIELD, X_SEQUENCE_KEY};
+use super::constants::{DEFAULT_ROUTING_SHARDS, INTERNAL_KEYS, PAYLOAD_FIELD, X_SEQUENCE_KEY};
 use super::topology::RedisTopologyDeclarer;
 
 // ---------------------------------------------------------------------------
@@ -39,9 +39,10 @@ pub fn shard_for_key(key: &str, routing_shards: u16) -> u16 {
 /// shared by every publish on this publisher and its clones — redis-rs dials
 /// a fresh TCP socket on every `get_multiplexed_async_connection` call, so
 /// acquiring per publish opened (and dropped) a connection per message.
-/// On a publish error the cached connection is invalidated and the next
+/// On a connection failure the cached connection is invalidated and the next
 /// publish dials a fresh one; the error itself still propagates to the
-/// caller unchanged.
+/// caller unchanged. A publish refused before anything is sent, because a
+/// header names a field the entry carries as its own, leaves it in place.
 #[derive(Clone)]
 pub struct RedisPublisher {
     client: RedisClient,
@@ -70,6 +71,11 @@ impl RedisPublishError {
             error: ShoveError::Connection(format!("XADD to {stream} failed: {source}")),
             explicit_rejection,
         }
+    }
+
+    /// Whether the connection failed, so the cached one must not be reused.
+    fn is_connection_failure(&self) -> bool {
+        matches!(self.error, ShoveError::Connection(_))
     }
 }
 
@@ -130,9 +136,7 @@ impl RedisPublisher {
         };
 
         match conn {
-            Some(c) => xadd_on_conn(c, &stream, &payload, &headers, sequence_key.as_deref())
-                .await
-                .map_err(|e| RedisPublishError::xadd(&stream, e)),
+            Some(c) => xadd_on_conn(c, &stream, &payload, &headers, sequence_key.as_deref()).await,
             None => {
                 let mut owned = self
                     .cached_conn()
@@ -146,10 +150,13 @@ impl RedisPublisher {
                     sequence_key.as_deref(),
                 )
                 .await;
-                if result.is_err() {
+                if result
+                    .as_ref()
+                    .is_err_and(RedisPublishError::is_connection_failure)
+                {
                     self.invalidate_conn().await;
                 }
-                result.map_err(|e| RedisPublishError::xadd(&stream, e))
+                result
             }
         }
     }
@@ -170,16 +177,16 @@ impl RedisPublisher {
 
     /// Publish `msg` with caller-provided headers carried in the XADD entry.
     ///
-    /// Rejects headers using a reserved prefix (e.g. `x-retry-count`,
-    /// `x-message-id`, `x-sequence-key`) so a publisher cannot forge the
-    /// internal routing/accounting fields the consumer reads off the stream
-    /// entry — matching the other backends.
+    /// Rejects reserved header names (e.g. `x-retry-count`, `x-sequence-key`,
+    /// `payload`) so a publisher cannot forge the internal routing/accounting
+    /// fields or the message body the consumer reads off the stream entry —
+    /// matching the other backends.
     pub async fn publish_with_headers<T: Topic>(
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
     ) -> Result<()> {
-        validate_headers(&headers)?;
+        validate_headers(&headers, INTERNAL_KEYS)?;
         self.publish_inner::<T>(msg, headers, None)
             .await
             .map_err(|e| e.error)
@@ -254,13 +261,25 @@ impl PublisherImpl for RedisPublisher {
 // ---------------------------------------------------------------------------
 
 /// Execute a single XADD on an already-open connection.
+///
+/// A header named like a field the entry carries as its own would write that
+/// field twice, and the consumer keeps the later value, so it is refused with
+/// `ShoveError::Validation` before anything is sent.
 async fn xadd_on_conn(
     conn: &mut RedisConnection,
     stream: &str,
     payload: &str,
     headers: &HashMap<String, String>,
     sequence_key: Option<&str>,
-) -> redis::RedisResult<()> {
+) -> std::result::Result<(), RedisPublishError> {
+    if let Some(name) = headers
+        .keys()
+        .find(|name| INTERNAL_KEYS.contains(&name.as_str()))
+    {
+        return Err(RedisPublishError::unresolved(ShoveError::Validation(
+            format!("header '{name}' collides with a field the stream entry carries as its own"),
+        )));
+    }
     let mut cmd = redis::cmd("XADD");
     cmd.arg(stream).arg("*");
     cmd.arg(PAYLOAD_FIELD).arg(payload);
@@ -270,7 +289,10 @@ async fn xadd_on_conn(
     if let Some(seq_key) = sequence_key {
         cmd.arg(X_SEQUENCE_KEY).arg(seq_key);
     }
-    conn.query_redis::<redis::Value>(&mut cmd).await.map(|_| ())
+    conn.query_redis::<redis::Value>(&mut cmd)
+        .await
+        .map(|_| ())
+        .map_err(|e| RedisPublishError::xadd(stream, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -375,26 +397,33 @@ mod tests {
         Ok(())
     }
 
-    async fn start_ambiguous_xadd_server() -> (String, tokio::task::JoinHandle<()>) {
+    /// A mock Redis that answers the first XADD it sees and drops the
+    /// connection on every later one. Also returns how many connections it
+    /// has accepted.
+    async fn start_ambiguous_xadd_server() -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>)
+    {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock Redis server");
         let address = listener.local_addr().expect("mock Redis address");
         let xadds = Arc::new(AtomicUsize::new(0));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::clone(&connections);
         let server = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
                 let xadds = Arc::clone(&xadds);
                 tokio::spawn(async move {
                     let _ = serve_mock_redis_connection(stream, xadds).await;
                 });
             }
         });
-        (format!("redis://{address}/"), server)
+        (format!("redis://{address}/"), server, connections)
     }
 
     #[tokio::test]
     async fn ambiguous_xadd_response_is_unattempted_not_failed() {
-        let (url, server) = start_ambiguous_xadd_server().await;
+        let (url, server, _) = start_ambiguous_xadd_server().await;
         let client = RedisClient::connect(
             RedisConfig::new(RedisMode::Standalone { url })
                 .with_response_timeout(Duration::from_secs(3)),
@@ -419,6 +448,87 @@ mod tests {
         );
         assert_eq!(failure.unattempted(), &[1, 2]);
         assert_eq!(failure.to_republish(), &[1, 2]);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_header_naming_an_entry_field_is_refused_before_any_xadd() {
+        let (url, server, _) = start_ambiguous_xadd_server().await;
+        let client = RedisClient::connect(
+            RedisConfig::new(RedisMode::Standalone { url })
+                .with_response_timeout(Duration::from_secs(3)),
+        )
+        .await
+        .expect("connect to mock Redis");
+        let publisher = RedisPublisher::new(client);
+
+        for name in INTERNAL_KEYS {
+            let headers = HashMap::from([((*name).to_string(), "forged".to_string())]);
+            let failure = publisher
+                .publish_inner::<AmbiguousBatchTopic>(&1, headers, None)
+                .await
+                .expect_err("a header that names an entry field is refused");
+            assert!(
+                matches!(failure.error, ShoveError::Validation(_)),
+                "{name}: {:?}",
+                failure.error
+            );
+        }
+
+        // The mock answers only the first XADD it sees, so this one succeeding
+        // shows that none of the refused publishes sent one.
+        publisher
+            .publish_inner::<AmbiguousBatchTopic>(&1, HashMap::new(), None)
+            .await
+            .map_err(|failure| failure.error)
+            .expect("the first XADD the server sees is accepted");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn publish_with_headers_reserves_the_stream_entry_fields_before_any_io() {
+        let (url, server, connections) = start_ambiguous_xadd_server().await;
+        let client = RedisClient::connect(
+            RedisConfig::new(RedisMode::Standalone { url })
+                .with_response_timeout(Duration::from_secs(3)),
+        )
+        .await
+        .expect("connect to mock Redis");
+        let publisher = RedisPublisher::new(client);
+        let connected = connections.load(Ordering::SeqCst);
+
+        for name in INTERNAL_KEYS {
+            let headers = HashMap::from([((*name).to_string(), "forged".to_string())]);
+            let err = publisher
+                .publish_with_headers::<AmbiguousBatchTopic>(&1, headers)
+                .await
+                .expect_err("a name the stream entry carries as its own is refused");
+            assert!(
+                matches!(&err, ShoveError::Validation(message) if message.contains(name)),
+                "{name}: {err:?}"
+            );
+        }
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            connected,
+            "a refused publish dialled a connection"
+        );
+
+        // Redis writes neither `shard` nor a `payload-type`, so both stay free.
+        let headers = HashMap::from([
+            ("shard".to_string(), "1".to_string()),
+            ("payload-type".to_string(), "json".to_string()),
+        ]);
+        publisher
+            .publish_with_headers::<AmbiguousBatchTopic>(&1, headers)
+            .await
+            .expect("names Redis does not write are published");
+        assert!(
+            connections.load(Ordering::SeqCst) > connected,
+            "the accepted publish dialled no connection"
+        );
 
         server.abort();
     }

@@ -36,6 +36,17 @@ pub(super) const DEATH_COUNT_KEY: &CStr = c"Shove-Death-Count";
 pub(super) const MESSAGE_ID_KEY: &CStr = c"Shove-Message-Id";
 pub(super) const BASE_MESSAGE_ID_KEY: &CStr = c"Shove-Base-Message-Id";
 
+/// Header names this backend writes itself. A new one belongs here: a test
+/// checks that `validate_headers` reserves every name in this list.
+#[cfg(test)]
+const INTERNAL_HEADERS: &[&str] = &[
+    RETRY_COUNT_HEADER,
+    DEATH_REASON_HEADER,
+    ORIGINAL_QUEUE_HEADER,
+    DEATH_COUNT_HEADER,
+    MESSAGE_ID_HEADER,
+];
+
 // ---------------------------------------------------------------------------
 // Group ID derivations
 // ---------------------------------------------------------------------------
@@ -158,6 +169,19 @@ pub(super) const DEFAULT_PARTITIONS: i32 = 8;
 /// or `KafkaTopologyDeclarer::with_replication_factor`.
 pub(super) const DEFAULT_REPLICATION: i32 = 1;
 
+/// How many times `declare` reads the metadata of a topic it found existing
+/// before it gives up on the answer. The broker that said the topic exists
+/// can be ahead of the one metadata comes from, and a topic created a moment
+/// ago has no leaders yet; both settle within a few seconds.
+pub(super) const PARTITION_METADATA_ATTEMPTS: u32 = 8;
+
+/// The first wait between two such reads; each wait doubles, up to
+/// [`PARTITION_METADATA_RETRY_MAX`].
+pub(super) const PARTITION_METADATA_RETRY_INITIAL: Duration = Duration::from_millis(100);
+
+/// The longest wait between two such reads.
+pub(super) const PARTITION_METADATA_RETRY_MAX: Duration = Duration::from_secs(1);
+
 // ---------------------------------------------------------------------------
 // Client lifecycle
 // ---------------------------------------------------------------------------
@@ -167,6 +191,35 @@ pub(super) const DEFAULT_REPLICATION: i32 = 1;
 /// healthy cluster but short enough that a hung broker cannot stall
 /// shutdown indefinitely.
 pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+
+/// The longest the producer flush at shutdown waits for records still queued
+/// to be delivered. Past it, `flush` returns with the records unsent.
+pub(super) const PRODUCER_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The longest `shutdown` waits for a producer build that is still in flight
+/// when it arrives. A build takes milliseconds; it takes longer only while
+/// librdkafka's constructor is held on slow storage or a helper process, and
+/// a shutdown has nothing to gain from outwaiting that. A build that
+/// finishes after the wait is not flushed.
+pub(super) const PRODUCER_BUILD_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+
+/// How long the client waits before it builds a producer again after a
+/// fatal error on one that never delivered a record. Such a producer usually
+/// met a fault its successor meets too, such as a principal that may not
+/// request a producer id, so the wait doubles for each one in a row, up to
+/// [`PRODUCER_REBUILD_WAIT_MAX`]. A producer that delivered is replaced at
+/// once.
+pub(super) const PRODUCER_REBUILD_WAIT: Duration = Duration::from_secs(1);
+
+/// The longest wait before a producer is built again after a fatal error.
+pub(super) const PRODUCER_REBUILD_WAIT_MAX: Duration = Duration::from_secs(60);
+
+/// The topic a `ping` asks the broker about. Metadata has to name a topic or
+/// ask for all of them, and a probe repeated for the life of the process must
+/// not ask for all of them. The topic need not exist: any answer from a
+/// broker, an unknown-topic or authorization error included, shows that the
+/// cluster is reachable.
+pub(super) const PING_PROBE_TOPIC: &str = "shove-ping-probe";
 
 /// How long the concurrent receive loop waits for its final synchronous
 /// offset commit at shutdown before giving up on the result.
@@ -181,11 +234,11 @@ pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// finishes on its own.
 pub(super) const SHUTDOWN_COMMIT_DEADLINE: Duration = Duration::from_secs(20);
 
-/// The share of `SHUTDOWN_COMMIT_DEADLINE` the concurrent receive loop gives
-/// a `CommitPolicy::PerRecord` commit it finds in flight at shutdown: three
-/// quarters, so the final commit and the consumer's close always keep a
-/// slice of the deadline. Derived from the deadline, never written beside
-/// it.
+/// The share of `SHUTDOWN_COMMIT_DEADLINE` a receive loop gives the commit
+/// it finds in flight at shutdown, under either commit policy and on a
+/// sequenced consumer: three quarters, so the final commit and the
+/// consumer's close always keep a slice of the deadline. Derived from the
+/// deadline, never written beside it.
 pub(super) const PENDING_COMMIT_BUDGET: Duration = {
     // `Duration` has no const `Div`; `checked_div` is `None` for a divisor
     // of zero only, so the fallback arm cannot be taken.
@@ -195,6 +248,18 @@ pub(super) const PENDING_COMMIT_BUDGET: Duration = {
     };
     SHUTDOWN_COMMIT_DEADLINE.saturating_sub(quarter)
 };
+
+/// How long a stop polls, its assignment paused, before it tries again a
+/// final commit the coordinator refused while the group rebalances, so the
+/// polls can serve the rebalance callbacks the rebalance waits on.
+pub(super) const FINAL_COMMIT_RETRY_POLL: Duration = Duration::from_millis(500);
+
+/// The least of `SHUTDOWN_COMMIT_DEADLINE` that must be left, both when a
+/// final commit starts and when its refusal while the group rebalances
+/// comes back, for that refusal to be tried again: room for the poll, and
+/// for the last try and the close that follows it. A refusal that comes
+/// back with less left stands.
+pub(super) const FINAL_COMMIT_RETRY_RESERVE: Duration = Duration::from_secs(2);
 
 /// How long a consume loop waits before asking the schema registry again for
 /// a record whose schema id it could not resolve: a transport failure, or a
@@ -250,9 +315,29 @@ pub(super) const FETCH_MIN_BYTES: u32 = 1;
 /// low-volume topics don't pay librdkafka's default 500 ms dwell.
 pub(super) const FETCH_WAIT_MAX_MS: u32 = 50;
 
+/// Consumer `fetch.queue.backoff.ms`: how long librdkafka waits before it
+/// fetches a partition again once the partition's local queue reached
+/// `queued.min.messages` or `queued.max.messages.kbytes`.
+///
+/// librdkafka's default is 1000 ms. The wait runs its full length even when
+/// the application empties the queue meanwhile, so a consumer that works
+/// through a backlog faster than the queue refills idles for the rest of each
+/// second. With the default `queued.min.messages` of 100000 that caps a
+/// consumer of one partition at about 100k messages per second. 25 ms
+/// refetches a drained queue promptly, and a queue that stays full is checked
+/// at most forty times a second per partition. Every consumer shove builds
+/// uses it, and `with_fetch_queue_backoff_ms` replaces it.
+pub(super) const FETCH_QUEUE_BACKOFF_MS: u32 = 25;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::publisher_internal::assert_internal_keys_reserved;
+
+    #[test]
+    fn every_internal_header_is_reserved_by_validate_headers() {
+        assert_internal_keys_reserved("Kafka", INTERNAL_HEADERS, &[]);
+    }
 
     #[test]
     fn group_id_derivations_are_canonical() {

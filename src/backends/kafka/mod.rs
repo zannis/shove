@@ -4,6 +4,7 @@ mod client;
 mod constants;
 mod consumer;
 mod consumer_group;
+mod fetch_queue;
 #[cfg(feature = "kafka-msk-iam")]
 mod msk_iam;
 mod offset_reset;
@@ -21,7 +22,19 @@ pub use client::{KafkaClient, KafkaCompression, KafkaConfig};
 pub use client::{KafkaSasl, KafkaTls};
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
+pub use consumer::broadcast_refresh_probe;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use consumer::client_id_probe;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use consumer::commit_gate_probe;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
 pub use consumer::completion_probe;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use consumer::fetch_queue_probe;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use consumer::permit_wait_probe;
@@ -30,6 +43,11 @@ pub use consumer::permit_wait_probe;
 pub use consumer::put_back_probe;
 pub use consumer::{BatchConsumerOptions, KafkaConsumer};
 pub(crate) use consumer_group::validate_commit_policy;
+pub(crate) use fetch_queue::FetchQueueTuning;
+#[cfg(feature = "env-config")]
+pub(crate) use fetch_queue::{
+    FETCH_QUEUE_BACKOFF_MS_RANGE, QUEUED_MAX_MESSAGES_KBYTES_RANGE, QUEUED_MIN_MESSAGES_RANGE,
+};
 #[cfg(all(feature = "kafka-msk-iam", feature = "test-support"))]
 #[doc(hidden)]
 pub use msk_iam::msk_iam_context_for_test;
@@ -48,9 +66,8 @@ pub fn shutdown_commit_deadline_for_test() -> std::time::Duration {
 }
 
 /// Test-only seam (see the `test-support` feature): the share of that
-/// deadline a `CommitPolicy::PerRecord` commit found in flight at shutdown
-/// is waited for, so a test asserts against the constant rather than a
-/// hand-derived fraction.
+/// deadline a commit found in flight at shutdown is waited for, so a test
+/// asserts against the constant rather than a hand-derived fraction.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn pending_commit_budget_for_test() -> std::time::Duration {
@@ -73,9 +90,22 @@ pub use consumer::fence_probe;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use consumer::final_commit_spawn_probe;
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use consumer::dlq_publish_probe;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use consumer::per_record_probe;
+
+/// Test-only seam (see the `test-support` feature): the topic a `ping` asks
+/// the broker about, so a test that looks for it in the cluster reads the
+/// constant itself.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn ping_probe_topic_for_test() -> &'static str {
+    constants::PING_PROBE_TOPIC
+}
 
 /// Test-only seam (see the `test-support` feature): the `session.timeout.ms`
 /// every shove consumer is created with, so a test that waits past it asserts
