@@ -1,0 +1,19 @@
+tests/kafka_broadcast_integration.rs
+  s_634a600f8b06aa::t_954e76a0709ee5 452-461
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d037a31f208bdfad39993aeae05cc9d1a91e57b7",
+  "prompts": {},
+  "sessions": {
+    "s_634a600f8b06aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad694d59-7695-4461-86b1-40da5b9622f9",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
