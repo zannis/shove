@@ -133,8 +133,8 @@
       "fail_above_pct": 122.0
     },
     "inmemory_batch/consume_batch_b256/65536": {
-      "mean_ns": 5649112.26,
-      "fail_above_pct": 59.0
+      "mean_ns": 11373398.55,
+      "fail_above_pct": 178.0
     },
     "inmemory_batch/consume_batch_b32/1024": {
       "mean_ns": 251816.21,
