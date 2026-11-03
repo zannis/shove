@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::any::Any;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::marker::PhantomData;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,7 +20,7 @@ use async_nats::jetstream::context::{
 use async_nats::jetstream::message::AckKind;
 use futures_util::FutureExt;
 use futures_util::stream::{self, StreamExt};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
+use tokio::sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore, SemaphorePermit, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
@@ -852,13 +854,16 @@ where
 
         shard.processing.store(true, Ordering::Release);
         let retry_count = metadata.retry_count;
-        let handler = Arc::clone(shard.handler);
-        let ctx = Arc::clone(shard.ctx);
         let attempt = metadata.clone();
         let outcome = invoke_handler(
-            async move { handler.handle(payload, attempt, ctx.as_ref()).await },
+            async {
+                shard
+                    .handler
+                    .handle(payload, attempt, shard.ctx.as_ref())
+                    .await
+            },
             shard.handler_timeout,
-            shard.timeout_outcome.clone(),
+            shard.timeout_outcome.as_ref(),
             shard.topic,
             shard.group,
         )
@@ -1007,35 +1012,51 @@ pub(super) fn abort_on_drop<T>(handles: &[tokio::task::JoinHandle<T>]) -> Vec<Ab
 /// How a [`guarded`] call ended.
 enum Guarded<T> {
     Done(T),
-    /// The call panicked; the error is the task's `JoinError`.
-    Panicked(tokio::task::JoinError),
-    /// The call outlasted this limit and was aborted.
+    /// The call panicked; the text is the panic's message.
+    Panicked(String),
+    /// The call outlasted this limit and was dropped.
     TimedOut(Duration),
 }
 
-/// Runs `fut` in a child task, so a panic inside it ends that task while the
-/// caller carries on, and gives up on it after `timeout`. Records no metric.
+/// The text a panic was raised with, whether it was given a literal or a
+/// formatted string.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic payload that is no text".to_string())
+}
+
+/// Polls `fut` on the caller's own task, so a panic inside it is caught while
+/// the caller carries on, and gives up on it after `timeout`. Records no
+/// metric.
 ///
-/// The child is aborted when the call times out and when the caller is
-/// dropped, as an aborted FIFO shard or DLQ drain is. A bare `JoinHandle` would
-/// detach it to run on with no limit.
-async fn guarded<F>(fut: F, timeout: Option<Duration>) -> Guarded<F::Output>
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    let mut join = tokio::spawn(fut);
-    let _abort = AbortOnDrop(join.abort_handle());
-    let joined = match timeout {
-        Some(limit) => match tokio::time::timeout(limit, &mut join).await {
-            Ok(joined) => joined,
+/// No task runs the call apart from the caller, so the call is dropped when it
+/// times out and when the caller is dropped, as an aborted FIFO shard or DLQ
+/// drain is, and a message costs the one task its caller already is.
+///
+/// The limit bounds a call that yields: a call still running when it passes
+/// is dropped at its next yield, before the caller resumes. A call that holds
+/// its thread is not stopped while it does. One that runs past the limit and
+/// then returns without yielding is [`Guarded::Done`] with its own output,
+/// since the call is polled before the limit is checked.
+///
+/// A panic raised while a timed-out call is dropped, in the `Drop` of
+/// something the call holds, is not caught: it unwinds the caller, the
+/// message task, the FIFO shard or the DLQ drain.
+async fn guarded<F: Future>(fut: F, timeout: Option<Duration>) -> Guarded<F::Output> {
+    let caught = AssertUnwindSafe(fut).catch_unwind();
+    let caught = match timeout {
+        Some(limit) => match tokio::time::timeout(limit, caught).await {
+            Ok(caught) => caught,
             Err(_) => return Guarded::TimedOut(limit),
         },
-        None => join.await,
+        None => caught.await,
     };
-    match joined {
+    match caught {
         Ok(output) => Guarded::Done(output),
-        Err(e) => Guarded::Panicked(e),
+        Err(payload) => Guarded::Panicked(panic_message(payload.as_ref())),
     }
 }
 
@@ -1044,29 +1065,29 @@ where
 ///
 /// The future runs under [`guarded`], so a panic inside the user's handler is
 /// caught there and surfaced as `Outcome::Retry` with metrics recorded.
-/// Without this, the spawned task would abort before the metric calls and
-/// panicked handlers would disappear from the consumed/latency series even
-/// though the caller still requeues them.
+/// Without this, the panic would unwind past the metric calls and panicked
+/// handlers would disappear from the consumed/latency series even though the
+/// caller still requeues them.
 async fn invoke_handler<F>(
     fut: F,
     timeout: Option<Duration>,
-    timeout_outcome: Option<Outcome>,
+    timeout_outcome: Option<&Outcome>,
     topic: &str,
     group: Option<&str>,
 ) -> Outcome
 where
-    F: Future<Output = Outcome> + Send + 'static,
+    F: Future<Output = Outcome>,
 {
     let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
     let outcome = match guarded(fut, timeout).await {
         Guarded::Done(outcome) => outcome,
-        Guarded::Panicked(e) => {
-            tracing::warn!(error = %e, "handler task panicked, retrying message");
+        Guarded::Panicked(message) => {
+            tracing::warn!(error = %message, "handler panicked, retrying message");
             Outcome::Retry
         }
         Guarded::TimedOut(limit) => {
-            let resolved = handler_timeout_outcome(timeout_outcome);
+            let resolved = handler_timeout_outcome(timeout_outcome.cloned());
             tracing::warn!(outcome = ?resolved, "handler timed out after {limit:?}");
             metrics::record_failed(topic, group, metrics::FailReason::Timeout);
             resolved
@@ -1266,6 +1287,110 @@ fn next_pause(backoff: &mut Backoff) -> Duration {
     backoff.next().unwrap_or(ENDED_PULL_PAUSE_MAX)
 }
 
+/// `None` when `shutdown` fires before `work` finishes.
+async fn unless_stopped<F: Future>(shutdown: &CancellationToken, work: F) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => None,
+        out = work => Some(out),
+    }
+}
+
+/// What a consumer does about a pull the server ended with a status.
+enum EndedPull {
+    /// The status clears on its own and the connection answered the probe:
+    /// pause this long before the next pull.
+    Pause(Duration),
+    /// The status, or the failed probe after it, is a connection error that
+    /// spends a reconnect attempt.
+    Fail(ShoveError),
+    /// A stop landed during the probe.
+    Stopped,
+}
+
+/// Judges `status`, which ended a pull of `consumer` on `queue`. One of the
+/// [`TRANSIENT_PULL_STATUSES`] gets a probe of the connection and the next
+/// pause of `backoff`, and any other status is a connection error. `kind`
+/// names the consumer in the error it logs and returns.
+async fn ended_pull(
+    consumer: &PullConsumer,
+    queue: &str,
+    kind: &str,
+    status: &async_nats::Error,
+    backoff: &mut Backoff,
+    shutdown: &CancellationToken,
+) -> EndedPull {
+    if !is_transient_pull_status(&status.to_string()) {
+        tracing::error!(error = %status, queue, "{kind} stream error");
+        metrics::record_backend_error(
+            metrics::BackendLabel::Nats,
+            metrics::BackendErrorKind::Consume,
+        );
+        return EndedPull::Fail(ShoveError::Connection(format!(
+            "{kind} stream error on {queue}: {status}"
+        )));
+    }
+    tracing::warn!(error = %status, queue, "the server ended a pull, probing the connection");
+    match unless_stopped(shutdown, consumer.get_info()).await {
+        None => EndedPull::Stopped,
+        Some(Ok(_)) => EndedPull::Pause(next_pause(backoff)),
+        Some(Err(probe_err)) => {
+            metrics::record_backend_error(
+                metrics::BackendLabel::Nats,
+                metrics::BackendErrorKind::Consume,
+            );
+            EndedPull::Fail(ShoveError::Connection(format!(
+                "a pull on {queue} ended with `{status}`, and the connection probe failed: {probe_err}"
+            )))
+        }
+    }
+}
+
+/// Watches a consumer's client for reconnects. The server may have lost the
+/// requests of the consumer's open pulls with the old connection, so a
+/// consumer drops its pulls on a reconnect and pulls again.
+struct ReconnectWatch {
+    changes: watch::Receiver<()>,
+    /// Cleared once the client is gone for good, which ends the watch.
+    watching: bool,
+    /// The connection the consumer's open pulls were sent on.
+    connection: u64,
+}
+
+impl ReconnectWatch {
+    fn new(client: &NatsClient) -> Self {
+        let mut changes = client.connection_changes();
+        changes.borrow_and_update();
+        Self {
+            changes,
+            watching: true,
+            connection: client.connections(),
+        }
+    }
+
+    /// The next change of the client's connection, never ready once the
+    /// client is gone for good. Cancel-safe.
+    async fn next_change(&mut self) {
+        if self.watching && self.changes.changed().await.is_ok() {
+            return;
+        }
+        self.watching = false;
+        std::future::pending().await
+    }
+
+    /// Whether `client` is on a new connection since the consumer's open
+    /// pulls were sent. If so, the pulls sent from now on are on it.
+    fn reconnected(&mut self, client: &NatsClient, queue: &str) -> bool {
+        let now = client.connections();
+        if now == self.connection {
+            return false;
+        }
+        self.connection = now;
+        tracing::info!(queue, "the client reconnected, pulling again");
+        true
+    }
+}
+
 /// One open pull of a worker.
 struct Pull {
     deliveries: Deliveries,
@@ -1336,16 +1461,17 @@ fn next_event(pulls: &mut Vec<Pull>) -> impl Future<Output = PullEvent> + '_ {
 #[allow(clippy::large_enum_variant)]
 enum Step {
     Stop,
-    /// The client connected again, or, when `false`, it is gone for good.
-    Connected(bool),
+    /// The client's connection changed.
+    Connected,
     Resume,
     Reserved(Result<Vec<OwnedSemaphorePermit>>),
     Event(PullEvent),
 }
 
-/// Waits out the pause before a worker's next pull, never ready without one.
-async fn pause_over(pause: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
-    match pause {
+/// Waits out `sleep`, such as the pause before a consumer's next pull, never
+/// ready without one.
+async fn sleep_over(sleep: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
+    match sleep {
         Some(sleep) => sleep.as_mut().await,
         None => std::future::pending().await,
     }
@@ -1417,6 +1543,29 @@ impl Drop for BusyTask {
     }
 }
 
+/// Waits, for at most [`EXIT_DRAIN_TIMEOUT`], for the tasks `busy` counts, when
+/// a consumer of `queue` leaves any other way than a stop, which has drained
+/// them already.
+async fn wait_for_busy_tasks(busy: &BusyTasks, queue: &str) {
+    let running = busy.running();
+    if running == 0 {
+        return;
+    }
+    tracing::info!(
+        queue,
+        running,
+        "the consumer is exiting, waiting for in-flight tasks"
+    );
+    if !busy.idle_within(EXIT_DRAIN_TIMEOUT).await {
+        tracing::warn!(
+            queue,
+            running = busy.running(),
+            timeout = ?EXIT_DRAIN_TIMEOUT,
+            "tasks were still running when the wait ended; each settles its message as it finishes"
+        );
+    }
+}
+
 /// Waits for a free processing slot, then takes every other free one: the
 /// slots the next pull is sized to and reserves for its messages.
 async fn reserve_free_slots(slots: &Arc<Semaphore>) -> Result<Vec<OwnedSemaphorePermit>> {
@@ -1483,15 +1632,6 @@ struct Worker<T: Topic, H: MessageHandler<T>> {
 }
 
 impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
-    /// `None` when shutdown fires before `work` finishes.
-    async fn unless_stopped<F: Future>(&self, work: F) -> Option<F::Output> {
-        tokio::select! {
-            biased;
-            _ = self.shutdown.cancelled() => None,
-            out = work => Some(out),
-        }
-    }
-
     /// Pulls and starts messages on `consumer` until shutdown, which releases
     /// what the worker pulled and never started ([`release_pulled`]) and waits
     /// for its tasks, or until the connection to the server fails.
@@ -1505,38 +1645,29 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
         let mut quiet_since = tokio::time::Instant::now();
         let mut pause: Option<Pin<Box<tokio::time::Sleep>>> = None;
         let mut pause_backoff = ended_pull_backoff();
-        let mut connected = self.client.connection_changes();
-        connected.borrow_and_update();
-        let mut connection = self.client.connections();
-        let mut watching = true;
+        let mut reconnects = ReconnectWatch::new(&self.client);
         loop {
             let may_pull = pulls.len() < MAX_OPEN_PULLS && pause.is_none();
             let step = tokio::select! {
                 biased;
                 _ = self.shutdown.cancelled() => Step::Stop,
-                changed = connected.changed(), if watching => Step::Connected(changed.is_ok()),
-                () = pause_over(&mut pause), if pause.is_some() => Step::Resume,
+                () = reconnects.next_change() => Step::Connected,
+                () = sleep_over(&mut pause), if pause.is_some() => Step::Resume,
                 reserved = reserve_free_slots(&self.slots), if may_pull => Step::Reserved(reserved),
                 event = next_event(&mut pulls), if !pulls.is_empty() => Step::Event(event),
             };
             match step {
                 Step::Stop => return self.stop(consumer, pulls).await,
-                Step::Connected(false) => watching = false,
-                Step::Connected(true) => {
-                    let now = self.client.connections();
-                    if now == connection {
+                Step::Connected => {
+                    if !reconnects.reconnected(&self.client, queue) {
                         continue;
                     }
-                    connection = now;
-                    // The server may have lost these pulls' requests with the old connection.
-                    tracing::info!(queue, "the client reconnected, pulling again");
                     for (msg, slot) in take_ready(&mut pulls) {
                         self.start(msg, slot, ack_wait);
                     }
                     pulls.clear();
                     pause = None;
-                    if self
-                        .unless_stopped(sweep_waiting_list(consumer))
+                    if unless_stopped(&self.shutdown, sweep_waiting_list(consumer))
                         .await
                         .is_none()
                     {
@@ -1552,7 +1683,7 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                         .max_messages(reserved.len())
                         .expires(PULL_EXPIRES)
                         .messages();
-                    let Some(batch) = self.unless_stopped(request).await else {
+                    let Some(batch) = unless_stopped(&self.shutdown, request).await else {
                         drop(reserved);
                         return self.stop(consumer, pulls).await;
                     };
@@ -1567,31 +1698,23 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                     self.start(msg, slot, ack_wait);
                 }
                 Step::Event(PullEvent::Delivery(Err(e), _)) => {
-                    if !is_transient_pull_status(&e.to_string()) {
-                        tracing::error!(error = %e, queue, "consumer stream error");
-                        metrics::record_backend_error(
-                            metrics::BackendLabel::Nats,
-                            metrics::BackendErrorKind::Consume,
-                        );
-                        return Err(ShoveError::Connection(format!(
-                            "consumer stream error on {queue}: {e}"
-                        )));
+                    let ended = ended_pull(
+                        consumer,
+                        queue,
+                        "consumer",
+                        &e,
+                        &mut pause_backoff,
+                        &self.shutdown,
+                    )
+                    .await;
+                    match ended {
+                        EndedPull::Pause(delay) => {
+                            quiet_since = tokio::time::Instant::now();
+                            pause = Some(Box::pin(tokio::time::sleep(delay)));
+                        }
+                        EndedPull::Fail(failure) => return Err(failure),
+                        EndedPull::Stopped => return self.stop(consumer, pulls).await,
                     }
-                    tracing::warn!(error = %e, queue, "the server ended a pull, probing the connection");
-                    let Some(probe) = self.unless_stopped(consumer.get_info()).await else {
-                        return self.stop(consumer, pulls).await;
-                    };
-                    if let Err(probe_err) = probe {
-                        metrics::record_backend_error(
-                            metrics::BackendLabel::Nats,
-                            metrics::BackendErrorKind::Consume,
-                        );
-                        return Err(ShoveError::Connection(format!(
-                            "a pull on {queue} ended with `{e}`, and the connection probe failed: {probe_err}"
-                        )));
-                    }
-                    quiet_since = tokio::time::Instant::now();
-                    pause = Some(Box::pin(tokio::time::sleep(next_pause(&mut pause_backoff))));
                 }
                 Step::Event(PullEvent::Ended { delivered }) => {
                     if delivered {
@@ -1601,7 +1724,8 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                     if quiet_since.elapsed() < PULL_EXPIRES {
                         continue;
                     }
-                    let Some(probe) = self.unless_stopped(consumer.get_info()).await else {
+                    let Some(probe) = unless_stopped(&self.shutdown, consumer.get_info()).await
+                    else {
                         return self.stop(consumer, pulls).await;
                     };
                     probe.map_err(|e| {
@@ -1653,24 +1777,7 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
     /// started, when the consumer leaves any other way than a stop, which has
     /// drained them already.
     async fn drain_on_exit(&self) {
-        let running = self.busy.running();
-        if running == 0 {
-            return;
-        }
-        let queue = self.topology.queue();
-        tracing::info!(
-            queue,
-            running,
-            "the consumer is exiting, waiting for in-flight tasks"
-        );
-        if !self.busy.idle_within(EXIT_DRAIN_TIMEOUT).await {
-            tracing::warn!(
-                queue,
-                running = self.busy.running(),
-                timeout = ?EXIT_DRAIN_TIMEOUT,
-                "tasks were still running when the wait ended; each settles its message as it finishes"
-            );
-        }
+        wait_for_busy_tasks(&self.busy, self.topology.queue()).await;
     }
 
     /// Size-checks and decodes `msg`, runs the handler on it and settles its
@@ -1714,11 +1821,10 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
         }
         let retry_count = metadata.retry_count;
 
-        let worker = Arc::clone(&self);
         let outcome = invoke_handler(
-            async move { worker.handler.handle(payload, metadata, &worker.ctx).await },
+            async { self.handler.handle(payload, metadata, &self.ctx).await },
             self.handler_timeout,
-            self.timeout_outcome.clone(),
+            self.timeout_outcome.as_ref(),
             queue,
             group,
         )
@@ -1876,10 +1982,12 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
         if let Ok(hold) = self.holds.try_acquire() {
             return Some(hold);
         }
-        let hold = self
-            .unless_stopped(renewing(msg, ack_wait, self.holds.acquire()))
-            .await?
-            .ok()?;
+        let hold = unless_stopped(
+            &self.shutdown,
+            renewing(msg, ack_wait, self.holds.acquire()),
+        )
+        .await?
+        .ok()?;
         if let Err(e) = msg.ack_with(AckKind::Progress).await {
             tracing::warn!(error = %e, "failed to renew the ack_wait of a retry that waited for a hold slot");
         }
@@ -2573,14 +2681,8 @@ impl NatsConsumer {
                         };
 
                     let metadata = extract_dead_metadata(&msg);
-                    let dead_handler = Arc::clone(&handler);
-                    let dead_ctx = Arc::clone(&ctx);
                     let call = guarded(
-                        async move {
-                            dead_handler
-                                .handle_dead(payload, metadata, dead_ctx.as_ref())
-                                .await;
-                        },
+                        async { handler.handle_dead(payload, metadata, ctx.as_ref()).await },
                         handler_timeout,
                     )
                     .await;
@@ -2617,6 +2719,15 @@ impl NatsConsumer {
 /// single-path derivation ([`derive_ack_wait`]: 3x the handler timeout,
 /// floored at the JetStream default) under-covers a batch: the pull window is
 /// added on top.
+///
+/// The batch read ahead also waits out the flush in progress: its handler,
+/// the dead-letter publishes of a rejected batch, or the pause before a batch
+/// handed back is redelivered. While it waits, the consumer renews the
+/// `ack_wait` of each of its messages with a progress ack every
+/// [`progress_interval`], so that wait needs no margin of its own. A message
+/// read ahead goes without a renewal for at most the longer of the window and
+/// one interval, a third of the `ack_wait`, before its own flush starts, and
+/// the margin covers that flush.
 ///
 /// `handler_timeout: None`
 /// ([`BatchConsumerOptions::without_handler_timeout`](crate::BatchConsumerOptions::without_handler_timeout))
@@ -2668,29 +2779,44 @@ fn empty_windows_before_probe(max_batch_age: Duration) -> u32 {
 /// that window small without turning a reject into a thundering herd.
 const REJECT_SETTLE_CONCURRENCY: usize = 16;
 
-/// Everything a batch settle arm needs, bundled so the helpers stay at sane
-/// arities — the same shape as Kafka's `BatchFlushCtx`.
-struct NatsBatchCtx<'a> {
-    client: &'a NatsClient,
+/// How many pre-handler drops, oversized or undecodable messages, settle in
+/// the background at once. The ones beyond that wait for a slot in the order
+/// they came, and the intake sends no further pull while any wait, so they
+/// never exceed what one pull delivers.
+const POISON_SETTLE_CONCURRENCY: usize = 16;
+
+/// Everything a batch settle arm needs, owned so a settlement spawned for a
+/// message can carry it.
+struct NatsBatchCtx {
+    client: NatsClient,
     topology: &'static QueueTopology,
-    topic: &'a str,
-    group: Option<&'a str>,
+    topic: Arc<str>,
+    group: Option<Arc<str>>,
+    /// The attached durable's `ack_wait`, which paces the progress acks of a
+    /// dead-letter publish.
+    ack_wait: Duration,
+}
+
+/// What the pre-handler intake made of one pulled message.
+enum Ingested<T: Topic> {
+    /// Decoded, ready for the batch.
+    Message(T::Message, MessageMetadata, Message),
+    /// Oversized or undecodable, for the DLQ with this reason. The failure is
+    /// already counted.
+    Poison(Message, String),
 }
 
 /// Pre-handler intake for one pulled message: size-gate, decode, extract
-/// metadata. Poison (oversized or undecodable) is settled immediately —
-/// `record_failed` + DLQ publish + ack, with a Nak if the publish fails —
-/// exactly like the single-message path's pre-handler arms. Immediate
-/// settlement is safe here where Kafka has to defer its poison DLQ publishes
-/// to the commit: acks are per message, so a later batch redelivery can never
-/// replay a message that was individually acked, and the DLQ cannot collect
-/// duplicate copies of it.
-async fn ingest_batch_message<T: Topic>(
-    ctx: &NatsBatchCtx<'_>,
+/// metadata. Poison (oversized or undecodable) is counted with `record_failed`
+/// here and handed back for [`settle_poison`], which runs in the background so
+/// a slow dead-letter publish cannot hold the receive loop.
+fn ingest_batch_message<T: Topic>(
+    ctx: &NatsBatchCtx,
     msg: Message,
     max_message_size: Option<usize>,
-) -> Option<(T::Message, MessageMetadata, Message)> {
-    metrics::record_message_size(ctx.topic, ctx.group, msg.payload.len());
+) -> Ingested<T> {
+    let group = ctx.group.as_deref();
+    metrics::record_message_size(&ctx.topic, group, msg.payload.len());
 
     if let Err(e) = validate_message_size(msg.payload.len(), max_message_size) {
         tracing::warn!(
@@ -2698,9 +2824,8 @@ async fn ingest_batch_message<T: Topic>(
             queue = ctx.topology.queue(),
             "oversized message dropped from the batch, rejecting to DLQ"
         );
-        metrics::record_failed(ctx.topic, ctx.group, metrics::FailReason::Oversize);
-        settle_poison(ctx, &msg, &e.to_string()).await;
-        return None;
+        metrics::record_failed(&ctx.topic, group, metrics::FailReason::Oversize);
+        return Ingested::Poison(msg, e.to_string());
     }
 
     let payload: T::Message =
@@ -2712,23 +2837,27 @@ async fn ingest_batch_message<T: Topic>(
                     queue = ctx.topology.queue(),
                     "failed to deserialize message, dropped from the batch and sent to DLQ"
                 );
-                metrics::record_failed(ctx.topic, ctx.group, metrics::FailReason::Deserialize);
-                settle_poison(ctx, &msg, "deserialization_error").await;
-                return None;
+                metrics::record_failed(&ctx.topic, group, metrics::FailReason::Deserialize);
+                return Ingested::Poison(msg, "deserialization_error".to_string());
             }
         };
 
     let metadata = extract_message_metadata(&msg);
-    Some((payload, metadata, msg))
+    Ingested::Message(payload, metadata, msg)
 }
 
 /// Retire one pre-handler drop: DLQ publish then ack, Nak for redelivery if
 /// the publish fails. Mirrors the single-message path's oversize/deserialize
-/// arms; like them it does no terminal accounting (`record_failed` already
-/// counted the drop, and pre-handler drops are not part of the
-/// terminal-discard contract on any backend).
-async fn settle_poison(ctx: &NatsBatchCtx<'_>, msg: &Message, reason: &str) {
-    if let Err(dlq_err) = publish_to_dlq(ctx.client, ctx.topology, msg, reason).await {
+/// arms, progress acks included while the publish runs. Like them it counts
+/// only the failure `record_failed` already recorded, no discard: the NATS
+/// consume paths do not yet settle a discard for a pre-handler drop, as the
+/// completeness statement on `metrics::record_terminal` lists, so
+/// `messages_discarded_total` is a lower bound here. Acks are per message, so
+/// a later batch redelivery can never replay a message that was individually
+/// acked, and the DLQ cannot collect duplicate copies of it.
+async fn settle_poison(ctx: &NatsBatchCtx, msg: &Message, reason: &str) {
+    let dead_letter = publish_to_dlq(&ctx.client, ctx.topology, msg, reason);
+    if let Err(dlq_err) = renewing(msg, ctx.ack_wait, dead_letter).await {
         tracing::error!(
             error = %dlq_err,
             "failed to publish poison batch message to DLQ, nak-ing"
@@ -2767,18 +2896,17 @@ async fn ack_batch(acks: &[Message]) {
 /// remainder un-acked, and JetStream redelivers them on `ack_wait` expiry —
 /// no message can be left in limbo. Settlement runs at
 /// [`REJECT_SETTLE_CONCURRENCY`] to bound how long a large batch's tail
-/// stays un-acked behind the sequential publish+confirm round trips.
-async fn settle_reject_batch(ctx: &NatsBatchCtx<'_>, acks: &[Message]) {
+/// stays un-acked behind the sequential publish+confirm round trips, and a
+/// message whose publish outlasts its `ack_wait` gets progress acks meanwhile.
+async fn settle_reject_batch(ctx: &NatsBatchCtx, acks: &[Message]) {
     let has_dlq = ctx.topology.dlq().is_some();
+    let group = ctx.group.as_deref();
     stream::iter(acks.iter())
         .for_each_concurrent(REJECT_SETTLE_CONCURRENCY, |msg| async move {
-            let pending = metrics::record_terminal(
-                ctx.topic,
-                ctx.group,
-                metrics::FailReason::Rejected,
-                has_dlq,
-            );
-            match publish_to_dlq(ctx.client, ctx.topology, msg, "rejected").await {
+            let pending =
+                metrics::record_terminal(&ctx.topic, group, metrics::FailReason::Rejected, has_dlq);
+            let dead_letter = publish_to_dlq(&ctx.client, ctx.topology, msg, "rejected");
+            match renewing(msg, ctx.ack_wait, dead_letter).await {
                 Ok(()) => match msg.double_ack().await {
                     Ok(()) => pending.confirm(),
                     Err(e) => {
@@ -2821,6 +2949,754 @@ async fn nak_batch(acks: &[Message], delay: Option<Duration>) {
     }
 }
 
+/// The messages of one batch as the intake collects them.
+struct Forming<T: Topic> {
+    messages: Vec<(T::Message, MessageMetadata)>,
+    acks: Vec<Message>,
+}
+
+impl<T: Topic> Forming<T> {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            messages: Vec::with_capacity(capacity),
+            acks: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.acks.is_empty()
+    }
+}
+
+/// A pre-handler drop that waits for a slot to settle in.
+struct Poison {
+    msg: Message,
+    reason: String,
+}
+
+/// What [`BatchIntake::next_event`] reports.
+// Never stored, so boxing would only add an allocation per message.
+#[allow(clippy::large_enum_variant)]
+enum IntakeEvent {
+    /// The client's connection changed.
+    Connected,
+    /// The pause after a refused pull is over.
+    Resume,
+    /// The batch read ahead is due a renewal of its `ack_wait`.
+    Renew,
+    /// A slot for the first of the poison messages that wait for one.
+    Permit(std::result::Result<OwnedSemaphorePermit, AcquireError>),
+    /// A message, the status the server ended the pull with, or the end of
+    /// the pull.
+    Item(Option<std::result::Result<Message, async_nats::Error>>),
+}
+
+/// A future that resolves with the next slot of `slots`.
+async fn wait_for_slot(
+    slots: &Arc<Semaphore>,
+) -> std::result::Result<OwnedSemaphorePermit, AcquireError> {
+    Arc::clone(slots).acquire_owned().await
+}
+
+/// The next item of `pull`, never ready without one.
+async fn next_item(
+    pull: &mut Option<Batch>,
+) -> Option<std::result::Result<Message, async_nats::Error>> {
+    match pull {
+        Some(pull) => pull.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The flush in progress, as a task of its own. It is aborted along with a
+/// consumer that is dropped, so no handler call outlives its consumer.
+struct Flushing {
+    task: tokio::task::JoinHandle<Backoff>,
+    _abort: AbortOnDrop,
+}
+
+/// The end of the flush in progress, never ready without one.
+async fn flush_end(
+    flush: &mut Option<Flushing>,
+) -> std::result::Result<Backoff, tokio::task::JoinError> {
+    match flush {
+        Some(flushing) => (&mut flushing.task).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The receive side of a batch consumer's attach to its durable: the one pull
+/// it keeps open, the batch that pull is filling, and what to do about a stop,
+/// a reconnect and a pull the server ends with a status.
+///
+/// The intake never waits on a flush, which runs in a task of its own, so it
+/// goes on reading while one runs, and renews the `ack_wait` of the batch it
+/// reads ahead meanwhile. It never waits on a settlement either, so the pull
+/// is read as fast as it delivers.
+struct BatchIntake<T: Topic> {
+    consumer: PullConsumer,
+    ctx: Arc<NatsBatchCtx>,
+    queue: &'static str,
+    size: usize,
+    max_batch_age: Duration,
+    max_message_size: Option<usize>,
+    probe_after: u32,
+    shutdown: CancellationToken,
+    poison_slots: Arc<Semaphore>,
+    poison_tasks: Arc<BusyTasks>,
+    reconnects: ReconnectWatch,
+    /// The pull that is filling `forming`. None before the first request, in
+    /// the pause after a refused one, and once the pull is over.
+    pull: Option<Batch>,
+    /// Whether the pull in hand has delivered a message.
+    got_message: bool,
+    forming: Forming<T>,
+    /// The poison messages not yet settling, for want of a slot.
+    waiting: VecDeque<Poison>,
+    pause: Option<Pin<Box<tokio::time::Sleep>>>,
+    pause_backoff: Backoff,
+    /// When the batch read ahead is next renewed. Set while a flush is in
+    /// progress.
+    renew: Option<Pin<Box<tokio::time::Sleep>>>,
+    empty_windows: u32,
+    stopping: bool,
+    failure: Option<ShoveError>,
+}
+
+impl<T: Topic> BatchIntake<T> {
+    /// Whether the consumer has stopped reading: told to stop, or failed.
+    fn halted(&self) -> bool {
+        self.stopping || self.failure.is_some()
+    }
+
+    /// Whether to send the next pull request: none is open, the batch it would
+    /// fill has been taken for a flush, and nothing holds the intake back.
+    fn wants_pull(&self) -> bool {
+        self.pull.is_none()
+            && self.forming.is_empty()
+            && self.waiting.is_empty()
+            && self.pause.is_none()
+            && !self.halted()
+            && !self.shutdown.is_cancelled()
+    }
+
+    /// Whether the batch in hand can flush: its pull is over, whether it
+    /// filled, expired, was ended by a status or was lost with a connection.
+    fn batch_ready(&self) -> bool {
+        !self.forming.is_empty() && self.pull.is_none()
+    }
+
+    /// Whether the intake has nothing left to settle once the flush ends.
+    fn done(&self) -> bool {
+        self.halted() && self.forming.is_empty() && self.waiting.is_empty()
+    }
+
+    /// Whether the consumer was told to stop and the intake has not stopped
+    /// yet.
+    fn stop_pending(&self) -> bool {
+        !self.stopping && self.shutdown.is_cancelled()
+    }
+
+    fn take_batch(&mut self) -> (Vec<(T::Message, MessageMetadata)>, Vec<Message>) {
+        let next = Forming::with_capacity(self.size.min(PREALLOC_CAP));
+        let batch = std::mem::replace(&mut self.forming, next);
+        (batch.messages, batch.acks)
+    }
+
+    /// Sends the request for the next batch. A request that cannot be sent
+    /// fails the consumer.
+    async fn open_pull(&mut self) {
+        let request = self
+            .consumer
+            .batch()
+            .max_messages(self.size)
+            .expires(self.max_batch_age)
+            .messages();
+        let Some(requested) = unless_stopped(&self.shutdown, request).await else {
+            return;
+        };
+        match requested {
+            Ok(pull) => {
+                self.pull = Some(pull);
+                self.got_message = false;
+            }
+            Err(e) => {
+                let queue = self.queue;
+                self.fail(ShoveError::Connection(format!(
+                    "batch pull request on {queue} failed: {e}"
+                )))
+                .await;
+            }
+        }
+    }
+
+    /// The next thing to react to other than a stop, which the caller
+    /// watches for. Cancel-safe: whatever it drops by being dropped is still
+    /// there to read.
+    async fn next_event(&mut self) -> IntakeEvent {
+        let halted = self.halted();
+        tokio::select! {
+            biased;
+            () = self.reconnects.next_change(), if !halted => IntakeEvent::Connected,
+            () = sleep_over(&mut self.pause), if self.pause.is_some() && !halted => {
+                IntakeEvent::Resume
+            }
+            () = sleep_over(&mut self.renew), if self.renew.is_some() && !halted => {
+                IntakeEvent::Renew
+            }
+            permit = wait_for_slot(&self.poison_slots), if !self.waiting.is_empty() => {
+                IntakeEvent::Permit(permit)
+            }
+            item = next_item(&mut self.pull), if self.pull.is_some() && !halted => {
+                IntakeEvent::Item(item)
+            }
+            else => std::future::pending().await,
+        }
+    }
+
+    /// Reacts to `event`.
+    async fn on_event(&mut self, event: IntakeEvent) {
+        match event {
+            IntakeEvent::Connected => self.on_reconnect().await,
+            IntakeEvent::Resume => self.pause = None,
+            IntakeEvent::Renew => self.renew_read_ahead().await,
+            IntakeEvent::Permit(Ok(slot)) => {
+                if let Some(Poison { msg, reason }) = self.waiting.pop_front() {
+                    self.settle_in_background(msg, reason, slot);
+                }
+                self.settle_waiting();
+            }
+            IntakeEvent::Permit(Err(_)) => {
+                self.fail(ShoveError::Connection("semaphore closed".to_string()))
+                    .await;
+            }
+            IntakeEvent::Item(Some(Ok(msg))) => {
+                self.got_message = true;
+                self.pause_backoff = ended_pull_backoff();
+                self.on_message(msg);
+            }
+            IntakeEvent::Item(Some(Err(status))) => self.on_status(status).await,
+            IntakeEvent::Item(None) => self.on_end().await,
+        }
+    }
+
+    fn on_message(&mut self, msg: Message) {
+        match ingest_batch_message::<T>(&self.ctx, msg, self.max_message_size) {
+            Ingested::Message(payload, metadata, msg) => {
+                self.forming.messages.push((payload, metadata));
+                self.forming.acks.push(msg);
+            }
+            Ingested::Poison(msg, reason) => {
+                self.waiting.push_back(Poison { msg, reason });
+                self.settle_waiting();
+            }
+        }
+    }
+
+    /// Starts settling the waiting poison messages, in order, for as long as
+    /// there are slots free.
+    fn settle_waiting(&mut self) {
+        while !self.waiting.is_empty() {
+            let Ok(slot) = Arc::clone(&self.poison_slots).try_acquire_owned() else {
+                return;
+            };
+            if let Some(Poison { msg, reason }) = self.waiting.pop_front() {
+                self.settle_in_background(msg, reason, slot);
+            }
+        }
+    }
+
+    /// Settles a pre-handler drop in a task of its own, holding `slot` until
+    /// it is done. The dead letter is published first and the message acked
+    /// after it.
+    fn settle_in_background(&self, msg: Message, reason: String, slot: OwnedSemaphorePermit) {
+        let ctx = Arc::clone(&self.ctx);
+        let busy = self.poison_tasks.enter();
+        tokio::spawn(async move {
+            settle_poison(&ctx, &msg, &reason).await;
+            drop((slot, busy));
+        });
+    }
+
+    /// Schedules the next renewal of the batch read ahead a
+    /// [`progress_interval`] from now. Called as a flush starts.
+    fn renew_later(&mut self) {
+        let interval = progress_interval(self.ctx.ack_wait);
+        self.renew = Some(Box::pin(tokio::time::sleep(interval)));
+    }
+
+    /// Renews, with a progress ack, the `ack_wait` of every message of the
+    /// batch read ahead, which waits out the flush in progress before its own
+    /// flush, then schedules the next renewal.
+    ///
+    /// The renewals go on until the consumer stops, so a flush that never
+    /// ends keeps the batch read ahead with this consumer: one with no
+    /// handler timeout and a handler that never returns, or, on a
+    /// multi-threaded runtime, one whose handler holds its thread. A stop
+    /// releases the batch.
+    async fn renew_read_ahead(&mut self) {
+        let renewals = async {
+            for msg in &self.forming.acks {
+                if let Err(e) = msg.ack_with(AckKind::Progress).await {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to renew the ack_wait of a message read ahead"
+                    );
+                }
+            }
+        };
+        // A publish can block while the client reconnects.
+        unless_stopped(&self.shutdown, renewals).await;
+        self.renew_later();
+    }
+
+    /// The pull is over: it filled, or its window expired.
+    async fn on_end(&mut self) {
+        self.pull = None;
+        if self.got_message {
+            self.empty_windows = 0;
+            return;
+        }
+        // A silent outage ends windows exactly like an idle topic — see
+        // `empty_windows_before_probe`.
+        self.empty_windows = self.empty_windows.saturating_add(1);
+        if self.empty_windows < self.probe_after {
+            return;
+        }
+        match unless_stopped(&self.shutdown, self.consumer.get_info()).await {
+            None => {}
+            Some(Ok(_)) => self.empty_windows = 0,
+            Some(Err(e)) => {
+                let queue = self.queue;
+                self.fail(ShoveError::Connection(format!(
+                    "batch liveness probe on {queue} failed: {e}"
+                )))
+                .await;
+            }
+        }
+    }
+
+    /// The server ended the pull with a status. A full waiting list or a
+    /// leader change clears on its own: the connection is probed, and a pause
+    /// precedes the next pull. Any other status is a connection error that
+    /// spends a reconnect attempt.
+    async fn on_status(&mut self, status: async_nats::Error) {
+        self.pull = None;
+        let ended = ended_pull(
+            &self.consumer,
+            self.queue,
+            "batch pull",
+            &status,
+            &mut self.pause_backoff,
+            &self.shutdown,
+        )
+        .await;
+        match ended {
+            EndedPull::Pause(delay) => {
+                self.empty_windows = 0;
+                self.pause = Some(Box::pin(tokio::time::sleep(delay)));
+            }
+            EndedPull::Fail(failure) => self.fail(failure).await,
+            EndedPull::Stopped => {}
+        }
+    }
+
+    /// The client connected again. The server may have lost the open pull's
+    /// request with the old connection, so the messages it had delivered go
+    /// into the batch in hand and the pull is dropped. The next pull goes out
+    /// as after any pull ([`wants_pull`](Self::wants_pull)): at once if the
+    /// batch in hand is empty and no poison message waits for a settle slot,
+    /// and otherwise once that batch has started its flush and every waiting
+    /// poison message has a slot.
+    async fn on_reconnect(&mut self) {
+        if !self.reconnects.reconnected(&self.ctx.client, self.queue) {
+            return;
+        }
+        if let Some(mut stale) = self.pull.take() {
+            while let Some(Some(Ok(msg))) = stale.next().now_or_never() {
+                self.on_message(msg);
+            }
+        }
+        self.pause = None;
+        self.empty_windows = 0;
+        unless_stopped(&self.shutdown, sweep_waiting_list(&self.consumer)).await;
+    }
+
+    /// Stops reading. The batch in hand is left to flush, unless a flush is in
+    /// progress, which would delay the stop by a second one: then it is handed
+    /// back with the rest ([`release_pulled`]). The durable's waiting list is
+    /// swept whatever the intake still holds, as a concurrent worker's stop
+    /// sweeps it, so no pull request the intake sent outlives the stop there.
+    async fn stop(&mut self, flushing: bool) {
+        self.stopping = true;
+        let unstarted = self.take_unstarted(flushing);
+        release_pulled(&self.consumer, &unstarted).await;
+    }
+
+    /// Stops reading and keeps the first failure. What the intake holds goes
+    /// back to the server ([`release_pulled`]), which sweeps the waiting list
+    /// when there was a pull to drop.
+    async fn fail(&mut self, failure: ShoveError) {
+        self.failure.get_or_insert(failure);
+        let had_pull = self.pull.is_some();
+        let unstarted = self.take_unstarted(true);
+        if had_pull || !unstarted.is_empty() {
+            release_pulled(&self.consumer, &unstarted).await;
+        }
+    }
+
+    /// Takes what the intake has not started, to hand back to the server with
+    /// a nak and no delay: what its pull delivered and nobody read, the poison
+    /// messages waiting for a slot, and, with `with_batch`, the batch in hand.
+    /// The pull is dropped.
+    fn take_unstarted(&mut self, with_batch: bool) -> Vec<Message> {
+        let mut unstarted = Vec::new();
+        if let Some(mut pull) = self.pull.take() {
+            while let Some(Some(Ok(msg))) = pull.next().now_or_never() {
+                unstarted.push(msg);
+            }
+        }
+        unstarted.extend(self.waiting.drain(..).map(|poison| poison.msg));
+        if with_batch {
+            unstarted.append(&mut self.forming.acks);
+            self.forming.messages.clear();
+        }
+        unstarted
+    }
+}
+
+/// What a batch consumer shares across the attaches of one run.
+struct BatchRun<T: NotSequenced, H: BatchMessageHandler<T>> {
+    client: NatsClient,
+    topology: &'static QueueTopology,
+    consumer_name: String,
+    handler: H,
+    hctx: H::Context,
+    topic: Arc<str>,
+    group: Option<Arc<str>>,
+    max_batch_size: usize,
+    max_batch_age: Duration,
+    handler_timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
+    max_message_size: Option<usize>,
+    batch_ack_wait: Duration,
+    probe_after: u32,
+    shutdown: CancellationToken,
+    poison_slots: Arc<Semaphore>,
+    poison_tasks: Arc<BusyTasks>,
+    _topic: PhantomData<fn() -> T>,
+}
+
+impl<T: NotSequenced, H: BatchMessageHandler<T>> BatchRun<T, H> {
+    /// Binds to the topic's durable, creating it only when nothing declared
+    /// it, and warns about whatever would hold the flushes back. Returns the
+    /// consumer, the per-pull batch size and the durable's `ack_wait`.
+    async fn attach(&self) -> Result<(PullConsumer, usize, Duration)> {
+        let queue = self.topology.queue();
+        let consumer_name = self.consumer_name.as_str();
+        let max_batch_size = self.max_batch_size;
+        let stream = self
+            .client
+            .jetstream()
+            .get_stream(queue)
+            .await
+            .map_err(|e| map_get_stream_error(queue, e))?;
+
+        // Same fast-path/fallback split as `run_with_inner`: attach to the
+        // pre-declared durable, and only bootstrap one (NotFound alone) with
+        // batch-derived config when nothing declared it.
+        let pull_consumer = match stream
+            .get_consumer::<PullConsumerConfig>(consumer_name)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let is_not_found = e
+                    .downcast_ref::<ConsumerInfoError>()
+                    .is_some_and(|ce| matches!(ce.kind(), ConsumerInfoErrorKind::NotFound));
+                if !is_not_found {
+                    return Err(ShoveError::Connection(format!(
+                        "get_consumer({consumer_name}) failed: {e}"
+                    )));
+                }
+                stream
+                    .create_consumer(PullConsumerConfig {
+                        durable_name: Some(consumer_name.to_string()),
+                        ack_policy: AckPolicy::Explicit,
+                        // Unbounded on purpose — see the doc block of
+                        // `run_batch_inner`: a finite budget is split across
+                        // every attached worker's pull requests, and a request
+                        // that cannot fill to `max_messages` waits out the
+                        // whole `expires` window even when the stream has
+                        // supply. Flight stays bounded by the pull requests
+                        // themselves (≤ two batches per worker).
+                        max_ack_pending: UNBOUNDED_ACK_PENDING,
+                        ack_wait: self.batch_ack_wait,
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|e| {
+                        ShoveError::Connection(format!(
+                            "create_consumer({consumer_name}) fallback failed: {e}"
+                        ))
+                    })?
+            }
+        };
+
+        let (budget, ack_wait) = {
+            let config = &pull_consumer.cached_info().config;
+            (config.max_ack_pending, config.ack_wait)
+        };
+        let effective_batch_size = match usize::try_from(budget) {
+            Ok(b) if b > 0 && b < max_batch_size => {
+                tracing::warn!(
+                    queue,
+                    max_batch_size,
+                    max_ack_pending = budget,
+                    "clamping the per-pull batch size to the consumer's \
+                     max_ack_pending — a batch larger than the unacked budget \
+                     can never fill, and every flush would wait out the full \
+                     window; the budget is shared by every attached worker, and \
+                     a worker holds up to two batches, the one flushing and the \
+                     one read ahead, so size it at 2 x max_batch_size x workers \
+                     to keep flushes supply-bound rather than expiry-bound, or \
+                     lift it in place with `nats consumer edit {queue} \
+                     {consumer_name} --max-pending=-1`"
+                );
+                b
+            }
+            Ok(b) if b >= max_batch_size && b < max_batch_size.saturating_mul(2) => {
+                // The band is `[size, 2*size)` because that is where the batch
+                // read ahead provably cannot fill beside the batch in flush,
+                // and where a *second* worker cannot fill either: each needs
+                // 2*size of budget between its two batches. It also catches
+                // the durable this bootstrap wrote before it went unbounded
+                // (exactly one batch of budget, which persists server-side
+                // across an upgrade). A budget at or above 2*size is left
+                // alone even though it is still too small for enough workers
+                // — the consumer cannot know how many will attach, so the
+                // warning names the rule instead of guessing the count.
+                tracing::warn!(
+                    queue,
+                    max_batch_size,
+                    max_ack_pending = budget,
+                    "the durable's max_ack_pending covers only a single batch, and \
+                     it is shared by every attached worker: a worker reads the \
+                     next batch while it flushes the previous one, so the batch \
+                     read ahead cannot fill until the flush acks, and a second \
+                     worker's concurrent pull splits the budget so neither can \
+                     fill and both flushes go expiry-bound. Size the budget at \
+                     2 x max_batch_size x workers, or lift it in place with \
+                     `nats consumer edit {queue} {consumer_name} --max-pending=-1`"
+                );
+                max_batch_size
+            }
+            // Zero/negative budget means unbounded, and a budget at or above
+            // twice the batch size fits a flush and the batch read ahead, so
+            // it needs no clamp and no warning.
+            _ => max_batch_size,
+        };
+        if !ack_wait.is_zero() && ack_wait < self.batch_ack_wait {
+            tracing::warn!(
+                queue,
+                ?ack_wait,
+                required = ?self.batch_ack_wait,
+                "consumer ack_wait is below the batch window plus the \
+                 handler-timeout margin; a slow flush risks mid-flight \
+                 redelivery (duplicates, never loss)"
+            );
+        }
+        Ok((pull_consumer, effective_batch_size, ack_wait))
+    }
+
+    /// One attach to the durable, from its binding to the stop or the
+    /// failure that ends it.
+    async fn run_attached(self: &Arc<Self>) -> Result<()> {
+        let (consumer, size, ack_wait) = self.attach().await?;
+        let queue = self.topology.queue();
+        let reconnects = ReconnectWatch::new(&self.client);
+        let mut intake = BatchIntake::<T> {
+            consumer,
+            ctx: Arc::new(NatsBatchCtx {
+                client: self.client.clone(),
+                topology: self.topology,
+                topic: Arc::clone(&self.topic),
+                group: self.group.clone(),
+                ack_wait,
+            }),
+            queue,
+            size,
+            max_batch_age: self.max_batch_age,
+            max_message_size: self.max_message_size,
+            probe_after: self.probe_after,
+            shutdown: self.shutdown.clone(),
+            poison_slots: Arc::clone(&self.poison_slots),
+            poison_tasks: Arc::clone(&self.poison_tasks),
+            reconnects,
+            pull: None,
+            got_message: false,
+            forming: Forming::with_capacity(size.min(PREALLOC_CAP)),
+            waiting: VecDeque::new(),
+            pause: None,
+            pause_backoff: ended_pull_backoff(),
+            renew: None,
+            empty_windows: 0,
+            stopping: false,
+            failure: None,
+        };
+        let result = self.drive(&mut intake).await;
+        if result.is_ok() {
+            tracing::info!(queue, "shutdown signal received, batch consumer stopped");
+        }
+        result
+    }
+
+    /// Reads batches and flushes them, one flush at a time, until a stop or a
+    /// failure. The pull for the next batch is sent as the previous batch
+    /// starts to flush, so the next batch is read, and decoded, while the
+    /// flush runs, and is complete by the time the flush ends. That pull is
+    /// the one the consumer keeps outstanding; the following pull waits for
+    /// the batch read ahead to start its own flush, so at most two batches are
+    /// in flight.
+    ///
+    /// The flush runs in a task of its own so that a handler that holds its
+    /// thread cannot keep the intake from reading the pull, whose client-side
+    /// timer ends it, and drops what it delivered, 5 s after its window.
+    ///
+    /// A failure of the intake ends the attach only once the flush in
+    /// progress has settled its batch.
+    ///
+    /// A stop is handled before anything else: no flush starts while one is
+    /// pending, and a stop seen together with the end of a flush counts as
+    /// landing during that flush, so the batch read ahead is handed back.
+    async fn drive(self: &Arc<Self>, intake: &mut BatchIntake<T>) -> Result<()> {
+        let queue = self.topology.queue();
+        let mut redelivery_backoff = batch_redelivery_backoff();
+        let mut flush: Option<Flushing> = None;
+        loop {
+            if flush.is_none() && intake.batch_ready() && !intake.stop_pending() {
+                let (messages, acks) = intake.take_batch();
+                let ctx = Arc::clone(&intake.ctx);
+                let run = Arc::clone(self);
+                let backoff =
+                    std::mem::replace(&mut redelivery_backoff, batch_redelivery_backoff());
+                let task =
+                    tokio::spawn(async move { run.flush(&ctx, messages, acks, backoff).await });
+                flush = Some(Flushing {
+                    _abort: AbortOnDrop(task.abort_handle()),
+                    task,
+                });
+                intake.renew_later();
+            }
+            if intake.wants_pull() {
+                intake.open_pull().await;
+            }
+            if flush.is_none() && intake.done() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                () = self.shutdown.cancelled(), if !intake.stopping => {
+                    intake.stop(flush.is_some()).await;
+                }
+                ended = flush_end(&mut flush), if flush.is_some() => {
+                    flush = None;
+                    intake.renew = None;
+                    match ended {
+                        Ok(backoff) => redelivery_backoff = backoff,
+                        Err(e) => {
+                            tracing::error!(error = %e, queue, "a batch flush task failed");
+                            intake
+                                .fail(ShoveError::Unknown(format!(
+                                    "a batch flush task on {queue} failed: {e}"
+                                )))
+                                .await;
+                        }
+                    }
+                }
+                event = intake.next_event() => intake.on_event(event).await,
+            }
+        }
+        match intake.failure.take() {
+            Some(failure) => Err(failure),
+            None => Ok(()),
+        }
+    }
+
+    /// Hands `messages` to the handler and settles `acks` by its outcome,
+    /// returning the redelivery backoff, escalated by a batch handed back.
+    async fn flush(
+        &self,
+        ctx: &NatsBatchCtx,
+        messages: Vec<(T::Message, MessageMetadata)>,
+        acks: Vec<Message>,
+        mut backoff: Backoff,
+    ) -> Backoff {
+        let queue = self.topology.queue();
+        let batch_size = acks.len();
+        let outcome = invoke_batch_handler(
+            // Closure, not a ready-made future: `handle_batch` may panic while
+            // building it, and that has to happen inside the guard.
+            || self.handler.handle_batch(messages, &self.hctx),
+            self.handler_timeout,
+            self.timeout_outcome.clone(),
+            &self.topic,
+            self.group.as_deref(),
+            u64::try_from(batch_size).unwrap_or(u64::MAX),
+        )
+        .await;
+
+        match settle_batch_outcome(&outcome) {
+            BatchSettlement::Commit => {
+                ack_batch(&acks).await;
+                backoff = batch_redelivery_backoff();
+                tracing::debug!(queue, batch_size, "batch acked");
+            }
+            BatchSettlement::DeadLetter => {
+                if self.topology.dlq().is_some() {
+                    tracing::warn!(queue, batch_size, "batch rejected, routed to the DLQ");
+                } else {
+                    tracing::warn!(
+                        queue,
+                        batch_size,
+                        "batch rejected but no DLQ is configured, the \
+                         messages are discarded"
+                    );
+                }
+                settle_reject_batch(ctx, &acks).await;
+                backoff = batch_redelivery_backoff();
+            }
+            BatchSettlement::Redeliver => {
+                if self.shutdown.is_cancelled() {
+                    // No delay and no local sleep at shutdown: a restarted
+                    // process should see the batch immediately.
+                    nak_batch(&acks, None).await;
+                } else {
+                    let delay = next_redelivery_delay(&mut backoff);
+                    tracing::warn!(
+                        queue,
+                        batch_size,
+                        ?outcome,
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        "batch handler returned a non-Ack outcome, \
+                         redelivering the whole batch"
+                    );
+                    nak_batch(&acks, Some(delay)).await;
+                    // Pace the next flush to the same delay the Naks carry: the
+                    // batch becomes eligible right as the loop resumes, and a
+                    // wedged-sink loop cannot hammer fresh messages in the
+                    // meantime.
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        () = self.shutdown.cancelled() => {}
+                    }
+                }
+            }
+        }
+        backoff
+    }
+}
+
 impl NatsConsumer {
     /// The NATS body of
     /// [`BatchConsumer::run`](crate::batch_consumer::BatchConsumer::run),
@@ -2835,14 +3711,59 @@ impl NatsConsumer {
     /// One JetStream pull request per batch: up to `max_batch_size` messages,
     /// expiring after `max_batch_age`. The server ends the request at
     /// whichever comes first, so the size/age flush pair needs no local
-    /// accumulator or timer — a flush happens at most `max_batch_age` after
-    /// the *request* was issued, which is always at or before "age since the
-    /// first message in the batch". The cost is one pull request per
+    /// accumulator or timer — a batch is complete at most `max_batch_age`
+    /// after the *request* was issued, which is always at or before "age since
+    /// the first message in the batch". The cost is one pull request per
     /// `max_batch_age` on an idle topic (250ms windows by default, against
     /// the single path's long-lived pull) — cheap, but visible in server
     /// request counters.
     ///
-    /// # The durable consumer and `max_ack_pending`
+    /// # Reading ahead
+    ///
+    /// The consumer keeps one pull outstanding. The request for the next
+    /// batch goes out as the previous batch starts to flush, so the next batch
+    /// is delivered and decoded while the flush runs, and a full one is
+    /// waiting when it ends. The request after that waits for the batch read
+    /// ahead to start its own flush, so a worker holds at most two batches:
+    /// the one flushing and the one read ahead. A message of the second waits
+    /// out the first flush before its own, and its `ack_wait` is renewed with
+    /// a progress ack every third of it meanwhile, so a flush that outlasts
+    /// the `ack_wait` does not get the batch read ahead redelivered (see
+    /// [`derive_batch_ack_wait`]).
+    ///
+    /// A stop finishes the flush in progress, hands the batch read ahead back
+    /// to the server with a nak, and flushes the batch in hand only when no
+    /// flush is in progress.
+    ///
+    /// # Oversized and undecodable messages
+    ///
+    /// A message the handler cannot be given is counted as a failure, then
+    /// dead-lettered and acked in a task of its own, up to
+    /// [`POISON_SETTLE_CONCURRENCY`] at once, so a slow dead-letter publish
+    /// holds up neither the healthy messages of its pull nor the flush. Its
+    /// `ack_wait` is renewed with progress acks while the publish runs, and
+    /// the ack follows the publish. Messages beyond that bound wait for a slot
+    /// in the order they came, and no further pull is sent while any of them
+    /// waits, so more than [`POISON_SETTLE_CONCURRENCY`] slow dead letters
+    /// hold back the next pull until all but that many have settled. The
+    /// consumer waits for these tasks, up to [`EXIT_DRAIN_TIMEOUT`], before it
+    /// returns.
+    ///
+    /// # Pull statuses and reconnects
+    ///
+    /// A pull the server ends with `Exceeded MaxWaiting` or `Leadership
+    /// Change` clears on its own: the consumer probes its connection, pauses,
+    /// and pulls again, and only a failed probe spends a reconnect attempt.
+    /// Any other status is a connection error that spends one. When the
+    /// client reconnects the consumer reads what the open pull had delivered
+    /// into the batch in hand and drops the pull, since a server that
+    /// restarted or failed over has lost the request without a word. It pulls
+    /// again as after any pull: at once if the batch in hand is empty and no
+    /// oversized or undecodable message waits for a settle slot, and
+    /// otherwise once that batch has started its flush and every waiting
+    /// message has a slot.
+    ///
+    /// # The durable and `max_ack_pending`
     ///
     /// Binds the same durable (`{queue}-consumer`) as the single-message
     /// path. The fallback `create_consumer` — which applies **only** when
@@ -2855,14 +3776,14 @@ impl NatsConsumer {
     /// collapsing throughput to `budget / max_batch_age` while the stream is
     /// full. In-flight exposure stays bounded without the budget's help: in
     /// steady state each worker keeps at most one outstanding pull of at most
-    /// `max_batch_size` messages and settles it at flush. The exception is a
-    /// flapping connection — the server keeps serving an abandoned pull
+    /// `max_batch_size` messages and one batch in its flush. The exception is
+    /// a flapping connection — the server keeps serving an abandoned pull
     /// request until its `expires`, and with no budget to cap it those
     /// messages stay ack-pending for the full `ack_wait`. The failed cycle
-    /// Naks everything it actually received (see the `stream_error` arm) and
-    /// `run_with_reconnect` backs off between cycles, so the accumulation is
-    /// bounded by that rate rather than unbounded — but it is more than one
-    /// batch per worker while a server is flapping.
+    /// Naks everything it actually received and `run_with_reconnect` backs off
+    /// between cycles, so the accumulation is bounded by that rate rather than
+    /// unbounded — but it is more than two batches per worker while a server
+    /// is flapping.
     ///
     /// A pre-declared durable keeps whatever the registry gave it; since the
     /// server stops delivering at the unacked budget and this loop acks only
@@ -2872,12 +3793,15 @@ impl NatsConsumer {
     /// ≤budget-sized batches rather than a silent deadlock. A budget that
     /// covers only a single batch (this includes durables created by the
     /// pre-unbounded bootstrap, which persist server-side across an upgrade)
-    /// draws its own warning: one worker runs fine, but concurrent workers
-    /// split it and flushes go expiry-bound — recreate the durable or raise
-    /// its budget for multi-worker use. A further warning fires when the
-    /// durable's `ack_wait` is below the batch window plus the
-    /// handler-timeout margin, where a slow flush risks mid-flight redelivery
-    /// (duplicates, never loss).
+    /// draws its own warning: the batch read ahead cannot fill while the batch
+    /// in flush holds the budget, and concurrent workers split it, so flushes
+    /// go expiry-bound. Lift the budget in place with `nats consumer edit
+    /// <stream> <durable> --max-pending=-1`, or size it at two batches per
+    /// worker. Editing keeps the durable's position in the stream, which a
+    /// recreated durable does not. A further warning fires when the durable's
+    /// `ack_wait` is below the batch window plus the handler-timeout margin,
+    /// where a slow flush risks mid-flight redelivery (duplicates, never
+    /// loss).
     ///
     /// A batch consumer and a single-message group can legally share the
     /// durable: JetStream splits deliveries arbitrarily across their pull
@@ -2897,21 +3821,8 @@ impl NatsConsumer {
         let topology = T::topology();
         let queue = topology.queue();
         let consumer_name = super::constants::consumer_name(queue);
-
-        let shutdown = options.shutdown.clone();
         let max_batch_size = options.max_batch_size;
         let max_batch_age = options.max_batch_age;
-        let handler_timeout = options.handler_timeout;
-        let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
-        let max_message_size = options.max_message_size;
-        let batch_ack_wait = derive_batch_ack_wait(max_batch_age, handler_timeout);
-        let probe_after = empty_windows_before_probe(max_batch_age);
-
-        let handler = Arc::new(handler);
-        let hctx = Arc::new(ctx);
-        let client = self.client.clone();
-        let topic: Arc<str> = Arc::from(queue);
-        let group: Option<Arc<str>> = options.consumer_group.clone();
 
         tracing::info!(
             queue,
@@ -2921,330 +3832,40 @@ impl NatsConsumer {
             "NATS batch consumer started"
         );
 
-        run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, || {
-            let handler = handler.clone();
-            let hctx = hctx.clone();
-            let client = client.clone();
-            let shutdown = shutdown.clone();
-            let consumer_name = consumer_name.clone();
-            let topic = topic.clone();
-            let group = group.clone();
-            let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
-            async move {
-                let stream = client
-                    .jetstream()
-                    .get_stream(queue)
-                    .await
-                    .map_err(|e| map_get_stream_error(queue, e))?;
+        let run = Arc::new(BatchRun::<T, H> {
+            client: self.client.clone(),
+            topology,
+            consumer_name,
+            handler,
+            hctx: ctx,
+            topic: Arc::from(queue),
+            group: options.consumer_group.clone(),
+            max_batch_size,
+            max_batch_age,
+            handler_timeout: options.handler_timeout,
+            timeout_outcome: options.handler_timeout_outcome.clone(),
+            max_message_size: options.max_message_size,
+            batch_ack_wait: derive_batch_ack_wait(max_batch_age, options.handler_timeout),
+            probe_after: empty_windows_before_probe(max_batch_age),
+            shutdown: options.shutdown.clone(),
+            poison_slots: Arc::new(Semaphore::new(POISON_SETTLE_CONCURRENCY)),
+            poison_tasks: BusyTasks::new(Arc::new(AtomicBool::new(false))),
+            _topic: PhantomData,
+        });
 
-                // Same fast-path/fallback split as `run_with_inner`: attach to
-                // the pre-declared durable, and only bootstrap one (NotFound
-                // alone) with batch-derived config when nothing declared it.
-                let mut pull_consumer = match stream
-                    .get_consumer::<PullConsumerConfig>(&consumer_name)
-                    .await
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let is_not_found = e
-                            .downcast_ref::<ConsumerInfoError>()
-                            .is_some_and(|ce| matches!(ce.kind(), ConsumerInfoErrorKind::NotFound));
-                        if !is_not_found {
-                            return Err(ShoveError::Connection(format!(
-                                "get_consumer({consumer_name}) failed: {e}"
-                            )));
-                        }
-                        stream
-                            .create_consumer(PullConsumerConfig {
-                                durable_name: Some(consumer_name.clone()),
-                                ack_policy: AckPolicy::Explicit,
-                                // Unbounded on purpose — see the doc block: a
-                                // finite budget is split across every attached
-                                // worker's pull request, and a request that
-                                // cannot fill to `max_messages` waits out the
-                                // whole `expires` window even when the stream
-                                // has supply. Flight stays bounded by the pull
-                                // requests themselves (≤ one batch per worker).
-                                max_ack_pending: UNBOUNDED_ACK_PENDING,
-                                ack_wait: batch_ack_wait,
-                                ..Default::default()
-                            })
-                            .await
-                            .map_err(|e| {
-                                ShoveError::Connection(format!(
-                                    "create_consumer({consumer_name}) fallback failed: {e}"
-                                ))
-                            })?
-                    }
-                };
+        let result = run_with_reconnect(
+            &options.shutdown,
+            queue,
+            options.max_reconnect_attempts,
+            || {
+                let run = Arc::clone(&run);
+                async move { run.run_attached().await }
+            },
+        )
+        .await;
 
-                let (budget, ack_wait) = {
-                    let config = &pull_consumer.cached_info().config;
-                    (config.max_ack_pending, config.ack_wait)
-                };
-                let effective_batch_size = match usize::try_from(budget) {
-                    Ok(b) if b > 0 && b < max_batch_size => {
-                        tracing::warn!(
-                            queue,
-                            max_batch_size,
-                            max_ack_pending = budget,
-                            "clamping the per-pull batch size to the consumer's \
-                             max_ack_pending — a batch larger than the unacked budget \
-                             can never fill, and every flush would wait out the full \
-                             window; the budget is shared by every attached worker, so \
-                             size it at max_batch_size x workers to keep flushes \
-                             supply-bound rather than expiry-bound"
-                        );
-                        b
-                    }
-                    Ok(b) if b >= max_batch_size && b < max_batch_size.saturating_mul(2) => {
-                        // The band is `[size, 2*size)` because that is where a
-                        // *second* worker provably cannot fill: two concurrent
-                        // pulls need 2*size of budget between them. It also
-                        // catches the durable this bootstrap wrote before it
-                        // went unbounded (exactly one batch of budget, which
-                        // persists server-side across an upgrade). A budget at
-                        // or above 2*size is left alone even though it is still
-                        // too small for enough workers — the consumer cannot
-                        // know how many will attach, so the warning names the
-                        // rule instead of guessing the count.
-                        tracing::warn!(
-                            queue,
-                            max_batch_size,
-                            max_ack_pending = budget,
-                            "the durable's max_ack_pending covers only a single \
-                             batch, and it is shared by every attached worker: \
-                             fine for one, but a second worker's concurrent pull \
-                             splits the budget so neither can fill and both \
-                             flushes go expiry-bound. Size the budget at \
-                             max_batch_size x workers (or recreate the durable to \
-                             take shove's unbounded default) before running more \
-                             than one batch worker"
-                        );
-                        max_batch_size
-                    }
-                    // Zero/negative budget means unbounded, and a budget at or
-                    // above twice the batch size fits at least two concurrent
-                    // pulls, so it needs no clamp and no warning.
-                    _ => max_batch_size,
-                };
-                if !ack_wait.is_zero() && ack_wait < batch_ack_wait {
-                    tracing::warn!(
-                        queue,
-                        ?ack_wait,
-                        required = ?batch_ack_wait,
-                        "consumer ack_wait is below the batch window plus the \
-                         handler-timeout margin; a slow flush risks mid-flight \
-                         redelivery (duplicates, never loss)"
-                    );
-                }
-
-                let flush_ctx = NatsBatchCtx {
-                    client: &client,
-                    topology,
-                    topic: topic.as_ref(),
-                    group: group.as_deref(),
-                };
-                let mut redelivery_backoff = batch_redelivery_backoff();
-                let mut empty_windows: u32 = 0;
-
-                loop {
-                    if shutdown.is_cancelled() {
-                        tracing::info!(queue, "shutdown signal received, batch consumer stopped");
-                        return Ok(());
-                    }
-
-                    let mut batch_stream = pull_consumer
-                        .batch()
-                        .max_messages(effective_batch_size)
-                        .expires(max_batch_age)
-                        .messages()
-                        .await
-                        .map_err(|e| {
-                            ShoveError::Connection(format!(
-                                "batch pull request on {queue} failed: {e}"
-                            ))
-                        })?;
-
-                    let prealloc = effective_batch_size.min(PREALLOC_CAP);
-                    let mut buffer: Vec<(T::Message, MessageMetadata)> =
-                        Vec::with_capacity(prealloc);
-                    let mut acks: Vec<Message> = Vec::with_capacity(prealloc);
-                    let mut saw_messages = false;
-                    let mut interrupted = false;
-                    let mut stream_error: Option<ShoveError> = None;
-
-                    loop {
-                        tokio::select! {
-                            _ = shutdown.cancelled() => {
-                                interrupted = true;
-                                break;
-                            }
-                            item = batch_stream.next() => match item {
-                                None => break,
-                                Some(Err(e)) => {
-                                    tracing::error!(error = %e, queue, "batch pull stream error");
-                                    metrics::record_backend_error(
-                                        metrics::BackendLabel::Nats,
-                                        metrics::BackendErrorKind::Consume,
-                                    );
-                                    stream_error = Some(ShoveError::Connection(format!(
-                                        "batch pull stream error on {queue}: {e}"
-                                    )));
-                                    break;
-                                }
-                                Some(Ok(msg)) => {
-                                    saw_messages = true;
-                                    if let Some((payload, metadata, msg)) =
-                                        ingest_batch_message::<T>(
-                                            &flush_ctx,
-                                            msg,
-                                            max_message_size,
-                                        )
-                                        .await
-                                    {
-                                        buffer.push((payload, metadata));
-                                        acks.push(msg);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some(err) = stream_error {
-                        // This cycle took delivery of `acks` but never reached
-                        // the flush, so nothing handled them and nothing
-                        // settled them. `run_with_reconnect` retries, and
-                        // without the budget that used to cap it (the durable
-                        // is unbounded now) every failed cycle inside one
-                        // `ack_wait` window would leave another batch parked
-                        // ack-pending until that window expired. Nak instead:
-                        // best-effort, at-least-once holds either way, and the
-                        // retry sees them immediately. Same shape as the
-                        // shutdown arm below.
-                        for msg in acks {
-                            if let Err(e) = msg.ack_with(AckKind::Nak(None)).await {
-                                tracing::error!(
-                                    error = %e,
-                                    queue,
-                                    "failed to nak an unhandled batch message after a \
-                                     pull stream error; it redelivers on ack_wait"
-                                );
-                            }
-                        }
-                        return Err(err);
-                    }
-
-                    if interrupted {
-                        // Best-effort: Nak whatever the open pull request
-                        // already delivered beyond the buffer, so a restarted
-                        // process sees it immediately instead of after
-                        // ack_wait. Anything still in flight from the server
-                        // redelivers on ack_wait expiry — at-least-once holds
-                        // either way.
-                        while let Some(Some(Ok(msg))) = batch_stream.next().now_or_never() {
-                            if let Err(e) = msg.ack_with(AckKind::Nak(None)).await {
-                                tracing::error!(
-                                    error = %e,
-                                    "failed to nak undelivered batch message at shutdown"
-                                );
-                            }
-                        }
-                    } else if saw_messages {
-                        empty_windows = 0;
-                    } else {
-                        // A silent outage ends windows exactly like an idle
-                        // topic — see `empty_windows_before_probe`.
-                        empty_windows += 1;
-                        if empty_windows >= probe_after {
-                            pull_consumer.info().await.map_err(|e| {
-                                ShoveError::Connection(format!(
-                                    "batch liveness probe on {queue} failed: {e}"
-                                ))
-                            })?;
-                            empty_windows = 0;
-                        }
-                    }
-
-                    if !buffer.is_empty() {
-                        let batch_size = buffer.len();
-                        let messages = std::mem::take(&mut buffer);
-                        let outcome = invoke_batch_handler(
-                            // Closure, not a ready-made future: `handle_batch`
-                            // may panic while building it, and that has to
-                            // happen inside the guard.
-                            || handler.handle_batch(messages, hctx.as_ref()),
-                            handler_timeout,
-                            handler_timeout_outcome_cfg.clone(),
-                            &topic,
-                            group.as_deref(),
-                            batch_size as u64,
-                        )
-                        .await;
-
-                        match settle_batch_outcome(&outcome) {
-                            BatchSettlement::Commit => {
-                                ack_batch(&acks).await;
-                                redelivery_backoff = batch_redelivery_backoff();
-                                tracing::debug!(queue, batch_size, "batch acked");
-                            }
-                            BatchSettlement::DeadLetter => {
-                                if topology.dlq().is_some() {
-                                    tracing::warn!(
-                                        queue,
-                                        batch_size,
-                                        "batch rejected, routed to the DLQ"
-                                    );
-                                } else {
-                                    tracing::warn!(
-                                        queue,
-                                        batch_size,
-                                        "batch rejected but no DLQ is configured, the \
-                                         messages are discarded"
-                                    );
-                                }
-                                settle_reject_batch(&flush_ctx, &acks).await;
-                                redelivery_backoff = batch_redelivery_backoff();
-                            }
-                            BatchSettlement::Redeliver => {
-                                if shutdown.is_cancelled() {
-                                    // No delay and no local sleep at shutdown:
-                                    // a restarted process should see the batch
-                                    // immediately.
-                                    nak_batch(&acks, None).await;
-                                } else {
-                                    let delay = next_redelivery_delay(&mut redelivery_backoff);
-                                    tracing::warn!(
-                                        queue,
-                                        batch_size,
-                                        ?outcome,
-                                        delay_ms = delay.as_millis() as u64,
-                                        "batch handler returned a non-Ack outcome, \
-                                         redelivering the whole batch"
-                                    );
-                                    nak_batch(&acks, Some(delay)).await;
-                                    // Pace the next pull to the same delay the
-                                    // Naks carry: the batch becomes eligible
-                                    // right as the loop resumes, and a
-                                    // wedged-sink loop cannot hammer fresh
-                                    // messages in the meantime.
-                                    tokio::select! {
-                                        _ = tokio::time::sleep(delay) => {}
-                                        _ = shutdown.cancelled() => {}
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if interrupted {
-                        tracing::info!(queue, "shutdown signal received, batch consumer stopped");
-                        return Ok(());
-                    }
-                }
-            }
-        })
-        .await
+        wait_for_busy_tasks(&run.poison_tasks, queue).await;
+        result
     }
 }
 
@@ -3312,6 +3933,24 @@ mod retry_strategy_tests {
     fn a_sequenced_count_saturates() {
         assert_eq!(sequenced(u32::MAX, Some(5)), u32::MAX);
         assert_eq!(sequenced(1, Some(u32::MAX)), u32::MAX);
+    }
+
+    fn with_count(value: &str) -> Option<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_COUNT_HEADER, value);
+        Some(headers)
+    }
+
+    /// A publish stamps no count of its own, so a message that has never been
+    /// retried reads as zero retries, as one an earlier version stamped with
+    /// `0` does.
+    #[test]
+    fn a_missing_retry_count_header_reads_as_zero_retries() {
+        assert_eq!(get_retry_count(&None), 0);
+        assert_eq!(get_retry_count(&Some(HeaderMap::new())), 0);
+        assert_eq!(get_retry_count(&with_count("0")), 0);
+        assert_eq!(get_retry_count(&with_count("3")), 3);
+        assert_eq!(get_retry_count(&with_count("many")), 0);
     }
 }
 
@@ -3527,12 +4166,51 @@ mod guarded_tests {
         ));
     }
 
+    async fn panics_with_a_formatted_message() {
+        panic!(
+            "{}",
+            String::from("the call panics with a formatted message")
+        );
+    }
+
+    async fn panics_with_a_payload_that_is_no_text() {
+        std::panic::panic_any(7_u32);
+    }
+
+    /// The caller gets the panic back as its text, whether the panic carried a
+    /// literal, a formatted string or something that is no text at all.
     #[tokio::test]
-    async fn a_panic_is_reported_to_the_caller() {
-        assert!(matches!(
-            guarded(panics(), None).await,
-            Guarded::Panicked(_)
-        ));
+    async fn a_panic_is_reported_to_the_caller_with_its_message() {
+        for timeout in [None, Some(Duration::from_secs(1))] {
+            assert!(matches!(
+                guarded(panics(), timeout).await,
+                Guarded::Panicked(message) if message == "the call panics on purpose"
+            ));
+            assert!(matches!(
+                guarded(panics_with_a_formatted_message(), timeout).await,
+                Guarded::Panicked(message)
+                    if message == "the call panics with a formatted message"
+            ));
+            assert!(matches!(
+                guarded(panics_with_a_payload_that_is_no_text(), timeout).await,
+                Guarded::Panicked(message) if message == "a panic payload that is no text"
+            ));
+        }
+    }
+
+    /// The caller polls the call itself, with no child task spawned for it,
+    /// so a message costs a single task.
+    #[tokio::test]
+    async fn a_guarded_call_runs_on_the_callers_task() {
+        tokio::spawn(async {
+            let caller = tokio::task::id();
+            for timeout in [None, Some(Duration::from_secs(1))] {
+                let call = guarded(async { tokio::task::id() }, timeout).await;
+                assert!(matches!(call, Guarded::Done(id) if id == caller));
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -3540,6 +4218,24 @@ mod guarded_tests {
         let limit = Duration::from_secs(5);
         let call = guarded(std::future::pending::<()>(), Some(limit)).await;
         assert!(matches!(call, Guarded::TimedOut(at) if at == limit));
+    }
+
+    /// A call that outlasts its limit is dropped before the caller carries on,
+    /// so it cannot run alongside whatever the caller does next.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_past_its_limit_is_dropped_before_the_caller_resumes() {
+        let gone = Arc::new(AtomicBool::new(false));
+        let held = Dropped(Arc::clone(&gone));
+        let call = guarded(
+            async move {
+                let _held = held;
+                std::future::pending::<()>().await;
+            },
+            Some(Duration::from_secs(5)),
+        )
+        .await;
+        assert!(matches!(call, Guarded::TimedOut(_)));
+        assert!(gone.load(Ordering::Acquire), "the call outlived its limit");
     }
 
     /// Sets its flag when the call it was moved into is dropped.
@@ -3676,8 +4372,9 @@ mod either_token_tests {
 mod batch_derivation_tests {
     use super::*;
 
-    /// The batch window is added on top of the single-path margin: a message
-    /// can wait the whole window before its flush even starts.
+    /// A message can wait out the window before its own flush, and the wait
+    /// for a flush ahead of it is renewed, so the window is added to the
+    /// single-path margin once.
     #[test]
     fn batch_ack_wait_adds_the_window_to_the_single_path_margin() {
         assert_eq!(
@@ -3703,6 +4400,18 @@ mod batch_derivation_tests {
         assert_eq!(
             derive_batch_ack_wait(Duration::from_secs(1), None),
             Duration::from_secs(1) + derive_ack_wait(DEFAULT_HANDLER_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn a_huge_window_or_timeout_saturates() {
+        assert_eq!(
+            derive_batch_ack_wait(Duration::MAX, Some(Duration::from_secs(30))),
+            Duration::MAX
+        );
+        assert_eq!(
+            derive_batch_ack_wait(Duration::from_secs(1), Some(Duration::MAX)),
+            Duration::MAX
         );
     }
 
