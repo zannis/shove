@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "kafka")]
-use crate::backends::kafka::{CommitPolicy, KafkaAutoOffsetReset};
+use crate::backends::kafka::{CommitPolicy, FetchQueueTuning, KafkaAutoOffsetReset};
 use crate::broadcast::BroadcastStart;
 use crate::consumer::{
     DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, RetryStrategy,
@@ -67,6 +67,15 @@ pub(crate) struct ConsumerOptionsInner {
     /// `into_inner` folds the public `kafka_commit_interval` field into it.
     #[cfg(feature = "kafka")]
     pub kafka_commit_policy: Option<CommitPolicy>,
+
+    /// Kafka-only: the fetch queue settings the consumer's librdkafka client
+    /// is created with. Unset settings keep the backoff default and
+    /// librdkafka's thresholds. Propagated from
+    /// `KafkaConsumerGroupConfig::with_queued_min_messages` and its two
+    /// siblings on the registry path, and from the same setters on
+    /// `ConsumerOptions::<Kafka>` otherwise.
+    #[cfg(feature = "kafka")]
+    pub kafka_fetch_queue: FetchQueueTuning,
 
     /// Kafka-only, `test-support` builds: the `max.poll.interval.ms` the
     /// concurrent and FIFO members are created with, in place of the pinned
@@ -149,6 +158,8 @@ impl ConsumerOptionsInner {
             kafka_auto_offset_reset: None,
             #[cfg(feature = "kafka")]
             kafka_commit_policy: None,
+            #[cfg(feature = "kafka")]
+            kafka_fetch_queue: FetchQueueTuning::default(),
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: None,
             #[cfg(all(feature = "kafka", feature = "test-support"))]

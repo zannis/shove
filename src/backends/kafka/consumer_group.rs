@@ -16,6 +16,7 @@ use crate::backends::kafka::client::KafkaClient;
 use crate::backends::kafka::consumer::{
     KafkaConsumer, check_per_record_prefetch, reject_fifo_commit_policy, resolve_retry_strategy,
 };
+use crate::backends::kafka::fetch_queue::FetchQueueTuning;
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
 use crate::consumer::RetryStrategy;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
@@ -254,6 +255,11 @@ pub struct KafkaConsumerGroupConfig {
     /// [`with_retry_strategy`](Self::with_retry_strategy). `None` lets the
     /// topology's ownership decide.
     retry_strategy: Option<RetryStrategy>,
+    /// The fetch queue settings of the members' librdkafka clients, see
+    /// [`with_queued_min_messages`](Self::with_queued_min_messages) and its
+    /// two siblings. Unset settings keep the backoff default and librdkafka's
+    /// thresholds.
+    pub(crate) fetch_queue: FetchQueueTuning,
     /// `test-support` builds only: the members' `max.poll.interval.ms`, see
     /// [`with_max_poll_interval_for_test`](Self::with_max_poll_interval_for_test).
     #[cfg(feature = "test-support")]
@@ -315,6 +321,7 @@ impl KafkaConsumerGroupConfig {
             auto_offset_reset: None,
             commit_policy: None,
             retry_strategy: None,
+            fetch_queue: FetchQueueTuning::default(),
             #[cfg(feature = "test-support")]
             max_poll_interval: None,
             #[cfg(feature = "test-support")]
@@ -555,6 +562,66 @@ impl KafkaConsumerGroupConfig {
     /// topology's ownership decides.
     pub fn retry_strategy(&self) -> Option<RetryStrategy> {
         self.retry_strategy
+    }
+
+    /// librdkafka's `queued.min.messages` for every member: how many messages
+    /// per partition a member tries to keep prefetched in its local queue. A
+    /// partition whose queue holds that many is not fetched again until
+    /// [`with_fetch_queue_backoff_ms`](Self::with_fetch_queue_backoff_ms) has
+    /// passed. Unset keeps librdkafka's default, 100000.
+    ///
+    /// A higher value prefetches further ahead of the handlers and holds more
+    /// messages in memory, and a lower one bounds that memory.
+    /// [`with_queued_max_messages_kbytes`](Self::with_queued_max_messages_kbytes)
+    /// bounds the same queue by size.
+    ///
+    /// The accepted range is `1..=10000000`. A value outside it is refused
+    /// with `ShoveError::Validation` by `register` and `register_fifo`, before
+    /// anything is declared or a member spawned. The same setting is available
+    /// on `ConsumerOptions::<Kafka>` for the direct and supervisor paths.
+    pub fn with_queued_min_messages(mut self, messages: u32) -> Self {
+        self.fetch_queue.queued_min_messages = Some(messages);
+        self
+    }
+
+    /// librdkafka's `queued.max.messages.kbytes` for every member: how many
+    /// kilobytes of prefetched messages a member's local queue may hold before
+    /// librdkafka stops fetching until
+    /// [`with_fetch_queue_backoff_ms`](Self::with_fetch_queue_backoff_ms) has
+    /// passed. librdkafka gives it priority over `queued.min.messages`. Unset
+    /// keeps librdkafka's default, 65536, about 64 MB.
+    ///
+    /// The accepted range is `1..=2097151`. A value outside it is refused
+    /// with `ShoveError::Validation` by `register` and `register_fifo`, as
+    /// [`with_queued_min_messages`](Self::with_queued_min_messages) is. The same
+    /// setting is available on `ConsumerOptions::<Kafka>` for the direct and
+    /// supervisor paths.
+    pub fn with_queued_max_messages_kbytes(mut self, kbytes: u32) -> Self {
+        self.fetch_queue.queued_max_messages_kbytes = Some(kbytes);
+        self
+    }
+
+    /// librdkafka's `fetch.queue.backoff.ms` for every member: how long to
+    /// wait before fetching a partition again once its local queue reached
+    /// `queued.min.messages` or `queued.max.messages.kbytes`. Unset keeps
+    /// 25 ms, which every Kafka consumer shove builds uses, in place of
+    /// librdkafka's 1000 ms.
+    ///
+    /// The wait runs its full length even when the handlers empty the queue
+    /// meanwhile. At 1000 ms a consumer that works through a backlog faster
+    /// than the queue refills idles for the rest of each second, which caps a
+    /// partition at about `queued.min.messages` messages per second. A lower
+    /// value refetches sooner and checks a full queue more often. `0` removes
+    /// the wait, and can raise CPU use while a queue stays full.
+    ///
+    /// The accepted range is `0..=300000`. A value outside it is refused with
+    /// `ShoveError::Validation` by `register` and `register_fifo`, as
+    /// [`with_queued_min_messages`](Self::with_queued_min_messages) is. The same
+    /// setting is available on `ConsumerOptions::<Kafka>` for the direct and
+    /// supervisor paths.
+    pub fn with_fetch_queue_backoff_ms(mut self, ms: u32) -> Self {
+        self.fetch_queue.fetch_queue_backoff_ms = Some(ms);
+        self
     }
 
     /// Set the Schema Registry client for this consumer group.
@@ -1102,6 +1169,7 @@ impl KafkaConsumerGroup {
         }
         options.kafka_auto_offset_reset = self.config.auto_offset_reset;
         options.kafka_commit_policy = self.config.commit_policy;
+        options.kafka_fetch_queue = self.config.fetch_queue;
         options.retry_strategy = self.config.retry_strategy;
         #[cfg(feature = "test-support")]
         {
@@ -1118,7 +1186,11 @@ impl KafkaConsumerGroup {
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         // Raw vec position of the new entry, not a liveness count.
-        debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");
+        debug!(
+            group = %self.queue,
+            consumer_index = self.consumers.len().saturating_sub(1),
+            "spawned consumer"
+        );
     }
 }
 
@@ -1239,6 +1311,7 @@ impl KafkaConsumerGroupRegistry {
                 "KafkaConsumerGroupRegistry::register",
             )?;
         }
+        config.fetch_queue.validate(&name)?;
 
         if self.groups.contains_key(&name) {
             metrics::record_backend_error(
@@ -1318,6 +1391,7 @@ impl KafkaConsumerGroupRegistry {
 
         let topology = T::topology();
         let name = topology.queue().to_string();
+        config.fetch_queue.validate(&name)?;
 
         if self.groups.contains_key(&name) {
             return Err(ShoveError::Topology(format!(
@@ -2030,6 +2104,77 @@ mod tests {
         );
     }
 
+    // -- fetch queue --
+
+    #[test]
+    fn fetch_queue_settings_default_to_unset() {
+        assert_eq!(
+            KafkaConsumerGroupConfig::new(1..=1).fetch_queue,
+            FetchQueueTuning::default()
+        );
+    }
+
+    #[test]
+    fn the_fetch_queue_setters_store_their_values_independently() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1).with_queued_min_messages(5_000);
+        assert_eq!(
+            cfg.fetch_queue,
+            FetchQueueTuning {
+                queued_min_messages: Some(5_000),
+                ..FetchQueueTuning::default()
+            }
+        );
+
+        let cfg = cfg
+            .with_queued_max_messages_kbytes(2_048)
+            .with_fetch_queue_backoff_ms(250);
+        assert_eq!(
+            cfg.fetch_queue,
+            FetchQueueTuning {
+                queued_min_messages: Some(5_000),
+                queued_max_messages_kbytes: Some(2_048),
+                fetch_queue_backoff_ms: Some(250),
+            }
+        );
+    }
+
+    /// Every member the group spawns, the first ones and the ones the
+    /// autoscaler adds, is created from the group config's settings.
+    #[tokio::test]
+    async fn spawn_one_hands_every_member_the_fetch_queue_settings() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spawner: Spawner = {
+            let seen = seen.clone();
+            Arc::new(move |options: ConsumerOptions| {
+                seen.lock()
+                    .expect("capture mutex poisoned")
+                    .push(options.kafka_fetch_queue);
+                tokio::spawn(async move {
+                    options.shutdown.cancelled().await;
+                })
+            })
+        };
+        let config = KafkaConsumerGroupConfig::new(2..=3)
+            .with_queued_min_messages(5_000)
+            .with_queued_max_messages_kbytes(2_048)
+            .with_fetch_queue_backoff_ms(250);
+        let mut group = test_group_with_spawner(config, spawner);
+
+        group.start();
+        assert!(group.scale_up());
+
+        let expected = FetchQueueTuning {
+            queued_min_messages: Some(5_000),
+            queued_max_messages_kbytes: Some(2_048),
+            fetch_queue_backoff_ms: Some(250),
+        };
+        assert_eq!(
+            *seen.lock().expect("capture mutex poisoned"),
+            vec![expected; 3]
+        );
+        group.shutdown().await;
+    }
+
     #[test]
     #[should_panic(expected = "commit_interval must be positive")]
     fn with_commit_interval_rejects_zero() {
@@ -2512,6 +2657,84 @@ mod tests {
                     .await
                     .expect_err("a client-less registry cannot finish registering");
 
+                let ShoveError::Topology(msg) = err else {
+                    panic!("expected ShoveError::Topology, got {err:?}");
+                };
+                assert!(
+                    msg.contains("registry has no client"),
+                    "expected to reach the client lookup past the guard, got: {msg}"
+                );
+            }
+        }
+
+        /// A fetch queue setting outside librdkafka's range is refused at
+        /// registration, before anything is declared or a member spawned:
+        /// each member would otherwise refuse it where its consumer is
+        /// created, and the group would count an error per member and stay
+        /// empty after `register` reported success. The test registry has no
+        /// client, so a check that ran after the client lookup would surface
+        /// as the client error instead.
+        #[tokio::test]
+        async fn register_rejects_an_out_of_range_fetch_queue_setting() {
+            let config = KafkaConsumerGroupConfig::new(1..=4).with_queued_max_messages_kbytes(0);
+
+            let err = registry()
+                .register::<GuardExternal, _>(config, || NoopHandler, ())
+                .await
+                .expect_err("an out-of-range fetch queue setting must be rejected");
+
+            let ShoveError::Validation(msg) = err else {
+                panic!("expected ShoveError::Validation, got {err:?}");
+            };
+            assert!(
+                msg.contains("kafka-register-guard-external")
+                    && msg.contains("with_queued_max_messages_kbytes")
+                    && msg.contains("1..=2097151"),
+                "message must name the topic, the setter and the range: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn register_fifo_rejects_an_out_of_range_fetch_queue_setting() {
+            let config = KafkaConsumerGroupConfig::new(1..=4).with_fetch_queue_backoff_ms(300_001);
+
+            let err = registry()
+                .register_fifo::<GuardLedger, _>(config, || NoopHandler, ())
+                .await
+                .expect_err("an out-of-range fetch queue setting must be rejected");
+
+            let ShoveError::Validation(msg) = err else {
+                panic!("expected ShoveError::Validation, got {err:?}");
+            };
+            assert!(
+                msg.contains("kafka-fifo-concurrency-guard")
+                    && msg.contains("with_fetch_queue_backoff_ms")
+                    && msg.contains("0..=300000"),
+                "message must name the topic, the setter and the range: {msg}"
+            );
+        }
+
+        /// Negative control: settings inside the ranges, edges included, run
+        /// past the guard and only then fail on the absent client.
+        #[tokio::test]
+        async fn register_admits_fetch_queue_settings_inside_the_ranges() {
+            let config = || {
+                KafkaConsumerGroupConfig::new(1..=4)
+                    .with_queued_min_messages(1)
+                    .with_queued_max_messages_kbytes(2_097_151)
+                    .with_fetch_queue_backoff_ms(0)
+            };
+
+            let plain = registry()
+                .register::<GuardExternal, _>(config(), || NoopHandler, ())
+                .await
+                .expect_err("a client-less registry cannot finish registering");
+            let fifo = registry()
+                .register_fifo::<GuardLedger, _>(config(), || NoopHandler, ())
+                .await
+                .expect_err("a client-less registry cannot finish registering");
+
+            for err in [plain, fifo] {
                 let ShoveError::Topology(msg) = err else {
                     panic!("expected ShoveError::Topology, got {err:?}");
                 };
