@@ -1,0 +1,19 @@
+Cargo.lock
+  s_0ede5f39d038a6::t_8e6a86d36f39d3 252,254
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "409b30180ba0770d3266c30d08d294e72de23392",
+  "prompts": {},
+  "sessions": {
+    "s_0ede5f39d038a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3417a676-18d7-4088-80b2-0e73dfa5a511",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
