@@ -1,0 +1,19 @@
+benches/baselines/tier-a-ubuntu-latest.json
+  s_634a600f8b06aa::t_8f950f9c62bbc0 136-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ba484d0a4e83e57d758a53a7d2224ca31b799a31",
+  "prompts": {},
+  "sessions": {
+    "s_634a600f8b06aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad694d59-7695-4461-86b1-40da5b9622f9",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
