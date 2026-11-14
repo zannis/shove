@@ -48,7 +48,7 @@ GATE_LEVEL="${GATE_LEVEL:-error}"
 # renamed there and not here fails the gate closed, which is the safe
 # direction. `bench-tier-a` is excluded on purpose, not drift: a perf leg
 # subject to runner hardware jitter must not be able to block a release the way
-# the deterministic legs can (rationale above the job in ci.yml). Do not "fix"
+# the deterministic legs can (rationale above the job in bench.yml). Do not "fix"
 # that by adding it here.
 REQUIRED_JOBS="check feature-lint msrv audit"
 REQUIRED_COVERAGE_LEGS="inmemory rabbitmq aws-sns-sqs nats kafka kafka-schema-registry redis-streams"
