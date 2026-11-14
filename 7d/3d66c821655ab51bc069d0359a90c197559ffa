@@ -1,0 +1,24 @@
+examples/common/stress_test.rs
+  s_3aad640512ded6::t_6170e91d435957 3578-3579,3590
+.config/nextest.toml
+  s_3aad640512ded6::t_3cc1db8930728d 10-20
+.github/workflows/ci.yml
+  s_3aad640512ded6::t_411737b5d50345 346-351
+  s_3aad640512ded6::t_294d0ad0a92701 295-298
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7d3d66c821655ab51bc069d0359a90c197559ffa",
+  "prompts": {},
+  "sessions": {
+    "s_3aad640512ded6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "446d6e3b-c69f-4c9c-af76-57b53ffe4b94",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
