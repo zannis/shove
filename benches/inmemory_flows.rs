@@ -482,7 +482,7 @@ fn bench_consume(c: &mut Criterion) {
     // 20-45% on the scheduler-bound ids: the variance is environmental,
     // not sampling, so the extra 10 s per id bought precision the
     // environment immediately discarded -- while tripling the wall-clock
-    // of the bench-tier-a CI leg that runs this suite on every PR.
+    // of the bench-tier-a CI leg that runs this suite.
 
     for bytes in PAYLOAD_SIZES {
         let msg = BenchMsg {

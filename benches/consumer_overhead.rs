@@ -1094,7 +1094,7 @@ fn bench_dispatch(c: &mut Criterion) {
     // 20-45% on the scheduler-bound ids: the variance is environmental,
     // not sampling, so the extra 10 s per id bought precision the
     // environment immediately discarded -- while tripling the wall-clock
-    // of the bench-tier-a CI leg that runs this suite on every PR.
+    // of the bench-tier-a CI leg that runs this suite.
 
     let warmup_body = payload(WARMUP_PAYLOAD_BYTES);
 
