@@ -55,7 +55,9 @@
       "hono@>=4.12.4 <4.13.11": ">=4.13.11",
       "toml@<=5.0.0": ">=5.0.1",
       "dompurify@>=3.4.4 <=3.4.16": ">=3.4.17",
-      "dompurify@<=3.4.16": ">=3.4.17"
+      "dompurify@<=3.4.16": ">=3.4.17",
+      "hono@<4.13.16": ">=4.13.16",
+      "@hono/node-server@<2.1.6": ">=2.1.6"
     }
   },
   "packageManager": "pnpm@10.33.2+sha512.a90faf6feeab71ad6c6e57f94e0fe1a12f5dcc22cd754db40ae9593eb6a3e0b6b12e3540218bb37ae083404b1f2ce6db2a4121e979829b4aff94b99f49da1cf8"
