@@ -3575,7 +3575,8 @@ async fn await_completion(
     cancel: &CancellationToken,
 ) -> Result<(), String> {
     let mut last = processed.load(Ordering::Relaxed);
-    let mut last_progress = Instant::now();
+    // tokio's Instant so a paused-clock test does not spin out the window in real time.
+    let mut last_progress = tokio::time::Instant::now();
     loop {
         let count = processed.load(Ordering::Relaxed);
         if count >= target {
@@ -3586,7 +3587,7 @@ async fn await_completion(
         }
         if count != last {
             last = count;
-            last_progress = Instant::now();
+            last_progress = tokio::time::Instant::now();
         } else if last_progress.elapsed() >= DRAIN_STALL {
             return Err(format!(
                 "completion stalled: {count} of {target} messages processed, no progress for {}s",
