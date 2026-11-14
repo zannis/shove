@@ -1,0 +1,27 @@
+.github/workflows/ci.yml
+  s_3aad640512ded6::t_973883c293fc30 42-47
+.github/scripts/require-green-ci.sh
+  s_3aad640512ded6::t_81fee2923b7d65 51
+.github/workflows/bench.yml
+  s_3aad640512ded6::t_65203d38aec4bb 1-72
+benches/consumer_overhead.rs
+  s_3aad640512ded6::t_413b502b8824e4 1097
+benches/inmemory_flows.rs
+  s_3aad640512ded6::t_b37ee6a94eab02 485
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "26aa159a1cea6bdf2b5ffd8c5c96c427f12b7915",
+  "prompts": {},
+  "sessions": {
+    "s_3aad640512ded6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "446d6e3b-c69f-4c9c-af76-57b53ffe4b94",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
