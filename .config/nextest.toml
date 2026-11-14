@@ -7,6 +7,17 @@ setup-scripts = true
 [profile.default]
 retries = 1
 
+# The in-process Kafka MockCluster binaries spend most of their time in
+# deliberate wall-clock holds, not on CPU. Everything else stays capped at one
+# test per core, so raising `--test-threads` (the kafka CI leg does) only adds
+# lanes for the sleep-bound mock tests and never more concurrent containers.
+[test-groups]
+per-core = { max-threads = "num-cpus" }
+
+[[profile.default.overrides]]
+filter = 'not (binary(/_mock$/) | binary(kafka_fifo_in_place) | binary(kafka_header_handling) | binary(metrics_sqs_sequenced))'
+test-group = 'per-core'
+
 [scripts.setup.rabbitmq-setup]
 command = 'tests/scripts/rmq_setup.sh'
 slow-timeout = { period = "90s" }

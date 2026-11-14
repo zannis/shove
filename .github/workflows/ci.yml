@@ -240,6 +240,10 @@ jobs:
             # link is exercised in one test job, since `kafka-ssl` no longer
             # pulls it (the `check` job asserts that with `cargo tree`).
             features: kafka,kafka-ssl,kafka-gssapi,kafka-msk-iam,test-support,audit,metrics,sbe,env-config,inmemory
+            # Extra lanes go only to the sleep-bound MockCluster binaries;
+            # container tests stay one per core (the `per-core` test group in
+            # .config/nextest.toml).
+            test-threads: 12
           - name: kafka-schema-registry
             # Split out from the `kafka` entry rather than folded into it: the
             # two schema-registry suites each pin FIXED host ports (cp stack
@@ -287,8 +291,12 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo install -q cargo-llvm-cov cargo-nextest --locked
       # `matrix.filter` is unset for every entry but kafka-schema-registry,
-      # where it expands to empty and the full suite runs as before.
-      - run: cargo llvm-cov nextest --features ${{ matrix.features }} ${{ matrix.filter }} --lcov --output-path lcov.info
+      # where it expands to empty and the full suite runs as before;
+      # `matrix.test-threads` likewise for every entry but kafka.
+      - run: >-
+          cargo llvm-cov nextest --features ${{ matrix.features }} ${{ matrix.filter }}
+          ${{ matrix.test-threads && format('--test-threads {0}', matrix.test-threads) || '' }}
+          --lcov --output-path lcov.info
       - uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
         with:
           use_oidc: true
