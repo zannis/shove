@@ -160,8 +160,14 @@ jobs:
           key: cargo-audit-db-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
             cargo-audit-db-${{ runner.os }}-
+      # Unmaintained, no fix available:
+      # RUSTSEC-2026-0440 astral-tokio-tar, dev-only via testcontainers (latest 0.28 still uses it).
+      # RUSTSEC-2026-0441 pin-utils via aws-smithy-http 0.63; 0.64 needs an AWS SDK above MSRV 1.91.
       - name: RustSec audit
-        run: cargo audit --deny warnings
+        run: >-
+          cargo audit --deny warnings
+          --ignore RUSTSEC-2026-0440
+          --ignore RUSTSEC-2026-0441
 
   # ── Tier A benchmark regression ──────────────────────────────────────────
   # Runs the in-process criterion suite (no Docker, no secrets) against the
