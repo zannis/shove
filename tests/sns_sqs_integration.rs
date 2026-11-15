@@ -20,7 +20,9 @@
 //!
 //! Run with: `cargo test --features aws-sns-sqs,audit --test sns_sqs_integration`
 
-use aws_sdk_sqs::types::{Message, MessageSystemAttributeName, QueueAttributeName};
+use aws_sdk_sqs::types::{
+    Message, MessageAttributeValue, MessageSystemAttributeName, QueueAttributeName,
+};
 use shove::Broker;
 use shove::Sqs;
 use shove::publisher::Publisher as PublisherV2;
@@ -3211,6 +3213,130 @@ async fn autoscaler_scale_magnitude_with_sqs() {
     shutdown.cancel();
     let _ = auto_handle.await;
     registry_arc.lock().await.shutdown_all().await;
+}
+
+// ---------------------------------------------------------------------------
+// Forged x-retry-count on the sequenced path
+// ---------------------------------------------------------------------------
+
+define_sequenced_topic!(
+    SeqForgedCountTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("sqs-seq-forged")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_secs(1))
+        .dlq()
+        .build()
+);
+
+#[derive(Clone)]
+struct ForgedCountHandler {
+    poison_calls: Arc<AtomicU32>,
+    later_handled: Arc<AtomicU32>,
+}
+
+impl MessageHandler<SeqForgedCountTopic> for ForgedCountHandler {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        if msg.amount == 1 {
+            self.poison_calls.fetch_add(1, Ordering::SeqCst);
+            Outcome::Retry
+        } else {
+            self.later_handled.fetch_add(1, Ordering::SeqCst);
+            Outcome::Ack
+        }
+    }
+}
+
+/// A sender-supplied `x-retry-count` must not steer the sequenced retry
+/// budget: the FIFO retry path never rewrites it, so a forged "0" would
+/// otherwise defeat `max_retries` and leave the key stuck in `AwaitingRetry`.
+#[tokio::test]
+async fn sequenced_ignores_forged_retry_count_attribute() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqForgedCountTopic>().await;
+
+    let sqs = broker.sqs_client().await;
+    let shard_url = setup
+        .queue_registry()
+        .get("sqs-seq-forged-seq-0")
+        .await
+        .expect("shard queue should be registered after declare");
+
+    let send = |amount: u64, forged: bool| {
+        let sqs = sqs.clone();
+        let shard_url = shard_url.clone();
+        async move {
+            let body = serde_json::to_string(&OrderMessage {
+                order_id: "K".into(),
+                amount,
+            })
+            .expect("serialize");
+            let mut req = sqs
+                .send_message()
+                .queue_url(shard_url)
+                .message_body(body)
+                .message_group_id("K")
+                .message_deduplication_id(format!("forged-{amount}"));
+            if forged {
+                req = req.message_attributes(
+                    "x-retry-count",
+                    MessageAttributeValue::builder()
+                        .data_type("String")
+                        .string_value("0")
+                        .build()
+                        .expect("attribute"),
+                );
+            }
+            req.send().await.expect("send to FIFO shard");
+        }
+    };
+    send(1, true).await;
+    send(2, false).await;
+
+    let handler = ForgedCountHandler {
+        poison_calls: Arc::new(AtomicU32::new(0)),
+        later_handled: Arc::new(AtomicU32::new(0)),
+    };
+    let poison_calls = handler.poison_calls.clone();
+    let later_handled = handler.later_handled.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqForgedCountTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10)
+                    .with_max_retries(2),
+            )
+            .await
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while later_handled.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    assert_eq!(
+        poison_calls.load(Ordering::SeqCst),
+        2,
+        "max_retries(2) allows exactly two handler attempts despite the forged attribute"
+    );
+    assert!(
+        later_handled.load(Ordering::SeqCst) >= 1,
+        "a later message for the same key must be handled once the poisoned one is retired"
+    );
 }
 
 // ---------------------------------------------------------------------------

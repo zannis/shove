@@ -109,8 +109,7 @@ impl SqsConsumer {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn extract_metadata(msg: &Message) -> MessageMetadata {
-    let retry_count = router::get_retry_count(msg);
+fn extract_metadata(msg: &Message, retry_count: u32) -> MessageMetadata {
     MessageMetadata {
         retry_count,
         delivery_id: msg.message_id().unwrap_or_default().to_string(),
@@ -163,7 +162,7 @@ fn extract_payload(body: &str) -> std::borrow::Cow<'_, str> {
 }
 
 fn extract_dead_metadata(msg: &Message, queue_name: &str) -> DeadMessageMetadata {
-    let metadata = extract_metadata(msg);
+    let metadata = extract_metadata(msg, router::get_retry_count(msg));
     let death_count = metadata.retry_count;
     DeadMessageMetadata {
         message: metadata,
@@ -575,7 +574,7 @@ where
                 }
             };
 
-            let metadata = extract_metadata(&msg);
+            let metadata = extract_metadata(&msg, retry_count);
             debug!(
                 queue_url,
                 message_id = %metadata.delivery_id,
@@ -1351,7 +1350,7 @@ where
 
                 for msg in messages {
                     let receipt_handle = msg.receipt_handle().unwrap_or_default().to_string();
-                    let retry_count = router::get_retry_count(&msg);
+                    let retry_count = router::get_retry_count_fifo(&msg);
                     // Unreachable on the supported topology, and deliberately kept.
                     // `declare` creates every sequenced shard queue as FIFO
                     // (`topology.rs`, `create_sqs_queue(.., fifo = true, ..)`), and SQS
@@ -1587,7 +1586,7 @@ where
                         }
                     };
 
-                    let metadata = extract_metadata(&msg);
+                    let metadata = extract_metadata(&msg, retry_count);
 
                     debug!(
                         queue_url,
@@ -1667,7 +1666,7 @@ async fn drain_pending_for_key<T, H>(
     // Pop the next delivery and try to spawn it.
     while let Some(msg) = pending.pop_front() {
         let receipt_handle = msg.receipt_handle().unwrap_or_default().to_string();
-        let retry_count = router::get_retry_count(&msg);
+        let retry_count = router::get_retry_count_fifo(&msg);
 
         // Max retries check on buffered delivery.
         if retry_count >= options.max_retries {
@@ -1784,7 +1783,7 @@ async fn drain_pending_for_key<T, H>(
                 }
             };
 
-        let metadata = extract_metadata(&msg);
+        let metadata = extract_metadata(&msg, retry_count);
 
         let rx = spawn_handler_keyed::<T, H>(
             handler,
@@ -2459,7 +2458,7 @@ where
                 }
             };
 
-            let metadata = extract_metadata(&msg);
+            let metadata = extract_metadata(&msg, router::get_retry_count(&msg));
             if batch.is_empty() {
                 deadline = batch_deadline(tokio::time::Instant::now(), max_batch_age);
             }
