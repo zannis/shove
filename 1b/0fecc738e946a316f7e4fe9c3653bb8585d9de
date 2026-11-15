@@ -1,0 +1,19 @@
+Cargo.lock
+  s_6511f1668e6a79::t_415602b09fd540 36,38,50,52,63,65,75,77,1670,2585,2587,2989,3387,3786,3807,3809,3859,4446,4448,4454,4456,5175
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1b0fecc738e946a316f7e4fe9c3653bb8585d9de",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
