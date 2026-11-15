@@ -1,9 +1,9 @@
 //! Concurrent consumption example (SQS backend).
 //!
 //! Demonstrates `ConsumerOptions::with_concurrent_processing` for non-blocking
-//! message processing with in-order acknowledgement. Compares sequential vs
-//! concurrent throughput with a slow handler, both driven through the generic
-//! `Broker<Sqs>::consumer_supervisor()` path.
+//! message processing, each message settled when its handler completes.
+//! Compares sequential vs concurrent throughput with a slow handler, both
+//! driven through the generic `Broker<Sqs>::consumer_supervisor()` path.
 //!
 //! Spins up a LocalStack testcontainer automatically. Requires a running
 //! Docker daemon and the `LOCALSTACK_AUTH_TOKEN` environment variable:

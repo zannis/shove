@@ -491,64 +491,17 @@ where
 
         // ── Shutdown: requeue buffered messages, drain in-flight handlers ──
         if options.shutdown.is_cancelled() {
-            debug!(
-                "shutdown signal, requeueing {} buffered, draining {} in-flight on {queue_url}",
-                local_buffer.len(),
-                in_flight.len()
-            );
-            flush_acks(sqs, queue_url, &mut pending_acks, "on shutdown").await;
-            // Messages in the local buffer were received (invisible in SQS) but
-            // never dispatched.  Make them visible again so they can be redelivered.
-            for msg in local_buffer.drain(..) {
-                if let Some(rh) = msg.receipt_handle() {
-                    router::route_requeue(sqs, queue_url, rh).await;
-                }
-            }
-            // When a `handler_timeout` is set the handler is already bounded by
-            // it and resolves its own timeout; this wait is only a backstop so
-            // shutdown cannot hang on a handler that never completes. Hence the
-            // grace, and hence resolving to the *configured* timeout outcome
-            // rather than assuming Retry. With deadlines disabled the handler is
-            // still running when this fires, so `drain_timeout_outcome` keeps
-            // the backstop at Retry — see its docs.
-            let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
-            while let Ok(Some((done, outcome))) =
-                tokio::time::timeout(drain_timeout, in_flight.next()).await
-            {
-                settle_completed(
-                    sqs,
-                    queue_url,
-                    topology,
-                    group.as_deref(),
-                    done,
-                    outcome,
-                    &mut pending_acks,
-                )
-                .await;
-                flush_acks(sqs, queue_url, &mut pending_acks, "during drain").await;
-            }
-            for done in in_flight.take_remaining() {
-                let resolved = drain_timeout_outcome(
-                    options.handler_timeout,
-                    options.handler_timeout_outcome.clone(),
-                );
-                warn!(
-                    queue_url,
-                    outcome = ?resolved,
-                    "handler outcome did not arrive within the shutdown drain"
-                );
-                settle_completed(
-                    sqs,
-                    queue_url,
-                    topology,
-                    group.as_deref(),
-                    done,
-                    resolved,
-                    &mut pending_acks,
-                )
-                .await;
-            }
-            flush_acks(sqs, queue_url, &mut pending_acks, "on drain completion").await;
+            drain_and_settle(
+                sqs,
+                queue_url,
+                topology,
+                group.as_deref(),
+                options,
+                &mut in_flight,
+                &mut local_buffer,
+                &mut pending_acks,
+            )
+            .await;
             return Ok(());
         }
 
@@ -683,14 +636,30 @@ where
                 .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
                 .message_attribute_names("All")
                 .send()
-                .await
-                .map_err(|e| {
+                .await;
+            let receive_result = match receive_result {
+                Ok(r) => r,
+                Err(e) => {
                     metrics::record_backend_error(
                         metrics::BackendLabel::SnsSqs,
                         metrics::BackendErrorKind::Consume,
                     );
-                    map_sqs_error(&format!("SQS ReceiveMessage failed on {queue_url}"), e)
-                })?;
+                    let err =
+                        map_sqs_error(&format!("SQS ReceiveMessage failed on {queue_url}"), e);
+                    drain_and_settle(
+                        sqs,
+                        queue_url,
+                        topology,
+                        group.as_deref(),
+                        options,
+                        &mut in_flight,
+                        &mut local_buffer,
+                        &mut pending_acks,
+                    )
+                    .await;
+                    return Err(err);
+                }
+            };
 
             let msgs = receive_result.messages.unwrap_or_default();
             if msgs.is_empty() {
@@ -735,6 +704,71 @@ where
         // If in_flight is empty and local_buffer is also empty, the outer loop
         // will fall through to the poll branch on the next iteration.
     }
+}
+
+/// Settles everything already taken from the queue: flushes pending acks,
+/// requeues the local buffer, then settles each in-flight handler as it
+/// completes. Shared by the shutdown and receive-error exits.
+#[allow(clippy::too_many_arguments)]
+async fn drain_and_settle(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    topology: &'static QueueTopology,
+    group: Option<&str>,
+    options: &ConsumerOptions,
+    in_flight: &mut InFlight,
+    local_buffer: &mut VecDeque<Message>,
+    pending_acks: &mut Vec<String>,
+) {
+    debug!(
+        "requeueing {} buffered, draining {} in-flight on {queue_url}",
+        local_buffer.len(),
+        in_flight.len()
+    );
+    flush_acks(sqs, queue_url, pending_acks, "on drain start").await;
+    // Messages in the local buffer were received (invisible in SQS) but
+    // never dispatched.  Make them visible again so they can be redelivered.
+    for msg in local_buffer.drain(..) {
+        if let Some(rh) = msg.receipt_handle() {
+            router::route_requeue(sqs, queue_url, rh).await;
+        }
+    }
+    // When a `handler_timeout` is set the handler is already bounded by
+    // it and resolves its own timeout; this wait is only a backstop so
+    // shutdown cannot hang on a handler that never completes. Hence the
+    // grace, and hence resolving to the *configured* timeout outcome
+    // rather than assuming Retry. With deadlines disabled the handler is
+    // still running when this fires, so `drain_timeout_outcome` keeps
+    // the backstop at Retry — see its docs.
+    let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
+    while let Ok(Some((done, outcome))) =
+        tokio::time::timeout(drain_timeout, in_flight.next()).await
+    {
+        settle_completed(sqs, queue_url, topology, group, done, outcome, pending_acks).await;
+        flush_acks(sqs, queue_url, pending_acks, "during drain").await;
+    }
+    for done in in_flight.take_remaining() {
+        let resolved = drain_timeout_outcome(
+            options.handler_timeout,
+            options.handler_timeout_outcome.clone(),
+        );
+        warn!(
+            queue_url,
+            outcome = ?resolved,
+            "handler outcome did not arrive within the shutdown drain"
+        );
+        settle_completed(
+            sqs,
+            queue_url,
+            topology,
+            group,
+            done,
+            resolved,
+            pending_acks,
+        )
+        .await;
+    }
+    flush_acks(sqs, queue_url, pending_acks, "on drain completion").await;
 }
 
 /// Sends the accumulated ack receipts as one DeleteMessageBatch.
@@ -3020,6 +3054,68 @@ mod in_flight_tests {
             ]
         );
         assert_eq!(in_flight.len(), 0);
+    }
+
+    #[allow(clippy::absolute_paths)]
+    #[tokio::test]
+    async fn drain_settles_completed_running_and_buffered_work() {
+        use crate::{TopologyBuilder, topology::QueueTopology};
+        use std::sync::OnceLock;
+
+        static TOPOLOGY: OnceLock<QueueTopology> = OnceLock::new();
+        let topology = TOPOLOGY.get_or_init(|| TopologyBuilder::new("drain-test").build());
+
+        // Every request fails fast; the routing functions log and carry on.
+        let sqs = aws_sdk_sqs::Client::from_conf(
+            aws_sdk_sqs::config::Config::builder()
+                .behavior_version(aws_config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_sqs::config::Credentials::new(
+                    "k", "s", None, None, "test",
+                ))
+                .endpoint_url("http://127.0.0.1:1")
+                .retry_config(aws_config::retry::RetryConfig::disabled())
+                .build(),
+        );
+        let options = crate::ConsumerOptions::<crate::Sqs>::new().into_inner();
+
+        let mut in_flight = InFlight::with_capacity(4);
+        in_flight.spawn(async { Outcome::Ack }, entry("done"));
+        in_flight.spawn(
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Outcome::Retry
+            },
+            entry("running"),
+        );
+        in_flight.spawn(
+            async {
+                if true {
+                    panic!("handler task panic");
+                }
+                Outcome::Ack
+            },
+            entry("boom"),
+        );
+        let mut local_buffer =
+            VecDeque::from([Message::builder().receipt_handle("buffered").build()]);
+        let mut pending_acks = vec!["earlier".to_string()];
+
+        drain_and_settle(
+            &sqs,
+            "http://127.0.0.1:1/q",
+            topology,
+            None,
+            &options,
+            &mut in_flight,
+            &mut local_buffer,
+            &mut pending_acks,
+        )
+        .await;
+
+        assert_eq!(in_flight.len(), 0);
+        assert!(local_buffer.is_empty());
+        assert!(pending_acks.is_empty());
     }
 
     #[tokio::test]
