@@ -64,7 +64,8 @@ pub(super) enum PublishFailure {
     Unconfirmed(ShoveError),
     /// A copy that can never be published, however often it is tried: the
     /// client or the stream refuses its size. Only a copy is classified, a
-    /// user's publish keeps its retries and its `Connection` error.
+    /// user's publish keeps its retries and its `Connection` error. An earlier
+    /// attempt may have stored the copy unacknowledged, see `record_terminal`.
     #[error(transparent)]
     Unpublishable(ShoveError),
 }
