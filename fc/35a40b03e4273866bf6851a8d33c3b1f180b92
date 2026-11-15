@@ -1,0 +1,37 @@
+docs/pages/backends/sqs.mdx
+  s_6511f1668e6a79::t_d9e6a8de325f61 93
+  s_6511f1668e6a79::t_fa3c445bd9526b 97-98
+docs/pages/backends/sqs/examples/autoscaler.mdx
+  s_6511f1668e6a79::t_141b4246f4b472 49
+src/backends/sns/consumer.rs
+  s_6511f1668e6a79::t_622ad167413d9e 400-417,436-437,448-449,454,458,654-662,732,2902-2938
+  s_6511f1668e6a79::t_cb01bac1aa23ef 11-12,279-280,282,291,298-299,306-307,314,321-397,447,459-460,462-465,474-485,488,499,509,515-527,529-534,536-537,539-548,550,631,641-648,663,719-731,739-791,2939-3039
+src/backends/sns/consumer_group.rs
+  s_6511f1668e6a79::t_d5f46a4553cd9b 193-194
+  s_6511f1668e6a79::t_cec81734236e49 39-40,109
+src/consumer.rs
+  s_6511f1668e6a79::t_2e377f8bd3c529 308,310-314,859,861-862
+tests/sns_sqs_integration.rs
+  s_6511f1668e6a79::t_30934c318a1244 23,3463-3689
+  s_6511f1668e6a79::t_259f1c9086734d 3690-3971
+docs/pages/backends/sqs/examples/concurrent.mdx
+  s_6511f1668e6a79::t_c97497293f1131 39
+examples/sqs/concurrent_pubsub.rs
+  s_6511f1668e6a79::t_fe8e9185a4172a 242
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fc35a40b03e4273866bf6851a8d33c3b1f180b92",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
