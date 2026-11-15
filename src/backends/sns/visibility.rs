@@ -2,15 +2,18 @@
 //! sequenced key's pending buffer and an accumulating or running batch.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::time::Duration;
 
 use aws_sdk_sqs::types::{Message, QueueAttributeName};
 
-use crate::backends::sns::router::SQS_MAX_VISIBILITY_TIMEOUT_SECS;
+use crate::backends::sns::router::{
+    MAX_BATCH_ENTRIES, SQS_MAX_VISIBILITY_TIMEOUT_SECS, VisibilityChange,
+};
 use crate::error::{Result, ShoveError};
 
-/// Upper bound on one extension round, however long the queue's timeout is.
-const MAX_EXTEND_BOUND: Duration = Duration::from_secs(5);
+/// Upper bound on one extension request, however long the queue's timeout is.
+const MAX_CHUNK_BOUND: Duration = Duration::from_secs(5);
 
 /// How held messages are kept hidden: every `period`, each is set to be hidden
 /// for `extend_to_secs` from that moment, so a tick that lands late still
@@ -35,11 +38,83 @@ impl Heartbeat {
         })
     }
 
-    /// How long one extension round may take before it is abandoned until the
-    /// next tick.
-    pub(crate) fn bound(&self) -> Duration {
-        self.period.min(MAX_EXTEND_BOUND)
+    /// How long one `ChangeMessageVisibilityBatch` request may take.
+    pub(crate) fn chunk_bound(&self) -> Duration {
+        (self.period / 4).min(MAX_CHUNK_BOUND)
     }
+
+    /// How long one round may spend over all its requests. A handle extended
+    /// at the start of a round is next reached within `period + budget`, which
+    /// is 3/4 of the window it was extended for. A round that runs out of
+    /// budget resumes at the first unsent chunk on the next tick; with `n`
+    /// requests taking `latency` each, a round covers every handle when
+    /// `n * latency <= period / 2`, so a few thousand held handles fit at the
+    /// default timeout.
+    pub(crate) fn round_budget(&self) -> Duration {
+        self.period / 2
+    }
+}
+
+/// What one extension round did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Round {
+    pub(crate) stale: Vec<String>,
+    /// Requests that outlasted their bound.
+    pub(crate) timed_out: usize,
+    /// The round ran out of budget before every chunk was sent.
+    pub(crate) cut_short: bool,
+}
+
+/// Sends every 10-handle chunk of `handles` through `send`, starting at the
+/// chunk `cursor` names so a round cut short by its budget resumes where it
+/// stopped and no chunk is systematically skipped. Each request has its own
+/// bound, so a slow one does not stop the chunks after it. A timed-out chunk
+/// is where the next round starts.
+pub(crate) async fn run_round<F, Fut>(
+    handles: &[String],
+    cursor: &mut usize,
+    chunk_bound: Duration,
+    budget: Duration,
+    mut send: F,
+) -> Round
+where
+    F: FnMut(Vec<String>) -> Fut,
+    Fut: Future<Output = VisibilityChange>,
+{
+    let mut round = Round::default();
+    let chunks: Vec<&[String]> = handles.chunks(MAX_BATCH_ENTRIES).collect();
+    let count = chunks.len();
+    if count == 0 {
+        *cursor = 0;
+        return round;
+    }
+    let start = *cursor % count;
+    let deadline = tokio::time::Instant::now().checked_add(budget);
+    let mut next_start = None;
+    for step in 0..count {
+        let index = start.saturating_add(step) % count;
+        let remaining = match deadline {
+            Some(d) => d.saturating_duration_since(tokio::time::Instant::now()),
+            None => chunk_bound,
+        };
+        if remaining.is_zero() {
+            round.cut_short = true;
+            next_start.get_or_insert(index);
+            break;
+        }
+        let Some(chunk) = chunks.get(index) else {
+            continue;
+        };
+        match tokio::time::timeout(chunk_bound.min(remaining), send(chunk.to_vec())).await {
+            Ok(change) => round.stale.extend(change.stale),
+            Err(_) => {
+                round.timed_out = round.timed_out.saturating_add(1);
+                next_start.get_or_insert(index);
+            }
+        }
+    }
+    *cursor = next_start.unwrap_or(0);
+    round
 }
 
 /// Reads the `VisibilityTimeout` out of a `GetQueueAttributes` answer.
@@ -57,10 +132,13 @@ pub(crate) fn parse_visibility_timeout(
         })
 }
 
-/// Every receipt handle in the pending buffers.
+/// Every receipt handle in the pending buffers, keys in sorted order so a
+/// round's cursor means the same position on the next tick.
 pub(crate) fn held_handles(pending: &HashMap<String, VecDeque<Message>>) -> Vec<String> {
-    pending
-        .values()
+    let mut keys: Vec<&String> = pending.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .filter_map(|k| pending.get(k))
         .flatten()
         .filter_map(|m| m.receipt_handle())
         .map(str::to_string)
@@ -159,11 +237,27 @@ mod tests {
     }
 
     #[test]
-    fn a_round_is_bounded_by_the_period_and_by_five_seconds() {
+    fn requests_and_rounds_are_bounded_inside_the_period() {
         let short = Heartbeat::for_queue_timeout(4);
-        assert_eq!(short.map(|h| h.bound()), Some(Duration::from_secs(2)));
+        assert_eq!(
+            short.map(|h| h.chunk_bound()),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            short.map(|h| h.round_budget()),
+            Some(Duration::from_secs(1))
+        );
         let default = Heartbeat::for_queue_timeout(30);
-        assert_eq!(default.map(|h| h.bound()), Some(Duration::from_secs(5)));
+        assert_eq!(
+            default.map(|h| h.chunk_bound()),
+            Some(Duration::from_millis(3750))
+        );
+        assert_eq!(
+            default.map(|h| h.round_budget()),
+            Some(Duration::from_millis(7500))
+        );
+        let long = Heartbeat::for_queue_timeout(SQS_MAX_VISIBILITY_TIMEOUT_SECS);
+        assert_eq!(long.map(|h| h.chunk_bound()), Some(Duration::from_secs(5)));
     }
 
     #[test]
@@ -186,9 +280,7 @@ mod tests {
         p.entry("c".into())
             .or_default()
             .push_back(Message::builder().build());
-        let mut held = held_handles(&p);
-        held.sort();
-        assert_eq!(held, ["a1", "a2", "b1"]);
+        assert_eq!(held_handles(&p), ["a1", "a2", "b1"]);
         assert!(held_handles(&HashMap::new()).is_empty());
     }
 
@@ -217,5 +309,118 @@ mod tests {
         let mut p = pending(&[("a", &["a1", "a2"])]);
         assert!(drop_stale(&mut p, &[]).is_empty());
         assert_eq!(handles(&p, "a"), ["a1", "a2"]);
+    }
+
+    fn numbered(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("h{i}")).collect()
+    }
+
+    /// A sender that records each chunk's first handle and takes `delay_of`
+    /// that chunk's index to answer.
+    fn recording_sender(
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        delay_of: impl Fn(usize) -> Duration + Copy + 'static,
+    ) -> impl FnMut(Vec<String>) -> std::pin::Pin<Box<dyn Future<Output = VisibilityChange>>> {
+        move |chunk: Vec<String>| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                let first = chunk.first().cloned().unwrap_or_default();
+                let index = first.trim_start_matches('h').parse::<usize>().unwrap_or(0) / 10;
+                if let Ok(mut s) = seen.lock() {
+                    s.push(first);
+                }
+                tokio::time::sleep(delay_of(index)).await;
+                VisibilityChange::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_round_sends_every_chunk_of_a_large_set() {
+        let seen = Default::default();
+        let mut cursor = 0;
+        let round = run_round(
+            &numbered(95),
+            &mut cursor,
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+            recording_sender(std::sync::Arc::clone(&seen), |_| Duration::ZERO),
+        )
+        .await;
+        assert_eq!(seen.lock().map(|s| s.len()).ok(), Some(10));
+        assert!(!round.cut_short);
+        assert_eq!(round.timed_out, 0);
+        assert_eq!(cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn a_slow_chunk_does_not_stop_the_chunks_after_it() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let mut cursor = 0;
+        let round = run_round(
+            &numbered(30),
+            &mut cursor,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            recording_sender(std::sync::Arc::clone(&seen), |i| {
+                if i == 1 {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::ZERO
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            seen.lock().map(|s| s.clone()).ok(),
+            Some(numbered(30).into_iter().step_by(10).collect())
+        );
+        assert_eq!(round.timed_out, 1);
+        assert_eq!(
+            cursor, 1,
+            "the next round starts at the chunk that timed out"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_round_cut_short_resumes_where_it_stopped() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let mut cursor = 0;
+        let all = numbered(50);
+        let mut covered = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let round = run_round(
+                &all,
+                &mut cursor,
+                Duration::from_millis(100),
+                Duration::from_millis(70),
+                recording_sender(std::sync::Arc::clone(&seen), |_| Duration::from_millis(30)),
+            )
+            .await;
+            assert!(round.cut_short || cursor == 0);
+            if let Ok(mut s) = seen.lock() {
+                covered.extend(s.drain(..));
+            }
+        }
+        assert_eq!(covered.len(), 5, "every chunk was sent within three rounds");
+    }
+
+    #[tokio::test]
+    async fn stale_handles_from_every_chunk_are_collected() {
+        let mut cursor = 0;
+        let round = run_round(
+            &numbered(25),
+            &mut cursor,
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+            |chunk: Vec<String>| async move {
+                VisibilityChange {
+                    stale: chunk.into_iter().take(1).collect(),
+                    errors: 0,
+                }
+            },
+        )
+        .await;
+        assert_eq!(round.stale, ["h0", "h10", "h20"]);
     }
 }

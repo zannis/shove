@@ -169,74 +169,84 @@ fn stale_handles(chunk: &[String], failures: &[BatchResultErrorEntry]) -> Vec<St
         .collect()
 }
 
-/// Shared mechanics behind [`route_requeue_batch`], [`route_reject_batch`] and
-/// [`extend_visibility_batch`]: one `ChangeMessageVisibilityBatch` call per
-/// chunk of up to 10 receipt handles, all set to the same `visibility_timeout`.
-/// Failures are logged. Settlement ignores them, mirroring `route_ack_batch`:
-/// a failed entry simply returns via its original visibility timeout instead
-/// of the requested one, which is "delayed, not lost".
-async fn change_visibility_batch(
+/// One `ChangeMessageVisibilityBatch` call over up to 10 receipt handles, all
+/// set to `visibility_timeout`. Failures are logged and counted in the result.
+async fn change_visibility_chunk(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
-    receipt_handles: &[String],
+    chunk: &[String],
     visibility_timeout: i32,
 ) -> VisibilityChange {
     let mut change = VisibilityChange::default();
-    for chunk in receipt_handles.chunks(MAX_BATCH_ENTRIES) {
-        let entries = visibility_entries(chunk, visibility_timeout);
-
-        if entries.is_empty() {
-            continue;
+    let entries = visibility_entries(chunk, visibility_timeout);
+    if entries.is_empty() {
+        return change;
+    }
+    match sqs
+        .change_message_visibility_batch()
+        .queue_url(queue_url)
+        .set_entries(Some(entries))
+        .send()
+        .await
+    {
+        Err(e) => {
+            change.errors = change.errors.saturating_add(1);
+            warn!(
+                queue_url,
+                error = %e,
+                "failed to batch change visibility for SQS messages"
+            );
         }
-
-        match sqs
-            .change_message_visibility_batch()
-            .queue_url(queue_url)
-            .set_entries(Some(entries))
-            .send()
-            .await
-        {
-            Err(e) => {
+        Ok(out) => {
+            for failure in out.failed() {
                 change.errors = change.errors.saturating_add(1);
                 warn!(
                     queue_url,
-                    error = %e,
-                    "failed to batch change visibility for SQS messages"
+                    id = failure.id(),
+                    code = failure.code(),
+                    "batch visibility change: individual entry failed"
                 );
             }
-            Ok(out) => {
-                for failure in out.failed() {
-                    change.errors = change.errors.saturating_add(1);
-                    warn!(
-                        queue_url,
-                        id = failure.id(),
-                        code = failure.code(),
-                        "batch visibility change: individual entry failed"
-                    );
-                }
-                change.stale.extend(stale_handles(chunk, out.failed()));
-            }
+            change.stale.extend(stale_handles(chunk, out.failed()));
         }
     }
     change
 }
 
-/// Hold `receipt_handles` for another `visibility_timeout` seconds. Every
-/// failure is counted as a backend error and left for the next heartbeat to
-/// retry; the stale handles are reported to the caller.
-pub(crate) async fn extend_visibility_batch(
+/// Shared mechanics behind [`route_requeue_batch`] and [`route_reject_batch`]:
+/// one chunk call per 10 receipt handles, all set to the same
+/// `visibility_timeout`. Settlement ignores failures, mirroring
+/// `route_ack_batch`: a failed entry simply returns via its original
+/// visibility timeout instead of the requested one, which is "delayed, not
+/// lost".
+async fn change_visibility_batch(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
     receipt_handles: &[String],
     visibility_timeout: i32,
+) {
+    for chunk in receipt_handles.chunks(MAX_BATCH_ENTRIES) {
+        change_visibility_chunk(sqs, queue_url, chunk, visibility_timeout).await;
+    }
+}
+
+/// Hold one chunk of up to 10 `receipt_handles` for another
+/// `visibility_timeout` seconds. Every failure is counted as a backend error
+/// and left for the next heartbeat to retry; the stale handles are reported
+/// to the caller.
+pub(crate) async fn extend_visibility_chunk(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    chunk: &[String],
+    visibility_timeout: i32,
 ) -> VisibilityChange {
     debug!(
         queue_url,
-        held = receipt_handles.len(),
+        held = chunk.len(),
         visibility_timeout,
         "extending visibility of held messages"
     );
-    let change = change_visibility_batch(sqs, queue_url, receipt_handles, visibility_timeout).await;
+    let change = change_visibility_chunk(sqs, queue_url, chunk, visibility_timeout).await;
     for _ in 0..change.errors {
         record_backend_error(BackendLabel::SnsSqs, BackendErrorKind::Consume);
     }

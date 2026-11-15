@@ -139,38 +139,42 @@ async fn read_heartbeat(sqs: &aws_sdk_sqs::Client, queue_url: &str) -> Result<Op
     Ok(heartbeat)
 }
 
-/// One bounded extension round over `handles`. Returns the handles SQS reports
-/// as already redelivered; a round that outlasts its bound is retried on the
-/// next tick.
+/// One bounded extension round over `handles`, resuming at `cursor`. Returns
+/// the handles SQS reports as already redelivered. A request that outlasts its
+/// bound and a round that runs out of budget are retried on the next tick.
 async fn extend_held(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
     heartbeat: Heartbeat,
     handles: &[String],
+    cursor: &mut usize,
 ) -> Vec<String> {
-    if handles.is_empty() {
-        return Vec::new();
-    }
-    match tokio::time::timeout(
-        heartbeat.bound(),
-        router::extend_visibility_batch(sqs, queue_url, handles, heartbeat.extend_to_secs),
+    let round = visibility::run_round(
+        handles,
+        cursor,
+        heartbeat.chunk_bound(),
+        heartbeat.round_budget(),
+        |chunk| async move {
+            router::extend_visibility_chunk(sqs, queue_url, &chunk, heartbeat.extend_to_secs).await
+        },
     )
-    .await
-    {
-        Ok(change) => change.stale,
-        Err(_) => {
-            warn!(
-                queue_url,
-                held = handles.len(),
-                "extending visibility of held messages timed out, retrying next tick"
-            );
-            metrics::record_backend_error(
-                metrics::BackendLabel::SnsSqs,
-                metrics::BackendErrorKind::Consume,
-            );
-            Vec::new()
-        }
+    .await;
+    if round.timed_out > 0 || round.cut_short {
+        warn!(
+            queue_url,
+            held = handles.len(),
+            timed_out = round.timed_out,
+            cut_short = round.cut_short,
+            "extending visibility of held messages did not finish, retrying next tick"
+        );
     }
+    for _ in 0..round.timed_out {
+        metrics::record_backend_error(
+            metrics::BackendLabel::SnsSqs,
+            metrics::BackendErrorKind::Consume,
+        );
+    }
+    round.stale
 }
 
 /// Ticks every `period` once armed; pending forever when there is no heartbeat.
@@ -1231,6 +1235,7 @@ where
     let mut in_flight_count: usize = 0;
     let mut receive: Option<InFlightReceive<'_>> = None;
     let mut ticker = heartbeat.map(beat_interval);
+    let mut extend_cursor = 0usize;
 
     info!(queue_url, prefetch, "sequenced SQS consumer started");
 
@@ -1398,86 +1403,16 @@ where
                     "shutdown signal, draining {} in-flight messages on {queue_url}",
                     in_flight_count
                 );
-                // Wait for all in-flight handlers to complete. Same backstop as
-                // the standard consumer's drain: the handler is already bounded
-                // by `handler_timeout` and resolves its own timeout, so this
-                // only stops shutdown hanging on a channel that never delivers.
-                // With deadlines disabled the handler is still running when it
-                // fires, so `drain_timeout_outcome` keeps it at Retry.
-                let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
-                for (key, state) in key_states.drain() {
-                    if let KeyState::InFlight { receipt_handle, retry_count, outcome_rx, .. } = state {
-                        let outcome = tokio::time::timeout(drain_timeout, outcome_rx)
-                            .await
-                            .unwrap_or_else(|_| {
-                                let resolved = drain_timeout_outcome(
-                                    options.handler_timeout,
-                                    options.handler_timeout_outcome.clone(),
-                                );
-                                warn!(queue_url, sequence_key = %key, outcome = ?resolved, "handler outcome did not arrive within the shutdown drain");
-                                Ok(resolved)
-                            })
-                            // A closed channel means the handler task panicked
-                            // or was aborted: no outcome exists, so redeliver.
-                            .unwrap_or(Outcome::Retry);
-                        debug!(
-                            queue_url,
-                            sequence_key = %key,
-                            ?outcome,
-                            "draining in-flight message on shutdown"
-                        );
-                        match outcome {
-                            Outcome::Ack => {
-                                router::route_ack(sqs, queue_url, &receipt_handle).await;
-                            }
-                            Outcome::Reject => {
-                                router::route_reject(
-                                    sqs,
-                                    queue_url,
-                                    &receipt_handle,
-                                    topology,
-                                    group.as_deref(),
-                                    metrics::FailReason::Rejected,
-                                )
-                                .await;
-                            }
-                            Outcome::Retry => {
-                                router::route_retry_fifo(
-                                    sqs,
-                                    queue_url,
-                                    &receipt_handle,
-                                    topology,
-                                    retry_count,
-                                )
-                                .await;
-                            }
-                            Outcome::Defer => {
-                                warn!(
-                                    queue_url,
-                                    sequence_key = %key,
-                                    "Defer is not supported on sequenced (FIFO) consumers, treating as Retry"
-                                );
-                                router::route_retry_fifo(
-                                    sqs,
-                                    queue_url,
-                                    &receipt_handle,
-                                    topology,
-                                    retry_count,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                }
-                // Pending deliveries: change visibility to 0 so they are redelivered.
-                // These were buffered but never dispatched, so this is a requeue,
-                // not a rejection — matching the standard and concurrent loops.
-                for (_key, msgs) in pending_deliveries.drain() {
-                    for msg in msgs {
-                        let rh = msg.receipt_handle().unwrap_or_default();
-                        router::route_requeue(sqs, queue_url, rh).await;
-                    }
-                }
+                drain_on_shutdown(
+                    sqs,
+                    queue_url,
+                    topology,
+                    options,
+                    group.as_deref(),
+                    key_states,
+                    pending_deliveries,
+                )
+                .await;
                 return Ok(());
             }
 
@@ -1489,7 +1424,8 @@ where
             () = next_beat(&mut ticker), if !pending_deliveries.is_empty() => {
                 if let Some(heartbeat) = heartbeat {
                     let held = visibility::held_handles(pending_deliveries);
-                    let stale = extend_held(sqs, queue_url, heartbeat, &held).await;
+                    let stale =
+                        extend_held(sqs, queue_url, heartbeat, &held, &mut extend_cursor).await;
                     if !stale.is_empty() {
                         warn!(
                             queue_url,
@@ -1795,6 +1731,109 @@ where
                     );
                     in_flight_count = in_flight_count.saturating_add(1);
                     options.processing.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// Releases the buffered messages, then settles the running handlers.
+///
+/// The buffered ones go first: they were never dispatched, so a visibility-0
+/// requeue is their whole outcome, and awaiting a handler first would leave
+/// them held (and no longer heartbeated) until it finished.
+async fn drain_on_shutdown(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    topology: &'static QueueTopology,
+    options: &ConsumerOptions,
+    group: Option<&str>,
+    key_states: HashMap<String, KeyState>,
+    pending_deliveries: &mut HashMap<String, VecDeque<Message>>,
+) {
+    // Pending deliveries: change visibility to 0 so they are redelivered.
+    // These were buffered but never dispatched, so this is a requeue,
+    // not a rejection — matching the standard and concurrent loops.
+    for (_key, msgs) in pending_deliveries.drain() {
+        for msg in msgs {
+            let rh = msg.receipt_handle().unwrap_or_default();
+            router::route_requeue(sqs, queue_url, rh).await;
+        }
+    }
+
+    // Wait for all in-flight handlers to complete. Same backstop as
+    // the standard consumer's drain: the handler is already bounded
+    // by `handler_timeout` and resolves its own timeout, so this
+    // only stops shutdown hanging on a channel that never delivers.
+    // With deadlines disabled the handler is still running when it
+    // fires, so `drain_timeout_outcome` keeps it at Retry.
+    let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
+    for (key, state) in key_states {
+        if let KeyState::InFlight {
+            receipt_handle,
+            retry_count,
+            outcome_rx,
+            ..
+        } = state
+        {
+            let outcome = tokio::time::timeout(drain_timeout, outcome_rx)
+                    .await
+                    .unwrap_or_else(|_| {
+                        let resolved = drain_timeout_outcome(
+                            options.handler_timeout,
+                            options.handler_timeout_outcome.clone(),
+                        );
+                        warn!(queue_url, sequence_key = %key, outcome = ?resolved, "handler outcome did not arrive within the shutdown drain");
+                        Ok(resolved)
+                    })
+                    // A closed channel means the handler task panicked
+                    // or was aborted: no outcome exists, so redeliver.
+                    .unwrap_or(Outcome::Retry);
+            debug!(
+                queue_url,
+                sequence_key = %key,
+                ?outcome,
+                "draining in-flight message on shutdown"
+            );
+            match outcome {
+                Outcome::Ack => {
+                    router::route_ack(sqs, queue_url, &receipt_handle).await;
+                }
+                Outcome::Reject => {
+                    router::route_reject(
+                        sqs,
+                        queue_url,
+                        &receipt_handle,
+                        topology,
+                        group,
+                        metrics::FailReason::Rejected,
+                    )
+                    .await;
+                }
+                Outcome::Retry => {
+                    router::route_retry_fifo(
+                        sqs,
+                        queue_url,
+                        &receipt_handle,
+                        topology,
+                        retry_count,
+                    )
+                    .await;
+                }
+                Outcome::Defer => {
+                    warn!(
+                        queue_url,
+                        sequence_key = %key,
+                        "Defer is not supported on sequenced (FIFO) consumers, treating as Retry"
+                    );
+                    router::route_retry_fifo(
+                        sqs,
+                        queue_url,
+                        &receipt_handle,
+                        topology,
+                        retry_count,
+                    )
+                    .await;
                 }
             }
         }
@@ -2387,9 +2426,10 @@ async fn beat_forever(
     handles: &[String],
 ) -> std::convert::Infallible {
     let mut ticker = beat_interval(heartbeat);
+    let mut cursor = 0;
     loop {
         ticker.tick().await;
-        let stale = extend_held(sqs, queue_url, heartbeat, handles).await;
+        let stale = extend_held(sqs, queue_url, heartbeat, handles, &mut cursor).await;
         if !stale.is_empty() {
             warn!(
                 queue_url,
@@ -2418,7 +2458,14 @@ async fn flush_sqs_batch<T, H>(
         return;
     }
     if let Some(heartbeat) = flush.heartbeat {
-        let stale = extend_held(flush.sqs, flush.queue_url, heartbeat, &batch.handles).await;
+        let stale = extend_held(
+            flush.sqs,
+            flush.queue_url,
+            heartbeat,
+            &batch.handles,
+            &mut 0,
+        )
+        .await;
         if !stale.is_empty() {
             let dropped = batch.drop_handles(&stale);
             warn!(
@@ -2626,7 +2673,7 @@ where
         if let (Some(heartbeat), Some(due)) = (heartbeat, next_extension)
             && tokio::time::Instant::now() >= due
         {
-            let stale = extend_held(sqs, queue_url, heartbeat, &batch.handles).await;
+            let stale = extend_held(sqs, queue_url, heartbeat, &batch.handles, &mut 0).await;
             if !stale.is_empty() {
                 let dropped = batch.drop_handles(&stale);
                 warn!(
@@ -3561,5 +3608,166 @@ mod held_batch_tests {
         assert_eq!(batch.drop_handles(&["h1".to_string()]), 1);
         assert!(batch.is_empty());
         assert_eq!(batch.drop_handles(&["h1".to_string()]), 0);
+    }
+}
+
+#[cfg(test)]
+mod shutdown_order_tests {
+    use super::*;
+    use crate::TopologyBuilder;
+    use std::sync::{Mutex, OnceLock};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    type Requests = Arc<Mutex<Vec<String>>>;
+
+    /// A local SQS endpoint that answers every request with `{}` and records
+    /// each as `<x-amz-target> <body>`.
+    async fn recording_endpoint() -> (String, Requests) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let requests: Requests = Arc::default();
+        let log = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    return;
+                };
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let head_end = loop {
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break i + 4;
+                            }
+                            match conn.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        while buf.len() < head_end + len {
+                            match conn.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let target = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("x-amz-target:"))
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let body = String::from_utf8_lossy(&buf[head_end..head_end + len]);
+                        if let Ok(mut l) = log.lock() {
+                            l.push(format!("{target} {body}"));
+                        }
+                        buf.drain(..head_end + len);
+                        let reply = "HTTP/1.1 200 OK\r\ncontent-type: application/x-amz-json-1.0\r\ncontent-length: 2\r\n\r\n{}";
+                        if conn.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), requests)
+    }
+
+    #[allow(clippy::absolute_paths)]
+    fn client(endpoint: &str) -> aws_sdk_sqs::Client {
+        aws_sdk_sqs::Client::from_conf(
+            aws_sdk_sqs::config::Config::builder()
+                .behavior_version(aws_config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_sqs::config::Credentials::new(
+                    "k", "s", None, None, "test",
+                ))
+                .endpoint_url(endpoint)
+                .retry_config(aws_config::retry::RetryConfig::disabled())
+                .build(),
+        )
+    }
+
+    fn position(requests: &Requests, needle: &str) -> Option<usize> {
+        requests
+            .lock()
+            .ok()
+            .and_then(|l| l.iter().position(|r| r.contains(needle)))
+    }
+
+    /// The buffered message is requeued while the running handler is still
+    /// outstanding, and the handler's message is still acked afterwards.
+    #[tokio::test]
+    async fn buffered_messages_are_released_before_the_running_handler_is_awaited() {
+        static TOPOLOGY: OnceLock<QueueTopology> = OnceLock::new();
+        let topology = TOPOLOGY.get_or_init(|| TopologyBuilder::new("shutdown-order").build());
+        let (endpoint, requests) = recording_endpoint().await;
+        let sqs = client(&endpoint);
+        let options = crate::ConsumerOptions::<crate::Sqs>::new().into_inner();
+
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        let key_states = HashMap::from([(
+            "k".to_string(),
+            KeyState::InFlight {
+                receipt_handle: "running-handle".to_string(),
+                msg: Arc::new(Message::builder().build()),
+                message_id: "m1".to_string(),
+                retry_count: 0,
+                outcome_rx,
+            },
+        )]);
+        let mut pending = HashMap::from([(
+            "k".to_string(),
+            VecDeque::from([Message::builder().receipt_handle("buffered-handle").build()]),
+        )]);
+
+        let drain = tokio::spawn(async move {
+            drain_on_shutdown(
+                &sqs,
+                "http://queue",
+                topology,
+                &options,
+                None,
+                key_states,
+                &mut pending,
+            )
+            .await;
+            pending.len()
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while position(&requests, "buffered-handle").is_none()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            position(&requests, "buffered-handle").is_some(),
+            "the buffered message was not released while the handler was running"
+        );
+        assert!(position(&requests, "running-handle").is_none());
+
+        let _ = outcome_tx.send(Outcome::Ack);
+        let left = drain.await.expect("drain task");
+        assert_eq!(left, 0);
+        let released = position(&requests, "buffered-handle");
+        let acked = position(&requests, "running-handle");
+        assert!(released.is_some() && acked.is_some() && released < acked);
+        assert!(
+            requests
+                .lock()
+                .map(|l| l
+                    .iter()
+                    .any(|r| r.contains("deletemessage") && r.contains("running-handle")))
+                .unwrap_or(false)
+        );
     }
 }
