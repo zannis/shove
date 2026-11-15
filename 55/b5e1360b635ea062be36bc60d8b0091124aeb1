@@ -1,0 +1,21 @@
+src/backends/rabbitmq/client.rs
+  s_6511f1668e6a79::t_fd96f997b3e626 29-59,62,517-543
+src/backends/rabbitmq/management.rs
+  s_6511f1668e6a79::t_144f95cb2287c0 31,476-488
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "55b5e1360b635ea062be36bc60d8b0091124aeb1",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
