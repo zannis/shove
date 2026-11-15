@@ -572,13 +572,23 @@ pub(crate) fn get_retry_count(message: &Message) -> u32 {
     {
         return count;
     }
-    // Fallback: ApproximateReceiveCount - 1 (first delivery or legacy messages).
+    receive_count_retries(message)
+}
+
+fn receive_count_retries(message: &Message) -> u32 {
     message
         .attributes()
         .and_then(|attrs| attrs.get(&MessageSystemAttributeName::ApproximateReceiveCount))
         .and_then(|v| v.parse::<u32>().ok())
         .map(|count| count.saturating_sub(1))
         .unwrap_or(0)
+}
+
+/// Retry count on a FIFO (sequenced) queue, from `ApproximateReceiveCount - 1`
+/// alone. The FIFO retry path never rewrites `x-retry-count`, so any value
+/// present was set by the sender and must not steer the count.
+pub(crate) fn get_retry_count_fifo(message: &Message) -> u32 {
+    receive_count_retries(message)
 }
 
 /// Extract string message attributes from an SQS message.
@@ -714,6 +724,39 @@ mod tests {
             .message_attributes(RETRY_COUNT_ATTR, attr)
             .build();
         assert_eq!(get_retry_count(&msg), 3);
+    }
+
+    fn forged_attr_message(arc: &str, forged: &str) -> Message {
+        let attr = MessageAttributeValue::builder()
+            .data_type("String")
+            .string_value(forged)
+            .build()
+            .unwrap();
+        Message::builder()
+            .attributes(MessageSystemAttributeName::ApproximateReceiveCount, arc)
+            .message_attributes(RETRY_COUNT_ATTR, attr)
+            .build()
+    }
+
+    #[test]
+    fn fifo_retry_count_ignores_forged_attribute() {
+        assert_eq!(get_retry_count_fifo(&forged_attr_message("4", "0")), 3);
+        assert_eq!(get_retry_count_fifo(&forged_attr_message("4", "99")), 3);
+        assert_eq!(get_retry_count_fifo(&forged_attr_message("1", "7")), 0);
+    }
+
+    #[test]
+    fn fifo_retry_count_without_attribute_is_receive_count_minus_one() {
+        let msg = Message::builder()
+            .attributes(MessageSystemAttributeName::ApproximateReceiveCount, "4")
+            .build();
+        assert_eq!(get_retry_count_fifo(&msg), 3);
+        assert_eq!(get_retry_count_fifo(&Message::builder().build()), 0);
+    }
+
+    #[test]
+    fn standard_retry_count_still_prefers_attribute() {
+        assert_eq!(get_retry_count(&forged_attr_message("4", "0")), 0);
     }
 
     #[test]
