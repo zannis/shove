@@ -619,16 +619,16 @@ impl RabbitMqConsumer {
                             }
                             if !shard_hold_queues.is_empty() {
                                 let hold_queue = &shard_hold_queues[0];
-                                let mut headers = router::clone_headers(delivery);
-                                let hold_token = router::stamp_hold_headers(
-                                    &mut headers,
-                                    &delivery_sequence_key(delivery),
-                                );
-                                match publisher
-                                    .publish_to_queue(hold_queue.name(), &received.payload, headers)
-                                    .await
+                                match publish_shard_hold_copy(
+                                    &publisher,
+                                    hold_queue,
+                                    &received,
+                                    router::clone_headers(delivery),
+                                    queue,
+                                )
+                                .await
                                 {
-                                    Ok(()) => {
+                                    Ok(hold_token) => {
                                         if let Err(e) =
                                             delivery.ack(BasicAckOptions::default()).await
                                         {
@@ -749,16 +749,16 @@ impl RabbitMqConsumer {
                                     }
                                     if !shard_hold_queues.is_empty() {
                                         let hold_queue = &shard_hold_queues[0];
-                                        let headers = router::clone_headers(delivery);
-                                        match publisher
-                                            .publish_to_queue(
-                                                hold_queue.name(),
-                                                &received.payload,
-                                                headers,
-                                            )
-                                            .await
+                                        match publish_shard_hold_copy(
+                                            &publisher,
+                                            hold_queue,
+                                            &received,
+                                            router::clone_headers(delivery),
+                                            queue,
+                                        )
+                                        .await
                                         {
-                                            Ok(()) => {
+                                            Ok(_) => {
                                                 if let Err(e) =
                                                     delivery.ack(BasicAckOptions::default()).await
                                                 {
@@ -841,7 +841,7 @@ impl RabbitMqConsumer {
                     let received = ReceivedDelivery::new(unwrap_delivery(item, queue)?);
                     let delivery = &received.delivery;
                     let arriving_token = delivery_retry_token(delivery);
-                    let seq_key = delivery_sequence_key(delivery);
+                    let seq_key = delivery_sequence_key(delivery, queue);
                     let retry_count = get_retry_count(delivery);
 
                     // ── FailAll: skip poisoned keys ──
@@ -1625,6 +1625,26 @@ async fn route_broadcast_outcome(
 /// Route a retry for a sequenced shard via per-shard hold queues.
 /// Returns the `x-message-id` the key should wait for: the hold-queue copy's
 /// when it was published, the original's when the message was requeued.
+/// The only way a sequenced message reaches a shard hold queue: stamps the
+/// original sequence key and a fresh token on the copy, publishes it, and
+/// returns the token.
+async fn publish_shard_hold_copy(
+    publisher: &ChannelPublisher,
+    hold_queue: &HoldQueue,
+    received: &ReceivedDelivery,
+    mut headers: FieldTable,
+    shard_queue: &str,
+) -> Result<String> {
+    let token = router::stamp_hold_headers(
+        &mut headers,
+        &delivery_sequence_key(&received.delivery, shard_queue),
+    );
+    publisher
+        .publish_to_queue(hold_queue.name(), &received.payload, headers)
+        .await?;
+    Ok(token)
+}
+
 async fn route_shard_retry(
     received: &ReceivedDelivery,
     shard_hold_queues: &[HoldQueue],
@@ -1638,14 +1658,10 @@ async fn route_shard_retry(
         .and_then(|index| shard_hold_queues.get(index))
     {
         let new_retry_count = retry_count.saturating_add(1);
-        let mut headers = router::clone_headers_with_retry(delivery, new_retry_count);
-        let hold_token = router::stamp_hold_headers(&mut headers, &delivery_sequence_key(delivery));
+        let headers = router::clone_headers_with_retry(delivery, new_retry_count);
 
-        match publisher
-            .publish_to_queue(hold_queue.name(), &received.payload, headers)
-            .await
-        {
-            Ok(()) => {
+        match publish_shard_hold_copy(publisher, hold_queue, received, headers, queue).await {
+            Ok(hold_token) => {
                 if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
                     error!("failed to ack delivery after publishing to shard hold queue: {e}");
                     publisher.rollback_if_tx().await;

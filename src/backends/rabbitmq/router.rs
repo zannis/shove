@@ -592,9 +592,13 @@ mod tests {
     fn sequence_key_survives_a_second_hop_while_the_token_is_replaced() {
         let mut first_hop = FieldTable::default();
         let first_token = stamp_hold_headers(&mut first_hop, "K");
+        first_hop.insert(
+            ShortString::from("x-death"),
+            AMQPValue::FieldArray(vec![AMQPValue::FieldTable(FieldTable::default())].into()),
+        );
         let mut returned = make_delivery(Some(first_hop));
         returned.routing_key = ShortString::from("queue-seq-0");
-        let key = delivery_sequence_key(&returned);
+        let key = delivery_sequence_key(&returned, "queue-seq-0");
         let mut second_hop = clone_headers_with_retry(&returned, 2);
         let second_token = stamp_hold_headers(&mut second_hop, &key);
         assert_eq!(
