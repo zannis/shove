@@ -137,7 +137,7 @@ inmemory = ["dep:dashmap", "dep:futures-util"]
 # futures-util: `FutureExt::catch_unwind`, to resolve a panicking handler to
 # `Outcome::Retry` (see `backends::redis::lease::catch_handler_panic`). The
 # `redis` crate already pulls it in, so this only wires up the feature edge.
-redis-streams = ["dep:redis", "dep:futures-util"]
+redis-streams = ["dep:redis", "dep:futures-util", "dep:rustls"]
 
 # Emit operational metrics via the `metrics` facade. Consumer services
 # install their own recorder (e.g. `metrics-exporter-prometheus`) and
@@ -218,6 +218,9 @@ redis = { version = "1", features = [
   "tokio-rustls-comp",
   "cluster-async",
 ], optional = true }
+# redis builds its TLS config from rustls' process-default provider; this edge compiles `ring`
+# in so `backends::redis::client` can install it when the process has none.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 metrics = { version = "0.24", optional = true }
 url = { version = "2", optional = true }
 prost = { version = "0.14", optional = true }
