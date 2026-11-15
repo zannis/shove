@@ -1490,3 +1490,80 @@ async fn batch_held_past_the_visibility_timeout_is_handled_once() {
         remaining.messages().len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// 14. The flush extends the batch before the handler runs
+// ---------------------------------------------------------------------------
+
+/// The consumer starts under the queue's 30 s default and heartbeats every
+/// 15 s. The queue's timeout then drops to 3 s, so the messages lapse at 3 s,
+/// before any accumulation tick and 1 s after the flush at 2 s. Only an
+/// extension made at the flush itself keeps them from a sibling consumer for
+/// the 4 s the handler runs.
+#[tokio::test]
+async fn batch_flush_extends_before_the_handler_runs() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<HeldTopic>().await;
+
+    let sqs = broker.sqs_client().await;
+    let url = sqs_queue_url(&sqs, "sqs-batch-held").await;
+
+    let handler = SlowBatchHandler {
+        batches: Arc::new(Mutex::new(Vec::new())),
+        run_for: Duration::from_secs(4),
+    };
+    let batches = handler.batches.clone();
+    let shutdown = CancellationToken::new();
+    let consumer = setup.broker.batch_consumer();
+    let handle = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<HeldTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(10)
+                        .with_max_batch_age(Duration::from_secs(2))
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    sqs.set_queue_attributes()
+        .queue_url(&url)
+        .attributes(QueueAttributeName::VisibilityTimeout, "3")
+        .send()
+        .await
+        .expect("shorten visibility timeout");
+    publish_seqs::<HeldTopic>(&setup.publisher, 0..3).await;
+
+    // Let the consumer receive the messages before the sibling starts.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut sibling_saw = 0usize;
+    let watch_until = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < watch_until {
+        let got = sqs
+            .receive_message()
+            .queue_url(&url)
+            .max_number_of_messages(10)
+            .visibility_timeout(0)
+            .send()
+            .await
+            .expect("sibling receive");
+        sibling_saw += got.messages().len();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task should not panic")
+        .expect("consumer should exit cleanly");
+
+    assert_eq!(sibling_saw, 0, "a sibling consumer saw the flushed batch");
+    assert_eq!(batches.lock().unwrap().len(), 1);
+}

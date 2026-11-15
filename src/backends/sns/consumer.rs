@@ -1026,23 +1026,34 @@ fn classify_sequenced_delivery(
 }
 
 /// Replaces the buffered entry sharing `msg`'s `MessageId` with the fresh
-/// delivery (the old receipt handle is stale), keeping its position. Returns
-/// the message back when nothing in the buffer shares its id.
+/// delivery (the old receipt handle is stale), keeping its position. The
+/// replacement keeps the entry's `ApproximateReceiveCount`: the message was
+/// never dispatched, so the receives made while it waited are not retries.
+/// Returns the message back when nothing in the buffer shares its id.
 fn buffer_or_replace(
     buffer: &mut VecDeque<Message>,
     message_id: &str,
     msg: Message,
 ) -> Option<Message> {
-    match buffer
+    let Some(slot) = buffer
         .iter_mut()
         .find(|m| m.message_id() == Some(message_id))
-    {
-        Some(slot) => {
-            *slot = msg;
-            None
-        }
-        None => Some(msg),
+    else {
+        return Some(msg);
+    };
+    let held_count = slot
+        .attributes()
+        .and_then(|a| a.get(&MessageSystemAttributeName::ApproximateReceiveCount))
+        .cloned();
+    let mut fresh = msg;
+    if let Some(count) = held_count {
+        fresh
+            .attributes
+            .get_or_insert_with(HashMap::new)
+            .insert(MessageSystemAttributeName::ApproximateReceiveCount, count);
     }
+    *slot = fresh;
+    None
 }
 
 /// Extract the sequence key from SQS MessageGroupId system attribute.
@@ -1591,7 +1602,7 @@ where
                             debug!(
                                 sequence_key = %seq_key,
                                 queue_url,
-                                "buffered message redelivered, refreshed its receipt handle"
+                                "buffered message redelivered, refreshed its receipt handle, kept its receive count"
                             );
                             continue;
                         };
@@ -2406,6 +2417,19 @@ async fn flush_sqs_batch<T, H>(
     if batch.is_empty() {
         return;
     }
+    if let Some(heartbeat) = flush.heartbeat {
+        let stale = extend_held(flush.sqs, flush.queue_url, heartbeat, &batch.handles).await;
+        if !stale.is_empty() {
+            let dropped = batch.drop_handles(&stale);
+            warn!(
+                queue_url = flush.queue_url,
+                dropped, "batch messages were redelivered before the flush, dropping them"
+            );
+            if batch.is_empty() {
+                return;
+            }
+        }
+    }
     let batch_size = batch.len();
     let (messages, handles) = batch.take();
 
@@ -2893,12 +2917,17 @@ impl SqsConsumer {
         let on_failure = seq.on_failure();
         let mut handles = Vec::new();
 
+        let sqs = consumer.client.sqs().clone();
+        let mut shards = Vec::new();
         for i in 0..seq.routing_shards() {
             let shard_queue_name = format!("{}-seq-{i}", topology.queue());
             let shard_queue_url = consumer.resolve_queue_url(&shard_queue_name).await?;
-
-            let sqs = consumer.client.sqs().clone();
             let heartbeat = read_heartbeat(&sqs, &shard_queue_url).await?;
+            shards.push((shard_queue_name, shard_queue_url, heartbeat));
+        }
+
+        for (shard_queue_name, shard_queue_url, heartbeat) in shards {
+            let sqs = sqs.clone();
             let h = handler.clone();
             let c = ctx.clone();
             let opts = options.clone();
@@ -3468,6 +3497,19 @@ mod key_identity_tests {
         assert!(buffer_or_replace(&mut buf, "m1", msg(Some("m1"), "new1")).is_none());
         let handles: Vec<_> = buf.iter().map(|m| m.receipt_handle()).collect();
         assert_eq!(handles, [Some("new1"), Some("old2")]);
+    }
+
+    #[test]
+    fn a_redelivered_buffered_message_keeps_the_receive_count_it_was_buffered_with() {
+        let mut buf: VecDeque<Message> = VecDeque::from([counted(Some("m1"), "2")]);
+        let fresh = counted(Some("m1"), "5");
+        assert!(buffer_or_replace(&mut buf, "m1", fresh).is_none());
+        assert_eq!(buf.front().and_then(approximate_receive_count), Some(2));
+        assert_eq!(
+            buf.front()
+                .and_then(|m| classify_sequenced_delivery(m).ok()),
+            Some((1, "m1".to_string()))
+        );
     }
 
     #[test]

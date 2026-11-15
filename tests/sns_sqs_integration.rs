@@ -4462,3 +4462,59 @@ async fn shutdown_settles_completed_and_running_handlers() {
     assert!(fast_done, "the fast handlers should complete");
     assert_eq!(counts, (0, 0), "every handled message should be deleted");
 }
+
+define_sequenced_topic!(
+    SeqTwoShardTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("sqs-seq-twoshard")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(2)
+        .hold_queue(Duration::from_secs(5))
+        .dlq()
+        .build()
+);
+
+/// A shard whose queue attributes cannot be read fails the start before any
+/// shard begins consuming.
+#[tokio::test]
+async fn a_failed_shard_start_leaves_no_earlier_shard_running() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqTwoShardTopic>().await;
+
+    let sqs = broker.sqs_client().await;
+    let first = setup
+        .queue_registry()
+        .get("sqs-seq-twoshard-seq-0")
+        .await
+        .expect("shard 0 registered");
+    let second = setup
+        .queue_registry()
+        .get("sqs-seq-twoshard-seq-1")
+        .await
+        .expect("shard 1 registered");
+    sqs.delete_queue()
+        .queue_url(&second)
+        .send()
+        .await
+        .expect("delete shard 1");
+    send_to_shard(&sqs, &first, "twoshard", &[1]).await;
+
+    let handler = RetryFirstHandler {
+        poison_calls: Arc::new(AtomicU32::new(0)),
+        later_handled: Arc::new(AtomicU32::new(0)),
+    };
+    let handled = handler.poison_calls.clone();
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    let result = consumer
+        .run_fifo::<SeqTwoShardTopic, _>(handler, (), ConsumerOptions::<Sqs>::new())
+        .await;
+    assert!(
+        result.is_err(),
+        "start must fail when a shard cannot be read"
+    );
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(handled.load(Ordering::SeqCst), 0, "shard 0 consumed anyway");
+}
