@@ -66,7 +66,6 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -137,13 +136,12 @@ fn lock() -> std::sync::MutexGuard<'static, HashMap<Key, Entry>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Latest requeuer task per key, with the generation that stored it. It stays
+/// Latest requeuer task per key, with the marker its task owns. It stays
 /// reachable after the registry entry is released so a replacement can wait
 /// for it; a task removes its own slot when it exits.
-type RequeuerSlots = HashMap<Key, (u64, JoinHandle<()>)>;
+type RequeuerSlots = HashMap<Key, (Arc<()>, JoinHandle<()>)>;
 
 static REQUEUERS: OnceLock<Mutex<RequeuerSlots>> = OnceLock::new();
-static REQUEUER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn requeuer_slots() -> std::sync::MutexGuard<'static, RequeuerSlots> {
     REQUEUERS
@@ -158,7 +156,8 @@ fn spawn_after_previous<F>(key: &Key, task: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let generation = REQUEUER_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let marker = Arc::new(());
+    let task_marker = Arc::clone(&marker);
     let mut slots = requeuer_slots();
     let previous = slots
         .remove(key)
@@ -173,12 +172,12 @@ where
         let mut slots = requeuer_slots();
         if slots
             .get(&slot_key)
-            .is_some_and(|(stored, _)| *stored == generation)
+            .is_some_and(|(stored, _)| Arc::ptr_eq(stored, &task_marker))
         {
             slots.remove(&slot_key);
         }
     });
-    slots.insert(key.clone(), (generation, handle));
+    slots.insert(key.clone(), (marker, handle));
 }
 
 /// Handle for one consumer's interest in a stream's maintenance. Dropping
