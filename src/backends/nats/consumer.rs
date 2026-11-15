@@ -665,7 +665,7 @@ fn progress_interval(ack_wait: Duration) -> Duration {
 }
 
 /// A sub-3 ns `ack_wait` would divide to zero and spin the renewal loops.
-const MIN_PROGRESS_INTERVAL: Duration = Duration::from_millis(1);
+const MIN_PROGRESS_INTERVAL: Duration = Duration::from_nanos(1);
 
 /// Holds `msg` un-acked for `delay`, renewing its `ack_wait` with a progress
 /// ack every [`progress_interval`] and once more as the wait ends, so what
@@ -4105,6 +4105,10 @@ mod ack_wait_tests {
         for ack_wait in [Duration::from_nanos(1), Duration::from_nanos(2)] {
             assert_eq!(progress_interval(ack_wait), MIN_PROGRESS_INTERVAL);
         }
+        assert_eq!(
+            progress_interval(Duration::from_micros(900)),
+            Duration::from_micros(300)
+        );
         assert_eq!(
             progress_interval(Duration::from_secs(30)),
             Duration::from_secs(10)

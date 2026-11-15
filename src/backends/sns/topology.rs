@@ -22,6 +22,15 @@ fn shard_filter_policy(shard: u16) -> String {
     serde_json::json!({ SHARD_ATTR: [shard.to_string()] }).to_string()
 }
 
+#[cfg(feature = "aws-sns-sqs")]
+fn declared_topic_arn(arn: Option<String>, queue: &str) -> Result<String> {
+    arn.ok_or_else(|| {
+        ShoveError::Topology(format!(
+            "topic ARN for '{queue}' missing from the registry after declare"
+        ))
+    })
+}
+
 /// Registry mapping queue names to SNS topic ARNs.
 ///
 /// Populated by the topology declarer or pre-configured ARNs.
@@ -463,16 +472,10 @@ impl SnsTopologyDeclarer {
         // Declare SQS queues if not yet registered (idempotent).
         #[cfg(feature = "aws-sns-sqs")]
         if self.queue_registry().get(topology.queue()).await.is_none() {
-            let topic_arn = self
-                .topic_registry()
-                .get(topology.queue())
-                .await
-                .ok_or_else(|| {
-                    ShoveError::Topology(format!(
-                        "topic ARN for '{}' missing from the registry after declare",
-                        topology.queue()
-                    ))
-                })?;
+            let topic_arn = declared_topic_arn(
+                self.topic_registry().get(topology.queue()).await,
+                topology.queue(),
+            )?;
 
             if topology.sequencing().is_some() {
                 self.declare_sqs_sequenced(topology, &topic_arn).await?;
@@ -491,6 +494,19 @@ mod tests {
     use crate::SequenceFailure;
     use crate::topology::TopologyBuilder;
     use std::time::Duration;
+
+    #[cfg(feature = "aws-sns-sqs")]
+    #[test]
+    fn a_topic_arn_missing_after_declare_is_a_topology_error() {
+        assert_eq!(
+            declared_topic_arn(Some("arn:aws:sns:x".into()), "orders").unwrap(),
+            "arn:aws:sns:x"
+        );
+        assert!(matches!(
+            declared_topic_arn(None, "orders"),
+            Err(ShoveError::Topology(_))
+        ));
+    }
 
     #[cfg(feature = "aws-sns-sqs")]
     #[test]
