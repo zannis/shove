@@ -7682,30 +7682,7 @@ async fn sequenced_key_of_a_returning_delivery_comes_from_its_payload_not_a_head
     ctx.cleanup().await;
 }
 
-/// The broker closes the connection while a key waits: the waiting message and
-/// the one buffered behind it are redelivered, handled once more each, in order,
-/// and never at the same time.
-#[tokio::test]
-async fn sequenced_connection_loss_during_a_wait_redelivers_in_order_without_overlap() {
-    let ctx = TestContext::new().await;
-    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
-    let b = ctx.broker_from(client.clone());
-    b.topology()
-        .declare::<InPlaceRestartOrders>()
-        .await
-        .unwrap();
-    let publisher = b.publisher().await.unwrap();
-    let handler =
-        InPlaceHandler::new(retry_first_handling_of(1)).busy_for(Duration::from_millis(400));
-
-    let shutdown = CancellationToken::new();
-    let consumer =
-        spawn_in_place_consumer::<InPlaceRestartOrders>(&client, &handler, shutdown.clone(), 5);
-    publish_order::<InPlaceRestartOrders>(&publisher, "ACC-LOSS", 1).await;
-    handler.wait_handled(1, 30).await;
-    publish_order::<InPlaceRestartOrders>(&publisher, "ACC-LOSS", 2).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
+async fn close_all_connections(ctx: &TestContext) {
     let http = reqwest::Client::new();
     // The management API reports connections on its stats interval.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -7744,6 +7721,33 @@ async fn sequenced_connection_loss_during_a_wait_redelivers_in_order_without_ove
             .await
             .unwrap();
     }
+}
+
+/// The broker closes the connection while a key waits: the waiting message and
+/// the one buffered behind it are redelivered, handled once more each, in order,
+/// and never at the same time.
+#[tokio::test]
+async fn sequenced_connection_loss_during_a_wait_redelivers_in_order_without_overlap() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology()
+        .declare::<InPlaceRestartOrders>()
+        .await
+        .unwrap();
+    let publisher = b.publisher().await.unwrap();
+    let handler =
+        InPlaceHandler::new(retry_first_handling_of(1)).busy_for(Duration::from_millis(400));
+
+    let shutdown = CancellationToken::new();
+    let consumer =
+        spawn_in_place_consumer::<InPlaceRestartOrders>(&client, &handler, shutdown.clone(), 5);
+    publish_order::<InPlaceRestartOrders>(&publisher, "ACC-LOSS", 1).await;
+    handler.wait_handled(1, 30).await;
+    publish_order::<InPlaceRestartOrders>(&publisher, "ACC-LOSS", 2).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    close_all_connections(&ctx).await;
 
     handler.wait_handled(3, 60).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -7874,6 +7878,37 @@ async fn sequenced_hold_queue_timeout_does_not_evict_a_key_waiting_in_place() {
     shutdown.cancel();
     consumer.await.unwrap().unwrap();
     dlq.abort();
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+/// The connection closes while the handler of a key's message is running, so
+/// its `Ack` cannot be sent. The message is redelivered and handled again before
+/// the one buffered behind it. The orphaned first run keeps going until it
+/// returns, so overlap with that run is not asserted.
+#[tokio::test]
+async fn sequenced_connection_loss_during_a_handler_keeps_the_key_held() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology().declare::<InPlaceSkipOrders>().await.unwrap();
+    let publisher = b.publisher().await.unwrap();
+    let handler = InPlaceHandler::new(|_, _, _| Outcome::Ack).busy_for(Duration::from_secs(4));
+
+    let shutdown = CancellationToken::new();
+    let consumer =
+        spawn_in_place_consumer::<InPlaceSkipOrders>(&client, &handler, shutdown.clone(), 5);
+    publish_order::<InPlaceSkipOrders>(&publisher, "ACC-INFLIGHT", 1).await;
+    publish_order::<InPlaceSkipOrders>(&publisher, "ACC-INFLIGHT", 2).await;
+    handler.wait_handled(1, 30).await;
+    close_all_connections(&ctx).await;
+
+    handler.wait_handled(3, 60).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(handler.order(), vec![1, 1, 2]);
+
+    shutdown.cancel();
+    consumer.await.unwrap().unwrap();
     client.shutdown().await;
     ctx.cleanup().await;
 }

@@ -642,6 +642,7 @@ impl RabbitMqConsumer {
                                     metrics::FailReason::Deserialize,
                                 )
                                 .await?;
+                                ensure_channel_open(&publisher, queue)?;
                                 self.release_key::<T, H>(
                                     &key,
                                     &handler,
@@ -797,6 +798,10 @@ impl RabbitMqConsumer {
                         .await?;
                     }
                 }
+                // `route_ack` and `route_reject` log a failed frame and return Ok, so
+                // a closed channel is the sign it failed. The delivery is then still
+                // un-acked and the key must stay held until the redelivery.
+                ensure_channel_open(&publisher, queue)?;
                 release_slot(&mut in_flight_count);
 
                 // Drain pending deliveries for this key.
@@ -820,6 +825,7 @@ impl RabbitMqConsumer {
                 .await;
             }
 
+            ensure_channel_open(&publisher, queue)?;
             options
                 .processing
                 .store(in_flight_count > 0 || waiting_count > 0, Ordering::Relaxed);
@@ -1012,6 +1018,7 @@ impl RabbitMqConsumer {
                             }
                         }
                         router::route_reject(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::MaxRetriesExceeded).await?;
+                        ensure_channel_open(&publisher, queue)?;
                         self.release_key::<T, H>(
                             &seq_key,
                             &handler,
@@ -1049,6 +1056,7 @@ impl RabbitMqConsumer {
                     {
                         None => {
                             // Rejected before the handler: this message's turn is over.
+                            ensure_channel_open(&publisher, queue)?;
                             self.release_key::<T, H>(
                                 &seq_key,
                                 &handler,
@@ -1197,6 +1205,11 @@ impl RabbitMqConsumer {
 
         // Pop the next delivery and try to spawn it.
         while let Some(received) = pending.pop_front() {
+            // Un-acked on a dead channel: the broker requeues it, and the main
+            // loop reconnects at its next iteration.
+            if !publisher.is_open() {
+                return;
+            }
             let retry_count = get_retry_count(&received.delivery);
 
             // Max retries check on buffered delivery.
