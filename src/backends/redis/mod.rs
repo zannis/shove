@@ -29,5 +29,5 @@ pub use consumer_group::{
 pub use publisher::{RedisPublisher, shard_for_key};
 #[doc(hidden)]
 pub use reaper::{spawn_maintenance, spawn_reaper};
-pub(crate) use requeue::{HoldEntry, enqueue_hold, spawn_requeuer};
+pub(crate) use requeue::{HoldEntry, enqueue_hold};
 pub use topology::RedisTopologyDeclarer;
