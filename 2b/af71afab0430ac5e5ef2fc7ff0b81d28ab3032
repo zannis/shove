@@ -1,0 +1,21 @@
+docs/pages/guides/observability.mdx
+  s_6511f1668e6a79::t_cb96cb05294542 290
+docs/pages/guides/sequenced.mdx
+  s_6511f1668e6a79::t_2a7e0a9081ec6f 141-146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2baf71afab0430ac5e5ef2fc7ff0b81d28ab3032",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
