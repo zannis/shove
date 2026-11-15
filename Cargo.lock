@@ -4213,6 +4213,7 @@ dependencies = [
  "rdkafka",
  "redis",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "testcontainers",

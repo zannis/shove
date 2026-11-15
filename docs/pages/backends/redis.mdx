@@ -33,7 +33,7 @@ let broker = Broker::<Redis>::new(RedisConfig {
 .await?;
 ```
 
-`RedisMode::Standalone` accepts `redis://` and `rediss://` (TLS) URLs. For Redis Cluster, use `RedisMode::Cluster { urls: vec![...] }` with one or more seed node URLs.
+`RedisMode::Standalone` accepts `redis://` and `rediss://` (TLS) URLs. For Redis Cluster, use `RedisMode::Cluster { urls: vec![...] }` with one or more seed node URLs. For TLS URLs, shove installs the `ring` crypto provider as the rustls process default when the process has none, and leaves a provider your application installed in place.
 
 `group` sets the consumer group name shared by all consumers. Defaults to `"shove"` if `None`.
 

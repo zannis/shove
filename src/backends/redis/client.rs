@@ -6,6 +6,8 @@ use std::time::Duration;
 use redis::aio::MultiplexedConnection;
 use redis::cluster::{ClusterClient, ClusterConfig};
 use redis::cluster_async::ClusterConnection;
+use redis::{ConnectionAddr, IntoConnectionInfo};
+use rustls::crypto::ring::default_provider;
 
 use tokio_util::sync::CancellationToken;
 
@@ -24,6 +26,9 @@ pub enum RedisMode {
     /// Use `rediss://` scheme for TLS. Examples:
     ///   - `redis://127.0.0.1:6379/`
     ///   - `rediss://user:pass@myhost:6380/`
+    ///
+    /// For TLS URLs, shove installs the `ring` rustls provider as the process
+    /// default when none is set; an application-installed provider is kept.
     Standalone { url: String },
     /// Redis Cluster. Provide one or more seed node URLs (plain or `rediss://` for TLS).
     Cluster { urls: Vec<String> },
@@ -238,6 +243,17 @@ pub struct RedisClient {
     trim_interval: Option<Duration>,
 }
 
+fn is_tls_url(url: &str) -> bool {
+    url.into_connection_info()
+        .is_ok_and(|info| matches!(info.addr(), ConnectionAddr::TcpTls { .. }))
+}
+
+/// Installs the `ring` provider as rustls' process default when none is set.
+fn ensure_crypto_provider() {
+    // Err means a default is already installed, which is left in place.
+    let _ = default_provider().install_default();
+}
+
 impl RedisClient {
     /// Build a [`RedisClient`] and eagerly verify connectivity by opening a
     /// test connection.
@@ -249,6 +265,9 @@ impl RedisClient {
 
         let inner = match config.mode {
             RedisMode::Standalone { url } => {
+                if is_tls_url(&url) {
+                    ensure_crypto_provider();
+                }
                 let client = redis::Client::open(url.as_str())
                     .map_err(|e| ShoveError::Connection(e.to_string()))?;
                 client
@@ -265,6 +284,9 @@ impl RedisClient {
                     return Err(ShoveError::Connection(
                         "cluster URLs must not be empty".into(),
                     ));
+                }
+                if urls.iter().any(|u| is_tls_url(u)) {
+                    ensure_crypto_provider();
                 }
                 let nodes: Vec<&str> = urls.iter().map(String::as_str).collect();
                 let client =
@@ -535,6 +557,8 @@ pub(super) async fn acquire_conn_with_retry(
 
 #[cfg(test)]
 mod tests {
+    use rustls::crypto::CryptoProvider;
+
     use super::*;
 
     #[test]
@@ -819,5 +843,49 @@ mod tests {
         // An integer reply makes no sense for INFO; we should refuse it.
         let err = info_payloads(redis::Value::Int(42)).unwrap_err();
         assert!(err.to_string().contains("unexpected INFO server reply"));
+    }
+
+    #[tokio::test]
+    async fn rediss_standalone_connect_to_closed_port_errors() {
+        let cfg = RedisConfig::new(RedisMode::Standalone {
+            url: "rediss://127.0.0.1:1/".to_string(),
+        });
+        let err = RedisClient::connect(cfg).await.err();
+        assert!(matches!(err, Some(ShoveError::Connection(_))), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn rediss_cluster_connect_to_closed_port_errors() {
+        let cfg = RedisConfig::new(RedisMode::Cluster {
+            urls: vec!["rediss://127.0.0.1:1/".to_string()],
+        });
+        let err = RedisClient::connect(cfg).await.err();
+        assert!(matches!(err, Some(ShoveError::Connection(_))), "{err:?}");
+    }
+
+    #[test]
+    fn is_tls_url_matches_tls_schemes_only() {
+        assert!(is_tls_url("rediss://127.0.0.1:6379/"));
+        assert!(is_tls_url("valkeys://127.0.0.1:6379/"));
+        assert!(!is_tls_url("redis://127.0.0.1:6379/"));
+        assert!(!is_tls_url("not a url"));
+    }
+
+    #[test]
+    fn ensure_crypto_provider_keeps_an_application_installed_default() {
+        default_provider().install_default().unwrap();
+        let before = Arc::as_ptr(CryptoProvider::get_default().unwrap());
+        ensure_crypto_provider();
+        let after = Arc::as_ptr(CryptoProvider::get_default().unwrap());
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn plain_redis_connect_does_not_install_a_provider() {
+        let cfg = RedisConfig::new(RedisMode::Standalone {
+            url: "redis://127.0.0.1:1/".to_string(),
+        });
+        assert!(RedisClient::connect(cfg).await.is_err());
+        assert!(CryptoProvider::get_default().is_none());
     }
 }
