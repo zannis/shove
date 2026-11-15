@@ -1,0 +1,29 @@
+docs/pages/backends/sqs.mdx
+  s_6511f1668e6a79::t_d9e6a8de325f61 93
+docs/pages/backends/sqs/examples/autoscaler.mdx
+  s_6511f1668e6a79::t_141b4246f4b472 49
+src/backends/sns/consumer.rs
+  s_6511f1668e6a79::t_622ad167413d9e 327-344,364-365,376-377,382,386-387,389-391,655-663,725-729,2795-2831
+src/backends/sns/consumer_group.rs
+  s_6511f1668e6a79::t_d5f46a4553cd9b 192-193
+src/consumer.rs
+  s_6511f1668e6a79::t_2e377f8bd3c529 308,310-314,859,861-862
+tests/sns_sqs_integration.rs
+  s_6511f1668e6a79::t_30934c318a1244 23,3463-3689
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c802f66b3bd373144a904cccbd0d210e2e02fc6b",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
