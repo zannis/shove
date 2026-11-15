@@ -1,0 +1,25 @@
+Cargo.lock
+  s_6511f1668e6a79::t_b297b03eb34e1f 4216
+Cargo.toml
+  s_6511f1668e6a79::t_321eb54399aa50 140,221-223
+docs/pages/backends/redis.mdx
+  s_6511f1668e6a79::t_7831ed34055268 36
+src/backends/redis/client.rs
+  s_6511f1668e6a79::t_96b07df40325c2 9-10,29-31,246-256,268-270,288-290,560-561,847-890
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7368259c271d4f01049da6c5eeb706ab3449c9ed",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
