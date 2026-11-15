@@ -1,0 +1,20 @@
+src/backends/nats/publisher.rs
+  s_6511f1668e6a79::t_ca0006cc4fbe2e 284-285
+  s_6511f1668e6a79::t_bd364e36e65d97 293-294
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "279efc9f28ffa55deda07d703c25eed571b891cb",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
