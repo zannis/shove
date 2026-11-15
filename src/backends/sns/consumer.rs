@@ -1282,7 +1282,16 @@ where
 
                 for msg in messages {
                     let receipt_handle = msg.receipt_handle().unwrap_or_default().to_string();
-                    let retry_count = router::get_retry_count_fifo(&msg);
+                    let Some(retry_count) = router::get_retry_count_fifo(&msg) else {
+                        requeue_without_receive_count(
+                            sqs,
+                            queue_url,
+                            &msg,
+                            &receipt_handle,
+                        )
+                        .await;
+                        continue;
+                    };
                     // Unreachable on the supported topology, and deliberately kept.
                     // `declare` creates every sequenced shard queue as FIFO
                     // (`topology.rs`, `create_sqs_queue(.., fifo = true, ..)`), and SQS
@@ -1554,6 +1563,28 @@ where
     }
 }
 
+/// A sequenced delivery without a usable `ApproximateReceiveCount` is handed
+/// back untouched: not dispatched, not buffered, key state left alone. SQS's own
+/// redrive retires it, since every return raises the service-side count.
+async fn requeue_without_receive_count(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    msg: &Message,
+    receipt_handle: &str,
+) {
+    error!(
+        queue_url,
+        message_group_id = extract_sequence_key(msg).as_deref().unwrap_or(""),
+        message_id = msg.message_id().unwrap_or(""),
+        "sequenced delivery has a missing or invalid ApproximateReceiveCount, requeueing without handling"
+    );
+    metrics::record_backend_error(
+        metrics::BackendLabel::SnsSqs,
+        metrics::BackendErrorKind::Consume,
+    );
+    router::route_requeue(sqs, queue_url, receipt_handle).await;
+}
+
 /// Pop the next pending delivery for `key` and spawn a handler for it.
 /// Called after a terminal outcome (Ack/Reject) to drain buffered messages.
 #[allow(clippy::too_many_arguments)]
@@ -1596,7 +1627,10 @@ async fn drain_pending_for_key<T, H>(
     // Pop the next delivery and try to spawn it.
     while let Some(msg) = pending.pop_front() {
         let receipt_handle = msg.receipt_handle().unwrap_or_default().to_string();
-        let retry_count = router::get_retry_count_fifo(&msg);
+        let Some(retry_count) = router::get_retry_count_fifo(&msg) else {
+            requeue_without_receive_count(sqs, queue_url, &msg, &receipt_handle).await;
+            continue;
+        };
 
         // Max retries check on buffered delivery.
         if retry_count >= options.max_retries {
