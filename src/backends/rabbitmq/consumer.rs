@@ -502,11 +502,8 @@ impl RabbitMqConsumer {
         // in the select! makes it inactive, but Interval still needs a valid duration).
         // Poll at half the timeout so a key evicted just after a tick is caught
         // within 1.5× the configured maximum, not 2×.
-        let eviction_period = options
-            .hold_queue_timeout
-            .map(|t| t / 2)
-            .unwrap_or(Duration::from_secs(86400));
-        let mut eviction_ticker = tokio::time::interval(eviction_period);
+        let mut eviction_ticker =
+            tokio::time::interval(eviction_period(options.hold_queue_timeout));
         eviction_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         eviction_ticker.tick().await; // consume the immediate first tick
 
@@ -2270,6 +2267,16 @@ impl RabbitMqConsumer {
 /// panics; it mirrors `Backoff::default()`'s ceiling.
 const RECONNECT_BACKOFF_FALLBACK: Duration = Duration::from_secs(30);
 
+/// `tokio::time::interval` panics on a zero period, so the period is floored.
+const MIN_EVICTION_PERIOD: Duration = Duration::from_nanos(1);
+
+fn eviction_period(hold_queue_timeout: Option<Duration>) -> Duration {
+    hold_queue_timeout
+        .map(|t| t / 2)
+        .unwrap_or(Duration::from_secs(86400))
+        .max(MIN_EVICTION_PERIOD)
+}
+
 /// The flush threshold (and channel prefetch) actually used for a configured
 /// `max_batch_size`: at least 1, at most `u16::MAX` — AMQP's `basic.qos`
 /// prefetch window is a `u16`, and a batch is held **unacked** inside that
@@ -2806,6 +2813,39 @@ impl RabbitMqConsumer {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod eviction_period_tests {
+    use super::*;
+
+    #[test]
+    fn never_zero() {
+        for t in [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_nanos(3),
+        ] {
+            assert_eq!(eviction_period(Some(t)), MIN_EVICTION_PERIOD);
+        }
+    }
+
+    #[test]
+    fn halves_a_short_timeout() {
+        assert_eq!(
+            eviction_period(Some(Duration::from_millis(1))),
+            Duration::from_micros(500)
+        );
+    }
+
+    #[test]
+    fn halves_an_ordinary_timeout() {
+        assert_eq!(
+            eviction_period(Some(Duration::from_secs(60))),
+            Duration::from_secs(30)
+        );
+        assert_eq!(eviction_period(None), Duration::from_secs(86400));
     }
 }
 
