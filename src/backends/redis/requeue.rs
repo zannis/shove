@@ -8,9 +8,10 @@
 //! This task polls each hold set every `POLL_INTERVAL`, moves all entries
 //! whose score ≤ now_ms back to the appropriate stream via XADD, and removes
 //! them from the set only after successful XADD (at-least-once delivery).
-//! A poll that returns a full batch of `REQUEUE_BATCH_SIZE` entries is
-//! followed by another poll straight away, so a backlog drains without
-//! waiting out the interval.
+//! A pass in which some set returned a full batch of `REQUEUE_BATCH_SIZE`
+//! entries and no set failed to requeue or remove an entry is followed by
+//! another pass straight away, so a backlog drains without waiting out the
+//! interval. Any failure in a pass takes the normal wait.
 //!
 //! ## Concurrent requeuer instances
 //!
@@ -18,7 +19,9 @@
 //! sets. Consumers obtain it through
 //! [`super::maintenance::acquire_requeuer`], which starts it for the first
 //! consumer of a topic and cancels it when the last one releases its guard, so
-//! N workers on one topic never race each other over the same due entry.
+//! N workers on one topic never race each other over the same due entry. A
+//! replacement started after a release waits for the cancelled task to exit
+//! before its first poll.
 //!
 //! Across processes (or independently connected clients) each side runs its
 //! own requeuer. If two of them run concurrently (e.g., during a rolling
@@ -95,72 +98,126 @@ pub(crate) async fn enqueue_hold(
     Ok(())
 }
 
-/// Spawn a background requeuer task that periodically drains due entries
-/// from all hold sets back to their target streams.
+/// How one poll of a hold set ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PollOutcome {
+    /// Fewer than a full batch was due and every entry was requeued.
+    Drained,
+    /// A full batch was due and every entry was requeued; more may be waiting.
+    Backlog,
+    /// An entry could not be requeued or removed, or shutdown cut the batch short.
+    Failed,
+}
+
+impl PollOutcome {
+    fn from_batch(full_batch: bool, all_settled: bool) -> Self {
+        match (all_settled, full_batch) {
+            (false, _) => Self::Failed,
+            (true, true) => Self::Backlog,
+            (true, false) => Self::Drained,
+        }
+    }
+}
+
+/// Whether a pass over the hold sets should poll again without waiting: some
+/// set returned a full batch and no set had a failure.
+fn repoll_now(outcomes: impl IntoIterator<Item = PollOutcome>) -> bool {
+    let mut backlog = false;
+    for outcome in outcomes {
+        match outcome {
+            PollOutcome::Failed => return false,
+            PollOutcome::Backlog => backlog = true,
+            PollOutcome::Drained => {}
+        }
+    }
+    backlog
+}
+
+/// Log and count a failed ZREM of a corrupt entry; `true` when it was removed.
+fn corrupt_removal_succeeded<E: std::fmt::Display>(
+    result: std::result::Result<i64, E>,
+    hold_queue_name: &str,
+) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                "requeuer: ZREM failed for corrupt entry in {}: {}",
+                hold_queue_name,
+                e
+            );
+            record_backend_error(BackendLabel::Redis, BackendErrorKind::Ack);
+            false
+        }
+    }
+}
+
+/// Run the requeuer: periodically drain due entries from all hold sets back
+/// to their target streams.
 ///
-/// The task acquires one connection and reuses it across poll ticks. On
+/// The future acquires one connection and reuses it across poll ticks. On
 /// connection error it backs off with jitter and retries until the shutdown
 /// token is cancelled, preventing silent abandonment of hold-queue messages.
-/// The task runs until `shutdown` is cancelled.
+/// It runs until `shutdown` is cancelled, which also cuts a poll short between
+/// entries.
 ///
 /// Callers go through [`super::maintenance::acquire_requeuer`] so that one
 /// requeuer serves every consumer in the process. **At-least-once
 /// semantics:** see the module-level documentation for the cross-process
 /// duplicate-delivery note.
-pub(crate) fn spawn_requeuer(
+pub(super) async fn run_requeuer(
     client: RedisClient,
     hold_queue_names: Vec<String>,
     shutdown: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
+) {
     // Pre-compute the sorted-set key for each hold queue once.
     let hold_set_keys: Vec<String> = hold_queue_names
         .iter()
         .map(|n| RedisTopologyDeclarer::hold_set_name(n))
         .collect();
 
-    tokio::spawn(async move {
-        let mut conn = match acquire_conn_with_retry(&client, &shutdown, "requeuer").await {
-            Some(c) => c,
-            None => return,
-        };
+    let mut conn = match acquire_conn_with_retry(&client, &shutdown, "requeuer").await {
+        Some(c) => c,
+        None => return,
+    };
 
-        loop {
-            let mut needs_reconnect = false;
-            let mut backlog = false;
-            for (hold_queue_name, set_key) in hold_queue_names.iter().zip(hold_set_keys.iter()) {
-                match poll_hold_set(&mut conn, hold_queue_name, set_key).await {
-                    Ok(full) => backlog |= full,
-                    Err(e) => {
-                        tracing::warn!("requeuer: poll failed for {}: {}", hold_queue_name, e);
-                        needs_reconnect = true;
-                        break;
-                    }
-                }
-            }
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
 
-            if needs_reconnect {
-                match acquire_conn_with_retry(&client, &shutdown, "requeuer").await {
-                    Some(c) => {
-                        conn = c;
-                        continue;
-                    }
-                    None => break,
-                }
-            }
-
-            if backlog {
-                if shutdown.is_cancelled() {
+        let mut needs_reconnect = false;
+        let mut outcomes = Vec::with_capacity(hold_queue_names.len());
+        for (hold_queue_name, set_key) in hold_queue_names.iter().zip(hold_set_keys.iter()) {
+            match poll_hold_set(&mut conn, hold_queue_name, set_key, &shutdown).await {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(e) => {
+                    tracing::warn!("requeuer: poll failed for {}: {}", hold_queue_name, e);
+                    needs_reconnect = true;
                     break;
                 }
-                continue;
-            }
-
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(POLL_INTERVAL) => {}
             }
         }
-    })
+
+        if needs_reconnect {
+            match acquire_conn_with_retry(&client, &shutdown, "requeuer").await {
+                Some(c) => {
+                    conn = c;
+                    continue;
+                }
+                None => break,
+            }
+        }
+
+        if repoll_now(outcomes) {
+            continue;
+        }
+
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,14 +242,16 @@ fn now_ms() -> u64 {
 /// success. Corrupt entries (JSON parse failures) are removed from the set to
 /// avoid perpetual re-fetch and logged as warnings.
 ///
-/// Returns `true` when a full batch came back and every entry in it was
-/// requeued, meaning more due entries may be waiting. A batch with a failed
-/// XADD or ZREM reports `false` so a failing broker is not hammered.
+/// Returns [`PollOutcome::Backlog`] when a full batch came back and every entry
+/// in it was requeued, meaning more due entries may be waiting. Any failed
+/// XADD or ZREM, or a cancelled `shutdown` between entries, yields
+/// [`PollOutcome::Failed`] so a failing broker is not hammered.
 async fn poll_hold_set(
     conn: &mut RedisConnection,
     hold_queue_name: &str,
     set_key: &str,
-) -> Result<bool> {
+    shutdown: &CancellationToken,
+) -> Result<PollOutcome> {
     let now = now_ms();
 
     let entries: Vec<String> = match conn
@@ -227,6 +286,9 @@ async fn poll_hold_set(
     let mut all_requeued = true;
 
     for raw_json in entries {
+        if shutdown.is_cancelled() {
+            return Ok(PollOutcome::Failed);
+        }
         let entry: HoldEntry = match serde_json::from_str(&raw_json) {
             Ok(e) => e,
             Err(e) => {
@@ -235,10 +297,10 @@ async fn poll_hold_set(
                     hold_queue_name,
                     e
                 );
-                let _: i64 = conn
-                    .query(redis::cmd("ZREM").arg(set_key).arg(&raw_json))
-                    .await
-                    .unwrap_or(0);
+                let removal = conn
+                    .query::<i64>(redis::cmd("ZREM").arg(set_key).arg(&raw_json))
+                    .await;
+                all_requeued &= corrupt_removal_succeeded(removal, hold_queue_name);
                 continue;
             }
         };
@@ -271,7 +333,7 @@ async fn poll_hold_set(
         }
     }
 
-    Ok(full_batch && all_requeued)
+    Ok(PollOutcome::from_batch(full_batch, all_requeued))
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +383,36 @@ mod tests {
             serde_json::to_string(&make("1-0")).unwrap(),
             serde_json::to_string(&make("1-1")).unwrap()
         );
+    }
+
+    #[test]
+    fn failed_set_forces_the_wait_even_when_another_is_full() {
+        use PollOutcome::*;
+        assert!(repoll_now([Backlog, Drained]));
+        assert!(!repoll_now([Backlog, Failed]));
+        assert!(!repoll_now([Failed, Backlog]));
+        assert!(!repoll_now([Drained, Drained]));
+        assert!(!repoll_now([]));
+    }
+
+    #[test]
+    fn batch_with_an_unsettled_entry_is_failed_even_when_full() {
+        assert_eq!(PollOutcome::from_batch(true, false), PollOutcome::Failed);
+        assert_eq!(PollOutcome::from_batch(false, false), PollOutcome::Failed);
+        assert_eq!(PollOutcome::from_batch(true, true), PollOutcome::Backlog);
+        assert_eq!(PollOutcome::from_batch(false, true), PollOutcome::Drained);
+    }
+
+    #[test]
+    fn corrupt_entry_whose_removal_fails_counts_as_failure() {
+        assert!(!corrupt_removal_succeeded(
+            Err::<i64, _>("connection reset"),
+            "orders-hold-5s"
+        ));
+        assert!(corrupt_removal_succeeded(
+            Ok::<_, &str>(1),
+            "orders-hold-5s"
+        ));
     }
 
     #[test]

@@ -16,7 +16,10 @@
 //! it polls (the requeuer's whole input), so every consumer of one topic joins
 //! one requeuer while the shards of a FIFO topic, which poll different hold
 //! sets, get one each. It carries no reclaim policy, so joining or leaving
-//! never respawns it.
+//! never respawns it. Cancelling a requeuer does not stop it mid-poll, so the
+//! registry keeps the latest task's handle per key after the entry is released
+//! and a replacement awaits it before polling: two requeuers never overlap on
+//! one key.
 //!
 //! ## Mixed handler-timeout policies
 //!
@@ -62,14 +65,17 @@
 //! min-across-groups trim are both safe under.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::client::RedisClient;
 use super::reaper::spawn_maintenance;
-use super::requeue::spawn_requeuer;
+use super::requeue::run_requeuer;
 use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -129,6 +135,50 @@ fn lock() -> std::sync::MutexGuard<'static, HashMap<Key, Entry>> {
     registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Latest requeuer task per key, with the generation that stored it. It stays
+/// reachable after the registry entry is released so a replacement can wait
+/// for it; a task removes its own slot when it exits.
+type RequeuerSlots = HashMap<Key, (u64, JoinHandle<()>)>;
+
+static REQUEUERS: OnceLock<Mutex<RequeuerSlots>> = OnceLock::new();
+static REQUEUER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn requeuer_slots() -> std::sync::MutexGuard<'static, RequeuerSlots> {
+    REQUEUERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Spawn `task` for `key` so that it starts only after the key's previous task
+/// has exited. Never blocks the caller; the wait happens inside the task.
+fn spawn_after_previous<F>(key: &Key, task: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let generation = REQUEUER_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let mut slots = requeuer_slots();
+    let previous = slots
+        .remove(key)
+        .map(|(_, handle)| handle)
+        .filter(|handle| !handle.is_finished());
+    let slot_key = key.clone();
+    let handle = tokio::spawn(async move {
+        if let Some(previous) = previous {
+            let _ = previous.await;
+        }
+        task.await;
+        let mut slots = requeuer_slots();
+        if slots
+            .get(&slot_key)
+            .is_some_and(|(stored, _)| *stored == generation)
+        {
+            slots.remove(&slot_key);
+        }
+    });
+    slots.insert(key.clone(), (generation, handle));
 }
 
 /// Handle for one consumer's interest in a stream's maintenance. Dropping
@@ -280,8 +330,12 @@ pub(super) fn acquire_requeuer(
     );
     let client = client.clone();
     let names = hold_queue_names.to_vec();
+    let slot_key = key.clone();
     let spawner: Spawner = Arc::new(move |shutdown, _| {
-        spawn_requeuer(client.clone(), names.clone(), shutdown);
+        spawn_after_previous(
+            &slot_key,
+            run_requeuer(client.clone(), names.clone(), shutdown),
+        );
     });
     acquire_with(key, None, spawner)
 }
@@ -404,6 +458,58 @@ mod tests {
         // `without_handler_timeout()` disables reclaim; a timeout outcome is
         // unreachable in that configuration and must not resurrect it.
         assert_eq!(reclaim_policy(None, true), None);
+    }
+
+    #[tokio::test]
+    async fn replacement_spawn_waits_for_the_previous_task_to_exit() {
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::oneshot;
+
+        let mut k = key(8);
+        k.1 = Kind::Requeuer;
+        let first_started = Arc::new(AtomicBool::new(false));
+        let first_done = Arc::new(AtomicBool::new(false));
+        let second_started = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+
+        let (started, done) = (first_started.clone(), first_done.clone());
+        spawn_after_previous(&k, async move {
+            started.store(true, Ordering::SeqCst);
+            let _ = release_rx.await;
+            done.store(true, Ordering::SeqCst);
+        });
+        while !first_started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        let (second, first_done_seen) = (second_started.clone(), first_done.clone());
+        let (seen_tx, seen_rx) = oneshot::channel::<bool>();
+        spawn_after_previous(&k, async move {
+            second.store(true, Ordering::SeqCst);
+            let _ = seen_tx.send(first_done_seen.load(Ordering::SeqCst));
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !second_started.load(Ordering::SeqCst),
+            "replacement started while the previous task was still running"
+        );
+
+        release_tx.send(()).ok();
+        assert_eq!(
+            seen_rx.await.ok(),
+            Some(true),
+            "first finished before second ran"
+        );
+
+        // Both tasks have exited, so their slot must be gone.
+        for _ in 0..100 {
+            if !requeuer_slots().contains_key(&k) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("finished task left its handle in the slot");
     }
 
     #[test]
