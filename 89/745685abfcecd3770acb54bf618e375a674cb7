@@ -1,0 +1,21 @@
+src/backends/nats/publisher.rs
+  s_6511f1668e6a79::t_d970e0fc8d89d1 67-68
+src/metrics.rs
+  s_6511f1668e6a79::t_633a82d119c5f0 465-470
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "89745685abfcecd3770acb54bf618e375a674cb7",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
