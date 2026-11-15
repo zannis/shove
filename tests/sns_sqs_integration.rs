@@ -3687,3 +3687,285 @@ async fn concurrent_consumer_holds_at_most_prefetch_messages() {
         "a prefetch-4 consumer held {max_not_visible} messages at once"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Settlement on completion: a finished handler is settled without waiting for
+// handlers that were received before it
+// ---------------------------------------------------------------------------
+
+/// The first `block_first` calls wait for a permit from `release`; call index
+/// `retry_call` returns `Retry`; every other call returns `Ack` at once.
+#[derive(Clone)]
+struct GatedHandler {
+    block_first: u32,
+    retry_call: Option<u32>,
+    release: Arc<tokio::sync::Semaphore>,
+    calls: Arc<AtomicU32>,
+    seen: Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    blocked_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Incremented when a call returns without having blocked.
+    fast_done: WaitableCounter,
+}
+
+impl GatedHandler {
+    fn new(block_first: u32, retry_call: Option<u32>) -> Self {
+        Self {
+            block_first,
+            retry_call,
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            calls: Arc::new(AtomicU32::new(0)),
+            seen: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            blocked_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fast_done: WaitableCounter::new(),
+        }
+    }
+
+    fn deliveries(&self) -> HashMap<String, u32> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl MessageHandler<FreeSlotsTopic> for GatedHandler {
+    type Context = ();
+    async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.seen.lock().unwrap().entry(msg.id.clone()).or_insert(0) += 1;
+        if call < self.block_first {
+            self.blocked_ids.lock().unwrap().push(msg.id);
+            self.release
+                .acquire()
+                .await
+                .expect("semaphore open")
+                .forget();
+            return Outcome::Ack;
+        }
+        let outcome = if self.retry_call == Some(call) {
+            Outcome::Retry
+        } else {
+            Outcome::Ack
+        };
+        self.fast_done.increment();
+        outcome
+    }
+}
+
+fn spawn_gated_consumer(
+    setup: &TestSetup,
+    handler: GatedHandler,
+    shutdown: CancellationToken,
+    prefetch: u16,
+) -> tokio::task::JoinHandle<Result<(), ShoveError>> {
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    tokio::spawn(async move {
+        consumer
+            .run::<FreeSlotsTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(shutdown)
+                    .with_prefetch_count(prefetch),
+            )
+            .await
+    })
+}
+
+/// Returns (visible, not visible) approximate message counts.
+async fn queue_counts(sqs: &aws_sdk_sqs::Client, queue_url: &str) -> (u32, u32) {
+    let attrs = sqs
+        .get_queue_attributes()
+        .queue_url(queue_url)
+        .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
+        .attribute_names(QueueAttributeName::ApproximateNumberOfMessagesNotVisible)
+        .send()
+        .await
+        .expect("GetQueueAttributes should succeed");
+    let read = |name: QueueAttributeName| {
+        attrs
+            .attributes()
+            .and_then(|a| a.get(&name))
+            .and_then(|v| v.parse::<u32>().ok())
+            .expect("queue attribute should be a number")
+    };
+    (
+        read(QueueAttributeName::ApproximateNumberOfMessages),
+        read(QueueAttributeName::ApproximateNumberOfMessagesNotVisible),
+    )
+}
+
+/// Polls until `pred(visible, not_visible)` holds or `timeout` elapses.
+async fn wait_for_queue_counts(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    timeout: Duration,
+    pred: impl Fn(u32, u32) -> bool,
+) -> (u32, u32) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let counts = queue_counts(sqs, queue_url).await;
+        if pred(counts.0, counts.1) || Instant::now() >= deadline {
+            return counts;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[tokio::test]
+async fn completed_handler_frees_its_slot_behind_a_blocked_earlier_handler() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<FreeSlotsTopic>().await;
+    set_visibility_timeout(&broker, &setup, "sqs-free-slots", 60).await;
+    publish_free_slots_messages(&setup, 8).await;
+
+    let handler = GatedHandler::new(1, None);
+    let shutdown = CancellationToken::new();
+    let handle = spawn_gated_consumer(&setup, handler.clone(), shutdown.clone(), 4);
+
+    // 3 fast messages fit beside the blocked one; reaching 7 means slots were reused.
+    let progressed = handler.fast_done.wait_for(7, Duration::from_secs(30)).await;
+    let calls_while_blocked = handler.calls.load(Ordering::SeqCst);
+
+    handler.release.add_permits(1);
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task should not panic")
+        .expect("consumer should exit cleanly");
+
+    assert!(
+        progressed,
+        "only {} fast messages handled while the first handler was blocked ({calls_while_blocked} calls)",
+        handler.fast_done.get()
+    );
+}
+
+#[tokio::test]
+async fn completed_handler_is_deleted_while_an_earlier_handler_is_blocked() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<FreeSlotsTopic>().await;
+    let url = set_visibility_timeout(&broker, &setup, "sqs-free-slots", 60).await;
+    publish_free_slots_messages(&setup, 4).await;
+
+    let handler = GatedHandler::new(1, None);
+    let shutdown = CancellationToken::new();
+    let handle = spawn_gated_consumer(&setup, handler.clone(), shutdown.clone(), 4);
+
+    let all_fast_done = handler.fast_done.wait_for(3, Duration::from_secs(30)).await;
+    let sqs = broker.sqs_client().await;
+    let counts = wait_for_queue_counts(&sqs, &url, Duration::from_secs(10), |_, nv| nv <= 1).await;
+
+    handler.release.add_permits(1);
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task should not panic")
+        .expect("consumer should exit cleanly");
+
+    assert!(all_fast_done, "the 3 fast handlers should complete");
+    assert_eq!(
+        counts,
+        (0, 1),
+        "only the blocked message should remain undeleted"
+    );
+}
+
+#[tokio::test]
+async fn completed_handlers_are_not_redelivered_while_an_earlier_handler_outlasts_visibility() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<FreeSlotsTopic>().await;
+    set_visibility_timeout(&broker, &setup, "sqs-free-slots", 4).await;
+    publish_free_slots_messages(&setup, 4).await;
+
+    let handler = GatedHandler::new(1, None);
+    let shutdown_a = CancellationToken::new();
+    let handle_a = spawn_gated_consumer(&setup, handler.clone(), shutdown_a.clone(), 4);
+    let all_fast_done = handler.fast_done.wait_for(3, Duration::from_secs(30)).await;
+
+    // A second consumer receives whatever the first one leaves visible.
+    let shutdown_b = CancellationToken::new();
+    let handle_b = spawn_gated_consumer(&setup, handler.clone(), shutdown_b.clone(), 4);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let deliveries = handler.deliveries();
+    let blocked = handler.blocked_ids.lock().unwrap().clone();
+
+    handler.release.add_permits(1);
+    shutdown_a.cancel();
+    shutdown_b.cancel();
+    handle_a.await.expect("consumer A should not panic").ok();
+    handle_b.await.expect("consumer B should not panic").ok();
+
+    assert!(all_fast_done, "the 3 fast handlers should complete");
+    let duplicated: Vec<_> = deliveries
+        .iter()
+        .filter(|(id, n)| !blocked.contains(*id) && **n != 1)
+        .collect();
+    assert_eq!(deliveries.len(), 4, "every message id should be seen");
+    assert!(
+        duplicated.is_empty(),
+        "handled messages delivered more than once: {duplicated:?}"
+    );
+}
+
+#[tokio::test]
+async fn retry_behind_a_blocked_handler_is_routed_promptly() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<FreeSlotsTopic>().await;
+    set_visibility_timeout(&broker, &setup, "sqs-free-slots", 60).await;
+    publish_free_slots_messages(&setup, 4).await;
+
+    // Call 0 blocks, call 1 returns Retry; the re-sent message is handled again.
+    let handler = GatedHandler::new(1, Some(1));
+    let shutdown = CancellationToken::new();
+    let handle = spawn_gated_consumer(&setup, handler.clone(), shutdown.clone(), 4);
+
+    // 3 fast calls plus the re-delivery of the retried message.
+    let redelivered = handler.fast_done.wait_for(4, Duration::from_secs(30)).await;
+    let deliveries = handler.deliveries();
+
+    handler.release.add_permits(1);
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task should not panic")
+        .expect("consumer should exit cleanly");
+
+    assert!(
+        redelivered && deliveries.values().any(|n| *n >= 2),
+        "the retried message was not redelivered while the first handler was blocked: {deliveries:?}"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_settles_completed_and_running_handlers() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<FreeSlotsTopic>().await;
+    let url = set_visibility_timeout(&broker, &setup, "sqs-free-slots", 60).await;
+    publish_free_slots_messages(&setup, 6).await;
+
+    // Two handlers stay running across the shutdown signal.
+    let handler = GatedHandler::new(2, None);
+    let shutdown = CancellationToken::new();
+    let handle = spawn_gated_consumer(&setup, handler.clone(), shutdown.clone(), 4);
+
+    let fast_done = handler.fast_done.wait_for(4, Duration::from_secs(30)).await;
+    shutdown.cancel();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    handler.release.add_permits(2);
+    tokio::time::timeout(Duration::from_secs(15), handle)
+        .await
+        .expect("consumer should drain within 15s")
+        .expect("consumer task should not panic")
+        .expect("consumer should exit cleanly");
+
+    let sqs = broker.sqs_client().await;
+    let counts = wait_for_queue_counts(&sqs, &url, Duration::from_secs(10), |v, nv| {
+        v == 0 && nv == 0
+    })
+    .await;
+    assert!(fast_done, "the fast handlers should complete");
+    assert_eq!(counts, (0, 0), "every handled message should be deleted");
+}
