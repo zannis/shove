@@ -1,0 +1,31 @@
+docs/pages/backends/rabbitmq.mdx
+  s_6511f1668e6a79::t_d28ff28b9481d9 87,89,91,93
+docs/pages/guides/observability.mdx
+  s_6511f1668e6a79::t_674afd29743506 289
+docs/pages/guides/sequenced.mdx
+  s_6511f1668e6a79::t_dd31723bdb832e 145-147,149-150
+src/backends/rabbitmq/consumer.rs
+  s_6511f1668e6a79::t_85f717e3c54a86 31,419-444,485,566,601-603,915-943,2143-2151,3068-3082
+src/backends/rabbitmq/headers.rs
+  s_6511f1668e6a79::t_bd41753eeeaf20 25-27,30-32,73,75-86,338-350,353-356,361
+src/backends/rabbitmq/publisher.rs
+  s_6511f1668e6a79::t_6aff0259d511e6 508-512
+tests/rabbitmq_integration.rs
+  s_6511f1668e6a79::t_fd0166d40846c7 7130-7132,7142-7144,7148-7157,7212-7215,7569-7572,7592-7593,7633-7758
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a130d29c393f082781741c7b96e937ee6f97803f",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
