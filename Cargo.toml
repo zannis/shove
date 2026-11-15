@@ -203,7 +203,7 @@ arc-swap = { version = "1", optional = true }
 # plain TCP connection, while `is_websocket()` still suppresses the post-INFO
 # TLS upgrade. Transport validation classifies `wss://` as encrypted, so that
 # would be a silent downgrade rather than a build error.
-async-nats = { version = "0.49", features = ["websockets"], optional = true }
+async-nats = { version = "0.52", features = ["websockets"], optional = true }
 bytes = "1"
 futures-util = { version = "0.3", optional = true }
 rdkafka = { version = "0.39", features = [
