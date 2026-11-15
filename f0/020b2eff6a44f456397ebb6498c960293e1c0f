@@ -1,0 +1,23 @@
+src/backends/sns/consumer.rs
+  s_6511f1668e6a79::t_84d7995568f5cf 1029-1032,1038,1041-1056,1605,2420-2432,2920-2921,2926-2930,3502-3514
+tests/sns_sqs_batch.rs
+  s_6511f1668e6a79::t_85bff76696cfbc 1493-1569
+tests/sns_sqs_integration.rs
+  s_6511f1668e6a79::t_a3c93c1fcf1dfc 4465-4520
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f0020b2eff6a44f456397ebb6498c960293e1c0f",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
