@@ -5,6 +5,8 @@ use std::time::Duration;
 use async_nats::HeaderMap;
 use async_nats::header::{HeaderName, HeaderValue, NATS_MESSAGE_ID};
 use async_nats::jetstream;
+use async_nats::jetstream::ErrorCode;
+use async_nats::jetstream::context::{PublishError, PublishErrorKind};
 use async_nats::jetstream::publish::PublishAck;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -60,6 +62,11 @@ pub(super) enum PublishFailure {
     /// copy could not be read back.
     #[error(transparent)]
     Unconfirmed(ShoveError),
+    /// A copy that can never be published, however often it is tried: the
+    /// client or the stream refuses its size. Only a copy is classified, a
+    /// user's publish keeps its retries and its `Connection` error.
+    #[error(transparent)]
+    Unpublishable(ShoveError),
 }
 
 /// What [`publish_with_retry`] returns.
@@ -70,16 +77,32 @@ impl PublishFailure {
     /// immediate redelivery, which is what every other failure gets.
     pub(super) fn redelivery_delay(&self) -> Option<Duration> {
         match self {
-            Self::Failed(_) => None,
+            Self::Failed(_) | Self::Unpublishable(_) => None,
             Self::Unconfirmed(_) => Some(UNCONFIRMED_COPY_REDELIVERY),
         }
     }
 
+    pub(super) fn is_unpublishable(&self) -> bool {
+        matches!(self, Self::Unpublishable(_))
+    }
+
     fn into_error(self) -> ShoveError {
         match self {
-            Self::Failed(e) | Self::Unconfirmed(e) => e,
+            Self::Failed(e) | Self::Unconfirmed(e) | Self::Unpublishable(e) => e,
         }
     }
+}
+
+/// Whether a failed publish can never succeed for this message: the client
+/// refuses it over the server's `max_payload`, or the stream refuses it over
+/// its maximum message size.
+fn is_permanent_publish_error(e: &PublishError) -> bool {
+    if e.kind() == PublishErrorKind::MaxPayloadExceeded {
+        return true;
+    }
+    std::error::Error::source(e)
+        .and_then(|source| source.downcast_ref::<jetstream::Error>())
+        .is_some_and(|api| api.error_code() == ErrorCode::STREAM_MESSAGE_EXCEEDS_MAXIMUM)
 }
 
 /// Publish a message to JetStream with retry on transient failures.
@@ -140,6 +163,9 @@ pub(super) async fn publish_with_retry(
                     }
                 }
                 Err(e) => {
+                    if copy_origin.is_some() && is_permanent_publish_error(&e) {
+                        return Err(unpublishable(label, &e));
+                    }
                     if attempt >= max_attempts {
                         metrics::record_backend_error(
                             metrics::BackendLabel::Nats,
@@ -156,6 +182,9 @@ pub(super) async fn publish_with_retry(
                 }
             },
             Err(e) => {
+                if copy_origin.is_some() && is_permanent_publish_error(&e) {
+                    return Err(unpublishable(label, &e));
+                }
                 if attempt >= max_attempts {
                     metrics::record_backend_error(
                         metrics::BackendLabel::Nats,
@@ -173,6 +202,12 @@ pub(super) async fn publish_with_retry(
         }
         attempt = attempt.saturating_add(1);
     }
+}
+
+fn unpublishable(label: &str, e: &PublishError) -> PublishFailure {
+    PublishFailure::Unpublishable(ShoveError::Validation(format!(
+        "{label} can never be published: {e}"
+    )))
 }
 
 /// A copy as its publish sent it.
@@ -810,6 +845,58 @@ mod tests {
             headers.get(SEQUENCE_KEY_HEADER).map(HeaderValue::as_str),
             Some("key")
         );
+    }
+
+    fn api_error(err_code: u64) -> jetstream::Error {
+        serde_json::from_value(serde_json::json!({
+            "code": 400,
+            "err_code": err_code,
+            "description": "api error",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_payload_over_the_server_limit_is_permanent() {
+        let e = PublishError::new(PublishErrorKind::MaxPayloadExceeded);
+        assert!(is_permanent_publish_error(&e));
+    }
+
+    #[test]
+    fn a_message_over_the_stream_limit_is_permanent() {
+        let e = PublishError::with_source(
+            PublishErrorKind::Other,
+            api_error(ErrorCode::STREAM_MESSAGE_EXCEEDS_MAXIMUM.0),
+        );
+        assert!(is_permanent_publish_error(&e));
+    }
+
+    #[test]
+    fn other_publish_failures_are_not_permanent() {
+        for kind in [
+            PublishErrorKind::StreamNotFound,
+            PublishErrorKind::WrongLastMessageId,
+            PublishErrorKind::WrongLastSequence,
+            PublishErrorKind::TimedOut,
+            PublishErrorKind::BrokenPipe,
+            PublishErrorKind::MaxAckPending,
+            PublishErrorKind::Other,
+        ] {
+            assert!(!is_permanent_publish_error(&PublishError::new(kind)));
+        }
+        let other_api = PublishError::with_source(
+            PublishErrorKind::Other,
+            api_error(ErrorCode::CONSUMER_NAME_EXIST.0),
+        );
+        assert!(!is_permanent_publish_error(&other_api));
+    }
+
+    #[test]
+    fn only_an_unpublishable_failure_reports_so() {
+        let e = || ShoveError::Validation("x".into());
+        assert!(PublishFailure::Unpublishable(e()).is_unpublishable());
+        assert!(!PublishFailure::Failed(e()).is_unpublishable());
+        assert!(!PublishFailure::Unconfirmed(e()).is_unpublishable());
     }
 
     /// A zero attempt budget is a caller's mistake, answered before anything
