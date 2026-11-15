@@ -1,4 +1,5 @@
-//! Process-wide registry of per-`(client, stream, group)` maintenance tasks.
+//! Process-wide registry of per-`(client, stream, group)` maintenance tasks,
+//! plus the per-`(client, hold sets)` hold-queue requeuer.
 //!
 //! Every Redis consumer loop — registry-managed or direct — calls
 //! [`acquire`] for the stream it consumes. The first acquisition for a
@@ -9,6 +10,16 @@
 //! removed. This keeps maintenance at exactly one task per key no matter how
 //! many consumers a group scales to — the N-redundant-sweepers pathology the
 //! reaper consolidation removed must not come back through this door.
+//!
+//! The hold-queue requeuer ([`acquire_requeuer`]) shares the same refcount and
+//! guard lifecycle. It is keyed by the client and the set of hold-queue names
+//! it polls (the requeuer's whole input), so every consumer of one topic joins
+//! one requeuer while the shards of a FIFO topic, which poll different hold
+//! sets, get one each. It carries no reclaim policy, so joining or leaving
+//! never respawns it. Cancelling a requeuer does not stop it mid-poll, so the
+//! registry keeps the latest task's handle per key after the entry is released
+//! and a replacement awaits it before polling: two requeuers never overlap on
+//! one key.
 //!
 //! ## Mixed handler-timeout policies
 //!
@@ -54,16 +65,26 @@
 //! min-across-groups trim are both safe under.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::client::RedisClient;
 use super::reaper::spawn_maintenance;
+use super::requeue::run_requeuer;
 use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
 
-type Key = (usize, String, String);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Kind {
+    Reaper,
+    Requeuer,
+}
+
+/// `(client, kind, stream or joined hold-queue names, group)`.
+type Key = (usize, Kind, String, String);
 
 /// One consumer's reclaim policy: its handler timeout, or `None` for
 /// consumers that may hold in-flight work indefinitely.
@@ -113,6 +134,50 @@ fn lock() -> std::sync::MutexGuard<'static, HashMap<Key, Entry>> {
     registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Latest requeuer task per key, with the marker its task owns. It stays
+/// reachable after the registry entry is released so a replacement can wait
+/// for it; a task removes its own slot when it exits.
+type RequeuerSlots = HashMap<Key, (Arc<()>, JoinHandle<()>)>;
+
+static REQUEUERS: OnceLock<Mutex<RequeuerSlots>> = OnceLock::new();
+
+fn requeuer_slots() -> std::sync::MutexGuard<'static, RequeuerSlots> {
+    REQUEUERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Spawn `task` for `key` so that it starts only after the key's previous task
+/// has exited. Never blocks the caller; the wait happens inside the task.
+fn spawn_after_previous<F>(key: &Key, task: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let marker = Arc::new(());
+    let task_marker = Arc::clone(&marker);
+    let mut slots = requeuer_slots();
+    let previous = slots
+        .remove(key)
+        .map(|(_, handle)| handle)
+        .filter(|handle| !handle.is_finished());
+    let slot_key = key.clone();
+    let handle = tokio::spawn(async move {
+        if let Some(previous) = previous {
+            let _ = previous.await;
+        }
+        task.await;
+        let mut slots = requeuer_slots();
+        if slots
+            .get(&slot_key)
+            .is_some_and(|(stored, _)| Arc::ptr_eq(stored, &task_marker))
+        {
+            slots.remove(&slot_key);
+        }
+    });
+    slots.insert(key.clone(), (marker, handle));
 }
 
 /// Handle for one consumer's interest in a stream's maintenance. Dropping
@@ -224,6 +289,7 @@ pub(super) fn acquire(
 ) -> MaintenanceGuard {
     let key = (
         client.instance_id(),
+        Kind::Reaper,
         stream.to_owned(),
         client.group().to_owned(),
     );
@@ -246,6 +312,31 @@ pub(super) fn acquire(
         reclaim_policy(handler_timeout, resolves_own_timeout),
         spawner,
     )
+}
+
+/// Ensure one requeuer polls `hold_queue_names` for this client and return a
+/// guard expressing this consumer's interest in it. The last guard to drop
+/// cancels the requeuer.
+pub(super) fn acquire_requeuer(
+    client: &RedisClient,
+    hold_queue_names: &[String],
+) -> MaintenanceGuard {
+    let key = (
+        client.instance_id(),
+        Kind::Requeuer,
+        hold_queue_names.join("\n"),
+        client.group().to_owned(),
+    );
+    let client = client.clone();
+    let names = hold_queue_names.to_vec();
+    let slot_key = key.clone();
+    let spawner: Spawner = Arc::new(move |shutdown, _| {
+        spawn_after_previous(
+            &slot_key,
+            run_requeuer(client.clone(), names.clone(), shutdown),
+        );
+    });
+    acquire_with(key, None, spawner)
 }
 
 /// Core refcount + effective-policy logic, generic over the spawner so the
@@ -284,7 +375,12 @@ mod tests {
     fn key(n: usize) -> Key {
         // Distinct high client-ids so tests can't collide with each other or
         // with real acquisitions in the shared process-wide registry.
-        (usize::MAX - n, format!("stream-{n}"), format!("group-{n}"))
+        (
+            usize::MAX - n,
+            Kind::Reaper,
+            format!("stream-{n}"),
+            format!("group-{n}"),
+        )
     }
 
     #[test]
@@ -361,6 +457,79 @@ mod tests {
         // `without_handler_timeout()` disables reclaim; a timeout outcome is
         // unreachable in that configuration and must not resurrect it.
         assert_eq!(reclaim_policy(None, true), None);
+    }
+
+    #[tokio::test]
+    async fn replacement_spawn_waits_for_the_previous_task_to_exit() {
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::oneshot;
+
+        let mut k = key(8);
+        k.1 = Kind::Requeuer;
+        let first_started = Arc::new(AtomicBool::new(false));
+        let first_done = Arc::new(AtomicBool::new(false));
+        let second_started = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+
+        let (started, done) = (first_started.clone(), first_done.clone());
+        spawn_after_previous(&k, async move {
+            started.store(true, Ordering::SeqCst);
+            let _ = release_rx.await;
+            done.store(true, Ordering::SeqCst);
+        });
+        while !first_started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        let (second, first_done_seen) = (second_started.clone(), first_done.clone());
+        let (seen_tx, seen_rx) = oneshot::channel::<bool>();
+        spawn_after_previous(&k, async move {
+            second.store(true, Ordering::SeqCst);
+            let _ = seen_tx.send(first_done_seen.load(Ordering::SeqCst));
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !second_started.load(Ordering::SeqCst),
+            "replacement started while the previous task was still running"
+        );
+
+        release_tx.send(()).ok();
+        assert_eq!(
+            seen_rx.await.ok(),
+            Some(true),
+            "first finished before second ran"
+        );
+
+        // Both tasks have exited, so their slot must be gone.
+        for _ in 0..100 {
+            if !requeuer_slots().contains_key(&k) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("finished task left its handle in the slot");
+    }
+
+    #[test]
+    fn requeuer_and_reaper_keys_do_not_collide() {
+        let (log, spawner) = recorder();
+        let reaper = key(7);
+        let mut requeuer = key(7);
+        requeuer.1 = Kind::Requeuer;
+        let g1 = acquire_with(reaper, None, spawner.clone());
+        let g2 = acquire_with(requeuer.clone(), None, spawner.clone());
+        let g3 = acquire_with(requeuer, None, spawner);
+        assert_eq!(
+            log.lock().unwrap().len(),
+            2,
+            "one task per kind, joined by later guards"
+        );
+        drop(g1);
+        drop(g2);
+        assert!(!log.lock().unwrap()[1].0.is_cancelled());
+        drop(g3);
+        assert!(log.lock().unwrap()[1].0.is_cancelled());
     }
 
     use std::sync::Mutex as StdMutex;

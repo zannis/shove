@@ -34,7 +34,7 @@ use super::constants::{
     X_ORIGINAL_QUEUE, X_RETRY_COUNT, X_SEQUENCE_KEY,
 };
 use super::lease;
-use super::requeue::{HoldEntry, enqueue_hold, spawn_requeuer};
+use super::requeue::{HoldEntry, enqueue_hold};
 use super::topology::RedisTopologyDeclarer;
 
 // ---------------------------------------------------------------------------
@@ -96,20 +96,11 @@ impl RedisConsumer {
         let topology = T::topology();
         let stream = topology.queue();
         let hold_queues = topology.hold_queues();
-        let shutdown = options.shutdown.clone();
-
         let hold_names: Vec<String> = hold_queues.iter().map(|hq| hq.name().to_owned()).collect();
-        let requeue_handle = if !hold_names.is_empty() {
-            Some(spawn_requeuer(
-                self.client.clone(),
-                hold_names,
-                shutdown.clone(),
-            ))
-        } else {
-            None
-        };
+        let _requeuer = (!hold_names.is_empty())
+            .then(|| super::maintenance::acquire_requeuer(&self.client, &hold_names));
 
-        let result = run_stream_loop_concurrent::<T, H>(
+        run_stream_loop_concurrent::<T, H>(
             self.client.clone(),
             Arc::new(handler),
             Arc::new(ctx),
@@ -118,12 +109,7 @@ impl RedisConsumer {
             stream,
             hold_queues,
         )
-        .await;
-
-        if let Some(h) = requeue_handle {
-            h.abort();
-        }
-        result
+        .await
     }
 }
 
@@ -418,17 +404,13 @@ impl ConsumerImpl for RedisConsumer {
                         .map(|hq| hq.name().to_owned())
                         .collect();
 
-                    let shutdown = options.shutdown.clone();
-                    let requeue_handle = if !hold_names.is_empty() {
-                        Some(spawn_requeuer(client.clone(), hold_names, shutdown.clone()))
-                    } else {
-                        None
-                    };
+                    let _requeuer = (!hold_names.is_empty())
+                        .then(|| super::maintenance::acquire_requeuer(&client, &hold_names));
 
                     // One poison set per shard task. A sequence key always
                     // hashes to the same shard, so per-shard tracking sees
                     // every message the key will ever produce on this consumer.
-                    let result = run_stream_loop_arc::<T, H>(
+                    run_stream_loop_arc::<T, H>(
                         client,
                         handler,
                         ctx,
@@ -439,12 +421,7 @@ impl ConsumerImpl for RedisConsumer {
                         Maintain::Stream,
                         PoisonedKeys::new(on_failure),
                     )
-                    .await;
-
-                    if let Some(h) = requeue_handle {
-                        h.abort();
-                    }
-                    result
+                    .await
                 }));
             }
 
@@ -544,16 +521,11 @@ where
     H: MessageHandler<T>,
 {
     let hold_queues = topology.hold_queues();
-    let shutdown = options.shutdown.clone();
-
     let hold_names: Vec<String> = hold_queues.iter().map(|hq| hq.name().to_owned()).collect();
-    let requeue_handle = if !hold_names.is_empty() {
-        Some(spawn_requeuer(client.clone(), hold_names, shutdown.clone()))
-    } else {
-        None
-    };
+    let _requeuer = (!hold_names.is_empty())
+        .then(|| super::maintenance::acquire_requeuer(&client, &hold_names));
 
-    let result = run_stream_loop_arc::<T, H>(
+    run_stream_loop_arc::<T, H>(
         client,
         Arc::new(handler),
         Arc::new(ctx),
@@ -565,12 +537,7 @@ where
         // Unsequenced path — no sequence keys, so an inert tracker.
         PoisonedKeys::default(),
     )
-    .await;
-
-    if let Some(h) = requeue_handle {
-        h.abort();
-    }
-    result
+    .await
 }
 
 /// Record a `FailAll` poisoning, logging only the first transition per key.
