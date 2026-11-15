@@ -313,10 +313,7 @@ impl SchemaRegistry {
             message: format!("subject `{subject}` has no registered version (404)"),
         };
         let body = ctx.get_json(&url, not_found).await?;
-        let id = body.get("id").and_then(|v| v.as_u64()).ok_or_else(|| {
-            SchemaRegistryError::Decode("missing id in latest-version response".into())
-        })?;
-        let id = SchemaId(id as u32);
+        let id = parse_latest_id(&body)?;
         self.subject_ids.insert(Arc::from(subject), id);
         Ok(id)
     }
@@ -365,6 +362,36 @@ struct FetchCtx {
     credentials_configured: bool,
 }
 
+fn parse_latest_id(body: &serde_json::Value) -> Result<SchemaId> {
+    let id = body.get("id").and_then(|v| v.as_u64()).ok_or_else(|| {
+        SchemaRegistryError::Decode("missing id in latest-version response".into())
+    })?;
+    u32::try_from(id)
+        .map(SchemaId)
+        .map_err(|_| SchemaRegistryError::Decode(format!("schema id {id} out of range")))
+}
+
+fn parse_versions(body: &serde_json::Value) -> Result<Vec<(Arc<str>, i32)>> {
+    let arr = body
+        .as_array()
+        .ok_or_else(|| SchemaRegistryError::Decode("expected array from /versions".into()))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        let subject = v
+            .get("subject")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| SchemaRegistryError::Decode("missing subject".into()))?;
+        let version = v
+            .get("version")
+            .and_then(|n| n.as_i64())
+            .ok_or_else(|| SchemaRegistryError::Decode("missing version".into()))?;
+        let version = i32::try_from(version)
+            .map_err(|_| SchemaRegistryError::Decode(format!("version {version} out of range")))?;
+        out.push((Arc::from(subject), version));
+    }
+    Ok(out)
+}
+
 impl FetchCtx {
     async fn fetch(self, id: SchemaId) -> Result<Arc<CachedSchema>> {
         let versions = self.get_versions(id).await?;
@@ -382,19 +409,7 @@ impl FetchCtx {
         let body: serde_json::Value = self
             .get_json(&url, SchemaRegistryError::NotFound(id.0))
             .await?;
-        let arr = body
-            .as_array()
-            .ok_or_else(|| SchemaRegistryError::Decode("expected array from /versions".into()))?;
-        let mut out = Vec::with_capacity(arr.len());
-        for v in arr {
-            let subject = v
-                .get("subject")
-                .and_then(|s| s.as_str())
-                .ok_or_else(|| SchemaRegistryError::Decode("missing subject".into()))?;
-            let version = v.get("version").and_then(|n| n.as_i64()).unwrap_or(0) as i32;
-            out.push((Arc::from(subject), version));
-        }
-        Ok(out)
+        parse_versions(&body)
     }
 
     async fn get_schema(&self, id: SchemaId) -> Result<(String, SchemaType)> {
@@ -793,6 +808,43 @@ impl SchemaRegistryBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn latest_id_out_of_u32_range_is_a_decode_error() {
+        assert!(matches!(
+            parse_latest_id(&json!({"id": u64::from(u32::MAX) + 1})),
+            Err(SchemaRegistryError::Decode(_))
+        ));
+        assert_eq!(
+            parse_latest_id(&json!({"id": u32::MAX})).unwrap(),
+            SchemaId(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn version_out_of_i32_range_is_a_decode_error() {
+        let body = json!([{"subject": "s", "version": i64::from(i32::MAX) + 1}]);
+        assert!(matches!(
+            parse_versions(&body),
+            Err(SchemaRegistryError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn missing_or_non_integer_version_is_a_decode_error() {
+        for body in [
+            json!([{"subject": "s"}]),
+            json!([{"subject": "s", "version": "1"}]),
+        ] {
+            assert!(matches!(
+                parse_versions(&body),
+                Err(SchemaRegistryError::Decode(_))
+            ));
+        }
+        let ok = parse_versions(&json!([{"subject": "s", "version": 3}])).unwrap();
+        assert_eq!(ok[0].1, 3);
+    }
 
     #[test]
     fn bearer_token_is_redacted_in_debug() {

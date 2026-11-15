@@ -467,7 +467,12 @@ impl SnsTopologyDeclarer {
                 .topic_registry()
                 .get(topology.queue())
                 .await
-                .expect("topic ARN must be in registry after declare");
+                .ok_or_else(|| {
+                    ShoveError::Topology(format!(
+                        "topic ARN for '{}' missing from the registry after declare",
+                        topology.queue()
+                    ))
+                })?;
 
             if topology.sequencing().is_some() {
                 self.declare_sqs_sequenced(topology, &topic_arn).await?;

@@ -250,6 +250,10 @@ pub(crate) async fn route_reject_batch(
     change_visibility_batch(sqs, queue_url, receipt_handles, 0).await;
 }
 
+fn next_retry_count(retry_count: u32) -> u32 {
+    retry_count.saturating_add(1)
+}
+
 /// Delete + re-send the message with an incremented `x-retry-count`
 /// attribute and a delay based on the hold queue configuration.
 pub(crate) async fn route_retry(
@@ -261,7 +265,7 @@ pub(crate) async fn route_retry(
     topology: &QueueTopology,
     retry_count: u32,
 ) {
-    let new_retry_count = retry_count + 1;
+    let new_retry_count = next_retry_count(retry_count);
 
     let delay = if topology.hold_queues().is_empty() {
         warn!(
@@ -318,7 +322,7 @@ pub(crate) async fn route_retry_fifo(
         topology.hold_queues()[index].delay()
     };
 
-    let timeout_secs = delay.as_secs() as i32;
+    let timeout_secs = visibility_seconds_for_delay(delay);
 
     debug!(
         queue_url,
@@ -599,6 +603,12 @@ pub(crate) fn extract_message_attributes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_count_saturates_at_the_maximum() {
+        assert_eq!(next_retry_count(0), 1);
+        assert_eq!(next_retry_count(u32::MAX), u32::MAX);
+    }
     use crate::publisher_internal::assert_internal_keys_reserved;
     use crate::topology::TopologyBuilder;
 

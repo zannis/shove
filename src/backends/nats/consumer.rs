@@ -661,8 +661,11 @@ fn progress_interval(ack_wait: Duration) -> Duration {
     } else {
         ack_wait
     };
-    ack_wait / 3
+    (ack_wait / 3).max(MIN_PROGRESS_INTERVAL)
 }
+
+/// A sub-3 ns `ack_wait` would divide to zero and spin the renewal loops.
+const MIN_PROGRESS_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Holds `msg` un-acked for `delay`, renewing its `ack_wait` with a progress
 /// ack every [`progress_interval`] and once more as the wait ends, so what
@@ -4096,6 +4099,17 @@ mod retry_strategy_tests {
 #[cfg(test)]
 mod ack_wait_tests {
     use super::*;
+
+    #[test]
+    fn progress_interval_is_never_zero() {
+        for ack_wait in [Duration::from_nanos(1), Duration::from_nanos(2)] {
+            assert_eq!(progress_interval(ack_wait), MIN_PROGRESS_INTERVAL);
+        }
+        assert_eq!(
+            progress_interval(Duration::from_secs(30)),
+            Duration::from_secs(10)
+        );
+    }
 
     #[test]
     fn default_handler_timeout_gets_triple_margin() {

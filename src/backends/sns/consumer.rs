@@ -2336,7 +2336,7 @@ where
 
             let metadata = extract_metadata(&msg);
             if batch.is_empty() {
-                deadline = Some(tokio::time::Instant::now() + max_batch_age);
+                deadline = batch_deadline(tokio::time::Instant::now(), max_batch_age);
             }
             batch.push(message, metadata, receipt_handle);
         }
@@ -2610,6 +2610,38 @@ impl SqsConsumer {
             )
             .await
         }
+    }
+}
+
+/// `checked_add` because `with_max_batch_age` bounds its argument below only;
+/// an age the clock cannot represent leaves the deadline unarmed, so the size
+/// trigger alone bounds the batch.
+fn batch_deadline(
+    now: tokio::time::Instant,
+    max_batch_age: Duration,
+) -> Option<tokio::time::Instant> {
+    now.checked_add(max_batch_age)
+}
+
+#[cfg(test)]
+mod batch_deadline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unrepresentable_age_leaves_the_deadline_unarmed() {
+        assert_eq!(
+            batch_deadline(tokio::time::Instant::now(), Duration::MAX),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_age_arms_the_deadline() {
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            batch_deadline(now, Duration::from_millis(250)),
+            Some(now + Duration::from_millis(250))
+        );
     }
 }
 

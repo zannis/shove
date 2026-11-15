@@ -148,28 +148,27 @@ impl RabbitMqClient {
     /// Compose or Kubernetes) where the broker may not be ready immediately.
     pub async fn connect_with_retry(config: &RabbitMqConfig, max_attempts: u32) -> Result<Self> {
         let mut backoff = Backoff::default();
-        let mut last_err = None;
+        let mut attempts = 0u32;
 
-        for attempt in 0..max_attempts {
+        loop {
+            attempts = attempts.saturating_add(1);
             match Self::connect(config).await {
                 Ok(client) => return Ok(client),
                 Err(e) => {
-                    if attempt + 1 < max_attempts {
-                        let delay = backoff.next().expect("backoff is infinite");
-                        tracing::warn!(
-                            attempt = attempt + 1,
-                            max_attempts,
-                            error = %e,
-                            "RabbitMQ connection failed, retrying in {delay:?}"
-                        );
-                        tokio::time::sleep(delay).await;
+                    if attempts >= max_attempts {
+                        return Err(e);
                     }
-                    last_err = Some(e);
+                    let delay = backoff.next_delay();
+                    tracing::warn!(
+                        attempt = attempts,
+                        max_attempts,
+                        error = %e,
+                        "RabbitMQ connection failed, retrying in {delay:?}"
+                    );
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
-
-        Err(last_err.expect("loop ran at least once"))
     }
 
     /// Dial an independent sibling `RabbitMqClient` that reuses this client's
@@ -387,6 +386,19 @@ mod tests {
     use super::*;
     use lapin::ErrorKind;
     use lapin::protocol::{AMQPError, AMQPErrorKind, AMQPHardError, AMQPSoftError};
+
+    #[tokio::test]
+    async fn connect_with_retry_makes_one_attempt_without_a_budget_to_retry() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let config = RabbitMqConfig::new(format!("amqp://127.0.0.1:{port}/%2F"));
+
+        let outcome = RabbitMqClient::connect_with_retry(&config, 0).await;
+
+        assert!(outcome.is_err());
+    }
 
     #[test]
     fn config_debug_redacts_password_only() {
