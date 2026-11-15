@@ -28,8 +28,7 @@ use crate::backend::batch_consumer::{
 use crate::backend::broadcast::BROADCAST_DEFER_DELAY;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::{
-    delivery_message_id, extract_dead_metadata, extract_message_metadata, get_retry_count,
-    table_message_id,
+    delivery_retry_token, extract_dead_metadata, extract_message_metadata, get_retry_count,
 };
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::backends::rabbitmq::router;
@@ -339,15 +338,19 @@ enum KeyState {
     /// hold queue. The key is blocked until the retry comes back.
     /// The `Instant` records when the key entered this state, used to enforce
     /// `hold_queue_timeout` eviction. The `Option<String>` is the
-    /// `x-message-id` of the copy that was sent back through the broker; see
-    /// [`is_returning_retry`].
+    /// consumer-minted retry token of the copy sent back through the broker;
+    /// see [`is_returning_retry`].
     AwaitingRetry(Instant, Option<String>),
 }
 
 /// Whether an arriving message for an `AwaitingRetry` key is the one that
-/// key is waiting for. With no recorded id the message went back as the
-/// original (requeued, and it carried no id), so only a redelivery without
-/// an id can be it.
+/// key is waiting for.
+///
+/// The token is minted by this consumer when it publishes the hold-queue
+/// copy, so a producer cannot forge it. A requeued message (no hold queues,
+/// or a failed hold-queue publish) keeps its original headers and cannot
+/// carry a fresh token: for it the match is best-effort, any redelivery
+/// without a token.
 fn is_returning_retry(expected: Option<&str>, arriving: Option<&str>, redelivered: bool) -> bool {
     match (expected, arriving) {
         (Some(expected), Some(arriving)) => expected == arriving,
@@ -491,8 +494,8 @@ impl RabbitMqConsumer {
 
         let mut key_states: HashMap<String, KeyState> = HashMap::new();
         // Hold-queue copies dead-letter back with the shard queue name as their
-        // routing key, so the arriving id is what maps a copy to its sequence key.
-        let mut awaited_ids: HashMap<String, String> = HashMap::new();
+        // routing key, so the consumer-minted token is what maps a copy to its key.
+        let mut awaited_tokens: HashMap<String, String> = HashMap::new();
         let mut in_flight_count: usize = 0;
 
         // Interval for evicting keys that have been stuck in AwaitingRetry too long.
@@ -598,9 +601,9 @@ impl RabbitMqConsumer {
                     }
                     Outcome::Retry | Outcome::Defer => {
                         // Non-terminal — route to hold queue, key enters AwaitingRetry.
-                        let mut expected_id = delivery_message_id(delivery);
+                        let mut expected_token = delivery_retry_token(delivery);
                         if matches!(outcome, Outcome::Retry) {
-                            expected_id = route_shard_retry(
+                            expected_token = route_shard_retry(
                                 &received,
                                 shard_hold_queues,
                                 &publisher,
@@ -618,8 +621,8 @@ impl RabbitMqConsumer {
                             }
                             if !shard_hold_queues.is_empty() {
                                 let hold_queue = &shard_hold_queues[0];
-                                let headers = router::clone_headers(delivery);
-                                let hold_id = table_message_id(&headers);
+                                let mut headers = router::clone_headers(delivery);
+                                let hold_token = router::stamp_retry_token(&mut headers);
                                 match publisher
                                     .publish_to_queue(hold_queue.name(), &received.payload, headers)
                                     .await
@@ -634,10 +637,10 @@ impl RabbitMqConsumer {
                                             publisher.rollback_if_tx().await;
                                             router::nack_requeue(delivery, &publisher).await.ok();
                                         } else if let Err(e) = publisher.commit_if_tx().await {
-                                            expected_id = hold_id;
+                                            expected_token = Some(hold_token);
                                             error!("tx_commit failed for shard defer: {e}");
                                         } else {
-                                            expected_id = hold_id;
+                                            expected_token = Some(hold_token);
                                             debug!(
                                                 "deferring message to shard hold queue {}",
                                                 hold_queue.name()
@@ -657,11 +660,11 @@ impl RabbitMqConsumer {
                             }
                         }
                         in_flight_count -= 1;
-                        if let Some(id) = &expected_id {
-                            awaited_ids.insert(id.clone(), key.clone());
+                        if let Some(token) = &expected_token {
+                            awaited_tokens.insert(token.clone(), key.clone());
                         }
                         key_states
-                            .insert(key, KeyState::AwaitingRetry(Instant::now(), expected_id));
+                            .insert(key, KeyState::AwaitingRetry(Instant::now(), expected_token));
                     }
                 }
             }
@@ -817,7 +820,7 @@ impl RabbitMqConsumer {
                             "sequence key stuck in AwaitingRetry, dead-lettering pending messages"
                         );
                         key_states.remove(&key);
-                        awaited_ids.retain(|_, awaiting_key| *awaiting_key != key);
+                        awaited_tokens.retain(|_, awaiting_key| *awaiting_key != key);
                         if let Some(pending) = pending_deliveries.remove(&key) {
                             for pd in pending {
                                 // Not a cascade: no already-counted failure
@@ -840,10 +843,10 @@ impl RabbitMqConsumer {
                 item = stream.next(), if can_accept => {
                     let received = ReceivedDelivery::new(unwrap_delivery(item, queue)?);
                     let delivery = &received.delivery;
-                    let arriving_id = delivery_message_id(delivery);
-                    let seq_key = arriving_id
+                    let arriving_token = delivery_retry_token(delivery);
+                    let seq_key = arriving_token
                         .as_ref()
-                        .and_then(|id| awaited_ids.get(id))
+                        .and_then(|token| awaited_tokens.get(token))
                         .cloned()
                         .unwrap_or_else(|| delivery.routing_key.to_string());
                     let retry_count = get_retry_count(delivery);
@@ -859,6 +862,58 @@ impl RabbitMqConsumer {
                         );
                         // Cascade: intentionally not counted — see `metrics::FailReason`.
                         router::route_reject_cascade(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::Rejected).await?;
+                        continue;
+                    }
+
+                    // ── Is this the retry the key is waiting for? ──
+                    let awaited_retry = matches!(
+                        key_states.get(&seq_key),
+                        Some(KeyState::AwaitingRetry(_, expected_token))
+                            if is_returning_retry(
+                                expected_token.as_deref(),
+                                arriving_token.as_deref(),
+                                delivery.redelivered,
+                            )
+                    );
+                    if awaited_retry {
+                        debug!(
+                            sequence_key = %seq_key,
+                            queue = %queue,
+                            retry_count,
+                            "returning retry clears AwaitingRetry"
+                        );
+                        key_states.remove(&seq_key);
+                        if let Some(token) = &arriving_token {
+                            awaited_tokens.remove(token);
+                        }
+                    }
+
+                    // ── Key busy: buffer whatever the retry count ──
+                    if key_states.contains_key(&seq_key) {
+                        if let Some(limit) = options.max_pending_per_key {
+                            let current_len = pending_deliveries
+                                .get(&seq_key)
+                                .map_or(0, |q| q.len());
+                            if current_len >= limit {
+                                warn!(
+                                    sequence_key = %seq_key,
+                                    queue = %queue,
+                                    limit,
+                                    "per-key pending buffer full, rejecting to DLQ"
+                                );
+                                router::route_reject(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::PendingFull).await?;
+                                continue;
+                            }
+                        }
+                        debug!(
+                            sequence_key = %seq_key,
+                            queue = %queue,
+                            "key busy, buffering delivery locally"
+                        );
+                        pending_deliveries
+                            .entry(seq_key)
+                            .or_insert_with(|| VecDeque::with_capacity(4))
+                            .push_back(received);
                         continue;
                     }
 
@@ -887,90 +942,29 @@ impl RabbitMqConsumer {
                             }
                         }
                         router::route_reject(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::MaxRetriesExceeded).await?;
+                        if awaited_retry {
+                            self.drain_pending_for_key::<T, H>(
+                                &seq_key,
+                                &handler,
+                                &ctx,
+                                options,
+                                on_failure,
+                                poisoned_keys,
+                                &completed_tx,
+                                &mut key_states,
+                                &mut in_flight_count,
+                                pending_deliveries,
+                                queue,
+                                topology,
+                                &publisher,
+                                &topic,
+                                &group,
+                            )
+                            .await;
+                        }
                         continue;
                     }
 
-                    // ── Check if key is busy ──
-                    match key_states.get(&seq_key) {
-                        Some(KeyState::InFlight { .. }) => {
-                            // Handler running — buffer locally if within limit.
-                            if let Some(limit) = options.max_pending_per_key {
-                                let current_len = pending_deliveries
-                                    .get(&seq_key)
-                                    .map_or(0, |q| q.len());
-                                if current_len >= limit {
-                                    warn!(
-                                        sequence_key = %seq_key,
-                                        queue = %queue,
-                                        limit,
-                                        "per-key pending buffer full, rejecting to DLQ"
-                                    );
-                                    router::route_reject(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::PendingFull).await?;
-                                    continue;
-                                }
-                            }
-                            debug!(
-                                sequence_key = %seq_key,
-                                queue = %queue,
-                                "key in-flight, buffering delivery locally"
-                            );
-                            pending_deliveries
-                                .entry(seq_key)
-                                .or_insert_with(|| VecDeque::with_capacity(4))
-                                .push_back(received);
-                            continue;
-                        }
-                        Some(KeyState::AwaitingRetry(_, expected_id)) => {
-                            if is_returning_retry(
-                                expected_id.as_deref(),
-                                arriving_id.as_deref(),
-                                delivery.redelivered,
-                            ) {
-                                // This is the returning retry (or a nack+requeue
-                                // redelivery when no hold queue is configured) —
-                                // clear AwaitingRetry and fall through to spawn a
-                                // handler below.
-                                debug!(
-                                    sequence_key = %seq_key,
-                                    queue = %queue,
-                                    retry_count,
-                                    "returning retry clears AwaitingRetry"
-                                );
-                                key_states.remove(&seq_key);
-                                if let Some(id) = &arriving_id {
-                                    awaited_ids.remove(id);
-                                }
-                            } else {
-                                // New message while awaiting retry — buffer if within limit.
-                                if let Some(limit) = options.max_pending_per_key {
-                                    let current_len = pending_deliveries
-                                        .get(&seq_key)
-                                        .map_or(0, |q| q.len());
-                                    if current_len >= limit {
-                                        warn!(
-                                            sequence_key = %seq_key,
-                                            queue = %queue,
-                                            limit,
-                                            "per-key pending buffer full, rejecting to DLQ"
-                                        );
-                                        router::route_reject(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::PendingFull).await?;
-                                        continue;
-                                    }
-                                }
-                                debug!(
-                                    sequence_key = %seq_key,
-                                    queue = %queue,
-                                    "key awaiting retry, buffering new delivery locally"
-                                );
-                                pending_deliveries
-                                    .entry(seq_key)
-                                    .or_default()
-                                    .push_back(received);
-                                continue;
-                            }
-                        }
-                        None => {}
-                    }
 
                     // ── Spawn handler for this key ──
                     let metadata = extract_message_metadata(&received.delivery);
@@ -1649,13 +1643,13 @@ async fn route_shard_retry(
     queue: &str,
 ) -> Option<String> {
     let delivery = &received.delivery;
-    let original_id = delivery_message_id(delivery);
+    let original_token = delivery_retry_token(delivery);
     if let Some(hold_queue) = hold_index(retry_count, shard_hold_queues.len())
         .and_then(|index| shard_hold_queues.get(index))
     {
         let new_retry_count = retry_count.saturating_add(1);
-        let headers = router::clone_headers_with_retry(delivery, new_retry_count);
-        let hold_id = table_message_id(&headers);
+        let mut headers = router::clone_headers_with_retry(delivery, new_retry_count);
+        let hold_token = router::stamp_retry_token(&mut headers);
 
         match publisher
             .publish_to_queue(hold_queue.name(), &received.payload, headers)
@@ -1666,18 +1660,18 @@ async fn route_shard_retry(
                     error!("failed to ack delivery after publishing to shard hold queue: {e}");
                     publisher.rollback_if_tx().await;
                     router::nack_requeue(delivery, publisher).await.ok();
-                    return original_id;
+                    return original_token;
                 }
                 if let Err(e) = publisher.commit_if_tx().await {
                     error!("tx_commit failed for shard retry (attempt {new_retry_count}): {e}");
-                    return hold_id;
+                    return Some(hold_token);
                 }
                 debug!(
                     "retrying message via shard hold queue {} (attempt {})",
                     hold_queue.name(),
                     new_retry_count
                 );
-                hold_id
+                Some(hold_token)
             }
             Err(e) => {
                 warn!(
@@ -1685,7 +1679,7 @@ async fn route_shard_retry(
                     hold_queue.name()
                 );
                 router::nack_requeue(delivery, publisher).await.ok();
-                original_id
+                original_token
             }
         }
     } else {
@@ -1695,7 +1689,7 @@ async fn route_shard_retry(
             "retrying sequenced message but no shard hold queues configured — requeuing with no delay"
         );
         router::nack_requeue(delivery, publisher).await.ok();
-        original_id
+        original_token
     }
 }
 
@@ -2872,7 +2866,7 @@ mod tests {
     }
 
     #[test]
-    fn returning_retry_requires_the_recorded_id() {
+    fn returning_retry_requires_the_recorded_token() {
         assert!(is_returning_retry(Some("a"), Some("a"), false));
         assert!(is_returning_retry(Some("a"), Some("a"), true));
         assert!(!is_returning_retry(Some("a"), Some("b"), true));
@@ -2880,7 +2874,7 @@ mod tests {
     }
 
     #[test]
-    fn returning_retry_without_recorded_id_needs_an_idless_redelivery() {
+    fn returning_retry_without_recorded_token_needs_a_tokenless_redelivery() {
         assert!(is_returning_retry(None, None, true));
         assert!(!is_returning_retry(None, None, false));
         assert!(!is_returning_retry(None, Some("x"), true));

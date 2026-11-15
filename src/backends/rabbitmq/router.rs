@@ -6,7 +6,7 @@ use tracing::{debug, error, warn};
 
 use uuid::Uuid;
 
-use crate::backends::rabbitmq::headers::{MESSAGE_ID_KEY, RETRY_COUNT_KEY};
+use crate::backends::rabbitmq::headers::{MESSAGE_ID_KEY, RETRY_COUNT_KEY, RETRY_TOKEN_KEY};
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::error::{Result, ShoveError};
 use crate::metrics;
@@ -457,6 +457,18 @@ pub(crate) fn clone_headers(delivery: &Delivery) -> FieldTable {
     table
 }
 
+/// Stamp a fresh consumer-minted token on a hold-queue copy and return it.
+/// Copies are built from [`copy_preserved_headers`], which never carries a
+/// previous token, so every hop gets its own.
+pub(crate) fn stamp_retry_token(table: &mut FieldTable) -> String {
+    let token = Uuid::new_v4().to_string();
+    table.insert(
+        RETRY_TOKEN_KEY.into(),
+        AMQPValue::LongString(token.clone().into()),
+    );
+    token
+}
+
 /// Insert a fresh `x-message-id` if one is not already present.
 ///
 /// Called when routing a message to a hold queue so that the hold-queue copy
@@ -546,6 +558,26 @@ mod tests {
         assert!(result.inner().contains_key("x-trace-id"));
         assert!(result.inner().contains_key(MESSAGE_ID_KEY));
         assert_eq!(result.inner().len(), 2);
+    }
+
+    #[test]
+    fn stale_retry_token_does_not_survive_a_hop() {
+        let mut table = FieldTable::default();
+        table.insert(
+            ShortString::from(RETRY_TOKEN_KEY),
+            AMQPValue::LongString("old".into()),
+        );
+        let delivery = make_delivery(Some(table));
+        let mut copy = clone_headers_with_retry(&delivery, 2);
+        assert!(!copy.inner().contains_key(RETRY_TOKEN_KEY));
+        let first = stamp_retry_token(&mut copy);
+        let second = stamp_retry_token(&mut copy);
+        assert_ne!(first, "old");
+        assert_ne!(first, second);
+        assert_eq!(
+            copy.inner().get(RETRY_TOKEN_KEY),
+            Some(&AMQPValue::LongString(second.into()))
+        );
     }
 
     #[test]

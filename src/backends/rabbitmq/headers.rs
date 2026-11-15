@@ -22,10 +22,15 @@ pub const MESSAGE_ID_KEY: &str = "x-message-id";
 /// the dead-letter metadata.
 const DEATH_KEY: &str = "x-death";
 
+/// Header carrying the token the sequenced consumer mints for a hold-queue
+/// copy, so the copy that returns can be told from any other message for its
+/// key. Never copied onto a later hop and hidden from handlers.
+pub(crate) const RETRY_TOKEN_KEY: &str = "shove-retry-token";
+
 /// Header names this backend writes or reads back as its own. A new one belongs
 /// here: a test checks that `validate_headers` reserves every name in this list.
 #[cfg(test)]
-const INTERNAL_KEYS: &[&str] = &[RETRY_COUNT_KEY, MESSAGE_ID_KEY, DEATH_KEY];
+const INTERNAL_KEYS: &[&str] = &[RETRY_COUNT_KEY, MESSAGE_ID_KEY, DEATH_KEY, RETRY_TOKEN_KEY];
 
 fn long_string_to_owned(s: &LongString) -> String {
     // Fast path for valid UTF-8 (common case) avoids the extra allocation
@@ -54,21 +59,18 @@ pub(crate) fn get_retry_count(delivery: &Delivery) -> u32 {
     }
 }
 
-/// The `x-message-id` carried in `table`, if it is a string.
-pub(crate) fn table_message_id(table: &FieldTable) -> Option<String> {
-    match table.inner().get(MESSAGE_ID_KEY) {
+pub(crate) fn delivery_retry_token(delivery: &Delivery) -> Option<String> {
+    match delivery
+        .properties
+        .headers()
+        .as_ref()?
+        .inner()
+        .get(RETRY_TOKEN_KEY)
+    {
         Some(AMQPValue::LongString(s)) => Some(long_string_to_owned(s)),
         Some(AMQPValue::ShortString(s)) => Some(s.to_string()),
         _ => None,
     }
-}
-
-pub(crate) fn delivery_message_id(delivery: &Delivery) -> Option<String> {
-    delivery
-        .properties
-        .headers()
-        .as_ref()
-        .and_then(table_message_id)
 }
 
 pub(crate) fn extract_message_metadata(delivery: &Delivery) -> MessageMetadata {
@@ -96,6 +98,9 @@ pub(crate) fn extract_string_headers(delivery: &Delivery) -> HashMap<String, Str
     let inner = table.inner();
     let mut headers = HashMap::with_capacity(inner.len());
     for (k, v) in inner.iter() {
+        if k.as_str() == RETRY_TOKEN_KEY {
+            continue;
+        }
         let value = match v {
             AMQPValue::LongString(s) => long_string_to_owned(s),
             AMQPValue::ShortString(s) => s.to_string(),
@@ -308,6 +313,24 @@ mod tests {
     }
 
     // ---- extract_string_headers ----
+
+    #[test]
+    fn retry_token_is_hidden_from_handlers_but_readable_by_the_consumer() {
+        let mut table = FieldTable::default();
+        table.insert(
+            ShortString::from(RETRY_TOKEN_KEY),
+            AMQPValue::LongString("tok".into()),
+        );
+        table.insert(
+            ShortString::from("x-trace-id"),
+            AMQPValue::LongString("tid".into()),
+        );
+        let delivery = make_delivery(Some(table), 1, false);
+        let headers = extract_string_headers(&delivery);
+        assert!(!headers.contains_key(RETRY_TOKEN_KEY));
+        assert!(headers.contains_key("x-trace-id"));
+        assert_eq!(delivery_retry_token(&delivery).as_deref(), Some("tok"));
+    }
 
     #[test]
     fn string_headers_no_headers() {
