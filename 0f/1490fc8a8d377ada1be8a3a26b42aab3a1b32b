@@ -1,0 +1,20 @@
+.github/workflows/publish.yml
+  s_9b810d0831ab39::t_25ac7eb4771223 45
+  s_9b810d0831ab39::t_09cfcd76350bb3 46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0f1490fc8a8d377ada1be8a3a26b42aab3a1b32b",
+  "prompts": {},
+  "sessions": {
+    "s_9b810d0831ab39": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b648f5a8-71a2-4a66-ae8c-cc6ac1470b7f",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
