@@ -932,8 +932,44 @@ impl RabbitMqConsumer {
                             }
                         }
                         router::route_reject(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::MaxRetriesExceeded).await?;
-                        if awaited_retry {
-                            self.drain_pending_for_key::<T, H>(
+                        self.release_key::<T, H>(
+                            &seq_key,
+                            &handler,
+                            &ctx,
+                            options,
+                            on_failure,
+                            poisoned_keys,
+                            &completed_tx,
+                            &mut key_states,
+                            &mut in_flight_count,
+                            pending_deliveries,
+                            queue,
+                            topology,
+                            &publisher,
+                            &topic,
+                            &group,
+                        )
+                        .await;
+                        continue;
+                    }
+
+                    // ── Spawn handler for this key ──
+                    let metadata = extract_message_metadata(&received.delivery);
+                    match try_deserialize_or_reject::<T>(
+                        &received,
+                        &metadata,
+                        queue,
+                        topology,
+                        &publisher,
+                        options,
+                        &topic,
+                        group.as_deref(),
+                    )
+                    .await
+                    {
+                        None => {
+                            // Rejected before the handler: this message's turn is over.
+                            self.release_key::<T, H>(
                                 &seq_key,
                                 &handler,
                                 &ctx,
@@ -951,30 +987,6 @@ impl RabbitMqConsumer {
                                 &group,
                             )
                             .await;
-                        }
-                        continue;
-                    }
-
-
-                    // ── Spawn handler for this key ──
-                    let metadata = extract_message_metadata(&received.delivery);
-                    match try_deserialize_or_reject::<T>(
-                        &received,
-                        &metadata,
-                        queue,
-                        topology,
-                        &publisher,
-                        options,
-                        &topic,
-                        group.as_deref(),
-                    )
-                    .await
-                    {
-                        None => {
-                            // Reject undeserializable messages immediately.
-                            if on_failure == SequenceFailure::FailAll {
-                                poisoned_keys.insert(seq_key.clone());
-                            }
                         }
                         Some(message) => {
                             let rx = spawn_handler_keyed::<T, H>(
@@ -1004,6 +1016,55 @@ impl RabbitMqConsumer {
                 }
             }
         }
+    }
+
+    /// A message that owned the key's turn was rejected before its handler
+    /// ran. Poisons the key under `FailAll`, then releases the buffer through
+    /// [`Self::drain_pending_for_key`]: cascade-rejects it for a poisoned key,
+    /// otherwise starts the next buffered message in order.
+    #[allow(clippy::too_many_arguments)]
+    async fn release_key<T, H>(
+        &self,
+        key: &str,
+        handler: &Arc<H>,
+        ctx: &Arc<H::Context>,
+        options: &ConsumerOptions,
+        on_failure: SequenceFailure,
+        poisoned_keys: &mut HashSet<String>,
+        completed_tx: &mpsc::UnboundedSender<String>,
+        key_states: &mut HashMap<String, KeyState>,
+        in_flight_count: &mut usize,
+        pending_deliveries: &mut HashMap<String, VecDeque<ReceivedDelivery>>,
+        queue: &str,
+        topology: &'static QueueTopology,
+        publisher: &ChannelPublisher,
+        topic: &Arc<str>,
+        group: &Option<Arc<str>>,
+    ) where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        if on_failure == SequenceFailure::FailAll {
+            poisoned_keys.insert(key.to_string());
+        }
+        self.drain_pending_for_key::<T, H>(
+            key,
+            handler,
+            ctx,
+            options,
+            on_failure,
+            poisoned_keys,
+            completed_tx,
+            key_states,
+            in_flight_count,
+            pending_deliveries,
+            queue,
+            topology,
+            publisher,
+            topic,
+            group,
+        )
+        .await;
     }
 
     /// Pop the next pending delivery for `key` and spawn a handler for it.
