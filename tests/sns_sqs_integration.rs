@@ -20,7 +20,7 @@
 //!
 //! Run with: `cargo test --features aws-sns-sqs,audit --test sns_sqs_integration`
 
-use aws_sdk_sqs::types::{Message, MessageSystemAttributeName};
+use aws_sdk_sqs::types::{Message, MessageSystemAttributeName, QueueAttributeName};
 use shove::Broker;
 use shove::Sqs;
 use shove::publisher::Publisher as PublisherV2;
@@ -3459,4 +3459,231 @@ mod sbe_codec {
             other => panic!("expected Codec error, got {other:?}"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Receive sizing: a consumer never holds more messages than it can dispatch
+// ---------------------------------------------------------------------------
+
+define_topic!(
+    FreeSlotsTopic,
+    SimpleMessage,
+    TopologyBuilder::new("sqs-free-slots").build()
+);
+
+/// Records how often each message id is handled, sleeping `delay` per message.
+#[derive(Clone)]
+struct DeliveryCountingHandler {
+    delay: Duration,
+    seen: Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    handled: WaitableCounter,
+}
+
+impl DeliveryCountingHandler {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            seen: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            handled: WaitableCounter::new(),
+        }
+    }
+
+    fn deliveries(&self) -> HashMap<String, u32> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl MessageHandler<FreeSlotsTopic> for DeliveryCountingHandler {
+    type Context = ();
+    async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        *self.seen.lock().unwrap().entry(msg.id).or_insert(0) += 1;
+        tokio::time::sleep(self.delay).await;
+        self.handled.increment();
+        Outcome::Ack
+    }
+}
+
+async fn publish_free_slots_messages(setup: &TestSetup, n: u32) {
+    for i in 0..n {
+        let msg = SimpleMessage {
+            id: format!("free-slots-{i}"),
+            content: "payload".to_string(),
+        };
+        setup
+            .publisher
+            .publish::<FreeSlotsTopic>(&msg)
+            .await
+            .expect("publish should succeed");
+    }
+}
+
+async fn set_visibility_timeout(
+    broker: &TestBroker,
+    setup: &TestSetup,
+    queue: &str,
+    seconds: u32,
+) -> String {
+    let url = setup
+        .queue_registry()
+        .get(queue)
+        .await
+        .expect("queue URL should be registered");
+    broker
+        .sqs_client()
+        .await
+        .set_queue_attributes()
+        .queue_url(&url)
+        .attributes(QueueAttributeName::VisibilityTimeout, seconds.to_string())
+        .send()
+        .await
+        .expect("setting the visibility timeout should succeed");
+    url
+}
+
+/// Samples `ApproximateNumberOfMessagesNotVisible` until `stop` is cancelled
+/// and returns the maximum observed.
+fn sample_not_visible(
+    sqs: aws_sdk_sqs::Client,
+    queue_url: String,
+    stop: CancellationToken,
+) -> tokio::task::JoinHandle<u32> {
+    tokio::spawn(async move {
+        let mut max = 0u32;
+        while !stop.is_cancelled() {
+            let attrs = sqs
+                .get_queue_attributes()
+                .queue_url(&queue_url)
+                .attribute_names(QueueAttributeName::ApproximateNumberOfMessagesNotVisible)
+                .send()
+                .await
+                .expect("GetQueueAttributes should succeed");
+            let not_visible = attrs
+                .attributes()
+                .and_then(|a| a.get(&QueueAttributeName::ApproximateNumberOfMessagesNotVisible))
+                .and_then(|v| v.parse::<u32>().ok())
+                .expect("NotVisible attribute should be a number");
+            max = max.max(not_visible);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        max
+    })
+}
+
+#[tokio::test]
+async fn serial_group_handles_each_message_exactly_once_with_short_visibility() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<FreeSlotsTopic>().await;
+    set_visibility_timeout(&broker, &setup, "sqs-free-slots", 4).await;
+    publish_free_slots_messages(&setup, 10).await;
+
+    let handler = DeliveryCountingHandler::new(Duration::from_millis(1500));
+    let template = handler.clone();
+    let mut group = SqsConsumerGroup::new::<FreeSlotsTopic, DeliveryCountingHandler>(
+        "free-slots-group",
+        "sqs-free-slots",
+        SqsConsumerGroupConfig::new(2..=2),
+        setup.sns_client.clone(),
+        setup.queue_registry().clone(),
+        CancellationToken::new(),
+        move || template.clone(),
+        (),
+    );
+    group.start();
+
+    let all_handled = handler.handled.wait_for(10, Duration::from_secs(60)).await;
+    // Redeliveries of messages still held by a consumer surface after the visibility timeout.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    group.shutdown().await;
+
+    assert!(all_handled, "all 10 messages should be handled");
+    let deliveries = handler.deliveries();
+    assert_eq!(deliveries.len(), 10, "every message id should be seen");
+    let duplicated: Vec<_> = deliveries.iter().filter(|(_, n)| **n != 1).collect();
+    assert!(
+        duplicated.is_empty(),
+        "messages handled more than once: {duplicated:?}"
+    );
+}
+
+#[tokio::test]
+async fn serial_consumer_holds_at_most_one_message() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<FreeSlotsTopic>().await;
+    let url = set_visibility_timeout(&broker, &setup, "sqs-free-slots", 60).await;
+    publish_free_slots_messages(&setup, 10).await;
+
+    let stop = CancellationToken::new();
+    let sampler = sample_not_visible(broker.sqs_client().await, url, stop.clone());
+
+    let handler = DeliveryCountingHandler::new(Duration::from_millis(500));
+    let handler_clone = handler.clone();
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<FreeSlotsTopic, _>(
+                handler_clone,
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(shutdown_clone)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let all_handled = handler.handled.wait_for(10, Duration::from_secs(60)).await;
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+    stop.cancel();
+    let max_not_visible = sampler.await.expect("sampler should not panic");
+
+    assert!(all_handled, "all 10 messages should be handled");
+    assert!(
+        max_not_visible <= 1,
+        "a serial consumer held {max_not_visible} messages at once"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_consumer_holds_at_most_prefetch_messages() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<FreeSlotsTopic>().await;
+    let url = set_visibility_timeout(&broker, &setup, "sqs-free-slots", 60).await;
+    publish_free_slots_messages(&setup, 10).await;
+
+    let stop = CancellationToken::new();
+    let sampler = sample_not_visible(broker.sqs_client().await, url, stop.clone());
+
+    let handler = DeliveryCountingHandler::new(Duration::from_millis(1500));
+    let handler_clone = handler.clone();
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<FreeSlotsTopic, _>(
+                handler_clone,
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(shutdown_clone)
+                    .with_prefetch_count(4),
+            )
+            .await
+    });
+
+    let all_handled = handler.handled.wait_for(10, Duration::from_secs(60)).await;
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+    stop.cancel();
+    let max_not_visible = sampler.await.expect("sampler should not panic");
+
+    assert!(all_handled, "all 10 messages should be handled");
+    assert!(
+        max_not_visible <= 4,
+        "a prefetch-4 consumer held {max_not_visible} messages at once"
+    );
 }

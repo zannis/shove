@@ -46,7 +46,7 @@ done
 
 ### Consumer group registry
 
-`SqsConsumerGroupRegistry::new(client)` manages a pool of independent SQS poll workers. `registry.register` configures `WorkQueue` with `SqsConsumerGroupConfig::new(1..=5).with_prefetch_count(5)`. Each poll receives up to 5 messages, and because the example leaves `with_concurrent_processing` off, each consumer handles them one at a time: the group's capacity is `consumers × 1`, or 1–5 messages in progress. With `.with_concurrent_processing(true)` it becomes `consumers × prefetch = 5–25`. `registry.start_all()` spawns the minimum number of consumers (1); the autoscaler adds workers as needed.
+`SqsConsumerGroupRegistry::new(client)` manages a pool of independent SQS poll workers. `registry.register` configures `WorkQueue` with `SqsConsumerGroupConfig::new(1..=5).with_prefetch_count(5)`. Because the example leaves `with_concurrent_processing` off, each consumer handles one message at a time and polls for one message per request: the group's capacity is `consumers × 1`, or 1–5 messages in progress. With `.with_concurrent_processing(true)` it becomes `consumers × prefetch = 5–25`. `registry.start_all()` spawns the minimum number of consumers (1); the autoscaler adds workers as needed.
 
 ### `SqsAutoscalerBackend` and `AutoscalerConfig`
 

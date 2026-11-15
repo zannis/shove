@@ -305,10 +305,13 @@ pub struct ConsumerOptions<B: Backend> {
     #[cfg(feature = "rabbitmq-transactional")]
     #[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq-transactional")))]
     pub exactly_once: bool,
-    /// Number of messages to request per SQS `ReceiveMessage` poll, independent
-    /// of how many handlers may run concurrently (`prefetch_count`).
+    /// Upper bound on messages per SQS `ReceiveMessage` poll, at most 10.
     ///
-    /// Zero means "use `prefetch_count`" (the default).
+    /// Zero means 10 (the default). Each poll also requests no more than the
+    /// handler slots free at that moment (`prefetch_count` minus in-flight), so
+    /// a received message never waits invisible behind a running handler. The
+    /// trade is more `ReceiveMessage` requests when handlers are serial, in
+    /// return for fewer duplicate deliveries.
     #[cfg(feature = "aws-sns-sqs")]
     #[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
     pub receive_batch_size: u16,
@@ -853,9 +856,10 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
 #[cfg(feature = "aws-sns-sqs")]
 #[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
 impl ConsumerOptions<Sqs> {
-    /// Number of messages requested per SQS `ReceiveMessage` poll.
+    /// Upper bound on messages requested per SQS `ReceiveMessage` poll, at most 10.
     ///
-    /// Zero (the default) means "use `prefetch_count`".
+    /// Zero (the default) means 10. A poll never requests more than the free
+    /// handler slots; see [`ConsumerOptions::receive_batch_size`].
     pub fn with_receive_batch_size(mut self, n: u16) -> Self {
         self.receive_batch_size = n;
         self

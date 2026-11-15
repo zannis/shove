@@ -90,7 +90,7 @@ let opts = ConsumerOptions::<Sqs>::new()
     .with_max_reconnect_attempts(5);
 ```
 
-- **`with_receive_batch_size(u16)`** — messages requested per `ReceiveMessage` call. SQS's hard max is `10`; SQS returns batches up to this size. Default: `0` (= use the prefetch count).
+- **`with_receive_batch_size(u16)`** — upper bound on messages requested per `ReceiveMessage` call. SQS's hard max is `10`. Default: `0` (= `10`). Each call also requests no more than the handler slots free at that moment (`prefetch_count` minus in-flight handlers), so a received message never waits invisible behind a running handler. With serial handlers that means one `ReceiveMessage` per message, which trades extra requests for fewer duplicate deliveries.
 - **`with_handler_timeout(Duration)`** — per-message wall-clock deadline; must be less than the queue's `VisibilityTimeout` so a slow handler doesn't race the broker re-delivering the same message. Default: `30s`.
 - **`with_max_reconnect_attempts(u32)`** — cap on SQS client redials before surfacing a `Connection` error. Default: unlimited.
 
