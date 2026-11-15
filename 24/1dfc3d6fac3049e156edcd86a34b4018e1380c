@@ -1,0 +1,26 @@
+src/backends/rabbitmq/client.rs
+  s_6511f1668e6a79::t_b64167ab916493 226
+  s_6511f1668e6a79::t_2a35dc301d9b6b 235
+  s_6511f1668e6a79::t_53a6e42632e99e 170
+  s_6511f1668e6a79::t_7f935bd0c57f87 32-36
+  s_6511f1668e6a79::t_d10ebaedf6cd99 90-107
+  s_6511f1668e6a79::t_01a250a2fbcb29 6
+  s_6511f1668e6a79::t_4765dd14a15b39 31
+  s_6511f1668e6a79::t_9ca4f371f2b4a3 421-491
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "241dfc3d6fac3049e156edcd86a34b4018e1380c",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
