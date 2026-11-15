@@ -458,7 +458,16 @@ pub(crate) fn record_discarded(_: &str, _: Option<&str>, _: FailReason) {}
 ///   oversize/deserialize sites and the batch ingest,
 ///   `backends::redis::consumer` oversize/deserialize sites), so on those
 ///   two the counter is a lower bound before the drain gap even enters into
-///   it. Read the counter as: complete for consume-path drops on Kafka,
+///   it. The one NATS pre-handler drop that counts is a dead letter that can
+///   never be published, refused by the client or the stream as too large:
+///   the message is retired with no copy anywhere and counted on the
+///   confirmed ack, as are the same refusal of a reject's dead letter and of
+///   a retry's republished copy (`FailReason::RepublishFailed`). That count
+///   can be one too many when an earlier attempt for the same copy reached the
+///   stream and lost its acknowledgement before the server's `max_payload` or
+///   the stream's maximum message size was lowered: the copy exists, nothing
+///   is lost, and JetStream cannot look a stored message up by its id to
+///   tell. Read the counter as: complete for consume-path drops on Kafka,
 ///   RabbitMQ and InMemory; a lower bound everywhere else, and on every
 ///   `run_dlq` drain.
 /// - **Not every terminal outcome is a discard.** SNS/SQS deliberately never

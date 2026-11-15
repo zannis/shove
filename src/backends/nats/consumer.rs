@@ -51,7 +51,7 @@ use super::constants::{
     COPY_OF_HEADER, DEATH_COUNT_HEADER, DEATH_REASON_HEADER, ORIGINAL_QUEUE_HEADER,
     RETRY_COUNT_HEADER, SEQUENCE_KEY_HEADER, UNBOUNDED_ACK_PENDING,
 };
-use super::publisher::{PublishResult, header_value, publish_with_retry};
+use super::publisher::{PublishFailure, PublishResult, header_value, publish_with_retry};
 
 // ---------------------------------------------------------------------------
 // ack_wait derivation
@@ -489,7 +489,8 @@ async fn publish_dead_letter(
 /// shutdown the hold is abandoned with the message still un-acked so it is
 /// redelivered on restart; on republish failure the original is nak'd for
 /// redelivery, at once or, when the copy's id is held by a message that is not
-/// this copy, after a second.
+/// this copy, after a second. A copy that can never be published is handed
+/// back un-acked for the caller to retire.
 ///
 /// Retry counting stays header-based — the republished copy carries an
 /// incremented `RETRY_COUNT_HEADER` — so, unlike a `Nak`-driven redelivery, a
@@ -502,9 +503,9 @@ async fn hold_then_republish(
     new_count: u32,
     ack_wait: Duration,
     shutdown: &CancellationToken,
-) {
+) -> Option<PublishFailure> {
     if !hold_with_progress(msg, delay, ack_wait, shutdown).await {
-        return;
+        return None;
     }
 
     // Publish the copy durably BEFORE acking the original: a failure leaves the
@@ -515,6 +516,7 @@ async fn hold_then_republish(
                 tracing::error!(error = %e, "failed to ack after retry republish");
             }
         }
+        Err(e) if e.is_unpublishable() => return Some(e),
         Err(e) => {
             tracing::error!(error = %e, "retry republish failed, nak-ing original for redelivery");
             if let Err(nak_err) = msg.ack_with(AckKind::Nak(e.redelivery_delay())).await {
@@ -522,6 +524,7 @@ async fn hold_then_republish(
             }
         }
     }
+    None
 }
 
 /// Publishes the retry copy of `msg`: the original's headers less its publish
@@ -634,6 +637,23 @@ async fn confirmed_ack(msg: &Message) -> Result<()> {
     }
 }
 
+/// Retires `msg`, whose copy can never be published, and settles `pending`
+/// against the confirmed ack. Nothing holds a copy of it, so a confirmed
+/// retirement is a lost message whether or not the topology has a DLQ.
+async fn retire_unpublishable(msg: &Message, pending: metrics::PendingDiscard, e: &PublishFailure) {
+    tracing::error!(
+        error = %e,
+        "the copy can never be published, discarding the message instead of redelivering it"
+    );
+    match confirmed_ack(msg).await {
+        Ok(()) => pending.confirm_lost(),
+        Err(ack_err) => {
+            tracing::error!(error = %ack_err, "failed to ack an unpublishable message");
+            pending.survived();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sequenced settlement
 // ---------------------------------------------------------------------------
@@ -733,12 +753,16 @@ enum DeadLetter {
     /// Shutdown fired between two attempts. The record is still un-acked, and
     /// `redelivery` is the delay the last failed publish asks for.
     Stopped { redelivery: Option<Duration> },
+    /// The dead letter can never be published, so retrying would block the
+    /// shard forever. The record is still un-acked, for the caller to retire.
+    Unpublishable(PublishFailure),
 }
 
 /// Publishes the dead letter of a record a FIFO shard holds. A failed publish
 /// keeps the record un-acked, its `ack_wait` renewed, and is retried in place
 /// after a capped exponential backoff for as long as it fails, so nothing
-/// behind the record on its shard is delivered before the copy lands.
+/// behind the record on its shard is delivered before the copy lands. A
+/// dead letter that can never be published is not retried.
 async fn dead_letter_in_place<H, C>(
     shard: &FifoShard<'_, H, C>,
     msg: &Message,
@@ -751,6 +775,7 @@ async fn dead_letter_in_place<H, C>(
             match publish_dead_letter(shard.client, shard.topology, msg, reason, retry_count).await
             {
                 Ok(()) => return DeadLetter::Landed,
+                Err(e) if e.is_unpublishable() => return DeadLetter::Unpublishable(e),
                 Err(e) => e,
             };
         let delay = next_redelivery_delay(&mut backoff);
@@ -770,11 +795,13 @@ async fn dead_letter_in_place<H, C>(
 
 /// Dead-letters a record the handler never saw, oversized or undecodable,
 /// then acks it. Like the other NATS pre-handler drops it counts only the
-/// failure the caller already recorded, no discard.
+/// failure the caller already recorded, and a discard only when the dead
+/// letter can never be published and the record is retired without one.
 async fn dead_letter_unhandled<H, C>(
     shard: &FifoShard<'_, H, C>,
     msg: &Message,
     reason: &str,
+    fail: metrics::FailReason,
     retry_count: Option<u32>,
 ) -> ShardStep {
     match dead_letter_in_place(shard, msg, reason, retry_count).await {
@@ -785,6 +812,16 @@ async fn dead_letter_unhandled<H, C>(
             ShardStep::Settled
         }
         DeadLetter::Stopped { redelivery } => ShardStep::Stopped { redelivery },
+        DeadLetter::Unpublishable(e) => {
+            let pending = metrics::pending_discard(
+                shard.topic,
+                shard.group,
+                fail,
+                shard.topology.dlq().is_some(),
+            );
+            retire_unpublishable(msg, pending, &e).await;
+            ShardStep::Settled
+        }
     }
 }
 
@@ -819,6 +856,10 @@ async fn dead_letter_terminal<H, C>(
         DeadLetter::Stopped { redelivery } => {
             pending.survived();
             ShardStep::Stopped { redelivery }
+        }
+        DeadLetter::Unpublishable(e) => {
+            retire_unpublishable(msg, pending, &e).await;
+            ShardStep::Settled
         }
     }
 }
@@ -864,11 +905,16 @@ where
             metrics::FailReason::Rejected,
             has_dlq,
         );
-        if let DeadLetter::Stopped { redelivery } =
-            dead_letter_in_place(shard, msg, "rejected", None).await
-        {
-            pending.survived();
-            return ShardStep::Stopped { redelivery };
+        match dead_letter_in_place(shard, msg, "rejected", None).await {
+            DeadLetter::Landed => {}
+            DeadLetter::Stopped { redelivery } => {
+                pending.survived();
+                return ShardStep::Stopped { redelivery };
+            }
+            DeadLetter::Unpublishable(e) => {
+                retire_unpublishable(msg, pending, &e).await;
+                return ShardStep::Settled;
+            }
         }
         if has_dlq {
             // The message is in the DLQ, so it exists whatever the ack does
@@ -904,7 +950,14 @@ where
         tracing::warn!(error = %e, shard = shard.shard, "rejecting oversized message to DLQ");
         metrics::record_failed(shard.topic, shard.group, metrics::FailReason::Oversize);
         poison_key(shard.poisoned, &seq_key, queue);
-        return dead_letter_unhandled(shard, msg, &e.to_string(), None).await;
+        return dead_letter_unhandled(
+            shard,
+            msg,
+            &e.to_string(),
+            metrics::FailReason::Oversize,
+            None,
+        )
+        .await;
     }
 
     let mut metadata = extract_message_metadata(msg);
@@ -926,7 +979,14 @@ where
                     );
                     poison_key(shard.poisoned, &seq_key, queue);
                     let count = Some(metadata.retry_count);
-                    return dead_letter_unhandled(shard, msg, "deserialization_error", count).await;
+                    return dead_letter_unhandled(
+                        shard,
+                        msg,
+                        "deserialization_error",
+                        metrics::FailReason::Deserialize,
+                        count,
+                    )
+                    .await;
                 }
             };
 
@@ -1868,7 +1928,13 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
         if let Err(e) = validate_message_size(msg.payload.len(), self.max_message_size) {
             tracing::warn!(error = %e, queue, "rejecting oversized message to DLQ");
             metrics::record_failed(queue, group, metrics::FailReason::Oversize);
-            self.settle_unhandled(&msg, &e.to_string(), ack_wait).await;
+            self.settle_unhandled(
+                &msg,
+                &e.to_string(),
+                metrics::FailReason::Oversize,
+                ack_wait,
+            )
+            .await;
             return;
         }
 
@@ -1882,8 +1948,13 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                         "failed to deserialize message, sending to DLQ"
                     );
                     metrics::record_failed(queue, group, metrics::FailReason::Deserialize);
-                    self.settle_unhandled(&msg, "deserialization_error", ack_wait)
-                        .await;
+                    self.settle_unhandled(
+                        &msg,
+                        "deserialization_error",
+                        metrics::FailReason::Deserialize,
+                        ack_wait,
+                    )
+                    .await;
                     return;
                 }
             };
@@ -1910,14 +1981,31 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
     /// Dead-letters a message the handler never saw, oversized or
     /// undecodable, and acks it, or naks it for redelivery when the dead
     /// letter cannot be published. Like the other NATS pre-handler drops it
-    /// counts only the failure the caller recorded, no discard.
-    async fn settle_unhandled(&self, msg: &Message, reason: &str, ack_wait: Duration) {
+    /// counts only the failure the caller recorded, and a discard only when the
+    /// dead letter can never be published and the message is retired without
+    /// one.
+    async fn settle_unhandled(
+        &self,
+        msg: &Message,
+        reason: &str,
+        fail: metrics::FailReason,
+        ack_wait: Duration,
+    ) {
         let dead_letter = publish_to_dlq(&self.client, self.topology, msg, reason);
         match renewing(msg, ack_wait, dead_letter).await {
             Ok(()) => {
                 if let Err(e) = msg.ack().await {
                     tracing::error!(error = %e, "failed to ack message after DLQ publish");
                 }
+            }
+            Err(e) if e.is_unpublishable() => {
+                let pending = metrics::pending_discard(
+                    self.topology.queue(),
+                    self.group.as_deref(),
+                    fail,
+                    self.topology.dlq().is_some(),
+                );
+                retire_unpublishable(msg, pending, &e).await;
             }
             Err(e) => {
                 tracing::error!(
@@ -1988,6 +2076,10 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                         }
                         return;
                     }
+                    Err(e) if e.is_unpublishable() => {
+                        retire_unpublishable(msg, pending, &e).await;
+                        return;
+                    }
                     Err(e) => {
                         // Not acked, so JetStream redelivers.
                         pending.survived();
@@ -2017,7 +2109,7 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                     return;
                 };
                 drop(slot);
-                hold_then_republish(
+                let unpublishable = hold_then_republish(
                     &self.client,
                     msg,
                     delay,
@@ -2026,6 +2118,15 @@ impl<T: Topic, H: MessageHandler<T>> Worker<T, H> {
                     &self.shutdown,
                 )
                 .await;
+                if let Some(e) = unpublishable {
+                    let pending = metrics::record_terminal(
+                        topology.queue(),
+                        self.group.as_deref(),
+                        metrics::FailReason::RepublishFailed,
+                        topology.dlq().is_some(),
+                    );
+                    retire_unpublishable(msg, pending, &e).await;
+                }
                 return;
             }
             RetryDecision::Hold { increment: false } => {
@@ -2890,7 +2991,7 @@ enum Ingested<T: Topic> {
     Message(T::Message, MessageMetadata, Message),
     /// Oversized or undecodable, for the DLQ with this reason. The failure is
     /// already counted.
-    Poison(Message, String),
+    Poison(Message, String, metrics::FailReason),
 }
 
 /// Pre-handler intake for one pulled message: size-gate, decode, extract
@@ -2912,7 +3013,7 @@ fn ingest_batch_message<T: Topic>(
             "oversized message dropped from the batch, rejecting to DLQ"
         );
         metrics::record_failed(&ctx.topic, group, metrics::FailReason::Oversize);
-        return Ingested::Poison(msg, e.to_string());
+        return Ingested::Poison(msg, e.to_string(), metrics::FailReason::Oversize);
     }
 
     let payload: T::Message =
@@ -2925,7 +3026,11 @@ fn ingest_batch_message<T: Topic>(
                     "failed to deserialize message, dropped from the batch and sent to DLQ"
                 );
                 metrics::record_failed(&ctx.topic, group, metrics::FailReason::Deserialize);
-                return Ingested::Poison(msg, "deserialization_error".to_string());
+                return Ingested::Poison(
+                    msg,
+                    "deserialization_error".to_string(),
+                    metrics::FailReason::Deserialize,
+                );
             }
         };
 
@@ -2936,15 +3041,27 @@ fn ingest_batch_message<T: Topic>(
 /// Retire one pre-handler drop: DLQ publish then ack, Nak for redelivery if
 /// the publish fails. Mirrors the single-message path's oversize/deserialize
 /// arms, progress acks included while the publish runs. Like them it counts
-/// only the failure `record_failed` already recorded, no discard: the NATS
-/// consume paths do not yet settle a discard for a pre-handler drop, as the
-/// completeness statement on `metrics::record_terminal` lists, so
-/// `messages_discarded_total` is a lower bound here. Acks are per message, so
+/// only the failure `record_failed` already recorded, and a discard only when
+/// the dead letter can never be published and the message is retired without
+/// one. The NATS consume paths do not otherwise settle a discard for a
+/// pre-handler drop, as the completeness statement on
+/// `metrics::record_terminal` lists, so `messages_discarded_total` is a lower
+/// bound here. Acks are per message, so
 /// a later batch redelivery can never replay a message that was individually
 /// acked, and the DLQ cannot collect duplicate copies of it.
-async fn settle_poison(ctx: &NatsBatchCtx, msg: &Message, reason: &str) {
+async fn settle_poison(ctx: &NatsBatchCtx, msg: &Message, reason: &str, fail: metrics::FailReason) {
     let dead_letter = publish_to_dlq(&ctx.client, ctx.topology, msg, reason);
     if let Err(dlq_err) = renewing(msg, ctx.ack_wait, dead_letter).await {
+        if dlq_err.is_unpublishable() {
+            let pending = metrics::pending_discard(
+                &ctx.topic,
+                ctx.group.as_deref(),
+                fail,
+                ctx.topology.dlq().is_some(),
+            );
+            retire_unpublishable(msg, pending, &dlq_err).await;
+            return;
+        }
         tracing::error!(
             error = %dlq_err,
             "failed to publish poison batch message to DLQ, nak-ing"
@@ -3004,6 +3121,9 @@ async fn settle_reject_batch(ctx: &NatsBatchCtx, acks: &[Message]) {
                         pending.survived();
                     }
                 },
+                Err(e) if e.is_unpublishable() => {
+                    retire_unpublishable(msg, pending, &e).await;
+                }
                 Err(e) => {
                     // Not acked, so JetStream redelivers.
                     pending.survived();
@@ -3059,6 +3179,7 @@ impl<T: Topic> Forming<T> {
 struct Poison {
     msg: Message,
     reason: String,
+    fail: metrics::FailReason,
 }
 
 /// What [`BatchIntake::next_event`] reports.
@@ -3248,8 +3369,8 @@ impl<T: Topic> BatchIntake<T> {
             IntakeEvent::Resume => self.pause = None,
             IntakeEvent::Renew => self.renew_read_ahead().await,
             IntakeEvent::Permit(Ok(slot)) => {
-                if let Some(Poison { msg, reason }) = self.waiting.pop_front() {
-                    self.settle_in_background(msg, reason, slot);
+                if let Some(Poison { msg, reason, fail }) = self.waiting.pop_front() {
+                    self.settle_in_background(msg, reason, fail, slot);
                 }
                 self.settle_waiting();
             }
@@ -3273,8 +3394,8 @@ impl<T: Topic> BatchIntake<T> {
                 self.forming.messages.push((payload, metadata));
                 self.forming.acks.push(msg);
             }
-            Ingested::Poison(msg, reason) => {
-                self.waiting.push_back(Poison { msg, reason });
+            Ingested::Poison(msg, reason, fail) => {
+                self.waiting.push_back(Poison { msg, reason, fail });
                 self.settle_waiting();
             }
         }
@@ -3287,8 +3408,8 @@ impl<T: Topic> BatchIntake<T> {
             let Ok(slot) = Arc::clone(&self.poison_slots).try_acquire_owned() else {
                 return;
             };
-            if let Some(Poison { msg, reason }) = self.waiting.pop_front() {
-                self.settle_in_background(msg, reason, slot);
+            if let Some(Poison { msg, reason, fail }) = self.waiting.pop_front() {
+                self.settle_in_background(msg, reason, fail, slot);
             }
         }
     }
@@ -3296,11 +3417,17 @@ impl<T: Topic> BatchIntake<T> {
     /// Settles a pre-handler drop in a task of its own, holding `slot` until
     /// it is done. The dead letter is published first and the message acked
     /// after it.
-    fn settle_in_background(&self, msg: Message, reason: String, slot: OwnedSemaphorePermit) {
+    fn settle_in_background(
+        &self,
+        msg: Message,
+        reason: String,
+        fail: metrics::FailReason,
+        slot: OwnedSemaphorePermit,
+    ) {
         let ctx = Arc::clone(&self.ctx);
         let busy = self.poison_tasks.enter();
         tokio::spawn(async move {
-            settle_poison(&ctx, &msg, &reason).await;
+            settle_poison(&ctx, &msg, &reason, fail).await;
             drop((slot, busy));
         });
     }
