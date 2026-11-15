@@ -1,0 +1,29 @@
+Cargo.lock
+  s_9b810d0831ab39::t_48135383628c65 291,293,1670,2989,3387,3786,3860,4677,4679,4687,4689-4690,5156
+Cargo.toml
+  s_6511f1668e6a79::t_52c2337853b1cc 206
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b568d81227f320732dc415b34ef6f1a9b2d5314e",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_9b810d0831ab39": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b648f5a8-71a2-4a66-ae8c-cc6ac1470b7f",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
