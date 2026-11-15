@@ -1,0 +1,21 @@
+src/backends/redis/maintenance.rs
+  s_6511f1668e6a79::t_192c0e437c273a 139,142,159-160,175,180
+src/backends/redis/requeue.rs
+  s_6511f1668e6a79::t_4547c072e445e2 184,186,190-192,204-208,218-219
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7bd2e5497c3216a155a906575704af0d608363d0",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
