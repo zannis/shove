@@ -26,15 +26,40 @@ pub struct RabbitMqConfig {
     pub management: Option<super::management::ManagementConfig>,
 }
 
+/// Renders `raw` from scheme, username, host, port and path only. Password, query
+/// and fragment are dropped; a non-empty query leaves a `?<redacted>` marker.
+pub(super) fn redact_url(raw: &str) -> String {
+    const UNPARSEABLE: &str = "<unparseable>";
+    let Ok(url) = url::Url::parse(raw) else {
+        return UNPARSEABLE.to_string();
+    };
+    let Some(host) = url.host_str() else {
+        return UNPARSEABLE.to_string();
+    };
+    if url.cannot_be_a_base() {
+        return UNPARSEABLE.to_string();
+    }
+    let userinfo = if url.username().is_empty() {
+        String::new()
+    } else {
+        format!("{}@", url.username())
+    };
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let query = if url.query().is_some_and(|q| !q.is_empty()) {
+        "?<redacted>"
+    } else {
+        ""
+    };
+    format!(
+        "{}://{userinfo}{host}{port}{}{query}",
+        url.scheme(),
+        url.path()
+    )
+}
+
 impl Debug for RabbitMqConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let redacted_uri = match url::Url::parse(&self.uri) {
-            Ok(mut url) => match url.set_password(None) {
-                Ok(()) => url.to_string(),
-                Err(()) => "<unparseable>".to_string(),
-            },
-            Err(_) => "<unparseable>".to_string(),
-        };
+        let redacted_uri = redact_url(&self.uri);
 
         f.debug_struct("RabbitMqConfig")
             .field("uri", &redacted_uri)
@@ -487,6 +512,33 @@ mod tests {
             .unwrap();
         assert!(matches!(err, ShoveError::Validation(_)), "{err:?}");
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn config_debug_drops_query_and_fragment() {
+        let rendered = format!(
+            "{:?}",
+            RabbitMqConfig::new(
+                "amqp://user:s3cret@host:5672/%2f?password=s3cret&heartbeat=10#s3cret"
+            )
+        );
+        assert!(!rendered.contains("s3cret"), "{rendered}");
+        assert!(!rendered.contains("heartbeat"), "{rendered}");
+        assert!(
+            rendered.contains("amqp://user@host:5672/%2f?<redacted>"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn config_debug_without_query_has_no_marker() {
+        let rendered = format!(
+            "{:?}",
+            RabbitMqConfig::new("amqp://user:pw@host:5672/%2f#frag")
+        );
+        assert!(!rendered.contains("redacted"), "{rendered}");
+        assert!(!rendered.contains("frag"), "{rendered}");
+        assert!(rendered.contains("amqp://user@host:5672/%2f"), "{rendered}");
     }
 
     #[test]
