@@ -303,6 +303,22 @@ fn carries_ignored_components(addr: &ServerAddr) -> bool {
     carries_path || url.query().is_some() || url.fragment().is_some()
 }
 
+fn has_static_credentials(config: &NatsConfig) -> bool {
+    (config.username.is_some() && config.password.is_some()) || config.token.is_some()
+}
+
+/// Whether every connection, reconnects to gossiped peers included, must be
+/// upgraded to TLS regardless of what a server's own INFO claims. Scheme-less
+/// discovered peers would otherwise follow their unauthenticated INFO.
+///
+/// True when the configured URL is encrypted, or when static credentials are
+/// set without the plaintext opt-in.
+fn tls_required(config: &NatsConfig) -> Result<bool> {
+    let addr = parse_server_addr(&config.url)?;
+    Ok(scheme_security(&addr) == SchemeSecurity::Encrypted
+        || (has_static_credentials(config) && !config.allow_plaintext_credentials))
+}
+
 /// Reject transport/auth combinations that would silently discard TLS options
 /// or disclose reusable credentials on the wire.
 fn validate_transport_security(config: &NatsConfig) -> Result<()> {
@@ -374,8 +390,7 @@ fn validate_transport_security(config: &NatsConfig) -> Result<()> {
         )));
     }
 
-    let has_static_credentials =
-        (config.username.is_some() && config.password.is_some()) || config.token.is_some();
+    let has_static_credentials = has_static_credentials(config);
     if has_static_credentials
         && security == SchemeSecurity::Plaintext
         && !config.allow_plaintext_credentials
@@ -395,6 +410,7 @@ fn validate_transport_security(config: &NatsConfig) -> Result<()> {
 impl NatsClient {
     pub async fn connect(config: &NatsConfig) -> Result<Self> {
         validate_transport_security(config)?;
+        let tls_required = tls_required(config)?;
 
         let client_name = format!("shove-rs-{}", process::id());
         let (connected_tx, connected) = watch::channel(());
@@ -408,7 +424,8 @@ impl NatsClient {
                         connected_tx.send_replace(());
                     }
                 }
-            });
+            })
+            .require_tls(tls_required);
 
         if let Some(ca) = &config.tls_ca_cert {
             opts = opts.add_root_certificates(ca.clone());
@@ -879,6 +896,34 @@ mod tests {
             !rendered.contains("nats+tls"),
             "error must not recommend a scheme the client rejects: {rendered}"
         );
+    }
+
+    fn creds_config(url: &str, allow_plaintext: bool) -> NatsConfig {
+        let mut cfg = NatsConfig::new(url);
+        cfg.username = Some("alice".into());
+        cfg.password = Some("pw".into());
+        cfg.allow_plaintext_credentials = allow_plaintext;
+        cfg
+    }
+
+    #[test]
+    fn tls_required_matrix() {
+        assert!(tls_required(&NatsConfig::new("tls://h:4222")).unwrap());
+        assert!(tls_required(&creds_config("tls://h:4222", false)).unwrap());
+        assert!(tls_required(&creds_config("tls://h:4222", true)).unwrap());
+        assert!(tls_required(&NatsConfig::new("wss://h:443")).unwrap());
+        assert!(!tls_required(&NatsConfig::new("nats://h:4222")).unwrap());
+        assert!(!tls_required(&NatsConfig::new("h:4222")).unwrap());
+        assert!(!tls_required(&NatsConfig::new("ws://h:80")).unwrap());
+        assert!(!tls_required(&creds_config("nats://h:4222", true)).unwrap());
+        let rejected = creds_config("nats://h:4222", false);
+        assert!(validate_transport_security(&rejected).is_err());
+        assert!(tls_required(&rejected).unwrap());
+    }
+
+    #[test]
+    fn tls_required_rejects_unparseable_url() {
+        assert!(tls_required(&NatsConfig::new("nats+tls://h:4222")).is_err());
     }
 
     #[test]
