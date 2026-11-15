@@ -525,6 +525,7 @@ where
                     &mut pending_acks,
                 )
                 .await;
+                flush_acks(sqs, queue_url, &mut pending_acks, "during drain").await;
             }
             for done in in_flight.take_remaining() {
                 let resolved = drain_timeout_outcome(
