@@ -35,6 +35,11 @@ pub struct NatsConfig {
     pub nkey_seed: Option<String>,
     /// Path to a NATS `.creds` file (JWT + NKey) for credentials-based authentication.
     pub creds_file: Option<PathBuf>,
+    /// With a `tls://` or `wss://` URL, or static credentials without this
+    /// opt-in, the client connects and reconnects only to the configured server
+    /// and ignores servers advertised by the cluster, because that list arrives
+    /// before the connection is encrypted. See [`NatsConfig::tls_first`].
+    ///
     /// Send static username/password or token credentials over a cleartext
     /// connection — `nats://`, `ws://`, or a schemeless address, which the
     /// client reads as `nats://`. Default: `false`.
@@ -48,6 +53,16 @@ pub struct NatsConfig {
     /// the URL are rejected on every scheme and this flag does not re-admit
     /// them.
     pub allow_plaintext_credentials: bool,
+    /// Perform the TLS handshake before the server sends its INFO. Default:
+    /// `false`.
+    ///
+    /// Requires an encrypted URL (`tls://` or `wss://`) and servers configured
+    /// for handshake-first (`handshake_first` in the server's TLS block, per the
+    /// `async-nats` `tls_first` documentation). With `tls://` it authenticates
+    /// the INFO message, so the client may fail over to servers the cluster
+    /// advertises. On `wss://` the client has no handshake-first mode, so the
+    /// setting changes nothing and advertised servers stay ignored.
+    pub tls_first: bool,
 }
 
 impl NatsConfig {
@@ -63,6 +78,7 @@ impl NatsConfig {
             nkey_seed: None,
             creds_file: None,
             allow_plaintext_credentials: false,
+            tls_first: false,
         }
     }
 
@@ -95,6 +111,7 @@ impl fmt::Debug for NatsConfig {
                 "allow_plaintext_credentials",
                 &self.allow_plaintext_credentials,
             )
+            .field("tls_first", &self.tls_first)
             .finish()
     }
 }
@@ -319,6 +336,20 @@ fn tls_required(config: &NatsConfig) -> Result<bool> {
         || (has_static_credentials(config) && !config.allow_plaintext_credentials))
 }
 
+/// Whether servers advertised in the cluster's INFO may be connected to.
+///
+/// INFO arrives in plaintext unless `tls_first` is set, so when TLS is
+/// mandatory an advertised address can be injected by an on-path attacker.
+/// `tls_first` authenticates INFO for TCP addresses only; websocket addresses
+/// get no handshake-first mode in the client.
+fn use_discovered_servers(config: &NatsConfig) -> Result<bool> {
+    if !tls_required(config)? {
+        return Ok(true);
+    }
+    let addr = parse_server_addr(&config.url)?;
+    Ok(config.tls_first && !is_websocket(&addr))
+}
+
 /// Reject transport/auth combinations that would silently discard TLS options
 /// or disclose reusable credentials on the wire.
 fn validate_transport_security(config: &NatsConfig) -> Result<()> {
@@ -378,6 +409,13 @@ fn validate_transport_security(config: &NatsConfig) -> Result<()> {
         )));
     }
 
+    if config.tls_first && security == SchemeSecurity::Plaintext {
+        return Err(ShoveError::Connection(
+            "NatsConfig::tls_first requires an encrypted URL scheme: use a tls:// or wss:// URL"
+                .into(),
+        ));
+    }
+
     if has_tls_options(config) && security == SchemeSecurity::Plaintext {
         return Err(ShoveError::Connection(format!(
             "TLS options are configured but NATS URL '{}' uses a plaintext scheme; \
@@ -411,6 +449,7 @@ impl NatsClient {
     pub async fn connect(config: &NatsConfig) -> Result<Self> {
         validate_transport_security(config)?;
         let tls_required = tls_required(config)?;
+        let use_discovered = use_discovered_servers(config)?;
 
         let client_name = format!("shove-rs-{}", process::id());
         let (connected_tx, connected) = watch::channel(());
@@ -426,6 +465,13 @@ impl NatsClient {
                 }
             })
             .require_tls(tls_required);
+
+        if config.tls_first {
+            opts = opts.tls_first();
+        }
+        if !use_discovered {
+            opts = opts.ignore_discovered_servers();
+        }
 
         if let Some(ca) = &config.tls_ca_cert {
             opts = opts.add_root_certificates(ca.clone());
@@ -919,6 +965,35 @@ mod tests {
         let rejected = creds_config("nats://h:4222", false);
         assert!(validate_transport_security(&rejected).is_err());
         assert!(tls_required(&rejected).unwrap());
+    }
+
+    fn first(mut cfg: NatsConfig) -> NatsConfig {
+        cfg.tls_first = true;
+        cfg
+    }
+
+    #[test]
+    fn discovered_servers_matrix() {
+        let used = |c: &NatsConfig| use_discovered_servers(c).unwrap();
+        assert!(used(&NatsConfig::new("nats://h:4222")));
+        assert!(used(&creds_config("nats://h:4222", true)));
+        assert!(used(&NatsConfig::new("ws://h:80")));
+        assert!(!used(&NatsConfig::new("tls://h:4222")));
+        assert!(!used(&creds_config("tls://h:4222", false)));
+        assert!(used(&first(NatsConfig::new("tls://h:4222"))));
+        assert!(used(&first(creds_config("tls://h:4222", false))));
+        assert!(!used(&NatsConfig::new("wss://h:443")));
+        assert!(!used(&first(NatsConfig::new("wss://h:443"))));
+    }
+
+    #[test]
+    fn tls_first_requires_an_encrypted_scheme() {
+        for url in ["nats://h:4222", "h:4222", "ws://h:80"] {
+            assert!(validate_transport_security(&first(NatsConfig::new(url))).is_err());
+        }
+        for url in ["tls://h:4222", "wss://h:443"] {
+            assert!(validate_transport_security(&first(NatsConfig::new(url))).is_ok());
+        }
     }
 
     #[test]
