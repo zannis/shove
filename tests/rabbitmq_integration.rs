@@ -10,7 +10,7 @@
 //! Run with: `cargo test --features rabbitmq,audit --test rabbitmq_integration`
 
 use lapin::options::{BasicPublishOptions, ConfirmSelectOptions, QueueDeclareOptions};
-use lapin::types::FieldTable;
+use lapin::types::{AMQPValue, FieldTable};
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
 use shove::handler::MessageHandler;
@@ -457,6 +457,20 @@ define_sequenced_topic!(
     TopologyBuilder::new("test-retry-seq-orders")
         .dlq()
         .hold_queue(Duration::from_secs(1))
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .build()
+);
+
+// Topic for the foreign-producer ordering test; a 2 s hold leaves room to
+// publish while the retry is still parked.
+define_sequenced_topic!(
+    ForeignRetrySeqOrders,
+    OrderMessage,
+    |msg: &OrderMessage| msg.account.clone(),
+    TopologyBuilder::new("test-foreign-retry-seq-orders")
+        .dlq()
+        .hold_queue(Duration::from_secs(2))
         .sequenced(SequenceFailure::Skip)
         .routing_shards(1)
         .build()
@@ -1323,6 +1337,24 @@ impl MessageHandler<RetrySeqOrders> for SeqRetryHandler {
         } else {
             self.ack_count.fetch_add(1, Ordering::Relaxed);
             self.signal.notify_waiters();
+            Outcome::Ack
+        }
+    }
+}
+
+/// Records the `seq` of every handled message; `seq == 1` retries once.
+#[derive(Clone)]
+struct SeqOrderRecorder {
+    order: Arc<std::sync::Mutex<Vec<u32>>>,
+}
+
+impl MessageHandler<ForeignRetrySeqOrders> for SeqOrderRecorder {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        self.order.lock().unwrap().push(msg.seq);
+        if msg.seq == 1 && meta.retry_count == 0 {
+            Outcome::Retry
+        } else {
             Outcome::Ack
         }
     }
@@ -4031,6 +4063,104 @@ async fn sequenced_consumer_retry_via_shard_hold_queues() {
     assert!(
         handler.wait_for_ack(1, Duration::from_secs(30)).await,
         "timed out waiting for ack after sequenced retry"
+    );
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+// --- Sequenced consumer — foreign message must not stand in for the returning retry ---
+
+#[tokio::test]
+async fn sequenced_foreign_retry_count_message_does_not_jump_the_held_retry() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology()
+        .declare::<ForeignRetrySeqOrders>()
+        .await
+        .unwrap();
+
+    let handler = SeqOrderRecorder {
+        order: Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::<RabbitMqMarker>::new()
+            .with_shutdown(s)
+            .with_max_retries(5);
+        consumer
+            .run_fifo::<ForeignRetrySeqOrders, _>(h, (), opts)
+            .await
+    });
+
+    let publisher = b.publisher().await.unwrap();
+    publisher
+        .publish::<ForeignRetrySeqOrders>(&OrderMessage {
+            account: "ACC-FOREIGN".into(),
+            seq: 1,
+        })
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while handler.order.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "first attempt never ran");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The retry copy is now parked in the 2 s hold queue.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let raw_channel = client.create_confirm_channel().await.unwrap();
+    let mut headers = FieldTable::default();
+    headers.insert("x-retry-count".into(), AMQPValue::LongUInt(1));
+    let foreign = br#"{"account":"ACC-FOREIGN","seq":99}"#;
+    raw_channel
+        .basic_publish(
+            ForeignRetrySeqOrders::topology()
+                .sequencing()
+                .unwrap()
+                .exchange()
+                .into(),
+            "ACC-FOREIGN".into(),
+            BasicPublishOptions::default(),
+            foreign,
+            lapin::BasicProperties::default()
+                .with_delivery_mode(2)
+                .with_content_type("application/json".into())
+                .with_headers(headers),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    publisher
+        .publish::<ForeignRetrySeqOrders>(&OrderMessage {
+            account: "ACC-FOREIGN".into(),
+            seq: 2,
+        })
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while handler.order.lock().unwrap().len() < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for 4 handlings: {:?}",
+            handler.order.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let order = handler.order.lock().unwrap().clone();
+    assert_eq!(
+        order,
+        vec![1, 1, 99, 2],
+        "held retry must precede later messages for its key"
     );
 
     shutdown.cancel();

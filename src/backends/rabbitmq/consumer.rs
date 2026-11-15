@@ -28,7 +28,8 @@ use crate::backend::batch_consumer::{
 use crate::backend::broadcast::BROADCAST_DEFER_DELAY;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::{
-    extract_dead_metadata, extract_message_metadata, get_retry_count,
+    delivery_message_id, extract_dead_metadata, extract_message_metadata, get_retry_count,
+    table_message_id,
 };
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::backends::rabbitmq::router;
@@ -337,8 +338,22 @@ enum KeyState {
     /// The handler returned Retry/Defer and the message has been routed to a
     /// hold queue. The key is blocked until the retry comes back.
     /// The `Instant` records when the key entered this state, used to enforce
-    /// `hold_queue_timeout` eviction.
-    AwaitingRetry(Instant),
+    /// `hold_queue_timeout` eviction. The `Option<String>` is the
+    /// `x-message-id` of the copy that was sent back through the broker; see
+    /// [`is_returning_retry`].
+    AwaitingRetry(Instant, Option<String>),
+}
+
+/// Whether an arriving message for an `AwaitingRetry` key is the one that
+/// key is waiting for. With no recorded id the message went back as the
+/// original (requeued, and it carried no id), so only a redelivery without
+/// an id can be it.
+fn is_returning_retry(expected: Option<&str>, arriving: Option<&str>, redelivered: bool) -> bool {
+    match (expected, arriving) {
+        (Some(expected), Some(arriving)) => expected == arriving,
+        (None, None) => redelivered,
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +490,9 @@ impl RabbitMqConsumer {
         let group: Option<Arc<str>> = options.consumer_group.clone();
 
         let mut key_states: HashMap<String, KeyState> = HashMap::new();
+        // Hold-queue copies dead-letter back with the shard queue name as their
+        // routing key, so the arriving id is what maps a copy to its sequence key.
+        let mut awaited_ids: HashMap<String, String> = HashMap::new();
         let mut in_flight_count: usize = 0;
 
         // Interval for evicting keys that have been stuck in AwaitingRetry too long.
@@ -506,7 +524,7 @@ impl RabbitMqConsumer {
                 } = state
                 else {
                     // AwaitingRetry — shouldn't happen, but put it back.
-                    key_states.insert(key, KeyState::AwaitingRetry(Instant::now()));
+                    key_states.insert(key, state);
                     continue;
                 };
 
@@ -580,8 +598,9 @@ impl RabbitMqConsumer {
                     }
                     Outcome::Retry | Outcome::Defer => {
                         // Non-terminal — route to hold queue, key enters AwaitingRetry.
+                        let mut expected_id = delivery_message_id(delivery);
                         if matches!(outcome, Outcome::Retry) {
-                            route_shard_retry(
+                            expected_id = route_shard_retry(
                                 &received,
                                 shard_hold_queues,
                                 &publisher,
@@ -600,6 +619,7 @@ impl RabbitMqConsumer {
                             if !shard_hold_queues.is_empty() {
                                 let hold_queue = &shard_hold_queues[0];
                                 let headers = router::clone_headers(delivery);
+                                let hold_id = table_message_id(&headers);
                                 match publisher
                                     .publish_to_queue(hold_queue.name(), &received.payload, headers)
                                     .await
@@ -614,8 +634,10 @@ impl RabbitMqConsumer {
                                             publisher.rollback_if_tx().await;
                                             router::nack_requeue(delivery, &publisher).await.ok();
                                         } else if let Err(e) = publisher.commit_if_tx().await {
+                                            expected_id = hold_id;
                                             error!("tx_commit failed for shard defer: {e}");
                                         } else {
+                                            expected_id = hold_id;
                                             debug!(
                                                 "deferring message to shard hold queue {}",
                                                 hold_queue.name()
@@ -635,7 +657,11 @@ impl RabbitMqConsumer {
                             }
                         }
                         in_flight_count -= 1;
-                        key_states.insert(key, KeyState::AwaitingRetry(Instant::now()));
+                        if let Some(id) = &expected_id {
+                            awaited_ids.insert(id.clone(), key.clone());
+                        }
+                        key_states
+                            .insert(key, KeyState::AwaitingRetry(Instant::now(), expected_id));
                     }
                 }
             }
@@ -693,7 +719,7 @@ impl RabbitMqConsumer {
                                     router::route_ack(delivery, &publisher).await.ok();
                                 }
                                 Outcome::Retry => {
-                                    route_shard_retry(
+                                    let _ = route_shard_retry(
                                         &received,
                                         shard_hold_queues,
                                         &publisher,
@@ -772,7 +798,7 @@ impl RabbitMqConsumer {
                     let timed_out: Vec<String> = key_states
                         .iter()
                         .filter_map(|(k, v)| {
-                            if let KeyState::AwaitingRetry(entered_at) = v {
+                            if let KeyState::AwaitingRetry(entered_at, _) = v {
                                 if now.duration_since(*entered_at) >= timeout {
                                     Some(k.clone())
                                 } else {
@@ -791,6 +817,7 @@ impl RabbitMqConsumer {
                             "sequence key stuck in AwaitingRetry, dead-lettering pending messages"
                         );
                         key_states.remove(&key);
+                        awaited_ids.retain(|_, awaiting_key| *awaiting_key != key);
                         if let Some(pending) = pending_deliveries.remove(&key) {
                             for pd in pending {
                                 // Not a cascade: no already-counted failure
@@ -813,7 +840,12 @@ impl RabbitMqConsumer {
                 item = stream.next(), if can_accept => {
                     let received = ReceivedDelivery::new(unwrap_delivery(item, queue)?);
                     let delivery = &received.delivery;
-                    let seq_key = delivery.routing_key.to_string();
+                    let arriving_id = delivery_message_id(delivery);
+                    let seq_key = arriving_id
+                        .as_ref()
+                        .and_then(|id| awaited_ids.get(id))
+                        .cloned()
+                        .unwrap_or_else(|| delivery.routing_key.to_string());
                     let retry_count = get_retry_count(delivery);
 
                     // ── FailAll: skip poisoned keys ──
@@ -888,8 +920,12 @@ impl RabbitMqConsumer {
                                 .push_back(received);
                             continue;
                         }
-                        Some(KeyState::AwaitingRetry(_)) => {
-                            if retry_count > 0 || delivery.redelivered {
+                        Some(KeyState::AwaitingRetry(_, expected_id)) => {
+                            if is_returning_retry(
+                                expected_id.as_deref(),
+                                arriving_id.as_deref(),
+                                delivery.redelivered,
+                            ) {
                                 // This is the returning retry (or a nack+requeue
                                 // redelivery when no hold queue is configured) —
                                 // clear AwaitingRetry and fall through to spawn a
@@ -901,6 +937,9 @@ impl RabbitMqConsumer {
                                     "returning retry clears AwaitingRetry"
                                 );
                                 key_states.remove(&seq_key);
+                                if let Some(id) = &arriving_id {
+                                    awaited_ids.remove(id);
+                                }
                             } else {
                                 // New message while awaiting retry — buffer if within limit.
                                 if let Some(limit) = options.max_pending_per_key {
@@ -1600,19 +1639,23 @@ async fn route_broadcast_outcome(
 }
 
 /// Route a retry for a sequenced shard via per-shard hold queues.
+/// Returns the `x-message-id` the key should wait for: the hold-queue copy's
+/// when it was published, the original's when the message was requeued.
 async fn route_shard_retry(
     received: &ReceivedDelivery,
     shard_hold_queues: &[HoldQueue],
     publisher: &ChannelPublisher,
     retry_count: u32,
     queue: &str,
-) {
+) -> Option<String> {
     let delivery = &received.delivery;
+    let original_id = delivery_message_id(delivery);
     if let Some(hold_queue) = hold_index(retry_count, shard_hold_queues.len())
         .and_then(|index| shard_hold_queues.get(index))
     {
         let new_retry_count = retry_count.saturating_add(1);
         let headers = router::clone_headers_with_retry(delivery, new_retry_count);
+        let hold_id = table_message_id(&headers);
 
         match publisher
             .publish_to_queue(hold_queue.name(), &received.payload, headers)
@@ -1623,17 +1666,18 @@ async fn route_shard_retry(
                     error!("failed to ack delivery after publishing to shard hold queue: {e}");
                     publisher.rollback_if_tx().await;
                     router::nack_requeue(delivery, publisher).await.ok();
-                    return;
+                    return original_id;
                 }
                 if let Err(e) = publisher.commit_if_tx().await {
                     error!("tx_commit failed for shard retry (attempt {new_retry_count}): {e}");
-                    return;
+                    return hold_id;
                 }
                 debug!(
                     "retrying message via shard hold queue {} (attempt {})",
                     hold_queue.name(),
                     new_retry_count
                 );
+                hold_id
             }
             Err(e) => {
                 warn!(
@@ -1641,6 +1685,7 @@ async fn route_shard_retry(
                     hold_queue.name()
                 );
                 router::nack_requeue(delivery, publisher).await.ok();
+                original_id
             }
         }
     } else {
@@ -1650,6 +1695,7 @@ async fn route_shard_retry(
             "retrying sequenced message but no shard hold queues configured — requeuing with no delay"
         );
         router::nack_requeue(delivery, publisher).await.ok();
+        original_id
     }
 }
 
@@ -2820,9 +2866,24 @@ mod tests {
 
     #[test]
     fn key_state_awaiting_retry_is_distinct() {
-        let state = KeyState::AwaitingRetry(Instant::now());
-        assert!(matches!(state, KeyState::AwaitingRetry(_)));
+        let state = KeyState::AwaitingRetry(Instant::now(), None);
+        assert!(matches!(state, KeyState::AwaitingRetry(..)));
         assert!(!matches!(state, KeyState::InFlight { .. }));
+    }
+
+    #[test]
+    fn returning_retry_requires_the_recorded_id() {
+        assert!(is_returning_retry(Some("a"), Some("a"), false));
+        assert!(is_returning_retry(Some("a"), Some("a"), true));
+        assert!(!is_returning_retry(Some("a"), Some("b"), true));
+        assert!(!is_returning_retry(Some("a"), None, true));
+    }
+
+    #[test]
+    fn returning_retry_without_recorded_id_needs_an_idless_redelivery() {
+        assert!(is_returning_retry(None, None, true));
+        assert!(!is_returning_retry(None, None, false));
+        assert!(!is_returning_retry(None, Some("x"), true));
     }
 
     #[tokio::test]

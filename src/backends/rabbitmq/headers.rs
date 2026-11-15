@@ -54,6 +54,23 @@ pub(crate) fn get_retry_count(delivery: &Delivery) -> u32 {
     }
 }
 
+/// The `x-message-id` carried in `table`, if it is a string.
+pub(crate) fn table_message_id(table: &FieldTable) -> Option<String> {
+    match table.inner().get(MESSAGE_ID_KEY) {
+        Some(AMQPValue::LongString(s)) => Some(long_string_to_owned(s)),
+        Some(AMQPValue::ShortString(s)) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+pub(crate) fn delivery_message_id(delivery: &Delivery) -> Option<String> {
+    delivery
+        .properties
+        .headers()
+        .as_ref()
+        .and_then(table_message_id)
+}
+
 pub(crate) fn extract_message_metadata(delivery: &Delivery) -> MessageMetadata {
     let headers = extract_string_headers(delivery);
     MessageMetadata {
