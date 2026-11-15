@@ -33,12 +33,10 @@ pub(super) fn redact_url(raw: &str) -> String {
     let Ok(url) = url::Url::parse(raw) else {
         return UNPARSEABLE.to_string();
     };
-    let Some(host) = url.host_str() else {
-        return UNPARSEABLE.to_string();
-    };
     if url.cannot_be_a_base() {
         return UNPARSEABLE.to_string();
     }
+    let host = url.host_str().unwrap_or_default();
     let userinfo = if url.username().is_empty() {
         String::new()
     } else {
@@ -116,15 +114,10 @@ impl Default for RabbitMqConfig {
 /// the broker password and the underlying parsers echo it.
 fn parse_uri(uri: &str) -> Result<AMQPUri> {
     let invalid = || {
-        ShoveError::Validation(
-            "RabbitMqConfig::uri is not a valid amqp:// or amqps:// URI with a host".into(),
-        )
+        ShoveError::Validation("RabbitMqConfig::uri is not a valid amqp:// or amqps:// URI".into())
     };
     let url = url::Url::parse(uri).map_err(|_| invalid())?;
-    if url.cannot_be_a_base()
-        || url.host_str().is_none_or(str::is_empty)
-        || !matches!(url.scheme(), "amqp" | "amqps")
-    {
+    if url.cannot_be_a_base() || !matches!(url.scheme(), "amqp" | "amqps") {
         return Err(invalid());
     }
     uri.parse::<AMQPUri>().map_err(|_| invalid())
@@ -444,10 +437,10 @@ mod tests {
     }
 
     const MALFORMED_URIS: [&str; 5] = [
+        "amqp://admin:s3cret@:5672/%2f",
         "amqp:admin:s3cret@host:5672",
         "admin:s3cret@host:5672/%2f",
         "http://admin:s3cret@host:5672/%2f",
-        "amqp://admin:s3cret@:5672/%2f",
         "amqp://admin:s3cret@host:notaport/%2f",
     ];
 
@@ -539,6 +532,36 @@ mod tests {
         assert!(!rendered.contains("redacted"), "{rendered}");
         assert!(!rendered.contains("frag"), "{rendered}");
         assert!(rendered.contains("amqp://user@host:5672/%2f"), "{rendered}");
+    }
+
+    #[test]
+    fn parse_uri_accepts_hostless_forms_like_upstream() {
+        let cases = [
+            ("amqp://", "/"),
+            ("amqp:///", ""),
+            ("amqp:///%2f", "/"),
+            ("amqp:///vhost", "vhost"),
+        ];
+        for (uri, vhost) in cases {
+            let parsed = parse_uri(uri).unwrap();
+            assert_eq!(parsed.authority.host, "localhost", "{uri}");
+            assert_eq!(parsed.authority.port, 5672, "{uri}");
+            assert_eq!(parsed.vhost, vhost, "{uri}");
+        }
+        assert_eq!(parse_uri("amqps://").unwrap().authority.port, 5671);
+    }
+
+    #[test]
+    fn empty_host_with_userinfo_is_rejected_by_url_itself() {
+        assert!(url::Url::parse("amqp://admin:s3cret@:5672/%2f").is_err());
+    }
+
+    #[test]
+    fn config_debug_renders_hostless_uris() {
+        let rendered = format!("{:?}", RabbitMqConfig::new("amqp:///%2f?heartbeat=10"));
+        assert!(rendered.contains("amqp:///%2f?<redacted>"), "{rendered}");
+        let rendered = format!("{:?}", RabbitMqConfig::new("amqp://"));
+        assert!(!rendered.contains("unparseable"), "{rendered}");
     }
 
     #[test]
