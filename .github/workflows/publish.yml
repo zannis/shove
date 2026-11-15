@@ -12,7 +12,7 @@ on:
           - minor
           - major
           - none
-      # A rehearsal runs *every* step of the real release in the same job, so
+      # A rehearsal runs *every* step of the real release in the same jobs, so
       # the path being exercised cannot drift from the path that ships. Only
       # the three irreversible/outward-facing effects are withheld: the push of
       # the release commit and tag, the crates.io upload (`--dry-run`
@@ -25,25 +25,28 @@ on:
         default: false
         type: boolean
 
-permissions:
-  # Also covers the gate's commit lookup: it resolves its argument to a full
-  # SHA before querying runs, which is the contents API. Do not trim this
-  # below `read`.
-  contents: write
-  id-token: write
-  # Read-only, for the "Require a green ci.yml run" gate below: listing a
-  # commit's workflow runs and their jobs is the Actions API, not the checks
-  # API, so `contents: read` does not cover it.
-  actions: read
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  publish:
+  # Holds the signing key and the push; never the crates.io identity.
+  prepare:
     runs-on: ubuntu-latest
-    # crates.io only mints a token for this environment; rehearsals skip it.
-    environment: ${{ inputs.dry_run != true && 'release' || '' }}
+    permissions:
+      # Also covers the gate's commit lookup: it resolves its argument to a
+      # full SHA before querying runs, which is the contents API. Do not trim
+      # this below `read`.
+      contents: write
+      # Read-only, for the "Require a green ci.yml run" gate below: listing a
+      # commit's workflow runs and their jobs is the Actions API, not the
+      # checks API, so `contents: read` does not cover it.
+      actions: read
+    outputs:
+      dry_run: ${{ steps.inputs.outputs.dry_run }}
+      version: ${{ steps.version.outputs.version }}
+      release_sha: ${{ steps.handoff.outputs.release_sha }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -54,6 +57,7 @@ jobs:
       # arbitrary strings. Read through the environment rather than
       # interpolating either input into the script.
       - name: Resolve release inputs
+        id: inputs
         env:
           DRY_RUN_INPUT: ${{ inputs.dry_run }}
           BUMP_INPUT: ${{ inputs.bump }}
@@ -75,6 +79,7 @@ jobs:
           esac
           echo "DRY_RUN=$DRY_RUN_INPUT" >> "$GITHUB_ENV"
           echo "BUMP=$BUMP_INPUT" >> "$GITHUB_ENV"
+          echo "dry_run=$DRY_RUN_INPUT" >> "$GITHUB_OUTPUT"
 
       # Do not ship code CI never ran. v0.13.0 was published from b36dcff, a
       # commit with zero ci.yml legs -- ci.yml's `paths:` filter skipped it --
@@ -121,13 +126,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      - uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 # v1.20.1
-
       - name: Install cargo-edit
         if: inputs.bump != 'none'
-        run: cargo binstall -y --version 0.13.10 cargo-edit
+        run: cargo install -q cargo-edit --version 0.13.10 --locked
 
       - name: Bump version
         if: inputs.bump != 'none'
@@ -146,7 +147,6 @@ jobs:
         if: inputs.bump != 'none'
         with:
           node-version: 22
-          cache: pnpm
 
       - name: Sync package.json version
         if: inputs.bump != 'none'
@@ -325,7 +325,8 @@ jobs:
           # release itself so a new crates.io upload cannot enter this job.
           cargo install -q git-cliff --version 2.13.1 --locked
           VERSION="${{ steps.version.outputs.version }}"
-          NOTES="${RUNNER_TEMP}/RELEASE_NOTES.md"
+          mkdir -p "${RUNNER_TEMP}/release"
+          NOTES="${RUNNER_TEMP}/release/RELEASE_NOTES.md"
           # Do not use `--latest`: on the `bump: none` path the "Commit and tag"
           # step is skipped, so the tag does not exist yet and the newest tag is
           # still the *previous* release -- `--latest` then re-emits that
@@ -363,6 +364,64 @@ jobs:
           fi
           cat "$NOTES"
 
+      # The release commit travels as a bundle because a rehearsal never
+      # pushes it, so the publish job takes the same path either way.
+      - name: Hand the release commit to the publish job
+        id: handoff
+        env:
+          GATED_SHA: ${{ github.sha }}
+        run: |
+          if [ "$BUMP" != "none" ]; then
+            git bundle create -q "${RUNNER_TEMP}/release/release.bundle" "${GATED_SHA}..HEAD"
+          fi
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+          retention-days: 1
+
+  # Holds the crates.io identity; never the signing key.
+  publish:
+    needs: prepare
+    runs-on: ubuntu-latest
+    # crates.io only mints a token for this environment; rehearsals skip it.
+    environment: ${{ inputs.dry_run != true && 'release' || '' }}
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      DRY_RUN: ${{ needs.prepare.outputs.dry_run }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+
+      - name: Check out the release commit
+        run: |
+          if [ -f "${RUNNER_TEMP}/release/release.bundle" ]; then
+            git fetch -q "${RUNNER_TEMP}/release/release.bundle" HEAD
+            git checkout -q --detach FETCH_HEAD
+          fi
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$RELEASE_SHA" ]; then
+            echo "::error::Checked out ${head}, but the prepare job produced ${RELEASE_SHA}."
+            exit 1
+          fi
+
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev libsasl2-dev
+
+      - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
+
       # Nothing after this point may write to the working tree: `cargo publish`
       # rejects a dirty one, and the next step is the irreversible publish.
       - name: Fail early if the working tree is dirty
@@ -396,17 +455,17 @@ jobs:
 
       - name: Create GitHub release
         run: |
-          set -- gh release create "v${{ steps.version.outputs.version }}" \
-            -F "${RUNNER_TEMP}/RELEASE_NOTES.md" \
-            --target "${{ github.sha }}"
+          set -- gh release create "v${VERSION}" \
+            -F "${RUNNER_TEMP}/release/RELEASE_NOTES.md" \
+            --target "$GATED_SHA"
           if [ "$DRY_RUN" = "true" ]; then
             # A rehearsal cannot create the release: `gh release create` would
             # create the tag on the remote, which is the push we just withheld.
             # Assert instead that the notes file `-F` reads is still there and
             # non-blank at this point in the job -- the failure this guards
             # against is a step in between moving or clobbering it.
-            if ! grep -q '[^[:space:]]' "${RUNNER_TEMP}/RELEASE_NOTES.md"; then
-              echo "::error::${RUNNER_TEMP}/RELEASE_NOTES.md is missing or blank at the release step; 'gh release create -F' would fail here."
+            if ! grep -q '[^[:space:]]' "${RUNNER_TEMP}/release/RELEASE_NOTES.md"; then
+              echo "::error::${RUNNER_TEMP}/release/RELEASE_NOTES.md is missing or blank at the release step; 'gh release create -F' would fail here."
               exit 1
             fi
             echo "dry run: would run: $*"
@@ -415,3 +474,4 @@ jobs:
           "$@"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GATED_SHA: ${{ github.sha }}
