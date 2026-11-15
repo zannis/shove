@@ -244,6 +244,21 @@ impl Topic for RetryTopic {
     }
 }
 
+struct IdenticalHoldTopic;
+impl Topic for IdenticalHoldTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-identical-hold")
+                .hold_queue(Duration::from_millis(1500))
+                .dlq()
+                .build()
+        })
+    }
+}
+
 struct RejectTopic;
 impl Topic for RejectTopic {
     type Message = Order;
@@ -522,6 +537,69 @@ async fn retry_then_ack_on_redeliver() {
         call_count.load(Ordering::Relaxed),
         2,
         "handler must be called exactly twice (retry + ack)"
+    );
+}
+
+// Two identical messages parked in the same hold set must both survive.
+#[tokio::test]
+async fn identical_messages_in_hold_set_are_both_redelivered() {
+    let broker = make_broker("redis-int-identical-hold").await;
+    broker
+        .topology()
+        .declare::<IdenticalHoldTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    for _ in 0..2 {
+        publisher
+            .publish::<IdenticalHoldTopic>(&Order { id: 99 })
+            .await
+            .expect("publish");
+    }
+
+    let redeliveries = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>);
+    impl MessageHandler<IdenticalHoldTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, meta: MessageMetadata, _: &()) -> Outcome {
+            if meta.retry_count == 0 {
+                Outcome::Retry
+            } else {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Outcome::Ack
+            }
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<IdenticalHoldTopic, _>(
+            H(redeliveries.clone()),
+            ConsumerOptions::<Redis>::new().with_max_retries(5),
+        )
+        .expect("register");
+
+    let probe = redeliveries.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 2,
+            Duration::from_secs(10),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(
+        redeliveries.load(Ordering::Relaxed),
+        2,
+        "both identical messages must be redelivered"
     );
 }
 

@@ -50,6 +50,9 @@ pub(crate) struct HoldEntry {
     pub stream: String,
     /// All fields (payload + metadata) to restore on redeliver, as key-value pairs.
     pub fields: Vec<(String, String)>,
+    /// Original stream entry id; keeps otherwise-identical members distinct in the sorted set.
+    #[serde(default)]
+    pub entry_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -257,12 +260,35 @@ mod tests {
                 (PAYLOAD_FIELD.into(), "{}".into()),
                 (X_RETRY_COUNT.into(), "1".into()),
             ],
+            entry_id: "1-0".into(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: HoldEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.stream, "orders");
         assert_eq!(decoded.fields[0], (PAYLOAD_FIELD.into(), "{}".into()));
         assert_eq!(decoded.fields[1], (X_RETRY_COUNT.into(), "1".into()));
+    }
+
+    #[test]
+    fn hold_entry_without_entry_id_still_deserializes() {
+        let decoded: HoldEntry =
+            serde_json::from_str(r#"{"stream":"orders","fields":[["a","1"]]}"#).unwrap();
+        assert_eq!(decoded.stream, "orders");
+        assert_eq!(decoded.fields, vec![("a".to_owned(), "1".to_owned())]);
+        assert!(decoded.entry_id.is_empty());
+    }
+
+    #[test]
+    fn hold_entries_differing_only_in_entry_id_serialize_differently() {
+        let make = |id: &str| HoldEntry {
+            stream: "orders".into(),
+            fields: vec![("a".into(), "1".into())],
+            entry_id: id.into(),
+        };
+        assert_ne!(
+            serde_json::to_string(&make("1-0")).unwrap(),
+            serde_json::to_string(&make("1-1")).unwrap()
+        );
     }
 
     #[test]
@@ -275,6 +301,7 @@ mod tests {
         let entry = HoldEntry {
             stream: "my-stream".into(),
             fields: vec![],
+            entry_id: "1-0".into(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: HoldEntry = serde_json::from_str(&json).unwrap();
@@ -292,6 +319,7 @@ mod tests {
                 ("beta".into(), "2".into()),
                 ("gamma".into(), "3".into()),
             ],
+            entry_id: "1-0".into(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: HoldEntry = serde_json::from_str(&json).unwrap();

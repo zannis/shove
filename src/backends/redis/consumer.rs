@@ -1724,6 +1724,7 @@ async fn route_to_hold(
     let entry = HoldEntry {
         stream: stream.to_owned(),
         fields: hold_fields,
+        entry_id: entry_id.to_owned(),
     };
 
     if let Err(e) = enqueue_hold(conn, hold_name, entry, delay).await {
