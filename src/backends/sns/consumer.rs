@@ -1406,7 +1406,11 @@ where
                     }
 
                     // ── Max retries check ──
-                    if retry_count >= options.max_retries {
+                    // While a different message holds the key, this one waits in the
+                    // buffer and meets the same gate when drained.
+                    if retry_count >= options.max_retries
+                        && !matches!(key_states.get(&seq_key), Some(KeyState::InFlight { .. }))
+                    {
                         warn!(
                             queue_url,
                             retry_count,
@@ -1437,6 +1441,25 @@ where
                             topology,
                             group.as_deref(),
                             metrics::FailReason::MaxRetriesExceeded,
+                        )
+                        .await;
+                        key_states.remove(&seq_key);
+                        drain_pending_for_key::<T, H>(
+                            sqs,
+                            queue_url,
+                            &seq_key,
+                            handler,
+                            ctx,
+                            options,
+                            on_failure,
+                            topology,
+                            poisoned_keys,
+                            &completed_tx,
+                            &mut key_states,
+                            &mut in_flight_count,
+                            pending_deliveries,
+                            &topic,
+                            &group,
                         )
                         .await;
                         continue;
