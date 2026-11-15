@@ -1,0 +1,21 @@
+src/backends/nats/client.rs
+  s_6511f1668e6a79::t_cf71c75c5efab4 65-70
+docs/pages/backends/nats.mdx
+  s_6511f1668e6a79::t_068358373e687a 372
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f512167000723790a1b698803ec30b463bf9c5ab",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
