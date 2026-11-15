@@ -1,0 +1,21 @@
+src/backends/rabbitmq/consumer.rs
+  s_6511f1668e6a79::t_3802d013e186c4 645,801-804,828,1021,1059,1208-1212
+tests/rabbitmq_integration.rs
+  s_6511f1668e6a79::t_9688488a7f490e 7685,7724-7750,7884-7914
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3265e8298ca7c29b7ead86040a7f15935969f6c2",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
