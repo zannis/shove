@@ -20,7 +20,9 @@
 //!
 //! Run with: `cargo test --features aws-sns-sqs,audit --test sns_sqs_integration`
 
-use aws_sdk_sqs::types::{Message, MessageAttributeValue, MessageSystemAttributeName};
+use aws_sdk_sqs::types::{
+    Message, MessageAttributeValue, MessageSystemAttributeName, QueueAttributeName,
+};
 use shove::Broker;
 use shove::Sqs;
 use shove::publisher::Publisher as PublisherV2;
@@ -3394,6 +3396,125 @@ async fn sequenced_failall_exhausted_retry_cascades_to_later_message() {
             .await;
     assert_eq!(poison, 2);
     assert_eq!(later, 0, "a poisoned key must not handle later messages");
+}
+
+define_sequenced_topic!(
+    SeqBufferedRedeliveryTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("sqs-seq-bufdup")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_secs(5))
+        .dlq()
+        .build()
+);
+
+/// Retries amount 1 once, then acks it; acks everything else. Records the
+/// order of handler starts and whether two handlers ever overlapped.
+#[derive(Clone)]
+struct RetryOnceHandler {
+    starts: Arc<Mutex<Vec<u64>>>,
+    active: Arc<AtomicU32>,
+    overlapped: Arc<AtomicU32>,
+}
+
+impl MessageHandler<SeqBufferedRedeliveryTopic> for RetryOnceHandler {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        if self.active.fetch_add(1, Ordering::SeqCst) > 0 {
+            self.overlapped.fetch_add(1, Ordering::SeqCst);
+        }
+        let attempt = {
+            let mut starts = self.starts.lock().await;
+            starts.push(msg.amount);
+            starts.iter().filter(|a| **a == msg.amount).count()
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        if msg.amount == 1 && attempt == 1 {
+            Outcome::Retry
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+/// A message buffered while its key awaits an earlier message's retry has its
+/// own visibility expire and is redelivered. It must not be mistaken for the
+/// returning retry nor buffered twice: every message is handled once (the first
+/// twice by design), in order, with no overlap.
+#[tokio::test]
+async fn sequenced_buffered_redelivery_is_not_mistaken_for_the_retry() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqBufferedRedeliveryTopic>().await;
+
+    let sqs = broker.sqs_client().await;
+    let shard_url = setup
+        .queue_registry()
+        .get("sqs-seq-bufdup-seq-0")
+        .await
+        .expect("shard queue should be registered after declare");
+    sqs.set_queue_attributes()
+        .queue_url(&shard_url)
+        .attributes(QueueAttributeName::VisibilityTimeout, "3")
+        .send()
+        .await
+        .expect("shorten visibility timeout");
+
+    for amount in [1u64, 2] {
+        let body = serde_json::to_string(&OrderMessage {
+            order_id: "K".into(),
+            amount,
+        })
+        .expect("serialize");
+        sqs.send_message()
+            .queue_url(&shard_url)
+            .message_body(body)
+            .message_group_id("K")
+            .message_deduplication_id(format!("bufdup-{amount}"))
+            .send()
+            .await
+            .expect("send to FIFO shard");
+    }
+
+    let handler = RetryOnceHandler {
+        starts: Arc::new(Mutex::new(Vec::new())),
+        active: Arc::new(AtomicU32::new(0)),
+        overlapped: Arc::new(AtomicU32::new(0)),
+    };
+    let starts = handler.starts.clone();
+    let overlapped = handler.overlapped.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqBufferedRedeliveryTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10)
+                    .with_max_retries(5),
+            )
+            .await
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while starts.lock().await.len() < 3 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Long enough for any stale duplicate to surface.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    assert_eq!(*starts.lock().await, vec![1, 1, 2]);
+    assert_eq!(overlapped.load(Ordering::SeqCst), 0, "handlers overlapped");
 }
 
 // ---------------------------------------------------------------------------

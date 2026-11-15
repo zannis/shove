@@ -800,7 +800,32 @@ enum KeyState {
     },
     /// The handler returned Retry/Defer and the message visibility has been
     /// changed. The key is blocked until the retry comes back.
-    AwaitingRetry,
+    AwaitingRetry {
+        /// SQS `MessageId` of the message whose retry is awaited; `None` never matches.
+        message_id: Option<String>,
+    },
+}
+
+/// True iff the arriving delivery is the message the key awaits. Both ids must
+/// be present and equal; the service assigns the id, so a producer cannot forge it.
+fn is_awaited_retry(awaited: Option<&str>, arriving: Option<&str>) -> bool {
+    matches!((awaited, arriving), (Some(a), Some(b)) if a == b)
+}
+
+/// Replaces the buffered entry sharing `msg`'s `MessageId` with the fresh
+/// delivery (the old receipt handle is stale), keeping its position. Returns
+/// the message back when nothing in the buffer shares its id.
+fn buffer_or_replace(buffer: &mut VecDeque<Message>, msg: Message) -> Option<Message> {
+    let Some(id) = msg.message_id() else {
+        return Some(msg);
+    };
+    match buffer.iter_mut().find(|m| m.message_id() == Some(id)) {
+        Some(slot) => {
+            *slot = msg;
+            None
+        }
+        None => Some(msg),
+    }
 }
 
 /// Extract the sequence key from SQS MessageGroupId system attribute.
@@ -1087,7 +1112,12 @@ where
                     )
                     .await;
                     in_flight_count = in_flight_count.saturating_sub(1);
-                    key_states.insert(key, KeyState::AwaitingRetry);
+                    key_states.insert(
+                        key,
+                        KeyState::AwaitingRetry {
+                            message_id: msg.message_id().map(str::to_string),
+                        },
+                    );
                 }
                 Outcome::Defer => {
                     warn!(
@@ -1104,7 +1134,12 @@ where
                     )
                     .await;
                     in_flight_count = in_flight_count.saturating_sub(1);
-                    key_states.insert(key, KeyState::AwaitingRetry);
+                    key_states.insert(
+                        key,
+                        KeyState::AwaitingRetry {
+                            message_id: msg.message_id().map(str::to_string),
+                        },
+                    );
                 }
             }
         }
@@ -1302,12 +1337,66 @@ where
                         continue;
                     }
 
+                    // ── Check if key is busy ──
+                    if msg.message_id().is_none() {
+                        warn!(queue_url, sequence_key = %seq_key, "delivery has no MessageId");
+                    }
+                    let is_awaited = matches!(
+                        key_states.get(&seq_key),
+                        Some(KeyState::AwaitingRetry { message_id })
+                            if is_awaited_retry(message_id.as_deref(), msg.message_id())
+                    );
+                    if key_states.contains_key(&seq_key) && !is_awaited {
+                        // Not the awaited retry: wait behind the key whatever the
+                        // receive count; the retry gate applies when it is drained.
+                        let Some(msg) = buffer_or_replace(
+                            pending_deliveries.entry(seq_key.clone()).or_default(),
+                            msg,
+                        ) else {
+                            debug!(
+                                sequence_key = %seq_key,
+                                queue_url,
+                                "buffered message redelivered, refreshed its receipt handle"
+                            );
+                            continue;
+                        };
+                        if let Some(limit) = options.max_pending_per_key {
+                            let current_len = pending_deliveries
+                                .get(&seq_key)
+                                .map_or(0, |q| q.len());
+                            if current_len >= limit {
+                                warn!(
+                                    sequence_key = %seq_key,
+                                    queue_url,
+                                    limit,
+                                    "per-key pending buffer full, rejecting"
+                                );
+                                router::route_reject(
+                                    sqs,
+                                    queue_url,
+                                    &receipt_handle,
+                                    topology,
+                                    group.as_deref(),
+                                    metrics::FailReason::PendingFull,
+                                )
+                                .await;
+                                continue;
+                            }
+                        }
+                        debug!(
+                            sequence_key = %seq_key,
+                            queue_url,
+                            "key busy, buffering delivery locally"
+                        );
+                        pending_deliveries
+                            .entry(seq_key)
+                            .or_default()
+                            .push_back(msg);
+                        continue;
+                    }
+
                     // ── Max retries check ──
-                    // While a different message holds the key, this one waits in the
-                    // buffer and meets the same gate when drained.
-                    if retry_count >= options.max_retries
-                        && !matches!(key_states.get(&seq_key), Some(KeyState::InFlight { .. }))
-                    {
+                    if retry_count >= options.max_retries {
                         warn!(
                             queue_url,
                             retry_count,
@@ -1362,93 +1451,14 @@ where
                         continue;
                     }
 
-                    // ── Check if key is busy ──
-                    match key_states.get(&seq_key) {
-                        Some(KeyState::InFlight { .. }) => {
-                            // Handler running — buffer locally if within limit.
-                            if let Some(limit) = options.max_pending_per_key {
-                                let current_len = pending_deliveries
-                                    .get(&seq_key)
-                                    .map_or(0, |q| q.len());
-                                if current_len >= limit {
-                                    warn!(
-                                        sequence_key = %seq_key,
-                                        queue_url,
-                                        limit,
-                                        "per-key pending buffer full, rejecting"
-                                    );
-                                    router::route_reject(
-                                        sqs,
-                                        queue_url,
-                                        &receipt_handle,
-                                        topology,
-                                        group.as_deref(),
-                                        metrics::FailReason::PendingFull,
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                            }
-                            debug!(
-                                sequence_key = %seq_key,
-                                queue_url,
-                                "key in-flight, buffering delivery locally"
-                            );
-                            pending_deliveries
-                                .entry(seq_key)
-                                .or_insert_with(|| VecDeque::with_capacity(4))
-                                .push_back(msg);
-                            continue;
-                        }
-                        Some(KeyState::AwaitingRetry) => {
-                            if retry_count > 0 {
-                                // This is the returning retry — clear AwaitingRetry
-                                // and fall through to spawn a handler below.
-                                debug!(
-                                    sequence_key = %seq_key,
-                                    queue_url,
-                                    retry_count,
-                                    "returning retry clears AwaitingRetry"
-                                );
-                                key_states.remove(&seq_key);
-                            } else {
-                                // New message while awaiting retry — buffer if within limit.
-                                if let Some(limit) = options.max_pending_per_key {
-                                    let current_len = pending_deliveries
-                                        .get(&seq_key)
-                                        .map_or(0, |q| q.len());
-                                    if current_len >= limit {
-                                        warn!(
-                                            sequence_key = %seq_key,
-                                            queue_url,
-                                            limit,
-                                            "per-key pending buffer full, rejecting"
-                                        );
-                                        router::route_reject(
-                                            sqs,
-                                            queue_url,
-                                            &receipt_handle,
-                                            topology,
-                                            group.as_deref(),
-                                            metrics::FailReason::PendingFull,
-                                        )
-                                        .await;
-                                        continue;
-                                    }
-                                }
-                                debug!(
-                                    sequence_key = %seq_key,
-                                    queue_url,
-                                    "key awaiting retry, buffering new delivery locally"
-                                );
-                                pending_deliveries
-                                    .entry(seq_key)
-                                    .or_default()
-                                    .push_back(msg);
-                                continue;
-                            }
-                        }
-                        None => {}
+                    if is_awaited {
+                        debug!(
+                            sequence_key = %seq_key,
+                            queue_url,
+                            retry_count,
+                            "returning retry clears AwaitingRetry"
+                        );
+                        key_states.remove(&seq_key);
                     }
 
                     // ── Spawn handler for this key ──
@@ -2819,5 +2829,48 @@ mod external_refusal_tests {
         .expect("the refusal is synchronous")
         .expect_err("external() must be refused on the SQS DLQ drain");
         expect_external_refusal(err, "SqsConsumer::run_dlq");
+    }
+}
+
+#[cfg(test)]
+mod key_identity_tests {
+    use super::*;
+
+    fn msg(id: Option<&str>, handle: &str) -> Message {
+        let mut b = Message::builder().receipt_handle(handle);
+        if let Some(id) = id {
+            b = b.message_id(id);
+        }
+        b.build()
+    }
+
+    #[test]
+    fn awaited_retry_matches_only_the_recorded_message_id() {
+        assert!(is_awaited_retry(Some("a"), Some("a")));
+        assert!(!is_awaited_retry(Some("a"), Some("b")));
+    }
+
+    #[test]
+    fn awaited_retry_never_matches_a_missing_id() {
+        assert!(!is_awaited_retry(None, Some("a")));
+        assert!(!is_awaited_retry(Some("a"), None));
+        assert!(!is_awaited_retry(None, None));
+    }
+
+    #[test]
+    fn redelivered_buffered_message_replaces_the_entry_in_place() {
+        let mut buf: VecDeque<Message> =
+            VecDeque::from([msg(Some("m1"), "old1"), msg(Some("m2"), "old2")]);
+        assert!(buffer_or_replace(&mut buf, msg(Some("m1"), "new1")).is_none());
+        let handles: Vec<_> = buf.iter().map(|m| m.receipt_handle()).collect();
+        assert_eq!(handles, [Some("new1"), Some("old2")]);
+    }
+
+    #[test]
+    fn unseen_or_idless_message_is_handed_back_for_buffering() {
+        let mut buf: VecDeque<Message> = VecDeque::from([msg(Some("m1"), "h1")]);
+        assert!(buffer_or_replace(&mut buf, msg(Some("m3"), "h3")).is_some());
+        assert!(buffer_or_replace(&mut buf, msg(None, "h4")).is_some());
+        assert_eq!(buf.len(), 1);
     }
 }
