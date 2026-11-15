@@ -1,0 +1,51 @@
+.config/nextest.toml
+  s_6511f1668e6a79::t_d478558f684af0 40
+docs/pages/backends/rabbitmq.mdx
+  s_6511f1668e6a79::t_79b6bad8e19b17 85-94,137,139
+docs/pages/concepts/handlers.mdx
+  s_6511f1668e6a79::t_1b09fd50a753f0 147
+docs/pages/concepts/outcomes.mdx
+  s_6511f1668e6a79::t_f798f7db710a1b 50,107,112
+docs/pages/guides/observability.mdx
+  s_6511f1668e6a79::t_1daa5ef02c6518 98,289
+docs/pages/guides/retries.mdx
+  s_6511f1668e6a79::t_ac586773b23089 59,141
+docs/pages/guides/sequenced.mdx
+  s_6511f1668e6a79::t_26fa4404e098a9 132,139,141,143-149
+docs/pages/guides/shutdown.mdx
+  s_6511f1668e6a79::t_808a47c2c51170 165
+src/backend/options_inner.rs
+  s_6511f1668e6a79::t_4ec4c1d0dffade 37
+src/backends/rabbitmq/consumer.rs
+  s_6511f1668e6a79::t_c3463bea3c8b7b 5,18,31,44,336-349,353-363,365-426,510,558,564-566,568,573,578-673,689,696-697,699-701,703-708,710-714,716,718-729,731-743,746-768,771-791,796,819-830,832-848,851-852,854-858,860,864,866-870,874-881,1033,1036,1247,1250,2868,2877-2969,2971-2983,2987-3019,3023-3029
+src/backends/rabbitmq/headers.rs
+  s_6511f1668e6a79::t_2f3b57ab384075 25-27,30-33,76-78,85-87,410
+src/backends/rabbitmq/router.rs
+  s_6511f1668e6a79::t_9ce96a12c5234a 9,143,511,553,559-562,564,566
+src/consumer.rs
+  s_6511f1668e6a79::t_6a0b5496148625 278-284,909-911
+src/metrics.rs
+  s_6511f1668e6a79::t_0d4ddef700a9ee 1017-1019
+src/routing.rs
+  s_6511f1668e6a79::t_52d6f5bc9d5793 21,27
+tests/metrics_rabbitmq_sequenced.rs
+  s_6511f1668e6a79::t_3e69a9d7ba08a5 328,402-403,422,468
+tests/rabbitmq_integration.rs
+  s_6511f1668e6a79::t_844e2a618b57c1 452,465-466,505,4086,4089,4186,4189,4258,4260,4268,4271,4340,4396,4501,4504,5777,5780,5807,7032-7736
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f9eba2ea796611bcf1fb452c7c9aa4c870bb0bbb",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
