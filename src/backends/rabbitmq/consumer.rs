@@ -28,7 +28,8 @@ use crate::backend::batch_consumer::{
 use crate::backend::broadcast::BROADCAST_DEFER_DELAY;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::{
-    delivery_retry_token, extract_dead_metadata, extract_message_metadata, get_retry_count,
+    delivery_retry_token, delivery_sequence_key, extract_dead_metadata, extract_message_metadata,
+    get_retry_count,
 };
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::backends::rabbitmq::router;
@@ -493,9 +494,6 @@ impl RabbitMqConsumer {
         let group: Option<Arc<str>> = options.consumer_group.clone();
 
         let mut key_states: HashMap<String, KeyState> = HashMap::new();
-        // Hold-queue copies dead-letter back with the shard queue name as their
-        // routing key, so the consumer-minted token is what maps a copy to its key.
-        let mut awaited_tokens: HashMap<String, String> = HashMap::new();
         let mut in_flight_count: usize = 0;
 
         // Interval for evicting keys that have been stuck in AwaitingRetry too long.
@@ -622,7 +620,10 @@ impl RabbitMqConsumer {
                             if !shard_hold_queues.is_empty() {
                                 let hold_queue = &shard_hold_queues[0];
                                 let mut headers = router::clone_headers(delivery);
-                                let hold_token = router::stamp_retry_token(&mut headers);
+                                let hold_token = router::stamp_hold_headers(
+                                    &mut headers,
+                                    &delivery_sequence_key(delivery),
+                                );
                                 match publisher
                                     .publish_to_queue(hold_queue.name(), &received.payload, headers)
                                     .await
@@ -660,9 +661,6 @@ impl RabbitMqConsumer {
                             }
                         }
                         in_flight_count -= 1;
-                        if let Some(token) = &expected_token {
-                            awaited_tokens.insert(token.clone(), key.clone());
-                        }
                         key_states
                             .insert(key, KeyState::AwaitingRetry(Instant::now(), expected_token));
                     }
@@ -820,7 +818,6 @@ impl RabbitMqConsumer {
                             "sequence key stuck in AwaitingRetry, dead-lettering pending messages"
                         );
                         key_states.remove(&key);
-                        awaited_tokens.retain(|_, awaiting_key| *awaiting_key != key);
                         if let Some(pending) = pending_deliveries.remove(&key) {
                             for pd in pending {
                                 // Not a cascade: no already-counted failure
@@ -844,11 +841,7 @@ impl RabbitMqConsumer {
                     let received = ReceivedDelivery::new(unwrap_delivery(item, queue)?);
                     let delivery = &received.delivery;
                     let arriving_token = delivery_retry_token(delivery);
-                    let seq_key = arriving_token
-                        .as_ref()
-                        .and_then(|token| awaited_tokens.get(token))
-                        .cloned()
-                        .unwrap_or_else(|| delivery.routing_key.to_string());
+                    let seq_key = delivery_sequence_key(delivery);
                     let retry_count = get_retry_count(delivery);
 
                     // ── FailAll: skip poisoned keys ──
@@ -883,9 +876,6 @@ impl RabbitMqConsumer {
                             "returning retry clears AwaitingRetry"
                         );
                         key_states.remove(&seq_key);
-                        if let Some(token) = &arriving_token {
-                            awaited_tokens.remove(token);
-                        }
                     }
 
                     // ── Key busy: buffer whatever the retry count ──
@@ -1649,7 +1639,7 @@ async fn route_shard_retry(
     {
         let new_retry_count = retry_count.saturating_add(1);
         let mut headers = router::clone_headers_with_retry(delivery, new_retry_count);
-        let hold_token = router::stamp_retry_token(&mut headers);
+        let hold_token = router::stamp_hold_headers(&mut headers, &delivery_sequence_key(delivery));
 
         match publisher
             .publish_to_queue(hold_queue.name(), &received.payload, headers)

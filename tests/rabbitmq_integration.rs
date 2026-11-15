@@ -489,6 +489,19 @@ define_sequenced_topic!(
         .build()
 );
 
+// Topic for the consumer-restart test: a hold long enough to restart inside it.
+define_sequenced_topic!(
+    RestartSeqOrders,
+    OrderMessage,
+    |msg: &OrderMessage| msg.account.clone(),
+    TopologyBuilder::new("test-restart-seq-orders")
+        .dlq()
+        .hold_queue(Duration::from_secs(3))
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .build()
+);
+
 // Topic for sequenced consumer defer via shard hold queues
 define_sequenced_topic!(
     DeferSeqOrders,
@@ -1393,6 +1406,34 @@ impl MessageHandler<LimitSeqOrders> for SeqLimitHandler {
     }
     async fn handle_dead(&self, _msg: OrderMessage, _meta: DeadMessageMetadata, _: &()) {
         self.dead.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `seq == 1` retries once; `seq == 2` is slow. Tracks peak concurrency for
+/// the (single) key.
+#[derive(Clone)]
+struct SeqOverlapHandler {
+    order: Arc<std::sync::Mutex<Vec<u32>>>,
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+}
+
+impl MessageHandler<RestartSeqOrders> for SeqOverlapHandler {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        self.order.lock().unwrap().push(msg.seq);
+        let outcome = if msg.seq == 1 && meta.retry_count == 0 {
+            Outcome::Retry
+        } else {
+            if msg.seq == 2 {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+            }
+            Outcome::Ack
+        };
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        outcome
     }
 }
 
@@ -4162,6 +4203,82 @@ async fn sequenced_retry_at_the_limit_releases_the_key() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     dlq_handle.abort();
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+// --- Sequenced consumer — a retry parked across a consumer restart keeps its key ---
+
+#[tokio::test]
+async fn sequenced_retry_parked_across_restart_stays_serialized_with_its_key() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology().declare::<RestartSeqOrders>().await.unwrap();
+
+    let handler = SeqOverlapHandler {
+        order: Arc::new(std::sync::Mutex::new(Vec::new())),
+        active: Arc::new(AtomicUsize::new(0)),
+        peak: Arc::new(AtomicUsize::new(0)),
+    };
+    let spawn_consumer = |shutdown: CancellationToken| {
+        let consumer = RabbitMqConsumer::new(client.clone());
+        let h = handler.clone();
+        tokio::spawn(async move {
+            let opts = ConsumerOptions::<RabbitMqMarker>::new()
+                .with_shutdown(shutdown)
+                .with_max_retries(5);
+            consumer.run_fifo::<RestartSeqOrders, _>(h, (), opts).await
+        })
+    };
+
+    let publisher = b.publisher().await.unwrap();
+    let first_shutdown = CancellationToken::new();
+    let first = spawn_consumer(first_shutdown.clone());
+    publisher
+        .publish::<RestartSeqOrders>(&OrderMessage {
+            account: "ACC-RESTART".into(),
+            seq: 1,
+        })
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while handler.order.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "first attempt never ran");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    first_shutdown.cancel();
+    first.await.unwrap().unwrap();
+
+    // The retry is parked in the hold queue; a fresh consumer knows nothing of it.
+    let second_shutdown = CancellationToken::new();
+    let second = spawn_consumer(second_shutdown.clone());
+    publisher
+        .publish::<RestartSeqOrders>(&OrderMessage {
+            account: "ACC-RESTART".into(),
+            seq: 2,
+        })
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while handler.order.lock().unwrap().len() < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out: handled {:?}",
+            handler.order.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        handler.peak.load(Ordering::SeqCst),
+        1,
+        "the returning retry ran concurrently with a message for its own key"
+    );
+
+    second_shutdown.cancel();
+    second.await.unwrap().unwrap();
     client.shutdown().await;
     ctx.cleanup().await;
 }

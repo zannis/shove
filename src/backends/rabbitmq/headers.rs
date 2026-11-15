@@ -27,10 +27,22 @@ const DEATH_KEY: &str = "x-death";
 /// key. Never copied onto a later hop and hidden from handlers.
 pub(crate) const RETRY_TOKEN_KEY: &str = "shove-retry-token";
 
+/// Header carrying the sequence key a hold-queue copy belongs to. A copy
+/// dead-letters back with the shard queue name as its routing key, so this is
+/// the only place the key survives. Copied unchanged across every hop and
+/// hidden from handlers.
+pub(crate) const SEQUENCE_KEY_HEADER: &str = "shove-sequence-key";
+
 /// Header names this backend writes or reads back as its own. A new one belongs
 /// here: a test checks that `validate_headers` reserves every name in this list.
 #[cfg(test)]
-const INTERNAL_KEYS: &[&str] = &[RETRY_COUNT_KEY, MESSAGE_ID_KEY, DEATH_KEY, RETRY_TOKEN_KEY];
+const INTERNAL_KEYS: &[&str] = &[
+    RETRY_COUNT_KEY,
+    MESSAGE_ID_KEY,
+    DEATH_KEY,
+    RETRY_TOKEN_KEY,
+    SEQUENCE_KEY_HEADER,
+];
 
 fn long_string_to_owned(s: &LongString) -> String {
     // Fast path for valid UTF-8 (common case) avoids the extra allocation
@@ -57,6 +69,22 @@ pub(crate) fn get_retry_count(delivery: &Delivery) -> u32 {
         Some(AMQPValue::ShortShortInt(v)) => u32::try_from(*v).unwrap_or(0),
         _ => 0,
     }
+}
+
+/// The sequence key of a delivery: the key header a hold-queue copy carries,
+/// else the routing key. A non-string header value is ignored.
+///
+/// A producer can set the header, but it can already pick any routing key and
+/// so any sequence key; this grants nothing more.
+pub(crate) fn delivery_sequence_key(delivery: &Delivery) -> String {
+    let from_header = delivery.properties.headers().as_ref().and_then(|table| {
+        match table.inner().get(SEQUENCE_KEY_HEADER) {
+            Some(AMQPValue::LongString(s)) => Some(long_string_to_owned(s)),
+            Some(AMQPValue::ShortString(s)) => Some(s.to_string()),
+            _ => None,
+        }
+    });
+    from_header.unwrap_or_else(|| delivery.routing_key.to_string())
 }
 
 pub(crate) fn delivery_retry_token(delivery: &Delivery) -> Option<String> {
@@ -98,7 +126,7 @@ pub(crate) fn extract_string_headers(delivery: &Delivery) -> HashMap<String, Str
     let inner = table.inner();
     let mut headers = HashMap::with_capacity(inner.len());
     for (k, v) in inner.iter() {
-        if k.as_str() == RETRY_TOKEN_KEY {
+        if k.as_str() == RETRY_TOKEN_KEY || k.as_str() == SEQUENCE_KEY_HEADER {
             continue;
         }
         let value = match v {
@@ -313,6 +341,47 @@ mod tests {
     }
 
     // ---- extract_string_headers ----
+
+    fn delivery_with(routing_key: &str, headers: Option<FieldTable>) -> Delivery {
+        let mut delivery = make_delivery(headers, 1, false);
+        delivery.routing_key = ShortString::from(routing_key);
+        delivery
+    }
+
+    #[test]
+    fn sequence_key_comes_from_the_header_else_the_routing_key() {
+        let mut table = FieldTable::default();
+        table.insert(
+            ShortString::from(SEQUENCE_KEY_HEADER),
+            AMQPValue::LongString("K".into()),
+        );
+        let with_header = delivery_with("queue-seq-0", Some(table));
+        assert_eq!(delivery_sequence_key(&with_header), "K");
+        let without = delivery_with("plain-key", None);
+        assert_eq!(delivery_sequence_key(&without), "plain-key");
+    }
+
+    #[test]
+    fn wrong_typed_sequence_key_header_falls_back_to_the_routing_key() {
+        let mut table = FieldTable::default();
+        table.insert(
+            ShortString::from(SEQUENCE_KEY_HEADER),
+            AMQPValue::LongUInt(7),
+        );
+        let delivery = delivery_with("queue-seq-0", Some(table));
+        assert_eq!(delivery_sequence_key(&delivery), "queue-seq-0");
+    }
+
+    #[test]
+    fn sequence_key_header_is_hidden_from_handlers() {
+        let mut table = FieldTable::default();
+        table.insert(
+            ShortString::from(SEQUENCE_KEY_HEADER),
+            AMQPValue::LongString("K".into()),
+        );
+        let delivery = delivery_with("q", Some(table));
+        assert!(!extract_string_headers(&delivery).contains_key(SEQUENCE_KEY_HEADER));
+    }
 
     #[test]
     fn retry_token_is_hidden_from_handlers_but_readable_by_the_consumer() {
