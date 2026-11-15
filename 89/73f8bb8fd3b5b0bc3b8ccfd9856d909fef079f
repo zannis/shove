@@ -1,0 +1,21 @@
+src/backends/sns/consumer.rs
+  s_6511f1668e6a79::t_588cb0dca5881c 803-828,1115-1120,1137-1142,1340-1397,1399,1454-1461,2834-2876
+tests/sns_sqs_integration.rs
+  s_6511f1668e6a79::t_9904e385bc2c29 23-25,3401-3519
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8973f8bb8fd3b5b0bc3b8ccfd9856d909fef079f",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
