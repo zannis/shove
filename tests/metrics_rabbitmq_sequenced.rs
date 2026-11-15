@@ -325,7 +325,7 @@ fn discarded_series(snapshot: &Snapshot) -> Vec<(String, u64)> {
 }
 
 /// Wait until both handlers have run, so the reject has poisoned its key and
-/// the retry has been parked in a shard hold queue.
+/// the retry has run.
 async fn wait_for_handlers(ctx: &Counters, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
@@ -399,9 +399,8 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
     let handler_ctx = counters.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        // `max_retries(1)` = one initial attempt plus one retry, so the
-        // retry-key message is dead-lettered the moment it comes back from the
-        // shard hold queue with `retry_count = 1`.
+        // With `max_retries(1)` the retry-key message's first `Retry` takes its
+        // count to the limit, so it is dead-lettered with no second handler call.
         let opts = ConsumerOptions::<RabbitMqMarker>::new()
             .with_shutdown(s)
             .with_prefetch_count(10)
@@ -420,7 +419,7 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
     );
 
     // Four messages must reach the DLQ: the rejected one, the two cascaded
-    // behind its poisoned key, and the retry-exhausted one (after the 1s hold).
+    // behind its poisoned key, and the retry-exhausted one.
     assert!(
         dlq_counter.wait_for_count(4, Duration::from_secs(30)).await,
         "expected 4 dead-lettered messages, got {}",
@@ -466,7 +465,7 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
     assert_eq!(
         counters.retry_key_calls.load(Ordering::SeqCst),
         1,
-        "the retry-key message is dead-lettered on its way back in, so the \
+        "the retry-key message is dead-lettered at its first `Retry`, so the \
          handler must see it exactly once"
     );
 

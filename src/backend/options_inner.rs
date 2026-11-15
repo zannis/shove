@@ -34,8 +34,7 @@ pub(crate) struct ConsumerOptionsInner {
     pub max_pending_per_key: Option<usize>,
     pub max_message_size: Option<usize>,
     pub max_reconnect_attempts: Option<u32>,
-    /// Maximum time a sequence key may remain in the AwaitingRetry state
-    /// before its pending messages are dead-lettered (RabbitMQ only).
+    /// No effect; see `ConsumerOptions::hold_queue_timeout`.
     #[cfg(feature = "rabbitmq")]
     pub hold_queue_timeout: Option<Duration>,
     pub shutdown: CancellationToken,

@@ -162,7 +162,7 @@ let shutdown_handle = tokio::spawn(async move {
 A `SupervisorOutcome` with `exit_code() == 0` means every in-flight message at signal time was one of:
 
 - **Acked** — handler returned `Outcome::Ack`. Removed from the queue.
-- **Retried** — handler returned `Outcome::Retry` or `Outcome::Defer`. Published to hold queue and acked from main queue.
+- **Retried** — handler returned `Outcome::Retry` or `Outcome::Defer`. Published to hold queue and acked from main queue. On a sequenced RabbitMQ topic nothing is published: the delivery, and one that was waiting out a retry delay, goes back to its queue with a nack and is handled again ahead of the later messages for its key.
 - **Rejected** — handler returned `Outcome::Reject` or exhausted `max_retries`. Routed to DLQ (or discarded with warning if no DLQ) and acked from main queue.
 - **Discarded with warning** — message was malformed (deserialization failure, size limit exceeded). Acked from main queue after routing to DLQ or discarding.
 

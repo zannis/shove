@@ -18,13 +18,13 @@ pub(crate) fn hold_index(retry_count: u32, hold_queue_count: usize) -> Option<us
 
 /// The hold a backend waits out before it hands a message back on a topology
 /// without hold queues.
-#[allow(dead_code)] // only NATS calls `hold_delay` so far
+#[allow(dead_code)] // only NATS and RabbitMQ call `hold_delay`
 const NO_HOLD_QUEUE_DELAY: Duration = Duration::from_secs(1);
 
 /// The delay of the hold tier for `retry_count`: the tier [`hold_index`]
 /// picks, or [`NO_HOLD_QUEUE_DELAY`] on a topology without hold queues. A
 /// `Defer` holds for tier 0's delay, so it passes 0.
-#[allow(dead_code)] // only NATS calls it so far
+#[allow(dead_code)] // only NATS and RabbitMQ call it
 pub(crate) fn hold_delay(hold_queues: &[HoldQueue], retry_count: u32) -> Duration {
     hold_index(retry_count, hold_queues.len())
         .and_then(|tier| hold_queues.get(tier))

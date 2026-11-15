@@ -47,7 +47,7 @@ For the single-message consumers of a shared queue, each backend then redelivers
 |---|---|---|
 | Apache Kafka | After a fixed 1 s, the record is republished into the topic, with the retry count incremented for a `Retry`. Under `RetryStrategy::InPlace` the handler's task waits 1 s and hands the same record back. | None |
 | NATS JetStream | After a fixed 1 s. On a shove-owned stream a `Retry` holds the original un-acked and then publishes a copy with the count incremented. A `Defer`, and both outcomes on an external stream, nak with a 1 s delay. | None |
-| RabbitMQ | With no delay, by `basic.nack` with requeue. The delivery keeps its retry count, so a `Retry` never spends `max_retries`. | Every `Retry` and `Defer` |
+| RabbitMQ | With no delay, by `basic.nack` with requeue. The delivery keeps its retry count, so a `Retry` never spends `max_retries`. A sequenced consumer instead waits a fixed 1 s in place and counts the retry. | Every `Retry` and `Defer`, except on a sequenced consumer |
 | Redis Streams | With no delay: the entry is added back to its stream and the original is acknowledged. | Every `Retry` and `Defer` |
 | AWS SQS | With no delay: the message is re-sent with a delay of 0 seconds and the original is deleted. A FIFO queue sets the visibility timeout to 0 instead. | Every `Retry` and `Defer` |
 | In-process | With no delay: the message is queued again. | Every `Defer`; a `Retry` logs nothing |
@@ -104,11 +104,12 @@ One invariant binds every backend: a consumer never writes into an external topo
 | Apache Kafka | pauses the assignment and waits in the handler's task, or in the receive loop of a sequenced consumer, the count kept in memory | both strategies; `with_retry_strategy` on `ConsumerOptions::<Kafka>` and `KafkaConsumerGroupConfig`; a sequenced consumer accepts either and always retries in place |
 | NATS JetStream | naks with the tier's delay, the count from JetStream's `num_delivered` | `InPlace` on an external stream, `Republish` on a shove-owned one; the setter follows |
 | AWS SQS | extends the visibility timeout, the path the FIFO consumer already uses | later, additive; `declare` and every consumer entry point refuse `external()` |
-| RabbitMQ | `basic.nack` with requeue | later, additive; `declare` and every consumer entry point refuse `external()` |
+| RabbitMQ | `basic.nack` with requeue; a sequenced consumer holds the un-acked delivery through the delay instead | a sequenced consumer retries in place; later, additive for other consumers; `declare` and every consumer entry point refuse `external()` |
 | Redis Streams | leaves the entry pending for idle redelivery | later, additive; `declare` and every consumer entry point refuse `external()` |
 
 On Kafka a shove-owned topology runs with `Republish` by default and may opt into `InPlace` with `with_retry_strategy`; an external topology refuses `Republish`.
 A sequenced Kafka consumer retries in place whichever strategy is set, so a retried record blocks the later records of its key; see [Sequenced delivery](/backends/kafka#retries-in-place).
+A sequenced RabbitMQ consumer does the same: it holds the delivery un-acked through the delay and hands it back, with the count kept in memory; see [Retries wait in place](/backends/rabbitmq#retries-wait-in-place).
 Under `InPlace` nothing is republished: Kafka keeps the count in memory, and NATS reads it from the delivery info, so on an external stream a `Defer` and an `ack_wait` expiry consume the retry budget too.
 See [Bind to an infra-owned topic](/backends/kafka#bind-to-an-infra-owned-topic) and [Bind to an externally-provisioned stream](/backends/nats#bind-to-an-externally-provisioned-stream).
 

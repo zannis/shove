@@ -505,6 +505,11 @@ impl ChannelPublisher {
         }
     }
 
+    /// Whether the channel is still open.
+    pub(crate) fn is_open(&self) -> bool {
+        self.channel.status().connected()
+    }
+
     /// Commit the current AMQP transaction if in tx mode; otherwise no-op.
     ///
     /// Call after every routing decision (publish + ack/nack) to make the

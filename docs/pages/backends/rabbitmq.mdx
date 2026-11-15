@@ -82,6 +82,16 @@ Messages for the same key stay in order. RabbitMQ enforces per-key ordering via 
 
 The shard count is configurable via `routing_shards(N)` in `TopologyBuilder` (default 8). More shards increase parallelism across different keys at the cost of more queues on the broker.
 
+### Retries wait in place
+
+A `Retry` on a sequenced topic keeps the delivery in its shard queue. The consumer holds it un-acked for the attempt's delay, then hands the same delivery to the handler again with `redelivered: true`. The delay is the hold tier for the retry count, as on the other backends, with `hold_queue()` selecting it by attempt and 1 s applying without hold queues. `Defer`, a handler timeout and a handler panic retry the same way, and a `Defer` spends retry budget as a `Retry` does. No copy is published and the shard hold queues are not used for retries. They are still declared, and a copy parked there by an earlier version returns to the shard queue, where the consumer derives its key from its payload and handles it under that key.
+
+Later messages for the key are buffered behind the waiting delivery and the other keys on the shard keep being handled. Every waiting delivery and every delivery buffered behind it stays un-acked and counts against `prefetch_count` at the broker. Messages failing on at least `prefetch_count` distinct keys of one shard at once stall that shard until their waits end. Keep sequenced retry delays short, and size `prefetch_count` above the number of keys you expect to be retrying at once. A stop, a reconnect or a crash returns them to the queue in their original order. A shutdown requeues the waiting delivery with `basic.nack`, so the next consumer of the shard handles it before anything behind it.
+
+The retry count is kept in memory and starts from the delivery's `x-retry-count` header. A shard queue is a classic queue and carries no delivery counter, so a delivery that comes back after a stop, a reconnect or a crash restarts from its header count: the hold ladder starts over and `max_retries` does not bound a message caught in a restart loop. A message that keeps failing is handled `max_retries` times and then dead-lettered from the original delivery, which keeps the headers it arrived with.
+
+A delivery that stays un-acked longer than the broker's `consumer_timeout` makes the broker close the channel, so keep the longest hold delay well below it. The consumer logs a warning at start when a hold delay exceeds 15 minutes.
+
 See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced Pubsub example](/backends/rabbitmq/examples/sequenced) for a runnable walkthrough.
 
 ## Consumer groups + autoscaling
@@ -124,9 +134,9 @@ not add broker throughput. To scale past the ceiling, spread the topic over
 several queues: a sequenced topic with `routing_shards(N)` does exactly that
 on the broker side, at the cost of per-key ordering constraints.
 
-### Stuck-retry eviction
+### `hold_queue_timeout`
 
-If a transient broker error kills the consumer mid-republish, a delivery can land in the per-consumer `AwaitingRetry` map and never escape. `ConsumerOptions::<RabbitMq>::new().with_hold_queue_timeout(Duration)` evicts any entry that has been waiting longer than the timeout and requeues it to the main queue. The eviction ticker fires at half the configured timeout, so a 30 s setting checks every 15 s. Default: no eviction — set it explicitly to enable.
+`ConsumerOptions::<RabbitMq>::with_hold_queue_timeout(Duration)` has no effect. It bounded how long a sequenced key could wait for a retry parked in a hold queue. A sequenced retry now waits on the consumer's own un-acked delivery, so no key waits on the broker, and the option is kept only so existing code compiles.
 
 ### Reconnect bounds
 
