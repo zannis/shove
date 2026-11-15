@@ -1,0 +1,21 @@
+src/backends/rabbitmq/consumer.rs
+  s_6511f1668e6a79::t_ad93deb75a46e0 2728-2735
+  s_6511f1668e6a79::t_506423b6abc69f 2161-2162
+  s_6511f1668e6a79::t_d322430d349b06 2164
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6be295f15e2d307e8e745cb3dcdf11a854ca6e1c",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
