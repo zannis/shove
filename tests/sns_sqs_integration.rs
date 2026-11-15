@@ -20,7 +20,9 @@
 //!
 //! Run with: `cargo test --features aws-sns-sqs,audit --test sns_sqs_integration`
 
-use aws_sdk_sqs::types::{Message, MessageSystemAttributeName, QueueAttributeName};
+use aws_sdk_sqs::types::{
+    Message, MessageAttributeValue, MessageSystemAttributeName, QueueAttributeName,
+};
 use shove::Broker;
 use shove::Sqs;
 use shove::publisher::Publisher as PublisherV2;
@@ -3211,6 +3213,308 @@ async fn autoscaler_scale_magnitude_with_sqs() {
     shutdown.cancel();
     let _ = auto_handle.await;
     registry_arc.lock().await.shutdown_all().await;
+}
+
+// ---------------------------------------------------------------------------
+// Retry exhaustion on the sequenced path
+// ---------------------------------------------------------------------------
+
+define_sequenced_topic!(
+    SeqForgedCountTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("sqs-seq-forged")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_secs(1))
+        .dlq()
+        .build()
+);
+
+define_sequenced_topic!(
+    SeqForgedCountFailAllTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("sqs-seq-forged-fa")
+        .sequenced(SequenceFailure::FailAll)
+        .routing_shards(1)
+        .hold_queue(Duration::from_secs(1))
+        .dlq()
+        .build()
+);
+
+/// Retries amount 1 forever; acks anything else.
+#[derive(Clone)]
+struct RetryFirstHandler {
+    poison_calls: Arc<AtomicU32>,
+    later_handled: Arc<AtomicU32>,
+}
+
+impl<T: Topic<Message = OrderMessage>> MessageHandler<T> for RetryFirstHandler {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        if msg.amount == 1 {
+            self.poison_calls.fetch_add(1, Ordering::SeqCst);
+            Outcome::Retry
+        } else {
+            self.later_handled.fetch_add(1, Ordering::SeqCst);
+            Outcome::Ack
+        }
+    }
+}
+
+/// Sends amount 1 (optionally with a forged `x-retry-count="0"`) and then
+/// amount 2 for key "K" straight to the shard queue, runs `max_retries(2)`, and
+/// returns `(poison_calls, later_handled, elapsed_until_settled)`.
+async fn run_retry_exhaustion<T>(
+    shard: &str,
+    forged: bool,
+    wait_for_later: bool,
+) -> (u32, u32, Duration)
+where
+    T: SequencedTopic + Topic<Message = OrderMessage>,
+{
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<T>().await;
+
+    let sqs = broker.sqs_client().await;
+    let shard_url = setup
+        .queue_registry()
+        .get(shard)
+        .await
+        .expect("shard queue should be registered after declare");
+
+    for (amount, with_attr) in [(1u64, forged), (2, false)] {
+        let body = serde_json::to_string(&OrderMessage {
+            order_id: "K".into(),
+            amount,
+        })
+        .expect("serialize");
+        let mut req = sqs
+            .send_message()
+            .queue_url(&shard_url)
+            .message_body(body)
+            .message_group_id("K")
+            .message_deduplication_id(format!("exhaust-{amount}"));
+        if with_attr {
+            req = req.message_attributes(
+                "x-retry-count",
+                MessageAttributeValue::builder()
+                    .data_type("String")
+                    .string_value("0")
+                    .build()
+                    .expect("attribute"),
+            );
+        }
+        req.send().await.expect("send to FIFO shard");
+    }
+
+    let handler = RetryFirstHandler {
+        poison_calls: Arc::new(AtomicU32::new(0)),
+        later_handled: Arc::new(AtomicU32::new(0)),
+    };
+    let poison_calls = handler.poison_calls.clone();
+    let later_handled = handler.later_handled.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    let started = Instant::now();
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<T, _>(
+                handler,
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10)
+                    .with_max_retries(2),
+            )
+            .await
+    });
+
+    let deadline = started + Duration::from_secs(60);
+    if wait_for_later {
+        while later_handled.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    } else {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+    }
+    let elapsed = started.elapsed();
+    // Past the 30 s visibility timeout a duplicate would show up.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    (
+        poison_calls.load(Ordering::SeqCst),
+        later_handled.load(Ordering::SeqCst),
+        elapsed,
+    )
+}
+
+/// A sender-supplied `x-retry-count` must not steer the sequenced retry
+/// budget, and the message after an exhausted one must be handled once and
+/// promptly rather than after its visibility timeout.
+#[tokio::test]
+async fn sequenced_ignores_forged_retry_count_attribute() {
+    let (poison, later, elapsed) =
+        run_retry_exhaustion::<SeqForgedCountTopic>("sqs-seq-forged-seq-0", true, true).await;
+    assert_eq!(
+        poison, 2,
+        "max_retries(2) allows exactly two handler attempts"
+    );
+    assert_eq!(later, 1, "the later message must be handled exactly once");
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "later message took {elapsed:?}; it waited out a visibility timeout"
+    );
+}
+
+/// Same without forgery: exhausting the retry budget must release the key.
+#[tokio::test]
+async fn sequenced_exhausted_retry_releases_the_key() {
+    let (poison, later, elapsed) =
+        run_retry_exhaustion::<SeqForgedCountTopic>("sqs-seq-forged-seq-0", false, true).await;
+    assert_eq!(poison, 2);
+    assert_eq!(later, 1, "the later message must be handled exactly once");
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "later message took {elapsed:?}; it waited out a visibility timeout"
+    );
+}
+
+/// FailAll: the exhausted message poisons the key and the later one is
+/// cascade-rejected without reaching the handler.
+#[tokio::test]
+async fn sequenced_failall_exhausted_retry_cascades_to_later_message() {
+    let (poison, later, _) =
+        run_retry_exhaustion::<SeqForgedCountFailAllTopic>("sqs-seq-forged-fa-seq-0", false, false)
+            .await;
+    assert_eq!(poison, 2);
+    assert_eq!(later, 0, "a poisoned key must not handle later messages");
+}
+
+define_sequenced_topic!(
+    SeqBufferedRedeliveryTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("sqs-seq-bufdup")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_secs(5))
+        .dlq()
+        .build()
+);
+
+/// Retries amount 1 once, then acks it; acks everything else. Records the
+/// order of handler starts and whether two handlers ever overlapped.
+#[derive(Clone)]
+struct RetryOnceHandler {
+    starts: Arc<Mutex<Vec<u64>>>,
+    active: Arc<AtomicU32>,
+    overlapped: Arc<AtomicU32>,
+}
+
+impl MessageHandler<SeqBufferedRedeliveryTopic> for RetryOnceHandler {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        if self.active.fetch_add(1, Ordering::SeqCst) > 0 {
+            self.overlapped.fetch_add(1, Ordering::SeqCst);
+        }
+        let attempt = {
+            let mut starts = self.starts.lock().await;
+            starts.push(msg.amount);
+            starts.iter().filter(|a| **a == msg.amount).count()
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        if msg.amount == 1 && attempt == 1 {
+            Outcome::Retry
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+/// A message buffered while its key awaits an earlier message's retry has its
+/// own visibility expire and is redelivered. It must not be mistaken for the
+/// returning retry nor buffered twice: every message is handled once (the first
+/// twice by design), in order, with no overlap.
+#[tokio::test]
+async fn sequenced_buffered_redelivery_is_not_mistaken_for_the_retry() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqBufferedRedeliveryTopic>().await;
+
+    let sqs = broker.sqs_client().await;
+    let shard_url = setup
+        .queue_registry()
+        .get("sqs-seq-bufdup-seq-0")
+        .await
+        .expect("shard queue should be registered after declare");
+    sqs.set_queue_attributes()
+        .queue_url(&shard_url)
+        .attributes(QueueAttributeName::VisibilityTimeout, "3")
+        .send()
+        .await
+        .expect("shorten visibility timeout");
+
+    for amount in [1u64, 2] {
+        let body = serde_json::to_string(&OrderMessage {
+            order_id: "K".into(),
+            amount,
+        })
+        .expect("serialize");
+        sqs.send_message()
+            .queue_url(&shard_url)
+            .message_body(body)
+            .message_group_id("K")
+            .message_deduplication_id(format!("bufdup-{amount}"))
+            .send()
+            .await
+            .expect("send to FIFO shard");
+    }
+
+    let handler = RetryOnceHandler {
+        starts: Arc::new(Mutex::new(Vec::new())),
+        active: Arc::new(AtomicU32::new(0)),
+        overlapped: Arc::new(AtomicU32::new(0)),
+    };
+    let starts = handler.starts.clone();
+    let overlapped = handler.overlapped.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqBufferedRedeliveryTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10)
+                    .with_max_retries(5),
+            )
+            .await
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while starts.lock().await.len() < 3 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Long enough for any stale duplicate to surface.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    assert_eq!(*starts.lock().await, vec![1, 1, 2]);
+    assert_eq!(overlapped.load(Ordering::SeqCst), 0, "handlers overlapped");
 }
 
 // ---------------------------------------------------------------------------
