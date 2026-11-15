@@ -3,6 +3,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use lapin::options::ConfirmSelectOptions;
+use lapin::uri::AMQPUri;
 use lapin::{Channel, Connection, ConnectionProperties};
 use tokio::time::{Duration, sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -25,14 +26,38 @@ pub struct RabbitMqConfig {
     pub management: Option<super::management::ManagementConfig>,
 }
 
+/// Renders `raw` from scheme, username, host, port and path only. Password, query
+/// and fragment are dropped; a non-empty query leaves a `?<redacted>` marker.
+pub(super) fn redact_url(raw: &str) -> String {
+    const UNPARSEABLE: &str = "<unparseable>";
+    let Ok(url) = url::Url::parse(raw) else {
+        return UNPARSEABLE.to_string();
+    };
+    if url.cannot_be_a_base() {
+        return UNPARSEABLE.to_string();
+    }
+    let host = url.host_str().unwrap_or_default();
+    let userinfo = if url.username().is_empty() {
+        String::new()
+    } else {
+        format!("{}@", url.username())
+    };
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let query = if url.query().is_some_and(|q| !q.is_empty()) {
+        "?<redacted>"
+    } else {
+        ""
+    };
+    format!(
+        "{}://{userinfo}{host}{port}{}{query}",
+        url.scheme(),
+        url.path()
+    )
+}
+
 impl Debug for RabbitMqConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let redacted_uri = if let Ok(mut url) = url::Url::parse(&self.uri) {
-            url.set_password(None).ok();
-            url.to_string()
-        } else {
-            "<unparseable>".to_string()
-        };
+        let redacted_uri = redact_url(&self.uri);
 
         f.debug_struct("RabbitMqConfig")
             .field("uri", &redacted_uri)
@@ -83,6 +108,19 @@ impl Default for RabbitMqConfig {
     fn default() -> Self {
         Self::new("amqp://guest:guest@localhost:5672")
     }
+}
+
+/// Parses `uri` for lapin. Errors carry a fixed message because the input holds
+/// the broker password and the underlying parsers echo it.
+fn parse_uri(uri: &str) -> Result<AMQPUri> {
+    let invalid = || {
+        ShoveError::Validation("RabbitMqConfig::uri is not a valid amqp:// or amqps:// URI".into())
+    };
+    let url = url::Url::parse(uri).map_err(|_| invalid())?;
+    if url.cannot_be_a_base() || !matches!(url.scheme(), "amqp" | "amqps") {
+        return Err(invalid());
+    }
+    uri.parse::<AMQPUri>().map_err(|_| invalid())
 }
 
 /// Returns true for lapin errors that indicate the underlying AMQP connection
@@ -147,6 +185,7 @@ impl RabbitMqClient {
     /// Useful for services that start alongside their broker (e.g. in Docker
     /// Compose or Kubernetes) where the broker may not be ready immediately.
     pub async fn connect_with_retry(config: &RabbitMqConfig, max_attempts: u32) -> Result<Self> {
+        parse_uri(&config.uri)?;
         let mut backoff = Backoff::default();
         let mut attempts = 0u32;
 
@@ -201,6 +240,7 @@ impl RabbitMqClient {
     /// connection but never completes the AMQP handshake (e.g. during
     /// `stop_app`) does not block the caller indefinitely.
     async fn dial(config: &RabbitMqConfig) -> Result<Connection> {
+        let uri = parse_uri(&config.uri)?;
         let pid = std::process::id();
         let connection_name = format!("shove-rs-{pid}");
 
@@ -209,7 +249,7 @@ impl RabbitMqClient {
 
         timeout(
             Duration::from_secs(5),
-            Connection::connect(&config.uri, properties),
+            Connection::connect_uri(uri, properties),
         )
         .await
         .map_err(|_| ShoveError::Connection("timed out connecting to RabbitMQ".into()))?
@@ -406,6 +446,134 @@ mod tests {
         let debug_output = format!("{config:?}");
         assert!(!debug_output.contains("s3cret!"));
         assert!(debug_output.contains("admin@localhost"));
+    }
+
+    const MALFORMED_URIS: [&str; 5] = [
+        "amqp://admin:s3cret@:5672/%2f",
+        "amqp:admin:s3cret@host:5672",
+        "admin:s3cret@host:5672/%2f",
+        "http://admin:s3cret@host:5672/%2f",
+        "amqp://admin:s3cret@host:notaport/%2f",
+    ];
+
+    fn assert_no_leak(rendered: &str) {
+        assert!(!rendered.contains("s3cret"), "password leaked: {rendered}");
+        assert!(!rendered.contains("admin"), "username leaked: {rendered}");
+    }
+
+    #[test]
+    fn config_debug_never_leaks_password_for_malformed_uri() {
+        for uri in MALFORMED_URIS {
+            let rendered = format!("{:?}", RabbitMqConfig::new(uri));
+            assert!(!rendered.contains("s3cret"), "{uri}: {rendered}");
+        }
+        let rendered = format!("{:?}", RabbitMqConfig::new("amqp:admin:s3cret@host:5672"));
+        assert!(rendered.contains("<unparseable>"), "{rendered}");
+    }
+
+    #[test]
+    fn parse_uri_rejects_malformed_without_echoing_input() {
+        for uri in MALFORMED_URIS {
+            let err = parse_uri(uri).unwrap_err();
+            assert!(matches!(err, ShoveError::Validation(_)), "{uri}: {err:?}");
+            assert_no_leak(&err.to_string());
+            assert_no_leak(&format!("{err:?}"));
+        }
+    }
+
+    #[test]
+    fn parse_uri_accepts_amqp_and_amqps() {
+        assert!(parse_uri("amqp://user:pass@host:5672/%2f").is_ok());
+        assert!(parse_uri("amqps://user:pass@host:5671/%2f").is_ok());
+    }
+
+    #[test]
+    fn config_debug_still_redacts_well_formed_uri() {
+        let rendered = format!(
+            "{:?}",
+            RabbitMqConfig::new("amqp://user:pass@host:5672/%2f")
+        );
+        assert!(!rendered.contains("pass@"), "{rendered}");
+        assert!(rendered.contains("user@host"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_malformed_uri_without_echoing_input() {
+        for uri in MALFORMED_URIS {
+            let config = RabbitMqConfig::new(uri);
+            let err = RabbitMqClient::connect(&config).await.err().unwrap();
+            assert_no_leak(&err.to_string());
+            assert_no_leak(&format!("{err:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_with_retry_fails_fast_on_malformed_uri() {
+        let config = RabbitMqConfig::new("admin:s3cret@host:5672/%2f");
+        let started = std::time::Instant::now();
+        let err = RabbitMqClient::connect_with_retry(&config, 5)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, ShoveError::Validation(_)), "{err:?}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn config_debug_drops_query_and_fragment() {
+        let rendered = format!(
+            "{:?}",
+            RabbitMqConfig::new(
+                "amqp://user:s3cret@host:5672/%2f?password=s3cret&heartbeat=10#s3cret"
+            )
+        );
+        assert!(!rendered.contains("s3cret"), "{rendered}");
+        assert!(!rendered.contains("heartbeat"), "{rendered}");
+        assert!(
+            rendered.contains("amqp://user@host:5672/%2f?<redacted>"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn config_debug_without_query_has_no_marker() {
+        let rendered = format!(
+            "{:?}",
+            RabbitMqConfig::new("amqp://user:pw@host:5672/%2f#frag")
+        );
+        assert!(!rendered.contains("redacted"), "{rendered}");
+        assert!(!rendered.contains("frag"), "{rendered}");
+        assert!(rendered.contains("amqp://user@host:5672/%2f"), "{rendered}");
+    }
+
+    #[test]
+    fn parse_uri_accepts_hostless_forms_like_upstream() {
+        let cases = [
+            ("amqp://", "/"),
+            ("amqp:///", ""),
+            ("amqp:///%2f", "/"),
+            ("amqp:///vhost", "vhost"),
+        ];
+        for (uri, vhost) in cases {
+            let parsed = parse_uri(uri).unwrap();
+            assert_eq!(parsed.authority.host, "localhost", "{uri}");
+            assert_eq!(parsed.authority.port, 5672, "{uri}");
+            assert_eq!(parsed.vhost, vhost, "{uri}");
+        }
+        assert_eq!(parse_uri("amqps://").unwrap().authority.port, 5671);
+    }
+
+    #[test]
+    fn empty_host_with_userinfo_is_rejected_by_url_itself() {
+        assert!(url::Url::parse("amqp://admin:s3cret@:5672/%2f").is_err());
+    }
+
+    #[test]
+    fn config_debug_renders_hostless_uris() {
+        let rendered = format!("{:?}", RabbitMqConfig::new("amqp:///%2f?heartbeat=10"));
+        assert!(rendered.contains("amqp:///%2f?<redacted>"), "{rendered}");
+        let rendered = format!("{:?}", RabbitMqConfig::new("amqp://"));
+        assert!(!rendered.contains("unparseable"), "{rendered}");
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub struct ManagementConfig {
 impl std::fmt::Debug for ManagementConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ManagementConfig")
-            .field("base_url", &self.base_url)
+            .field("base_url", &super::client::redact_url(&self.base_url))
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .field("vhost", &self.vhost)
@@ -470,6 +470,19 @@ mod tests {
         assert!(
             err.to_string().contains("must not embed credentials"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn management_config_debug_drops_secrets_from_base_url() {
+        let rendered = format!(
+            "{:?}",
+            ManagementConfig::new("http://u:s3cret@host:15672/p?token=s3cret#s3cret", "u", "p")
+        );
+        assert!(!rendered.contains("s3cret"), "{rendered}");
+        assert!(
+            rendered.contains("http://u@host:15672/p?<redacted>"),
+            "{rendered}"
         );
     }
 
