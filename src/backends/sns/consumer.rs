@@ -1,5 +1,6 @@
 use aws_sdk_sqs::config::http::HttpResponse;
 use aws_sdk_sqs::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_sqs::operation::receive_message::{ReceiveMessageError, ReceiveMessageOutput};
 use aws_sdk_sqs::types::{Message, MessageSystemAttributeName};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -937,6 +938,19 @@ where
     }
 }
 
+type ReceiveResult =
+    std::result::Result<ReceiveMessageOutput, SdkError<ReceiveMessageError, HttpResponse>>;
+type InFlightReceive<'a> = std::pin::Pin<Box<dyn Future<Output = ReceiveResult> + Send + 'a>>;
+
+/// Polls the held receive without consuming it, so losing a `select!` race does not cancel it.
+async fn poll_in_flight_receive(slot: &mut Option<InFlightReceive<'_>>) -> ReceiveResult {
+    std::future::poll_fn(|cx| match slot.as_mut() {
+        Some(fut) => fut.as_mut().poll(cx),
+        None => std::task::Poll::Pending,
+    })
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn consume_loop_sequenced<T, H>(
     sqs: &aws_sdk_sqs::Client,
@@ -960,6 +974,7 @@ where
 
     let mut key_states: HashMap<String, KeyState> = HashMap::new();
     let mut in_flight_count: usize = 0;
+    let mut receive: Option<InFlightReceive<'_>> = None;
 
     info!(queue_url, prefetch, "sequenced SQS consumer started");
 
@@ -1005,7 +1020,7 @@ where
             match outcome {
                 Outcome::Ack => {
                     router::route_ack(sqs, queue_url, &receipt_handle).await;
-                    in_flight_count -= 1;
+                    in_flight_count = in_flight_count.saturating_sub(1);
                     drain_pending_for_key::<T, H>(
                         sqs,
                         queue_url,
@@ -1043,7 +1058,7 @@ where
                         metrics::FailReason::Rejected,
                     )
                     .await;
-                    in_flight_count -= 1;
+                    in_flight_count = in_flight_count.saturating_sub(1);
                     drain_pending_for_key::<T, H>(
                         sqs,
                         queue_url,
@@ -1072,7 +1087,7 @@ where
                         retry_count,
                     )
                     .await;
-                    in_flight_count -= 1;
+                    in_flight_count = in_flight_count.saturating_sub(1);
                     key_states.insert(key, KeyState::AwaitingRetry);
                 }
                 Outcome::Defer => {
@@ -1089,7 +1104,7 @@ where
                         retry_count,
                     )
                     .await;
-                    in_flight_count -= 1;
+                    in_flight_count = in_flight_count.saturating_sub(1);
                     key_states.insert(key, KeyState::AwaitingRetry);
                 }
             }
@@ -1099,7 +1114,23 @@ where
             .processing
             .store(in_flight_count > 0, Ordering::Relaxed);
 
-        let can_accept = in_flight_count < prefetch;
+        // Free capacity only grows while a receive is in flight, so its response
+        // never exceeds it; a started receive is polled to completion regardless.
+        let free_capacity = prefetch.saturating_sub(in_flight_count);
+        if receive.is_none() && free_capacity > 0 {
+            receive = Some(Box::pin(
+                sqs.receive_message()
+                    .queue_url(queue_url)
+                    .wait_time_seconds(5)
+                    .max_number_of_messages(free_capacity.min(10) as i32)
+                    .message_system_attribute_names(
+                        MessageSystemAttributeName::ApproximateReceiveCount,
+                    )
+                    .message_system_attribute_names(MessageSystemAttributeName::MessageGroupId)
+                    .message_attribute_names("All")
+                    .send(),
+            ));
+        }
 
         tokio::select! {
             biased;
@@ -1197,17 +1228,8 @@ where
                 let _ = completed_tx.send(key);
             }
 
-            result = async {
-                sqs.receive_message()
-                    .queue_url(queue_url)
-                    .wait_time_seconds(5)
-                    .max_number_of_messages(prefetch.saturating_sub(in_flight_count).min(10) as i32)
-                    .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
-                    .message_system_attribute_names(MessageSystemAttributeName::MessageGroupId)
-                    .message_attribute_names("All")
-                    .send()
-                    .await
-            }, if can_accept => {
+            result = poll_in_flight_receive(&mut receive), if receive.is_some() => {
+                receive = None;
                 let messages = result
                     .map_err(|e| {
                         metrics::record_backend_error(
@@ -1492,7 +1514,7 @@ where
                             outcome_rx: rx,
                         },
                     );
-                    in_flight_count += 1;
+                    in_flight_count = in_flight_count.saturating_add(1);
                     options.processing.store(true, Ordering::Relaxed);
                 }
             }
