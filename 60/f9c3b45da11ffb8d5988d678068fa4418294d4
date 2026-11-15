@@ -1,0 +1,23 @@
+src/backends/redis/consumer.rs
+  s_6511f1668e6a79::t_9f58dc2b470802 1727
+src/backends/redis/requeue.rs
+  s_6511f1668e6a79::t_fb96a994369489 53-55,263,272-293,304,322
+tests/redis_integration.rs
+  s_6511f1668e6a79::t_d0ced8b2837e02 247-261,543-605
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "60f9c3b45da11ffb8d5988d678068fa4418294d4",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
