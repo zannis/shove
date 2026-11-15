@@ -21,7 +21,7 @@ mod topology;
 pub use autoscaler::{
     RedisAutoscalerBackend, RedisQueueStats, RedisQueueStatsProvider, XlenStatsProvider,
 };
-pub use client::{RedisClient, RedisConfig, RedisMode};
+pub use client::{DEFAULT_BROADCAST_MAX_LEN, RedisClient, RedisConfig, RedisMode};
 pub use consumer::RedisConsumer;
 pub use consumer_group::{
     RedisConsumerGroup, RedisConsumerGroupConfig, RedisConsumerGroupRegistry,

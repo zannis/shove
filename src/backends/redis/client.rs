@@ -1,5 +1,6 @@
 //! Redis client abstraction supporting standalone, TLS (`rediss://`), and cluster modes.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,6 +47,16 @@ pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// XREADGROUP. 10 s gives margin without hiding a truly unreachable broker.
 pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default cap on a broadcast stream's length, in entries. See
+/// [`RedisConfig::with_broadcast_max_len`].
+pub const DEFAULT_BROADCAST_MAX_LEN: u64 = 10_000;
+
+const DEFAULT_BROADCAST_MAX_LEN_NONZERO: NonZeroU64 =
+    match NonZeroU64::new(DEFAULT_BROADCAST_MAX_LEN) {
+        Some(n) => n,
+        None => panic!("DEFAULT_BROADCAST_MAX_LEN must be positive"),
+    };
+
 /// Configuration for [`RedisClient`].
 pub struct RedisConfig {
     /// Connection mode: standalone or cluster.
@@ -71,6 +82,12 @@ pub struct RedisConfig {
     /// derives it from the handler timeout, floored at 30 s. Set via
     /// [`with_trim_interval`](Self::with_trim_interval).
     pub(crate) trim_interval: Option<Duration>,
+    /// Approximate cap on a broadcast stream's length, applied on every
+    /// broadcast publish. `None` publishes without trimming. Defaults to
+    /// [`DEFAULT_BROADCAST_MAX_LEN`]. Set via
+    /// [`with_broadcast_max_len`](Self::with_broadcast_max_len) or
+    /// [`without_broadcast_trim`](Self::without_broadcast_trim).
+    pub(crate) broadcast_max_len: Option<NonZeroU64>,
 }
 
 impl Default for RedisConfig {
@@ -92,6 +109,7 @@ impl Default for RedisConfig {
             response_timeout: DEFAULT_RESPONSE_TIMEOUT,
             connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             trim_interval: None,
+            broadcast_max_len: Some(DEFAULT_BROADCAST_MAX_LEN_NONZERO),
         }
     }
 }
@@ -156,6 +174,60 @@ impl RedisConfig {
     pub fn with_trim_interval(mut self, interval: Duration) -> Self {
         assert!(!interval.is_zero(), "trim_interval must be positive");
         self.trim_interval = Some(interval);
+        self
+    }
+
+    /// Cap the length of every broadcast stream this client publishes to.
+    ///
+    /// A broadcast subscriber reads with `XREAD`, which neither acknowledges
+    /// nor trims, and a broadcast stream has no consumer group for the
+    /// maintenance sweep to trim behind. The publisher is therefore the only
+    /// party that can bound the stream: each publish to a
+    /// [`broadcast`](crate::topology::TopologyBuilder::broadcast) topology is
+    /// sent as `XADD ... MAXLEN ~ max_len`. Defaults to
+    /// [`DEFAULT_BROADCAST_MAX_LEN`] entries.
+    ///
+    /// The cap is approximate. Redis trims whole radix-tree nodes, so the
+    /// stream can sit above `max_len` by up to one node (100 entries with the
+    /// server's default `stream-node-max-entries`) and never drops below it.
+    ///
+    /// The cap is also the replay window. A subscriber that falls more than
+    /// `max_len` entries behind the tail, or reconnects after an outage in
+    /// which more than `max_len` entries were published, resumes at the
+    /// oldest entry still in the stream and never sees the trimmed ones.
+    /// Redis reports no error for a read position that has been trimmed away,
+    /// so the gap is silent.
+    ///
+    /// Streams of every other topology are untouched: their entries leave
+    /// through the acknowledged-entry sweep (see
+    /// [`with_trim_interval`](Self::with_trim_interval)), and a length cap
+    /// there would drop undelivered work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShoveError::Validation`] if `max_len` is zero or exceeds
+    /// `i64::MAX`, the largest length Redis accepts.
+    pub fn with_broadcast_max_len(mut self, max_len: u64) -> Result<Self> {
+        let bounded = NonZeroU64::new(max_len)
+            .filter(|n| i64::try_from(n.get()).is_ok())
+            .ok_or_else(|| {
+                ShoveError::Validation(format!(
+                    "broadcast_max_len must be between 1 and {}, got {max_len}; use \
+                     without_broadcast_trim() to publish without a cap",
+                    i64::MAX
+                ))
+            })?;
+        self.broadcast_max_len = Some(bounded);
+        Ok(self)
+    }
+
+    /// Publish to broadcast streams without a length cap.
+    ///
+    /// Nothing in shove trims a broadcast stream after this, so it grows
+    /// until something else bounds it, such as an external `XTRIM` job or a
+    /// key expiry. See [`with_broadcast_max_len`](Self::with_broadcast_max_len).
+    pub fn without_broadcast_trim(mut self) -> Self {
+        self.broadcast_max_len = None;
         self
     }
 
@@ -241,6 +313,7 @@ pub struct RedisClient {
     response_timeout: Duration,
     connection_timeout: Duration,
     trim_interval: Option<Duration>,
+    broadcast_max_len: Option<NonZeroU64>,
 }
 
 fn is_tls_url(url: &str) -> bool {
@@ -262,6 +335,7 @@ impl RedisClient {
         let response_timeout = config.response_timeout;
         let connection_timeout = config.connection_timeout;
         let trim_interval = config.trim_interval;
+        let broadcast_max_len = config.broadcast_max_len;
 
         let inner = match config.mode {
             RedisMode::Standalone { url } => {
@@ -309,6 +383,7 @@ impl RedisClient {
             response_timeout,
             connection_timeout,
             trim_interval,
+            broadcast_max_len,
         };
 
         let mut conn = client.multiplexed_conn().await?;
@@ -395,6 +470,12 @@ impl RedisClient {
     /// ([`RedisConfig::with_trim_interval`]).
     pub(super) fn trim_interval(&self) -> Option<Duration> {
         self.trim_interval
+    }
+
+    /// The broadcast stream length cap, if trimming is enabled
+    /// ([`RedisConfig::with_broadcast_max_len`]).
+    pub(super) fn broadcast_max_len(&self) -> Option<NonZeroU64> {
+        self.broadcast_max_len
     }
 
     /// Identity of this client's shared inner connection state. Clones of one
@@ -560,6 +641,49 @@ mod tests {
     use rustls::crypto::CryptoProvider;
 
     use super::*;
+
+    #[test]
+    fn broadcast_max_len_defaults_to_the_documented_cap() {
+        assert_eq!(
+            RedisConfig::default()
+                .broadcast_max_len
+                .map(NonZeroU64::get),
+            Some(DEFAULT_BROADCAST_MAX_LEN)
+        );
+    }
+
+    #[test]
+    fn broadcast_max_len_accepts_the_bounds_redis_accepts() {
+        for max_len in [1, i64::MAX as u64] {
+            let cfg = RedisConfig::default()
+                .with_broadcast_max_len(max_len)
+                .expect("in range");
+            assert_eq!(cfg.broadcast_max_len.map(NonZeroU64::get), Some(max_len));
+        }
+    }
+
+    #[test]
+    fn broadcast_max_len_rejects_zero_and_lengths_redis_cannot_hold() {
+        for max_len in [0, i64::MAX as u64 + 1, u64::MAX] {
+            let Err(err) = RedisConfig::default().with_broadcast_max_len(max_len) else {
+                panic!("{max_len} was accepted");
+            };
+            assert!(
+                matches!(&err, ShoveError::Validation(message) if message.contains("broadcast_max_len")),
+                "{max_len}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_broadcast_trim_clears_the_cap() {
+        assert!(
+            RedisConfig::default()
+                .without_broadcast_trim()
+                .broadcast_max_len
+                .is_none()
+        );
+    }
 
     #[test]
     fn config_default_group() {
