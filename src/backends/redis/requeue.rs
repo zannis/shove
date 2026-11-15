@@ -181,14 +181,15 @@ pub(super) async fn run_requeuer(
         None => return,
     };
 
-    loop {
-        if shutdown.is_cancelled() {
-            break;
-        }
+    let mut poll_error_backoff = Backoff::default();
 
+    'passes: loop {
         let mut needs_reconnect = false;
         let mut outcomes = Vec::with_capacity(hold_queue_names.len());
         for (hold_queue_name, set_key) in hold_queue_names.iter().zip(hold_set_keys.iter()) {
+            if shutdown.is_cancelled() {
+                break 'passes;
+            }
             match poll_hold_set(&mut conn, hold_queue_name, set_key, &shutdown).await {
                 Ok(outcome) => outcomes.push(outcome),
                 Err(e) => {
@@ -200,6 +201,11 @@ pub(super) async fn run_requeuer(
         }
 
         if needs_reconnect {
+            // A fresh connection can still be rejected by the poll itself, so wait regardless.
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(poll_error_backoff.next_delay()) => {}
+            }
             match acquire_conn_with_retry(&client, &shutdown, "requeuer").await {
                 Some(c) => {
                     conn = c;
@@ -208,6 +214,8 @@ pub(super) async fn run_requeuer(
                 None => break,
             }
         }
+
+        poll_error_backoff = Backoff::default();
 
         if repoll_now(outcomes) {
             continue;
