@@ -1,7 +1,7 @@
 use aws_sdk_sqs::config::http::HttpResponse;
 use aws_sdk_sqs::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_sqs::operation::receive_message::{ReceiveMessageError, ReceiveMessageOutput};
-use aws_sdk_sqs::types::{Message, MessageSystemAttributeName};
+use aws_sdk_sqs::types::{Message, MessageSystemAttributeName, QueueAttributeName};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
@@ -22,6 +22,7 @@ use crate::backend::batch_consumer::{BatchSettlement, settle_batch_outcome};
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::router;
 use crate::backends::sns::topology::QueueRegistry;
+use crate::backends::sns::visibility::{self, Heartbeat};
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
@@ -108,6 +109,88 @@ impl SqsConsumer {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Reads the queue's `VisibilityTimeout` once, so a consumer that holds
+/// messages can keep them hidden. A queue that cannot be read fails the
+/// consumer start: the hold bound is unknown, and guessing it would hide a
+/// missing `sqs:GetQueueAttributes` permission until messages were redelivered.
+async fn read_heartbeat(sqs: &aws_sdk_sqs::Client, queue_url: &str) -> Result<Option<Heartbeat>> {
+    let out = sqs
+        .get_queue_attributes()
+        .queue_url(queue_url)
+        .attribute_names(QueueAttributeName::VisibilityTimeout)
+        .send()
+        .await
+        .map_err(|e| {
+            metrics::record_backend_error(
+                metrics::BackendLabel::SnsSqs,
+                metrics::BackendErrorKind::Consume,
+            );
+            map_sqs_error(&format!("SQS GetQueueAttributes failed on {queue_url}"), e)
+        })?;
+    let timeout = visibility::parse_visibility_timeout(queue_url, out.attributes())?;
+    let heartbeat = Heartbeat::for_queue_timeout(timeout);
+    if heartbeat.is_none() {
+        warn!(
+            queue_url,
+            "queue VisibilityTimeout is 0, messages held locally are not kept hidden"
+        );
+    }
+    Ok(heartbeat)
+}
+
+/// One bounded extension round over `handles`. Returns the handles SQS reports
+/// as already redelivered; a round that outlasts its bound is retried on the
+/// next tick.
+async fn extend_held(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    heartbeat: Heartbeat,
+    handles: &[String],
+) -> Vec<String> {
+    if handles.is_empty() {
+        return Vec::new();
+    }
+    match tokio::time::timeout(
+        heartbeat.bound(),
+        router::extend_visibility_batch(sqs, queue_url, handles, heartbeat.extend_to_secs),
+    )
+    .await
+    {
+        Ok(change) => change.stale,
+        Err(_) => {
+            warn!(
+                queue_url,
+                held = handles.len(),
+                "extending visibility of held messages timed out, retrying next tick"
+            );
+            metrics::record_backend_error(
+                metrics::BackendLabel::SnsSqs,
+                metrics::BackendErrorKind::Consume,
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Ticks every `period` once armed; pending forever when there is no heartbeat.
+async fn next_beat(ticker: &mut Option<tokio::time::Interval>) {
+    match ticker {
+        Some(t) => {
+            t.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+fn beat_interval(heartbeat: Heartbeat) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + heartbeat.period,
+        heartbeat.period,
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker
+}
 
 fn extract_metadata(msg: &Message, retry_count: u32) -> MessageMetadata {
     MessageMetadata {
@@ -1023,6 +1106,7 @@ async fn run_sequenced_shard<T, H>(
     ctx: &Arc<H::Context>,
     options: &ConsumerOptions,
     on_failure: SequenceFailure,
+    heartbeat: Option<Heartbeat>,
 ) -> Result<()>
 where
     T: Topic,
@@ -1042,6 +1126,7 @@ where
             ctx,
             options,
             on_failure,
+            heartbeat,
             &mut poisoned_keys,
             &mut pending_deliveries,
         )
@@ -1118,6 +1203,7 @@ async fn consume_loop_sequenced<T, H>(
     ctx: &Arc<H::Context>,
     options: &ConsumerOptions,
     on_failure: SequenceFailure,
+    heartbeat: Option<Heartbeat>,
     poisoned_keys: &mut HashSet<String>,
     pending_deliveries: &mut HashMap<String, VecDeque<Message>>,
 ) -> Result<()>
@@ -1133,6 +1219,7 @@ where
     let mut key_states: HashMap<String, KeyState> = HashMap::new();
     let mut in_flight_count: usize = 0;
     let mut receive: Option<InFlightReceive<'_>> = None;
+    let mut ticker = heartbeat.map(beat_interval);
 
     info!(queue_url, prefetch, "sequenced SQS consumer started");
 
@@ -1386,6 +1473,23 @@ where
             Some(key) = completed_rx.recv() => {
                 // Re-inject the key so the drain loop at the top picks it up.
                 let _ = completed_tx.send(key);
+            }
+
+            () = next_beat(&mut ticker), if !pending_deliveries.is_empty() => {
+                if let Some(heartbeat) = heartbeat {
+                    let held = visibility::held_handles(pending_deliveries);
+                    let stale = extend_held(sqs, queue_url, heartbeat, &held).await;
+                    if !stale.is_empty() {
+                        warn!(
+                            queue_url,
+                            stale = stale.len(),
+                            "buffered messages were redelivered before their visibility was extended, dropping them"
+                        );
+                        for handle in visibility::drop_stale(pending_deliveries, &stale) {
+                            router::route_requeue(sqs, queue_url, &handle).await;
+                        }
+                    }
+                }
             }
 
             result = poll_in_flight_receive(&mut receive), if receive.is_some() => {
@@ -2057,20 +2161,19 @@ where
 // buys; it only guarantees the mechanics (one `ReceiveMessage`,
 // one flush, one settlement call) stay batched up to that ceiling.
 //
-// # The visibility bound covers receive-to-settle, not batch age alone
+// # Held messages keep their visibility
 //
-// A message must be accumulated (bounded by `max_batch_age`), flushed
-// (bounded by `handler_timeout`) *and* settled (one bounded API call) before
-// the queue's `VisibilityTimeout` elapses, or it turns visible again
-// mid-flush: a sibling consumer picks it up and processes it a second time,
-// and the eventual settlement call (`DeleteMessageBatch` or
-// `ChangeMessageVisibilityBatch`) partially fails on the now-stale receipt
-// handle — a systematic duplicate-processing hazard on slow flushes, not an
-// occasional one. The crate's own defaults (`max_batch_age` 250ms,
-// `handler_timeout` 30s) already brush SQS's own default `VisibilityTimeout`
-// (30s): raise `VisibilityTimeout` on the queue, or lower `handler_timeout`,
-// so that `max_batch_age + handler_timeout` sits well under whatever
-// `VisibilityTimeout` the queue declares.
+// A batch is accumulated (bounded by `max_batch_age`), flushed (bounded by
+// `handler_timeout`) and settled. Longer than the queue's `VisibilityTimeout`,
+// a message would turn visible mid-flush: a sibling consumer picks it up and
+// processes it a second time, and the settlement call partially fails on the
+// now-stale receipt handle. So from the first message received until the handler
+// returns, the loop re-extends every held handle to the queue's timeout every
+// half of it (`Heartbeat`, read once at start): in the accumulation loop
+// between receives, and concurrently with the handler inside
+// [`flush_sqs_batch`]. A handle SQS reports as already redelivered is dropped
+// from the batch while it accumulates. Once the handler has the messages they
+// cannot be taken back, so a stale handle there is only logged.
 //
 // # `Redeliver`: visibility reset, not a republish
 //
@@ -2223,6 +2326,20 @@ impl<T: Topic> SqsBatch<T> {
         self.handles.push(receipt_handle);
     }
 
+    /// Drops the messages whose handle is in `stale`; they were redelivered
+    /// and will be received again. Returns how many were dropped.
+    fn drop_handles(&mut self, stale: &[String]) -> usize {
+        let before = self.handles.len();
+        let (messages, handles) = std::mem::take(&mut self.messages)
+            .into_iter()
+            .zip(std::mem::take(&mut self.handles))
+            .filter(|(_, handle)| !stale.contains(handle))
+            .unzip();
+        self.messages = messages;
+        self.handles = handles;
+        before.saturating_sub(self.handles.len())
+    }
+
     /// Take both lists for a flush, leaving both empty (capacity retained by
     /// `Vec::drain`/`mem::take`'s allocation is not preserved here — a fresh
     /// batch is small and short-lived enough that re-growing to at most 10
@@ -2248,6 +2365,28 @@ struct SqsBatchFlushCtx<'a> {
     shutdown: &'a CancellationToken,
     handler_timeout: Option<Duration>,
     handler_timeout_outcome: Option<Outcome>,
+    heartbeat: Option<Heartbeat>,
+}
+
+/// Extends `handles` every heartbeat period for as long as it is polled.
+async fn beat_forever(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    heartbeat: Heartbeat,
+    handles: &[String],
+) -> std::convert::Infallible {
+    let mut ticker = beat_interval(heartbeat);
+    loop {
+        ticker.tick().await;
+        let stale = extend_held(sqs, queue_url, heartbeat, handles).await;
+        if !stale.is_empty() {
+            warn!(
+                queue_url,
+                stale = stale.len(),
+                "batch messages were redelivered while the handler runs"
+            );
+        }
+    }
 }
 
 /// Hands the buffered batch to the handler and settles the single returned
@@ -2270,15 +2409,24 @@ async fn flush_sqs_batch<T, H>(
     let batch_size = batch.len();
     let (messages, handles) = batch.take();
 
-    let outcome = invoke_batch_handler(
+    let run = invoke_batch_handler(
         || handler.handle_batch(messages, ctx),
         flush.handler_timeout,
         flush.handler_timeout_outcome.clone(),
         flush.topic,
         flush.group,
         batch_size as u64,
-    )
-    .await;
+    );
+    let outcome = match flush.heartbeat {
+        None => run.await,
+        Some(heartbeat) => {
+            let beat = beat_forever(flush.sqs, flush.queue_url, heartbeat, &handles);
+            tokio::select! {
+                outcome = run => outcome,
+                never = beat => match never {},
+            }
+        }
+    };
 
     match settle_batch_outcome(&outcome) {
         BatchSettlement::Commit => {
@@ -2360,6 +2508,7 @@ async fn run_batch_loop<T, H>(
     handler: &Arc<H>,
     ctx: &Arc<H::Context>,
     options: &BatchConsumerOptionsInner,
+    heartbeat: Option<Heartbeat>,
 ) -> Result<()>
 where
     T: NotSequenced,
@@ -2386,10 +2535,12 @@ where
         shutdown: &options.shutdown,
         handler_timeout,
         handler_timeout_outcome,
+        heartbeat,
     };
 
     let mut batch: SqsBatch<T> = SqsBatch::new(max_batch_size);
     let mut deadline: Option<tokio::time::Instant> = None;
+    let mut next_extension: Option<tokio::time::Instant> = None;
     let mut redelivery_backoff = batch_redelivery_backoff();
 
     tracing::info!(
@@ -2410,6 +2561,7 @@ where
             )
             .await;
             deadline = None;
+            next_extension = None;
             continue;
         }
 
@@ -2425,6 +2577,7 @@ where
             )
             .await;
             deadline = None;
+            next_extension = None;
             continue;
         }
 
@@ -2444,6 +2597,28 @@ where
                 "shutdown signal received, SQS batch consumer stopped"
             );
             return Ok(());
+        }
+
+        if let (Some(heartbeat), Some(due)) = (heartbeat, next_extension)
+            && tokio::time::Instant::now() >= due
+        {
+            let stale = extend_held(sqs, queue_url, heartbeat, &batch.handles).await;
+            if !stale.is_empty() {
+                let dropped = batch.drop_handles(&stale);
+                warn!(
+                    queue_url,
+                    dropped,
+                    "batch messages were redelivered before their visibility was extended, dropping them"
+                );
+                if batch.is_empty() {
+                    deadline = None;
+                }
+            }
+            next_extension = if batch.is_empty() {
+                None
+            } else {
+                tokio::time::Instant::now().checked_add(heartbeat.period)
+            };
         }
 
         // Headroom is always > 0 here: the size-trigger check above already
@@ -2487,17 +2662,11 @@ where
         };
 
         if msgs.is_empty() {
-            let sleep_for = match deadline {
-                Some(d) => {
-                    let now = tokio::time::Instant::now();
-                    if d <= now {
-                        Duration::ZERO
-                    } else {
-                        (d - now).min(Duration::from_millis(500))
-                    }
-                }
-                None => Duration::from_millis(500),
-            };
+            let now = tokio::time::Instant::now();
+            let mut sleep_for = Duration::from_millis(500);
+            for due in [deadline, next_extension].into_iter().flatten() {
+                sleep_for = sleep_for.min(due.saturating_duration_since(now));
+            }
             if !sleep_for.is_zero() {
                 tokio::select! {
                     biased;
@@ -2554,6 +2723,8 @@ where
             let metadata = extract_metadata(&msg, router::get_retry_count(&msg));
             if batch.is_empty() {
                 deadline = batch_deadline(tokio::time::Instant::now(), max_batch_age);
+                next_extension =
+                    heartbeat.and_then(|h| tokio::time::Instant::now().checked_add(h.period));
             }
             batch.push(message, metadata, receipt_handle);
         }
@@ -2727,6 +2898,7 @@ impl SqsConsumer {
             let shard_queue_url = consumer.resolve_queue_url(&shard_queue_name).await?;
 
             let sqs = consumer.client.sqs().clone();
+            let heartbeat = read_heartbeat(&sqs, &shard_queue_url).await?;
             let h = handler.clone();
             let c = ctx.clone();
             let opts = options.clone();
@@ -2741,6 +2913,7 @@ impl SqsConsumer {
                     &c,
                     &opts,
                     on_failure,
+                    heartbeat,
                 )
                 .await
             }));
@@ -2818,12 +2991,17 @@ impl SqsConsumer {
             let handler = Arc::new(handler);
             let ctx = Arc::new(ctx);
             let sqs = consumer.client.sqs().clone();
+            let heartbeat = read_heartbeat(&sqs, &queue_url).await?;
 
             run_with_reconnect(
                 &options.shutdown,
                 topology.queue(),
                 options.max_reconnect_attempts,
-                || run_batch_loop::<T, H>(&sqs, &queue_url, topology, &handler, &ctx, &options),
+                || {
+                    run_batch_loop::<T, H>(
+                        &sqs, &queue_url, topology, &handler, &ctx, &options, heartbeat,
+                    )
+                },
             )
             .await
         }
@@ -3297,5 +3475,49 @@ mod key_identity_tests {
         let mut buf: VecDeque<Message> = VecDeque::from([msg(Some("m1"), "h1")]);
         assert!(buffer_or_replace(&mut buf, "m3", msg(Some("m3"), "h3")).is_some());
         assert_eq!(buf.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod held_batch_tests {
+    use super::*;
+    use crate::JsonCodec;
+    use crate::TopologyBuilder;
+    use std::sync::OnceLock;
+
+    struct Held;
+    impl Topic for Held {
+        type Message = String;
+        type Codec = JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static T: OnceLock<QueueTopology> = OnceLock::new();
+            T.get_or_init(|| TopologyBuilder::new("held").build())
+        }
+    }
+
+    fn meta() -> MessageMetadata {
+        extract_metadata(&Message::builder().build(), 0)
+    }
+
+    #[test]
+    fn dropping_stale_handles_keeps_messages_and_handles_aligned() {
+        let mut batch: SqsBatch<Held> = SqsBatch::new(10);
+        for (body, handle) in [("a", "h1"), ("b", "h2"), ("c", "h3")] {
+            batch.push(body.to_string(), meta(), handle.to_string());
+        }
+        let dropped = batch.drop_handles(&["h2".to_string(), "unknown".to_string()]);
+        assert_eq!(dropped, 1);
+        let bodies: Vec<_> = batch.messages.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(bodies, ["a", "c"]);
+        assert_eq!(batch.handles, ["h1", "h3"]);
+    }
+
+    #[test]
+    fn dropping_every_handle_empties_the_batch() {
+        let mut batch: SqsBatch<Held> = SqsBatch::new(10);
+        batch.push("a".to_string(), meta(), "h1".to_string());
+        assert_eq!(batch.drop_handles(&["h1".to_string()]), 1);
+        assert!(batch.is_empty());
+        assert_eq!(batch.drop_handles(&["h1".to_string()]), 0);
     }
 }

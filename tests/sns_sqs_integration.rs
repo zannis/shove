@@ -3441,7 +3441,8 @@ impl MessageHandler<SeqBufferedRedeliveryTopic> for RetryOnceHandler {
 }
 
 /// A message buffered while its key awaits an earlier message's retry has its
-/// own visibility expire and is redelivered. It must not be mistaken for the
+/// own visibility expire (here before the first heartbeat) and is redelivered.
+/// It must not be mistaken for the
 /// returning retry nor buffered twice: every message is handled once (the first
 /// twice by design), in order, with no overlap.
 #[tokio::test]
@@ -3456,29 +3457,6 @@ async fn sequenced_buffered_redelivery_is_not_mistaken_for_the_retry() {
         .get("sqs-seq-bufdup-seq-0")
         .await
         .expect("shard queue should be registered after declare");
-    sqs.set_queue_attributes()
-        .queue_url(&shard_url)
-        .attributes(QueueAttributeName::VisibilityTimeout, "3")
-        .send()
-        .await
-        .expect("shorten visibility timeout");
-
-    for amount in [1u64, 2] {
-        let body = serde_json::to_string(&OrderMessage {
-            order_id: "K".into(),
-            amount,
-        })
-        .expect("serialize");
-        sqs.send_message()
-            .queue_url(&shard_url)
-            .message_body(body)
-            .message_group_id("K")
-            .message_deduplication_id(format!("bufdup-{amount}"))
-            .send()
-            .await
-            .expect("send to FIFO shard");
-    }
-
     let handler = RetryOnceHandler {
         starts: Arc::new(Mutex::new(Vec::new())),
         active: Arc::new(AtomicU32::new(0)),
@@ -3503,6 +3481,13 @@ async fn sequenced_buffered_redelivery_is_not_mistaken_for_the_retry() {
             .await
     });
 
+    // The consumer has read the queue's 30 s default and heartbeats every 15 s;
+    // the shorter timeout takes hold after that, so the buffered message lapses
+    // as if a heartbeat had been missed.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    set_visibility_timeout(&broker, &setup, "sqs-seq-bufdup-seq-0", 3).await;
+    send_to_shard(&sqs, &shard_url, "bufdup", &[1, 2]).await;
+
     let deadline = Instant::now() + Duration::from_secs(60);
     while starts.lock().await.len() < 3 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3515,6 +3500,210 @@ async fn sequenced_buffered_redelivery_is_not_mistaken_for_the_retry() {
 
     assert_eq!(*starts.lock().await, vec![1, 1, 2]);
     assert_eq!(overlapped.load(Ordering::SeqCst), 0, "handlers overlapped");
+}
+
+define_sequenced_topic!(
+    SeqBufferedHeldTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("sqs-seq-bufhold")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_secs(8))
+        .dlq()
+        .build()
+);
+
+async fn send_to_shard(sqs: &aws_sdk_sqs::Client, url: &str, tag: &str, amounts: &[u64]) {
+    for amount in amounts {
+        let body = serde_json::to_string(&OrderMessage {
+            order_id: "K".into(),
+            amount: *amount,
+        })
+        .expect("serialize");
+        sqs.send_message()
+            .queue_url(url)
+            .message_body(body)
+            .message_group_id("K")
+            .message_deduplication_id(format!("{tag}-{amount}"))
+            .send()
+            .await
+            .expect("send to FIFO shard");
+    }
+}
+
+/// Receives until a message with `amount` arrives, returning its
+/// `ApproximateReceiveCount`. Deletes every other message it gets, which also
+/// unlocks the group.
+async fn receive_count_of(sqs: &aws_sdk_sqs::Client, url: &str, amount: u64) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let got = sqs
+            .receive_message()
+            .queue_url(url)
+            .max_number_of_messages(10)
+            .wait_time_seconds(2)
+            .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
+            .send()
+            .await
+            .expect("receive");
+        for msg in got.messages() {
+            let body: OrderMessage =
+                serde_json::from_str(msg.body().expect("body")).expect("deserialize");
+            if body.amount == amount {
+                return msg
+                    .attributes()
+                    .and_then(|a| a.get(&MessageSystemAttributeName::ApproximateReceiveCount))
+                    .and_then(|v| v.parse().ok())
+                    .expect("receive count");
+            }
+            sqs.delete_message()
+                .queue_url(url)
+                .receipt_handle(msg.receipt_handle().expect("handle"))
+                .send()
+                .await
+                .expect("delete");
+        }
+    }
+    panic!("message {amount} never came back");
+}
+
+/// A message buffered behind a key that waits 8 s for a retry outlasts the
+/// queue's 3 s visibility timeout twice over. Nothing may redeliver it while
+/// it waits: its receive count stays at the consumer's own receive plus the
+/// one this test makes once the consumer has stopped.
+#[tokio::test]
+async fn sequenced_buffered_message_keeps_its_receive_count_while_its_key_waits() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqBufferedHeldTopic>().await;
+
+    let sqs = broker.sqs_client().await;
+    let shard_url = set_visibility_timeout(&broker, &setup, "sqs-seq-bufhold-seq-0", 3).await;
+    send_to_shard(&sqs, &shard_url, "bufhold", &[1, 2]).await;
+
+    let handler = RetryFirstHandler {
+        poison_calls: Arc::new(AtomicU32::new(0)),
+        later_handled: Arc::new(AtomicU32::new(0)),
+    };
+    let later_handled = handler.later_handled.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqBufferedHeldTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10)
+                    .with_max_retries(5),
+            )
+            .await
+    });
+
+    // Past two visibility timeouts, before the retry returns at 8 s.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+    assert_eq!(
+        later_handled.load(Ordering::SeqCst),
+        0,
+        "the buffered message must wait for its key"
+    );
+
+    // LocalStack lets the long poll that shutdown abandoned pick up the
+    // released message, which adds one receive. Redelivery while it waited
+    // would add two more, one per elapsed timeout.
+    let count = receive_count_of(&sqs, &shard_url, 2).await;
+    assert!((2..=3).contains(&count), "receive count was {count}");
+}
+
+define_sequenced_topic!(
+    SeqBufferedReleaseTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("sqs-seq-bufrel")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .hold_queue(Duration::from_secs(5))
+        .dlq()
+        .build()
+);
+
+/// Holds amount 1 until released, then acks; acks everything else at once.
+#[derive(Clone)]
+struct GateFirstHandler {
+    release: Arc<tokio::sync::Semaphore>,
+    started: Arc<Notify>,
+}
+
+impl MessageHandler<SeqBufferedReleaseTopic> for GateFirstHandler {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        if msg.amount == 1 {
+            self.started.notify_one();
+            let _ = self.release.acquire().await;
+        }
+        Outcome::Ack
+    }
+}
+
+/// Shutdown releases a buffered message that the heartbeat had been extending
+/// (a 6 s timeout beats every 3 s), and nothing hides it again afterwards.
+#[tokio::test]
+async fn sequenced_shutdown_releases_buffered_messages_and_stops_extending() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqBufferedReleaseTopic>().await;
+
+    let sqs = broker.sqs_client().await;
+    let shard_url = set_visibility_timeout(&broker, &setup, "sqs-seq-bufrel-seq-0", 6).await;
+    send_to_shard(&sqs, &shard_url, "bufrel", &[1, 2]).await;
+
+    let handler = GateFirstHandler {
+        release: Arc::new(tokio::sync::Semaphore::new(0)),
+        started: Arc::new(Notify::new()),
+    };
+    let release = handler.release.clone();
+    let started = handler.started.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqBufferedReleaseTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10)
+                    .with_max_retries(5),
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(30), started.notified())
+        .await
+        .expect("first message reaches the handler");
+    // Past the first heartbeat (3 s), so the buffered message has been extended.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(queue_counts(&sqs, &shard_url).await, (0, 2));
+
+    shutdown.cancel();
+    release.add_permits(1);
+    handle.await.expect("consumer task should not panic").ok();
+
+    // The first message is acked and the buffered one is released. A long poll
+    // abandoned by shutdown can still hide it for one visibility timeout.
+    let counts = wait_for_queue_counts(&sqs, &shard_url, Duration::from_secs(15), |v, nv| {
+        v == 1 && nv == 0
+    })
+    .await;
+    assert_eq!(counts, (1, 0));
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(queue_counts(&sqs, &shard_url).await, (1, 0));
 }
 
 // ---------------------------------------------------------------------------
