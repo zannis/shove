@@ -595,9 +595,9 @@ fn receive_count_retries(message: &Message) -> u32 {
 /// Retry count on a FIFO (sequenced) queue, from `ApproximateReceiveCount - 1`
 /// alone. The FIFO retry path never rewrites `x-retry-count`, so any value
 /// present was set by the sender and must not steer the count. `None` when the
-/// receive count is missing or not a number: the delivery is broken.
+/// receive count is missing, not a number or zero: the delivery is broken.
 pub(crate) fn get_retry_count_fifo(message: &Message) -> Option<u32> {
-    receive_count(message).map(|count| count.saturating_sub(1))
+    receive_count(message).and_then(|count| count.checked_sub(1))
 }
 
 /// Extract string message attributes from an SQS message.
@@ -794,6 +794,15 @@ mod tests {
             .message_attributes(RETRY_COUNT_ATTR, attr)
             .build();
         assert_eq!(get_retry_count_fifo(&forged_only), None);
+    }
+
+    #[test]
+    fn fifo_retry_count_is_none_for_a_zero_receive_count() {
+        let msg = Message::builder()
+            .attributes(MessageSystemAttributeName::ApproximateReceiveCount, "0")
+            .build();
+        assert_eq!(get_retry_count_fifo(&msg), None);
+        assert_eq!(get_retry_count(&msg), 0);
     }
 
     #[test]
