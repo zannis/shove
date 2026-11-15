@@ -73,27 +73,28 @@ pub(crate) fn get_retry_count(delivery: &Delivery) -> u32 {
 
 /// The sequence key of a delivery.
 ///
-/// A hold-queue return is dead-lettered to the default exchange with the
-/// shard queue's own name as routing key and carries the broker's `x-death`
-/// marker; only such a delivery takes its key from the key header. An
-/// ordinary message arrives through the hash exchange with its sequence key
-/// as routing key, so a header on it is ignored. A return whose header is
+/// A hold-queue return is dead-lettered through the default exchange (the
+/// empty exchange name, see `hold_queue_args`) with the shard queue's own name
+/// as routing key; only such a delivery takes its key from the key header.
+/// The broker reports the exchange, so a producer cannot forge it through
+/// headers. Any other delivery, including every one that arrives through the
+/// topic's hash exchange, uses its routing key. A return whose header is
 /// missing or not a string (parked by a version before the header existed)
-/// uses the routing key.
+/// also uses the routing key. Publishing straight to the shard queue through
+/// the default exchange bypasses the topology and is accepted as out of scope.
 pub(crate) fn delivery_sequence_key(delivery: &Delivery, shard_queue: &str) -> String {
-    let table = delivery.properties.headers().as_ref();
-    let is_return = delivery.routing_key.as_str() == shard_queue
-        && table.is_some_and(|t| {
-            matches!(t.inner().get(DEATH_KEY), Some(AMQPValue::FieldArray(a)) if !a.as_slice().is_empty())
+    let is_return =
+        delivery.exchange.as_str().is_empty() && delivery.routing_key.as_str() == shard_queue;
+    let from_header = delivery
+        .properties
+        .headers()
+        .as_ref()
+        .filter(|_| is_return)
+        .and_then(|t| match t.inner().get(SEQUENCE_KEY_HEADER) {
+            Some(AMQPValue::LongString(s)) => Some(long_string_to_owned(s)),
+            Some(AMQPValue::ShortString(s)) => Some(s.to_string()),
+            _ => None,
         });
-    let from_header =
-        table
-            .filter(|_| is_return)
-            .and_then(|t| match t.inner().get(SEQUENCE_KEY_HEADER) {
-                Some(AMQPValue::LongString(s)) => Some(long_string_to_owned(s)),
-                Some(AMQPValue::ShortString(s)) => Some(s.to_string()),
-                _ => None,
-            });
     from_header.unwrap_or_else(|| delivery.routing_key.to_string())
 }
 
@@ -352,16 +353,17 @@ mod tests {
 
     // ---- extract_string_headers ----
 
-    fn delivery_with(routing_key: &str, headers: Option<FieldTable>) -> Delivery {
+    fn delivery_with(exchange: &str, routing_key: &str, headers: Option<FieldTable>) -> Delivery {
         let mut delivery = make_delivery(headers, 1, false);
+        delivery.exchange = ShortString::from(exchange);
         delivery.routing_key = ShortString::from(routing_key);
         delivery
     }
 
-    fn key_table(value: AMQPValue, dead_lettered: bool) -> FieldTable {
+    fn key_table(value: AMQPValue, with_death: bool) -> FieldTable {
         let mut table = FieldTable::default();
         table.insert(ShortString::from(SEQUENCE_KEY_HEADER), value);
-        if dead_lettered {
+        if with_death {
             table.insert(
                 ShortString::from(DEATH_KEY),
                 AMQPValue::FieldArray(vec![AMQPValue::FieldTable(FieldTable::default())].into()),
@@ -371,35 +373,37 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_delivery_with_a_forged_key_header_uses_the_routing_key() {
+    fn delivery_through_the_hash_exchange_ignores_a_forged_key_header() {
+        // Even with the shard queue's name as routing key and a forged x-death.
+        let forged = key_table(AMQPValue::LongString("J".into()), true);
+        let delivery = delivery_with("t-seq-hash", "q-seq-0", Some(forged));
+        assert_eq!(delivery_sequence_key(&delivery, "q-seq-0"), "q-seq-0");
         let forged = key_table(AMQPValue::LongString("J".into()), false);
-        assert_eq!(
-            delivery_sequence_key(&delivery_with("K", Some(forged)), "q-seq-0"),
-            "K"
-        );
-        let forged_with_death = key_table(AMQPValue::LongString("J".into()), true);
-        assert_eq!(
-            delivery_sequence_key(&delivery_with("K", Some(forged_with_death)), "q-seq-0"),
-            "K"
-        );
+        let delivery = delivery_with("t-seq-hash", "K", Some(forged));
+        assert_eq!(delivery_sequence_key(&delivery, "q-seq-0"), "K");
+    }
+
+    #[test]
+    fn default_exchange_delivery_for_another_queue_ignores_the_header() {
+        let table = key_table(AMQPValue::LongString("J".into()), true);
+        let delivery = delivery_with("", "K", Some(table));
+        assert_eq!(delivery_sequence_key(&delivery, "q-seq-0"), "K");
     }
 
     #[test]
     fn returning_delivery_takes_its_key_from_the_header() {
         let table = key_table(AMQPValue::LongString("K".into()), true);
-        let returning = delivery_with("q-seq-0", Some(table));
+        let returning = delivery_with("", "q-seq-0", Some(table));
         assert_eq!(delivery_sequence_key(&returning, "q-seq-0"), "K");
     }
 
     #[test]
     fn returning_delivery_without_a_usable_header_uses_the_routing_key() {
-        let missing = delivery_with("q-seq-0", None);
+        let missing = delivery_with("", "q-seq-0", None);
         assert_eq!(delivery_sequence_key(&missing, "q-seq-0"), "q-seq-0");
         let wrong = key_table(AMQPValue::LongUInt(7), true);
-        assert_eq!(
-            delivery_sequence_key(&delivery_with("q-seq-0", Some(wrong)), "q-seq-0"),
-            "q-seq-0"
-        );
+        let delivery = delivery_with("", "q-seq-0", Some(wrong));
+        assert_eq!(delivery_sequence_key(&delivery, "q-seq-0"), "q-seq-0");
     }
 
     #[test]
@@ -409,7 +413,7 @@ mod tests {
             ShortString::from(SEQUENCE_KEY_HEADER),
             AMQPValue::LongString("K".into()),
         );
-        let delivery = delivery_with("q", Some(table));
+        let delivery = delivery_with("", "q", Some(table));
         assert!(!extract_string_headers(&delivery).contains_key(SEQUENCE_KEY_HEADER));
     }
 

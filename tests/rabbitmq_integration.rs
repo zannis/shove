@@ -4442,26 +4442,30 @@ async fn sequenced_foreign_retry_count_message_does_not_jump_the_held_retry() {
         .unwrap()
         .exchange()
         .to_string();
+    let raw_publish_to =
+        |routing_key: &'static str, payload: &'static [u8], headers: FieldTable| {
+            let raw_channel = raw_channel.clone();
+            let exchange = exchange.clone();
+            async move {
+                raw_channel
+                    .basic_publish(
+                        exchange.as_str().into(),
+                        routing_key.into(),
+                        BasicPublishOptions::default(),
+                        payload,
+                        lapin::BasicProperties::default()
+                            .with_delivery_mode(2)
+                            .with_content_type("application/json".into())
+                            .with_headers(headers),
+                    )
+                    .await
+                    .unwrap()
+                    .await
+                    .unwrap();
+            }
+        };
     let raw_publish = |payload: &'static [u8], headers: FieldTable| {
-        let raw_channel = raw_channel.clone();
-        let exchange = exchange.clone();
-        async move {
-            raw_channel
-                .basic_publish(
-                    exchange.as_str().into(),
-                    "ACC-FOREIGN".into(),
-                    BasicPublishOptions::default(),
-                    payload,
-                    lapin::BasicProperties::default()
-                        .with_delivery_mode(2)
-                        .with_content_type("application/json".into())
-                        .with_headers(headers),
-                )
-                .await
-                .unwrap()
-                .await
-                .unwrap();
-        }
+        raw_publish_to("ACC-FOREIGN", payload, headers)
     };
     let mut original_headers = FieldTable::default();
     original_headers.insert(
@@ -4487,6 +4491,23 @@ async fn sequenced_foreign_retry_count_message_does_not_jump_the_held_retry() {
         AMQPValue::LongString("original-id".into()),
     );
     raw_publish(br#"{"account":"ACC-FOREIGN","seq":98}"#, copied).await;
+    // Normal exchange, routing key = the shard queue's name, forged death marker
+    // and key header naming the awaiting key: it must not be filed under that key.
+    let mut attack = FieldTable::default();
+    attack.insert(
+        "shove-sequence-key".into(),
+        AMQPValue::LongString("ACC-FOREIGN".into()),
+    );
+    attack.insert(
+        "x-death".into(),
+        AMQPValue::FieldArray(vec![AMQPValue::FieldTable(FieldTable::default())].into()),
+    );
+    raw_publish_to(
+        "test-foreign-retry-seq-orders-seq-0",
+        br#"{"account":"ACC-FOREIGN","seq":96}"#,
+        attack,
+    )
+    .await;
     let mut forged = FieldTable::default();
     forged.insert(
         "shove-sequence-key".into(),
@@ -4502,10 +4523,10 @@ async fn sequenced_foreign_retry_count_message_does_not_jump_the_held_retry() {
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(30);
-    while handler.order.lock().unwrap().len() < 6 {
+    while handler.order.lock().unwrap().len() < 7 {
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for 6 handlings: {:?}",
+            "timed out waiting for 7 handlings: {:?}",
             handler.order.lock().unwrap()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4513,7 +4534,7 @@ async fn sequenced_foreign_retry_count_message_does_not_jump_the_held_retry() {
     let order = handler.order.lock().unwrap().clone();
     assert_eq!(
         order,
-        vec![1, 1, 99, 98, 97, 2],
+        vec![1, 96, 1, 99, 98, 97, 2],
         "held retry must precede later messages for its key"
     );
 
