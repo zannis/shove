@@ -324,6 +324,24 @@ struct PendingMessage {
     outcome_rx: oneshot::Receiver<Outcome>,
 }
 
+/// SQS's hard cap on messages per `ReceiveMessage`.
+const SQS_MAX_RECEIVE: usize = 10;
+
+/// How many messages the next poll may request: the configured batch, capped at
+/// the free handler slots and SQS's limit. `None` when no slot is free.
+fn receive_request_size(
+    receive_batch: usize,
+    in_flight: usize,
+    max_in_flight: usize,
+) -> Option<i32> {
+    let free = max_in_flight.saturating_sub(in_flight);
+    let n = receive_batch.min(free).min(SQS_MAX_RECEIVE);
+    if n == 0 {
+        return None;
+    }
+    i32::try_from(n).ok()
+}
+
 async fn consume_loop_concurrent<T, H>(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
@@ -343,11 +361,8 @@ where
     // Max number of handlers running concurrently (1 = serial / non-concurrent mode).
     let max_in_flight = options.prefetch_count as usize;
 
-    // How many messages to request per SQS poll. Defaults to SQS's hard cap
-    // (10) to amortise `ReceiveMessage` round-trips across as many messages
-    // as possible — critical in serial / low-prefetch mode where `max_in_flight`
-    // would otherwise pin the batch to 1 and bottleneck throughput on poll
-    // RTT. Users can override via `ConsumerOptions::with_receive_batch_size`.
+    // Upper bound on messages per SQS poll (default and hard cap: 10). Each
+    // poll is further capped at the free handler slots, see `receive_request_size`.
     let receive_batch: usize = {
         let configured = if options.receive_batch_size > 0 {
             options.receive_batch_size as usize
@@ -358,23 +373,22 @@ where
     };
 
     let mut in_flight: VecDeque<PendingMessage> = VecDeque::with_capacity(max_in_flight);
-    // Received from SQS but not yet dispatched to a handler.  Populated when
-    // the receive batch is larger than `max_in_flight`.
+    // Received from SQS and dispatched on the next iteration. Each poll requests
+    // at most the free handler slots, so nothing waits here across a handler run.
     let mut local_buffer: VecDeque<Message> = VecDeque::with_capacity(receive_batch);
 
     // Ack receipt handles accumulated across loop iterations.
     //
-    // Rather than flushing a DeleteMessageBatch after every drained handler
-    // (which would produce 1-item batches in serial / non-concurrent mode),
+    // Rather than flushing a DeleteMessageBatch after every drained handler,
     // we collect receipt handles here and only send the batch when:
     //   (a) we have a full batch of 10, or
     //   (b) we are about to call ReceiveMessage, or
-    //   (c) we are shutting down.
+    //   (c) we are about to wait for a handler to finish, or
+    //   (d) we are shutting down.
     //
-    // In concurrent mode (max_in_flight > 1) the drain loop typically fills
-    // the batch in a single iteration, so behaviour is unchanged.  In serial
-    // mode (max_in_flight = 1) this collapses N individual DeleteMessageBatch
-    // calls into a single call per receive batch, reducing API pressure by ~5×.
+    // A handled message is therefore deleted before the loop next blocks, never
+    // after another handler's full run. In serial mode that is one
+    // DeleteMessageBatch per message.
     let mut pending_acks: Vec<String> = Vec::with_capacity(10);
 
     info!(
@@ -458,9 +472,6 @@ where
                 }
             }
         }
-        // Do NOT flush pending_acks here — let them accumulate across
-        // iterations until the pre-poll flush or a full-batch flush above.
-
         options.processing.store(
             !in_flight.is_empty() || !local_buffer.is_empty(),
             Ordering::Release,
@@ -641,22 +652,21 @@ where
 
         // ── Poll SQS when the buffer needs refilling ──
         //
-        // Fetch a full batch whenever the buffer is empty AND we have handler
-        // slots available.  This keeps the pipeline full while preventing us
-        // from pulling messages we cannot process for a long time (which would
-        // exhaust SQS visibility timeouts).
-        if local_buffer.is_empty() && in_flight.len() < max_in_flight {
+        // Request only as many messages as there are free handler slots, so
+        // every received message is dispatched immediately instead of sitting
+        // invisible in the buffer until its visibility timeout expires.
+        let receive_size = if local_buffer.is_empty() {
+            receive_request_size(receive_batch, in_flight.len(), max_in_flight)
+        } else {
+            None
+        };
+        if let Some(max_messages) = receive_size {
             // Flush deferred acks before blocking on ReceiveMessage.
-            // In serial mode this is the point where all N messages from the
-            // previous receive batch have been processed — send their receipt
-            // handles in a single DeleteMessageBatch instead of N individual calls.
             if !pending_acks.is_empty() {
                 let batch_size = pending_acks.len();
                 debug!(queue_url, batch_size, "flushing ack batch before poll");
                 router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks)).await;
             }
-
-            let max_messages = receive_batch as i32;
 
             // Always use wait_time_seconds=0 (short poll, returns immediately).
             //
@@ -712,6 +722,11 @@ where
 
         // ── Wait for progress ──
         if in_flight.len() >= max_in_flight {
+            if !pending_acks.is_empty() {
+                let batch_size = pending_acks.len();
+                debug!(queue_url, batch_size, "flushing ack batch before waiting");
+                router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks)).await;
+            }
             // All handler slots occupied — wait for the next completion.
             notify.notified().await;
         }
@@ -2775,5 +2790,42 @@ mod external_refusal_tests {
         .expect("the refusal is synchronous")
         .expect_err("external() must be refused on the SQS DLQ drain");
         expect_external_refusal(err, "SqsConsumer::run_dlq");
+    }
+}
+
+#[cfg(test)]
+mod receive_request_size_tests {
+    use super::receive_request_size;
+
+    #[test]
+    fn no_free_slot_requests_nothing() {
+        assert_eq!(receive_request_size(10, 4, 4), None);
+        assert_eq!(receive_request_size(10, 1, 1), None);
+    }
+
+    #[test]
+    fn caps_at_free_slots() {
+        assert_eq!(receive_request_size(10, 0, 1), Some(1));
+        assert_eq!(receive_request_size(10, 1, 4), Some(3));
+        assert_eq!(receive_request_size(10, 0, 4), Some(4));
+    }
+
+    #[test]
+    fn caps_at_configured_batch() {
+        assert_eq!(receive_request_size(3, 0, 8), Some(3));
+    }
+
+    #[test]
+    fn caps_at_the_sqs_limit() {
+        assert_eq!(receive_request_size(10, 0, 50), Some(10));
+        assert_eq!(receive_request_size(25, 0, 50), Some(10));
+    }
+
+    #[test]
+    fn saturates_at_the_edges() {
+        assert_eq!(receive_request_size(10, 5, 4), None);
+        assert_eq!(receive_request_size(10, usize::MAX, 0), None);
+        assert_eq!(receive_request_size(usize::MAX, 0, usize::MAX), Some(10));
+        assert_eq!(receive_request_size(0, 0, 4), None);
     }
 }
