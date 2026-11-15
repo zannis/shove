@@ -2943,13 +2943,11 @@ const BATCH_LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Consecutive zero-message pull windows before a liveness probe.
 ///
-/// A dead connection ends a batch pull stream exactly like an idle topic
-/// does: async-nats 0.49.1 terminates the stream cleanly on its client-side
-/// backstop timer rather than yielding an error, and `idle_heartbeat` stays
-/// unset because that version's heartbeat arm returns `Pending` without
-/// registering a waker (a lost wakeup that stalls the stream). Without a
-/// probe, the loop would ride out an outage as an endless run of "idle"
-/// windows and `max_reconnect_attempts` could never fire. Once
+/// A dead connection can end a batch pull stream the same way an idle topic
+/// does, a clean end on the client-side backstop timer rather than an error,
+/// so the loop cannot tell a silent outage from genuine idleness by the stream
+/// alone. Without a probe it would ride out an outage as an endless run of
+/// "idle" windows and `max_reconnect_attempts` could never fire. Once
 /// [`BATCH_LIVENESS_INTERVAL`] of consecutive emptiness accumulates, one
 /// `consumer.info()` round trip either proves the server is reachable or
 /// converts the silent outage into a counted `Connection` error. Any received

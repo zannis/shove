@@ -281,7 +281,8 @@ fn is_same_copy(stored: &StoredMessage<'_>, sent: &SentCopy<'_>) -> bool {
 }
 
 /// `value` as a NATS header value, or a `Validation` error naming `header`
-/// when it holds a CR or LF, which the client's own conversion panics on.
+/// when it holds a CR or LF, so invalid header data is refused here rather
+/// than reaching the client.
 pub(super) fn header_value(header: &str, value: &str) -> Result<HeaderValue> {
     HeaderValue::from_str(value).map_err(|e| {
         ShoveError::Validation(format!("header {header:?} cannot carry this value: {e}"))
@@ -289,8 +290,8 @@ pub(super) fn header_value(header: &str, value: &str) -> Result<HeaderValue> {
 }
 
 /// `name` as a NATS header name, or a `Validation` error when it holds a
-/// colon, whitespace, a control or a non-ASCII character, which the client's
-/// own conversion panics on.
+/// colon, whitespace, a control or a non-ASCII character, so an invalid name
+/// is refused here rather than reaching the client.
 fn header_name(name: &str) -> Result<HeaderName> {
     HeaderName::from_str(name)
         .map_err(|e| ShoveError::Validation(format!("{name:?} cannot be a header name: {e}")))
