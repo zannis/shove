@@ -1,0 +1,25 @@
+docs/pages/backends/sqs.mdx
+  s_6511f1668e6a79::t_5a6839d1e5350f 128,130
+src/backends/sns/consumer.rs
+  s_6511f1668e6a79::t_4831134d12898f 142-144,150,152-159,161-175,177,1238,1406-1415,1427-1428,1740-1842,2429,2432,2461-2468,2676,3613-3773
+src/backends/sns/router.rs
+  s_6511f1668e6a79::t_0ca7ece6d9b1bc 172-174,177,181-198,200-201,205-207,210,216-222,227-241,245,249
+src/backends/sns/visibility.rs
+  s_6511f1668e6a79::t_2a1d44d9c51d5d 5,10-12,15-16,41-43,45-117,135-136,138-141,240,242-249,251-260,283,313-425
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5f63e0bf8391999b408ba8b0cdf860c0919e2648",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
