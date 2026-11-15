@@ -1,0 +1,33 @@
+tests/metrics_nats_unpublishable_copy.rs
+  s_6511f1668e6a79::t_ec8406ef89cd13 1-620
+src/backends/nats/consumer.rs
+  s_fb6193ec9cbee3::t_21f39e2d922e8f 54,492-493,506,508,519,527,640-656,756-758,764-765,778,798-799,804,815-824,860-863,908-917,953-960,982-989,1931-1937,1951-1957,1984-1993,2001-2009,2079-2082,2112,2121-2129,2994,3016,3029-3033,3044-3049,3052,3055-3064,3124-3126,3182,3372-3373,3397-3398,3411-3412,3420-3426,3430
+src/backends/nats/publisher.rs
+  s_fb6193ec9cbee3::t_1660e67afe5a86 8-9,65-69,80,85-88,91,96-107,166-168,185-187,207-212,850-901
+src/metrics.rs
+  s_fb6193ec9cbee3::t_b768e58090b96e 461-465
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "534905f163bc2b935fb47b72aeaab0ab9db4ceda",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_fb6193ec9cbee3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e3eebef2-5a7e-4966-bd4b-7fe8758d3dac",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
