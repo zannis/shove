@@ -62,6 +62,12 @@ pub struct NatsConfig {
     /// the INFO message, so the client may fail over to servers the cluster
     /// advertises. On `wss://` the client has no handshake-first mode, so the
     /// setting changes nothing and advertised servers stay ignored.
+    ///
+    /// With `tls_first` the advertised list is trustworthy as to who sent it,
+    /// and the client then connects to whatever that list contains. The cluster
+    /// must not advertise plaintext websocket (`ws://`) addresses to clients
+    /// that require TLS, because the client applies neither the TLS upgrade nor
+    /// the handshake-first step to websocket addresses.
     pub tls_first: bool,
 }
 
