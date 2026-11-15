@@ -2158,8 +2158,10 @@ impl RabbitMqConsumer {
 /// Fallback for the reconnect backoff's impossible-`None` — `Backoff`'s
 /// iterator never ends, so this only exists to keep the reconnect arm free of
 /// panics; it mirrors `Backoff::default()`'s ceiling.
+const RECONNECT_BACKOFF_FALLBACK: Duration = Duration::from_secs(30);
+
 /// `tokio::time::interval` panics on a zero period, so the period is floored.
-const MIN_EVICTION_PERIOD: Duration = Duration::from_millis(1);
+const MIN_EVICTION_PERIOD: Duration = Duration::from_nanos(1);
 
 fn eviction_period(hold_queue_timeout: Option<Duration>) -> Duration {
     hold_queue_timeout
@@ -2167,8 +2169,6 @@ fn eviction_period(hold_queue_timeout: Option<Duration>) -> Duration {
         .unwrap_or(Duration::from_secs(86400))
         .max(MIN_EVICTION_PERIOD)
 }
-
-const RECONNECT_BACKOFF_FALLBACK: Duration = Duration::from_secs(30);
 
 /// The flush threshold (and channel prefetch) actually used for a configured
 /// `max_batch_size`: at least 1, at most `u16::MAX` — AMQP's `basic.qos`
@@ -2722,6 +2722,14 @@ mod eviction_period_tests {
         ] {
             assert_eq!(eviction_period(Some(t)), MIN_EVICTION_PERIOD);
         }
+    }
+
+    #[test]
+    fn halves_a_short_timeout() {
+        assert_eq!(
+            eviction_period(Some(Duration::from_millis(1))),
+            Duration::from_micros(500)
+        );
     }
 
     #[test]
