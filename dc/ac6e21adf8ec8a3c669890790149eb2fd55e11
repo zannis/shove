@@ -1,0 +1,31 @@
+src/backends/sns/consumer.rs
+  s_6511f1668e6a79::t_b3587149ef8b2e 111,164,615,1250,1486,1566,1683,2358
+src/backends/sns/router.rs
+  s_6511f1668e6a79::t_c99f189468e1d4 575-578,587-593,729-761
+tests/sns_sqs_integration.rs
+  s_fb6193ec9cbee3::t_0488b4f90c52a1 23,3216-3339
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "dcac6e21adf8ec8a3c669890790149eb2fd55e11",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_fb6193ec9cbee3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e3eebef2-5a7e-4966-bd4b-7fe8758d3dac",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
