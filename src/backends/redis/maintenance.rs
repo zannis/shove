@@ -1,4 +1,5 @@
-//! Process-wide registry of per-`(client, stream, group)` maintenance tasks.
+//! Process-wide registry of per-`(client, stream, group)` maintenance tasks,
+//! plus the per-`(client, hold sets)` hold-queue requeuer.
 //!
 //! Every Redis consumer loop — registry-managed or direct — calls
 //! [`acquire`] for the stream it consumes. The first acquisition for a
@@ -9,6 +10,13 @@
 //! removed. This keeps maintenance at exactly one task per key no matter how
 //! many consumers a group scales to — the N-redundant-sweepers pathology the
 //! reaper consolidation removed must not come back through this door.
+//!
+//! The hold-queue requeuer ([`acquire_requeuer`]) shares the same refcount and
+//! guard lifecycle. It is keyed by the client and the set of hold-queue names
+//! it polls (the requeuer's whole input), so every consumer of one topic joins
+//! one requeuer while the shards of a FIFO topic, which poll different hold
+//! sets, get one each. It carries no reclaim policy, so joining or leaving
+//! never respawns it.
 //!
 //! ## Mixed handler-timeout policies
 //!
@@ -61,9 +69,17 @@ use tokio_util::sync::CancellationToken;
 
 use super::client::RedisClient;
 use super::reaper::spawn_maintenance;
+use super::requeue::spawn_requeuer;
 use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
 
-type Key = (usize, String, String);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Kind {
+    Reaper,
+    Requeuer,
+}
+
+/// `(client, kind, stream or joined hold-queue names, group)`.
+type Key = (usize, Kind, String, String);
 
 /// One consumer's reclaim policy: its handler timeout, or `None` for
 /// consumers that may hold in-flight work indefinitely.
@@ -224,6 +240,7 @@ pub(super) fn acquire(
 ) -> MaintenanceGuard {
     let key = (
         client.instance_id(),
+        Kind::Reaper,
         stream.to_owned(),
         client.group().to_owned(),
     );
@@ -246,6 +263,27 @@ pub(super) fn acquire(
         reclaim_policy(handler_timeout, resolves_own_timeout),
         spawner,
     )
+}
+
+/// Ensure one requeuer polls `hold_queue_names` for this client and return a
+/// guard expressing this consumer's interest in it. The last guard to drop
+/// cancels the requeuer.
+pub(super) fn acquire_requeuer(
+    client: &RedisClient,
+    hold_queue_names: &[String],
+) -> MaintenanceGuard {
+    let key = (
+        client.instance_id(),
+        Kind::Requeuer,
+        hold_queue_names.join("\n"),
+        client.group().to_owned(),
+    );
+    let client = client.clone();
+    let names = hold_queue_names.to_vec();
+    let spawner: Spawner = Arc::new(move |shutdown, _| {
+        spawn_requeuer(client.clone(), names.clone(), shutdown);
+    });
+    acquire_with(key, None, spawner)
 }
 
 /// Core refcount + effective-policy logic, generic over the spawner so the
@@ -284,7 +322,12 @@ mod tests {
     fn key(n: usize) -> Key {
         // Distinct high client-ids so tests can't collide with each other or
         // with real acquisitions in the shared process-wide registry.
-        (usize::MAX - n, format!("stream-{n}"), format!("group-{n}"))
+        (
+            usize::MAX - n,
+            Kind::Reaper,
+            format!("stream-{n}"),
+            format!("group-{n}"),
+        )
     }
 
     #[test]
@@ -361,6 +404,27 @@ mod tests {
         // `without_handler_timeout()` disables reclaim; a timeout outcome is
         // unreachable in that configuration and must not resurrect it.
         assert_eq!(reclaim_policy(None, true), None);
+    }
+
+    #[test]
+    fn requeuer_and_reaper_keys_do_not_collide() {
+        let (log, spawner) = recorder();
+        let reaper = key(7);
+        let mut requeuer = key(7);
+        requeuer.1 = Kind::Requeuer;
+        let g1 = acquire_with(reaper, None, spawner.clone());
+        let g2 = acquire_with(requeuer.clone(), None, spawner.clone());
+        let g3 = acquire_with(requeuer, None, spawner);
+        assert_eq!(
+            log.lock().unwrap().len(),
+            2,
+            "one task per kind, joined by later guards"
+        );
+        drop(g1);
+        drop(g2);
+        assert!(!log.lock().unwrap()[1].0.is_cancelled());
+        drop(g3);
+        assert!(log.lock().unwrap()[1].0.is_cancelled());
     }
 
     use std::sync::Mutex as StdMutex;

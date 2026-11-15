@@ -8,13 +8,23 @@
 //! This task polls each hold set every `POLL_INTERVAL`, moves all entries
 //! whose score ≤ now_ms back to the appropriate stream via XADD, and removes
 //! them from the set only after successful XADD (at-least-once delivery).
+//! A poll that returns a full batch of `REQUEUE_BATCH_SIZE` entries is
+//! followed by another poll straight away, so a backlog drains without
+//! waiting out the interval.
 //!
 //! ## Concurrent requeuer instances
 //!
-//! This module provides **at-least-once** redelivery semantics. If two requeuer
-//! instances run concurrently (e.g., during a rolling restart), both may XADD
-//! the same entry before either ZREM completes, resulting in duplicate delivery.
-//! This is expected behaviour: consumers must be idempotent, which is already
+//! Within one process there is a single requeuer per client and set of hold
+//! sets. Consumers obtain it through
+//! [`super::maintenance::acquire_requeuer`], which starts it for the first
+//! consumer of a topic and cancels it when the last one releases its guard, so
+//! N workers on one topic never race each other over the same due entry.
+//!
+//! Across processes (or independently connected clients) each side runs its
+//! own requeuer. If two of them run concurrently (e.g., during a rolling
+//! restart), both may XADD the same entry before either ZREM completes,
+//! resulting in duplicate delivery. This module provides **at-least-once**
+//! redelivery semantics there: consumers must be idempotent, which is already
 //! required by the broader shove at-least-once contract.
 
 use serde::{Deserialize, Serialize};
@@ -93,8 +103,10 @@ pub(crate) async fn enqueue_hold(
 /// token is cancelled, preventing silent abandonment of hold-queue messages.
 /// The task runs until `shutdown` is cancelled.
 ///
-/// **At-least-once semantics:** see module-level documentation for the
-/// concurrent-instance duplicate-delivery note.
+/// Callers go through [`super::maintenance::acquire_requeuer`] so that one
+/// requeuer serves every consumer in the process. **At-least-once
+/// semantics:** see the module-level documentation for the cross-process
+/// duplicate-delivery note.
 pub(crate) fn spawn_requeuer(
     client: RedisClient,
     hold_queue_names: Vec<String>,
@@ -114,11 +126,15 @@ pub(crate) fn spawn_requeuer(
 
         loop {
             let mut needs_reconnect = false;
+            let mut backlog = false;
             for (hold_queue_name, set_key) in hold_queue_names.iter().zip(hold_set_keys.iter()) {
-                if let Err(e) = poll_hold_set(&mut conn, hold_queue_name, set_key).await {
-                    tracing::warn!("requeuer: poll failed for {}: {}", hold_queue_name, e);
-                    needs_reconnect = true;
-                    break;
+                match poll_hold_set(&mut conn, hold_queue_name, set_key).await {
+                    Ok(full) => backlog |= full,
+                    Err(e) => {
+                        tracing::warn!("requeuer: poll failed for {}: {}", hold_queue_name, e);
+                        needs_reconnect = true;
+                        break;
+                    }
                 }
             }
 
@@ -130,6 +146,13 @@ pub(crate) fn spawn_requeuer(
                     }
                     None => break,
                 }
+            }
+
+            if backlog {
+                if shutdown.is_cancelled() {
+                    break;
+                }
+                continue;
             }
 
             tokio::select! {
@@ -161,11 +184,15 @@ fn now_ms() -> u64 {
 /// XADDs each to its origin stream, and removes it from the hold set only on
 /// success. Corrupt entries (JSON parse failures) are removed from the set to
 /// avoid perpetual re-fetch and logged as warnings.
+///
+/// Returns `true` when a full batch came back and every entry in it was
+/// requeued, meaning more due entries may be waiting. A batch with a failed
+/// XADD or ZREM reports `false` so a failing broker is not hammered.
 async fn poll_hold_set(
     conn: &mut RedisConnection,
     hold_queue_name: &str,
     set_key: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let now = now_ms();
 
     let entries: Vec<String> = match conn
@@ -195,6 +222,9 @@ async fn poll_hold_set(
             )));
         }
     };
+
+    let full_batch = i64::try_from(entries.len()).map_or(true, |n| n >= REQUEUE_BATCH_SIZE);
+    let mut all_requeued = true;
 
     for raw_json in entries {
         let entry: HoldEntry = match serde_json::from_str(&raw_json) {
@@ -231,15 +261,17 @@ async fn poll_hold_set(
                         e
                     );
                     record_backend_error(BackendLabel::Redis, BackendErrorKind::Ack);
+                    all_requeued = false;
                 }
             }
             Err(e) => {
                 tracing::warn!("requeuer: XADD failed for stream {}: {}", entry.stream, e);
+                all_requeued = false;
             }
         }
     }
 
-    Ok(())
+    Ok(full_batch && all_requeued)
 }
 
 // ---------------------------------------------------------------------------

@@ -5906,3 +5906,306 @@ async fn consuming_an_external_topology_is_refused_at_every_entry_point() {
     );
     assert_eq!(hits.load(Ordering::SeqCst), 0, "no handler ran");
 }
+
+// ---------------------------------------------------------------------------
+// One requeuer per topic per client: N workers must not duplicate redeliveries
+// ---------------------------------------------------------------------------
+
+struct SharedRequeuerTopic;
+impl Topic for SharedRequeuerTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-shared-requeuer")
+                .hold_queue(Duration::from_millis(100))
+                .dlq()
+                .build()
+        })
+    }
+}
+
+#[derive(Clone)]
+struct RetryOnceHandler(Arc<Mutex<std::collections::HashMap<u64, u32>>>);
+
+impl<T: Topic<Message = Order>> MessageHandler<T> for RetryOnceHandler {
+    type Context = ();
+    async fn handle(&self, msg: Order, meta: MessageMetadata, _: &()) -> Outcome {
+        if meta.retry_count == 0 {
+            return Outcome::Retry;
+        }
+        if let Ok(mut redeliveries) = self.0.lock() {
+            *redeliveries.entry(msg.id).or_default() += 1;
+        }
+        Outcome::Ack
+    }
+}
+
+#[tokio::test]
+async fn consumer_group_redelivers_each_retry_exactly_once() {
+    const MESSAGES: u64 = 300;
+    let broker = make_broker("redis-int-shared-requeuer-grp").await;
+    broker
+        .topology()
+        .declare::<SharedRequeuerTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    for id in 0..MESSAGES {
+        publisher
+            .publish::<SharedRequeuerTopic>(&Order { id })
+            .await
+            .expect("publish");
+    }
+
+    let redeliveries = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let factory_state = redeliveries.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<SharedRequeuerTopic, _>(
+            ConsumerGroupConfig::new(RedisConsumerGroupConfig::new(6..=6).with_max_retries(5)),
+            move || RetryOnceHandler(factory_state.clone()),
+        )
+        .await
+        .expect("register");
+
+    let probe = redeliveries.clone();
+    let signal = async move {
+        poll_until(
+            move || {
+                probe
+                    .lock()
+                    .map(|m| m.len() as u64 >= MESSAGES)
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(30),
+        )
+        .await;
+        // Duplicates land within the same poll tick; give them time to show.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    };
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(5))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    let redeliveries = redeliveries.lock().expect("lock");
+    assert_eq!(redeliveries.len() as u64, MESSAGES, "every message returns");
+    let duplicated: Vec<_> = redeliveries.iter().filter(|(_, n)| **n != 1).collect();
+    assert!(
+        duplicated.is_empty(),
+        "{} messages were redelivered more than once, e.g. {:?}",
+        duplicated.len(),
+        duplicated.iter().take(5).collect::<Vec<_>>()
+    );
+    assert_eq!(redeliveries.values().sum::<u32>() as u64, MESSAGES);
+}
+
+fn hold_set_key<T: Topic>() -> String {
+    format!("{}:pending", T::topology().hold_queues()[0].name())
+}
+
+struct RequeuerLifetimeTopic;
+impl Topic for RequeuerLifetimeTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-requeuer-lifetime")
+                .hold_queue(Duration::from_millis(1500))
+                .dlq()
+                .build()
+        })
+    }
+}
+
+/// A consumer parked-then-left test rig: the first consumer retries and is
+/// shut down; the second keeps the shared requeuer alive.
+#[tokio::test]
+async fn shared_requeuer_survives_one_consumer_and_stops_with_the_last() {
+    let broker = make_broker("redis-int-requeuer-lifetime").await;
+    broker
+        .topology()
+        .declare::<RequeuerLifetimeTopic>()
+        .await
+        .expect("declare");
+    let publisher = broker.publisher().await.expect("publisher");
+
+    let redeliveries = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let register = |broker: &Broker<Redis>| {
+        let mut supervisor = broker.consumer_supervisor();
+        supervisor
+            .register::<RequeuerLifetimeTopic, _>(
+                RetryOnceHandler(redeliveries.clone()),
+                ConsumerOptions::<Redis>::new().with_max_retries(5),
+            )
+            .expect("register");
+        supervisor
+    };
+    let first = register(&broker);
+    let second = register(&broker);
+    let first_token = first.cancellation_token();
+    let second_token = second.cancellation_token();
+    let first_run = tokio::spawn(async move {
+        first
+            .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(5))
+            .await
+    });
+    let second_run = tokio::spawn(async move {
+        second
+            .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(5))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // One consumer leaves; the survivor must still get its retry back.
+    first_token.cancel();
+    assert!(first_run.await.expect("join").is_clean());
+    publisher
+        .publish::<RequeuerLifetimeTopic>(&Order { id: 1 })
+        .await
+        .expect("publish");
+    let probe = redeliveries.clone();
+    let returned = poll_until(
+        move || probe.lock().map(|m| m.contains_key(&1)).unwrap_or(false),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(returned, "retry parked after one consumer left was lost");
+
+    // The last consumer parks a retry and leaves before it is due; nothing
+    // may requeue it afterwards.
+    publisher
+        .publish::<RequeuerLifetimeTopic>(&Order { id: 2 })
+        .await
+        .expect("publish");
+    let mut raw = redis::Client::open(redis_url().await)
+        .expect("raw client")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw conn");
+    let hold_key = hold_set_key::<RequeuerLifetimeTopic>();
+    let parked = async {
+        for _ in 0..200 {
+            let n: i64 = redis::cmd("ZCARD")
+                .arg(&hold_key)
+                .query_async(&mut raw)
+                .await
+                .unwrap_or(0);
+            if n >= 1 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+    .await;
+    assert!(parked, "retry was never parked");
+    second_token.cancel();
+    assert!(second_run.await.expect("join").is_clean());
+
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    let still_parked: i64 = redis::cmd("ZCARD")
+        .arg(&hold_key)
+        .query_async(&mut raw)
+        .await
+        .expect("ZCARD");
+    assert_eq!(
+        still_parked, 1,
+        "a requeuer kept running after the last consumer shut down"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A backlog larger than one batch drains without waiting out the poll interval
+// ---------------------------------------------------------------------------
+
+struct BacklogTopic;
+impl Topic for BacklogTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-requeue-backlog")
+                .hold_queue(Duration::from_millis(100))
+                .dlq()
+                .build()
+        })
+    }
+}
+
+#[tokio::test]
+async fn requeuer_drains_a_backlog_without_waiting_between_full_batches() {
+    // 4000 entries are 20 full batches; one batch per 500 ms tick needs 9.5 s.
+    const ENTRIES: u64 = 4000;
+    let broker = make_broker("redis-int-requeue-backlog").await;
+    broker
+        .topology()
+        .declare::<BacklogTopic>()
+        .await
+        .expect("declare");
+
+    let stream = BacklogTopic::topology().queue().to_owned();
+    let hold_key = hold_set_key::<BacklogTopic>();
+    let mut raw = redis::Client::open(redis_url().await)
+        .expect("raw client")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw conn");
+    let mut pipe = redis::pipe();
+    for id in 0..ENTRIES {
+        let entry = format!(
+            r#"{{"stream":"{stream}","fields":[["payload","{{\"id\":{id}}}"]],"entry_id":"{id}-0"}}"#
+        );
+        pipe.cmd("ZADD").arg(&hold_key).arg(0).arg(entry).ignore();
+    }
+    pipe.query_async::<()>(&mut raw)
+        .await
+        .expect("seed hold set");
+
+    struct Idle;
+    impl MessageHandler<BacklogTopic> for Idle {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<BacklogTopic, _>(Idle, ConsumerOptions::<Redis>::new())
+        .expect("register");
+
+    let started = Instant::now();
+    let signal = async move {
+        loop {
+            let left: i64 = redis::cmd("ZCARD")
+                .arg(&hold_key)
+                .query_async(&mut raw)
+                .await
+                .unwrap_or(i64::MAX);
+            if left == 0 || started.elapsed() > Duration::from_secs(30) {
+                return started.elapsed();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let outcome = supervisor
+        .run_until_timeout(
+            async move {
+                let _ = tx.send(signal.await);
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    let elapsed = rx.await.expect("drain time");
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "draining {ENTRIES} entries took {elapsed:?}; full batches must not wait out the poll interval"
+    );
+}
