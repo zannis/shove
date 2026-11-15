@@ -43,6 +43,14 @@ define_topic!(
         .build()
 );
 
+const WORK_STREAM: &str = "redis-bcast-trim-work";
+
+define_topic!(
+    WorkItems,
+    Invalidate,
+    TopologyBuilder::new("redis-bcast-trim-work").build()
+);
+
 /// `(partition, offset, timestamp_ms)` for one delivery.
 type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
 
@@ -105,6 +113,25 @@ impl MessageHandler<CacheInvalidations> for Recorder {
     }
 }
 
+/// Parks inside the first delivery until released, then records like
+/// [`Recorder`].
+struct Stalled {
+    inner: Recorder,
+    gate: Arc<tokio::sync::Notify>,
+}
+
+impl MessageHandler<CacheInvalidations> for Stalled {
+    type Context = ();
+    async fn handle(&self, msg: Invalidate, meta: MessageMetadata, ctx: &()) -> Outcome {
+        if msg.key == WARMUP_KEY && !self.inner.saw_warmup() {
+            self.inner.seen.lock().expect("seen lock").push(msg.key);
+            self.gate.notified().await;
+            return Outcome::Ack;
+        }
+        self.inner.handle(msg, meta, ctx).await
+    }
+}
+
 /// Reserved key used only to detect that a subscriber's `XREAD` is live.
 const WARMUP_KEY: u64 = 0;
 
@@ -136,10 +163,14 @@ impl TestBroker {
     }
 
     async fn broker(&self) -> Broker<Redis> {
+        self.broker_with(|config| config).await
+    }
+
+    async fn broker_with(&self, configure: impl Fn(RedisConfig) -> RedisConfig) -> Broker<Redis> {
         for _ in 0..60 {
-            let config = RedisConfig::new(RedisMode::Standalone {
+            let config = configure(RedisConfig::new(RedisMode::Standalone {
                 url: self.url.clone(),
-            });
+            }));
             if let Ok(b) = Broker::<Redis>::new(config).await {
                 return b;
             }
@@ -160,6 +191,15 @@ impl TestBroker {
     ///
     /// `XINFO GROUPS` errors when the key does not exist, which is itself a
     /// pass — no stream means no group — so that case maps to empty.
+    async fn stream_len(&self, stream: &str) -> u64 {
+        let mut conn = self.raw().await;
+        redis::cmd("XLEN")
+            .arg(stream)
+            .query_async::<u64>(&mut conn)
+            .await
+            .expect("XLEN")
+    }
+
     async fn groups(&self) -> Vec<redis::Value> {
         let mut conn = self.raw().await;
         redis::cmd("XINFO")
@@ -556,5 +596,146 @@ async fn a_subscription_survives_a_redis_restart() {
     assert!(
         tb.groups().await.is_empty(),
         "reconnecting must not have created an XGROUP"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stream length cap
+// ---------------------------------------------------------------------------
+
+const TRIM_CAP: u64 = 100;
+const TRIM_PUBLISHED: u64 = 1_000;
+/// `MAXLEN ~` trims whole radix-tree nodes, which hold at most this many
+/// entries under the server's default `stream-node-max-entries`.
+const STREAM_NODE_MAX_ENTRIES: u64 = 100;
+
+fn trim_corpus() -> Vec<Invalidate> {
+    (1..=TRIM_PUBLISHED).map(|key| Invalidate { key }).collect()
+}
+
+/// Nothing reads a broadcast stream away, so the publisher's `MAXLEN ~` is the
+/// only bound it has. A work stream on the same client carries undelivered
+/// messages and must keep every one of them.
+#[tokio::test]
+async fn a_broadcast_stream_is_capped_and_a_work_stream_is_not() {
+    let tb = TestBroker::start().await;
+    let broker = tb
+        .broker_with(|config| {
+            config
+                .with_broadcast_max_len(TRIM_CAP)
+                .expect("a positive cap is valid")
+        })
+        .await;
+    let publisher = broker.publisher().await.expect("publisher");
+    let corpus = trim_corpus();
+
+    publisher
+        .publish_batch::<CacheInvalidations>(&corpus)
+        .await
+        .expect("publish broadcast batch");
+    publisher
+        .publish_batch::<WorkItems>(&corpus)
+        .await
+        .expect("publish work batch");
+    // The single-message path builds its own XADD call site.
+    publisher
+        .publish::<CacheInvalidations>(&Invalidate { key: 1 })
+        .await
+        .expect("publish broadcast");
+    publisher
+        .publish::<WorkItems>(&Invalidate { key: 1 })
+        .await
+        .expect("publish work");
+
+    let broadcast_len = tb.stream_len(STREAM).await;
+    assert!(
+        (TRIM_CAP..=TRIM_CAP + STREAM_NODE_MAX_ENTRIES).contains(&broadcast_len),
+        "broadcast stream holds {broadcast_len} entries under a cap of {TRIM_CAP}"
+    );
+    assert_eq!(
+        tb.stream_len(WORK_STREAM).await,
+        TRIM_PUBLISHED + 1,
+        "a work stream lost entries to the broadcast cap"
+    );
+}
+
+#[tokio::test]
+async fn a_broadcast_stream_is_not_capped_once_trimming_is_disabled() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker_with(RedisConfig::without_broadcast_trim).await;
+    let publisher = broker.publisher().await.expect("publisher");
+
+    publisher
+        .publish_batch::<CacheInvalidations>(&trim_corpus())
+        .await
+        .expect("publish broadcast batch");
+
+    assert_eq!(tb.stream_len(STREAM).await, TRIM_PUBLISHED);
+}
+
+/// A subscriber whose read position has been trimmed away gets no error from
+/// Redis: it resumes at the oldest entry still in the stream.
+#[tokio::test]
+async fn a_subscriber_left_behind_by_the_cap_resumes_at_the_oldest_retained_entry() {
+    let tb = TestBroker::start().await;
+    let broker = tb
+        .broker_with(|config| {
+            config
+                .with_broadcast_max_len(TRIM_CAP)
+                .expect("a positive cap is valid")
+        })
+        .await;
+    let publisher = broker.publisher().await.expect("publisher");
+
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let stalled = Stalled {
+        inner: Recorder::new(),
+        gate: Arc::clone(&gate),
+    };
+    let recorder = stalled.inner.clone();
+
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<CacheInvalidations, _>(stalled, ConsumerOptions::new())
+        .expect("subscribe");
+
+    // The handler parks on the first probe it is handed, pinning the cursor
+    // while the corpus is published past it.
+    warm_up(&publisher, &[&recorder]).await;
+    publisher
+        .publish_batch::<CacheInvalidations>(&trim_corpus())
+        .await
+        .expect("publish broadcast batch");
+    gate.notify_one();
+
+    for _ in 0..100 {
+        if recorder.keys().last() == Some(&TRIM_PUBLISHED) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let keys = recorder.keys();
+    assert_eq!(
+        keys.last(),
+        Some(&TRIM_PUBLISHED),
+        "the tail was never reached"
+    );
+    assert!(
+        keys.len() as u64 <= TRIM_CAP + STREAM_NODE_MAX_ENTRIES,
+        "{} entries delivered from a stream capped at {TRIM_CAP}",
+        keys.len()
+    );
+    assert!(
+        keys.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "the retained suffix was not delivered contiguously"
+    );
+
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(10))
+        .await;
+    assert!(
+        outcome.is_clean(),
+        "subscriber drained cleanly: {outcome:?}"
     );
 }

@@ -28,7 +28,7 @@
 //! skip an outage window. Whether messages published during the outage are
 //! actually still there to resume onto is the operator's call, not this
 //! module's — they have to have survived both Redis persistence and the
-//! stream's `MAXLEN` bound. What the cursor guarantees is that this loop does
+//! publisher's `MAXLEN` cap. What the cursor guarantees is that this loop does
 //! not skip past them of its own accord, which is more than NATS can offer:
 //! its ephemeral consumer cannot resume where a previous one stopped, so a NATS
 //! reconnect always restarts at `New`.
@@ -36,12 +36,20 @@
 //! # The stream is not trimmed by reading it
 //!
 //! `XREAD` never acknowledges and never trims, so nothing about a broadcast
-//! subscriber makes the stream shrink. The stream must be `MAXLEN`-bounded by
-//! whoever declares or publishes to it; this is the caveat the docs page
-//! already states, and it is the one real asymmetry with NATS, whose `Interest`
-//! retention drops delivered messages on its own.
+//! subscriber makes the stream shrink, and with no consumer group there is no
+//! acknowledged prefix for the maintenance sweep to trim either. The bound
+//! comes from the publisher: every broadcast `XADD` carries `MAXLEN ~ N`, with
+//! `N` set by [`RedisConfig::with_broadcast_max_len`]. This is the one real
+//! asymmetry with NATS, whose `Interest` retention drops delivered messages on
+//! its own.
+//!
+//! A cursor that the cap has trimmed past is not an error to Redis. `XREAD`
+//! returns the entries after the id it is given, so the loop resumes at the
+//! oldest entry still in the stream and the trimmed ones are skipped without a
+//! signal.
 //!
 //! [`BroadcastImpl`]: crate::backend::BroadcastImpl
+//! [`RedisConfig::with_broadcast_max_len`]: super::client::RedisConfig::with_broadcast_max_len
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

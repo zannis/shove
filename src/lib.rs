@@ -489,9 +489,10 @@ pub mod redis {
     pub use crate::markers::Redis;
 
     pub use crate::backends::redis::{
-        RedisAutoscalerBackend, RedisClient, RedisConfig, RedisConsumer, RedisConsumerGroup,
-        RedisConsumerGroupConfig, RedisConsumerGroupRegistry, RedisMode, RedisPublisher,
-        RedisQueueStats, RedisQueueStatsProvider, RedisTopologyDeclarer, XlenStatsProvider,
+        DEFAULT_BROADCAST_MAX_LEN, RedisAutoscalerBackend, RedisClient, RedisConfig, RedisConsumer,
+        RedisConsumerGroup, RedisConsumerGroupConfig, RedisConsumerGroupRegistry, RedisMode,
+        RedisPublisher, RedisQueueStats, RedisQueueStatsProvider, RedisTopologyDeclarer,
+        XlenStatsProvider,
     };
 
     /// Test-only escape hatches. `#[doc(hidden)]` so they don't appear in

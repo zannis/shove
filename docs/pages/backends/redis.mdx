@@ -37,7 +37,7 @@ let broker = Broker::<Redis>::new(RedisConfig {
 
 `group` sets the consumer group name shared by all consumers. Defaults to `"shove"` if `None`.
 
-`RedisConfig` exposes three builder methods on top of the struct fields:
+`RedisConfig` exposes builder methods on top of the struct fields:
 
 ```rust,no_run
 use shove::redis::{RedisConfig, RedisMode};
@@ -48,7 +48,8 @@ let config = RedisConfig::new(RedisMode::Standalone {
 })
 .with_group("billing")                                // overrides the default "shove" group name
 .with_connection_timeout(Duration::from_secs(10))     // TCP connect deadline; default 10s
-.with_response_timeout(Duration::from_secs(30));      // per-command deadline; default 30s
+.with_response_timeout(Duration::from_secs(30))       // per-command deadline; default 30s
+.with_broadcast_max_len(10_000)?;                     // cap on broadcast streams; default 10,000 entries
 ```
 
 `response_timeout` must be longer than the consumer's `XREADGROUP BLOCK` window (the consumer derives this from `prefetch_count` and the polling interval) — otherwise the client cancels the long-poll mid-block and treats the resulting timeout as a connection error. The defaults are sized to leave headroom.
@@ -126,6 +127,7 @@ Three behaviours worth knowing:
 
 - **Trimming waits for the slowest reader.** If several consumer groups share a stream (fan-out via distinct `with_group` names), entries survive until every group has acknowledged them. A group that has not consumed anything yet blocks trimming entirely.
 - **Trimming runs on a sweep, not on ack.** `XACK` clears the pending entry; the entry itself leaves the stream at the next sweep, which runs every handler timeout floored at 30 s. At a high publish rate that is up to 30 s of consumed traffic resident in memory. `RedisConfig::with_trim_interval(Duration)` sets the sweep cadence directly (the reclaim deadline stays on the handler timeout); each sweep is `XINFO GROUPS`, one `XPENDING` per group and one `XTRIM`, so a sub-second interval trades round trips for memory.
+- **Broadcast streams are capped by length.** A [broadcast](/concepts/broadcast#redis-bound-the-stream) stream has no consumer group to trim behind, so each broadcast publish is sent as `XADD ... MAXLEN ~ N`. `N` is `RedisConfig::with_broadcast_max_len`, 10,000 entries by default, and `RedisConfig::without_broadcast_trim()` removes the cap. A subscriber more than `N` entries behind skips the trimmed entries without an error. No other stream is trimmed by length.
 - **DLQ streams are never trimmed or reclaimed.** Dead letters are an audit record and stay put until you handle them.
 - **Disabling the handler timeout also disables reclaim.** `ConsumerOptions::without_handler_timeout()` means in-flight work is never presumed dead; trimming still runs. Configure the same timeout for every consumer of a stream and group, including consumers in other processes — a process with a shorter timeout reclaims entries held by longer-running consumers elsewhere.
 

@@ -2,6 +2,7 @@
 //! the correct stream, with shove metadata as additional stream entry fields.
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -43,6 +44,12 @@ pub fn shard_for_key(key: &str, routing_shards: u16) -> u16 {
 /// publish dials a fresh one; the error itself still propagates to the
 /// caller unchanged. A publish refused before anything is sent, because a
 /// header names a field the entry carries as its own, leaves it in place.
+///
+/// A publish to a [`broadcast`](crate::topology::TopologyBuilder::broadcast)
+/// topology carries `MAXLEN ~ N`, with `N` from
+/// [`RedisConfig::with_broadcast_max_len`](super::client::RedisConfig::with_broadcast_max_len),
+/// because nothing else trims a stream that has no consumer group. Every other
+/// publish is sent without a cap.
 #[derive(Clone)]
 pub struct RedisPublisher {
     client: RedisClient,
@@ -135,8 +142,25 @@ impl RedisPublisher {
             (topology.queue().to_owned(), None)
         };
 
+        // Only a broadcast stream: a cap on a work stream drops undelivered entries.
+        let max_len = if topology.broadcast() {
+            self.client.broadcast_max_len()
+        } else {
+            None
+        };
+
         match conn {
-            Some(c) => xadd_on_conn(c, &stream, &payload, &headers, sequence_key.as_deref()).await,
+            Some(c) => {
+                xadd_on_conn(
+                    c,
+                    &stream,
+                    max_len,
+                    &payload,
+                    &headers,
+                    sequence_key.as_deref(),
+                )
+                .await
+            }
             None => {
                 let mut owned = self
                     .cached_conn()
@@ -145,6 +169,7 @@ impl RedisPublisher {
                 let result = xadd_on_conn(
                     &mut owned,
                     &stream,
+                    max_len,
                     &payload,
                     &headers,
                     sequence_key.as_deref(),
@@ -268,6 +293,7 @@ impl PublisherImpl for RedisPublisher {
 async fn xadd_on_conn(
     conn: &mut RedisConnection,
     stream: &str,
+    max_len: Option<NonZeroU64>,
     payload: &str,
     headers: &HashMap<String, String>,
     sequence_key: Option<&str>,
@@ -281,7 +307,11 @@ async fn xadd_on_conn(
         )));
     }
     let mut cmd = redis::cmd("XADD");
-    cmd.arg(stream).arg("*");
+    cmd.arg(stream);
+    if let Some(max_len) = max_len {
+        cmd.arg("MAXLEN").arg("~").arg(max_len.get());
+    }
+    cmd.arg("*");
     cmd.arg(PAYLOAD_FIELD).arg(payload);
     for (k, v) in headers {
         cmd.arg(k).arg(v);
