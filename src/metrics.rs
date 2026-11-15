@@ -132,18 +132,6 @@ pub(crate) fn outcome_label(o: &Outcome) -> &'static str {
 /// `// Cascade: intentionally not counted` comment pointing back here, so the
 /// backends do not drift apart the next time one of them is touched.
 ///
-/// ## Hold-queue eviction is *not* a cascade
-///
-/// [`FailReason::SequenceTimeout`] looks like a cascade — one stuck key, every
-/// message buffered behind it dead-lettered — but the test above is whether an
-/// already-counted failure accounts for the discard, and here none does. A key
-/// enters `AwaitingRetry` because a handler returned `Retry`, which is not a
-/// failure and is not counted; the retried message itself survives in its hold
-/// queue. The buffered messages are destroyed with nothing else standing in for
-/// them, so each one is counted individually — the count therefore scales with
-/// the depth behind the stuck key, deliberately, because that number is the
-/// size of the loss and is what an operator alerting on this needs.
-///
 /// # In-process broker drops are log-only
 ///
 /// The in-memory backend destroys messages in a handful of places a real
@@ -206,19 +194,6 @@ pub(crate) enum FailReason {
     /// cannot fire on the supported topology — do not treat `malformed` as an
     /// SQS signal.
     Malformed,
-    /// A sequence key sat in `AwaitingRetry` past `hold_queue_timeout`, so
-    /// every message buffered behind it was dead-lettered to unblock the key.
-    ///
-    /// Deliberately not [`FailReason::Timeout`], which means a single handler
-    /// exceeded `handler_timeout`. Conflating them would hide a stuck
-    /// *ordering* key — a topology/backoff problem — inside a handler-latency
-    /// alert. Currently RabbitMQ-only; it is the only backend that implements
-    /// hold-queue eviction.
-    ///
-    /// Counted once per dead-lettered message rather than excluded as a
-    /// cascade — see "Hold-queue eviction is *not* a cascade" on this enum for
-    /// why.
-    SequenceTimeout,
     /// A `Retry` or `Defer` republish was refused in a way no later send can
     /// get past, too large for the producer or the broker or invalid to the
     /// broker, so the message was dead-lettered under the death reason
@@ -242,7 +217,6 @@ impl FailReason {
             FailReason::SchemaValidation => "schema_validation",
             FailReason::SchemaUnavailable => "schema_unavailable",
             FailReason::Malformed => "malformed",
-            FailReason::SequenceTimeout => "sequence_timeout",
             FailReason::RepublishFailed => "republish_failed",
         }
     }
@@ -1016,7 +990,6 @@ mod tests {
             (FailReason::SchemaValidation, "schema_validation"),
             (FailReason::SchemaUnavailable, "schema_unavailable"),
             (FailReason::Malformed, "malformed"),
-            (FailReason::SequenceTimeout, "sequence_timeout"),
             (FailReason::RepublishFailed, "republish_failed"),
         ];
         for (reason, label) in all {
@@ -1041,17 +1014,11 @@ mod tests {
         }
     }
 
-    /// `sequence_timeout` exists because reusing `timeout` would hide a stuck
-    /// ordering key inside a handler-latency alert; `malformed` exists because
-    /// reusing `deserialize` would hide a foreign writer inside a codec alert.
-    /// Both distinctions are the point of the variants — assert them directly
-    /// so a future "simplification" has to argue with a test.
+    /// `malformed` exists because reusing `deserialize` would hide a foreign
+    /// writer inside a codec alert. The distinction is the point of the variant,
+    /// so assert it directly: a future "simplification" has to argue with a test.
     #[test]
     fn new_reasons_do_not_collapse_onto_the_ones_they_refine() {
-        assert_ne!(
-            FailReason::SequenceTimeout.as_label(),
-            FailReason::Timeout.as_label()
-        );
         assert_ne!(
             FailReason::Malformed.as_label(),
             FailReason::Deserialize.as_label()

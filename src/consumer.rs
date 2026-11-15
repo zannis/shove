@@ -275,18 +275,13 @@ pub struct ConsumerOptions<B: Backend> {
     /// ConsumerOptions::<MyBackend>::new().with_max_reconnect_attempts(50)
     /// ```
     pub max_reconnect_attempts: Option<u32>,
-    /// Maximum time a sequence key may remain in the `AwaitingRetry` state
-    /// before its pending deliveries are dead-lettered (RabbitMQ sequenced
-    /// consumers only).
+    /// No effect. It used to bound how long a sequenced RabbitMQ key could wait
+    /// for a retry parked in a hold queue. A sequenced retry now waits in place,
+    /// on the consumer's own un-acked delivery, so no key waits on the broker
+    /// and there is nothing to evict. The option is kept so existing code
+    /// compiles.
     ///
-    /// When a handler returns `Retry` or `Defer`, the key is blocked until
-    /// the hold-queue message comes back. If the hold queue has a longer TTL
-    /// than expected (or is misconfigured), the key stays blocked indefinitely.
-    /// Setting this timeout causes the consumer to dead-letter any buffered
-    /// deliveries for the key and unblock it, preventing consumer stalls.
-    ///
-    /// `None` (the default) disables the eviction — keys stay in
-    /// `AwaitingRetry` until the retry message arrives.
+    /// Non-sequenced RabbitMQ consumers never used it.
     #[cfg(feature = "rabbitmq")]
     #[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq")))]
     pub hold_queue_timeout: Option<Duration>,
@@ -911,11 +906,9 @@ impl ConsumerOptions<RabbitMq> {
 #[cfg(feature = "rabbitmq")]
 #[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq")))]
 impl ConsumerOptions<RabbitMq> {
-    /// Set the maximum time a sequence key may remain in `AwaitingRetry`
-    /// before its pending deliveries are dead-lettered.
-    ///
-    /// See [`hold_queue_timeout`](Self::hold_queue_timeout) for semantics.
-    /// Panics if `timeout` is zero.
+    /// Sets [`hold_queue_timeout`](Self::hold_queue_timeout), which has no
+    /// effect: a sequenced retry waits in place and no key waits on a hold
+    /// queue. Panics if `timeout` is zero.
     pub fn with_hold_queue_timeout(mut self, timeout: Duration) -> Self {
         assert!(!timeout.is_zero(), "hold_queue_timeout must be positive");
         self.hold_queue_timeout = Some(timeout);

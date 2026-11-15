@@ -449,7 +449,7 @@ define_topic!(
         .build()
 );
 
-// Topic for sequenced consumer retry via shard hold queues
+// Topic for sequenced consumer retry waiting in place
 define_sequenced_topic!(
     RetrySeqOrders,
     OrderMessage,
@@ -462,8 +462,8 @@ define_sequenced_topic!(
         .build()
 );
 
-// Topic for the foreign-producer ordering test; a 2 s hold leaves room to
-// publish while the retry is still parked.
+// Topic for the foreign-producer ordering test; a 2 s delay leaves room to
+// publish while the retry is still waiting.
 define_sequenced_topic!(
     ForeignRetrySeqOrders,
     OrderMessage,
@@ -489,19 +489,6 @@ define_sequenced_topic!(
         .build()
 );
 
-// Topic for the consumer-restart test: a hold long enough to restart inside it.
-define_sequenced_topic!(
-    RestartSeqOrders,
-    OrderMessage,
-    |msg: &OrderMessage| msg.account.clone(),
-    TopologyBuilder::new("test-restart-seq-orders")
-        .dlq()
-        .hold_queue(Duration::from_secs(3))
-        .sequenced(SequenceFailure::Skip)
-        .routing_shards(1)
-        .build()
-);
-
 // Topic for the defer-at-shutdown test.
 define_sequenced_topic!(
     ShutdownDeferSeqOrders,
@@ -515,7 +502,7 @@ define_sequenced_topic!(
         .build()
 );
 
-// Topic for sequenced consumer defer via shard hold queues
+// Topic for sequenced consumer defer waiting in place
 define_sequenced_topic!(
     DeferSeqOrders,
     OrderMessage,
@@ -538,21 +525,6 @@ define_sequenced_topic!(
     TopologyBuilder::new("test-timeout-seq-orders")
         .dlq()
         .hold_queue(Duration::from_secs(1))
-        .sequenced(SequenceFailure::Skip)
-        .routing_shards(1)
-        .build()
-);
-
-// Topic for hold_queue_timeout eviction tests.
-// Long hold-queue TTL (60 s) so the retried message stays in the hold queue
-// for the duration of the test, letting the consumer-side eviction timer fire.
-define_sequenced_topic!(
-    EvictSeqOrders,
-    OrderMessage,
-    |msg: &OrderMessage| msg.account.clone(),
-    TopologyBuilder::new("test-evict-seq-orders")
-        .dlq()
-        .hold_queue(Duration::from_secs(60))
         .sequenced(SequenceFailure::Skip)
         .routing_shards(1)
         .build()
@@ -1071,17 +1043,6 @@ impl MessageHandler<TimeoutSeqOrders> for OrderDlqHandler {
     }
 }
 
-impl MessageHandler<EvictSeqOrders> for OrderDlqHandler {
-    type Context = ();
-    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
-        Outcome::Ack
-    }
-    async fn handle_dead(&self, _msg: OrderMessage, _meta: DeadMessageMetadata, _: &()) {
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.signal.notify_waiters();
-    }
-}
-
 /// Handler that always rejects (for testing DLQ routing).
 struct RejectHandler;
 
@@ -1419,34 +1380,6 @@ impl MessageHandler<LimitSeqOrders> for SeqLimitHandler {
     }
     async fn handle_dead(&self, _msg: OrderMessage, _meta: DeadMessageMetadata, _: &()) {
         self.dead.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// `seq == 1` retries once; `seq == 2` is slow. Tracks peak concurrency for
-/// the (single) key.
-#[derive(Clone)]
-struct SeqOverlapHandler {
-    order: Arc<std::sync::Mutex<Vec<u32>>>,
-    active: Arc<AtomicUsize>,
-    peak: Arc<AtomicUsize>,
-}
-
-impl MessageHandler<RestartSeqOrders> for SeqOverlapHandler {
-    type Context = ();
-    async fn handle(&self, msg: OrderMessage, meta: MessageMetadata, _: &()) -> Outcome {
-        let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-        self.peak.fetch_max(now, Ordering::SeqCst);
-        self.order.lock().unwrap().push(msg.seq);
-        let outcome = if msg.seq == 1 && meta.retry_count == 0 {
-            Outcome::Retry
-        } else {
-            if msg.seq == 2 {
-                tokio::time::sleep(Duration::from_secs(4)).await;
-            }
-            Outcome::Ack
-        };
-        self.active.fetch_sub(1, Ordering::SeqCst);
-        outcome
     }
 }
 
@@ -4150,10 +4083,10 @@ async fn concurrent_consumer_handler_timeout_triggers_retry() {
     ctx.cleanup().await;
 }
 
-// --- Sequenced consumer — retry via shard hold queues ---
+// --- Sequenced consumer — retry waits in place ---
 
 #[tokio::test]
-async fn sequenced_consumer_retry_via_shard_hold_queues() {
+async fn sequenced_consumer_retry_waits_in_place() {
     let ctx = TestContext::new().await;
     let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
     let b = ctx.broker_from(client.clone());
@@ -4250,86 +4183,10 @@ async fn sequenced_retry_at_the_limit_releases_the_key() {
     ctx.cleanup().await;
 }
 
-// --- Sequenced consumer — a retry parked across a consumer restart keeps its key ---
+// --- Sequenced consumer — a message deferred at shutdown is requeued ahead of later ones ---
 
 #[tokio::test]
-async fn sequenced_retry_parked_across_restart_stays_serialized_with_its_key() {
-    let ctx = TestContext::new().await;
-    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
-    let b = ctx.broker_from(client.clone());
-    b.topology().declare::<RestartSeqOrders>().await.unwrap();
-
-    let handler = SeqOverlapHandler {
-        order: Arc::new(std::sync::Mutex::new(Vec::new())),
-        active: Arc::new(AtomicUsize::new(0)),
-        peak: Arc::new(AtomicUsize::new(0)),
-    };
-    let spawn_consumer = |shutdown: CancellationToken| {
-        let consumer = RabbitMqConsumer::new(client.clone());
-        let h = handler.clone();
-        tokio::spawn(async move {
-            let opts = ConsumerOptions::<RabbitMqMarker>::new()
-                .with_shutdown(shutdown)
-                .with_max_retries(5);
-            consumer.run_fifo::<RestartSeqOrders, _>(h, (), opts).await
-        })
-    };
-
-    let publisher = b.publisher().await.unwrap();
-    let first_shutdown = CancellationToken::new();
-    let first = spawn_consumer(first_shutdown.clone());
-    publisher
-        .publish::<RestartSeqOrders>(&OrderMessage {
-            account: "ACC-RESTART".into(),
-            seq: 1,
-        })
-        .await
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while handler.order.lock().unwrap().is_empty() {
-        assert!(Instant::now() < deadline, "first attempt never ran");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    first_shutdown.cancel();
-    first.await.unwrap().unwrap();
-
-    // The retry is parked in the hold queue; a fresh consumer knows nothing of it.
-    let second_shutdown = CancellationToken::new();
-    let second = spawn_consumer(second_shutdown.clone());
-    publisher
-        .publish::<RestartSeqOrders>(&OrderMessage {
-            account: "ACC-RESTART".into(),
-            seq: 2,
-        })
-        .await
-        .unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(40);
-    while handler.order.lock().unwrap().len() < 3 {
-        assert!(
-            Instant::now() < deadline,
-            "timed out: handled {:?}",
-            handler.order.lock().unwrap()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(
-        handler.peak.load(Ordering::SeqCst),
-        1,
-        "the returning retry ran concurrently with a message for its own key"
-    );
-
-    second_shutdown.cancel();
-    second.await.unwrap().unwrap();
-    client.shutdown().await;
-    ctx.cleanup().await;
-}
-
-// --- Sequenced consumer — a message deferred at shutdown keeps its key ---
-
-#[tokio::test]
-async fn sequenced_defer_at_shutdown_returns_under_its_real_key() {
+async fn sequenced_defer_at_shutdown_is_requeued_ahead_of_later_messages() {
     let ctx = TestContext::new().await;
     let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
     let b = ctx.broker_from(client.clone());
@@ -4398,8 +4255,9 @@ async fn sequenced_defer_at_shutdown_returns_under_its_real_key() {
     assert_eq!(
         handler.peak.load(Ordering::SeqCst),
         1,
-        "the deferred copy ran concurrently with a message for its own key"
+        "the deferred message ran concurrently with a message for its own key"
     );
+    assert_eq!(*handler.order.lock().unwrap(), vec![1, 1, 2]);
 
     second_shutdown.cancel();
     second.await.unwrap().unwrap();
@@ -4407,10 +4265,10 @@ async fn sequenced_defer_at_shutdown_returns_under_its_real_key() {
     ctx.cleanup().await;
 }
 
-// --- Sequenced consumer — foreign message must not stand in for the returning retry ---
+// --- Sequenced consumer — foreign messages queue behind the waiting retry ---
 
 #[tokio::test]
-async fn sequenced_foreign_retry_count_message_does_not_jump_the_held_retry() {
+async fn sequenced_foreign_retry_count_message_does_not_jump_the_waiting_retry() {
     let ctx = TestContext::new().await;
     let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
     let b = ctx.broker_from(client.clone());
@@ -4479,7 +4337,7 @@ async fn sequenced_foreign_retry_count_message_does_not_jump_the_held_retry() {
         assert!(Instant::now() < deadline, "first attempt never ran");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // The retry copy is now parked in the 2 s hold queue.
+    // The retry is now waiting in place through its 2 s delay.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let mut headers = FieldTable::default();
@@ -4535,7 +4393,7 @@ async fn sequenced_foreign_retry_count_message_does_not_jump_the_held_retry() {
     assert_eq!(
         order,
         vec![1, 96, 1, 99, 98, 97, 2],
-        "held retry must precede later messages for its key"
+        "the waiting retry must precede later messages for its key"
     );
 
     shutdown.cancel();
@@ -4640,10 +4498,10 @@ async fn sequenced_handler_timeout_outcome_reject_dead_letters_without_retrying(
     ctx.cleanup().await;
 }
 
-// --- Sequenced consumer — defer via shard hold queues ---
+// --- Sequenced consumer — defer waits in place ---
 
 #[tokio::test]
-async fn sequenced_consumer_defer_via_shard_hold_queues() {
+async fn sequenced_consumer_defer_waits_in_place() {
     let ctx = TestContext::new().await;
     let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
     let b = ctx.broker_from(client.clone());
@@ -5916,10 +5774,10 @@ async fn defer_preserves_retry_count() {
     ctx.cleanup().await;
 }
 
-// --- Sequenced defer without hold queues (nack+requeue fallback) ---
+// --- Sequenced defer without hold queues waits the fixed 1 s in place ---
 
 #[tokio::test]
-async fn sequenced_defer_without_hold_queue_requeues() {
+async fn sequenced_defer_without_hold_queue_waits_in_place() {
     let ctx = TestContext::new().await;
     let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
     let b = ctx.broker_from(client.clone());
@@ -5946,7 +5804,7 @@ async fn sequenced_defer_without_hold_queue_requeues() {
         consumer.run_fifo::<DeferSeqNoHold, _>(h, (), opts).await
     });
 
-    // Defer (nack-requeue) → redelivered → Ack
+    // Defer waits 1 s in place → handled again → Ack
     assert!(
         handler.wait_for_ack(1, Duration::from_secs(30)).await,
         "timed out waiting for ack after sequenced defer without hold queue"
@@ -6246,96 +6104,6 @@ async fn consumer_group_register_fifo_rejects_concurrent_processing() {
         .await;
     assert!(outcome.is_clean(), "outcome was {outcome:?}");
 
-    client.shutdown().await;
-    ctx.cleanup().await;
-}
-
-// --- hold_queue_timeout eviction ---
-
-/// Verify that a sequence key stuck in `AwaitingRetry` is dead-lettered within
-/// 1.5× the configured `hold_queue_timeout`.
-///
-/// The eviction ticker fires at `timeout / 2`, so the worst-case scenario is a
-/// key entering `AwaitingRetry` just after a tick, which means it waits until
-/// the *next* tick (one full period) before the check at `1.5×` clears it.
-#[tokio::test]
-async fn sequenced_consumer_hold_queue_timeout_evicts_stuck_key_within_1_5x() {
-    let ctx = TestContext::new().await;
-    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
-    let b = ctx.broker_from(client.clone());
-    b.topology().declare::<EvictSeqOrders>().await.unwrap();
-
-    let publisher = b.publisher().await.unwrap();
-
-    // msg1 → handler returns Retry → hold queue (60 s TTL, won't come back during test)
-    // key enters AwaitingRetry.
-    publisher
-        .publish::<EvictSeqOrders>(&OrderMessage {
-            account: "ACC-EVICT".into(),
-            seq: 1,
-        })
-        .await
-        .unwrap();
-
-    // msg2 → arrives while key is in AwaitingRetry → pending_deliveries.
-    // The eviction will dead-letter this message to the DLQ.
-    publisher
-        .publish::<EvictSeqOrders>(&OrderMessage {
-            account: "ACC-EVICT".into(),
-            seq: 2,
-        })
-        .await
-        .unwrap();
-
-    struct AlwaysRetry;
-    impl MessageHandler<EvictSeqOrders> for AlwaysRetry {
-        type Context = ();
-        async fn handle(&self, _: OrderMessage, _: MessageMetadata, _: &()) -> Outcome {
-            Outcome::Retry
-        }
-    }
-
-    let hold_queue_timeout = Duration::from_secs(2);
-    // Worst-case eviction is 1.5× the timeout; add 500 ms scheduling slack.
-    let deadline = hold_queue_timeout.mul_f64(1.5) + Duration::from_millis(500);
-
-    // DLQ consumer watches for msg2 to be dead-lettered by the eviction.
-    let dlq_handler = OrderDlqHandler::new();
-    let client2 = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
-    let consumer2 = RabbitMqConsumer::new(client2.clone());
-    let dh = dlq_handler.clone();
-    let dlq_handle =
-        tokio::spawn(async move { consumer2.run_dlq::<EvictSeqOrders, _>(dh, ()).await });
-
-    let shutdown = CancellationToken::new();
-    let consumer = RabbitMqConsumer::new(client.clone());
-    let s = shutdown.clone();
-    let started_at = Instant::now();
-    let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::<RabbitMqMarker>::new()
-            .with_shutdown(s)
-            // High limit so Retry is never treated as DLQ by the max-retries path.
-            .with_max_retries(100)
-            .with_hold_queue_timeout(hold_queue_timeout);
-        consumer
-            .run_fifo::<EvictSeqOrders, _>(AlwaysRetry, (), opts)
-            .await
-    });
-
-    assert!(
-        dlq_handler.wait_for_count(1, deadline).await,
-        "hold_queue_timeout eviction did not dead-letter msg2 within {deadline:?}"
-    );
-    assert!(
-        started_at.elapsed() <= deadline,
-        "eviction took {:?}, expected ≤ {deadline:?}",
-        started_at.elapsed()
-    );
-
-    shutdown.cancel();
-    consume_handle.await.unwrap().unwrap();
-    client2.shutdown().await;
-    dlq_handle.abort();
     client.shutdown().await;
     ctx.cleanup().await;
 }
@@ -7260,4 +7028,709 @@ async fn consuming_an_external_topology_is_refused_at_every_entry_point() {
         "the consumer wrote nothing and consumed nothing from the infra-owned queue"
     );
     assert_eq!(hits.load(Ordering::SeqCst), 0, "no handler ran");
+}
+
+// ---------------------------------------------------------------------------
+// Sequenced retry waits in place
+//
+// A `Retry` or `Defer` on a sequenced topic keeps the delivery un-acked on the
+// shard channel through the hold delay and hands the same delivery to the
+// handler again. Nothing is published to a hold queue.
+// ---------------------------------------------------------------------------
+
+macro_rules! in_place_topic {
+    ($name:ident, $queue:literal, $failure:expr, [$($hold:expr),*]) => {
+        define_sequenced_topic!(
+            $name,
+            OrderMessage,
+            |msg: &OrderMessage| msg.account.clone(),
+            TopologyBuilder::new($queue)
+                .dlq()
+                $(.hold_queue(Duration::from_secs($hold)))*
+                .sequenced($failure)
+                .routing_shards(1)
+                .build()
+        );
+    };
+}
+
+in_place_topic!(
+    InPlaceRestartOrders,
+    "test-in-place-restart",
+    SequenceFailure::Skip,
+    [3]
+);
+in_place_topic!(
+    InPlaceWaitOrders,
+    "test-in-place-wait",
+    SequenceFailure::Skip,
+    [2]
+);
+in_place_topic!(
+    InPlaceLadderOrders,
+    "test-in-place-ladder",
+    SequenceFailure::Skip,
+    [1, 2]
+);
+in_place_topic!(
+    InPlaceSkipOrders,
+    "test-in-place-skip",
+    SequenceFailure::Skip,
+    [1]
+);
+in_place_topic!(
+    InPlaceFailAllOrders,
+    "test-in-place-failall",
+    SequenceFailure::FailAll,
+    [1]
+);
+in_place_topic!(
+    InPlaceShutdownOrders,
+    "test-in-place-shutdown",
+    SequenceFailure::Skip,
+    [3]
+);
+in_place_topic!(
+    InPlaceUpgradeOrders,
+    "test-in-place-upgrade",
+    SequenceFailure::Skip,
+    [1]
+);
+in_place_topic!(
+    InPlaceForgedOrders,
+    "test-in-place-forged",
+    SequenceFailure::Skip,
+    [2]
+);
+in_place_topic!(
+    InPlaceNoEvictOrders,
+    "test-in-place-no-evict",
+    SequenceFailure::Skip,
+    [3]
+);
+
+type Script = Arc<dyn Fn(u32, u32, &MessageMetadata) -> Outcome + Send + Sync>;
+
+#[derive(Clone, Debug)]
+struct Seen {
+    seq: u32,
+    retry_count: u32,
+    redelivered: bool,
+    at: Instant,
+}
+
+/// Records every handling and answers from a script of
+/// `(seq, earlier handlings of that seq, metadata)`.
+#[derive(Clone)]
+struct InPlaceHandler {
+    seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+    dead: Arc<std::sync::Mutex<Vec<u32>>>,
+    calls: Arc<std::sync::Mutex<HashMap<u32, u32>>>,
+    script: Script,
+}
+
+impl InPlaceHandler {
+    fn new(script: impl Fn(u32, u32, &MessageMetadata) -> Outcome + Send + Sync + 'static) -> Self {
+        Self {
+            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+            dead: Arc::new(std::sync::Mutex::new(Vec::new())),
+            calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            script: Arc::new(script),
+        }
+    }
+
+    fn seen(&self) -> Vec<Seen> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    fn order(&self) -> Vec<u32> {
+        self.seen().iter().map(|s| s.seq).collect()
+    }
+
+    fn dead(&self) -> Vec<u32> {
+        self.dead.lock().unwrap().clone()
+    }
+
+    async fn wait_handled(&self, target: usize, secs: u64) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while self.seen().len() < target {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {target} handlings, got {:?}",
+                self.order()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn wait_dead(&self, target: usize, secs: u64) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while self.dead().len() < target {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {target} dead letters, got {:?}",
+                self.dead()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+impl<T: Topic<Message = OrderMessage>> MessageHandler<T> for InPlaceHandler {
+    type Context = ();
+
+    async fn handle(&self, msg: OrderMessage, meta: MessageMetadata, _: &()) -> Outcome {
+        let attempt = {
+            let mut calls = self.calls.lock().unwrap();
+            let n = calls.entry(msg.seq).or_insert(0);
+            let attempt = *n;
+            *n += 1;
+            attempt
+        };
+        self.seen.lock().unwrap().push(Seen {
+            seq: msg.seq,
+            retry_count: meta.retry_count,
+            redelivered: meta.redelivered,
+            at: Instant::now(),
+        });
+        (self.script)(msg.seq, attempt, &meta)
+    }
+
+    async fn handle_dead(&self, msg: OrderMessage, _meta: DeadMessageMetadata, _: &()) {
+        self.dead.lock().unwrap().push(msg.seq);
+    }
+}
+
+fn spawn_in_place_consumer<T>(
+    client: &RabbitMqClient,
+    handler: &InPlaceHandler,
+    shutdown: CancellationToken,
+    max_retries: u32,
+) -> tokio::task::JoinHandle<Result<(), ShoveError>>
+where
+    T: SequencedTopic<Message = OrderMessage>,
+{
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let handler = handler.clone();
+    tokio::spawn(async move {
+        let opts = ConsumerOptions::<RabbitMqMarker>::new()
+            .with_shutdown(shutdown)
+            .with_max_retries(max_retries);
+        consumer.run_fifo::<T, _>(handler, (), opts).await
+    })
+}
+
+fn spawn_in_place_dlq<T>(
+    client: &RabbitMqClient,
+    handler: &InPlaceHandler,
+) -> tokio::task::JoinHandle<Result<(), ShoveError>>
+where
+    T: Topic<Message = OrderMessage>,
+{
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let handler = handler.clone();
+    tokio::spawn(async move { consumer.run_dlq::<T, _>(handler, ()).await })
+}
+
+async fn publish_order<T>(publisher: &Publisher<RabbitMqMarker>, account: &str, seq: u32)
+where
+    T: Topic<Message = OrderMessage>,
+{
+    publisher
+        .publish::<T>(&OrderMessage {
+            account: account.into(),
+            seq,
+        })
+        .await
+        .unwrap();
+}
+
+/// Retries `seq` exactly once, on its first handling; every other message acks.
+fn retry_first_handling_of(seq: u32) -> impl Fn(u32, u32, &MessageMetadata) -> Outcome {
+    move |s, attempt, _| {
+        if s == seq && attempt == 0 {
+            Outcome::Retry
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+/// The restart test the hold-queue design could not pass: the broker, not the
+/// consumer's memory, keeps the waiting message ahead of the key's later ones.
+#[tokio::test]
+async fn sequenced_retry_waiting_across_restart_is_handled_before_a_later_message() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology()
+        .declare::<InPlaceRestartOrders>()
+        .await
+        .unwrap();
+    let publisher = b.publisher().await.unwrap();
+    let handler = InPlaceHandler::new(retry_first_handling_of(1));
+
+    let first_shutdown = CancellationToken::new();
+    let first = spawn_in_place_consumer::<InPlaceRestartOrders>(
+        &client,
+        &handler,
+        first_shutdown.clone(),
+        5,
+    );
+    publish_order::<InPlaceRestartOrders>(&publisher, "ACC-RESTART", 1).await;
+    handler.wait_handled(1, 30).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    first_shutdown.cancel();
+    first.await.unwrap().unwrap();
+
+    let second_shutdown = CancellationToken::new();
+    let second = spawn_in_place_consumer::<InPlaceRestartOrders>(
+        &client,
+        &handler,
+        second_shutdown.clone(),
+        5,
+    );
+    publish_order::<InPlaceRestartOrders>(&publisher, "ACC-RESTART", 2).await;
+    handler.wait_handled(3, 40).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(handler.order(), vec![1, 1, 2]);
+
+    second_shutdown.cancel();
+    second.await.unwrap().unwrap();
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+/// Messages for the waiting key buffer behind it in publish order, and the
+/// other keys on the shard keep being handled through the wait.
+#[tokio::test]
+async fn sequenced_retry_waits_in_place_while_other_keys_flow() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology().declare::<InPlaceWaitOrders>().await.unwrap();
+    let publisher = b.publisher().await.unwrap();
+    let handler = InPlaceHandler::new(retry_first_handling_of(1));
+
+    let shutdown = CancellationToken::new();
+    let consumer =
+        spawn_in_place_consumer::<InPlaceWaitOrders>(&client, &handler, shutdown.clone(), 5);
+    publish_order::<InPlaceWaitOrders>(&publisher, "ACC-K", 1).await;
+    handler.wait_handled(1, 30).await;
+    publish_order::<InPlaceWaitOrders>(&publisher, "ACC-K", 2).await;
+    publish_order::<InPlaceWaitOrders>(&publisher, "ACC-J", 11).await;
+    publish_order::<InPlaceWaitOrders>(&publisher, "ACC-J", 12).await;
+    handler.wait_handled(5, 30).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(handler.order(), vec![1, 11, 12, 1, 2]);
+
+    shutdown.cancel();
+    consumer.await.unwrap().unwrap();
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+/// Each attempt waits the delay of its tier, and the handler sees the count
+/// the consumer keeps for the delivery.
+#[tokio::test]
+async fn sequenced_retry_honours_the_tier_delay_and_reports_the_retry_count() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology().declare::<InPlaceLadderOrders>().await.unwrap();
+    let publisher = b.publisher().await.unwrap();
+    let handler = InPlaceHandler::new(|_, attempt, _| {
+        if attempt < 2 {
+            Outcome::Retry
+        } else {
+            Outcome::Ack
+        }
+    });
+
+    let shutdown = CancellationToken::new();
+    let consumer =
+        spawn_in_place_consumer::<InPlaceLadderOrders>(&client, &handler, shutdown.clone(), 5);
+    publish_order::<InPlaceLadderOrders>(&publisher, "ACC-LADDER", 1).await;
+    handler.wait_handled(3, 30).await;
+
+    let seen = handler.seen();
+    assert_eq!(
+        seen.iter().map(|s| s.retry_count).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        seen.iter().map(|s| s.redelivered).collect::<Vec<_>>(),
+        vec![false, true, true]
+    );
+    let first_gap = seen[1].at.duration_since(seen[0].at);
+    let second_gap = seen[2].at.duration_since(seen[1].at);
+    assert!(
+        first_gap >= Duration::from_secs(1) && first_gap < Duration::from_secs(4),
+        "first retry came after {first_gap:?}, expected the 1 s tier"
+    );
+    assert!(
+        second_gap >= Duration::from_secs(2) && second_gap < Duration::from_secs(5),
+        "second retry came after {second_gap:?}, expected the 2 s tier"
+    );
+
+    shutdown.cancel();
+    consumer.await.unwrap().unwrap();
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+/// A message that always retries is handled exactly `max_retries` times, then
+/// dead-lettered, and its key is released (or poisoned under `FailAll`).
+async fn exhausted_retries_dead_letter_then_release_the_key<T>(poisons: bool)
+where
+    T: SequencedTopic<Message = OrderMessage>,
+{
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology().declare::<T>().await.unwrap();
+    let publisher = b.publisher().await.unwrap();
+    let handler = InPlaceHandler::new(|seq, _, _| {
+        if seq == 1 {
+            Outcome::Retry
+        } else {
+            Outcome::Ack
+        }
+    });
+
+    let dlq = spawn_in_place_dlq::<T>(&client, &handler);
+    let shutdown = CancellationToken::new();
+    let consumer = spawn_in_place_consumer::<T>(&client, &handler, shutdown.clone(), 3);
+    publish_order::<T>(&publisher, "ACC-LIMIT", 1).await;
+    publish_order::<T>(&publisher, "ACC-LIMIT", 2).await;
+    publish_order::<T>(&publisher, "ACC-OTHER", 3).await;
+
+    let expected_dead: Vec<u32> = if poisons { vec![1, 2] } else { vec![1] };
+    handler.wait_dead(expected_dead.len(), 30).await;
+    handler.wait_handled(if poisons { 4 } else { 5 }, 30).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut dead = handler.dead();
+    dead.sort_unstable();
+    assert_eq!(dead, expected_dead);
+    let seen = handler.seen();
+    let own: Vec<(u32, u32)> = seen
+        .iter()
+        .filter(|s| s.seq == 1)
+        .map(|s| (s.seq, s.retry_count))
+        .collect();
+    assert_eq!(
+        own,
+        vec![(1, 0), (1, 1), (1, 2)],
+        "exactly max_retries attempts"
+    );
+    let handled_two = seen.iter().any(|s| s.seq == 2);
+    assert_eq!(
+        handled_two, !poisons,
+        "the key is released unless FailAll poisons it"
+    );
+    assert!(seen.iter().any(|s| s.seq == 3), "another key is untouched");
+
+    shutdown.cancel();
+    consumer.await.unwrap().unwrap();
+    dlq.abort();
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+#[tokio::test]
+async fn sequenced_retry_exhaustion_dead_letters_and_releases_the_key_under_skip() {
+    exhausted_retries_dead_letter_then_release_the_key::<InPlaceSkipOrders>(false).await;
+}
+
+#[tokio::test]
+async fn sequenced_retry_exhaustion_dead_letters_and_poisons_the_key_under_failall() {
+    exhausted_retries_dead_letter_then_release_the_key::<InPlaceFailAllOrders>(true).await;
+}
+
+/// `Defer` on a sequenced consumer is a `Retry`, as on Kafka and NATS: it waits
+/// in place for the tier's delay and spends retry budget.
+#[tokio::test]
+async fn sequenced_defer_waits_in_place_and_spends_retry_budget() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology().declare::<InPlaceLadderOrders>().await.unwrap();
+    let publisher = b.publisher().await.unwrap();
+    let handler = InPlaceHandler::new(|seq, _, _| {
+        if seq == 1 {
+            Outcome::Defer
+        } else {
+            Outcome::Ack
+        }
+    });
+
+    let dlq = spawn_in_place_dlq::<InPlaceLadderOrders>(&client, &handler);
+    let shutdown = CancellationToken::new();
+    let consumer =
+        spawn_in_place_consumer::<InPlaceLadderOrders>(&client, &handler, shutdown.clone(), 3);
+    publish_order::<InPlaceLadderOrders>(&publisher, "ACC-DEFER", 1).await;
+    publish_order::<InPlaceLadderOrders>(&publisher, "ACC-DEFER", 2).await;
+    handler.wait_dead(1, 40).await;
+    handler.wait_handled(4, 40).await;
+
+    let seen = handler.seen();
+    assert_eq!(
+        seen.iter()
+            .map(|s| (s.seq, s.retry_count))
+            .collect::<Vec<_>>(),
+        vec![(1, 0), (1, 1), (1, 2), (2, 0)]
+    );
+    let first_gap = seen[1].at.duration_since(seen[0].at);
+    assert!(
+        first_gap >= Duration::from_secs(1),
+        "defer came back after {first_gap:?}, before the first tier's delay"
+    );
+    assert_eq!(handler.dead(), vec![1]);
+
+    shutdown.cancel();
+    consumer.await.unwrap().unwrap();
+    dlq.abort();
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+/// Shutdown while a key waits: the waiting delivery and the ones buffered
+/// behind it go back to the queue in their original order.
+#[tokio::test]
+async fn sequenced_shutdown_during_a_wait_keeps_the_waiting_message_first() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology()
+        .declare::<InPlaceShutdownOrders>()
+        .await
+        .unwrap();
+    let publisher = b.publisher().await.unwrap();
+    let handler = InPlaceHandler::new(retry_first_handling_of(1));
+
+    let first_shutdown = CancellationToken::new();
+    let first = spawn_in_place_consumer::<InPlaceShutdownOrders>(
+        &client,
+        &handler,
+        first_shutdown.clone(),
+        5,
+    );
+    publish_order::<InPlaceShutdownOrders>(&publisher, "ACC-SHUT", 1).await;
+    handler.wait_handled(1, 30).await;
+    publish_order::<InPlaceShutdownOrders>(&publisher, "ACC-SHUT", 2).await;
+    publish_order::<InPlaceShutdownOrders>(&publisher, "ACC-SHUT", 3).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    first_shutdown.cancel();
+    first.await.unwrap().unwrap();
+    assert_eq!(
+        handler.order(),
+        vec![1],
+        "nothing behind the waiting message ran"
+    );
+
+    let second_shutdown = CancellationToken::new();
+    let second = spawn_in_place_consumer::<InPlaceShutdownOrders>(
+        &client,
+        &handler,
+        second_shutdown.clone(),
+        5,
+    );
+    handler.wait_handled(4, 40).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(handler.order(), vec![1, 1, 2, 3]);
+
+    second_shutdown.cancel();
+    second.await.unwrap().unwrap();
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+/// A copy parked in a shard hold queue by the previous version, with its key and
+/// retry count in headers, comes back, is handled under its real key, and any
+/// further retry waits in place.
+#[tokio::test]
+async fn sequenced_hold_queue_copy_from_the_previous_version_is_handled_under_its_key() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology()
+        .declare::<InPlaceUpgradeOrders>()
+        .await
+        .unwrap();
+    let publisher = b.publisher().await.unwrap();
+    let handler = InPlaceHandler::new(retry_first_handling_of(1));
+
+    let hold_queue = InPlaceUpgradeOrders::topology().shard_hold_queue_names(0)[0]
+        .name()
+        .to_string();
+    let raw_channel = client.create_confirm_channel().await.unwrap();
+    let mut headers = FieldTable::default();
+    headers.insert("x-retry-count".into(), AMQPValue::LongUInt(1));
+    headers.insert(
+        "shove-sequence-key".into(),
+        AMQPValue::LongString("ACC-UP".into()),
+    );
+    headers.insert(
+        "shove-retry-token".into(),
+        AMQPValue::LongString("token-minted-by-the-previous-version".into()),
+    );
+    raw_channel
+        .basic_publish(
+            "".into(),
+            hold_queue.as_str().into(),
+            BasicPublishOptions::default(),
+            br#"{"account":"ACC-UP","seq":1}"#,
+            lapin::BasicProperties::default()
+                .with_delivery_mode(2)
+                .with_content_type("application/json".into())
+                .with_headers(headers),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    let shutdown = CancellationToken::new();
+    let consumer =
+        spawn_in_place_consumer::<InPlaceUpgradeOrders>(&client, &handler, shutdown.clone(), 5);
+    handler.wait_handled(1, 30).await;
+    publish_order::<InPlaceUpgradeOrders>(&publisher, "ACC-UP", 2).await;
+    handler.wait_handled(3, 30).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        handler.order(),
+        vec![1, 1, 2],
+        "the copy is serialized under ACC-UP"
+    );
+    let counts: Vec<u32> = handler.seen().iter().map(|s| s.retry_count).collect();
+    assert_eq!(counts, vec![1, 2, 0]);
+
+    shutdown.cancel();
+    consumer.await.unwrap().unwrap();
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+/// Messages a foreign publisher writes straight to the shard queue, carrying
+/// the internal headers and a forged retry count, only queue behind the
+/// waiting key.
+#[tokio::test]
+async fn sequenced_forged_internal_headers_do_not_release_a_waiting_key() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology().declare::<InPlaceForgedOrders>().await.unwrap();
+    let publisher = b.publisher().await.unwrap();
+    let handler = InPlaceHandler::new(retry_first_handling_of(1));
+
+    let shard_queue = "test-in-place-forged-seq-0";
+    let raw_channel = client.create_confirm_channel().await.unwrap();
+    let raw_publish = |payload: &'static [u8], headers: FieldTable| {
+        let raw_channel = raw_channel.clone();
+        async move {
+            raw_channel
+                .basic_publish(
+                    "".into(),
+                    shard_queue.into(),
+                    BasicPublishOptions::default(),
+                    payload,
+                    lapin::BasicProperties::default()
+                        .with_delivery_mode(2)
+                        .with_content_type("application/json".into())
+                        .with_headers(headers),
+                )
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+    };
+
+    let shutdown = CancellationToken::new();
+    let dlq = spawn_in_place_dlq::<InPlaceForgedOrders>(&client, &handler);
+    let consumer =
+        spawn_in_place_consumer::<InPlaceForgedOrders>(&client, &handler, shutdown.clone(), 5);
+    publish_order::<InPlaceForgedOrders>(&publisher, "ACC-FORGED", 1).await;
+    handler.wait_handled(1, 30).await;
+
+    let mut as_returning_copy = FieldTable::default();
+    as_returning_copy.insert(
+        "shove-sequence-key".into(),
+        AMQPValue::LongString("ACC-FORGED".into()),
+    );
+    as_returning_copy.insert(
+        "shove-retry-token".into(),
+        AMQPValue::LongString("guessed-token".into()),
+    );
+    as_returning_copy.insert("x-retry-count".into(), AMQPValue::LongUInt(1));
+    raw_publish(br#"{"account":"ACC-FORGED","seq":50}"#, as_returning_copy).await;
+    let mut spent_budget = FieldTable::default();
+    spent_budget.insert(
+        "shove-sequence-key".into(),
+        AMQPValue::LongString("ACC-FORGED".into()),
+    );
+    spent_budget.insert("x-retry-count".into(), AMQPValue::LongUInt(99));
+    raw_publish(br#"{"account":"ACC-FORGED","seq":51}"#, spent_budget).await;
+
+    handler.wait_handled(3, 30).await;
+    handler.wait_dead(1, 30).await;
+    assert_eq!(
+        handler.order(),
+        vec![1, 1, 50],
+        "the forged messages wait behind the key's own retry"
+    );
+    assert_eq!(handler.dead(), vec![51]);
+
+    shutdown.cancel();
+    consumer.await.unwrap().unwrap();
+    dlq.abort();
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+/// `hold_queue_timeout` has nothing left to evict: a key waits in place, so a
+/// wait longer than the timeout dead-letters nothing.
+#[tokio::test]
+async fn sequenced_hold_queue_timeout_does_not_evict_a_key_waiting_in_place() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology()
+        .declare::<InPlaceNoEvictOrders>()
+        .await
+        .unwrap();
+    let publisher = b.publisher().await.unwrap();
+    let handler = InPlaceHandler::new(retry_first_handling_of(1));
+
+    let shutdown = CancellationToken::new();
+    let dlq = spawn_in_place_dlq::<InPlaceNoEvictOrders>(&client, &handler);
+    let consumer = {
+        let consumer = RabbitMqConsumer::new(client.clone());
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let opts = ConsumerOptions::<RabbitMqMarker>::new()
+                .with_shutdown(shutdown)
+                .with_max_retries(5)
+                .with_hold_queue_timeout(Duration::from_secs(1));
+            consumer
+                .run_fifo::<InPlaceNoEvictOrders, _>(handler, (), opts)
+                .await
+        })
+    };
+    publish_order::<InPlaceNoEvictOrders>(&publisher, "ACC-NOEVICT", 1).await;
+    handler.wait_handled(1, 30).await;
+    publish_order::<InPlaceNoEvictOrders>(&publisher, "ACC-NOEVICT", 2).await;
+    handler.wait_handled(3, 30).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(handler.order(), vec![1, 1, 2]);
+    assert!(handler.dead().is_empty(), "nothing was evicted");
+
+    shutdown.cancel();
+    consumer.await.unwrap().unwrap();
+    dlq.abort();
+    client.shutdown().await;
+    ctx.cleanup().await;
 }

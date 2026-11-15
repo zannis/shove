@@ -6,9 +6,7 @@ use tracing::{debug, error, warn};
 
 use uuid::Uuid;
 
-use crate::backends::rabbitmq::headers::{
-    MESSAGE_ID_KEY, RETRY_COUNT_KEY, RETRY_TOKEN_KEY, SEQUENCE_KEY_HEADER,
-};
+use crate::backends::rabbitmq::headers::{MESSAGE_ID_KEY, RETRY_COUNT_KEY};
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::error::{Result, ShoveError};
 use crate::metrics;
@@ -142,7 +140,7 @@ pub(crate) async fn route_defer(
 ///
 /// The terminal metric is recorded here rather than at the call sites. This
 /// consumer hand-rolls its retry-budget checks at a dozen-odd places (standard,
-/// sharded, concurrent-sequenced, buffered-pending, AwaitingRetry timeout,
+/// sharded, concurrent-sequenced, buffered-pending,
 /// FailAll cascade, pre-handler rejects), and instrumenting them individually
 /// is how the discard counter came to miss half of them. Every path that gives
 /// up on a delivery ends here, so `reason` is a required argument: a new
@@ -459,23 +457,6 @@ pub(crate) fn clone_headers(delivery: &Delivery) -> FieldTable {
     table
 }
 
-/// Stamp a hold-queue copy with the sequence key it belongs to and a fresh
-/// consumer-minted token, and return the token. Copies are built from
-/// [`copy_preserved_headers`], which carries neither forward, so the key is
-/// restated on every hop and each hop gets its own token.
-pub(crate) fn stamp_hold_headers(table: &mut FieldTable, sequence_key: &str) -> String {
-    let token = Uuid::new_v4().to_string();
-    table.insert(
-        RETRY_TOKEN_KEY.into(),
-        AMQPValue::LongString(token.clone().into()),
-    );
-    table.insert(
-        SEQUENCE_KEY_HEADER.into(),
-        AMQPValue::LongString(sequence_key.into()),
-    );
-    token
-}
-
 /// Insert a fresh `x-message-id` if one is not already present.
 ///
 /// Called when routing a message to a hold queue so that the hold-queue copy
@@ -527,7 +508,7 @@ fn copy_preserved_headers(delivery: &Delivery) -> FieldTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::rabbitmq::headers::delivery_sequence_key;
+    use crate::backends::rabbitmq::headers::{RETRY_TOKEN_KEY, SEQUENCE_KEY_HEADER};
     use lapin::BasicProperties;
     use lapin::message::Delivery;
     use lapin::types::{AMQPValue, FieldTable, ShortString};
@@ -569,40 +550,20 @@ mod tests {
     }
 
     #[test]
-    fn stale_retry_token_does_not_survive_a_hop() {
+    fn internal_sequence_headers_do_not_survive_a_hop() {
         let mut table = FieldTable::default();
         table.insert(
             ShortString::from(RETRY_TOKEN_KEY),
             AMQPValue::LongString("old".into()),
         );
+        table.insert(
+            ShortString::from(SEQUENCE_KEY_HEADER),
+            AMQPValue::LongString("K".into()),
+        );
         let delivery = make_delivery(Some(table));
-        let mut copy = clone_headers_with_retry(&delivery, 2);
+        let copy = clone_headers_with_retry(&delivery, 2);
         assert!(!copy.inner().contains_key(RETRY_TOKEN_KEY));
-        let first = stamp_hold_headers(&mut copy, "K");
-        let second = stamp_hold_headers(&mut copy, "K");
-        assert_ne!(first, "old");
-        assert_ne!(first, second);
-        assert_eq!(
-            copy.inner().get(RETRY_TOKEN_KEY),
-            Some(&AMQPValue::LongString(second.into()))
-        );
-    }
-
-    #[test]
-    fn sequence_key_survives_a_second_hop_while_the_token_is_replaced() {
-        let mut first_hop = FieldTable::default();
-        let first_token = stamp_hold_headers(&mut first_hop, "K");
-        let mut returned = make_delivery(Some(first_hop));
-        returned.exchange = ShortString::from("");
-        returned.routing_key = ShortString::from("queue-seq-0");
-        let key = delivery_sequence_key(&returned, "queue-seq-0");
-        let mut second_hop = clone_headers_with_retry(&returned, 2);
-        let second_token = stamp_hold_headers(&mut second_hop, &key);
-        assert_eq!(
-            second_hop.inner().get(SEQUENCE_KEY_HEADER),
-            Some(&AMQPValue::LongString("K".into()))
-        );
-        assert_ne!(first_token, second_token);
+        assert!(!copy.inner().contains_key(SEQUENCE_KEY_HEADER));
     }
 
     #[test]
