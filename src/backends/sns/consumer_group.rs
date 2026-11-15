@@ -36,7 +36,8 @@ pub struct SqsConsumerGroupConfig {
     /// historical default.
     pub(crate) handler_timeout_outcome: Option<crate::Outcome>,
     /// When `true`, each consumer in the group processes up to `prefetch_count`
-    /// messages concurrently while preserving in-order acknowledgement.
+    /// messages concurrently and settles each message as soon as its handler
+    /// completes.
     pub(crate) concurrent_processing: bool,
     /// Maximum locally buffered messages per sequence key (sequenced consumers).
     pub(crate) max_pending_per_key: Option<usize>,
@@ -105,7 +106,7 @@ impl SqsConsumerGroupConfig {
     /// Enable concurrent message processing within each consumer.
     ///
     /// When enabled, each consumer processes up to `prefetch_count` messages
-    /// concurrently while preserving in-order acknowledgement.
+    /// concurrently and settles each message as soon as its handler completes.
     pub fn with_concurrent_processing(mut self, concurrent: bool) -> Self {
         self.concurrent_processing = concurrent;
         self

@@ -36,7 +36,7 @@ LOCALSTACK_AUTH_TOKEN=<token> cargo run --example sqs_concurrent_pubsub --featur
   concurrent:  0.3s (68 msg/s)
   speedup:     7.5x
 
-  Messages are always acked in delivery order.
+  Each message is settled as soon as its handler completes.
   Concurrent mode overlaps handler I/O within a single consumer.
 ```
 

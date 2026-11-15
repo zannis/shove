@@ -94,6 +94,8 @@ let opts = ConsumerOptions::<Sqs>::new()
 - **`with_handler_timeout(Duration)`** — per-message wall-clock deadline; must be less than the queue's `VisibilityTimeout` so a slow handler doesn't race the broker re-delivering the same message. Default: `30s`.
 - **`with_max_reconnect_attempts(u32)`** — cap on SQS client redials before surfacing a `Connection` error. Default: unlimited.
 
+On a standard queue each handler's outcome is settled as soon as that handler completes, in whatever order the messages were received. A finished handler's message is deleted (or retried, rejected or deferred) and its slot reused without waiting for slower handlers received earlier.
+
 `SqsConsumerGroupConfig` exposes the same knobs for the group registry (`with_prefetch_count`, `with_max_retries`, `with_handler_timeout`, `with_concurrent_processing`).
 
 ### Autoscaling

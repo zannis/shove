@@ -239,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     eprintln!("  speedup:     {speedup:.1}x");
     eprintln!();
-    eprintln!("  Messages are always acked in delivery order.");
+    eprintln!("  Each message is settled as soon as its handler completes.");
     eprintln!("  Concurrent mode overlaps handler I/O within a single consumer.");
 
     broker.close().await;

@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::oneshot::error::TryRecvError;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -275,54 +276,125 @@ where
     outcome
 }
 
-/// Spawns a handler task for a deserialized message.
-/// Returns the oneshot receiver that will resolve with the handler's outcome.
+/// The future that runs the handler for a deserialized message and resolves
+/// with its outcome.
 #[allow(clippy::too_many_arguments)]
-fn spawn_handler<T, H>(
+fn handler_future<T, H>(
     handler: &Arc<H>,
     ctx: &Arc<H::Context>,
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
     timeout_outcome: Option<Outcome>,
-    notify: &Arc<Notify>,
     topic: Arc<str>,
     group: Option<Arc<str>>,
-) -> oneshot::Receiver<Outcome>
+) -> impl Future<Output = Outcome> + Send + 'static
 where
     T: Topic,
     H: MessageHandler<T>,
 {
-    let (tx, rx) = oneshot::channel();
     let h = handler.clone();
     let c = ctx.clone();
-    let n = notify.clone();
-    tokio::spawn(async move {
-        let outcome = invoke_handler(
+    async move {
+        invoke_handler(
             async move { h.handle(message, metadata, c.as_ref()).await },
             timeout,
             timeout_outcome,
             &topic,
             group.as_deref(),
         )
-        .await;
-        let _ = tx.send(outcome);
-        n.notify_one();
-    });
-    rx
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Concurrent consumption loop
 // ---------------------------------------------------------------------------
 
+/// What the loop needs to settle a message once its handler completes.
 struct PendingMessage {
     receipt_handle: String,
     /// The original SQS message, kept for lazy access on retry/defer paths.
     /// Arc avoids cloning the body and attributes for the common Ack outcome.
     msg: Arc<Message>,
     retry_count: u32,
-    outcome_rx: oneshot::Receiver<Outcome>,
+}
+
+/// The running handlers of the standard loop. Completions are taken in the
+/// order they finish, not the order the messages were received.
+struct InFlight {
+    tasks: JoinSet<Outcome>,
+    pending: HashMap<tokio::task::Id, PendingMessage>,
+}
+
+impl InFlight {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            pending: HashMap::with_capacity(capacity),
+        }
+    }
+
+    /// Handlers that are running, plus completed ones not yet taken.
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn spawn(
+        &mut self,
+        handler: impl Future<Output = Outcome> + Send + 'static,
+        entry: PendingMessage,
+    ) {
+        let id = self.tasks.spawn(handler).id();
+        self.pending.insert(id, entry);
+    }
+
+    /// A handler that has already completed, if any.
+    fn try_next(&mut self) -> Option<(PendingMessage, Outcome)> {
+        while let Some(joined) = self.tasks.try_join_next_with_id() {
+            if let Some(done) = self.settle(joined) {
+                return Some(done);
+            }
+        }
+        None
+    }
+
+    /// Waits for the next handler to complete; `None` when none are running.
+    async fn next(&mut self) -> Option<(PendingMessage, Outcome)> {
+        while let Some(joined) = self.tasks.join_next_with_id().await {
+            if let Some(done) = self.settle(joined) {
+                return Some(done);
+            }
+        }
+        None
+    }
+
+    /// Entries whose handler has not completed. Their tasks keep running.
+    fn take_remaining(&mut self) -> Vec<PendingMessage> {
+        self.tasks.detach_all();
+        self.pending.drain().map(|(_, entry)| entry).collect()
+    }
+
+    fn settle(
+        &mut self,
+        joined: std::result::Result<(tokio::task::Id, Outcome), tokio::task::JoinError>,
+    ) -> Option<(PendingMessage, Outcome)> {
+        let (id, outcome) = match joined {
+            Ok(done) => done,
+            Err(e) => {
+                warn!(error = %e, "handler task panicked or was aborted, retrying message");
+                (e.id(), Outcome::Retry)
+            }
+        };
+        self.pending.remove(&id).map(|entry| (entry, outcome))
+    }
+}
+
+impl Drop for InFlight {
+    // Handlers keep running to completion when the loop exits early.
+    fn drop(&mut self) {
+        self.tasks.detach_all();
+    }
 }
 
 /// SQS's hard cap on messages per `ReceiveMessage`.
@@ -355,7 +427,6 @@ where
     T: Topic,
     H: MessageHandler<T>,
 {
-    let notify = Arc::new(Notify::new());
     let topic: Arc<str> = Arc::from(topology.queue());
     let group: Option<Arc<str>> = options.consumer_group.as_deref().map(Arc::from);
 
@@ -373,7 +444,7 @@ where
         configured.min(10)
     };
 
-    let mut in_flight: VecDeque<PendingMessage> = VecDeque::with_capacity(max_in_flight);
+    let mut in_flight = InFlight::with_capacity(max_in_flight);
     // Received from SQS and dispatched on the next iteration. Each poll requests
     // at most the free handler slots, so nothing waits here across a handler run.
     let mut local_buffer: VecDeque<Message> = VecDeque::with_capacity(receive_batch);
@@ -385,11 +456,13 @@ where
     //   (a) we have a full batch of 10, or
     //   (b) we are about to call ReceiveMessage, or
     //   (c) we are about to wait for a handler to finish, or
-    //   (d) we are shutting down.
+    //   (d) we are shutting down, or
+    //   (e) a non-ack outcome is about to be routed.
     //
-    // A handled message is therefore deleted before the loop next blocks, never
-    // after another handler's full run. In serial mode that is one
-    // DeleteMessageBatch per message.
+    // A handler's receipt joins the batch when that handler completes, whatever
+    // order the messages were received in, so a handled message is deleted
+    // before the loop next blocks. In serial mode that is one DeleteMessageBatch
+    // per message.
     let mut pending_acks: Vec<String> = Vec::with_capacity(10);
 
     info!(
@@ -398,83 +471,21 @@ where
     );
 
     loop {
-        // ── Drain completed messages from the front, preserving order ──
-        //
-        // Accumulate consecutive Ack receipts in `pending_acks`.  They will be
-        // flushed as a single DeleteMessageBatch call before the next
-        // ReceiveMessage poll.  Non-Ack outcomes (Retry/Reject/Defer) are
-        // routed individually because they need separate SQS operations.
-        while let Some(front) = in_flight.front_mut() {
-            match front.outcome_rx.try_recv() {
-                Ok(Outcome::Ack) => {
-                    let msg = in_flight.pop_front().expect("in_flight was just peeked");
-                    debug!(queue_url, receipt_handle = %msg.receipt_handle, "message acked (pending flush)");
-                    pending_acks.push(msg.receipt_handle);
-                    // Flush immediately once we have a full batch.
-                    if pending_acks.len() >= 10 {
-                        let batch_size = pending_acks.len();
-                        debug!(queue_url, batch_size, "flushing full ack batch");
-                        router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks))
-                            .await;
-                    }
-                }
-                Ok(outcome) => {
-                    // Flush accumulated acks before routing a non-ack outcome.
-                    if !pending_acks.is_empty() {
-                        let batch_size = pending_acks.len();
-                        debug!(
-                            queue_url,
-                            batch_size,
-                            ?outcome,
-                            "flushing ack batch before non-ack outcome"
-                        );
-                        router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks))
-                            .await;
-                    }
-                    let msg = in_flight.pop_front().expect("in_flight was just peeked");
-                    debug!(queue_url, ?outcome, "message handled");
-                    route_outcome(
-                        sqs,
-                        queue_url,
-                        &msg.receipt_handle,
-                        &msg.msg,
-                        outcome,
-                        topology,
-                        msg.retry_count,
-                        group.as_deref(),
-                    )
-                    .await;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Closed) => {
-                    // Handler task panicked — treat as retry.
-                    if !pending_acks.is_empty() {
-                        let batch_size = pending_acks.len();
-                        debug!(
-                            queue_url,
-                            batch_size, "flushing ack batch after handler panic"
-                        );
-                        router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks))
-                            .await;
-                    }
-                    let msg = in_flight.pop_front().expect("in_flight was just peeked");
-                    warn!(queue_url, "handler task panicked, retrying message");
-                    route_outcome(
-                        sqs,
-                        queue_url,
-                        &msg.receipt_handle,
-                        &msg.msg,
-                        Outcome::Retry,
-                        topology,
-                        msg.retry_count,
-                        group.as_deref(),
-                    )
-                    .await;
-                }
-            }
+        // ── Settle every handler that has completed, in completion order ──
+        while let Some((done, outcome)) = in_flight.try_next() {
+            settle_completed(
+                sqs,
+                queue_url,
+                topology,
+                group.as_deref(),
+                done,
+                outcome,
+                &mut pending_acks,
+            )
+            .await;
         }
         options.processing.store(
-            !in_flight.is_empty() || !local_buffer.is_empty(),
+            in_flight.len() > 0 || !local_buffer.is_empty(),
             Ordering::Release,
         );
 
@@ -485,12 +496,7 @@ where
                 local_buffer.len(),
                 in_flight.len()
             );
-            // Flush any deferred acks before requeuing.
-            if !pending_acks.is_empty() {
-                let batch_size = pending_acks.len();
-                debug!(queue_url, batch_size, "flushing ack batch on shutdown");
-                router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks)).await;
-            }
+            flush_acks(sqs, queue_url, &mut pending_acks, "on shutdown").await;
             // Messages in the local buffer were received (invisible in SQS) but
             // never dispatched.  Make them visible again so they can be redelivered.
             for msg in local_buffer.drain(..) {
@@ -500,57 +506,48 @@ where
             }
             // When a `handler_timeout` is set the handler is already bounded by
             // it and resolves its own timeout; this wait is only a backstop so
-            // shutdown cannot hang on a channel that never delivers. Hence the
+            // shutdown cannot hang on a handler that never completes. Hence the
             // grace, and hence resolving to the *configured* timeout outcome
             // rather than assuming Retry. With deadlines disabled the handler is
             // still running when this fires, so `drain_timeout_outcome` keeps
             // the backstop at Retry — see its docs.
             let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
-            // Collect Acks into a batch; non-Ack outcomes still need
-            // per-message routing (Retry/Reject/Defer touch distinct queues).
-            let mut drain_acks: Vec<String> = Vec::with_capacity(in_flight.len());
-            for pending in in_flight {
-                let outcome = tokio::time::timeout(drain_timeout, pending.outcome_rx)
-                    .await
-                    .unwrap_or_else(|_| {
-                        let resolved = drain_timeout_outcome(
-                            options.handler_timeout,
-                            options.handler_timeout_outcome.clone(),
-                        );
-                        warn!(
-                            queue_url,
-                            outcome = ?resolved,
-                            "handler outcome did not arrive within the shutdown drain"
-                        );
-                        Ok(resolved)
-                    })
-                    // A closed channel means the handler task panicked or was
-                    // aborted: no outcome exists, so redeliver.
-                    .unwrap_or(Outcome::Retry);
-                if matches!(outcome, Outcome::Ack) {
-                    drain_acks.push(pending.receipt_handle);
-                } else {
-                    route_outcome(
-                        sqs,
-                        queue_url,
-                        &pending.receipt_handle,
-                        &pending.msg,
-                        outcome,
-                        topology,
-                        pending.retry_count,
-                        group.as_deref(),
-                    )
-                    .await;
-                }
-            }
-            if !drain_acks.is_empty() {
-                let batch_size = drain_acks.len();
-                debug!(
+            while let Ok(Some((done, outcome))) =
+                tokio::time::timeout(drain_timeout, in_flight.next()).await
+            {
+                settle_completed(
+                    sqs,
                     queue_url,
-                    batch_size, "flushing ack batch on drain completion"
-                );
-                router::route_ack_batch(sqs, queue_url, drain_acks).await;
+                    topology,
+                    group.as_deref(),
+                    done,
+                    outcome,
+                    &mut pending_acks,
+                )
+                .await;
             }
+            for done in in_flight.take_remaining() {
+                let resolved = drain_timeout_outcome(
+                    options.handler_timeout,
+                    options.handler_timeout_outcome.clone(),
+                );
+                warn!(
+                    queue_url,
+                    outcome = ?resolved,
+                    "handler outcome did not arrive within the shutdown drain"
+                );
+                settle_completed(
+                    sqs,
+                    queue_url,
+                    topology,
+                    group.as_deref(),
+                    done,
+                    resolved,
+                    &mut pending_acks,
+                )
+                .await;
+            }
+            flush_acks(sqs, queue_url, &mut pending_acks, "on drain completion").await;
             return Ok(());
         }
 
@@ -631,23 +628,24 @@ where
                 retry_count = metadata.retry_count,
                 "dispatching message to handler"
             );
-            let rx = spawn_handler::<T, H>(
+            let running = handler_future::<T, H>(
                 handler,
                 ctx,
                 message,
                 metadata,
                 options.handler_timeout,
                 options.handler_timeout_outcome.clone(),
-                &notify,
                 Arc::clone(&topic),
                 group.clone(),
             );
-            in_flight.push_back(PendingMessage {
-                receipt_handle,
-                msg: Arc::new(msg),
-                retry_count,
-                outcome_rx: rx,
-            });
+            in_flight.spawn(
+                running,
+                PendingMessage {
+                    receipt_handle,
+                    msg: Arc::new(msg),
+                    retry_count,
+                },
+            );
             options.processing.store(true, Ordering::Relaxed);
         }
 
@@ -662,12 +660,7 @@ where
             None
         };
         if let Some(max_messages) = receive_size {
-            // Flush deferred acks before blocking on ReceiveMessage.
-            if !pending_acks.is_empty() {
-                let batch_size = pending_acks.len();
-                debug!(queue_url, batch_size, "flushing ack batch before poll");
-                router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks)).await;
-            }
+            flush_acks(sqs, queue_url, &mut pending_acks, "before poll").await;
 
             // Always use wait_time_seconds=0 (short poll, returns immediately).
             //
@@ -723,17 +716,77 @@ where
 
         // ── Wait for progress ──
         if in_flight.len() >= max_in_flight {
-            if !pending_acks.is_empty() {
-                let batch_size = pending_acks.len();
-                debug!(queue_url, batch_size, "flushing ack batch before waiting");
-                router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks)).await;
+            flush_acks(sqs, queue_url, &mut pending_acks, "before waiting").await;
+            // All handler slots occupied — settle whichever handler completes next.
+            if let Some((done, outcome)) = in_flight.next().await {
+                settle_completed(
+                    sqs,
+                    queue_url,
+                    topology,
+                    group.as_deref(),
+                    done,
+                    outcome,
+                    &mut pending_acks,
+                )
+                .await;
             }
-            // All handler slots occupied — wait for the next completion.
-            notify.notified().await;
         }
         // If in_flight is empty and local_buffer is also empty, the outer loop
         // will fall through to the poll branch on the next iteration.
     }
+}
+
+/// Sends the accumulated ack receipts as one DeleteMessageBatch.
+async fn flush_acks(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    pending_acks: &mut Vec<String>,
+    when: &'static str,
+) {
+    if pending_acks.is_empty() {
+        return;
+    }
+    debug!(
+        queue_url,
+        batch_size = pending_acks.len(),
+        when,
+        "flushing ack batch"
+    );
+    router::route_ack_batch(sqs, queue_url, std::mem::take(pending_acks)).await;
+}
+
+/// Settles one completed handler: an Ack joins the pending delete batch, any
+/// other outcome flushes that batch and is routed individually.
+async fn settle_completed(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    topology: &'static QueueTopology,
+    group: Option<&str>,
+    done: PendingMessage,
+    outcome: Outcome,
+    pending_acks: &mut Vec<String>,
+) {
+    if matches!(outcome, Outcome::Ack) {
+        debug!(queue_url, receipt_handle = %done.receipt_handle, "message acked (pending flush)");
+        pending_acks.push(done.receipt_handle);
+        if pending_acks.len() >= 10 {
+            flush_acks(sqs, queue_url, pending_acks, "full batch").await;
+        }
+        return;
+    }
+    flush_acks(sqs, queue_url, pending_acks, "before non-ack outcome").await;
+    debug!(queue_url, ?outcome, "message handled");
+    route_outcome(
+        sqs,
+        queue_url,
+        &done.receipt_handle,
+        &done.msg,
+        outcome,
+        topology,
+        done.retry_count,
+        group,
+    )
+    .await;
 }
 
 /// Route a completed message based on its outcome.
@@ -2881,5 +2934,106 @@ mod receive_request_size_tests {
         assert_eq!(receive_request_size(10, usize::MAX, 0), None);
         assert_eq!(receive_request_size(usize::MAX, 0, usize::MAX), Some(10));
         assert_eq!(receive_request_size(0, 0, 4), None);
+    }
+}
+
+#[cfg(test)]
+mod in_flight_tests {
+    use super::*;
+
+    fn entry(id: &str) -> PendingMessage {
+        PendingMessage {
+            receipt_handle: id.to_string(),
+            msg: Arc::new(Message::builder().build()),
+            retry_count: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn completions_arrive_in_finish_order_and_free_slots_on_take() {
+        let mut in_flight = InFlight::with_capacity(3);
+        let (release, gate) = oneshot::channel::<()>();
+        in_flight.spawn(
+            async move {
+                let _ = gate.await;
+                Outcome::Ack
+            },
+            entry("slow"),
+        );
+        in_flight.spawn(async { Outcome::Retry }, entry("fast-retry"));
+        in_flight.spawn(async { Outcome::Ack }, entry("fast-ack"));
+        assert_eq!(in_flight.len(), 3);
+
+        let mut settled = Vec::new();
+        for _ in 0..2 {
+            let Some((done, outcome)) = in_flight.next().await else {
+                panic!("a fast handler should complete");
+            };
+            settled.push((done.receipt_handle, format!("{outcome:?}")));
+        }
+        settled.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            settled,
+            vec![
+                ("fast-ack".to_string(), "Ack".to_string()),
+                ("fast-retry".to_string(), "Retry".to_string())
+            ]
+        );
+        assert_eq!(in_flight.len(), 1);
+        assert!(in_flight.try_next().is_none());
+
+        let _ = release.send(());
+        let Some((done, outcome)) = in_flight.next().await else {
+            panic!("the released handler should complete");
+        };
+        assert_eq!(done.receipt_handle, "slow");
+        assert!(matches!(outcome, Outcome::Ack));
+        assert_eq!(in_flight.len(), 0);
+        assert!(in_flight.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_panicking_handler_task_settles_as_retry() {
+        let mut in_flight = InFlight::with_capacity(2);
+        in_flight.spawn(async { Outcome::Ack }, entry("ok"));
+        in_flight.spawn(
+            async {
+                if true {
+                    panic!("handler task panic");
+                }
+                Outcome::Ack
+            },
+            entry("boom"),
+        );
+
+        let mut settled = Vec::new();
+        while let Some((done, outcome)) = in_flight.next().await {
+            settled.push((done.receipt_handle, format!("{outcome:?}")));
+        }
+        settled.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            settled,
+            vec![
+                ("boom".to_string(), "Retry".to_string()),
+                ("ok".to_string(), "Ack".to_string())
+            ]
+        );
+        assert_eq!(in_flight.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn take_remaining_returns_only_unfinished_entries() {
+        let mut in_flight = InFlight::with_capacity(2);
+        in_flight.spawn(std::future::pending::<Outcome>(), entry("stuck"));
+        in_flight.spawn(async { Outcome::Ack }, entry("done"));
+        let Some((done, _)) = in_flight.next().await else {
+            panic!("the finished handler should complete");
+        };
+        assert_eq!(done.receipt_handle, "done");
+
+        let remaining = in_flight.take_remaining();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].receipt_handle, "stuck");
+        assert_eq!(in_flight.len(), 0);
     }
 }
