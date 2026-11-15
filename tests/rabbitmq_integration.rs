@@ -7127,6 +7127,9 @@ struct InPlaceHandler {
     dead: Arc<std::sync::Mutex<Vec<u32>>>,
     calls: Arc<std::sync::Mutex<HashMap<u32, u32>>>,
     script: Script,
+    busy: Duration,
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
 }
 
 impl InPlaceHandler {
@@ -7136,7 +7139,20 @@ impl InPlaceHandler {
             dead: Arc::new(std::sync::Mutex::new(Vec::new())),
             calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             script: Arc::new(script),
+            busy: Duration::ZERO,
+            active: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Makes every handling take `busy`, so overlapping runs are observable.
+    fn busy_for(mut self, busy: Duration) -> Self {
+        self.busy = busy;
+        self
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
     }
 
     fn seen(&self) -> Vec<Seen> {
@@ -7193,6 +7209,10 @@ impl<T: Topic<Message = OrderMessage>> MessageHandler<T> for InPlaceHandler {
             redelivered: meta.redelivered,
             at: Instant::now(),
         });
+        let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(self.busy).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
         (self.script)(msg.seq, attempt, &meta)
     }
 
@@ -7546,9 +7566,10 @@ async fn sequenced_shutdown_during_a_wait_keeps_the_waiting_message_first() {
     ctx.cleanup().await;
 }
 
-/// A copy parked in a shard hold queue by the previous version, with its key and
-/// retry count in headers, comes back, is handled under its real key, and any
-/// further retry waits in place.
+/// A copy parked in a shard hold queue by the released version carries only the
+/// retry count and message id. It returns with the shard queue's name as routing
+/// key, is handled under the key its payload yields, and any further retry waits
+/// in place, serialized with a later message for that key.
 #[tokio::test]
 async fn sequenced_hold_queue_copy_from_the_previous_version_is_handled_under_its_key() {
     let ctx = TestContext::new().await;
@@ -7568,12 +7589,8 @@ async fn sequenced_hold_queue_copy_from_the_previous_version_is_handled_under_it
     let mut headers = FieldTable::default();
     headers.insert("x-retry-count".into(), AMQPValue::LongUInt(1));
     headers.insert(
-        "shove-sequence-key".into(),
-        AMQPValue::LongString("ACC-UP".into()),
-    );
-    headers.insert(
-        "shove-retry-token".into(),
-        AMQPValue::LongString("token-minted-by-the-previous-version".into()),
+        "x-message-id".into(),
+        AMQPValue::LongString("id-from-the-previous-version".into()),
     );
     raw_channel
         .basic_publish(
@@ -7606,6 +7623,132 @@ async fn sequenced_hold_queue_copy_from_the_previous_version_is_handled_under_it
     );
     let counts: Vec<u32> = handler.seen().iter().map(|s| s.retry_count).collect();
     assert_eq!(counts, vec![1, 2, 0]);
+
+    shutdown.cancel();
+    consumer.await.unwrap().unwrap();
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+/// A default-exchange delivery to the shard queue is attributed by its payload,
+/// whatever `shove-sequence-key` names.
+#[tokio::test]
+async fn sequenced_key_of_a_returning_delivery_comes_from_its_payload_not_a_header() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology().declare::<InPlaceForgedOrders>().await.unwrap();
+    let publisher = b.publisher().await.unwrap();
+    let handler = InPlaceHandler::new(retry_first_handling_of(1));
+
+    let shutdown = CancellationToken::new();
+    let consumer =
+        spawn_in_place_consumer::<InPlaceForgedOrders>(&client, &handler, shutdown.clone(), 5);
+    publish_order::<InPlaceForgedOrders>(&publisher, "ACC-PAYLOAD", 1).await;
+    handler.wait_handled(1, 30).await;
+
+    let mut headers = FieldTable::default();
+    headers.insert(
+        "shove-sequence-key".into(),
+        AMQPValue::LongString("ACC-SOMEONE-ELSE".into()),
+    );
+    let raw_channel = client.create_confirm_channel().await.unwrap();
+    raw_channel
+        .basic_publish(
+            "".into(),
+            "test-in-place-forged-seq-0".into(),
+            BasicPublishOptions::default(),
+            br#"{"account":"ACC-PAYLOAD","seq":60}"#,
+            lapin::BasicProperties::default()
+                .with_delivery_mode(2)
+                .with_content_type("application/json".into())
+                .with_headers(headers),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    handler.wait_handled(3, 30).await;
+    assert_eq!(
+        handler.order(),
+        vec![1, 1, 60],
+        "the delivery waits behind the key its payload names"
+    );
+
+    shutdown.cancel();
+    consumer.await.unwrap().unwrap();
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+/// The broker closes the connection while a key waits: the waiting message and
+/// the one buffered behind it are redelivered, handled once more each, in order,
+/// and never at the same time.
+#[tokio::test]
+async fn sequenced_connection_loss_during_a_wait_redelivers_in_order_without_overlap() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology()
+        .declare::<InPlaceRestartOrders>()
+        .await
+        .unwrap();
+    let publisher = b.publisher().await.unwrap();
+    let handler =
+        InPlaceHandler::new(retry_first_handling_of(1)).busy_for(Duration::from_millis(400));
+
+    let shutdown = CancellationToken::new();
+    let consumer =
+        spawn_in_place_consumer::<InPlaceRestartOrders>(&client, &handler, shutdown.clone(), 5);
+    publish_order::<InPlaceRestartOrders>(&publisher, "ACC-LOSS", 1).await;
+    handler.wait_handled(1, 30).await;
+    publish_order::<InPlaceRestartOrders>(&publisher, "ACC-LOSS", 2).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let http = reqwest::Client::new();
+    // The management API reports connections on its stats interval.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let connections = loop {
+        let all: Vec<serde_json::Value> = http
+            .get(format!("{}/api/connections", ctx.mgmt_url))
+            .basic_auth("guest", Some("guest"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ours: Vec<serde_json::Value> = all
+            .into_iter()
+            .filter(|c| c["vhost"].as_str() == Some(ctx.vhost.as_str()))
+            .collect();
+        if !ours.is_empty() {
+            break ours;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the consumer's connection never listed"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    for connection in connections {
+        let name = connection["name"].as_str().unwrap().to_string();
+        let mut url = reqwest::Url::parse(&ctx.mgmt_url).unwrap();
+        url.path_segments_mut()
+            .unwrap()
+            .extend(["api", "connections", name.as_str()]);
+        http.delete(url)
+            .basic_auth("guest", Some("guest"))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    handler.wait_handled(3, 60).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(handler.order(), vec![1, 1, 2]);
+    assert_eq!(handler.peak(), 1, "two handler runs overlapped");
 
     shutdown.cancel();
     consumer.await.unwrap().unwrap();

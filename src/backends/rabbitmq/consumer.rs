@@ -28,7 +28,7 @@ use crate::backend::batch_consumer::{
 use crate::backend::broadcast::BROADCAST_DEFER_DELAY;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::{
-    delivery_sequence_key, extract_dead_metadata, extract_message_metadata, get_retry_count,
+    extract_dead_metadata, extract_message_metadata, get_retry_count, is_hold_queue_return,
 };
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::backends::rabbitmq::router;
@@ -416,6 +416,32 @@ fn start_retry_timer(
     guard
 }
 
+/// Fails with a retryable connection error once the loop's channel is closed, so
+/// the caller reconnects and the broker's redelivery is handled fresh.
+fn ensure_channel_open(publisher: &ChannelPublisher, queue: &str) -> Result<()> {
+    if publisher.is_open() {
+        Ok(())
+    } else {
+        Err(ShoveError::Connection(format!(
+            "channel closed while consuming {queue}; its un-acked deliveries were requeued"
+        )))
+    }
+}
+
+/// Longest retry delay a sequenced consumer holds a delivery un-acked for before
+/// it warns. Conservative against the broker's `consumer_timeout`, which closes
+/// the channel of a consumer that leaves a delivery un-acked for too long.
+const LONG_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
+
+/// The longest hold delay of `hold_queues` when it exceeds [`LONG_RETRY_DELAY`].
+fn risky_retry_delay(hold_queues: &[HoldQueue]) -> Option<Duration> {
+    hold_queues
+        .iter()
+        .map(HoldQueue::delay)
+        .max()
+        .filter(|delay| *delay > LONG_RETRY_DELAY)
+}
+
 /// Gives back one handler slot. Every release pairs with a claim, so a zero
 /// count is a broken invariant: it is reported and left at zero.
 fn release_slot(count: &mut usize) {
@@ -456,7 +482,7 @@ impl RabbitMqConsumer {
         shard_hold_queues: Vec<HoldQueue>,
     ) -> Result<()>
     where
-        T: Topic,
+        T: SequencedTopic,
         H: MessageHandler<T>,
     {
         let mut poisoned_keys = HashSet::new();
@@ -537,7 +563,7 @@ impl RabbitMqConsumer {
         pending_deliveries: &mut HashMap<String, VecDeque<ReceivedDelivery>>,
     ) -> Result<ChannelPublisher>
     where
-        T: Topic,
+        T: SequencedTopic,
         H: MessageHandler<T>,
     {
         let prefetch = options.prefetch_count;
@@ -572,6 +598,9 @@ impl RabbitMqConsumer {
         loop {
             // ── Drain completed handlers and expired retry timers ──
             while let Ok(key) = completed_rx.try_recv() {
+                // A closed channel means the broker has requeued every delivery
+                // this loop holds: handling one again would run a stale copy.
+                ensure_channel_open(&publisher, queue)?;
                 let Some(state) = key_states.remove(&key) else {
                     continue;
                 };
@@ -883,8 +912,36 @@ impl RabbitMqConsumer {
 
                 item = stream.next(), if can_accept => {
                     let received = ReceivedDelivery::new(unwrap_delivery(item, queue)?);
+                    // A hold-queue return carries the shard queue's name as routing
+                    // key, so its key comes from the payload, through the function
+                    // the publisher routes with. Only returns pay this second decode.
+                    let seq_key = if is_hold_queue_return(&received.delivery, queue) {
+                        match <T::Codec as crate::Codec<T::Message>>::decode_owned(
+                            received.payload.clone(),
+                        ) {
+                            Ok(message) => T::sequence_key(&message),
+                            Err(err) => {
+                                // No key to derive, so no key's state is touched.
+                                error!(
+                                    error = %err,
+                                    queue = %queue,
+                                    "failed to deserialize a message returned from a hold queue"
+                                );
+                                router::route_reject(
+                                    &received.delivery,
+                                    topology,
+                                    &publisher,
+                                    group.as_deref(),
+                                    metrics::FailReason::Deserialize,
+                                )
+                                .await?;
+                                continue;
+                            }
+                        }
+                    } else {
+                        received.delivery.routing_key.to_string()
+                    };
                     let delivery = &received.delivery;
-                    let seq_key = delivery_sequence_key(delivery, queue);
                     let retry_count = get_retry_count(delivery);
 
                     // ── FailAll: skip poisoned keys ──
@@ -2083,6 +2140,15 @@ impl RabbitMqConsumer {
         })?;
 
         let on_failure = seq.on_failure();
+        if let Some(delay) = risky_retry_delay(topology.hold_queues()) {
+            warn!(
+                topic = topology.queue(),
+                retry_delay = ?delay,
+                "a sequenced retry holds its delivery un-acked for this long; the broker closes \
+                 the channel of a consumer whose delivery stays un-acked past its consumer_timeout, \
+                 so keep retry delays well below that"
+            );
+        }
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
         let prefetch = options.prefetch_count;
@@ -2996,6 +3062,21 @@ mod tests {
                 delay: Duration::from_secs(5),
                 retry_count: 1_001
             }
+        );
+    }
+
+    #[test]
+    fn only_a_delay_past_the_threshold_is_risky() {
+        assert_eq!(risky_retry_delay(&[]), None);
+        let secs = |s: u64| ladder(&[s]);
+        assert_eq!(risky_retry_delay(&secs(900)), None);
+        assert_eq!(
+            risky_retry_delay(&secs(901)),
+            Some(Duration::from_secs(901))
+        );
+        assert_eq!(
+            risky_retry_delay(&ladder(&[1, 3600, 5])),
+            Some(Duration::from_secs(3600))
         );
     }
 

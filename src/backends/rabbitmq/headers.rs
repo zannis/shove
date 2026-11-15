@@ -22,15 +22,14 @@ pub const MESSAGE_ID_KEY: &str = "x-message-id";
 /// the dead-letter metadata.
 const DEATH_KEY: &str = "x-death";
 
-/// Header the previous version minted on a sequenced hold-queue copy. This
-/// version neither writes nor reads it, and only hides it from handlers on a
-/// copy parked before an upgrade.
+/// Header an unreleased build minted on sequenced hold-queue copies. Nothing
+/// reads or writes it now. It stays reserved on publish and hidden from
+/// handlers.
 pub(crate) const RETRY_TOKEN_KEY: &str = "shove-retry-token";
 
-/// Header carrying the sequence key of a hold-queue copy the previous version
-/// parked. Such a copy dead-letters back with the shard queue name as its
-/// routing key, so this is the only place its key survives. Read only to
-/// handle those copies; hidden from handlers.
+/// Header an unreleased build stamped on sequenced hold-queue copies. Nothing
+/// reads or writes it now. It stays reserved on publish and hidden from
+/// handlers so a copy that carries it never leaks it.
 pub(crate) const SEQUENCE_KEY_HEADER: &str = "shove-sequence-key";
 
 /// Header names this backend writes or reads back as its own. A new one belongs
@@ -71,34 +70,20 @@ pub(crate) fn get_retry_count(delivery: &Delivery) -> u32 {
     }
 }
 
-/// The sequence key of a delivery.
+/// Whether a delivery came back from a hold queue.
 ///
-/// Only a copy that the previous version parked in a shard hold queue needs the
-/// header: sequenced retries no longer publish one. Such a return is
-/// dead-lettered through the default exchange (the
-/// empty exchange name, see `hold_queue_args`) with the shard queue's own name
-/// as routing key; only such a delivery takes its key from the key header.
-/// The broker reports the exchange, so a producer cannot forge it through
-/// headers. Any other delivery, including every one that arrives through the
-/// topic's hash exchange, uses its routing key. A return whose header is
-/// missing or not a string (parked by a version before the header existed)
-/// also uses the routing key. A producer that publishes straight to the shard
-/// queue through the default exchange can file a message under any key this
-/// way; shard queues must not be writable by untrusted publishers.
-pub(crate) fn delivery_sequence_key(delivery: &Delivery, shard_queue: &str) -> String {
-    let is_return =
-        delivery.exchange.as_str().is_empty() && delivery.routing_key.as_str() == shard_queue;
-    let from_header = delivery
-        .properties
-        .headers()
-        .as_ref()
-        .filter(|_| is_return)
-        .and_then(|t| match t.inner().get(SEQUENCE_KEY_HEADER) {
-            Some(AMQPValue::LongString(s)) => Some(long_string_to_owned(s)),
-            Some(AMQPValue::ShortString(s)) => Some(s.to_string()),
-            _ => None,
-        });
-    from_header.unwrap_or_else(|| delivery.routing_key.to_string())
+/// A hold-queue copy dead-letters through the default exchange (the empty
+/// exchange name, see `hold_queue_args`) with the shard queue's own name as
+/// routing key, so its routing key says nothing about its sequence key. The
+/// broker reports the exchange, so a producer cannot forge it through headers.
+/// Every other delivery, including every one that arrives through the topic's
+/// hash exchange, has its sequence key as routing key. The consumer derives the
+/// key of a return from its payload. A producer that publishes straight to the
+/// shard queue through the default exchange looks like a return and is filed
+/// under the key its payload yields; shard queues must not be writable by
+/// untrusted publishers.
+pub(crate) fn is_hold_queue_return(delivery: &Delivery, shard_queue: &str) -> bool {
+    delivery.exchange.as_str().is_empty() && delivery.routing_key.as_str() == shard_queue
 }
 
 pub(crate) fn extract_message_metadata(delivery: &Delivery) -> MessageMetadata {
@@ -349,59 +334,31 @@ mod tests {
         delivery
     }
 
-    fn key_table(value: AMQPValue, with_death: bool) -> FieldTable {
+    #[test]
+    fn only_a_default_exchange_delivery_routed_to_the_shard_queue_is_a_return() {
+        assert!(is_hold_queue_return(
+            &delivery_with("", "q-seq-0", None),
+            "q-seq-0"
+        ));
+        assert!(!is_hold_queue_return(
+            &delivery_with("t-seq-hash", "q-seq-0", None),
+            "q-seq-0"
+        ));
+        assert!(!is_hold_queue_return(
+            &delivery_with("", "K", None),
+            "q-seq-0"
+        ));
+    }
+
+    fn key_table(value: AMQPValue) -> FieldTable {
         let mut table = FieldTable::default();
         table.insert(ShortString::from(SEQUENCE_KEY_HEADER), value);
-        if with_death {
-            table.insert(
-                ShortString::from(DEATH_KEY),
-                AMQPValue::FieldArray(vec![AMQPValue::FieldTable(FieldTable::default())].into()),
-            );
-        }
         table
     }
 
     #[test]
-    fn delivery_through_the_hash_exchange_ignores_a_forged_key_header() {
-        // Even with the shard queue's name as routing key and a forged x-death.
-        let forged = key_table(AMQPValue::LongString("J".into()), true);
-        let delivery = delivery_with("t-seq-hash", "q-seq-0", Some(forged));
-        assert_eq!(delivery_sequence_key(&delivery, "q-seq-0"), "q-seq-0");
-        let forged = key_table(AMQPValue::LongString("J".into()), false);
-        let delivery = delivery_with("t-seq-hash", "K", Some(forged));
-        assert_eq!(delivery_sequence_key(&delivery, "q-seq-0"), "K");
-    }
-
-    #[test]
-    fn default_exchange_delivery_for_another_queue_ignores_the_header() {
-        let table = key_table(AMQPValue::LongString("J".into()), true);
-        let delivery = delivery_with("", "K", Some(table));
-        assert_eq!(delivery_sequence_key(&delivery, "q-seq-0"), "K");
-    }
-
-    #[test]
-    fn returning_delivery_takes_its_key_from_the_header() {
-        let table = key_table(AMQPValue::LongString("K".into()), true);
-        let returning = delivery_with("", "q-seq-0", Some(table));
-        assert_eq!(delivery_sequence_key(&returning, "q-seq-0"), "K");
-    }
-
-    #[test]
-    fn returning_delivery_without_a_usable_header_uses_the_routing_key() {
-        let missing = delivery_with("", "q-seq-0", None);
-        assert_eq!(delivery_sequence_key(&missing, "q-seq-0"), "q-seq-0");
-        let wrong = key_table(AMQPValue::LongUInt(7), true);
-        let delivery = delivery_with("", "q-seq-0", Some(wrong));
-        assert_eq!(delivery_sequence_key(&delivery, "q-seq-0"), "q-seq-0");
-    }
-
-    #[test]
     fn sequence_key_header_is_hidden_from_handlers() {
-        let mut table = FieldTable::default();
-        table.insert(
-            ShortString::from(SEQUENCE_KEY_HEADER),
-            AMQPValue::LongString("K".into()),
-        );
+        let table = key_table(AMQPValue::LongString("K".into()));
         let delivery = delivery_with("", "q", Some(table));
         assert!(!extract_string_headers(&delivery).contains_key(SEQUENCE_KEY_HEADER));
     }
