@@ -116,11 +116,31 @@ Batching on SQS therefore amortises a sink's per-flush cost (one DB transaction,
 
 Whole-batch `Retry`/`Defer` redelivers by resetting every buffered message's visibility timeout to the shared escalating backoff's next delay, rather than deleting and re-sending — topology `hold_queues` do not apply to batch redelivery. `Reject` resets visibility to 0 immediately and relies entirely on the queue's AWS-side redrive policy (`maxReceiveCount`) to move the batch to a DLQ; shove never publishes to a DLQ itself on this backend, so until redrive fires, the handler will keep re-seeing the same rejected batch on the next flush.
 
-Keep `max_batch_age + handler_timeout` well under the queue's `VisibilityTimeout` (SQS's own default is 30s). A message must be accumulated, flushed and settled before visibility elapses, or it turns visible mid-flush, a sibling consumer picks it up, and you get duplicate processing.
+While a batch accumulates and while its handler runs, shove keeps the batch's messages hidden (see [Held messages](#held-messages)), so `max_batch_age` and the batch handler's run time are not limited by the queue's `VisibilityTimeout`.
+
+## Held messages
+
+SQS hides a message from other consumers for the queue's `VisibilityTimeout` from the moment it is received. Two consume paths keep received messages locally before their handler runs:
+
+- A sequenced consumer buffers a message whose key is busy, either because a handler is running for the key or because the key waits for a retry to return.
+- A batch consumer holds messages from the first one received until the batch flushes, and keeps them while the batch handler runs.
+
+For these messages shove extends the visibility itself. Each consumer reads the queue's `VisibilityTimeout` once when it starts. Every half of that timeout it sets each held message's visibility to the full timeout again, so waiting in a buffer never makes SQS redeliver a message and never raises its `ApproximateReceiveCount`, which a sequenced consumer uses as the retry count. Shutdown releases the buffered messages first, before it waits for any running handler, and the extension stops before it does.
+
+The extension costs two kinds of `ChangeMessageVisibilityBatch` request. The periodic heartbeat sends one request per 10 held messages every half timeout, 4 requests per minute per 10 held messages on a queue with the default 30s timeout. A batch consumer also sends one request at every non-empty flush, before the handler runs, so a workload of frequent small batches adds one request per flush. A consumer that holds nothing sends none. A failed request is logged at `warn`, counted in `shove_backend_errors_total{backend="sns_sqs",kind="consume"}` and retried on the next tick. Each request is bounded to a quarter of the extension period (at most 5 seconds), and a round of requests to half of it, so a slow SQS endpoint cannot stall the consume loop for longer. A request that times out does not stop the requests after it, and a round that runs out of time resumes at the first unsent request on the next tick. Every held message is covered in each round while the requests for all of them fit in half the period: at the default 30s timeout and 50ms per request that is about 1500 held messages per queue consumer. Past that, the tail of a very large buffer can lapse, so bound a sequenced topic's buffer with `max_pending_per_key`. When SQS reports a buffered message's receipt handle as invalid, the message was already redelivered, and a sequenced consumer drops it and the messages queued behind it for the same key and releases them, so they are received again in order under fresh handles.
+
+The extension is best-effort. It runs between the consumer's own SQS calls, so it keeps held messages hidden while those calls return within roughly half the queue's visibility timeout. A consumer whose calls stall for longer than that can still see a held message redelivered, which the at-least-once contract already allows. The same window applies when a buffered message is dispatched: shove does not re-validate its receipt handle first, so between a failed or late extension and the next heartbeat's stale-handle drop, a message that another consumer has since received can also be handled here. On a sequenced topic that is a rare duplicate or overlap for the key, not a loss.
+
+Two limits apply:
+
+- A handler that is running for a single message, on a standard or a sequenced consumer, is not extended. A handler that outlasts the queue's `VisibilityTimeout` is redelivered to another consumer as before, so keep `with_handler_timeout` below it.
+- A queue with a `VisibilityTimeout` of 0 hides nothing, so there is nothing to extend, and shove logs a warning at start.
+
+A sequenced or batch consumer fails to start when it cannot read the queue's attributes, which needs `sqs:GetQueueAttributes` on the queue. The IAM list under [Gotchas](#gotchas) already includes it.
 
 ## Gotchas
 
-- **Visibility timeout must be greater than handler timeout.** If the handler takes longer than the visibility timeout, the message becomes re-visible on the queue and will be delivered again while the original handler is still running. Set both values consciously.
+- **Visibility timeout must be greater than handler timeout.** If a single-message handler takes longer than the visibility timeout, the message becomes re-visible on the queue and will be delivered again while the original handler is still running. Set both values consciously. Messages held in a sequenced buffer or an accumulating batch are the exception: see [Held messages](#held-messages).
 - **FIFO 300 msg/s default cap.** High-throughput sequenced topics may require quota increases via the AWS console. Standard (non-FIFO) SQS queues have no ordering guarantee and much higher throughput limits.
 - **LocalStack endpoint is for local dev only.** The `SnsConfig::endpoint_url` field should be omitted in production; it exists solely to redirect traffic to a local emulator.
 - **Region matters.** SQS queues are regional. Cross-region fan-out requires explicit SNS topic ARN configuration — shove does not automatically route across regions.

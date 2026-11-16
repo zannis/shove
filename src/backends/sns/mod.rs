@@ -16,3 +16,5 @@ pub mod registry;
 pub(crate) mod router;
 #[cfg(feature = "aws-sns-sqs")]
 pub mod stats;
+#[cfg(feature = "aws-sns-sqs")]
+pub(crate) mod visibility;
