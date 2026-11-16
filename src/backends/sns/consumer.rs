@@ -1150,22 +1150,17 @@ where
             Ok(()) => {
                 // Graceful shutdown — release buffered-but-unprocessed messages
                 // back to the queue so another consumer can pick them up.
-                for (_key, msgs) in pending_deliveries.drain() {
-                    for msg in msgs {
-                        let rh = msg.receipt_handle().unwrap_or_default();
-                        router::route_requeue(sqs, queue_url, rh).await;
-                    }
-                }
+                requeue_pending(sqs, queue_url, &mut pending_deliveries).await;
                 return Ok(());
             }
             Err(e) => {
+                // Release the buffered messages now: the heartbeat may have
+                // just extended them, and they would stay hidden for a full
+                // visibility timeout.
+                requeue_pending(sqs, queue_url, &mut pending_deliveries).await;
                 if options.shutdown.is_cancelled() {
-                    pending_deliveries.clear();
                     return Ok(());
                 }
-                // On reconnect, clear pending — visibility will expire and SQS
-                // will redeliver them.
-                pending_deliveries.clear();
                 attempts += 1;
                 if let Some(max) = options.max_reconnect_attempts
                     && attempts >= max
@@ -1737,6 +1732,22 @@ where
     }
 }
 
+/// Requeues every buffered message (visibility 0) and empties the buffers.
+/// They were never dispatched, so releasing them is their whole outcome, not
+/// a rejection.
+async fn requeue_pending(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    pending_deliveries: &mut HashMap<String, VecDeque<Message>>,
+) {
+    for (_key, msgs) in pending_deliveries.drain() {
+        for msg in msgs {
+            let rh = msg.receipt_handle().unwrap_or_default();
+            router::route_requeue(sqs, queue_url, rh).await;
+        }
+    }
+}
+
 /// Releases the buffered messages, then settles the running handlers.
 ///
 /// The buffered ones go first: they were never dispatched, so a visibility-0
@@ -1751,15 +1762,7 @@ async fn drain_on_shutdown(
     key_states: HashMap<String, KeyState>,
     pending_deliveries: &mut HashMap<String, VecDeque<Message>>,
 ) {
-    // Pending deliveries: change visibility to 0 so they are redelivered.
-    // These were buffered but never dispatched, so this is a requeue,
-    // not a rejection — matching the standard and concurrent loops.
-    for (_key, msgs) in pending_deliveries.drain() {
-        for msg in msgs {
-            let rh = msg.receipt_handle().unwrap_or_default();
-            router::route_requeue(sqs, queue_url, rh).await;
-        }
-    }
+    requeue_pending(sqs, queue_url, pending_deliveries).await;
 
     // Wait for all in-flight handlers to complete. Same backstop as
     // the standard consumer's drain: the handler is already bounded
@@ -3920,5 +3923,73 @@ mod local_endpoint_tests {
         shutdown.cancel();
         run.abort();
         assert!(extended, "no extension while the receive was stalled");
+    }
+
+    struct Blocked;
+    impl MessageHandler<HeldTopic> for Blocked {
+        type Context = ();
+        async fn handle(&self, _: String, _: MessageMetadata, _: &()) -> Outcome {
+            std::future::pending().await
+        }
+    }
+
+    /// The second receive fails while a message is buffered behind the key the
+    /// first one is running: the buffered handle is requeued before the loop
+    /// reconnects.
+    #[tokio::test]
+    async fn a_receive_error_releases_the_buffered_messages() {
+        let message = |id: &str| {
+            format!(
+                r#"{{"MessageId":"{id}","ReceiptHandle":"handle-{id}","Body":"\"hi\"","Attributes":{{"ApproximateReceiveCount":"1","MessageGroupId":"K"}}}}"#
+            )
+        };
+        let both = format!(r#"{{"Messages":[{},{}]}}"#, message("m1"), message("m2"));
+        let (endpoint, requests) = scripted_endpoint(move |target, nth| {
+            if target.ends_with("receivemessage") {
+                match nth {
+                    0 => (Duration::ZERO, both.clone()),
+                    1 => (Duration::from_millis(300), "not json".to_string()),
+                    _ => (Duration::from_secs(30), r#"{"Messages":[]}"#.to_string()),
+                }
+            } else {
+                (Duration::ZERO, "{}".to_string())
+            }
+        })
+        .await;
+        let sqs = client(&endpoint);
+        let options = crate::ConsumerOptions::<crate::Sqs>::new().into_inner();
+        let topology = HeldTopic::topology();
+        let run = tokio::spawn(async move {
+            let _ = run_sequenced_shard::<HeldTopic, Blocked>(
+                &sqs,
+                "http://queue",
+                "held-stall",
+                topology,
+                &Arc::new(Blocked),
+                &Arc::new(()),
+                &options,
+                SequenceFailure::Skip,
+                None,
+            )
+            .await;
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while position(&requests, "handle-m2").is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let released = requests
+            .lock()
+            .map(|l| {
+                l.iter()
+                    .any(|r| r.contains("changemessagevisibility") && r.contains("handle-m2"))
+            })
+            .unwrap_or(false);
+        run.abort();
+        assert!(
+            released,
+            "the buffered message was not requeued on the receive error"
+        );
+        assert!(position(&requests, "handle-m1").is_none());
     }
 }
