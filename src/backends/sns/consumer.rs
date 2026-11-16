@@ -2564,6 +2564,35 @@ async fn flush_sqs_batch<T, H>(
     }
 }
 
+/// Extends the accumulated batch's handles and schedules the next extension.
+/// A handle SQS reports as redelivered drops its message from the batch.
+async fn extend_accumulating<T: Topic>(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    heartbeat: Heartbeat,
+    batch: &mut SqsBatch<T>,
+    deadline: &mut Option<tokio::time::Instant>,
+    next_extension: &mut Option<tokio::time::Instant>,
+) {
+    let stale = extend_held(sqs, queue_url, heartbeat, &batch.handles, &mut 0).await;
+    if !stale.is_empty() {
+        let dropped = batch.drop_handles(&stale);
+        warn!(
+            queue_url,
+            dropped,
+            "batch messages were redelivered before their visibility was extended, dropping them"
+        );
+        if batch.is_empty() {
+            *deadline = None;
+        }
+    }
+    *next_extension = if batch.is_empty() {
+        None
+    } else {
+        tokio::time::Instant::now().checked_add(heartbeat.period)
+    };
+}
+
 /// The accumulation loop: poll-shaped, not select-shaped — see the module
 /// doc's opening section for why. Runs one attempt; [`SqsConsumer::run_batch_with_inner`]
 /// wraps this in [`run_with_reconnect`] the same way
@@ -2673,42 +2702,63 @@ where
         if let (Some(heartbeat), Some(due)) = (heartbeat, next_extension)
             && tokio::time::Instant::now() >= due
         {
-            let stale = extend_held(sqs, queue_url, heartbeat, &batch.handles, &mut 0).await;
-            if !stale.is_empty() {
-                let dropped = batch.drop_handles(&stale);
-                warn!(
-                    queue_url,
-                    dropped,
-                    "batch messages were redelivered before their visibility was extended, dropping them"
-                );
-                if batch.is_empty() {
-                    deadline = None;
-                }
-            }
-            next_extension = if batch.is_empty() {
-                None
-            } else {
-                tokio::time::Instant::now().checked_add(heartbeat.period)
-            };
+            extend_accumulating(
+                sqs,
+                queue_url,
+                heartbeat,
+                &mut batch,
+                &mut deadline,
+                &mut next_extension,
+            )
+            .await;
         }
 
         // Headroom is always > 0 here: the size-trigger check above already
         // returned/continued when `batch.len() >= max_batch_size`.
-        let headroom = max_batch_size - batch.len();
+        let headroom = i32::try_from(max_batch_size.saturating_sub(batch.len()))
+            .map_err(|e| ShoveError::Validation(format!("batch headroom out of range: {e}")))?;
 
         // Same short-poll + client-side backoff rationale as
         // `consume_loop_concurrent` (see its own comment): a server-side long
         // poll would hold an open connection on LocalStack's serial request
         // handling for the full wait duration, stacking up across consumers.
-        let receive_result = sqs
-            .receive_message()
-            .queue_url(queue_url)
-            .wait_time_seconds(0)
-            .max_number_of_messages(headroom as i32)
-            .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
-            .message_attribute_names("All")
-            .send()
-            .await;
+        let mut receive = std::pin::pin!(
+            sqs.receive_message()
+                .queue_url(queue_url)
+                .wait_time_seconds(0)
+                .max_number_of_messages(headroom)
+                .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
+                .message_attribute_names("All")
+                .send()
+        );
+        // A slow receive (network latency, SDK retry backoff) must not hold
+        // the accumulated batch past its visibility: extend when the timer
+        // wins and keep polling the same, uncancelled receive.
+        let receive_result = loop {
+            let due = heartbeat.and(next_extension);
+            let beat = async move {
+                match due {
+                    Some(due) => tokio::time::sleep_until(due).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                result = &mut receive => break result,
+                () = beat => {
+                    if let Some(heartbeat) = heartbeat {
+                        extend_accumulating(
+                            sqs,
+                            queue_url,
+                            heartbeat,
+                            &mut batch,
+                            &mut deadline,
+                            &mut next_extension,
+                        )
+                        .await;
+                    }
+                }
+            }
+        };
 
         let msgs = match receive_result {
             Ok(output) => output.messages.unwrap_or_default(),
@@ -3612,7 +3662,7 @@ mod held_batch_tests {
 }
 
 #[cfg(test)]
-mod shutdown_order_tests {
+mod local_endpoint_tests {
     use super::*;
     use crate::TopologyBuilder;
     use std::sync::{Mutex, OnceLock};
@@ -3621,9 +3671,21 @@ mod shutdown_order_tests {
 
     type Requests = Arc<Mutex<Vec<String>>>;
 
-    /// A local SQS endpoint that answers every request with `{}` and records
-    /// each as `<x-amz-target> <body>`.
+    /// Reply for the `n`th request of a target (lowercased `x-amz-target`),
+    /// after a delay.
+    type Script = dyn Fn(&str, usize) -> (Duration, String) + Send + Sync;
+
     async fn recording_endpoint() -> (String, Requests) {
+        scripted_endpoint(|_, _| (Duration::ZERO, "{}".to_string())).await
+    }
+
+    /// A local SQS endpoint that records each request as
+    /// `<x-amz-target> <body>` and answers as `script` says.
+    async fn scripted_endpoint(
+        script: impl Fn(&str, usize) -> (Duration, String) + Send + Sync + 'static,
+    ) -> (String, Requests) {
+        let script: Arc<Script> = Arc::new(script);
+        let seen: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let requests: Requests = Arc::default();
@@ -3634,6 +3696,8 @@ mod shutdown_order_tests {
                     return;
                 };
                 let log = log.clone();
+                let script = script.clone();
+                let seen = seen.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -3670,7 +3734,21 @@ mod shutdown_order_tests {
                             l.push(format!("{target} {body}"));
                         }
                         buf.drain(..head_end + len);
-                        let reply = "HTTP/1.1 200 OK\r\ncontent-type: application/x-amz-json-1.0\r\ncontent-length: 2\r\n\r\n{}";
+                        let nth = seen
+                            .lock()
+                            .map(|mut m| {
+                                let n = m.entry(target.clone()).or_insert(0);
+                                let current = *n;
+                                *n = n.saturating_add(1);
+                                current
+                            })
+                            .unwrap_or(0);
+                        let (delay, payload) = script(&target, nth);
+                        tokio::time::sleep(delay).await;
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/x-amz-json-1.0\r\ncontent-length: {}\r\n\r\n{payload}",
+                            payload.len()
+                        );
                         if conn.write_all(reply.as_bytes()).await.is_err() {
                             return;
                         }
@@ -3769,5 +3847,78 @@ mod shutdown_order_tests {
                     .any(|r| r.contains("deletemessage") && r.contains("running-handle")))
                 .unwrap_or(false)
         );
+    }
+
+    struct HeldTopic;
+    impl Topic for HeldTopic {
+        type Message = String;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static T: OnceLock<QueueTopology> = OnceLock::new();
+            T.get_or_init(|| TopologyBuilder::new("held-stall").build())
+        }
+    }
+
+    impl NotSequenced for HeldTopic {}
+
+    struct Idle;
+    impl BatchMessageHandler<HeldTopic> for Idle {
+        type Context = ();
+        async fn handle_batch(&self, _: Vec<(String, MessageMetadata)>, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    /// The second receive stalls for 4 s. The accumulated batch is still
+    /// extended every second meanwhile, because the extension timer races the
+    /// receive instead of waiting behind it.
+    #[tokio::test]
+    async fn a_stalled_receive_does_not_hold_back_the_batch_extension() {
+        let (endpoint, requests) = scripted_endpoint(|target, nth| {
+            if target.ends_with("receivemessage") {
+                if nth == 0 {
+                    let message = r#"{"Messages":[{"MessageId":"m1","ReceiptHandle":"h1","Body":"\"hi\"","Attributes":{"ApproximateReceiveCount":"1"}}]}"#;
+                    (Duration::ZERO, message.to_string())
+                } else {
+                    (Duration::from_secs(4), r#"{"Messages":[]}"#.to_string())
+                }
+            } else {
+                (Duration::ZERO, r#"{"Successful":[{"Id":"0"}],"Failed":[]}"#.to_string())
+            }
+        })
+        .await;
+        let sqs = client(&endpoint);
+        let options = crate::BatchConsumerOptions::<crate::Sqs>::new()
+            .with_max_batch_size(10)
+            .with_max_batch_age(Duration::from_secs(60))
+            .into_inner();
+        let shutdown = options.shutdown.clone();
+        let heartbeat = Heartbeat::for_queue_timeout(2);
+        let topology = HeldTopic::topology();
+        let handler = Arc::new(Idle);
+        let ctx = Arc::new(());
+        let run = tokio::spawn(async move {
+            let _ = run_batch_loop::<HeldTopic, Idle>(
+                &sqs,
+                "http://queue",
+                topology,
+                &handler,
+                &ctx,
+                &options,
+                heartbeat,
+            )
+            .await;
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(3500);
+        while position(&requests, "changemessagevisibilitybatch").is_none()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let extended = position(&requests, "changemessagevisibilitybatch").is_some();
+        shutdown.cancel();
+        run.abort();
+        assert!(extended, "no extension while the receive was stalled");
     }
 }

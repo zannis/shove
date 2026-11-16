@@ -68,8 +68,9 @@ pub(crate) struct Round {
 /// Sends every 10-handle chunk of `handles` through `send`, starting at the
 /// chunk `cursor` names so a round cut short by its budget resumes where it
 /// stopped and no chunk is systematically skipped. Each request has its own
-/// bound, so a slow one does not stop the chunks after it. A timed-out chunk
-/// is where the next round starts.
+/// bound, so a slow one does not stop the chunks after it. The cursor only
+/// moves forward past what a round attempted, so chunks that keep timing out
+/// cannot keep the later ones from being reached.
 pub(crate) async fn run_round<F, Fut>(
     handles: &[String],
     cursor: &mut usize,
@@ -90,7 +91,6 @@ where
     }
     let start = *cursor % count;
     let deadline = tokio::time::Instant::now().checked_add(budget);
-    let mut next_start = None;
     for step in 0..count {
         let index = start.saturating_add(step) % count;
         let remaining = match deadline {
@@ -98,22 +98,21 @@ where
             None => chunk_bound,
         };
         if remaining.is_zero() {
+            // Resume at the first chunk this round did not reach.
             round.cut_short = true;
-            next_start.get_or_insert(index);
-            break;
+            *cursor = index;
+            return round;
         }
         let Some(chunk) = chunks.get(index) else {
             continue;
         };
         match tokio::time::timeout(chunk_bound.min(remaining), send(chunk.to_vec())).await {
             Ok(change) => round.stale.extend(change.stale),
-            Err(_) => {
-                round.timed_out = round.timed_out.saturating_add(1);
-                next_start.get_or_insert(index);
-            }
+            Err(_) => round.timed_out = round.timed_out.saturating_add(1),
         }
     }
-    *cursor = next_start.unwrap_or(0);
+    // Every chunk was attempted; a timed-out one is retried on the next lap.
+    *cursor = start;
     round
 }
 
@@ -377,8 +376,8 @@ mod tests {
         );
         assert_eq!(round.timed_out, 1);
         assert_eq!(
-            cursor, 1,
-            "the next round starts at the chunk that timed out"
+            cursor, 0,
+            "every chunk was attempted, so the lap is complete"
         );
     }
 
@@ -422,5 +421,39 @@ mod tests {
         )
         .await;
         assert_eq!(round.stale, ["h0", "h10", "h20"]);
+    }
+
+    #[tokio::test]
+    async fn chunks_that_keep_timing_out_do_not_starve_the_later_ones() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let mut cursor = 0;
+        let all = numbered(60);
+        let mut attempted = std::collections::HashSet::new();
+        // The first two chunks time out on every call and use up the budget.
+        for _ in 0..3 {
+            let round = run_round(
+                &all,
+                &mut cursor,
+                Duration::from_millis(30),
+                Duration::from_millis(50),
+                recording_sender(std::sync::Arc::clone(&seen), |i| {
+                    if i < 2 {
+                        Duration::from_secs(30)
+                    } else {
+                        Duration::ZERO
+                    }
+                }),
+            )
+            .await;
+            assert!(round.timed_out >= 1);
+            if let Ok(mut s) = seen.lock() {
+                attempted.extend(s.drain(..));
+            }
+        }
+        assert_eq!(
+            attempted.len(),
+            6,
+            "every chunk was attempted within three rounds"
+        );
     }
 }
