@@ -1,0 +1,19 @@
+docs/pages/backends/sqs.mdx
+  s_6511f1668e6a79::t_2685552b5046d7 130,132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "04d7979ec0839ba7a4674f5e27e5207a946c8e0c",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
