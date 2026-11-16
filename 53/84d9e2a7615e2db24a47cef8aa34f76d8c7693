@@ -1,0 +1,21 @@
+docs/pages/backends/sqs.mdx
+  s_6511f1668e6a79::t_0ae19e74960c69 132-133
+src/backends/sns/consumer.rs
+  s_6511f1668e6a79::t_78b4bde915da95 1153,1157-1160,1735-1750,1765,3927-3994
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5384d9e2a7615e2db24a47cef8aa34f76d8c7693",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
