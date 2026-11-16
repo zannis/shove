@@ -1,0 +1,21 @@
+src/backends/sns/consumer.rs
+  s_6511f1668e6a79::t_152066e1f9a457 2567-2595,2705-2713,2718-2719,2725-2761,3665,3674-3677,3679-3688,3699-3700,3737-3751,3851-3923
+src/backends/sns/visibility.rs
+  s_6511f1668e6a79::t_ad2f5b8804fe76 71-73,101,103-104,111,114-115,379-380,425-458
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "788938a16e1c8f34229c34ab85216aa2a7b02667",
+  "prompts": {},
+  "sessions": {
+    "s_6511f1668e6a79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10101425-6247-4225-b989-bc8b50d5b4c1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
